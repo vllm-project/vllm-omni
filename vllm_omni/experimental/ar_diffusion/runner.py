@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import dataclasses
@@ -22,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVCon
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -83,10 +85,30 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if not self.od_config.enforce_eager and self.ar_diffusion_kv_config.warmup_cudagraph:
             self._warmup_ar_rollout()
 
+    def _accelerator_device(self) -> torch.device | None:
+        """This runner's device when it is the active accelerator, else ``None``.
+
+        Keeps the KV pool platform-neutral: CUDA, XPU, and any other backend
+        ``torch.accelerator`` exposes are handled by the same code path.
+        """
+        if self.device is None:
+            return None
+        device = torch.device(self.device)
+        accelerator = torch.accelerator.current_accelerator()
+        return device if accelerator is not None and device.type == accelerator.type else None
+
     def _available_memory_bytes(self) -> int:
-        if self.device is None or torch.device(self.device).type != "cuda":
-            raise RuntimeError("AR-Diffusion KV preallocation currently requires a CUDA device")
-        return int(torch.cuda.mem_get_info(self.device)[0])
+        # Dispatch through the platform layer, which routes to
+        # torch.{cuda,xpu,npu,musa}.mem_get_info -- all of them share CUDA's
+        # (free, total) contract -- so KV preallocation is not pinned to one
+        # backend. The cpu rejection is kept: this widens the gate to
+        # accelerators, it does not remove it.
+        if self.device is None:
+            raise RuntimeError("AR-Diffusion KV preallocation requires a device")
+        device = torch.device(self.device)
+        if device.type == "cpu":
+            raise RuntimeError("AR-Diffusion KV preallocation requires an accelerator device, got cpu")
+        return int(current_omni_platform.get_free_memory(device))
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
@@ -261,8 +283,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         try:
             with capability.bind_ar_diffusion_state(session_id, state):
                 output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
-            if self.device is not None and torch.device(self.device).type == "cuda":
-                torch.accelerator.synchronize(self.device)
+            accelerator_device = self._accelerator_device()
+            if accelerator_device is not None:
+                torch.accelerator.synchronize(accelerator_device)
         except Exception:
             self._release_session(
                 session_id,

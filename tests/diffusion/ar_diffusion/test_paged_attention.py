@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for AR-Diffusion paged self-attention contexts."""
 
 from __future__ import annotations
@@ -32,7 +33,15 @@ POS = "positive"
 NEG = "negative"
 
 
-def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=torch.device("cpu")):
+def make_state(
+    *,
+    num_layers=1,
+    window_chunks=2,
+    frames_per_block=3,
+    dtype=torch.float32,
+    device=torch.device("cpu"),
+):
+    """``frames_per_block`` must cover the widest span the test commits at once."""
     cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
     kv = ARDiffusionKVCache(
         cfg,
@@ -45,7 +54,7 @@ def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=tor
         available_bytes=1 << 26,
         kv_branches=(ARDiffusionKVBranchSpec(POS, 0), ARDiffusionKVBranchSpec(NEG, 1)),
         session_capacity=2,
-        frames_per_block=2,
+        frames_per_block=frames_per_block,
         max_scratch_tokens_per_branch=BLOCK,
         device=device,
     )

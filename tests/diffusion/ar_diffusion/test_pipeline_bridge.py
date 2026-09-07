@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the ARDiffusionKVState paged-attention pipeline bridge."""
 
 import pytest
@@ -22,7 +23,14 @@ POS = "positive"
 NEG = "negative"
 
 
-def make_state(num_layers=1, window_chunks=4, cross_attn_length=0, shared_local_index=False):
+def make_state(
+    num_layers=1,
+    window_chunks=4,
+    cross_attn_length=0,
+    shared_local_index=False,
+    frames_per_block=3,
+):
+    """``frames_per_block`` must cover the widest span the test commits at once."""
     cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
     kv = ARDiffusionKVCache(
         cfg,
@@ -39,6 +47,7 @@ def make_state(num_layers=1, window_chunks=4, cross_attn_length=0, shared_local_
         ),
         session_capacity=2,
         cross_attention_lengths={"text": cross_attn_length} if cross_attn_length else None,
+        frames_per_block=frames_per_block,
         device=torch.device("cpu"),
     )
     pos = kv.begin_request("r-pos")

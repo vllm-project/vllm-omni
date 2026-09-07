@@ -58,8 +58,8 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
-    ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    cfg_kv_branches,
 )
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
 from vllm_omni.experimental.world_models.session_state import (
@@ -132,7 +132,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         frame_tokens = int(transformer.frame_seqlen)
         max_attention_tokens = int(transformer.blocks[0].self_attn.max_attention_size)
         cfg_world = int(get_classifier_free_guidance_world_size())
-        negative_local_index = 0 if cfg_world >= 2 else 1
         cross_attention = [
             ARDiffusionCrossAttentionKVSpec("text", int(transformer.text_len)),
         ]
@@ -145,9 +144,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             tokens_per_frame=frame_tokens,
             frames_per_block=int(transformer.num_frame_per_block),
             window_frames=max_attention_tokens // frame_tokens,
-            kv_branches=(
-                ARDiffusionKVBranchSpec(self._POSITIVE_BRANCH, 0),
-                ARDiffusionKVBranchSpec(self._NEGATIVE_BRANCH, negative_local_index),
+            kv_branches=cfg_kv_branches(
+                cfg_enabled=self.cfg_scale > 1.0,
+                cfg_parallel_world_size=cfg_world,
+                positive_name=self._POSITIVE_BRANCH,
+                negative_name=self._NEGATIVE_BRANCH,
             ),
             session_capacity=MAX_DREAMZERO_SESSIONS,
             cross_attention=tuple(cross_attention),

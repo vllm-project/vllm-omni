@@ -15,6 +15,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    cfg_kv_branches,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
@@ -43,7 +44,12 @@ def lingbot_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
     )
 
 
-def dreamzero_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
+def dreamzero_like_spec(
+    *,
+    capacity: int = 2,
+    cfg_enabled: bool = True,
+    cfg_parallel_world_size: int = 1,
+) -> ARDiffusionKVCacheSpec:
     return ARDiffusionKVCacheSpec(
         num_layers=2,
         num_kv_heads=4,
@@ -51,7 +57,10 @@ def dreamzero_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
         tokens_per_frame=BLOCK,
         frames_per_block=4,
         window_frames=6,
-        kv_branches=(ARDiffusionKVBranchSpec(POS, 0), ARDiffusionKVBranchSpec(NEG, 1)),
+        kv_branches=cfg_kv_branches(
+            cfg_enabled=cfg_enabled,
+            cfg_parallel_world_size=cfg_parallel_world_size,
+        ),
         session_capacity=capacity,
         cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 8),),
     )
@@ -287,6 +296,17 @@ def test_dreamzero_like_two_branches_are_independent():
     state = commit_one_frame(runner, "s1", POS)
     assert len(kv.window_block_ids(state.adapter(POS))) == 1
     assert kv.window_block_ids(state.adapter(NEG)) == []
+
+
+def test_dreamzero_like_cfg_off_does_not_expose_negative_branch():
+    runner = make_runner(CapablePipeline(dreamzero_like_spec(cfg_enabled=False)))
+    kv = runner.kv_cache
+    assert kv is not None and kv.num_local_kv_branches == 1
+    state = runner._get_or_create_session("s1")
+
+    assert state.kv_branch_names == (POS,)
+    with pytest.raises(KeyError, match="Unknown AR-Diffusion KV branch 'negative'"):
+        state.adapter(NEG)
 
 
 def test_lru_eviction_releases_blocks_and_notifies_pipeline():

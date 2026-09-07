@@ -33,6 +33,24 @@ class ARDiffusionKVBranchSpec:
             raise ValueError(f"AR-Diffusion KV branch local_index must be non-negative, got {self.local_index}")
 
 
+def cfg_kv_branches(
+    *,
+    cfg_enabled: bool,
+    cfg_parallel_world_size: int,
+    positive_name: str = "positive",
+    negative_name: str = "negative",
+) -> tuple[ARDiffusionKVBranchSpec, ...]:
+    """Describe the active KV branches for a two-branch CFG model."""
+    if not cfg_enabled:
+        return (ARDiffusionKVBranchSpec(positive_name, 0),)
+
+    negative_local_index = 0 if cfg_parallel_world_size >= 2 else 1
+    return (
+        ARDiffusionKVBranchSpec(positive_name, 0),
+        ARDiffusionKVBranchSpec(negative_name, negative_local_index),
+    )
+
+
 @dataclass(frozen=True)
 class ARDiffusionCrossAttentionKVSpec:
     """A fixed-length, per-layer cross-attention KV allocation."""

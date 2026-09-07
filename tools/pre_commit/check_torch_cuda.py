@@ -50,7 +50,6 @@ ALLOWED_FILES = {
     "vllm_omni/diffusion/models/nextstep_1_1/pipeline_nextstep_1_1.py",
     "vllm_omni/distributed/omni_connectors/connectors/mooncake_transfer_engine_connector.py",
     "vllm_omni/distributed/omni_connectors/connectors/mori_transfer_engine_connector.py",
-    "vllm_omni/experimental/ar_diffusion/runner.py",
     "vllm_omni/model_executor/models/moss_tts/cuda_graph_streaming_decoder_wrapper.py",
     "vllm_omni/model_executor/models/moss_tts_nano/modeling_moss_tts_nano.py",
     "vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py",

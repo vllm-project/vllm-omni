@@ -21,22 +21,9 @@ def _empty_pipeline() -> DreamZeroPipeline:
     return pipeline
 
 
-def test_dreamzero_pipeline_state_is_session_keyed() -> None:
-    pipeline = _empty_pipeline()
-
-    session_a = pipeline._get_or_create_state("session-a")
-    session_b = pipeline._get_or_create_state("session-b")
-    session_a.call_count = 7
-    session_b.call_count = 3
-
-    assert pipeline._get_or_create_state("session-a") is session_a
-    assert pipeline._get_or_create_state("session-b") is session_b
-    assert session_a.call_count == 7
-    assert session_b.call_count == 3
-
-
-def test_dreamzero_kv_spec_accounts_for_model_owned_cuda_state(monkeypatch) -> None:
+def _kv_spec_pipeline(cfg_scale: float) -> DreamZeroPipeline:
     pipeline = DreamZeroPipeline.__new__(DreamZeroPipeline)
+    pipeline.cfg_scale = cfg_scale
     pipeline.transformer = SimpleNamespace(
         frame_seqlen=16,
         blocks=[
@@ -56,6 +43,25 @@ def test_dreamzero_kv_spec_accounts_for_model_owned_cuda_state(monkeypatch) -> N
         num_action_per_block=2,
         num_state_per_block=1,
     )
+    return pipeline
+
+
+def test_dreamzero_pipeline_state_is_session_keyed() -> None:
+    pipeline = _empty_pipeline()
+
+    session_a = pipeline._get_or_create_state("session-a")
+    session_b = pipeline._get_or_create_state("session-b")
+    session_a.call_count = 7
+    session_b.call_count = 3
+
+    assert pipeline._get_or_create_state("session-a") is session_a
+    assert pipeline._get_or_create_state("session-b") is session_b
+    assert session_a.call_count == 7
+    assert session_b.call_count == 3
+
+
+def test_dreamzero_kv_spec_accounts_for_model_owned_cuda_state(monkeypatch) -> None:
+    pipeline = _kv_spec_pipeline(cfg_scale=1.0)
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero.get_classifier_free_guidance_world_size",
         lambda: 1,
@@ -64,6 +70,34 @@ def test_dreamzero_kv_spec_accounts_for_model_owned_cuda_state(monkeypatch) -> N
     spec = pipeline.ar_diffusion_kv_cache_spec()
 
     assert spec.model_owned_state_bytes_per_session == DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION
+
+
+@pytest.mark.parametrize(
+    ("cfg_scale", "cfg_world_size", "expected_branches", "expected_local_branches"),
+    [
+        (1.0, 1, (("positive", 0),), 1),
+        (1.0, 2, (("positive", 0),), 1),
+        (5.0, 1, (("positive", 0), ("negative", 1)), 2),
+        (5.0, 2, (("positive", 0), ("negative", 0)), 1),
+    ],
+)
+def test_dreamzero_kv_spec_declares_only_active_cfg_branches(
+    monkeypatch,
+    cfg_scale: float,
+    cfg_world_size: int,
+    expected_branches: tuple[tuple[str, int], ...],
+    expected_local_branches: int,
+) -> None:
+    pipeline = _kv_spec_pipeline(cfg_scale)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero.get_classifier_free_guidance_world_size",
+        lambda: cfg_world_size,
+    )
+
+    spec = pipeline.ar_diffusion_kv_cache_spec()
+
+    assert tuple((branch.name, branch.local_index) for branch in spec.kv_branches) == expected_branches
+    assert spec.num_local_kv_branches == expected_local_branches
 
 
 def test_dreamzero_pipeline_state_follows_runner_lifecycle_notifications() -> None:
