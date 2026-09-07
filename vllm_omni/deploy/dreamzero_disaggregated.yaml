@@ -1,0 +1,102 @@
+# DreamZero-DROID deploy: three disaggregated diffusion stages.
+#
+#   Stage 0  Encode   -> tokenizer + UMT5 + CLIP + Wan VAE encode
+#   Stage 1  Denoise  -> CausalWan DiT + AR-Diffusion paged KV, TP=4
+#   Stage 2  Decode   -> action postprocess
+#
+# Topology (stage roles and payload keys) is declared in
+# vllm_omni/model_executor/models/dreamzero/pipeline.py. This file owns only
+# runtime placement.
+#
+# Stage payload transfer: this default configures **no** stage-payload connector,
+# so the DreamZero payload stays on `DiffusionOutput.custom_output` and travels
+# the existing inline IPC/orchestrator path. The pipeline still declares its
+# directional payload keys -- that declaration is a payload *capability*, not a
+# transport choice -- and the worker-side connector hooks stay inert while no
+# connector edge exists.
+#
+# Adding a fast path later is a deploy-only change: declare a connector and wire
+# the `to_stage_N` / `from_stage_N` edges for stages 0->1 and 1->2. No DreamZero
+# source, payload schema, `run_stage` dispatch or XPU tensor-parallel collective
+# changes with it.
+#
+# AR-Diffusion KV needs no connector configuration at all: the paged KV pool is
+# engine-local to Stage 1 and never crosses a stage boundary, so there is nothing
+# here to keep separate from a stage-payload connector.
+
+pipeline: dreamzero_disaggregated
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  # ---- Stage 0: Encode ----------------------------------------------------
+  # Runs the encoders only; no DiT, no AR-Diffusion engine, no KV pool.
+  - stage_id: 0
+    devices: "4"
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+
+  # ---- Stage 1: Denoise ---------------------------------------------------
+  # The four logical devices form one vLLM tensor-parallel group, so the sharded
+  # CausalWan DiT keeps using vllm.distributed collectives (XPU xccl, falling
+  # back to oneCCL) exactly as it does in the monolithic deployment. XPU device
+  # visibility is still remapped by ZE_AFFINITY_MASK.
+  #
+  # Stage payload transfer never touches that path: with no connector edge the
+  # payload arrives inline, and with one it is delivered to the transfer-leader
+  # rank and broadcast over this same TP group. Either way every rank then runs
+  # its own shard of the DiT forward.
+  - stage_id: 1
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: DreamZeroPipeline
+    # DreamZero's denoise stage runs on the AR-Diffusion engine (engine-level
+    # paged KV cache). AR-Diffusion KV exists only on this stage.
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    parallel_config:
+      tensor_parallel_size: 4
+      cfg_parallel_size: 1
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+    cache_backend: step_cache
+    cache_config:
+      step_cache_dit_enabled: true
+      velocity_sim_thresholds: [0.95, 0.93]
+      velocity_skip_countdowns: [4, 2]
+
+  # ---- Stage 2: Decode ----------------------------------------------------
+  # Action postprocess only. DreamZero's response carries normalized video
+  # latents plus actions, so this stage loads no VAE decoder and no weights.
+  - stage_id: 2
+    devices: "4"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position

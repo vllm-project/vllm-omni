@@ -49,7 +49,10 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dots_tts.pipeline import DOTS_TTS_PIPELINE
-from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
+from vllm_omni.model_executor.models.dreamzero.pipeline import (
+    DREAMZERO_DISAGGREGATED_PIPELINE,
+    DREAMZERO_PIPELINE,
+)
 from vllm_omni.model_executor.models.dynin_omni.pipeline import DYNIN_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
@@ -141,6 +144,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "lance": LANCE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
+    # Disaggregated DreamZero (opt-in): Encode / Denoise / Decode split.
+    "dreamzero_disaggregated": DREAMZERO_DISAGGREGATED_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
     "gepard": GEPARD_PIPELINE,

@@ -716,6 +716,18 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Multi-stage diffusion role. ``None``/"dit"/"diffusion" run the full
+    # pipeline (encode + denoise + decode) in one stage. "encode" runs only the
+    # encoder(s) and emits conditioning for a downstream diffusion stage.
+    model_stage: str | None = None
+
+    # Structured diffusion stage role (encode / denoise / decode / full).
+    # This supersedes the free-form ``model_stage`` string: it is the
+    # model-agnostic axis that drives role-based component loading and stage
+    # dispatch so any DiT model can be disaggregated via config. When ``None``
+    # it is derived from ``model_stage`` (see ``resolve_diffusion_stage_role``).
+    stage_role: str | None = None
+
     # Optional model-defined startup task. Pipelines may use this to select
     # task-specific components or weights before serving requests.
     task_type: str | None = None
@@ -944,6 +956,15 @@ class OmniDiffusionConfig:
 
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
+
+    # Conditioning keys fetched from the upstream stage over the omni connector
+    # rather than carried inline through the orchestrator. Empty disables the
+    # worker-side connector receive path.
+    stage_input_payload_keys: tuple[str, ...] = ()
+
+    # Keys handed to the next stage over the omni connector. Empty disables the
+    # worker-side connector send path.
+    stage_output_payload_keys: tuple[str, ...] = ()
 
     # Quantization: str method name, dict config, QuantizationConfig, or None.
     # str is resolved to {"method": <str>} internally.
@@ -1570,6 +1591,13 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    # Connector-neutral payload for a non-final diffusion stage. Producing
+    # stages put plain (dict/tensor/scalar) entries here keyed by the names
+    # declared in ``stage_output_payload_keys``; the runner hands the declared
+    # keys to the omni connector and the orchestrator forwards whatever is left
+    # to the next stage. Never put live objects (schedulers, generators,
+    # modules, session state) here — the payload crosses a process boundary.
+    custom_output: dict[str, Any] = field(default_factory=dict)
     async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
@@ -1623,6 +1651,7 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        self.custom_output = _maybe_to_cpu(self.custom_output)
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":

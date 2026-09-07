@@ -1124,6 +1124,12 @@ def _project_omni_stage_engine_args(
     topology = stage_config.stage_pipeline_config
     topology_engine_args = {
         "model_stage": stage_config.model_stage,
+        # Diffusion disaggregation: stage role and the directional payload key
+        # schema. Empty tuples project to None so non-disaggregated stages are
+        # unaffected (the comprehension below drops None values).
+        "stage_role": topology.stage_role.value if topology.stage_role is not None else None,
+        "stage_input_payload_keys": tuple(topology.stage_input_payload_keys) or None,
+        "stage_output_payload_keys": tuple(topology.stage_output_payload_keys) or None,
         "worker_type": stage_config.worker_type,
         "scheduler_cls": stage_config.scheduler_cls,
         "hf_config_name": stage_config.hf_config_name,

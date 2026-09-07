@@ -107,6 +107,42 @@ def supports_step_execution(pipeline: object) -> bool:
     return isinstance(pipeline, SupportsStepExecution)
 
 
+# --- Generic role-based component loading for diffusion disaggregation ---------
+
+# Which component groups each diffusion stage role needs to load.
+# ``encoder`` = text/image encoders, ``dit`` = denoising transformer(s),
+# ``vae`` = VAE. A stage skips constructing every group not listed for its role,
+# which is what frees memory on disaggregated workers (e.g. an ENCODE stage
+# drops the DiT). This mapping is model-agnostic: a pipeline becomes
+# role-splittable without model-specific ``if`` branches in the runner.
+_ROLE_COMPONENT_GROUPS: dict[str, frozenset[str]] = {
+    "full": frozenset({"encoder", "dit", "vae"}),
+    "encode": frozenset({"encoder"}),
+    "denoise": frozenset({"dit"}),
+    "denoise_decode": frozenset({"dit", "vae"}),
+    "decode": frozenset({"vae"}),
+}
+
+
+def stage_component_groups(role: str) -> frozenset[str]:
+    """Return the component groups (``encoder``/``dit``/``vae``) a role loads."""
+    return _ROLE_COMPONENT_GROUPS.get(role, _ROLE_COMPONENT_GROUPS["full"])
+
+
+def role_loads_component(role: str, group: Literal["encoder", "dit", "vae"]) -> bool:
+    """Whether a diffusion stage ``role`` should load the given component group.
+
+    Use inside a pipeline ``__init__`` to decide, model-agnostically, whether to
+    instantiate the encoder / DiT / VAE for the current stage role::
+
+        if role_loads_component(role, "dit"):
+            self.transformer = ...
+        if role_loads_component(role, "vae"):
+            self.vae = ...
+    """
+    return group in stage_component_groups(role)
+
+
 @runtime_checkable
 class SupportsPromptUpdate(Protocol):
     """Optional protocol for pipelines that support midway prompt updates.

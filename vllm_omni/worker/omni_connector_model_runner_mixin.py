@@ -2327,7 +2327,8 @@ class OmniConnectorModelRunnerMixin:
         tp_group = self._get_local_tp_group()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             return getattr(tp_group, "rank_in_group", 0) == 0
-        return self._local_rank == 0
+        # Runners that skip init_omni_connectors (diffusion) have no _local_rank.
+        return getattr(self, "_local_rank", 0) == 0
 
     def get_kv_connector_key(
         self,
