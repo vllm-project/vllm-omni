@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
 from typing import Any
 
@@ -145,6 +148,8 @@ class OmniModelConfig(ModelConfig):
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
     omni_kv_config: dict | None = None
+    dit_load_aware: bool | None = None
+    dit_load_threshold: int | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
     enable_sleep_mode: bool = False

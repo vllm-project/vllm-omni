@@ -35,6 +35,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.core.sched.dit_load_state import DitLoadState
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -424,6 +425,8 @@ class Orchestrator:
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     duplex_control_plane: DuplexControlPlanePort | None = None
+    _dit_load_state: DitLoadState | None = None
+    _dit_load_aware: bool = False
 
     def __init__(
         self,
@@ -441,6 +444,7 @@ class Orchestrator:
         prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
+        dit_load_aware: bool = False,
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = False,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
@@ -516,6 +520,13 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+        self._dit_load_aware = bool(dit_load_aware)
+        if self._dit_load_aware:
+            self._dit_load_state: DitLoadState = DitLoadState()
+            self._dit_load_last_poll: dict[tuple[int, int], float] = {}
+
+    # [OmniDTPS] Min interval between DiT-load polls per replica.
+    _DIT_LOAD_POLL_INTERVAL_S: float = 0.1
 
     def _init_metrics_state(
         self,
@@ -700,6 +711,21 @@ class Orchestrator:
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
+                if self._dit_load_aware and self._dit_load_state is not None and msg.stage_id < len(self.stage_pools):
+                    pool = self.stage_pools[msg.stage_id]
+                    if pool.stage_type == "diffusion":
+                        replica_id = pool.get_replica_id_by_addr(msg.input_addr)
+                        if replica_id is not None:
+                            try:
+                                self._dit_load_state.remove(msg.stage_id, replica_id)
+                            except Exception:
+                                logger.debug(
+                                    "[Orchestrator] DitLoadState.remove on unregister failed for stage-%s rep-%s",
+                                    msg.stage_id,
+                                    replica_id,
+                                    exc_info=True,
+                                )
+                            await self._push_dit_load_to_ar(self._dit_load_state)
             elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
@@ -1176,6 +1202,77 @@ class Orchestrator:
                 self._update_stage_replica_waiting(stage_id, replica_id, int(n_waiting))
         return diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID
 
+    async def _poll_dit_load_throttled(
+        self,
+        stage_id: int,
+        pool: StagePool,
+        replica_id: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        state = self._dit_load_state
+        if state is None:
+            return
+        if not self._dit_load_aware:
+            return
+        now = _time.monotonic()
+        key = (stage_id, replica_id)
+        if not force:
+            last = self._dit_load_last_poll.get(key, 0.0)
+            if (now - last) < self._DIT_LOAD_POLL_INTERVAL_S:
+                return
+        self._dit_load_last_poll[key] = now
+
+        # Exit-driven eviction: a dead replica's last waiting=0 would falsely
+        # signal idle, so drop it before polling.
+        if not pool.check_dit_health(replica_id):
+            try:
+                state.remove(stage_id, replica_id)
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] DitLoadState.remove failed for stage-%s rep-%s",
+                    stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
+            await self._push_dit_load_to_ar(state)
+            return
+
+        load = await pool.poll_dit_load(replica_id)
+        if load is None:
+            return
+        waiting, running, waiting_ids, running_ids = load
+        try:
+            changed = state.update(
+                stage_id,
+                replica_id,
+                waiting,
+                running,
+                waiting_ids=waiting_ids,
+                running_ids=running_ids,
+            )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] DitLoadState.update failed for stage-%s rep-%s",
+                stage_id,
+                replica_id,
+                exc_info=True,
+            )
+            return
+
+        if changed:
+            await self._push_dit_load_to_ar(state)
+
+    async def _push_dit_load_to_ar(self, state: DitLoadState) -> None:
+        if not self._dit_load_aware:
+            return
+        snapshot = state.snapshot()
+        for stage_id in range(self.num_stages):
+            pool = self.stage_pools[stage_id]
+            if pool.stage_type != "llm":
+                continue
+            await pool.push_dit_load(snapshot)
+
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""
         while not self._shutdown_event.is_set():
@@ -1192,6 +1289,8 @@ class Orchestrator:
                     try:
                         if pool.stage_type == "diffusion":
                             diffusion_output = pool.poll_diffusion_output(replica_id)
+                            if self._dit_load_aware:
+                                await self._poll_dit_load_throttled(stage_id, pool, replica_id)
                             if diffusion_output is None:
                                 continue
 
