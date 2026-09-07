@@ -747,6 +747,7 @@ class Orchestrator:
             # Stage 0 lost all replicas between the HTTP-layer errored check and
             # dispatch. Runs before request state / running counter registration,
             # so the helper's cleanup is a no-op here.
+            cleanup_request_artifact_dirs(msg.request_artifact_dirs or [])
             await self._fail_request_dead_stage(request_id, stage_id)
             return
 
