@@ -15,8 +15,8 @@ import tempfile
 import time
 import uuid
 from argparse import Namespace
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from numbers import Integral
 from pathlib import Path
@@ -181,6 +181,9 @@ MINIMAX_H3_MAX_REFERENCE_COUNT = 12
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3"})
+CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
+CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
+CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 profiler_router = APIRouter()
 
 
@@ -3073,6 +3076,7 @@ async def _cleanup_video(video_id: str):
 def _cleanup_video_references(
     reference_video: ReferenceVideo | None,
     reference_audio: ReferenceAudio | None,
+    control_path: str | None = None,
 ) -> None:
     if reference_video is not None:
         for path in reference_video.cleanup_paths:
@@ -3083,6 +3087,8 @@ def _cleanup_video_references(
         for path in cleanup_paths:
             if os.path.exists(path):
                 os.unlink(path)
+    if control_path is not None and os.path.exists(control_path):
+        os.unlink(control_path)
 
 
 async def _run_video_generation_job(
@@ -3092,11 +3098,13 @@ async def _run_video_generation_job(
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
     reference_audio: ReferenceAudio | None = None,
+    control_path: str | None = None,
     app_state: Any | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
+        _cleanup_video_references(reference_video, reference_audio, control_path)
         return
 
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
@@ -3165,7 +3173,7 @@ async def _run_video_generation_job(
         await VIDEO_STORE.pop(video_id)
         raise
     finally:
-        _cleanup_video_references(reference_video, reference_audio)
+        _cleanup_video_references(reference_video, reference_audio, control_path)
 
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
@@ -3189,6 +3197,121 @@ async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[
                 os.unlink(path)
         raise
     return paths
+
+
+async def _persist_uploaded_control_reference(
+    upload: UploadFile,
+    *,
+    max_bytes: int = CONTROL_REFERENCE_MAX_BYTES,
+) -> str:
+    """Stream one model control upload to request-scoped local storage."""
+    kind = _uploaded_media_kind(upload)
+    suffix = Path(upload.filename or "").suffix.lower()
+    supported_suffixes = CONTROL_REFERENCE_IMAGE_SUFFIXES | CONTROL_REFERENCE_VIDEO_SUFFIXES
+    if kind == "audio" or (suffix and suffix not in supported_suffixes):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="control_reference must be an image or video file.",
+        )
+    if not suffix:
+        suffix = ".png" if kind == "image" else ".mp4"
+
+    declared_size = getattr(upload, "size", None)
+    if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"control_reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+        )
+
+    fd, path = tempfile.mkstemp(prefix="vllm_omni_control_reference_", suffix=suffix)
+    size = 0
+    persisted = False
+    try:
+        with os.fdopen(fd, "wb") as output:
+            while chunk := await upload.read(min(1024 * 1024, max_bytes - size + 1)):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST.value,
+                        detail=f"control_reference exceeds the {max_bytes // (1024 * 1024)} MiB size limit.",
+                    )
+                output.write(chunk)
+        if size == 0:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="control_reference must not be empty.",
+            )
+        persisted = True
+        return path
+    finally:
+        if not persisted:
+            with suppress(OSError):
+                os.unlink(path)
+
+
+def _validate_control_upload(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+    control_reference: UploadFile | None,
+    control_type: str | None,
+) -> str | None:
+    """Validate a generic uploaded control against model capabilities."""
+    if control_reference is None:
+        if control_type is not None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="control_type requires a control_reference upload.",
+            )
+        return None
+    if control_type is None or not control_type.strip():
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="control_reference requires control_type.",
+        )
+
+    normalized_type = control_type.strip().lower()
+    supported_types = frozenset(getattr(handler, "supported_control_upload_types", ()))
+    if normalized_type not in supported_types:
+        supported = ", ".join(sorted(supported_types)) or "none"
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                f"Control upload type '{normalized_type}' is not supported by this model. "
+                f"Supported control upload types: {supported}."
+            ),
+        )
+
+    existing = (request.extra_params or {}).get(normalized_type)
+    if existing is not None:
+        if not isinstance(existing, Mapping) and existing is not True:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"extra_params.{normalized_type} must be an object when control_reference is uploaded.",
+            )
+        if isinstance(existing, Mapping) and any(existing.get(key) is not None for key in ("control", "control_path")):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=(
+                    "Provide either control_reference or "
+                    f"extra_params.{normalized_type}.control/control_path, not both."
+                ),
+            )
+    return normalized_type
+
+
+def _attach_control_upload(
+    request: VideoGenerationRequest,
+    control_type: str,
+    control_path: str | None = None,
+) -> None:
+    """Declare an uploaded control and attach its persisted path when available."""
+    extra_params = dict(request.extra_params or {})
+    existing = extra_params.get(control_type)
+    control_params = dict(existing) if isinstance(existing, Mapping) else {}
+    if control_path is not None:
+        control_params["control_path"] = control_path
+    extra_params[control_type] = control_params
+    request.extra_params = extra_params
 
 
 def _reference_list(value: Any) -> list[Any]:
@@ -3337,6 +3460,8 @@ async def _parse_video_form(
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
     input_references: list[UploadFile] | None = File(default=None),
+    control_reference: UploadFile | None = File(default=None),
+    control_type: str | None = Form(default=None),
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
     audio_reference: str | None = Form(default=None),
@@ -3376,6 +3501,7 @@ async def _parse_video_form(
     ReferenceImage | None,
     ReferenceVideo | None,
     ReferenceAudio | None,
+    str | None,
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
@@ -3469,6 +3595,13 @@ async def _parse_video_form(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
             detail=f"Video generation setup failed: {str(e)}",
         )
+
+    normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
+    if normalized_control_type is not None:
+        # Make the selected transfer mode visible while choosing the model's
+        # reference-video decode policy. The upload itself stays unpersisted
+        # until reference parsing succeeds, preserving failure cleanup.
+        _attach_control_upload(request, normalized_control_type)
 
     supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
     if input_reference is not None:
@@ -3592,7 +3725,27 @@ async def _parse_video_form(
             cleanup_paths=cleanup_paths,
         )
 
-    return request, handler, effective_model_name, reference_image, reference_video, reference_audio
+    control_path: str | None = None
+    if control_reference is not None and normalized_control_type is not None:
+        try:
+            control_path = await _persist_uploaded_control_reference(
+                control_reference,
+                max_bytes=CONTROL_REFERENCE_MAX_BYTES,
+            )
+            _attach_control_upload(request, normalized_control_type, control_path)
+        except (asyncio.CancelledError, HTTPException, OSError, TypeError, ValueError):
+            _cleanup_video_references(reference_video, reference_audio, control_path)
+            raise
+
+    return (
+        request,
+        handler,
+        effective_model_name,
+        reference_image,
+        reference_video,
+        reference_audio,
+        control_path,
+    )
 
 
 @router.post(
@@ -3613,6 +3766,7 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
+        str | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -3620,7 +3774,15 @@ async def create_video(
     Accepts multipart form-data (see ``_parse_video_form`` for parameters),
     persists a queued job record, and starts generation in the background.
     """
-    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
+    (
+        request,
+        handler,
+        effective_model_name,
+        reference_image,
+        reference_video,
+        reference_audio,
+        control_path,
+    ) = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(
@@ -3631,6 +3793,7 @@ async def create_video(
             reference_image,
             reference_video,
             reference_audio,
+            control_path,
             app_state=raw_request.app.state,
         )
     )
@@ -3656,6 +3819,7 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
+        str | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -3667,7 +3831,15 @@ async def create_video_sync(
     Metadata is returned via response headers ``X-Request-Id``,
     ``X-Model``, and ``X-Inference-Time-S``.
     """
-    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
+    (
+        request,
+        handler,
+        effective_model_name,
+        reference_image,
+        reference_video,
+        reference_audio,
+        control_path,
+    ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
@@ -3701,7 +3873,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio)
+        _cleanup_video_references(reference_video, reference_audio, control_path)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
