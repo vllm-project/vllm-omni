@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
@@ -22,6 +24,13 @@ _ResultT = TypeVar("_ResultT")
 def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _ResultT:
     items.append(item)
     return result
+
+
+def _turbo_spec(filename: str) -> TurboSpec:
+    """Build the spec a loaded artifact of this name would carry."""
+    spec = parse_turbo_filename(filename)
+    assert spec is not None
+    return spec
 
 
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
@@ -244,9 +253,12 @@ def test_combined_task_inference_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
-    assert pipeline._resolve_task("fl2va", {"image": object()}, has_turbo_lora=True) == "fl2va"
-    with pytest.raises(OmniClientError, match="supports T2VA/FL2VA requests only"):
-        pipeline._resolve_task("ref2va", {}, has_turbo_lora=True)
+    fl2v_spec = _turbo_spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors")
+    ref2v_spec = _turbo_spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
+    assert pipeline._resolve_task("fl2va", {"image": object()}, turbo_spec=fl2v_spec) == "fl2va"
+    with pytest.raises(OmniClientError, match="serves"):
+        pipeline._resolve_task("ref2va", {}, turbo_spec=fl2v_spec)
+    assert pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=ref2v_spec) == "ref2va"
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task(None, {"image": object()}) == "ref2va"
@@ -265,14 +277,16 @@ def test_combined_task_inference_and_transformer_routing():
         "component_partition",
         "source_partitions",
         "expected_tasks",
+        "load_text_encoder",
     ),
     [
-        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}),
-        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}),
-        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
+        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}, True),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}, True),
+        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}, True),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}, False),
     ],
 )
-def test_pipeline_loads_task_selected_dits_and_shared_components_once(
+def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     monkeypatch,
     tmp_path,
     task_type,
@@ -281,6 +295,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     component_partition,
     source_partitions,
     expected_tasks,
+    load_text_encoder,
 ):
     from vllm_omni.diffusion.data import (
         DiffusionParallelConfig,
@@ -392,6 +407,11 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
         revision=None,
         task_type=task_type,
         quantization_config=None,
+        model_loaded={
+            "transformer": True,
+            "vae": True,
+            "text_encoder": load_text_encoder,
+        },
         parallel_config=DiffusionParallelConfig(
             cfg_parallel_size=1,
             text_encoder_tp_size=1,
@@ -403,34 +423,54 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     assert pipeline.supported_tasks == expected_tasks
     assert len(created["dit"]) == expected_dits
     component_path = tmp_path / component_partition
-    assert created["text_encoder"] == [str(component_path / "text_encoder")]
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
-    assert len(tokenizer_calls) == 1
-    assert len(processor_calls) == 1
     expected_dit_modules = ["transformer", "transformers_ref"] if expected_dits == 2 else ["transformer"]
     assert pipeline._dit_modules == expected_dit_modules
     assert hasattr(pipeline, "transformers_ref") is (expected_dits == 2)
+    if load_text_encoder:
+        assert created["text_encoder"] == [str(component_path / "text_encoder")]
+        assert len(tokenizer_calls) == 1
+        assert len(processor_calls) == 1
+        assert pipeline.text_encoder is not None
+        assert pipeline.tokenizer is not None
+        assert pipeline.processor is not None
+        assert pipeline._encoder_modules == ["text_encoder"]
+        assert pipeline.text_encoder_tp_size == 1
+    else:
+        assert created["text_encoder"] == []
+        assert tokenizer_calls == []
+        assert processor_calls == []
+        assert pipeline.text_encoder is None
+        assert pipeline.tokenizer is None
+        assert pipeline.processor is None
+        assert pipeline._encoder_modules == []
+        assert pipeline.text_encoder_tp_size == 0
+        assert pipeline.text_encoder_group is None
     if expected_partition == "ref2va":
         assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
     assert [source.model_or_path for source in pipeline.weights_sources] == [
         *(str(tmp_path / partition_name) for partition_name in source_partitions),
-        str(component_path),
+        *((str(component_path),) if load_text_encoder else ()),
     ]
     assert [source.subfolder for source in pipeline.weights_sources] == [
         *("transformer" for _ in source_partitions),
-        "text_encoder",
+        *(("text_encoder",) if load_text_encoder else ()),
     ]
     expected_prefixes = ["transformer."]
     if expected_dits == 2:
         expected_prefixes.append("transformers_ref.")
-    expected_prefixes.append("text_encoder.")
+    if load_text_encoder:
+        expected_prefixes.append("text_encoder.")
     assert [source.prefix for source in pipeline.weights_sources] == expected_prefixes
-    expected_patterns = (
-        pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS
-        if expected_partition == "combined"
-        else pipeline_module.MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[expected_partition]
-    )
+    if load_text_encoder:
+        expected_patterns = (
+            pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS
+            if expected_partition == "combined"
+            else pipeline_module.MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[expected_partition]
+        )
+    else:
+        expected_patterns = pipeline_module.MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS[expected_partition]
     assert download_calls == [
         {
             "model_name_or_path": "MiniMaxAI/MiniMax-H3",
@@ -487,6 +527,10 @@ def test_dlo_offload_plan_includes_token_refiner():
 
     assert MiniMaxH3Pipeline._offload_plan.offload_submodules == {"token_refiner": "blocks"}
     assert MiniMaxH3Pipeline._offload_plan.resident_dit_paths == frozenset({"transformer"})
+    assert MiniMaxH3Pipeline._offload_plan.encoder_component_types == {"text_encoder": "text_encoder"}
+    assert MiniMaxH3Pipeline._offload_plan.encoder_block_attrs == {
+        "text_encoder": ("vision.blocks", "text_model.layers")
+    }
 
 
 def test_joint_postprocess_is_multiprocessing_picklable():
@@ -1185,6 +1229,12 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
     )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        MiniMaxH3Pipeline,
+    )
+    from vllm_omni.diffusion.offloader.component_utils import (
+        get_encoder_block_groups,
+    )
 
     encoder = MiniMaxH3Qwen3VLEncoder(
         "/nonexistent/text_encoder",
@@ -1197,6 +1247,25 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
     # The stub has no parameters, so it never contributes to the runner's
     # strict missing-parameter check on non-encoder ranks.
     assert list(encoder.named_parameters()) == []
+    assert (
+        get_encoder_block_groups(
+            encoder,
+            "text_encoder",
+            MiniMaxH3Pipeline._offload_plan,
+            strict=True,
+        )
+        == []
+    )
+
+    # An arbitrary empty module is not silently treated as a distributed
+    # stub; explicit plans still validate their declared paths.
+    with pytest.raises(ValueError, match=r"text_encoder\.vision\.blocks was not found"):
+        get_encoder_block_groups(
+            nn.Module(),
+            "text_encoder",
+            MiniMaxH3Pipeline._offload_plan,
+            strict=True,
+        )
 
 
 def test_global_quant_config_is_shared_by_dit_and_encoder():
@@ -1303,10 +1372,38 @@ def test_model_offload_uses_hooked_text_encoder_call():
 
 
 @pytest.mark.parametrize(
-    "offload_flag",
-    ["enable_layerwise_offload", "enable_distributed_layerwise_offload"],
+    ("enable_layerwise", "enable_distributed"),
+    [(True, False), (False, True)],
 )
-def test_layerwise_offload_releases_text_encoder(offload_flag):
+def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise, enable_distributed):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config=None,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=enable_layerwise,
+        enable_distributed_layerwise_offload=enable_distributed,
+    )
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+
+    vae = Mock()
+    with pipeline._component_on_device(vae):
+        pass
+    vae.load_to_device.assert_called_once_with()
+    vae.offload_to_cpu.assert_called_once_with()
+
+
+def test_layerwise_encoder_selection_releases_text_encoder():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1315,8 +1412,11 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["text_encoder"],
+        },
     )
-    setattr(pipeline.od_config, offload_flag, True)
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
     pipeline.text_encoder.encode_ids.return_value = expected
@@ -1328,7 +1428,7 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
     pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
 
 
-def test_distributed_layerwise_offload_releases_text_encoder():
+def test_layerwise_dit_only_keeps_text_encoder_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1336,7 +1436,8 @@ def test_distributed_layerwise_offload_releases_text_encoder():
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=True,
+        enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={"mode": "layer", "components": ["dit"]},
     )
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
@@ -1346,25 +1447,30 @@ def test_distributed_layerwise_offload_releases_text_encoder():
 
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
-    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_not_called()
 
 
-def test_distributed_layerwise_offload_stages_vae_component():
+def test_dit_encoder_selection_keeps_vae_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=True,
+        enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit", "text_encoder"],
+        },
     )
     component = Mock()
 
     with pipeline._component_on_device(component):
-        component.load_to_device.assert_called_once_with()
-        component.offload_to_cpu.assert_not_called()
+        pass
 
-    component.offload_to_cpu.assert_called_once_with()
+    component.load_to_device.assert_not_called()
+    component.offload_to_cpu.assert_not_called()
 
 
 def test_distributed_layerwise_resident_blocks_are_stage_scoped():
@@ -1411,57 +1517,6 @@ def test_distributed_layerwise_resident_blocks_can_be_skipped():
 
     controller.load_resident_layers.assert_not_called()
     controller.offload_resident_layers.assert_not_called()
-
-
-def test_encoder_layerwise_offload_keeps_tp_blocks_rank_local(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3.encoder import (
-        MiniMaxH3Qwen3VLEncoder,
-    )
-
-    class Stack(torch.nn.Module):
-        def __init__(self, count):
-            super().__init__()
-            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
-
-    class TextStack(torch.nn.Module):
-        def __init__(self, count):
-            super().__init__()
-            self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
-
-    hooks = []
-
-    def fake_apply(block, next_block, device, stream, pin_memory):
-        hook = SimpleNamespace(
-            block=block,
-            next_block=next_block,
-            device=device,
-            stream=stream,
-            pin_memory=pin_memory,
-            _prev_hook=None,
-            offload_layer=Mock(),
-        )
-        hooks.append(hook)
-        return hook
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.offloader.layerwise_backend.apply_block_hook",
-        fake_apply,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.platforms.current_omni_platform.Stream",
-        Mock(return_value="copy-stream"),
-    )
-    encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
-    torch.nn.Module.__init__(encoder)
-    encoder.device_target = torch.device("cpu")
-    encoder.vision = Stack(2)
-    encoder.text_model = TextStack(3)
-
-    encoder.enable_omni_layerwise_offload(pin_memory=False)
-
-    assert len(hooks) == 5
-    assert all(hook._prev_hook is not None for hook in hooks)
-    assert all(hook.device == torch.device("cpu") for hook in hooks)
 
 
 def test_video_vae_keeps_reference_fp32_weights(monkeypatch):

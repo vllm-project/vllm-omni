@@ -23,7 +23,6 @@ Easy, fast, and cheap omni-modality model serving for everyone
 <a class="github-button" href="https://github.com/vllm-project/vllm-omni/fork" data-show-count="true" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
 </p>
 
-
 ## About
 
 [vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
@@ -52,7 +51,7 @@ vLLM-Omni is flexible and easy to use with:
 - Tensor, pipeline, data and expert parallelism support for distributed inference
 - Streaming outputs
 - OpenAI-compatible API server
-- Full-duplex realtime serving with streaming audio input and output (experimental)
+- [Full-duplex realtime serving](serving/realtime_duplex_api.md) with streaming audio input and output
 
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 

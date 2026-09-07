@@ -518,6 +518,40 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
         )
 
 
+def test_num_warmups_preserves_explicit_zero():
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    assert _resolve_num_warmups({}, default=4) == 4
+    assert _resolve_num_warmups({"num_warmups": 0}, default=4) == 0
+
+
+def test_omniinteract_result_accepts_complete_artifacts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 4,
+            "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": True},
+        },
+        {"dataset_name": "omniinteract"},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_incomplete_artifacts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="artifacts are incomplete"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": False},
+            },
+            {"dataset_name": "omniinteract"},
+            4,
+        )
+
+
 def test_omni_tpot_baseline_accepts_measured_finite_sample():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
