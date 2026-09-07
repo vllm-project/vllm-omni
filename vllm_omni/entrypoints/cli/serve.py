@@ -771,6 +771,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--host-weight-runtime-validation",
+            choices=("manifest_and_metadata", "full_checksum"),
+            default="manifest_and_metadata",
+            help=(
+                "HWR warm-acquisition validation. The default checks metadata, not payload corruption; "
+                "full_checksum reads and hashes every payload before restoring weights."
+            ),
+        )
+        omni_config_group.add_argument(
             "--host-weight-runtime-root",
             type=str,
             default=None,

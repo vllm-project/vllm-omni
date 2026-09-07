@@ -739,6 +739,7 @@ class _DiffusionConfigProjection:
     dlo_resident_layers: int = Field(default=0, ge=0)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None
+    host_weight_runtime_validation: str = "manifest_and_metadata"
     dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
@@ -892,6 +893,7 @@ class _DiffusionConfigProjection:
         validate_host_weight_runtime_options(
             mode=self.host_weight_runtime_mode,
             root=self.host_weight_runtime_root,
+            validation=self.host_weight_runtime_validation,
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,

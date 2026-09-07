@@ -193,6 +193,37 @@ def test_resolve_execution_mode_rejects_unknown_execution_type():
         omni_config_module._resolve_execution_mode("unknown_execution_type")
 
 
+@pytest.mark.parametrize("validation", ["manifest_and_metadata", "full_checksum"])
+def test_hwr_validation_survives_config_projection(validation: str):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    override = StageDeployConfig(stage_id=0, host_weight_runtime_validation=validation)
+    config = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path="dreamzero_tp1_cfg2",
+        cli_overrides={"host_weight_runtime_validation": validation},
+    )
+    stage = config.stage_by_id(0)
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.host_weight_runtime_validation == validation
+    projection = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        host_weight_runtime_validation=override.host_weight_runtime_validation
+    )
+    assert projection.host_weight_runtime_validation == validation
+    assert OmniDiffusionConfig(host_weight_runtime_validation=validation).host_weight_runtime_validation == validation
+    assert omni_config_module._DiffusionConfigProjection().host_weight_runtime_validation == "manifest_and_metadata"
+    assert OmniDiffusionConfig().host_weight_runtime_validation == "manifest_and_metadata"
+
+
+@pytest.mark.parametrize("validation", ["fs_verity", "unknown", None])
+def test_hwr_validation_rejects_unsupported_values(validation):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    for config_class in (OmniDiffusionConfig, omni_config_module._DiffusionConfigProjection):
+        with pytest.raises(ValueError, match="host_weight_runtime_validation"):
+            config_class(host_weight_runtime_validation=validation)
+
+
 def test_from_pipeline_config_preserves_current_pipeline_config_object():
     omni_config = _from_pipeline_key("minicpmo_4_5")
     pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")

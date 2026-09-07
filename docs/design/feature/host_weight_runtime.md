@@ -67,6 +67,26 @@ views and mapped ranges. A separate transport still decides whether to use
 registered mmap, private pinned staging, synchronous copies, or asynchronous
 H2D transfer.
 
+## Payload validation at startup
+
+Eligible diffusion loaders accept `--host-weight-runtime-validation` (or the
+`host_weight_runtime_validation` offline/stage configuration field):
+
+- `manifest_and_metadata` is the existing default. It validates identity,
+  metadata, tensor structure, and sizes, but does not detect payload-only
+  corruption.
+- `full_checksum` reads and hashes every payload on warm acquisition before
+  restoring weights. This adds startup I/O/CPU work proportional to artifact
+  bytes; it is not a per-inference check.
+
+For example, add `--host-weight-runtime-validation full_checksum` to an enabled
+HWR deployment. Preferred mode falls back to canonical loading and can publish
+a replacement after detecting corruption; required mode fails startup. Readers
+can use different validation levels in the same domain without changing artifact
+identity. Neither level authenticates an untrusted writer or prevents mutation
+after validation. Checksumming does not imply automatic recovery of a running
+service.
+
 ## Resolution behavior
 
 The loader resolves the immutable canonical source and computes the exact

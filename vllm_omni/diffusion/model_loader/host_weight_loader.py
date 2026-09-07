@@ -26,6 +26,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan, Te
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.model_loader.host_weights.identity_adapter import FinalLayoutIdentityContext
     from vllm_omni.diffusion.model_loader.host_weights.source_identity import (
         NodeSourceDigestCache,
@@ -39,6 +40,8 @@ class _HWRCommitError(RuntimeError):
 
 class HWRLoaderMixin:
     """Optional final-layout HWR behavior shared by diffusion loaders."""
+
+    od_config: OmniDiffusionConfig
 
     @staticmethod
     def _identity_value(value: object) -> object:
@@ -319,10 +322,12 @@ class HWRLoaderMixin:
             HostWeightLeaseCarrier,
             HostWeightRuntime,
             HostWeightRuntimeConfig,
+            IntegrityPolicy,
             ProductionPolicy,
             ResolutionOutcome,
             RuntimeMode,
             StorageDomainPolicy,
+            ValidationLevel,
         )
         from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
 
@@ -363,6 +368,11 @@ class HWRLoaderMixin:
             HostWeightRuntimeConfig(
                 mode=mode,
                 domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
+                integrity=IntegrityPolicy(
+                    local_lookup=ValidationLevel(
+                        getattr(self.od_config, "host_weight_runtime_validation", "manifest_and_metadata")
+                    ),
+                ),
                 production=ProductionPolicy(
                     allow_local_build=False,
                     allow_post_load_publish=True,

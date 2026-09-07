@@ -260,6 +260,78 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     assert len(tuple((store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
 
 
+@pytest.mark.parametrize("validation", ["manifest_and_metadata", "full_checksum"])
+@pytest.mark.parametrize("mode", ["preferred", "required"])
+def test_hwr_loader_payload_integrity_policy(tmp_path: Path, monkeypatch, validation: str, mode: str):
+    from vllm_omni.diffusion.offloader.startup import take_offload_startup_state
+
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    expected = torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)
+    save_file({"weight": expected}, str(canonical / "model.safetensors"))
+    root = tmp_path / "store"
+
+    def make_loader(runtime_mode: str):
+        config = _hwr_config(canonical, root, mode=runtime_mode)
+        config.host_weight_runtime_validation = validation
+        loader = DiffusersPipelineLoader(LoadConfig(), config)
+        pipeline = _HWRPipeline(canonical)
+        monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: pipeline)
+        return loader, pipeline
+
+    def close_plan(pipeline):
+        state = take_offload_startup_state(pipeline)
+        if state is not None and state.host_weight_plan is not None:
+            carrier = state.host_weight_plan.lease_carrier
+            if carrier is not None:
+                carrier.close()
+
+    cold_loader, cold = make_loader("preferred")
+    cold_loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert cold.load_count == 1
+    close_plan(cold)
+    payloads = list((root / "artifacts").glob("*/*.safetensors"))
+    assert len(payloads) == 1
+    payload = payloads[0]
+    data = bytearray(payload.read_bytes())
+    data[-1] ^= 1  # Keep the header and file length valid; change only a BF16 payload byte.
+    original_mode = payload.stat().st_mode
+    payload.chmod(0o600)
+    payload.write_bytes(data)
+    payload.chmod(original_mode)
+
+    loader, pipeline = make_loader(mode)
+    try:
+        if validation == "full_checksum" and mode == "required":
+            with pytest.raises(RuntimeError, match="Host Weight Runtime resolution failed"):
+                loader.load_model(load_device="cpu", device=torch.device("cpu"))
+            assert pipeline.load_count == 0
+            assert loader.take_host_weight_plan() is None
+        else:
+            loader.load_model(load_device="cpu", device=torch.device("cpu"))
+            if validation == "manifest_and_metadata":
+                assert pipeline.load_count == 0
+                assert not torch.equal(pipeline.transformer.weight, expected)
+            else:
+                assert pipeline.load_count == 1
+                assert torch.equal(pipeline.transformer.weight, expected)
+    finally:
+        close_plan(pipeline)
+
+    if validation == "full_checksum":
+        if mode == "required":
+            assert list((root / "deny").iterdir())
+        else:
+            assert list((root / "quarantine").iterdir())
+            warm_loader, warm = make_loader(mode)
+            try:
+                warm_loader.load_model(load_device="cpu", device=torch.device("cpu"))
+                assert warm.load_count == 0
+                assert torch.equal(warm.transformer.weight, expected)
+            finally:
+                close_plan(warm)
+
+
 def test_maybe_fuse_distilled_lora_skips_when_hwr_warm_snapshot_present():
     cfg = SimpleNamespace(
         lora_backend="distill",
