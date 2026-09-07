@@ -23,6 +23,8 @@ class _VoxCPM2RuntimeConfig:
     enable_loc_dit_skip_qkv_contig: bool = True
     enable_loc_dit_reduce_overhead_no_cg: bool = False
     enable_loc_dit_fullgraph_no_cg: bool = False
+    inference_timesteps: int = 10
+    cfg_value: float = 2.0
     cfg_cutoff_ratio: float = 1.0
     decode_graph_capture_policy: str = "all"
     enable_vae_cuda_graph: bool = False
@@ -111,7 +113,12 @@ class _VoxCPM2RuntimeConfig:
             return bool(value)
         if isinstance(default, int) and not isinstance(default, bool):
             value = int(value)
-            if key in {"audio_emit_every", "vae_decode_every", "batched_fsq_fusion_max_batch"}:
+            if key in {
+                "inference_timesteps",
+                "audio_emit_every",
+                "vae_decode_every",
+                "batched_fsq_fusion_max_batch",
+            }:
                 return max(1, value)
             return value
         if isinstance(default, float):
