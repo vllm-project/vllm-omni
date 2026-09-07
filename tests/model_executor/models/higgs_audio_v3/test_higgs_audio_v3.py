@@ -10,6 +10,7 @@ without requiring the actual checkpoint or GPU.
 import asyncio
 import json
 import os
+import threading
 import time
 from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
@@ -1753,3 +1754,66 @@ class TestVoiceCloneReferenceCache:
         assert cache_hit is True
         assert inflight_wait is False
         assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
+
+    def test_higgs_v3_ref_code_inflight_survives_request_cancellation(self):
+        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+
+        serving = object.__new__(OmniOpenAIServingSpeech)
+        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
+        serving._higgs_audio_v3_ref_code_cache_bytes = 0
+        serving._higgs_audio_v3_ref_code_inflight = {}
+        encode_started = threading.Event()
+        release_encode = threading.Event()
+        calls = 0
+        expected_codes = torch.arange(16, dtype=torch.long).reshape(2, 8) + 1
+
+        def encode_reference_audio(_wav, _sr):
+            nonlocal calls
+            calls += 1
+            encode_started.set()
+            assert release_encode.wait(timeout=5)
+            return torch.arange(16, dtype=torch.long).reshape(2, 8)
+
+        def apply_delay_pattern(codes):
+            return codes + 1
+
+        async def resolve():
+            return await serving._resolve_higgs_audio_v3_ref_codes(
+                "ref-a",
+                object(),
+                24000,
+                encode_reference_audio,
+                apply_delay_pattern,
+            )
+
+        async def run():
+            creator = asyncio.create_task(resolve())
+            assert await asyncio.wait_for(asyncio.to_thread(encode_started.wait), timeout=5)
+
+            cancelled_waiter = asyncio.create_task(resolve())
+            survivor = asyncio.create_task(resolve())
+            await asyncio.sleep(0)
+
+            cancelled_waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_waiter
+
+            creator.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await creator
+
+            release_encode.set()
+            survivor_result = await asyncio.wait_for(survivor, timeout=5)
+            await asyncio.sleep(0)
+            return survivor_result
+
+        codes, cache_hit, inflight_wait = asyncio.run(run())
+
+        assert calls == 1
+        assert cache_hit is False
+        assert inflight_wait is True
+        assert torch.equal(codes, expected_codes)
+        assert "ref-a" not in serving._higgs_audio_v3_ref_code_inflight
+        cached = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        assert cached is not None
+        assert torch.equal(cached, expected_codes)

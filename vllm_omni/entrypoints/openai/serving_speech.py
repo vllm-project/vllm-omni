@@ -1726,7 +1726,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         task = self._higgs_audio_v3_ref_code_inflight.get(artifact_key)
         if task is not None:
-            return (await task).clone(), False, True
+            return (await asyncio.shield(task)).clone(), False, True
 
         async def _encode_and_cache() -> torch.Tensor:
             ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, sr)
@@ -1737,11 +1737,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         task = asyncio.create_task(_encode_and_cache())
         self._higgs_audio_v3_ref_code_inflight[artifact_key] = task
-        try:
-            return (await task).clone(), False, False
-        finally:
-            if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is task:
-                self._higgs_audio_v3_ref_code_inflight.pop(artifact_key, None)
+
+        def _retire(t: asyncio.Task[torch.Tensor], key: str = artifact_key) -> None:
+            if self._higgs_audio_v3_ref_code_inflight.get(key) is t:
+                self._higgs_audio_v3_ref_code_inflight.pop(key, None)
+
+        task.add_done_callback(_retire)
+        return (await asyncio.shield(task)).clone(), False, False
 
     def _get_higgs_audio_v3_ref_codes(self, artifact_key: str | None) -> torch.Tensor | None:
         if not artifact_key:
