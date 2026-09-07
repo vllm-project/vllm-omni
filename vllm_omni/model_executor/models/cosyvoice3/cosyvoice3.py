@@ -488,7 +488,7 @@ class CosyVoice3Model(
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
-            self.code2wav = CosyVoice3Code2Wav(self.config)
+            self.code2wav = CosyVoice3Code2Wav(self.config, self._flow_graph_config(vllm_config))
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.
@@ -504,6 +504,21 @@ class CosyVoice3Model(
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
         return self.model
+
+    @staticmethod
+    def _flow_graph_config(vllm_config: VllmConfig) -> dict:
+        """Read the flow CUDA-graph settings out of the connector ``extra``."""
+        model_config = getattr(vllm_config, "model_config", None)
+        connector = getattr(model_config, "stage_connector_config", None)
+        if isinstance(connector, Mapping):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        extra = dict(extra) if isinstance(extra, Mapping) else {}
+        cfg = {"enabled": bool(extra.get("enable_flow_cuda_graph", False))}
+        if extra.get("flow_graph_max_graphs") is not None:
+            cfg["max_graphs"] = int(extra["flow_graph_max_graphs"])
+        return cfg
 
     def _create_llm_vllm_config(self, parent_config: VllmConfig) -> VllmConfig:
         """Create VllmConfig for the inner Qwen2 LLM.

@@ -35,6 +35,13 @@ connectors:
       codec_chunk_frames: 15
       codec_left_context_frames: 25
       codec_vocab_size: 6561
+      # The flow's Euler loop is launch-bound: every step dispatches a full
+      # DiT forward, so replaying a captured graph per input shape removes
+      # most of the per-step CPU cost. Stage 1 stays enforce_eager because the
+      # vocoder's dynamic convolutions rule out vLLM's own graphs, so only the
+      # flow estimator is captured here.
+      enable_flow_cuda_graph: true
+      flow_graph_max_graphs: 64
 
 stages:
   - stage_id: 0

@@ -40,7 +40,7 @@ class CosyVoice3Code2Wav(nn.Module):
     - HiFiGAN vocoder for mel-to-waveform conversion
     """
 
-    def __init__(self, config: CosyVoice3Config):
+    def __init__(self, config: CosyVoice3Config, flow_graph_config: dict | None = None):
         super().__init__()
         self.config = config
 
@@ -59,6 +59,7 @@ class CosyVoice3Code2Wav(nn.Module):
             cfm_params=cfm_params,
             n_spks=decoder_cfg["n_spks"],
             spk_emb_dim=decoder_cfg["spk_emb_dim"],
+            flow_graph_config=flow_graph_config,
         )
 
         self.flow_model = CausalMaskedDiffWithDiT(
