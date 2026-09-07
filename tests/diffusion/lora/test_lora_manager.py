@@ -482,6 +482,165 @@ def test_lora_manager_warns_when_all_adapters_pinned(monkeypatch):
     assert set(manager.list_adapters()) == {1, 2}
 
 
+def _make_hunyuan_image3_pipeline(num_heads=4, num_kv_heads=2, head_dim=2, hidden_size=8):
+    """Minimal stand-in for HunyuanImage3Pipeline exposing its LoRA hooks.
+
+    Mirrors the real pipeline's hooks: ``_get_diffusion_lora_name_aliases``
+    maps the ``transformer.*`` wrapper namespace to the PEFT ``model.*``
+    adapter namespace, and ``_deinterleave_fused_qkv_lora_b`` re-orders a
+    GQA-interleaved fused QKV LoRA-B into the block ``[Q; K; V]`` layout.
+    """
+
+    def _split_qkv_ref(qkv):
+        groups = num_heads // num_kv_heads
+        hidden = qkv.shape[1]
+        b = qkv.reshape(num_kv_heads, groups + 2, head_dim, hidden)
+        q, k, v = torch.split(b, (groups, 1, 1), dim=1)
+        return torch.concat((q.reshape(-1, hidden), k.reshape(-1, hidden), v.reshape(-1, hidden)))
+
+    class _Transformer:
+        config = SimpleNamespace(
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            attention_head_dim=head_dim,
+            hidden_size=hidden_size,
+        )
+        _split_qkv_weight = staticmethod(_split_qkv_ref)
+
+    class _HunyuanImage3Pipeline(torch.nn.Module):
+        transformer = _Transformer()
+
+        @staticmethod
+        def _get_diffusion_lora_name_aliases(full_module_name):
+            if full_module_name.startswith("transformer."):
+                return ["model." + full_module_name[len("transformer.") :]]
+            return []
+
+        @staticmethod
+        def _deinterleave_fused_qkv_lora_b(lora_b):
+            expected_rows = (num_heads + 2 * num_kv_heads) * head_dim
+            if lora_b.shape[0] != expected_rows:
+                return None
+            return _split_qkv_ref(lora_b)
+
+    return _HunyuanImage3Pipeline()
+
+
+def _make_hunyuan_image3_qkv_base():
+    """An un-initialized QKVParallelLinear instance for isinstance() checks.
+
+    Only the type identity matters to the manager's de-interleave branch, and
+    a real ``__init__`` requires a tensor-parallel group, so fabricate one.
+    """
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    return object.__new__(QKVParallelLinear)
+
+
+def test_lora_manager_activates_hunyuan_image3_fused_qkv_lora():
+    """A fused HI3 ``qkv_proj`` LoRA-B (GQA-interleaved in the adapter) is
+    de-interleaved to the block [Q; K; V] layout the QKV output slices expect,
+    with the namespace alias resolving the PEFT adapter tensors."""
+    manager = DiffusionLoRAManager(
+        pipeline=_make_hunyuan_image3_pipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    wrapper = "transformer.layers.0.self_attn.qkv_proj"
+    packed_layer = _DummyLoRALayer(
+        n_slices=3,
+        output_slices=(8, 4, 4),
+        tp_size=1,
+    )
+    # The real wrapped layer carries a QKVParallelLinear base_layer and the
+    # un-sharded output_sizes; the manager keys its de-interleave path on
+    # both being present.
+    packed_layer.base_layer = _make_hunyuan_image3_qkv_base()
+    packed_layer.output_sizes = (8, 4, 4)
+    manager._lora_modules = {wrapper: packed_layer}
+
+    rank = 3
+    # GQA-interleaved fused QKV rows: [Q-group0, K0, V0, Q-group1, K1, V1].
+    interleaved = torch.arange(16, dtype=torch.bfloat16).unsqueeze(1).repeat(1, rank)
+    lora = LoRALayerWeights(
+        module_name="model.layers.0.self_attn.qkv_proj",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 8)),
+        lora_b=interleaved,
+    )
+    manager._registered_adapters = {
+        11: type(
+            "LM",
+            (),
+            {
+                "id": 11,
+                "loras": {"model.layers.0.self_attn.qkv_proj": lora},
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    manager._activate_adapter(11, 0.5)
+
+    assert packed_layer.reset_calls == 0
+    assert len(packed_layer.set_calls) == 1
+    lora_a_list, lora_b_list = packed_layer.set_calls[0]
+    assert len(lora_a_list) == 3 and len(lora_b_list) == 3
+    # De-interleaved full [Q; K; V] slices, scaled by the lora scale.
+    expected_q = torch.cat([interleaved[0:4], interleaved[8:12]], dim=0) * 0.5
+    expected_k = torch.cat([interleaved[4:6], interleaved[12:14]], dim=0) * 0.5
+    expected_v = torch.cat([interleaved[6:8], interleaved[14:16]], dim=0) * 0.5
+    assert torch.equal(lora_b_list[0], expected_q)
+    assert torch.equal(lora_b_list[1], expected_k)
+    assert torch.equal(lora_b_list[2], expected_v)
+
+
+def test_lora_manager_rejects_hunyuan_image3_qkv_lora_with_unexpected_rows():
+    """If the fused HI3 QKV layout cannot be established (wrong row count), the
+    manager must fail closed instead of applying the LoRA to wrong slices."""
+    manager = DiffusionLoRAManager(
+        pipeline=_make_hunyuan_image3_pipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    wrapper = "transformer.layers.0.self_attn.qkv_proj"
+    packed_layer = _DummyLoRALayer(n_slices=3, output_slices=(8, 4, 4))
+    packed_layer.base_layer = _make_hunyuan_image3_qkv_base()
+    packed_layer.output_sizes = (8, 4, 4)
+    manager._lora_modules = {wrapper: packed_layer}
+
+    rank = 3
+    # Row count (12) does not match the HI3 QKV layout (16): fail closed.
+    lora = LoRALayerWeights(
+        module_name="model.layers.0.self_attn.qkv_proj",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 8)),
+        lora_b=torch.arange(12 * rank, dtype=torch.bfloat16).view(-1, rank),
+    )
+    manager._registered_adapters = {
+        12: type(
+            "LM",
+            (),
+            {
+                "id": 12,
+                "loras": {"model.layers.0.self_attn.qkv_proj": lora},
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    manager._activate_adapter(12, 0.5)
+
+    assert packed_layer.set_calls == []
+    assert packed_layer.reset_calls == 1
+
+
 def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
     """Ensure that the LoRA manager applies scales correctly when the
     active adapter receives a different scale, i.e., the rank is unchanged.
