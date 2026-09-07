@@ -32,6 +32,14 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
+_NON_TRANSFERABLE_FINISH_STATUSES = frozenset(
+    {
+        RequestStatus.FINISHED_ABORTED,
+        RequestStatus.FINISHED_ERROR,
+        RequestStatus.FINISHED_IGNORED,
+    }
+)
+
 
 def _should_emit_engine_output(
     model_config: Any,
@@ -1385,7 +1393,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # coordinator is None, so the unconditional finally is safe.
         try:
             # 2. Omni Specific: Check if we need to transfer KV
-            if self._should_transfer_kv_for_request(request_id):
+            if request.status in _NON_TRANSFERABLE_FINISH_STATUSES:
+                # A failed request must never create a new downstream KV
+                # payload. Drop work that has not reached the runner yet. If
+                # extraction is already active, keep the blocks alive until
+                # its acknowledgement arrives; freeing them here would race
+                # the worker reading those blocks.
+                self.requests_needing_kv_transfer.pop(request_id, None)
+                self.pending_stop_after_extraction.discard(request_id)
+                if request_id in self.active_kv_transfers:
+                    self.waiting_for_transfer_free.add(request_id)
+                    delay_free_blocks = True
+                else:
+                    self.waiting_for_transfer_free.discard(request_id)
+                    self.transfer_triggered_requests.discard(request_id)
+                logger.debug(
+                    "Skipping downstream KV transfer for request %s with status %s",
+                    request_id,
+                    request.status.name,
+                )
+            elif self._should_transfer_kv_for_request(request_id):
                 already_triggered = request_id in self.transfer_triggered_requests
                 is_active = request_id in self.active_kv_transfers
 
