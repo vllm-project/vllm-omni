@@ -8,14 +8,16 @@ n-step Euler ODE with CFG) into CUDA graphs for fixed batch sizes,
 eliminating kernel launch overhead on every decode step.
 """
 
+from typing import Any
+
 import torch
-from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
     AudioSpecialTokens,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -51,7 +53,7 @@ class CUDAGraphAcousticTransformerWrapper:
         self.n_steps = self.acoustic_transformer.acoustic_transformer_args.n_decoding_steps
 
         # Graph storage
-        self.graphs: dict[int, CUDAGraph] = {}
+        self.graphs: dict[int, Any] = {}
         self.static_inputs: dict[int, torch.Tensor] = {}
         self.static_noise: dict[int, torch.Tensor] = {}
         self.static_cfg_alpha: dict[int, torch.Tensor] = {}
@@ -82,6 +84,9 @@ class CUDAGraphAcousticTransformerWrapper:
             self.t_proj_table = self.acoustic_transformer.time_projection(t_emb_table)
         self.fake_eos_one = torch.tensor(1.0, dtype=dtype, device=device)
         self.fake_eos_zero = torch.tensor(0.0, dtype=dtype, device=device)
+        # Pre-allocated scalar used by torch.where inside the graph; boolean
+        # indexing (output_codes[~mask] = v) can hang NPU graph capture.
+        self.empty_audio_token = torch.tensor(self.empty_audio_token_id, device=device, dtype=torch.long)
 
         # Phase 1: Eager warmup for ALL capture sizes
         for size in self.capture_sizes:
@@ -91,7 +96,10 @@ class CUDAGraphAcousticTransformerWrapper:
             with torch.no_grad():
                 self._forward_cudagraph_compatible(dummy, cfg_alpha=dummy_cfg_alpha, noise=dummy_noise)
 
-        torch.accelerator.synchronize(device)
+        if current_omni_platform.is_npu():
+            torch.npu.synchronize(device)
+        else:
+            torch.accelerator.synchronize(device)
 
         # Phase 2: Capture graphs
         for size in self.capture_sizes:
@@ -174,7 +182,8 @@ class CUDAGraphAcousticTransformerWrapper:
         sampled = torch.clamp(x, -1, 1)
         scaled_x = ((sampled + 1) / 2) * (self.acoustic_embeddings_levels - 1)
         output_codes = scaled_x.round().long()
-        output_codes[~should_decode] = self.empty_audio_token_id
+        # torch.where is graph-safe; boolean indexing assignment may hang NPU capture
+        output_codes = torch.where(should_decode.unsqueeze(1), output_codes, self.empty_audio_token)
         acoustic_codes = output_codes + len(AudioSpecialTokens)
 
         # --- Combine semantic + acoustic ---
@@ -205,14 +214,22 @@ class CUDAGraphAcousticTransformerWrapper:
         with torch.no_grad():
             _ = self._forward_cudagraph_compatible(static_input, cfg_alpha=static_cfg_alpha, noise=static_noise)
 
-        torch.accelerator.synchronize(device)
-
-        graph = CUDAGraph()
-        with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_fake_eos, static_audio_codes = self._forward_cudagraph_compatible(
-                    static_input, cfg_alpha=static_cfg_alpha, noise=static_noise
-                )
+        if current_omni_platform.is_npu():
+            torch.npu.synchronize(device)
+            graph = torch.npu.NPUGraph()
+            with torch.no_grad():
+                with torch.npu.graph(graph, pool=current_platform.get_global_graph_pool()):
+                    static_fake_eos, static_audio_codes = self._forward_cudagraph_compatible(
+                        static_input, cfg_alpha=static_cfg_alpha, noise=static_noise
+                    )
+        else:
+            torch.accelerator.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.no_grad():
+                with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+                    static_fake_eos, static_audio_codes = self._forward_cudagraph_compatible(
+                        static_input, cfg_alpha=static_cfg_alpha, noise=static_noise
+                    )
 
         self.graphs[size] = graph
         self.static_inputs[size] = static_input

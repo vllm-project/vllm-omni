@@ -743,9 +743,19 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            #  -------------------------------------- Omni-new -------------------------------------------------
             hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                **model_kwargs,
+                sampling_metadata=self.input_batch.sampling_metadata,
+                logits_index=logits_indices,
+                sampler=self.sampler,
             )
+            #  -------------------------------------- Omni-new -------------------------------------------------
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             # [Omni] Map pending ropes metadata to req_ids.
