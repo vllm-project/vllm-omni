@@ -254,8 +254,11 @@ class TestRequestModeDispatch:
         executor.od_config = SimpleNamespace(
             step_execution=False,
             parallel_config=SimpleNamespace(data_parallel_size=2),
-            enable_distributed_layerwise_offload=True,
-            dlo_use_allgather=True,
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            },
         )
         executor.execute_request = Mock(return_value="dlo-dp")
         executor.collective_rpc = Mock()
@@ -358,7 +361,7 @@ class TestRequestModeDispatch:
         for rank, result_mq in enumerate(executor._result_mqs):
             assert result_mq.dequeue.call_count == (1 if rank in expected_primary_ranks else 0)
 
-    @pytest.mark.parametrize("empty_prompt", ["", {"prompt": ""}])
+    @pytest.mark.parametrize("empty_prompt", ["", [], {}, {"prompt": ""}])
     def test_dlo_dp_rejects_empty_prompt_before_worker_dispatch(self, empty_prompt):
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
@@ -372,6 +375,71 @@ class TestRequestModeDispatch:
         scheduler_output.scheduled_new_reqs[0].req.prompt = empty_prompt
 
         with pytest.raises(ValueError, match="non-empty prompt"):
+            executor.execute_request(scheduler_output)
+
+        executor.collective_rpc.assert_not_called()
+
+    def test_dlo_dp_accepts_precomputed_embeddings_without_prompt_text(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["text_encoder"],
+                "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+            },
+        )
+        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req in scheduler_output.scheduled_new_reqs:
+            new_req.req.prompt = {"prompt": "", "prompt_embeds": object()}
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            [1, 2],
+            {"type": "token", "prompt_token_ids": [1, 2]},
+            {"prompt_ids": [1, 2], "prompt_mask": object()},
+        ],
+    )
+    def test_dlo_dp_accepts_tokenized_prompts(self, prompt):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req in scheduler_output.scheduled_new_reqs:
+            new_req.req.prompt = prompt
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+
+    def test_text_encoder_allgather_rejects_mismatched_embedding_paths(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["text_encoder"],
+                "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+            },
+        )
+        executor.collective_rpc = Mock()
+        scheduler_output = _make_sched_output("A", "B")
+        scheduler_output.scheduled_new_reqs[1].req.prompt = {"prompt_embeds": object()}
+
+        with pytest.raises(ValueError, match="same positive/negative prompt embedding fields"):
             executor.execute_request(scheduler_output)
 
         executor.collective_rpc.assert_not_called()
@@ -392,24 +460,6 @@ class TestRequestModeDispatch:
             executor.execute_request(invalid_wave)
 
         result = executor.execute_request(_make_sched_output("A", "B"))
-
-        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
-        executor.collective_rpc.assert_called_once()
-
-    def test_dlo_dp_allows_shared_default_denoise_steps(self):
-        executor, _, _ = _make_executor(num_gpus=2)
-        executor.od_config = SimpleNamespace(
-            step_execution=False,
-            parallel_config=SimpleNamespace(data_parallel_size=2),
-            enable_distributed_layerwise_offload=True,
-            dlo_use_allgather=True,
-        )
-        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
-        scheduler_output = _make_sched_output("A", "B")
-        for new_req in scheduler_output.scheduled_new_reqs:
-            new_req.req.sampling_params.num_inference_steps = None
-
-        result = executor.execute_request(scheduler_output)
 
         assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
         executor.collective_rpc.assert_called_once()
@@ -495,6 +545,28 @@ class TestRequestModeDispatch:
         assert all("timed out" in output.result.error for output in result.runner_outputs)
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
         assert isinstance(executor._fail_closed_on_dp_wave_timeout.call_args.args[0], TimeoutError)
+
+    def test_single_allgather_request_times_out_and_fails_closed(self):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            },
+        )
+        executor.collective_rpc = Mock(side_effect=TimeoutError("timed out"))
+        executor._fail_closed_on_dp_wave_timeout = Mock()
+
+        result = executor.execute_request(_make_sched_output("A"))
+
+        assert result.runner_outputs[0].result.error == "timed out"
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
 
 # ───────────────── concurrent collective RPC ─────────────────
@@ -847,6 +919,50 @@ class TestWorkerProcRpcRankStatus:
         assert original.__traceback__ is None
         gc_collect.assert_called_once_with()
         mock_platform.empty_cache.assert_called_once_with()
+
+    def test_execute_rpc_drops_the_result_on_ranks_that_will_not_reply(self):
+        """A rank that will not reply must not hand its output back.
+
+        The busy loop binds the returned object to a local that outlives the
+        RPC, so a device-resident result -- for diffusion, a whole decoded
+        video -- would occupy accelerator memory on every non-reply rank until
+        the next request replaces it.
+        """
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 1,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is False
+        assert result is None, "a non-reply rank must not keep the output alive"
+
+    def test_execute_rpc_still_returns_the_result_on_the_replying_rank(self):
+        """The rank that owns the reply keeps returning the same object."""
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is True
+        assert result is payload
 
     def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
         proc = self._make_worker_proc()
