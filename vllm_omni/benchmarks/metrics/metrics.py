@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import math
 import warnings
 from collections import defaultdict
 from collections.abc import Sequence
@@ -282,10 +283,11 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     )
     print("{:<40} {:<10}".format("Total audio frames generated:", getattr(metrics, defs.TOTAL_AUDIO_FRAMES)))
     print("{:<40} {:<10.2f}".format("Audio throughput(audio duration/s):", getattr(metrics, defs.AUDIO_THROUGHPUT)))
+    continuity_ok_rate = getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE)
     print(
-        "{:<40} {:<10.2%}".format(
+        "{:<40} {:<10}".format(
             "Streaming continuity OK rate:",
-            getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE),
+            "n/a (not measured)" if not math.isfinite(continuity_ok_rate) else f"{continuity_ok_rate:.2%}",
         )
     )
     for metric in selected_percentile_metrics:
@@ -827,8 +829,13 @@ def calculate_metrics(
             denoise_step_latency_ms = float(getattr(outputs[i], defs.DENOISE_STEP_LATENCY_MS, 0.0) or 0.0)
             if denoise_step_latency_ms > 0:
                 denoise_step_latencies_ms.append(denoise_step_latency_ms)
-            audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
-            audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
+            # Only requests whose backend actually ran continuity analysis. A
+            # backend that records no chunk arrival times leaves the fields at
+            # their defaults, and counting those would report every request as
+            # continuous with a zero underrun.
+            if getattr(outputs[i], defs.AUDIO_CONTINUITY_MEASURED, False):
+                audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
+                audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
@@ -1016,7 +1023,7 @@ def calculate_metrics(
                 (p, np.percentile(audio_underruns or 0, p)) for p in selected_percentiles
             ],
             defs.AUDIO_CONTINUITY_OK_RATE: (
-                (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
+                (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else float("nan")
             ),
         },
     )

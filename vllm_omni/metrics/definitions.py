@@ -35,6 +35,7 @@ AUDIO_RTF = "audio_rtf"
 AUDIO_FRAMES = "audio_frames"
 AUDIO_UNDERRUN = "audio_underrun"
 AUDIO_CONTINUITY_OK = "audio_continuity_ok"
+AUDIO_CONTINUITY_MEASURED = "audio_continuity_measured"
 AUDIO_SKIPPED_REQUESTS = "audio_skipped_requests"
 
 # Bench-side aggregate field names. Keep these centralized so new benchmark
