@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from typing import ClassVar
 
 import torch
 from vllm.config import VllmConfig
@@ -30,6 +31,49 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.XPU
+
+    # One flat all-gather landing buffer per (dtype, device), held on the class
+    # so every coordinator in the process lands at the same address; see
+    # `all_gather_into_tensor`.
+    _all_gather_buffers: ClassVar[dict[tuple[torch.dtype, torch.device], torch.Tensor]] = {}
+
+    @classmethod
+    def all_gather_into_tensor(cls, input_: torch.Tensor, world_size: int, group) -> torch.Tensor:
+        """All-gather into a reused landing buffer, returning a private copy.
+
+        A fresh output per call means the collective sees a new receive address
+        after any request-path `empty_cache()`, and the driver-side registration
+        the communication library keeps for each such address is likely never
+        reclaimed -- an inference from intervention experiments (B70, 8 cards,
+        torch 2.13.0+xpu, xccl), not something read out of a driver registry. A
+        model-free 2x2 sandbox separated the factors: changing the collective
+        API does not help, reusing the receive buffer does. In an H3 server A/B
+        it moved per-request growth outside PyTorch's accounting
+        (`card_used - memory_reserved`) from 1726 MiB to 1626 MiB: all-gather is
+        one share of that total, not all of it.
+
+        One buffer per (dtype, device), grown monotonically, so residency is
+        bounded by the largest gather seen and the address count by the number
+        of record highs. `clone()` keeps the caller owning its result, and the
+        clone's memory is never handed to the library. The slot is shared, so
+        this assumes one execution stream per process, which is what the
+        diffusion worker does today.
+        """
+        output_size = list(input_.size())
+        output_size[0] *= world_size
+        numel = input_.numel() * world_size
+        key = (input_.dtype, input_.device)
+        buffer = cls._all_gather_buffers.get(key)
+        if buffer is None or buffer.numel() < numel:
+            buffer = torch.empty(numel, dtype=input_.dtype, device=input_.device)
+            cls._all_gather_buffers[key] = buffer
+        landing = buffer[:numel].view(output_size)
+        torch.distributed.all_gather_into_tensor(landing, input_.contiguous(), group=group)
+        return landing.clone()
+
+    @classmethod
+    def reset_all_gather_buffers(cls) -> None:
+        cls._all_gather_buffers.clear()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
