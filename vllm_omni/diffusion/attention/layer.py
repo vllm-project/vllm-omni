@@ -18,6 +18,10 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.mindiesd_usp import (
+    MindIESDUSPAdapter,
+    MindIESDUSPOptions,
+)
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
@@ -245,6 +249,20 @@ class Attention(nn.Module):
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
 
+        self._mindiesd_usp_adapter: MindIESDUSPAdapter | None = None
+        if (
+            config is not None
+            and not self._has_custom_attention
+            and not skip_sequence_parallel
+            and current_omni_platform.is_npu()
+            and getattr(config.parallel_config, "enable_mindiesd_usp", False)
+            and getattr(config.parallel_config, "sequence_parallel_size", 1) > 1
+        ):
+            self._mindiesd_usp_adapter = MindIESDUSPAdapter(
+                MindIESDUSPOptions.from_parallel_config(config.parallel_config),
+                get_sp_group(),
+            )
+
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
         self._kv_cache_dtype: str | None = None
@@ -406,6 +424,29 @@ class Attention(nn.Module):
                 raise NotImplementedError("paged Scheduler KV is not supported with AllGather-KV sequence parallelism")
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
+
+        # MindIE-SD owns the complete Ulysses + ring-group KV gather + FA hot
+        # path. Invoke it before Omni performs any communication so one and
+        # only one implementation owns the collectives for this forward.
+        if (
+            self._mindiesd_usp_adapter is not None
+            and strategy is not self._no_parallel_strategy
+            and not use_paged_attention
+        ):
+            usp_metadata = self._with_kv_cache_dtype(attn_metadata)
+            usp_output = self._mindiesd_usp_adapter.try_forward(
+                query,
+                key,
+                value,
+                attn_metadata=usp_metadata,
+                backend_name=self.attn_backend.get_name(),
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+                scatter_dim=self.scatter_idx,
+                gather_dim=self.gather_idx,
+            )
+            if usp_output is not None:
+                return usp_output
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
