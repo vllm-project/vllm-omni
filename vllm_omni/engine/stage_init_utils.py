@@ -17,6 +17,7 @@ import importlib
 import json
 import multiprocessing as mp
 import os
+import tempfile
 import time
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -1562,43 +1563,108 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     return input_processor
 
 
-def _cleanup_stale_lock_if_dead(lock_file: str) -> bool:
-    """If *lock_file* exists and its recorded PID is dead, unlink the file.
+def device_init_lock_path(device_id: int, lock_dir: str = "/tmp") -> str:
+    """Return the per-physical-device initialization lock file path.
 
-    Returns ``True`` if the stale lock was cleaned up (caller should retry),
-    ``False`` otherwise (lock holder appears alive, or file could not be read).
+    Shared by the orchestrator-side ``acquire_device_locks`` (legacy full-init
+    ``LOCK_EX``) and the engine-core-side ``DevicePhaseLock`` (parallel-stage-init
+    SH/EX phase locks) so both coordinate on the *same* file per device.
+
+    That coordination only holds while the **inode** is stable, so nothing may
+    unlink this path: two holders of the same pathname on different inodes do not
+    conflict. The PID written into the file is diagnostic only.
+    """
+    return os.path.join(lock_dir, f"vllm_omni_device_{device_id}_init.lock")
+
+
+def _open_existing_lock_file(lock_file: str) -> tuple[int, bool] | None:
+    """Open an already-existing lock file; ``None`` if it does not exist yet.
+
+    Prefers ``O_RDWR`` so the holder can stamp its PID, but falls back to
+    ``O_RDONLY``: ``flock`` locks attach to the open file description and, unlike
+    POSIX ``fcntl`` record locks, require no write access, so a read-only
+    descriptor still provides full mutual exclusion.
     """
     try:
-        with open(lock_file) as fh:
-            content = fh.read().strip()
-        if not content:
-            return False
-        pid = int(content)
-    except (OSError, ValueError):
-        return False
-
-    # Check whether the PID is still alive.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        # PID does not exist — stale lock.
-        logger.info(
-            "Removing stale device lock %s (PID %s is dead)",
-            lock_file,
-            pid,
-        )
-        try:
-            os.unlink(lock_file)
-            return True
-        except OSError:
-            logger.debug("Failed to unlink stale lock %s", lock_file)
-            return False
+        return os.open(lock_file, os.O_RDWR), True
+    except FileNotFoundError:
+        return None
     except PermissionError:
-        # PID exists but we cannot signal it (different user) — treat as alive.
-        return False
+        # Created by another user on this shared machine; read-only still locks.
+        pass
+    try:
+        return os.open(lock_file, os.O_RDONLY), False
+    except FileNotFoundError:
+        return None
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Device init lock {lock_file} exists but is not readable by this user "
+            f"({exc}). It coordinates GPU initialization across users, so it must stay "
+            "readable by all of them; have its owner remove it or chmod it to 0644."
+        ) from exc
 
-    # PID is alive — legitimate lock holder.
-    return False
+
+def open_device_lock_file(lock_file: str) -> tuple[int, bool]:
+    """Open a per-device lock file, tolerating one created by another user.
+
+    Returns ``(fd, writable)``.
+
+    These lock files coordinate *across* users -- two people running on the same
+    physical GPU must contend on the same file -- so every user has to be able to
+    open whichever one exists. Two things make that awkward:
+
+    * whoever creates it owns it, so later users may only get read access, which
+      ``flock`` is perfectly happy with; and
+    * the mode passed to ``os.open`` is filtered by the creator's ``umask``, so
+      under 0027 or 0077 the file would land 0640 or 0600 and lock everyone else
+      out entirely.
+
+    Creating it therefore stages a temporary file, widens it with ``fchmod``, and
+    publishes it with an atomic ``os.link``. Creating in place with ``O_EXCL`` and
+    widening afterwards would briefly expose the file at the umask-filtered mode,
+    and a concurrent user opening it in that window would be locked out -- the
+    very failure this avoids. ``link`` also fails cleanly if another process wins
+    the race, which keeps the "first creator wins" inode stable.
+    """
+    existing = _open_existing_lock_file(lock_file)
+    if existing is not None:
+        return existing
+
+    lock_dir = os.path.dirname(lock_file) or "."
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=lock_dir, prefix=".vllm_omni_device_lock_")
+    published = False
+    try:
+        os.fchmod(tmp_fd, 0o644)
+        try:
+            os.link(tmp_path, lock_file)
+        except FileExistsError:
+            pass  # another process published first; fall through and open theirs
+        else:
+            published = True
+            return tmp_fd, True
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            logger.debug("Could not remove staged device lock %s", tmp_path)
+        if not published:
+            os.close(tmp_fd)
+
+    existing = _open_existing_lock_file(lock_file)
+    if existing is not None:
+        return existing
+    raise PermissionError(f"Device init lock {lock_file} could not be created or opened")
+
+
+def record_lock_holder_pid(fd: int, writable: bool) -> None:
+    """Stamp the holder's PID into an open lock file (diagnostic only)."""
+    if not writable:
+        return
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
 
 
 def acquire_device_locks(
@@ -1677,28 +1743,31 @@ def acquire_device_locks(
         # Acquire locks
         wait_start = time.time()
         for device_id in devices_to_lock:
-            lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+            lock_file = device_init_lock_path(device_id)
             lock_acquired = False
-            already_cleaned_stale = False  # only try stale cleanup once per device
 
             while not lock_acquired:
                 try:
-                    lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
+                    lock_fd, lock_writable = open_device_lock_file(lock_file)
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        os.ftruncate(lock_fd, 0)
-                        os.write(lock_fd, f"{os.getpid()}\n".encode())
-                        os.fsync(lock_fd)
+                        record_lock_holder_pid(lock_fd, lock_writable)
                         lock_acquired = True
                         lock_fds.append(lock_fd)
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
-                        # Detect and clean stale locks from dead processes.
-                        if not already_cleaned_stale:
-                            already_cleaned_stale = True
-                            if _cleanup_stale_lock_if_dead(lock_file):
-                                continue  # retry flock immediately
+                        # NOTE: no stale-lock cleanup here. ``flock`` is released
+                        # by the kernel when the holder exits (SIGKILL included),
+                        # so a dead holder never keeps this lock. Unlinking the
+                        # path on a dead *recorded* PID was actively unsafe: the
+                        # PID is written by every holder, and under the
+                        # parallel-stage-init SH/EX protocol several LOCK_SH
+                        # holders overwrite it. Unlinking while one still held the
+                        # old inode let a contender create a fresh file with the
+                        # same name and take LOCK_EX on it, which then conflicted
+                        # with nobody -- breaking the interoperability between the
+                        # legacy full-init lock and the phase locks.
                         if time.time() - wait_start > stage_init_timeout:
                             logger.warning(
                                 "Timeout waiting for device %s initialization lock, proceeding anyway",
@@ -1707,8 +1776,10 @@ def acquire_device_locks(
                             break
                         time.sleep(0.01)
                 except OSError as e:
-                    logger.debug(
-                        "Failed to acquire lock for device %s: %s, continuing anyway",
+                    logger.warning(
+                        "Failed to acquire lock for device %s: %s. Continuing WITHOUT "
+                        "device-init serialization; concurrent initialization on this "
+                        "device may incorrectly measure available memory.",
                         device_id,
                         e,
                     )

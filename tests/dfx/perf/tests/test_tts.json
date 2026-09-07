@@ -276,7 +276,32 @@
             ]
           }
         }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen3_tts_voicedesign",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
       },
+      "full_model",
+      "tts"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+      "stage_overrides": {
+        "1": {
+          "devices": "1"
+        }
+      }
+    },
+    "benchmark_params": [
       {
         "task": "voice_design",
         "eval_phase": "latency",

@@ -338,6 +338,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--diffusion-offload-config",
+        type=json.loads,
+        default=None,
+        help="Component-selective diffusion offload config as JSON.",
+    )
+    parser.add_argument(
         "--enable-distributed-layerwise-offload",
         action="store_true",
         help="Enable distributed layerwise offloading with overlapped host-to-device weight streaming.",
@@ -467,7 +473,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hsdp-shard-size",
         type=int,
-        default=1,
+        default=-1,
         help="Number of GPUs to shard weights across for HSDP.",
     )
     parser.add_argument(
@@ -534,6 +540,7 @@ def main():
     omni_kwargs = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
+        diffusion_offload_config=args.diffusion_offload_config,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,
@@ -575,6 +582,10 @@ def main():
             lora_path = lora_path[0]
         omni_kwargs["lora_path"] = lora_path
         omni_kwargs["lora_backend"] = args.lora_backend
+    if args.use_hsdp:
+        omni_kwargs["use_hsdp"] = args.use_hsdp
+        omni_kwargs["hsdp_shard_size"] = args.hsdp_shard_size
+        omni_kwargs["hsdp_replicate_size"] = args.hsdp_replicate_size
 
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).

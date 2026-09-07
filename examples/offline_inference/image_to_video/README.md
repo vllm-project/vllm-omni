@@ -152,9 +152,6 @@ python image_to_video.py \
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
 | `--enable-layerwise-offload` | flag | off | Enable layerwise offloading on DiT modules |
-| `--enable-distributed-layerwise-offload` | flag | off | Enable distributed layerwise offload |
-| `--dlo-use-allgather` / `--dlo-no-use-allgather` | flag | on / off | Select sharded AllGather reconstruction (default) or rank-local streaming |
-| `--dlo-resident-layers` | int | `0` | Leading main-DiT blocks kept device-resident during distributed layerwise offload |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
 | `--tensor-parallel-size` | int | `1` | Tensor parallel size (effective for models that support TP, e.g. LTX2) |
 | `--ulysses-degree` | int | `1` | Ulysses sequence parallel degree |
@@ -346,6 +343,8 @@ Key arguments:
 - `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
 - `--hsdp-shard-size`: Number of GPUs to shard model weights across within each replica group. -1 (default) auto-calculates as world_size / replicate_size.
 - `--hsdp-replicate-size`: Number of replica groups for HSDP. Each replica holds a full sharded copy. Default 1 means pure sharding (no replication).
+
+
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 
