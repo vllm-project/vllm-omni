@@ -350,7 +350,9 @@ class ARDiffusionKVCache:
         self.null_block_id = self.manager.block_pool.null_block.block_id
 
         # Allocate the per-layer paged K/V pools on the given device.
-        self._kv_pools: list[torch.Tensor] = []
+        # Per layer, ``[k_cache, v_cache]`` -- separate allocations; see
+        # allocate_kv_pool_with_views for why they are not one tensor.
+        self._kv_pools: list[list[torch.Tensor]] = []
         self._k_pools: list[torch.Tensor] = []
         self._v_pools: list[torch.Tensor] = []
         if device is not None:
