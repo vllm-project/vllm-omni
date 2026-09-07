@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 CUDA Graph wrapper for AcousticTransformer in VoxtralTTS.
 
@@ -263,7 +265,13 @@ class CUDAGraphAcousticTransformerWrapper:
             return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
 
         # Inner graph replay is illegal during an outer stream capture.
-        if torch.cuda.is_current_stream_capturing():
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+            is_capturing = NPUExactGraphRunner._stream_is_capturing()
+        else:
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
             return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
 
         padded_size = self._get_padded_size(actual_size)
