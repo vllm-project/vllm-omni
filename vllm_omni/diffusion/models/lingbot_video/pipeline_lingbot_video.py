@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, ClassVar
 
 import numpy as np
@@ -19,6 +20,7 @@ from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
@@ -317,13 +319,52 @@ class LingBotVideoPipeline(
 
     supports_step_execution: ClassVar[bool] = False
     max_outputs_per_prompt: ClassVar[int] = 1
+    default_num_inference_steps: ClassVar[int] = 40
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    @staticmethod
+    def _validate_configuration(od_config: OmniDiffusionConfig) -> None:
+        parallel_config = od_config.parallel_config
+        cfg_size = parallel_config.cfg_parallel_size
+        if cfg_size not in (1, 2):
+            raise ValueError("LingBot CFG parallel requires cfg_parallel_size to be 1 or 2.")
+        cache_backend = str(getattr(od_config, "cache_backend", "none") or "none").lower()
+        if cfg_size == 2 and cache_backend not in {"none", "cache_dit"}:
+            raise ValueError("LingBot CFG parallel supports only cache_backend=none or cache_dit.")
+        if cache_backend != "cache_dit" and cfg_size == 1:
+            return
+
+        unsupported = [
+            name
+            for enabled, name in (
+                (parallel_config.pipeline_parallel_size > 1, "pipeline parallelism"),
+                (parallel_config.tensor_parallel_size > 1, "tensor parallelism"),
+                (parallel_config.enable_expert_parallel, "expert parallelism"),
+                ((parallel_config.sequence_parallel_size or 1) > 1, "sequence parallelism"),
+                (parallel_config.vae_patch_parallel_size > 1, "VAE patch parallelism"),
+                (parallel_config.use_hsdp, "HSDP"),
+                (od_config.enable_cpu_offload, "CPU offload"),
+                (od_config.enable_layerwise_offload, "layerwise offload"),
+                (
+                    od_config.enable_distributed_layerwise_offload,
+                    "distributed layerwise offload",
+                ),
+            )
+            if enabled
+        ]
+        if unsupported:
+            raise ValueError(
+                "LingBot Cache-DiT / CFG parallel does not support the following combinations: "
+                + ", ".join(unsupported)
+                + ". Use an unsharded, resident DiT stage."
+            )
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
+        self._validate_configuration(od_config)
         self.od_config = od_config
         self.device = get_local_device()
         self.vae_scale_factor_temporal = 4
@@ -354,6 +395,12 @@ class LingBotVideoPipeline(
             torch_dtype=transformer_dtype,
             local_files_only=local_files_only,
         ).to(self.device)
+        if od_config.parallel_config.cfg_parallel_size == 2:
+            # Each process owns one branch and makes one forward per step.
+            # Keep the class-level sequential-CFG adapter unchanged.
+            self.transformer._cache_dit_adapter_config = replace(
+                self.transformer._cache_dit_adapter_config, has_separate_cfg=False
+            )
         text_encoder_kwargs: dict[str, Any] = {
             "dtype": text_encoder_dtype,
             "local_files_only": local_files_only,
@@ -382,6 +429,38 @@ class LingBotVideoPipeline(
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
         self.default_image_negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
+
+    def _validate_acceleration_request(
+        self,
+        *,
+        guidance_scale: float,
+        batch_cfg: bool,
+        t_thresh: float | None,
+        null_cond_clone_zero: bool,
+        offload_vae_during_denoise: bool,
+        is_dummy_run: bool,
+        cfg_parallel: bool,
+    ) -> None:
+        cache_backend = str(getattr(self.od_config, "cache_backend", "none") or "none").lower()
+        if is_dummy_run or (cache_backend != "cache_dit" and not cfg_parallel):
+            return
+
+        unsupported = []
+        if guidance_scale <= 1.0:
+            unsupported.append("guidance_scale <= 1")
+        if batch_cfg:
+            unsupported.append("batch_cfg=true")
+        if t_thresh is not None:
+            unsupported.append("t_thresh")
+        if cfg_parallel and null_cond_clone_zero:
+            unsupported.append("null_cond_clone_zero=true")
+        if cfg_parallel and offload_vae_during_denoise:
+            unsupported.append("offload_vae_during_denoise=true")
+        if unsupported:
+            raise ValueError(
+                "LingBot Cache-DiT / CFG parallel requires separate positive and negative CFG passes; "
+                "unsupported request options: " + ", ".join(unsupported)
+            )
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
@@ -584,11 +663,30 @@ class LingBotVideoPipeline(
         refiner_sigma_tail_steps: int = LOW_NOISE_TAIL_V1_DEFAULT_STEPS,
         offload_vae_during_denoise: bool = False,
         **extra_args,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         del extra_args
         self.check_inputs(height, width, num_frames)
         device = self.device
         do_cfg = guidance_scale > 1.0
+        effective_batch_cfg = bool(batch_cfg)
+        cfg_parallel = cfg_parallel_group is not None
+        cfg_parallel_rank = 0
+        if cfg_parallel:
+            if not dist.is_available() or not dist.is_initialized():
+                raise ValueError("`cfg_parallel_group` requires an initialized process group.")
+            self._validate_acceleration_request(
+                guidance_scale=guidance_scale,
+                batch_cfg=effective_batch_cfg,
+                t_thresh=t_thresh,
+                null_cond_clone_zero=null_cond_clone_zero,
+                offload_vae_during_denoise=offload_vae_during_denoise,
+                is_dummy_run=False,
+                cfg_parallel=True,
+            )
+            cfg_parallel_rank = dist.get_rank(cfg_parallel_group)
+            cfg_parallel_world_size = dist.get_world_size(cfg_parallel_group)
+            if cfg_parallel_world_size != 2:
+                raise ValueError(f"CFG parallel currently requires exactly 2 ranks, got {cfg_parallel_world_size}.")
         image_condition = None
         prompt_images = None
         # Public image/mode combinations are validated by resolve_lingbot_mode.
@@ -605,20 +703,6 @@ class LingBotVideoPipeline(
             prompt_images = [image_condition.vlm_image]
         elif input_image is not None:
             raise ValueError(f"LingBot {mode.value} generation does not accept an input image.")
-        effective_batch_cfg = bool(batch_cfg)
-        cfg_parallel = cfg_parallel_group is not None
-        cfg_parallel_rank = 0
-        if cfg_parallel:
-            if not dist.is_available() or not dist.is_initialized():
-                raise ValueError("`cfg_parallel_group` requires an initialized process group.")
-            if effective_batch_cfg:
-                raise ValueError("`cfg_parallel_group` and `batch_cfg` are mutually exclusive.")
-            if not do_cfg:
-                raise ValueError("CFG parallel requires `guidance_scale > 1.0`.")
-            cfg_parallel_rank = dist.get_rank(cfg_parallel_group)
-            cfg_parallel_world_size = dist.get_world_size(cfg_parallel_group)
-            if cfg_parallel_world_size != 2:
-                raise ValueError(f"CFG parallel currently requires exactly 2 ranks, got {cfg_parallel_world_size}.")
 
         if prompt_embeds is not None:
             if prompt_mask is None:
@@ -694,6 +778,8 @@ class LingBotVideoPipeline(
         cfg_uncond_src = _group_global_rank(cfg_parallel_group, 1)
         for timestep in self.progress_bar(self.scheduler.timesteps):
             if cfg_parallel:
+                # Rank 0 owns initial noise and scheduler updates, including
+                # unseeded requests and caller-supplied latents.
                 dist.broadcast(latents, src=cfg_latent_src, group=cfg_parallel_group)
             timestep_batch = _transformer_timestep(timestep, transformer_dtype).expand(1).to(device)
             latent_model_input = latents
@@ -783,9 +869,10 @@ class LingBotVideoPipeline(
                 latents = apply_clean_prefix(latents, image_condition.clean_latent)
 
         if cfg_parallel:
-            dist.barrier(group=cfg_parallel_group)
+            # The last scheduler update must also reach the companion rank.
+            dist.broadcast(latents, src=cfg_latent_src, group=cfg_parallel_group)
             if cfg_parallel_rank != 0:
-                return latents if output_type == "latent" else []
+                return latents if output_type == "latent" else None
 
         if output_type == "latent":
             return latents
@@ -827,8 +914,21 @@ class LingBotVideoPipeline(
                 default_shift=default_shift,
                 default_output_type=default_output_type,
             )
+            self._validate_acceleration_request(
+                guidance_scale=request_config.guidance_scale,
+                batch_cfg=bool(extra_args.get("batch_cfg", False)),
+                t_thresh=extra_args.get("t_thresh"),
+                null_cond_clone_zero=bool(extra_args.get("null_cond_clone_zero", False)),
+                offload_vae_during_denoise=bool(extra_args.get("offload_vae_during_denoise", False)),
+                is_dummy_run=request.is_dummy_run(),
+                cfg_parallel=self.od_config.parallel_config.cfg_parallel_size == 2,
+            )
         except (TypeError, ValueError) as exc:
             raise OmniClientError(str(exc)) from exc
+
+        cfg_group = None
+        if self.od_config.parallel_config.cfg_parallel_size == 2:
+            cfg_group = get_cfg_group()
 
         generator = sampling.generator
         if isinstance(generator, list):
@@ -859,6 +959,11 @@ class LingBotVideoPipeline(
             generator=generator,
             latents=sampling.latents,
             output_type=request_config.output_type,
+            # A guidance-disabled internal warmup may run locally on each rank.
+            # The runner refreshes Cache-DiT before the next real request.
+            cfg_parallel_group=(
+                cfg_group.device_group if cfg_group is not None and request_config.guidance_scale > 1.0 else None
+            ),
             batch_cfg=bool(extra_args.get("batch_cfg", False)),
             null_cond_clone_zero=bool(extra_args.get("null_cond_clone_zero", False)),
             offload_vae_during_denoise=bool(extra_args.get("offload_vae_during_denoise", False)),
@@ -870,5 +975,7 @@ class LingBotVideoPipeline(
                 )
             ),
         )
+        if cfg_group is not None and cfg_group.rank_in_group != 0:
+            return DiffusionOutput(output=None)
         output_key = "image" if request_config.mode is LingBotGenerationMode.T2I else "video"
         return DiffusionOutput(output={output_key: frames})
