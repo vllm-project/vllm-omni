@@ -3,7 +3,7 @@
 This client:
 1) Reads a local WAV file (must be mono, 16-bit PCM, 16kHz),
 2) Streams PCM16 chunks to /v1/realtime with OpenAI-style events,
-3) Receives response.audio.* and transcription.* events,
+3) Receives response.audio.*, response.output_text.*, and transcript events,
 4) Saves synthesized audio to an output WAV file and optional text file.
 
 By default each ``response.audio.delta`` is treated as an **incremental PCM**
@@ -18,6 +18,7 @@ Usage:
       --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
       --input-wav input_16k_mono.wav \
       --output-wav realtime_output.wav \
+      --server-vad \
       --delta-dump-dir ./rt_delta_wavs
 
 Dependencies:
@@ -32,6 +33,7 @@ import base64
 import json
 import wave
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     import websockets
@@ -70,6 +72,17 @@ def _write_wav_pcm16(path: Path, pcm16_bytes: bytes, sample_rate_hz: int) -> Non
         wf.writeframes(pcm16_bytes)
 
 
+def _with_duplex_route(url: str, *, enabled: bool) -> str:
+    parts = urlsplit(url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    has_duplex = any(key == "duplex" for key, _ in query)
+    route_value = "1" if enabled else "0"
+    query = [(key, route_value if key == "duplex" else value) for key, value in query]
+    if not has_duplex:
+        query.append(("duplex", route_value))
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
 async def run_client(
     url: str,
     model: str,
@@ -79,6 +92,7 @@ async def run_client(
     chunk_ms: int,
     send_delay_ms: int,
     delta_dump_dir: Path | None,
+    server_vad: bool,
     request_idx: int = 1,
     total_requests: int = 1,
 ) -> None:
@@ -92,23 +106,44 @@ async def run_client(
     delta_index = 0
     text_chunks: list[str] = []
     final_text: str = ""
+    final_audio_transcript: str = ""
 
     if delta_dump_dir is not None:
         delta_dump_dir.mkdir(parents=True, exist_ok=True)
 
+    # Keep the CLI mode authoritative even if the input URL already contains
+    # an explicit duplex query parameter.
+    url = _with_duplex_route(url, enabled=server_vad)
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
         # 1) Validate model.
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
+        if server_vad:
+            session_update = {
+                "type": "session.update",
+                "session": {
                     "model": model,
-                }
-            )
-        )
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 16_000},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 500,
+                                "create_response": True,
+                                "interrupt_response": False,
+                            },
+                        }
+                    },
+                },
+            }
+        else:
+            # Preserve the existing non-duplex wire format.
+            session_update = {"type": "session.update", "model": model}
+        await ws.send(json.dumps(session_update))
 
-        # 2) Start generation once (non-final commit).
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
+        # 2) Preserve the legacy explicit-commit flow unless Server VAD owns endpointing.
+        if not server_vad:
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
 
         # 3) Stream audio chunks.
         for i in range(0, len(pcm16), chunk_bytes):
@@ -124,8 +159,20 @@ async def run_client(
             if send_delay_ms > 0:
                 await asyncio.sleep(send_delay_ms / 1000.0)
 
-        # 4) Final commit closes input stream.
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+        # 4) Finalize the turn explicitly, or append silence for Server VAD endpointing.
+        if server_vad:
+            trailing_silence = bytes(16_000 * 2)
+            for i in range(0, len(trailing_silence), chunk_bytes):
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(trailing_silence[i : i + chunk_bytes]).decode("utf-8"),
+                        }
+                    )
+                )
+        else:
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
 
         # 5) Receive server events until audio done.
         while True:
@@ -144,7 +191,7 @@ async def run_client(
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
                     output_sample_rate = sr
-                audio_b64 = event.get("audio", "")
+                audio_b64 = event.get("delta" if server_vad else "audio", "")
                 if audio_b64:
                     pcm_delta = base64.b64decode(audio_b64)
                     incremental_pcm_parts.append(pcm_delta)
@@ -158,14 +205,14 @@ async def run_client(
                         )
                 continue
 
-            if event_type == "transcription.delta":
+            if event_type in {"response.output_text.delta", "transcription.delta"}:
                 delta = event.get("delta", "")
                 if delta:
                     text_chunks.append(delta)
                     print(delta, end="", flush=True)
                 continue
 
-            if event_type == "transcription.done":
+            if event_type in {"response.output_text.done", "transcription.done"}:
                 final_text = event.get("text", "") or "".join(text_chunks)
                 usage = event.get("usage")
                 final_text_with_tag = f"Final transcription: {final_text}"
@@ -176,7 +223,16 @@ async def run_client(
                     print(f"{log_prefix}text usage: {usage}")
                 continue
 
+            if event_type == "response.audio_transcript.done":
+                final_audio_transcript = event.get("transcript", "")
+                continue
+
             if event_type == "response.audio.done":
+                if not server_vad:
+                    break
+                continue
+
+            if event_type == "response.done" and server_vad:
                 break
 
             if event_type == "error":
@@ -191,7 +247,7 @@ async def run_client(
         print(f"{log_prefix}Saved realtime audio to: {output_wav} (incremental chunks joined)")
 
         if output_text is not None:
-            text_to_save = final_text if final_text else "".join(text_chunks)
+            text_to_save = final_text or "".join(text_chunks) or final_audio_transcript
             output_text.parent.mkdir(parents=True, exist_ok=True)
             output_text.write_text(text_to_save, encoding="utf-8")
             print(f"{log_prefix}Saved realtime text to: {output_text}")
@@ -213,6 +269,7 @@ async def run_clients_concurrent(
     chunk_ms: int,
     send_delay_ms: int,
     delta_dump_dir: Path | None,
+    server_vad: bool,
     num_requests: int,
     concurrency: int,
 ) -> None:
@@ -235,6 +292,7 @@ async def run_clients_concurrent(
                     chunk_ms=chunk_ms,
                     send_delay_ms=send_delay_ms,
                     delta_dump_dir=per_delta_dir,
+                    server_vad=server_vad,
                     request_idx=index,
                     total_requests=num_requests,
                 )
@@ -283,6 +341,11 @@ def main() -> None:
         default=None,
         help="If set, each response.audio.delta is saved as delta_NNNNNN.wav under this directory",
     )
+    parser.add_argument(
+        "--server-vad",
+        action="store_true",
+        help="Let the server detect speech endpoints instead of sending input_audio_buffer.commit",
+    )
     parser.add_argument("--num-requests", type=int, default=1, help="Total number of requests to send")
     parser.add_argument(
         "--concurrency",
@@ -309,6 +372,7 @@ def main() -> None:
                 chunk_ms=args.chunk_ms,
                 send_delay_ms=args.send_delay_ms,
                 delta_dump_dir=args.delta_dump_dir,
+                server_vad=args.server_vad,
             )
         )
     else:
@@ -322,6 +386,7 @@ def main() -> None:
                 chunk_ms=args.chunk_ms,
                 send_delay_ms=args.send_delay_ms,
                 delta_dump_dir=args.delta_dump_dir,
+                server_vad=args.server_vad,
                 num_requests=args.num_requests,
                 concurrency=concurrency,
             )

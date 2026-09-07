@@ -193,9 +193,15 @@ class TestStreamingAudioResampler:
         output_rms = np.sqrt(np.mean(output[100:-100] ** 2))
         assert output_rms < input_rms * 0.01
 
-    def test_rejects_non_integer_downsampling_ratio(self):
-        with pytest.raises(ValueError, match="integer downsampling ratio"):
-            StreamingAudioResampler(24000, 16000)
+    def test_supports_rational_downsampling_ratio(self):
+        waveform = np.sin(np.linspace(0, 200 * np.pi, 24000, endpoint=False)).astype(np.float32)
+        resampler = StreamingAudioResampler(24000, 16000)
+
+        output = resampler.process(waveform, final=True)
+        reference = torchaudio.functional.resample(torch.from_numpy(waveform), 24000, 16000).numpy()
+
+        assert output.shape == (16000,)
+        np.testing.assert_allclose(output[100:-100], reference[100:-100], atol=2e-3, rtol=1e-3)
 
     def test_rejects_multichannel_audio(self):
         resampler = StreamingAudioResampler(24000, 8000)

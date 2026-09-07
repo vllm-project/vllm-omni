@@ -448,6 +448,27 @@ class TestLoadAndResolveStageConfigs:
         assert stage_configs[0]["engine_args"]["engine_backend"] == engine_backend
         assert stage_configs[0]["engine_args"]["revision"] == "pinned-revision"
 
+    def test_bare_deploy_name_returns_packaged_resolved_path(self, tmp_path, mocker: MockerFixture):
+        from vllm_omni.entrypoints import utils as utils_mod
+
+        deploy_name = "qwen3_omni_moe.yaml"
+        deploy_path = tmp_path / deploy_name
+        deploy_path.write_text("stages: []\n", encoding="utf-8")
+        mocker.patch.object(utils_mod, "_DEPLOY_DIR", tmp_path)
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            return_value=([], None),
+        )
+
+        config_path, _stage_configs, _ = load_and_resolve_stage_configs(
+            model="dummy-model",
+            kwargs={},
+            trust_remote_code=False,
+            deploy_config_path=deploy_name,
+        )
+
+        assert config_path == str(deploy_path)
+
     def test_deploy_config_preserves_cli_overrides_and_replicas(self, tmp_path, mocker: MockerFixture):
         deploy_path = tmp_path / "qwen3_multi.yaml"
         deploy_path.write_text(

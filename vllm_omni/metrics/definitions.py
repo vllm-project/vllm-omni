@@ -138,6 +138,12 @@ AUDIO_UNDERRUN_S = METRIC_PREFIX + AUDIO_UNDERRUN + "_s"
 AUDIO_CONTINUITY_OK_METRIC = METRIC_PREFIX + AUDIO_CONTINUITY_OK
 AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
 
+# Realtime Server VAD serving metrics.
+REALTIME_VAD_ACTIVE_SESSIONS = METRIC_PREFIX + "realtime_vad_active_sessions"
+REALTIME_VAD_INFERENCE_LATENCY_S = METRIC_PREFIX + "realtime_vad_inference_latency_s"
+REALTIME_VAD_ENDPOINT_DELAY_S = METRIC_PREFIX + "realtime_vad_endpoint_delay_s"
+REALTIME_VAD_ERRORS = METRIC_PREFIX + "realtime_vad_errors"
+
 
 # ============================================================================
 # Diffusion family (per-stage + per-replica diffusion timing breakdowns)

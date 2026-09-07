@@ -509,6 +509,7 @@ class DuplexSessionRuntimeConfig:
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
     completed_append_cache_size: int = 256
+    server_vad_model_path: str | None = None
     # Startup warmup: run this many silent 80 ms-style frames through a
     # throwaway realtime session before real clients are admitted, so
     # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
@@ -528,6 +529,10 @@ class DuplexSessionRuntimeConfig:
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.server_vad_model_path is not None and (
+            not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
+        ):
+            raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")

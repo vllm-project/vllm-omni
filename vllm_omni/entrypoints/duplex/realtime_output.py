@@ -39,6 +39,28 @@ class RealtimeOutputProjector:
         if event_type == "session.updated":
             session = self._realtime_session_payload(event.get("session"))
             return [{"type": "session.updated", "session": session}]
+        if event_type == "input_audio_buffer.speech_started":
+            item_id = event.get("item_id")
+            if isinstance(item_id, str):
+                self._active_input_item_id = item_id
+            self._input_speech_started = True
+            self._input_audio_buffer_has_audio = True
+            return [
+                {
+                    "type": "input_audio_buffer.speech_started",
+                    "audio_start_ms": max(0, int(event.get("audio_start_ms", 0) or 0)),
+                    "item_id": item_id,
+                }
+            ]
+        if event_type == "input_audio_buffer.speech_stopped":
+            self._input_speech_started = False
+            return [
+                {
+                    "type": "input_audio_buffer.speech_stopped",
+                    "audio_end_ms": max(0, int(event.get("audio_end_ms", 0) or 0)),
+                    "item_id": event.get("item_id") or self._active_input_item_id,
+                }
+            ]
         if event_type in {
             "session.resumed",
             "session.heartbeat_ack",
@@ -201,14 +223,15 @@ class RealtimeOutputProjector:
                 ),
             ]
         if event_type == "input.committed":
-            event_item_id = event.get("realtime_item_id")
+            self._reset_realtime_input_buffer_state()
+            event_item_id = event.get("item_id")
             item_id = (
                 event_item_id
                 if isinstance(event_item_id, str) and event_item_id
                 else self._pop_pending_commit_item_id()
             )
             item = self._conversation_items.get(item_id)
-            created_payload: list[dict[str, object]] = []
+            payloads = [self._input_audio_buffer_committed_event(item_id=item_id)]
             if item is None:
                 message = event.get("message")
                 no_response = event.get("no_response") is True
@@ -226,19 +249,18 @@ class RealtimeOutputProjector:
                     ),
                 }
                 self._conversation_items[item_id] = item
-                created_payload.extend(self._conversation_item_added_events(item))
+                payloads.extend(self._conversation_item_added_events(item))
             item["status"] = "completed"
-            payloads = created_payload + [
-                self._input_audio_buffer_committed_event(item_id=item_id, event=event),
-            ]
             transcription_event = self._input_audio_transcription_completed_event(item_id, item)
             if transcription_event is not None:
                 payloads.append(transcription_event)
             payloads.append(self._conversation_item_done_event(item))
             return payloads
         if event_type == "input.cancelled":
+            self._reset_realtime_input_buffer_state()
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "input_audio_buffer.cleared":
+            self._reset_realtime_input_buffer_state()
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "audio.cancelled":
             response_id = event.get("response_id")
@@ -416,7 +438,14 @@ class RealtimeOutputProjector:
                 return [event]
             message = str(raw_error or event.get("message") or "Duplex runtime error")
             code = str(event.get("code") or "duplex_error")
-            return [self._realtime_error_payload(code, message, event_id=event.get("realtime_event_id"))]
+            return [
+                self._realtime_error_payload(
+                    code,
+                    message,
+                    event_id=event.get("realtime_event_id") or event.get("event_id"),
+                    param=event.get("param"),
+                )
+            ]
         if event_type == "session.closed":
             return [{"type": "session.closed", "event": event}]
         return [{"type": f"duplex.{event_type}", "event": event}]
@@ -490,7 +519,14 @@ class RealtimeOutputProjector:
                 },
             },
         )
-        payload.setdefault("turn_detection", payload.get("turn_detection"))
+        if self._turn_detection_configured or "turn_detection" in payload:
+            turn_detection = payload.get("turn_detection", self._turn_detection)
+            audio = dict(payload["audio"]) if isinstance(payload.get("audio"), dict) else {}
+            audio_input = dict(audio["input"]) if isinstance(audio.get("input"), dict) else {}
+            audio_input["turn_detection"] = turn_detection
+            audio["input"] = audio_input
+            payload["audio"] = audio
+            payload["turn_detection"] = turn_detection
         payload.setdefault("input_audio_transcription", payload.get("input_audio_transcription"))
         payload.setdefault("tracing", payload.get("tracing"))
         return payload

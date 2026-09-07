@@ -606,6 +606,21 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     return parsed
 
 
+def _resolved_explicit_deploy_config_path(deploy_config_path: str) -> str:
+    """Return the concrete path accepted for an explicit deploy config.
+
+    ``StageConfigFactory`` accepts a bare YAML name by looking under the
+    packaged deploy directory. Keep the path returned to downstream
+    pipeline-wide config consumers consistent with that resolution.
+    """
+    deploy_path = Path(deploy_config_path)
+    if not deploy_path.exists() and deploy_path.parent == Path("."):
+        packaged_path = _DEPLOY_DIR / deploy_path
+        if packaged_path.exists():
+            return str(packaged_path)
+    return str(deploy_path)
+
+
 def load_and_resolve_stage_configs(
     model: str,
     kwargs: dict | None,
@@ -635,7 +650,11 @@ def load_and_resolve_stage_configs(
         the strategy-derived pipeline-wide load-balancer policy (``None`` when no
         strategy set one), returned for the engine to apply.
     """
-    config_path = deploy_config_path if deploy_config_path is not None else resolve_model_config_path(model)
+    config_path = (
+        _resolved_explicit_deploy_config_path(deploy_config_path)
+        if deploy_config_path is not None
+        else resolve_model_config_path(model)
+    )
     stage_configs, omni_lb_policy = load_stage_configs_from_model(
         model,
         trust_remote_code=trust_remote_code,

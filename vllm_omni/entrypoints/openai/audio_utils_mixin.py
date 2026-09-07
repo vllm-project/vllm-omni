@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import math
 from io import BytesIO
 
 import numpy as np
@@ -19,85 +20,152 @@ logger = init_logger(__name__)
 
 
 class StreamingAudioResampler:
-    """Stateful resampler for streaming mono audio.
+    """Stateful polyphase resampler for streaming mono float audio.
 
-    Only integer downsampling ratios are supported so every input chunk can
-    produce output without buffering the complete stream.
+    Retains filter state so output is invariant to input chunk boundaries.
     """
+
+    _half_filter_width = 10
+    _kaiser_beta = 5.0
+    _max_polyphase_factor = 2_048
 
     def __init__(self, source_rate: int, target_rate: int):
         if source_rate <= 0 or target_rate <= 0:
             raise ValueError("Audio sample rates must be positive")
         self.source_rate = source_rate
         self.target_rate = target_rate
-        if source_rate < target_rate or source_rate % target_rate != 0:
-            raise ValueError(
-                "Streaming audio resampling requires an integer downsampling ratio, "
-                f"got {source_rate} Hz to {target_rate} Hz"
+        rate_gcd = math.gcd(source_rate, target_rate)
+        self._up = target_rate // rate_gcd
+        self._down = source_rate // rate_gcd
+        if max(self._up, self._down) > self._max_polyphase_factor:
+            raise ValueError("source and target sample rates have an unsupported resampling ratio")
+        self._half_len, self._phase_kernels = self._design_polyphase_filter()
+        self._history_samples = self._phase_kernels.shape[1] - 1
+        self.reset()
+
+    def _design_polyphase_filter(self) -> tuple[int, np.ndarray]:
+        if self._up == self._down:
+            return 0, np.ones((1, 1), dtype=np.float32)
+
+        max_rate = max(self._up, self._down)
+        half_len = self._half_filter_width * max_rate
+        offsets = np.arange(-half_len, half_len + 1, dtype=np.float64)
+        cutoff = 1.0 / max_rate
+        taps = cutoff * np.sinc(cutoff * offsets)
+        taps *= np.kaiser(taps.size, self._kaiser_beta)
+        taps /= np.sum(taps)
+        taps *= self._up
+        taps = np.ascontiguousarray(taps, dtype=np.float32)
+
+        phases = [taps[phase :: self._up] for phase in range(self._up)]
+        phase_width = max(phase.size for phase in phases)
+        kernels = np.zeros((self._up, phase_width), dtype=np.float32)
+        for phase_index, phase in enumerate(phases):
+            kernels[phase_index, -phase.size :] = phase[::-1]
+        return half_len, kernels
+
+    @property
+    def scratch_bytes(self) -> int:
+        pending_samples = self._ceil_div(self._input_samples * self._up, self._down) - self._output_samples
+        return max(0, pending_samples) * np.dtype(np.float32).itemsize
+
+    @staticmethod
+    def _ceil_div(numerator: int, denominator: int) -> int:
+        return -(-numerator // denominator)
+
+    def _render_outputs(
+        self,
+        combined: np.ndarray,
+        *,
+        first_output: int,
+        output_count: int,
+        input_start: int,
+    ) -> np.ndarray:
+        if output_count <= 0:
+            return np.empty(0, dtype=np.float32)
+
+        output_indexes = np.arange(first_output, first_output + output_count, dtype=np.int64)
+        filter_indexes = output_indexes * self._down + self._half_len
+        source_indexes = filter_indexes // self._up
+        phases = filter_indexes % self._up
+        windows = np.lib.stride_tricks.sliding_window_view(
+            combined,
+            self._phase_kernels.shape[1],
+        )
+        selected_windows = windows[source_indexes - input_start]
+        return np.sum(
+            selected_windows * self._phase_kernels[phases],
+            axis=1,
+            dtype=np.float32,
+        )
+
+    def _push(self, chunk: np.ndarray) -> np.ndarray:
+        if chunk.size == 0:
+            return np.empty(0, dtype=np.float32)
+        if self._flushed:
+            raise RuntimeError("cannot process audio after the resampler has been finalized; call reset first")
+
+        combined = np.concatenate((self._history, chunk))
+        next_input_samples = self._input_samples + chunk.size
+        stable_output_samples = max(
+            0,
+            self._ceil_div(next_input_samples * self._up - self._half_len, self._down),
+        )
+        output = self._render_outputs(
+            combined,
+            first_output=self._output_samples,
+            output_count=stable_output_samples - self._output_samples,
+            input_start=self._input_samples,
+        )
+        if self._history_samples:
+            self._history = np.ascontiguousarray(combined[-self._history_samples :], dtype=np.float32)
+        self._input_samples = next_input_samples
+        self._output_samples = stable_output_samples
+        return output
+
+    def _flush(self) -> np.ndarray:
+        if self._flushed:
+            return np.empty(0, dtype=np.float32)
+
+        total_output_samples = self._ceil_div(self._input_samples * self._up, self._down)
+        output_count = total_output_samples - self._output_samples
+        if output_count:
+            last_output = total_output_samples - 1
+            last_source_index = (last_output * self._down + self._half_len) // self._up
+            right_padding = max(0, last_source_index - self._input_samples + 1)
+            combined = np.concatenate((self._history, np.zeros(right_padding, dtype=np.float32)))
+            output = self._render_outputs(
+                combined,
+                first_output=self._output_samples,
+                output_count=output_count,
+                input_start=self._input_samples,
             )
-
-        self._ratio = source_rate // target_rate
-        self._buffer = np.empty((0,), dtype=np.float32)
-        self._buffer_start = 0
-        self._total_samples = 0
-        self._next_center = 0
-
-        if self._ratio == 1:
-            self._taps = np.ones((1,), dtype=np.float32)
         else:
-            # Use a Kaiser-windowed sinc and leave a small transition band
-            # below the target Nyquist frequency.
-            num_taps = 20 * self._ratio + 1
-            half = num_taps // 2
-            offsets = np.arange(num_taps, dtype=np.float64) - half
-            cutoff = 0.95 / self._ratio
-            taps = cutoff * np.sinc(cutoff * offsets) * np.kaiser(num_taps, 5.0)
-            self._taps = (taps / taps.sum()).astype(np.float32)
+            output = np.empty(0, dtype=np.float32)
+        self._output_samples = total_output_samples
+        self._flushed = True
+        return output
 
     def process(self, audio: np.ndarray, *, final: bool = False) -> np.ndarray:
         chunk = np.asarray(audio, dtype=np.float32)
         if chunk.ndim != 1:
             raise ValueError(f"Streaming audio resampling only supports mono audio, got shape {chunk.shape}")
+        chunk = np.ascontiguousarray(chunk, dtype=np.float32)
+        output = self._push(chunk)
+        if not final:
+            return output
+        tail = self._flush()
+        if not output.size:
+            return tail
+        if not tail.size:
+            return output
+        return np.concatenate((output, tail))
 
-        if self._ratio == 1:
-            return chunk
-
-        if chunk.size:
-            self._buffer = np.concatenate((self._buffer, chunk))
-            self._total_samples += int(chunk.size)
-
-        half = self._taps.size // 2
-        max_center = self._total_samples - 1 if final else self._total_samples - 1 - half
-        if self._next_center > max_center:
-            return np.empty((0,), dtype=np.float32)
-
-        centers = np.arange(self._next_center, max_center + 1, self._ratio, dtype=np.int64)
-        first_center = int(centers[0])
-        last_center = int(centers[-1])
-        window_start = first_center - half
-        window_end = last_center + half
-        segment = np.zeros((window_end - window_start + 1,), dtype=np.float32)
-
-        copy_start = max(window_start, self._buffer_start, 0)
-        copy_end = min(window_end + 1, self._buffer_start + self._buffer.size)
-        if copy_end > copy_start:
-            dst_start = copy_start - window_start
-            src_start = copy_start - self._buffer_start
-            segment[dst_start : dst_start + copy_end - copy_start] = self._buffer[
-                src_start : src_start + copy_end - copy_start
-            ]
-
-        windows = np.lib.stride_tricks.sliding_window_view(segment, self._taps.size)[:: self._ratio]
-        output = windows @ self._taps[::-1]
-        self._next_center = last_center + self._ratio
-
-        keep_from = max(0, self._next_center - half)
-        drop = min(max(keep_from - self._buffer_start, 0), self._buffer.size)
-        if drop:
-            self._buffer = self._buffer[drop:]
-            self._buffer_start += int(drop)
-
-        return np.asarray(output, dtype=np.float32)
+    def reset(self) -> None:
+        self._history = np.zeros(self._history_samples, dtype=np.float32)
+        self._input_samples = 0
+        self._output_samples = 0
+        self._flushed = False
 
 
 class AudioMixin:

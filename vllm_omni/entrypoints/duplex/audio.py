@@ -21,8 +21,10 @@ MIN_INPUT_SAMPLE_RATE_HZ = 8_000
 MAX_INPUT_SAMPLE_RATE_HZ = 192_000
 
 
-def validate_input_sample_rate_hz(sample_rate_hz: int | float) -> int:
-    if isinstance(sample_rate_hz, bool) or (isinstance(sample_rate_hz, float) and not math.isfinite(sample_rate_hz)):
+def validate_input_sample_rate_hz(sample_rate_hz: object) -> int:
+    if isinstance(sample_rate_hz, bool) or not isinstance(sample_rate_hz, int | float):
+        raise ValueError("sample_rate_hz must be a finite integer")
+    if isinstance(sample_rate_hz, float) and not math.isfinite(sample_rate_hz):
         raise ValueError("sample_rate_hz must be a finite integer")
     rate = int(sample_rate_hz)
     if rate != sample_rate_hz:
@@ -35,14 +37,27 @@ def validate_input_sample_rate_hz(sample_rate_hz: int | float) -> int:
 def resample_pcm16_mono(raw: bytes, *, source_rate_hz: int, target_rate_hz: int) -> bytes:
     if source_rate_hz <= 0 or target_rate_hz <= 0 or source_rate_hz == target_rate_hz:
         return raw
-    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
-    if samples.size <= 1:
-        return raw
-    target_size = max(1, int(round(samples.size * target_rate_hz / source_rate_hz)))
-    source_x = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
-    target_x = np.linspace(0.0, 1.0, num=target_size, endpoint=True)
-    resampled = np.interp(target_x, source_x, samples)
-    return np.clip(resampled, -32768, 32767).astype("<i2").tobytes()
+    # Import lazily so the generic Duplex audio module does not pull in the
+    # OpenAI API server while the Duplex stack itself is being imported.
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
+
+    samples = np.frombuffer(raw, dtype="<i2")
+    rate_gcd = math.gcd(source_rate_hz, target_rate_hz)
+    reduced_factor = max(source_rate_hz // rate_gcd, target_rate_hz // rate_gcd)
+    if reduced_factor > StreamingAudioResampler._max_polyphase_factor:
+        # The FIR size scales with the reduced ratio. Keep unusual client
+        # rates bounded while common audio rates use the high-quality path.
+        if samples.size <= 1:
+            return raw
+        target_size = max(1, int(round(samples.size * target_rate_hz / source_rate_hz)))
+        source_x = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
+        target_x = np.linspace(0.0, 1.0, num=target_size, endpoint=True)
+        resampled = np.interp(target_x, source_x, samples)
+        return np.clip(resampled, -32_768, 32_767).astype("<i2").tobytes()
+    resampler = StreamingAudioResampler(source_rate_hz, target_rate_hz)
+    normalized = samples.astype(np.float32) * np.float32(1.0 / 32768.0)
+    resampled = resampler.process(normalized, final=True)
+    return np.clip(np.rint(resampled * 32768.0), -32768, 32767).astype("<i2").tobytes()
 
 
 def decode_g711_ulaw(raw: bytes) -> bytes:
@@ -114,6 +129,24 @@ def wav_payload_to_pcm16(raw: bytes) -> tuple[bytes | None, int | None]:
         return np.clip(mono, -32768, 32767).astype("<i2").tobytes(), sample_rate_hz
     except (EOFError, ValueError, wave.Error):
         return None, None
+
+
+def encode_float32_mono_wav_base64(
+    samples: np.ndarray,
+    *,
+    sample_rate_hz: int,
+) -> str:
+    """Package normalized mono float32 samples as a PCM16 WAV data payload."""
+    rate = validate_input_sample_rate_hz(sample_rate_hz)
+    normalized = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1)
+    pcm16 = np.clip(np.rint(normalized * 32768.0), -32768, 32767).astype("<i2")
+    with io.BytesIO() as buffer:
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(rate)
+            wav_file.writeframes(pcm16.tobytes())
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def convert_input_audio_with_rate(

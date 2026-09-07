@@ -1290,6 +1290,8 @@ async def omni_init_app_state(
     ):
         state.openai_serving_duplex = OmniDuplexSessionHandler(
             chat_service=state.openai_serving_chat,
+            served_model_name=model_name,
+            log_stats=state.log_stats,
             duplex_session_config=getattr(engine_client, "duplex_session_config", None),
             serving_runtime_adapter_path=getattr(engine_client, "duplex_serving_adapter_path", None),
         )
