@@ -2617,7 +2617,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 logger.info("Using precomputed Qwen3-TTS custom voice profile: %s (mode=%s)", voice_lower, mode)
 
         elif params["task_type"][0] == "CustomVoice":
-            params["speaker"] = ["Vivian"]  # Default for CustomVoice
+            # CustomVoice requires a speaker. This path is used by Qwen3-TTS and
+            # should always have an adapter, but we defensively check both cases.
+            if self._adapter is None:
+                logger.warning(
+                    "CustomVoice task encountered but no TTS adapter is loaded. "
+                    "This should not happen - request will fail downstream with "
+                    "error from model."
+                )
+                params["speaker"] = None
+            elif self._adapter.capabilities.default_speaker is None:
+                available = (
+                    sorted(self._adapter.capabilities.supported_speakers)
+                    if self._adapter.capabilities.supported_speakers
+                    else []
+                )
+                logger.warning(
+                    "CustomVoice task requires a speaker but no default speaker is "
+                    "configured in the model's spk_id config. Available speakers: %s. "
+                    "Request will fail downstream with error from model.",
+                    ", ".join(available) if available else "none",
+                )
+                params["speaker"] = None
+            else:
+                params["speaker"] = [self._adapter.capabilities.default_speaker]
 
         # Instructions for style/emotion control
         if request.instructions is not None:

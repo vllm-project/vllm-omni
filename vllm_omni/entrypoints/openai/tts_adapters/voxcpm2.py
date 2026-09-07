@@ -115,8 +115,8 @@ class VoxCPM2Adapter(ARTTSAdapter):
             validate_profile=validate_voxcpm2_profile,
         )
 
-    def _load_supported_speakers(self) -> set[str]:
-        return {"default"}
+    def _load_supported_speakers(self) -> list[str]:
+        return ["default"]
 
     def apply_sampling_overrides(
         self,

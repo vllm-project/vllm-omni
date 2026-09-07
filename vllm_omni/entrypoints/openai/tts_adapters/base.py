@@ -16,7 +16,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from vllm.logger import init_logger
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -133,6 +136,7 @@ class TTSCapabilities:
     supported_speakers: frozenset[str] = frozenset()
     supported_languages: frozenset[str] = DEFAULT_TTS_LANGUAGES
     codec_frame_rate: float | None = None
+    default_speaker: str | None = None
 
 
 class TTSModelAdapter(ABC):
@@ -269,19 +273,25 @@ class TTSModelAdapter(ABC):
         return None
 
     def load_capabilities(self) -> TTSCapabilities:
+        speakers_list = self._load_supported_speakers()
+        default_speaker = speakers_list[0] if speakers_list else None
+        if default_speaker:
+            logger.info("Default speaker for CustomVoice task: %s", default_speaker)
         self.capabilities = TTSCapabilities(
             precomputed_speakers=self._load_precomputed_speakers(),
-            supported_speakers=frozenset(self._load_supported_speakers()),
+            supported_speakers=frozenset(speakers_list),
             supported_languages=self._load_supported_languages(),
             codec_frame_rate=self._load_codec_frame_rate(),
+            default_speaker=default_speaker,
         )
         return self.capabilities
 
     def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
         return {}
 
-    def _load_supported_speakers(self) -> set[str]:
+    def _load_supported_speakers(self) -> list[str]:
         # Preserve the legacy default path, which reads talker_config.
+        # Returns a list to preserve config order.
         return load_supported_speakers(self.ctx.engine_client)
 
     def _load_supported_languages(self) -> frozenset[str]:

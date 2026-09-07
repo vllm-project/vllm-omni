@@ -51,7 +51,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         prompt = await self.ctx.server._build_voxtral_prompt_async(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="voxtral_tts")
 
-    def _load_supported_speakers(self) -> set[str]:
+    def _load_supported_speakers(self) -> list[str]:
         config = self.ctx.engine_client.model_config.hf_config.audio_config
         return load_supported_speakers(self.ctx.engine_client, config)
 
