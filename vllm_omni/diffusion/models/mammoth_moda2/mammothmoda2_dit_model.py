@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from typing import TYPE_CHECKING
+
 import torch
-import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch import nn
+
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
@@ -19,7 +27,12 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
 
+from vllm_omni.model_executor.models.utils import maybe_prefix
+
 from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 # On the measured RTX 4090, fusion won even for the shortest tested tables;
 # deployments can tune the crossover with VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS.
@@ -119,6 +132,7 @@ def _apply_qk_norm_rope(
     return query, key
 
 
+
 class LuminaRMSNormZero(nn.Module):
     """
     Norm layer adaptive RMS normalization zero.
@@ -161,6 +175,8 @@ class LuminaFeedForward(nn.Module):
         inner_dim: int,
         multiple_of: int | None = 256,
         ffn_dim_multiplier: float | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -169,28 +185,29 @@ class LuminaFeedForward(nn.Module):
             inner_dim = int(ffn_dim_multiplier * inner_dim)
         inner_dim = multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
 
-        self.linear_1 = nn.Linear(
-            dim,
-            inner_dim,
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=dim,
+            output_sizes=[inner_dim, inner_dim],
             bias=False,
-        )
-        self.linear_2 = nn.Linear(
-            inner_dim,
-            dim,
-            bias=False,
-        )
-        self.linear_3 = nn.Linear(
-            dim,
-            inner_dim,
-            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "gate_up_proj"),
         )
 
-    def swiglu(self, x, y):
-        return F.silu(x.float(), inplace=False).to(x.dtype) * y
+        self.linear_2 = RowParallelLinear(
+            input_size=inner_dim,
+            output_size=dim,
+            bias=False,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "linear_2"),
+        )
+
+        self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        h1, h2 = self.linear_1(x), self.linear_3(x)
-        return self.linear_2(self.swiglu(h1, h2))
+        gate_up, _ = self.gate_up_proj(x)
+        output, _ = self.linear_2(self.act_fn(gate_up))
+        return output
 
 
 class LuminaLayerNormContinuous(nn.Module):
@@ -408,7 +425,8 @@ class AttnProcessor:
             # cu_seqlens with arange(step=seq_len) and rejects step 0. Nothing
             # to attend to either way, so hand the projection an empty input.
             empty = query.new_zeros(batch_size, sequence_length, attn.heads * head_dim)
-            return attn.to_out[1](attn.to_out[0](empty))
+            empty = attn.to_out[0](empty)
+            return attn.to_out[1](empty)
 
         query = query.view(batch_size, -1, attn.heads, head_dim)
         key = key.view(batch_size, -1, kv_heads, head_dim)
@@ -449,10 +467,13 @@ class TransformerBlock(nn.Module):
         modulation: bool = True,
         *,
         rope_repeats_pairs: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         """Initialize the transformer block."""
         super().__init__()
         self.head_dim = dim // num_attention_heads
+        kv_dim = num_kv_heads * self.head_dim
         self.modulation = modulation
 
         processor = AttnProcessor(rope_repeats_pairs=rope_repeats_pairs)
@@ -470,9 +491,45 @@ class TransformerBlock(nn.Module):
             out_bias=False,
             processor=processor,
         )
-        # Set the QK norms here instead of letting diffusers build its own RMSNorm via qk_norm.
-        self.attn.norm_q = RMSNorm(self.head_dim, eps=1e-5)
-        self.attn.norm_k = RMSNorm(self.head_dim, eps=1e-5)
+
+        self.attn.to_q = ReplicatedLinear(
+            input_size=dim,
+            output_size=dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_q"),
+            return_bias=False,
+        )
+        self.attn.to_k = ReplicatedLinear(
+            input_size=dim,
+            output_size=kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_k"),
+            return_bias=False,
+        )
+
+        self.attn.to_v = ReplicatedLinear(
+            input_size=dim,
+            output_size=kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_v"),
+            return_bias=False,
+        )
+
+        self.attn.to_out[0] = ReplicatedLinear(
+            input_size=dim,
+            output_size=dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "attn.to_out.0"),
+            return_bias=False,
+        )
+
+        # 显式使用 transformers 的 Qwen2RMSNorm，避免依赖 diffusers 内部创建的 `RMSNorm` 再做递归替换。
+        self.attn.norm_q = Qwen2RMSNorm(self.head_dim, eps=1e-5)
+        self.attn.norm_k = Qwen2RMSNorm(self.head_dim, eps=1e-5)
         # The kernel itself runs through the shared Omni attention layer: backend
         # selection, padding-mask handling and native grouped-query heads live
         # there. It owns no parameters, so checkpoint keys are unchanged. The
@@ -488,12 +545,21 @@ class TransformerBlock(nn.Module):
 
         # Initialize feed-forward network
         self.feed_forward = LuminaFeedForward(
-            dim=dim, inner_dim=4 * dim, multiple_of=multiple_of, ffn_dim_multiplier=ffn_dim_multiplier
+            dim=dim,
+            inner_dim=4 * dim,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "feed_forward"),
         )
 
         # Initialize normalization layers
         if modulation:
-            self.norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps, norm_elementwise_affine=True)
+            self.norm1 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                norm_elementwise_affine=True,
+            )
         else:
             self.norm1 = RMSNorm(dim, eps=norm_eps)
 
@@ -558,6 +624,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         axes_lens: tuple[int, int, int] = (300, 512, 512),
         text_feat_dim: int = 1024,
         timestep_scale: float = 1.0,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         """Initialize the  transformer model."""
         super().__init__()
@@ -608,8 +676,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     norm_eps,
                     modulation=True,
                     rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"noise_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -624,8 +694,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     norm_eps,
                     modulation=True,
                     rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"ref_image_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -640,8 +712,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     norm_eps,
                     modulation=False,
                     rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"context_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -657,8 +731,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     norm_eps,
                     modulation=True,
                     rope_repeats_pairs=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, f"layers.{i}"),
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -817,8 +893,12 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         noise_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor,
     ):
-        for layer in self.context_refiner:
-            text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
+        # Online-FP8 GEMM kernels do not accept M=0. The default CFG
+        # unconditional branch has zero text tokens when no negative prompt
+        # embeddings are available, so skip the entire context refiner.
+        if text_hidden_states.shape[1] > 0:
+            for layer in self.context_refiner:
+                text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
 
         for layer in self.noise_refiner:
             img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
