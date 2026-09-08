@@ -19,7 +19,7 @@
 import os
 from typing import Any, ClassVar
 
-from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast, Qwen2Config
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -358,7 +358,7 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         # during PretrainedConfig.__init__, before llm_config is assigned
         llm_config = getattr(self, "llm_config", None)
         if isinstance(llm_config, dict):
-            return PretrainedConfig.from_dict(llm_config)
+            return Qwen2Config(**llm_config)
 
         return llm_config
 
@@ -417,4 +417,72 @@ AutoConfig.register(MingFlashOmniConfig.model_type, MingFlashOmniConfig)
 # AutoTokenizer.from_pretrained can resolve the tokenizer class
 AutoTokenizer.register(BailingMM2Config, fast_tokenizer_class=PreTrainedTokenizerFast)
 AutoTokenizer.register(MingFlashOmniTalkerConfig, fast_tokenizer_class=PreTrainedTokenizerFast)
+
+
+def resolve_ming_talker_config(root_config: Any, talker_dir: str, model_path: str) -> MingFlashOmniTalkerConfig | None:
+    """Resolve ``MingFlashOmniTalkerConfig``, or ``None`` when nothing loads.
+
+    Shared by the talker's own init, the stage-sizing text-config lookup, and
+    the prompt-wav geometry derivation so all probe the same locations in the
+    same order. ``root_config`` is the in-memory config to prefer when it
+    already wraps a talker config; pass ``None`` from callers that only have a
+    model path.
+    """
+    wrapped = getattr(root_config, "talker_config", None)
+    if isinstance(wrapped, dict):
+        wrapped = MingFlashOmniTalkerConfig(**wrapped)
+    if isinstance(wrapped, MingFlashOmniTalkerConfig):
+        return wrapped
+
+    if os.path.isdir(talker_dir):
+        try:
+            return MingFlashOmniTalkerConfig.from_pretrained(talker_dir)
+        except Exception:
+            pass
+    try:
+        return MingFlashOmniTalkerConfig.from_pretrained(model_path, subfolder="talker", trust_remote_code=True)
+    except Exception as e:
+        logger.info("Could not resolve talker config from %s or %s/talker: %s", talker_dir, model_path, e)
+        return None
+
+
+def resolve_ming_talker_text_config(root_config: Any, model_path: Any) -> Qwen2Config | PretrainedConfig | None:
+    """Resolve the talker's Qwen2 text config for stage sizing.
+
+    Prefers an in-memory ``talker_config`` on ``root_config``, then
+    ``talker/config.json``, and finally ``talker/llm/config.json`` (local dir
+    or HF hub) for standalone TTS checkpoints that ship only the LLM config.
+    Returns ``None`` when nothing resolves.
+    """
+    if not isinstance(model_path, str) or not model_path:
+        model_path = ""
+
+    talker_dir = ""
+    if model_path and os.path.isdir(model_path):
+        talker_dir = os.path.join(model_path, "talker")
+        if not os.path.isdir(talker_dir):
+            talker_dir = model_path
+
+    talker_config = resolve_ming_talker_config(root_config, talker_dir, model_path)
+    if talker_config is not None:
+        text_config = talker_config.get_text_config()
+        if text_config is not None:
+            return text_config
+
+    if not model_path:
+        return None
+    if os.path.isdir(model_path):
+        llm_dir = os.path.join(talker_dir or model_path, "llm")
+        if os.path.isdir(llm_dir):
+            try:
+                return Qwen2Config.from_pretrained(llm_dir)
+            except Exception:
+                return None
+        return None
+    try:
+        return Qwen2Config.from_pretrained(model_path, subfolder="talker/llm")
+    except Exception:
+        return None
+
+
 AutoTokenizer.register(MingFlashOmniConfig, fast_tokenizer_class=PreTrainedTokenizerFast)
