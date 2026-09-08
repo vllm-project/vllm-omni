@@ -510,22 +510,8 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 dit_module.to(self.device)
                 continue
 
-            # Move non-block modules to GPU (they stay resident)
-            for name, m in dit_module.named_children():
-                if name not in blocks_attr_names:
-                    m.to(self.device)
-                    logger.debug(f"Moved {name} to device {self.device}")
-                else:
-                    logger.debug(f"Skipped blocks module {name}")
-
-            # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
-            for param in dit_module._parameters.values():
-                if param is not None:
-                    param.data = param.data.to(self.device, non_blocking=True)
-
-            for buffer in dit_module._buffers.values():
-                if buffer is not None:
-                    buffer.data = buffer.data.to(self.device, non_blocking=True)
+            # Everything outside the streamed blocks stays resident on device
+            move_non_block_state_to_device(dit_module, [blocks], self.device)
 
             block_hooks = _install_layerwise_hook_group(
                 blocks,
