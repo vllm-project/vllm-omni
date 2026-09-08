@@ -59,6 +59,22 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
 
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_native_kv_transfer_requires_completed_ar_stage(async_chunk):
+    from types import SimpleNamespace
+
+    pipeline = SimpleNamespace(stages=(), model_type="test")
+    deploy = DeployConfig(
+        async_chunk=async_chunk,
+        stages=[StageDeployConfig(stage_id=0, engine_extras={"kv_transfer_config": {"kv_connector": "MooncakeConnector"}})],
+    )
+    if async_chunk:
+        with pytest.raises(ValueError, match="requires async_chunk=False"):
+            omni_config_module._validate_async_chunk_support(pipeline, deploy)
+    else:
+        omni_config_module._validate_async_chunk_support(pipeline, deploy)
+
+
 @pytest.fixture(autouse=True)
 def _stable_test_platform(monkeypatch):
     from vllm_omni import platforms
