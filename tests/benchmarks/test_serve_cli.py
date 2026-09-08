@@ -168,6 +168,26 @@ def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
             {"backend", "print_stage", "bot_task"},
         ),
         (
+            [
+                "--endpoint",
+                "/v1/images/edits",
+                "--image-edits-bot-task",
+                "think",
+            ],
+            {"bot_task": "think"},
+            {"endpoint", "bot_task"},
+        ),
+        (
+            [
+                "--backend",
+                "/v1/images/edits",
+                "--image-edits-bot-task",
+                "recaption",
+            ],
+            {"bot_task": "recaption"},
+            {"backend", "bot_task"},
+        ),
+        (
             ["--extra-body", '{"bot_task":"vanilla"}'],
             {"bot_task": "vanilla"},
             {"extra_body"},
@@ -182,6 +202,7 @@ def test_omni_args_parse_and_preprocess(
     parser = TrackingArgumentParser()
     parser.add_argument("--extra-body", type=json.loads, default=None)
     parser.add_argument("--backend", default="openai-chat-omni")
+    parser.add_argument("--endpoint", default="/v1/chat/completions")
     add_omni_args(parser)
 
     args = parser.parse_args(argv)

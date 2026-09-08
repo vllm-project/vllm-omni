@@ -52,6 +52,23 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     assert captured_requests[0].sampling_params.num_inference_steps == 2
 
 
+def test_allgather_startup_runs_broadcast_dummy_request() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit"],
+            "layer_options": {"dit": {"weight_transfer": "allgather"}},
+        },
+        parallel_config=SimpleNamespace(data_parallel_size=2, sequence_parallel_size=1),
+    )
+    engine._dummy_run = Mock()
+
+    engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
+
+
 def test_dummy_run_num_frames_uses_explicit_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     class JointAudioVideoModel:
         dummy_run_num_frames = 2

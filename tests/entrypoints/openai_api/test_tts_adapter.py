@@ -22,12 +22,14 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS2Adapter,
     IndexTTS25Adapter,
     indextts2_conditioning_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSAdapter,
     MossTTSNanoAdapter,
@@ -37,6 +39,8 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     Qwen3TTSAdapter,
     Qwen3TTSCodecLimitError,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.step_audio2 import StepAudio2Adapter
+from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
@@ -125,8 +129,8 @@ def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
 
 def _build_moss_tts_request(adapter_cls, mocker, *, request_seed):
     server = mocker.Mock()
-    server._build_moss_tts_params = mocker.AsyncMock(return_value={})
     adapter = adapter_cls(SpeechServingContext(server=server))
+    adapter._build_moss_tts_params = mocker.AsyncMock(return_value={})
     request = OpenAICreateSpeechRequest(input="hello", seed=request_seed)
 
     return asyncio.run(
@@ -165,6 +169,81 @@ def test_moss_tts_seed_falls_back_to_stage_default(adapter_cls, mocker):
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)
+
+
+def test_qwen3_tts_build_constructs_prepared_request():
+    server = SimpleNamespace(_tts_executor=None, _tts_tokenizer=None, uploaded_speakers={})
+    engine_client = SimpleNamespace(model_config=SimpleNamespace())
+    adapter = Qwen3TTSAdapter(SimpleNamespace(server=server, engine_client=engine_client))
+
+    async def estimate_prompt_len(_tts_params):
+        return 3
+
+    adapter._estimate_prompt_len_async = estimate_prompt_len
+    request = OpenAICreateSpeechRequest(input="hello")
+
+    prepared = asyncio.run(adapter.build(request, [], False))
+
+    assert prepared.prompt["prompt_token_ids"] == [1, 1, 1]
+    assert prepared.prompt["additional_information"] is prepared.tts_params
+    assert prepared.tts_params["text"] == ["hello"]
+    assert prepared.tts_params["speaker"] == ["Vivian"]
+    assert prepared.model_type == "CustomVoice"
+
+
+def test_covo_audio_build_constructs_tokenized_prompt():
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            assert messages[-1] == {"role": "user", "content": "hello"}
+            assert tokenize is True
+            assert add_generation_prompt is True
+            return [11, 12, 13]
+
+    adapter = CovoAudioAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
+    adapter._tokenizer = FakeTokenizer()
+
+    prepared = asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="hello"), [], False))
+
+    assert prepared.prompt == {"prompt_token_ids": [11, 12, 13]}
+    assert prepared.tts_params == {}
+    assert prepared.model_type == "covo_audio"
+
+
+def test_ming_flash_omni_build_constructs_prepared_request():
+    server = SimpleNamespace(uploaded_speakers={})
+    adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", voice="test")
+
+    prepared = asyncio.run(adapter.build(request, [], False))
+
+    assert prepared.prompt["prompt_token_ids"] == [0]
+    info = prepared.prompt["additional_information"]
+    assert info["ming_task"] == "instruct"
+    assert info["text"] == "hello"
+    assert info["voice_name"] == "test"
+    assert prepared.model_type == "ming_flash_omni_tts"
+
+
+def test_step_audio2_build_constructs_open_assistant_turn():
+    adapter = StepAudio2Adapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", instructions="Read warmly.")
+
+    prepared = asyncio.run(adapter.build(request, [], False))
+
+    assert "<|im_start|>system\nRead warmly.<|im_end|>" in prepared.prompt["prompt"]
+    assert prepared.prompt["prompt"].endswith("<|im_start|>assistant\n<tts_start>")
+    assert prepared.tts_params == {}
+    assert prepared.model_type == "step_audio2"
+
+
+def test_voxtral_prompt_builder_is_sync():
+    ctx = SimpleNamespace(
+        server=SimpleNamespace(_tts_executor=None),
+        engine_client=SimpleNamespace(),
+    )
+    adapter = VoxtralTTSAdapter(ctx)
+
+    assert not asyncio.iscoroutinefunction(adapter._build_prompt)
 
 
 @pytest.mark.parametrize(

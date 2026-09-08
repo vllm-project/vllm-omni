@@ -175,7 +175,19 @@ def test_ltx_device_uint8_output_rejects_invalid_contract(video, error):
         _prepare_ltx2_video_output(video, do_normalize=True)
 
 
-def test_ltx_profiler_covers_video_output_transport(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "parallel_config",
+    [
+        None,
+        SimpleNamespace(ulysses_degree=4),
+        SimpleNamespace(tensor_parallel_size=2),
+        SimpleNamespace(use_hsdp=True, hsdp_shard_size=2),
+        SimpleNamespace(ulysses_degree=2, tensor_parallel_size=2),
+        SimpleNamespace(ulysses_degree=2, use_hsdp=True, hsdp_shard_size=2),
+    ],
+    ids=["single", "ulysses", "tp", "hsdp", "tp-ulysses", "hsdp-ulysses"],
+)
+def test_ltx_supported_parallel_configs_keep_output_profiling(tmp_path, monkeypatch, parallel_config):
     from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
     (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2Vocoder"]}))
@@ -193,7 +205,13 @@ def test_ltx_profiler_covers_video_output_transport(tmp_path, monkeypatch):
     monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
     monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", capture_profiler_setup)
 
-    LTX2Pipeline(od_config=SimpleNamespace(model=str(tmp_path), enable_diffusion_pipeline_profiler=False))
+    LTX2Pipeline(
+        od_config=SimpleNamespace(
+            model=str(tmp_path),
+            parallel_config=parallel_config,
+            enable_diffusion_pipeline_profiler=False,
+        )
+    )
 
     assert "video_processor.postprocess_video" in profiler_setup["profiler_targets"]
     assert "_prepare_video_output_for_transport" in profiler_setup["profiler_targets"]
@@ -383,14 +401,42 @@ def test_ltx_checkpoint_validation_rejects_mismatched_scheduler_metadata(expecte
         )
 
 
-def test_ltx_rejects_advanced_uaa_before_component_initialization():
+@pytest.mark.parametrize(
+    "pipeline_cls",
+    [
+        LTX2Pipeline,
+        LTX2DistilledOneStagePipeline,
+        LTX2TwoStagePipeline,
+        LTX2DistilledTwoStagePipeline,
+        LTX2T2VDMD2Pipeline,
+        LTX2I2VDMD2Pipeline,
+    ],
+)
+@pytest.mark.parametrize(
+    ("parallel_config", "error"),
+    [
+        (SimpleNamespace(ulysses_mode="advanced_uaa"), "does not support ulysses_mode='advanced_uaa'"),
+        (SimpleNamespace(ring_degree=2), "pure Ulysses sequence parallelism only"),
+        (SimpleNamespace(ulysses_degree=2, ring_degree=2), "pure Ulysses sequence parallelism only"),
+        (SimpleNamespace(allgather_degree=2), "pure Ulysses sequence parallelism only"),
+    ],
+    ids=["advanced-uaa", "ring", "hybrid", "allgather-kv"],
+)
+def test_ltx_rejects_unsupported_sp_before_component_initialization(pipeline_cls, parallel_config, error, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+
+    def unexpected_model_access(*_args, **_kwargs):
+        pytest.fail("Unsupported SP must be rejected before accessing model files or initializing components")
+
+    monkeypatch.setattr(ltx2_runtime, "detect_ltx_model_version", unexpected_model_access)
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", unexpected_model_access)
     od_config = SimpleNamespace(
         model="unused",
-        parallel_config=SimpleNamespace(ulysses_mode="advanced_uaa"),
+        parallel_config=parallel_config,
     )
 
-    with pytest.raises(ValueError, match="does not support ulysses_mode='advanced_uaa'"):
-        LTX2Pipeline(od_config=od_config)
+    with pytest.raises(ValueError, match=error):
+        pipeline_cls(od_config=od_config)
 
 
 def test_ltx23_checkpoint_selects_version_specific_one_stage_profile(tmp_path, monkeypatch):
@@ -1409,39 +1455,19 @@ def test_ltx_distilled_forward_rejects_fixed_recipe_overrides(direct_kwargs, sam
         pipeline.forward(req, **direct_kwargs)
 
 
-def test_ltx_distilled_dummy_run_uses_fixed_recipe_values():
-    from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
-    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    req = DiffusionRequestBatch(
-        [
-            OmniDiffusionRequest(
-                prompt="dummy run",
-                sampling_params=OmniDiffusionSamplingParams(
-                    height=512,
-                    width=512,
-                    num_frames=LTX2DistilledPipeline.dummy_run_num_frames,
-                    num_inference_steps=1,
-                    guidance_scale=0.0,
-                ),
-                request_id=DUMMY_DIFFUSION_REQUEST_ID,
-            )
-        ]
-    )
-    pipeline = _make_ltx_request_pipe(LTX2DistilledPipeline)
-    seen = {}
-
-    def fake_run_recipe(_req, request_inputs, **_kwargs):
-        seen["request_inputs"] = request_inputs
-        return "dummy-output"
-
-    object.__setattr__(pipeline, "_run_recipe", fake_run_recipe)
-
-    assert pipeline.forward(req) == "dummy-output"
-    assert seen["request_inputs"].num_frames == 1
-    assert seen["request_inputs"].num_inference_steps == 8
-    assert seen["request_inputs"].guidance == LTXGuidanceSpec.positive_only()
+@pytest.mark.parametrize(
+    "pipeline_cls",
+    [
+        LTX2Pipeline,
+        LTX2DistilledOneStagePipeline,
+        LTX2TwoStagePipeline,
+        LTX2DistilledTwoStagePipeline,
+        LTX2T2VDMD2Pipeline,
+        LTX2I2VDMD2Pipeline,
+    ],
+)
+def test_ltx_pipelines_disable_startup_dummy_run(pipeline_cls):
+    assert pipeline_cls.dummy_run_num_frames == 0
 
 
 def test_ltx_custom_sigmas_bypass_scheduler_shifting():

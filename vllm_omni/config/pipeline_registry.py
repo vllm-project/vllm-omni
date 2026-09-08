@@ -17,9 +17,8 @@ To add a new pipeline:
 
 Out of tree pipeline configs or resolvers can also be registered with register_pipeline.
 
-NOTE: Single-stage diffusion models continue to use the
-``_create_default_diffusion_stage_cfg`` fallback in
-``async_omni_engine.py``; for now we do not add them to registry.
+NOTE: Generic single-stage diffusion is selected by ``config.resolver`` when
+no registered Omni pipeline matches.
 """
 
 from __future__ import annotations
@@ -69,6 +68,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS25_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
+from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
@@ -141,6 +141,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "lance": LANCE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
+    "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
     "gepard": GEPARD_PIPELINE,
