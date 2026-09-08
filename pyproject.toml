@@ -77,7 +77,6 @@ dev = [
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
-    "silero-vad==6.1", # Realtime server-VAD duplex E2E
 ]
 
 demo = [
@@ -87,9 +86,6 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
-server-vad = [
-    "silero-vad==6.1",
-]
 
 forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
