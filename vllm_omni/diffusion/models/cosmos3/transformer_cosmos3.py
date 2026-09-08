@@ -1970,7 +1970,8 @@ class Cosmos3VFMTransformer(nn.Module):
 
             # SeaCache's root hook controls this full-layout boundary. Skipping
             # bypasses every GEN block (and therefore layerwise-offload prefetch)
-            # while keeping input packing, normalization, and prediction heads fresh.
+            # and the final GEN normalization, while keeping input packing and
+            # prediction heads fresh.
             gen_input = hidden_gen
             cached_residual = getattr(self, "_seacache_residual", None)
             can_reuse = (
@@ -2002,11 +2003,11 @@ class Cosmos3VFMTransformer(nn.Module):
                     multi_control_token_sizes=multi_control_token_sizes,
                     multi_control_weights=multi_control_weights,
                 )
+                hidden_gen = self.norm_moe_gen(hidden_gen)
                 if getattr(self, "_seacache_record", False):
                     self._seacache_last_residual = hidden_gen - gen_input
 
-            # Final norm and project back to latent space
-            hidden_gen = self.norm_moe_gen(hidden_gen)
+            # Project the full or already-normalized cached state back to latent space.
             if not has_action and not has_sound and not has_control:
                 return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
 

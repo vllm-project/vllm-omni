@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -399,6 +399,99 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
         fps=24.0,
     )
 
+    assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
+def test_seacache_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    class TrackingNorm(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return hidden_states + 5.0
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    norm = TrackingNorm()
+    model.norm_moe_gen = norm
+    captured: dict[str, torch.Tensor] = {}
+
+    def run_gen_layers(hidden_gen: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        captured["input"] = hidden_gen.detach().clone()
+        return hidden_gen + 2.0
+
+    monkeypatch.setattr(model, "_run_gen_layers", run_gen_layers)
+    model._seacache_record = True
+    forward_kwargs = {
+        "hidden_states": torch.zeros(1, 2, 1, 2, 2),
+        "timestep": torch.tensor([1.0]),
+        "text_ids": torch.tensor([[1, 2]], dtype=torch.long),
+        "text_mask": torch.ones(1, 2, dtype=torch.long),
+        "video_shape": (1, 2, 2),
+        "fps": 24.0,
+    }
+
+    full_output = model(**forward_kwargs)
+
+    assert norm.calls == 1
+    torch.testing.assert_close(
+        model._seacache_last_residual,
+        torch.full_like(captured["input"], 7.0),
+    )
+
+    norm.calls = 0
+    model._seacache_record = False
+    model._seacache_skip = True
+    model._seacache_residual = model._seacache_last_residual
+
+    def fail_if_gen_layers_run(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("SeaCache hit unexpectedly executed GEN layers")
+
+    monkeypatch.setattr(model, "_run_gen_layers", fail_if_gen_layers_run)
+    cached_output = model(**forward_kwargs)
+
+    assert norm.calls == 0
+    torch.testing.assert_close(cached_output, full_output, rtol=0, atol=0)
+
+
+def test_no_cache_still_runs_final_gen_norm_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    class CountingNorm(nn.Module):
+        def __init__(self, original: nn.Module) -> None:
+            super().__init__()
+            self.original = original
+            self.calls = 0
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return self.original(hidden_states)
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    norm = CountingNorm(model.norm_moe_gen)
+    model.norm_moe_gen = norm
+
+    output = model(
+        hidden_states=torch.zeros(1, 2, 1, 2, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+    )
+
+    assert norm.calls == 1
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
