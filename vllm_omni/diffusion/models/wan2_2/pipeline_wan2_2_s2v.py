@@ -41,6 +41,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
     create_s2v_transformer_from_config,
 )
+from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, selected_offload_components
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
@@ -1090,6 +1091,11 @@ class Wan22S2VPipeline(
     # Main forward
     # ------------------------------------------------------------------
 
+    def _should_release_dit_before_decode(self) -> bool:
+        if getattr(self.od_config.parallel_config, "use_hsdp", False):
+            return False
+        return self.od_config.enable_cpu_offload and DIT_COMPONENT in selected_offload_components(self.od_config)
+
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -1401,7 +1407,7 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
-            if self.od_config.enable_cpu_offload and not getattr(self.od_config.parallel_config, "use_hsdp", False):
+            if self._should_release_dit_before_decode():
                 self.transformer.to("cpu")
                 current_omni_platform.empty_cache()
 

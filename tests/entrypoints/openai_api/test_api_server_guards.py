@@ -568,6 +568,48 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
                 websocket.receive_text()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("duplex_query", "expected_handler"),
+    [
+        (None, "duplex"),
+        ("1", "duplex"),
+        ("true", "duplex"),
+        ("on", "duplex"),
+        ("0", "legacy"),
+        ("false", "legacy"),
+    ],
+)
+async def test_realtime_route_defaults_to_configured_duplex_handler(
+    monkeypatch, duplex_query: str | None, expected_handler: str
+) -> None:
+    calls: list[str] = []
+
+    class _DuplexHandler:
+        async def handle_realtime_session(self, _websocket) -> None:
+            calls.append("duplex")
+
+    class _LegacyConnection:
+        async def handle_connection(self) -> None:
+            calls.append("legacy")
+
+    monkeypatch.setattr(api_server, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
+    query_params = {} if duplex_query is None else {"duplex": duplex_query}
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                openai_serving_duplex=_DuplexHandler(),
+                openai_serving_realtime=object(),
+            )
+        ),
+        query_params=query_params,
+    )
+
+    await api_server.realtime_websocket(websocket)
+
+    assert calls == [expected_handler]
+
+
 def test_health_without_engine_returns_stable_unhealthy_response() -> None:
     """Lock ``/health`` with no engine initialized.
 

@@ -331,10 +331,15 @@ def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -
     src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
     pytest_leaves = [step for step in _leaf_steps(src["steps"]) if "pytest" in str(step.get("commands"))]
     assert pytest_leaves
-    for step in pytest_leaves:
-        assert "mirror_hardwares" not in step
+    inferred_leaves = [step for step in pytest_leaves if "mirror_hardwares" not in step]
+    pinned_leaves = [step for step in pytest_leaves if "mirror_hardwares" in step]
+    assert inferred_leaves
+    for step in inferred_leaves:
         assert "agents" not in step
         assert "B200" in str(step.get("commands"))
+    for step in pinned_leaves:
+        # H100-only exceptions (e.g. MAGI-2) keep a CUDA preset and are omitted when MIRROR_HW=b200.
+        assert "B200" not in str(step.get("commands"))
 
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     default_leaves = _leaf_steps(_render_test_pipeline(src, changed_files=None)["steps"])
@@ -346,7 +351,10 @@ def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -
         step["label"]: step for step in _leaf_steps(_render_test_pipeline(b200_src, changed_files=None)["steps"])
     }
 
-    pytest_labels = {step["label"] for step in pytest_leaves}
+    pytest_labels = {step["label"] for step in inferred_leaves}
+    pinned_labels = {step["label"] for step in pinned_leaves}
+    assert pinned_labels <= set(default_by_label)
+    assert pinned_labels.isdisjoint(b200_by_label)
     assert pytest_labels <= set(default_by_label)
     assert pytest_labels <= set(b200_by_label)
     for label in pytest_labels:
