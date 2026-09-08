@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Loader-side adapters for proven direct-checkpoint mmap layouts."""
 
 from __future__ import annotations
@@ -83,8 +83,30 @@ class _Cosmos3DirectMmapAdapter:
         return DirectMmapTensorPolicy(allow_custom_loader=True)
 
 
+class _Magi2DirectMmapAdapter:
+    """Apply MAGI-2's rank-local MoE-head slices during bounded staging."""
+
+    def policy_for(
+        self,
+        runtime_name: str,
+        target: torch.Tensor,
+    ) -> DirectMmapTensorPolicy:
+        del runtime_name
+        transform = getattr(target, "mmap_weight_transform", None)
+        return DirectMmapTensorPolicy(
+            transform=transform if callable(transform) else None,
+        )
+
+
 def get_direct_mmap_adapter(pipeline: nn.Module) -> DirectMmapAdapter | None:
     """Return a loader-owned adapter without requiring a pipeline flag."""
+    from vllm_omni.diffusion.models.magi2.modeling_magi2 import (
+        Magi2PreviewTransformer,
+    )
+
+    if any(isinstance(module, Magi2PreviewTransformer) for module in pipeline.modules()):
+        return _Magi2DirectMmapAdapter()
+
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3DiTModel,
     )

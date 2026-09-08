@@ -351,7 +351,7 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
 async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
 
-    Fails if assembly stops replacing upstream chat/batch/models/profiler,
+    Fails if assembly stops replacing upstream chat/batch/models/health/profiler,
     deletes unrelated upstream routes, forgets Omni/profiler mounts, skips
     storage start, or drops Omni ``EngineDeadError`` / ``EngineGenerateError``
     handlers.
@@ -371,6 +371,10 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
         @app.get("/v1/models")
         async def upstream_models():
+            return {"owner": "upstream"}
+
+        @app.get("/health")
+        async def upstream_health():
             return {"owner": "upstream"}
 
         @app.post("/start_profile")
@@ -454,6 +458,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         is api_server.create_batch_chat_completion
     )
     assert _single_http_route(routes, "GET", "/v1/models").endpoint is api_server.show_available_models
+    assert _single_http_route(routes, "GET", "/health").endpoint is api_server.health
     assert _single_http_route(routes, "POST", "/start_profile").endpoint is api_server.start_profile
     assert _single_http_route(routes, "POST", "/stop_profile").endpoint is api_server.stop_profile
 
@@ -561,6 +566,48 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
             assert websocket.receive_json() == payload
             with pytest.raises(WebSocketDisconnect):
                 websocket.receive_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("duplex_query", "expected_handler"),
+    [
+        (None, "duplex"),
+        ("1", "duplex"),
+        ("true", "duplex"),
+        ("on", "duplex"),
+        ("0", "legacy"),
+        ("false", "legacy"),
+    ],
+)
+async def test_realtime_route_defaults_to_configured_duplex_handler(
+    monkeypatch, duplex_query: str | None, expected_handler: str
+) -> None:
+    calls: list[str] = []
+
+    class _DuplexHandler:
+        async def handle_realtime_session(self, _websocket) -> None:
+            calls.append("duplex")
+
+    class _LegacyConnection:
+        async def handle_connection(self) -> None:
+            calls.append("legacy")
+
+    monkeypatch.setattr(api_server, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
+    query_params = {} if duplex_query is None else {"duplex": duplex_query}
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                openai_serving_duplex=_DuplexHandler(),
+                openai_serving_realtime=object(),
+            )
+        ),
+        query_params=query_params,
+    )
+
+    await api_server.realtime_websocket(websocket)
+
+    assert calls == [expected_handler]
 
 
 def test_health_without_engine_returns_stable_unhealthy_response() -> None:

@@ -2,18 +2,31 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for CosyVoice3 components."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
-from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@contextmanager
+def _force_torch_sdpa():
+    """Pin TORCH_SDPA so CPU shape tests do not pick CUDA-only backends (FA3)."""
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
+    with set_current_diffusion_config(od_config):
+        yield
 
 
 @pytest.fixture
@@ -53,8 +66,6 @@ class TestPreLookaheadLayer:
 
         return PreLookaheadLayer(in_channels=512, channels=512, pre_lookahead_len=3)
 
-    @pytest.mark.core_model
-    @pytest.mark.cpu
     def test_forward_shape(self, layer):
         """Test that output shape matches input shape."""
         batch, seq_len, channels = 2, 10, 512
@@ -64,8 +75,6 @@ class TestPreLookaheadLayer:
 
         assert out.shape == x.shape
 
-    @pytest.mark.core_model
-    @pytest.mark.cpu
     def test_forward_with_context(self, layer):
         """Test forward with context for streaming."""
         batch, seq_len, channels = 1, 10, 512
@@ -77,8 +86,6 @@ class TestPreLookaheadLayer:
 
         assert out.shape == x.shape
 
-    @pytest.mark.core_model
-    @pytest.mark.cpu
     def test_residual_connection(self, layer):
         """Test that residual connection is applied."""
         batch, seq_len, channels = 1, 5, 512
@@ -98,10 +105,9 @@ class TestDiTAttention:
     def attention(self):
         from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTAttention
 
-        return DiTAttention(dim=512, heads=8, dim_head=64, dropout=0.0)
+        with _force_torch_sdpa():
+            return DiTAttention(dim=512, heads=8, dim_head=64, dropout=0.0)
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, attention):
         """Test attention output shape."""
         batch, seq_len, dim = 2, 16, 512
@@ -111,8 +117,6 @@ class TestDiTAttention:
 
         assert out.shape == x.shape
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_with_mask(self, attention):
         """Test attention with mask."""
         batch, seq_len, dim = 2, 16, 512
@@ -126,8 +130,6 @@ class TestDiTAttention:
         # Masked positions should be zero
         assert torch.allclose(out[:, -3:], torch.zeros_like(out[:, -3:]))
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_qkv_projections(self, attention):
         """Test that Q/K/V projections exist and have correct dimensions."""
         assert hasattr(attention, "to_q")
@@ -145,10 +147,9 @@ class TestDiTBlock:
     def block(self):
         from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTBlock
 
-        return DiTBlock(dim=512, heads=8, dim_head=64, ff_mult=4, dropout=0.0)
+        with _force_torch_sdpa():
+            return DiTBlock(dim=512, heads=8, dim_head=64, ff_mult=4, dropout=0.0)
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, block):
         """Test block output shape."""
         batch, seq_len, dim = 2, 16, 512
@@ -159,8 +160,6 @@ class TestDiTBlock:
 
         assert out.shape == x.shape
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_adalayernorm_modulation(self, block):
         """Test that AdaLayerNorm modulates based on timestep."""
         batch, seq_len, dim = 1, 8, 512
@@ -182,21 +181,20 @@ class TestDiT:
     def dit(self):
         from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
 
-        return DiT(
-            dim=256,
-            depth=2,
-            heads=4,
-            dim_head=64,
-            dropout=0.0,
-            ff_mult=2,
-            mel_dim=80,
-            mu_dim=80,
-            spk_dim=80,
-            long_skip_connection=True,
-        )
+        with _force_torch_sdpa():
+            return DiT(
+                dim=256,
+                depth=2,
+                heads=4,
+                dim_head=64,
+                dropout=0.0,
+                ff_mult=2,
+                mel_dim=80,
+                mu_dim=80,
+                spk_dim=80,
+                long_skip_connection=True,
+            )
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, dit):
         """Test DiT forward output shape."""
         batch, mel_dim, seq_len = 1, 80, 32
@@ -211,8 +209,6 @@ class TestDiT:
 
         assert out.shape == (batch, mel_dim, seq_len)
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_timestep_embedding(self, dit):
         """Test that different timesteps produce different outputs."""
         batch, mel_dim, seq_len = 1, 80, 16
@@ -245,8 +241,6 @@ class TestCFM:
 
         return DummyEstimator()
 
-    @pytest.mark.core_model
-    @pytest.mark.cpu
     def test_causal_conditional_cfm_forward(self, dummy_estimator):
         """Test CausalConditionalCFM forward pass."""
         from omegaconf import DictConfig
@@ -432,18 +426,17 @@ class TestCFM:
 class TestSDPAFallback:
     """Test SDPA fallback for float32 inputs."""
 
-    @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_float32_uses_sdpa(self):
         """Test that float32 inputs use SDPA fallback."""
         from vllm_omni.diffusion.attention.layer import Attention
 
-        attn = Attention(
-            num_heads=8,
-            head_size=64,
-            causal=False,
-            softmax_scale=1.0 / 8.0,
-        )
+        with _force_torch_sdpa():
+            attn = Attention(
+                num_heads=8,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0 / 8.0,
+            )
 
         batch, seq_len, heads, dim = 1, 16, 8, 64
         q = torch.randn(batch, seq_len, heads, dim, dtype=torch.float32)

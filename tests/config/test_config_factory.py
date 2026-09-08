@@ -6,7 +6,6 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +36,7 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     pipeline_cfg_resolver,
 )
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -451,13 +451,8 @@ class TestStageConfigFactory:
 
     def test_default_diffusion_with_parallel_config(self):
         """Test diffusion config calculates devices from parallel_config."""
-
-        @dataclass
-        class MockParallelConfig:
-            world_size: int = 4
-
         kwargs = {
-            "parallel_config": MockParallelConfig(),
+            "parallel_config": DiffusionParallelConfig(tensor_parallel_size=4),
             "cache_backend": "tea_cache",
         }
         configs = StageConfigFactory.create_default_diffusion(kwargs)
@@ -1475,6 +1470,11 @@ stages:
         deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
         stages = merge_pipeline_deploy(pipeline, deploy)
 
+        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3TextEncoder"
+        assert stages[1].yaml_engine_args["model_arch"] == "MiniMaxH3Pipeline"
+        assert stages[0].yaml_runtime["num_replicas"] == 1
+        assert stages[1].yaml_runtime["num_replicas"] == 1
+        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False}
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
         assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
         assert stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
@@ -1597,7 +1597,7 @@ stages:
         assert stage.max_model_len == 1024
         assert stage.max_num_batched_tokens == 1024
         assert stage.max_num_seqs == 1
-        assert stage.gpu_memory_utilization == 0.7
+        assert stage.gpu_memory_utilization == 0.8
         assert stage.skip_mm_profiling is True
         assert stage.enforce_eager is True
         assert stage.async_scheduling is False
@@ -2399,6 +2399,21 @@ class TestBaseConfigInheritance:
         # CI overrides max_tokens
         assert s0["max_tokens"] == 150
 
+    def test_qwen3_omni_colocate_async_bounds_only_rocm_kv_cache(self):
+        ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe_colocate_async.yaml"))
+        pipeline = resolve_pipeline_config("qwen3_omni_moe_thinker_only")
+        assert isinstance(pipeline, PipelineConfig)
+
+        cuda = _apply_platform_overrides(load_deploy_config(ci_path), platform="cuda")
+        cuda_stage = merge_pipeline_deploy(pipeline, cuda)[0]
+        assert cuda_stage.yaml_engine_args["gpu_memory_utilization"] == 0.9
+        assert "kv_cache_memory_bytes" not in cuda_stage.yaml_engine_args
+
+        rocm = _apply_platform_overrides(load_deploy_config(ci_path), platform="rocm")
+        rocm_stage = merge_pipeline_deploy(pipeline, rocm)[0]
+        assert "gpu_memory_utilization" not in rocm_stage.yaml_engine_args
+        assert rocm_stage.yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
+
     def test_pure_inheritance_overlay(self, tmp_path):
         """An overlay with only ``base_config`` inherits everything."""
         base = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -2859,6 +2874,54 @@ stages:
         assert omega_config.engine_args.max_num_batched_tokens == 2048
         assert omega_config.engine_args.max_model_len == 8192
         assert omega_config.engine_args.enforce_eager is True
+
+    def test_cli_attention_shorthand_replaces_yaml_structured_default(self):
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dit",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "diffusion_attention_config": {
+                    "default": {"backend": "FLASH_ATTN"},
+                    "per_role": {"cross": {"backend": "TORCH_SDPA"}},
+                },
+            },
+            runtime_overrides={"diffusion_attention_backend": "SAGE_ATTN"},
+        )
+
+        engine_args = stage.to_omegaconf().engine_args
+
+        assert engine_args.diffusion_attention_backend == "SAGE_ATTN"
+        assert "default" not in engine_args.diffusion_attention_config
+        assert engine_args.diffusion_attention_config.per_role.cross.backend == "TORCH_SDPA"
+
+    def test_cli_attention_shorthand_keeps_yaml_per_role_only_config(self):
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dit",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={"diffusion_attention_config": {"per_role": {"cross": {"backend": "TORCH_SDPA"}}}},
+            runtime_overrides={"diffusion_attention_backend": "SAGE_ATTN"},
+        )
+
+        engine_args = stage.to_omegaconf().engine_args
+
+        assert engine_args.diffusion_attention_backend == "SAGE_ATTN"
+        assert engine_args.diffusion_attention_config == {"per_role": {"cross": {"backend": "TORCH_SDPA"}}}
+
+    def test_cli_attention_config_replaces_yaml_shorthand(self):
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dit",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={"diffusion_attention_backend": "TORCH_SDPA"},
+            runtime_overrides={"diffusion_attention_config": {"default": {"backend": "SAGE_ATTN"}}},
+        )
+
+        engine_args = stage.to_omegaconf().engine_args
+
+        assert "diffusion_attention_backend" not in engine_args
+        assert engine_args.diffusion_attention_config.default.backend == "SAGE_ATTN"
 
 
 class TestSentinelDefaultPrecedence:

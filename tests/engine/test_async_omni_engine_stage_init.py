@@ -11,7 +11,7 @@ import types
 
 import pytest
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
@@ -205,6 +205,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     engine._omni_lb_policy = "random"
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = True
+    engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
     runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
@@ -1729,98 +1730,6 @@ def test_inject_kv_stage_info_infers_receiver_tp_topology():
     assert stage1.engine_args["omni_kv_config"]["stage_id"] == 1
     assert stage1.engine_args["omni_kv_config"]["engine_input_source"] == [0]
     assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
-
-
-def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=None,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-        trust_remote_code=False,
-    )
-
-    diffusion_attention_config = stage_configs[0].engine_args.diffusion_attention_config
-    assert isinstance(diffusion_attention_config, AttentionConfig)
-    assert diffusion_attention_config.default is not None
-    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
-
-
-def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    existing_attention = AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=existing_attention,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-        trust_remote_code=False,
-    )
-
-    assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
-
-
-def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stage(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="llm",
-        engine_args=types.SimpleNamespace(
-            attention_config={"backend": "FLASH_ATTN"},
-            enable_sleep_mode=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "TORCH_SDPA"},
-        trust_remote_code=False,
-    )
-
-    assert stage_configs[0].engine_args.attention_config == {"backend": "FLASH_ATTN"}
-    assert not hasattr(stage_configs[0].engine_args, "diffusion_attention_config")
 
 
 def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):

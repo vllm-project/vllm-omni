@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -9,9 +12,28 @@ from vllm_omni.metrics.utils import (
     count_audio_frames,
     count_image_pixels,
     count_tokens_from_outputs,
+    count_video_frames,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_frames"),
+    [
+        ((1, 64, 64, 3), 1),
+        ((3, 64, 64, 3), 3),
+        ((4, 64, 64, 3), 4),
+        ((8, 64, 64, 3), 8),
+        ((3, 8, 64, 64), 8),
+        ((1, 1, 64, 64, 3), 1),
+        ((1, 3, 64, 64, 3), 3),
+        ((1, 4, 64, 64, 3), 4),
+        ((1, 3, 8, 64, 64), 8),
+    ],
+)
+def test_count_video_frames_handles_short_channel_last_outputs(shape, expected_frames):
+    assert count_video_frames(SimpleNamespace(shape=shape)) == expected_frames
 
 
 @pytest.mark.parametrize(

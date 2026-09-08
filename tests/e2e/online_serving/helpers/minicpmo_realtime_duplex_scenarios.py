@@ -52,26 +52,47 @@ try:
 except ImportError as exc:  # pragma: no cover - demo dependency.
     raise SystemExit("Install websockets first: pip install websockets") from exc
 
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
-    RealtimeEventCollector,
+    EventCollector,
     build_realtime_url,
     duplex_unit_boundary_ms,
     read_pcm16_wav,
     summarize_session_request_metrics,
 )
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     reference_audio_data_url as _ref_audio_data_url,
 )
 from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
     concat_frames_b64,
     unit_subframe_offsets,
 )
+from vllm_omni.metrics.definitions import compute_audio_rtf  # noqa: E402
 
-_url_with_model = build_realtime_url
+
+def _url_with_model(url, model, *, autostart=None, session_id=None):
+    # This driver speaks the MiniCPM-o native duplex wire contract.
+    return build_realtime_url(
+        url,
+        model,
+        autostart=autostart,
+        session_id=session_id,
+        extra_query={"native_duplex": "1"},
+    )
+
+
 _read_wav_pcm16 = read_pcm16_wav
 DemoArgs = argparse.Namespace | SimpleNamespace
+
+
+def _audio_rtf_from_raw_metric(raw_metric: dict[str, object]) -> float | None:
+    """Derive audio RTF from the raw timings reported by the client."""
+    generation_ms = raw_metric.get("audio_generation_ms")
+    duration_ms = raw_metric.get("audio_duration_ms")
+    if not isinstance(generation_ms, int | float) or not isinstance(duration_ms, int | float) or duration_ms <= 0:
+        return None
+    return round(compute_audio_rtf(float(generation_ms) / 1000.0, float(duration_ms) / 1000.0), 6)
 
 
 def _video_frames_from_file(
@@ -156,7 +177,7 @@ def _resolve_video_frames(args: DemoArgs) -> tuple[list[str], list[str | None]]:
 @dataclass
 class DemoState:
     events: list[dict[str, object]] = field(default_factory=list)
-    timing_events: RealtimeEventCollector = field(default_factory=RealtimeEventCollector)
+    timing_events: EventCollector = field(default_factory=EventCollector)
     audio_deltas: list[bytes] = field(default_factory=list)
     response_audio_deltas: dict[str, list[bytes]] = field(default_factory=dict)
     response_ids: list[str] = field(default_factory=list)
@@ -273,6 +294,11 @@ class DemoState:
                 after_s=created_at_s,
                 input_committed_at_s=input_committed_at_s,
                 response_id=response_id,
+                measurement_origin={
+                    "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                    "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                    "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                },
             )
             timing["measurement_origin"] = {
                 "response": "response.created client receive",
@@ -292,14 +318,14 @@ class DemoState:
             metrics = timing.get("request_metrics")
             if not isinstance(metrics, dict):
                 continue
-            requests.append(
-                {
-                    "session_id": session_id,
-                    "request_index": request_index,
-                    "response_id": response_id,
-                    **metrics,
-                }
-            )
+            request_metrics = {
+                "session_id": session_id,
+                "request_index": request_index,
+                "response_id": response_id,
+                **metrics,
+                "rtf": _audio_rtf_from_raw_metric(metrics),
+            }
+            requests.append(request_metrics)
         return requests
 
     def session_metric_summary(
@@ -602,7 +628,7 @@ def _session_update_event(args: DemoArgs) -> dict[str, object]:
         "playback_commit_policy": "ack_only",
         "extra_body": {
             "auto_response": True,
-            "minicpmo45_native_duplex": True,
+            "native_duplex": True,
             "force_listen_count": 0,
         },
     }

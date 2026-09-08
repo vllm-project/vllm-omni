@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for cache backends (cache-dit and teacache).
@@ -164,7 +164,10 @@ class TestCacheDiTBackend:
             num_inference_steps=20,
             verbose=True,
         )
-        mock_cache_dit.summary.assert_called_once_with(transformer, details=True)
+        mock_cache_dit.summary.assert_called_once_with(
+            mock_block_adapter.return_value,
+            details=True,
+        )
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.logger")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
