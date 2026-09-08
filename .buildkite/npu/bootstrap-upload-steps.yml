@@ -169,7 +169,7 @@ steps:
     command: |
       python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/test-npu-ready.yml
 
-  # L4 Test — NIGHTLY=1 (full pipeline; TEMP: any branch), or PR nightly-test label
+  # L4 Test — main+NIGHTLY=1 (scheduled), or PR nightly-test label
   - label: "Upload Nightly Pipeline"
     depends_on:
       - image-build-a2
@@ -178,8 +178,7 @@ steps:
     commands:
       - |
         EXTRA=""
-        # TEMP: New Build validation — NIGHTLY=1 ignores branch. Restore `&& [ "${BUILDKITE_BRANCH}" = "main" ]`.
-        if [ "${NIGHTLY:-}" = "1" ]; then
+        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--all"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/npu/test-npu-nightly.yml

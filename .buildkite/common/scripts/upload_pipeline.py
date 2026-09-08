@@ -87,8 +87,7 @@ CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_depe
 # Bootstrap Buildkite ``if`` expressions.
 # ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
 # ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
-# TEMP: New Build validation — NIGHTLY=1 ignores branch. Restore `build.branch == "main" &&`.
-NIGHTLY_MAIN_IF = 'build.env("NIGHTLY") == "1"'
+NIGHTLY_MAIN_IF = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
 NIGHTLY_LABEL_IF = (
     f'({NIGHTLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
 )
