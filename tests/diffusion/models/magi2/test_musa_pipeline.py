@@ -12,6 +12,7 @@ from tests.diffusion.models.magi2.test_native_preview import _initialize_tiny_mo
 from tests.diffusion.models.magi2.test_pipeline_magi2 import _pipeline, _request
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.models.magi2 import attention
+from vllm_omni.diffusion.models.magi2 import mh_moe as moe
 from vllm_omni.diffusion.models.magi2 import pipeline_magi2 as pipeline
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer, Modality
@@ -141,6 +142,70 @@ def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type
         reference.assert_called_once()
         flash.assert_not_called()
         resolver.assert_not_called()
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("platform,is_cuda", [("musa", True), ("cuda", True), ("rocm", True), ("musa", False)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("requested", [None, "0", "1"])
+def test_moe_bf16_musa_uses_non_atomic_output(monkeypatch, platform, is_cuda, dtype, requested):
+    monkeypatch.setattr(moe, "current_omni_platform", fake_platform(platform))
+    if requested is None:
+        monkeypatch.delenv("MAGI2_DETERMINISTIC", raising=False)
+    else:
+        monkeypatch.setenv("MAGI2_DETERMINISTIC", requested)
+    layer = moe.Magi2MultiHeadMoE(moe.Magi2MultiHeadMoEConfig(4, 1, 2, 1, 8, dtype))
+    x = SimpleNamespace(is_cuda=is_cuda, dtype=dtype)
+    probabilities, indices = torch.ones(1, 1, 1), torch.zeros(1, 1, 1, dtype=torch.long)
+    monkeypatch.setattr(layer, "_route", Mock(return_value=(probabilities, indices)))
+    monkeypatch.setattr(moe, "global_sort_routes", Mock(return_value=(object(), object(), object())))
+    expected = object()
+    triton_path, torch_path = Mock(return_value=expected), Mock(return_value=expected)
+    monkeypatch.setattr(moe, "triton_mh_moe_forward", triton_path)
+    monkeypatch.setattr(moe, "torch_mh_moe_forward", torch_path)
+    assert layer._local_forward(x) is expected
+    if is_cuda:
+        triton_path.assert_called_once()
+        expected_non_atomic = requested == "1" or (platform == "musa" and dtype == torch.bfloat16)
+        assert triton_path.call_args.kwargs == {"deterministic": expected_non_atomic}
+        torch_path.assert_not_called()
+    else:
+        torch_path.assert_called_once()
+        triton_path.assert_not_called()
+
+
+@pytest.mark.musa
+@pytest.mark.parametrize("tokens,heads", [(2, 3), (129, 1)])
+def test_actual_musa_bf16_moe_default_dispatch(monkeypatch, tokens, heads):
+    """Non-atomic dispatch/kernel smoke with exact nonzero output, not checkpoint accuracy."""
+    require_musa()
+    assert moe.current_omni_platform.is_musa()
+    monkeypatch.delenv("MAGI2_DETERMINISTIC", raising=False)
+    layer = moe.Magi2MultiHeadMoE(moe.Magi2MultiHeadMoEConfig(heads * 256, heads, 8, 6, 1280, torch.bfloat16))
+    with torch.no_grad():
+        layer.gate.zero_()
+        layer.W_gate.fill_(1)
+        layer.W_up.fill_(1)
+        layer.W_down.fill_(3 / 2**17)
+    layer.to("musa").eval()
+    original_triton = moe.triton_mh_moe_forward
+    selected_modes = []
+
+    def checked_triton(*args, **kwargs):
+        selected_modes.append(kwargs.get("deterministic"))
+        assert kwargs.get("deterministic") is True
+        return original_triton(*args, **kwargs)
+
+    monkeypatch.setattr(moe, "triton_mh_moe_forward", checked_triton)
+    x = torch.ones(tokens, heads, 256, device="musa", dtype=torch.bfloat16)
+    with torch.inference_mode():
+        actual = layer._local_forward(x)
+    assert selected_modes == [True]
+    assert actual.shape == x.shape and actual.dtype == x.dtype
+    # Clamped SwiGLU7 stores 56 in BF16. Six equal routes each store 35/128,
+    # so their BF16 sum is exactly 105/64, independently of addition order.
+    expected = torch.full_like(actual.cpu(), 105 / 64)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.musa
