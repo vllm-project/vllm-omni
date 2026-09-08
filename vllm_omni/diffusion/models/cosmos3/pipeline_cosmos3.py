@@ -1307,6 +1307,7 @@ class Cosmos3OmniDiffusersPipeline(
         The transformer returns the raw prediction: video-only as a tensor,
         or a tuple in video, action, sound order for multimodal generation.
         """
+
         def _to_model_dtype(value: Any) -> Any:
             if isinstance(value, torch.Tensor):
                 return value.to(self.dtype)
