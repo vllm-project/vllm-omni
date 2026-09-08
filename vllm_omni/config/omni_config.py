@@ -63,6 +63,7 @@ _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
+        "disable_log_stats",
         "model",
         "omni",
         "output_modalities",
