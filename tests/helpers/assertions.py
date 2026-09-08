@@ -740,7 +740,11 @@ def _resolve_audio_transcript(
     audio_bytes = getattr(response, "audio_bytes", None)
     if not audio_bytes:
         return None
-    return convert_audio_bytes_to_text(audio_bytes, language=request_config.get("transcript_language"))
+    return convert_audio_bytes_to_text(
+        audio_bytes,
+        model_size=request_config.get("transcript_model", "small"),
+        language=request_config.get("transcript_language"),
+    )
 
 
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):

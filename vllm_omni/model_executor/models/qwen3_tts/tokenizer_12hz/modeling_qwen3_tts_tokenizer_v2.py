@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -866,6 +869,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
     def enable_cudagraph(
         self,
+        capture_modes: tuple[str, ...] = ("icl", "xvec"),
         capture_batch_sizes: list[int] | None = None,
         stateless_capture_sizes: list[int] | None = None,
         device: torch.device | None = None,
@@ -888,6 +892,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
+            capture_modes=capture_modes,
             capture_batch_sizes=capture_batch_sizes,
             stateless_capture_sizes=stateless_capture_sizes,
             num_quantizers=self.config.num_quantizers,

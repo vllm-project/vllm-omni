@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 
 from vllm_omni.metrics import OrchestratorAggregator
@@ -17,6 +20,7 @@ class ClientRequestState:
         self.stage_id: int | None = None
         self.queue = queue if queue is not None else asyncio.Queue()
         self.metrics: OrchestratorAggregator | None = None
+        self.input_stream_task: asyncio.Task | None = None
         # Request-scoped idempotency guard for Prometheus failure counters.
         self.failure_recorded = False
         # Wall-clock time at which the user's request arrived in the engine

@@ -14,8 +14,9 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+import anyio
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -38,6 +39,7 @@ from vllm_omni.engine.duplex.messages import (
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.duplex_request_client import (
+    DuplexEnginePort,
     DuplexRequestClient,
     DuplexRequestOutputPort,
 )
@@ -94,6 +96,9 @@ class AsyncEventResolver:
 
         if tid is None and isinstance(ack, dict):
             tid = ack.get("task_id")
+        if tid is None:
+            logger.warning("Received ACK without a task_id")
+            return
 
         async with self._lock:
             task_info = self._pending_tasks.get(tid)
@@ -418,9 +423,9 @@ class AsyncOmni(EngineClient, OmniBase):
     def _get_duplex_request_client(self) -> DuplexRequestClient:
         client = getattr(self, "_duplex_request_client", None)
         if client is None:
-            engine = getattr(self, "engine", None)
+            engine = self.engine
             client = DuplexRequestClient(
-                engine,
+                cast(DuplexEnginePort, engine),
                 DuplexRequestOutputPort(
                     request_states=getattr(self, "request_states", {}),
                     num_stages=getattr(engine, "num_stages", 1),
@@ -612,7 +617,7 @@ class AsyncOmni(EngineClient, OmniBase):
             # chunks incrementally through streaming_update. The helper
             # returns as soon as the pump task is created; each ADD/update
             # takes its own admission slot inside the pump.
-            if streaming_input:
+            if isinstance(prompt, AsyncGenerator):
                 first_chunk_submitted = asyncio.get_running_loop().create_future()
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
@@ -636,7 +641,8 @@ class AsyncOmni(EngineClient, OmniBase):
                     lora_request=lora_request,
                 )
             submit_ts = time.time()
-            req_state.metrics.stage_first_ts[0] = submit_ts
+            stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
+            stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
             if admitting:
                 await self._release_generate_admission()
@@ -661,7 +667,10 @@ class AsyncOmni(EngineClient, OmniBase):
 
         except (asyncio.CancelledError, GeneratorExit):
             self._record_request_failure_once(request_id, reason="client_disconnect")
-            await self._abort_internal_requests(request_id)
+            # ASGI cancellation scopes cancel subsequent await points too.
+            # Finish the engine abort before removing the local request state.
+            with anyio.CancelScope(shield=True):
+                await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
@@ -710,6 +719,7 @@ class AsyncOmni(EngineClient, OmniBase):
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
         self._validate_streaming_input_sampling_params(stage0_params)
+        stage0_params = cast(SamplingParams, stage0_params)
         req_state = self.request_states[request_id]
         has_submitted_first_chunk = False
 
@@ -1007,6 +1017,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     if should_continue:
                         continue
 
+                    assert req_state is not None
                     req_state.stage_id = stage_id
 
                     # Route to the per-request queue
@@ -1385,7 +1396,8 @@ class AsyncOmni(EngineClient, OmniBase):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(
+    # EngineClient exposes async operations; OmniBase implements the sync API.
+    async def start_profile(  # type: ignore[override]
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
@@ -1400,7 +1412,7 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
 
-    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:  # type: ignore[override]
         """Stop profiling specified stages.
 
         Uses vLLM-compatible profile(is_start=False) interface.
@@ -1706,7 +1718,7 @@ class AsyncOmni(EngineClient, OmniBase):
         mechanism does not resolve abstract methods from sibling MRO
         entries).
         """
-        return OmniBase.errored.fget(self)  # type: ignore[union-attr]
+        return super().errored
 
     @property
     def _name(self) -> str:
@@ -1732,10 +1744,14 @@ class AsyncOmni(EngineClient, OmniBase):
         """Get tokenizer for the comprehension stage."""
         stage_index = self._get_comprehension_stage_index()
         if stage_index is not None:
-            tokenizer = self.engine.output_processors[stage_index].tokenizer
+            processor = self.engine.output_processors[stage_index]
+            assert processor is not None
+            tokenizer = processor.tokenizer
             if tokenizer is not None:
                 return tokenizer
-        return self.input_processor.tokenizer  # type: ignore[return-value]
+        processor = self.input_processor
+        assert processor is not None
+        return processor.tokenizer
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
@@ -1783,7 +1799,7 @@ class AsyncOmni(EngineClient, OmniBase):
         """Return the task set exposed by the orchestrator-backed engine."""
         return tuple(self.engine.supported_tasks)
 
-    async def check_health(self) -> None:
+    async def check_health(self) -> None:  # type: ignore[override]
         """Check engine health by verifying the Orchestrator process is alive."""
         OmniBase.check_health(self)
 

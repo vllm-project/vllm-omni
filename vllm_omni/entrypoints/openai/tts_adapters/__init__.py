@@ -104,6 +104,7 @@ def tts_entry_stage_archs() -> frozenset[str]:
 from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     audex,
     audex_tta,
+    breeze_tts,
     cosyvoice3,
     covo_audio,
     dots_tts,

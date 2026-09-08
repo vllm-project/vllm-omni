@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -55,6 +58,8 @@ class Qwen3TTSCode2Wav(nn.Module):
     via the SpeechTokenizer decoder directly (bypassing HF wrapper overhead)."""
 
     input_modalities = "audio"
+    tokenizer_subfolder = "speech_tokenizer"
+    decoder_cudagraph_modes: tuple[str, ...] = ("icl", "xvec")
 
     # Ask the model runner for the scheduler-side request IDs. Stateful
     # decoder caches must use the same IDs delivered by on_requests_finished;
@@ -98,7 +103,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         # load_weights().
         tok_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         dec_config = tok_config.decoder_config
         self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config)
@@ -187,6 +192,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
 
         self.decoder.enable_cudagraph(
+            capture_modes=self.decoder_cudagraph_modes,
             capture_batch_sizes=decode_cudagraph_batch_sizes,
             stateless_capture_sizes=decode_cudagraph_capture_sizes,
             device=device,
@@ -549,7 +555,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
         loaded = AutoWeightsLoader(

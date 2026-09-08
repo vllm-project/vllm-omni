@@ -45,6 +45,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_SINGLE_STAGE_PIPELINE,
     BAGEL_THINK_PIPELINE,
 )
+from vllm_omni.model_executor.models.breeze_tts.pipeline import BREEZE_TTS_PIPELINE
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dots_tts.pipeline import DOTS_TTS_PIPELINE
@@ -124,6 +125,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "breeze": BREEZE_TTS_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
