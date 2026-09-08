@@ -29,7 +29,10 @@ from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    request_needs_downstream_stage,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
 logger = init_logger(__name__)
@@ -318,7 +321,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return getattr(config, key, default) if config is not None else default
 
     def _omni_final_stage_flags(self, request: Request) -> tuple[bool, bool]:
-        """Return ``(is_stage_zero_final, force_kv_transfer)`` from request metadata."""
+        """Return ``(is_current_stage_final, force_kv_transfer)`` from request metadata."""
         payload = getattr(request, "additional_information", None)
         if payload is None:
             return False, False
@@ -332,14 +335,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 return cached[1], cached[2]
 
         info = deserialize_additional_information(payload)
-        is_final = info.get("omni_final_stage_id") == 0
+        current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+        is_final = not request_needs_downstream_stage(info.get("omni_final_stage_id"), current_stage_id)
         force_kv = bool(info.get("omni_force_kv_transfer", False))
         if cache is not None:
             cache[rid] = (payload_id, is_final, force_kv)
         return is_final, force_kv
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
-        """True when this stage-zero-final request does not need downstream KV."""
+        """True when this final-stage request does not need downstream KV."""
         is_final, force_kv = self._omni_final_stage_flags(request)
         return is_final and not force_kv
 
@@ -397,7 +401,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not self.kv_transfer_criteria:
             return False
 
-        # Text-only requests finalize at stage 0; do not prefill-stop for DiT KV.
+        # Do not prefill-stop for downstream KV when this request ends here.
         if self._request_omits_kv_transfer_to_next_stage(request):
             return False
 

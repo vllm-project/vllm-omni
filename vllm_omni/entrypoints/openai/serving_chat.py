@@ -3494,6 +3494,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 comprehension_idx = idx
                 break
 
+        ar_seed_indices: set[int] = set()
+        if comprehension_idx is not None:
+            ar_seed_indices.add(comprehension_idx)
+        get_pd_pair = getattr(engine, "_get_pd_separation_pair", None)
+        pd_pair = get_pd_pair() if callable(get_pd_pair) else getattr(engine, "_pd_separation_pair", None)
+        if pd_pair is not None and pd_pair[0] == comprehension_idx:
+            ar_seed_indices.add(pd_pair[1])
+
         sampling_params_list = build_stage_sampling_params_list(
             stage_configs,
             default_params_list,
@@ -3528,12 +3536,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if ar_grid_budget is not None and hasattr(default_stage_params, "max_tokens"):
                     default_stage_params.max_tokens = ar_grid_budget
 
-            if (
-                comprehension_idx is not None
-                and idx == comprehension_idx
-                and seed is not None
-                and hasattr(default_stage_params, "seed")
-            ):
+            if idx in ar_seed_indices and seed is not None and hasattr(default_stage_params, "seed"):
                 default_stage_params.seed = seed
 
             # Inject target_h/w into AR stage for M-RoPE position pre-computation
