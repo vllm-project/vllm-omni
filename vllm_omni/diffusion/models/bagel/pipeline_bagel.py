@@ -523,6 +523,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 f"latent_downsample={self.bagel.latent_downsample})."
             )
         image_shape = (height, width)
+        image_shape_requested = sampling.height is not None or sampling.width is not None
 
         extra_args = getattr(sampling, "extra_args", {}) or {}
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
@@ -564,6 +565,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
             if sampling.kv_metadata and "image_shape" in sampling.kv_metadata:
                 image_shape = tuple(sampling.kv_metadata["image_shape"])
+                image_shape_requested = True
 
             branch_kvs = getattr(sampling, "cfg_branch_past_key_values", None) or {}
             branch_metadata = getattr(sampling, "cfg_branch_kv_metadata", None) or {}
@@ -668,8 +670,15 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     image_input = [_resize_to_stride(img) for img in image_input]
 
                     resized_w, resized_h = image_input[0].size
-                    image_shape = (resized_h, resized_w)
-                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
+                    if not image_shape_requested:
+                        image_shape = (resized_h, resized_w)
+                    logger.info(
+                        "img2img: resized source to %dx%d, generating at %dx%d",
+                        resized_w,
+                        resized_h,
+                        image_shape[1],
+                        image_shape[0],
+                    )
 
                     def vae_transforms(img):
                         if img.mode != "RGB":
