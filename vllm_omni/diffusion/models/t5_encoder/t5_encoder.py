@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import math
@@ -285,12 +285,35 @@ class T5Block(nn.Module):
 
 
 class T5Stack(nn.Module):
-    def __init__(self, config: T5Config, shared: nn.Embedding, prefix: str = ""):
+    """Encoder stack for T5 (shared position bias) and UMT5 (per-layer bias).
+
+    ``per_layer_relative_attention_bias`` selects between the two families and
+    must stay consistent with ``forward``'s threading of ``position_bias``:
+    T5 computes the bias once on block 0 and reuses it, while UMT5 gives every
+    block its own ``relative_attention_bias`` table and recomputes per block
+    (HF ``UMT5LayerSelfAttention`` passes ``has_relative_attention_bias=True``
+    for every layer). Building the extra tables without also stopping the
+    threading would leave all but the first unused; stopping the threading
+    without building them would feed zeros into every block after the first.
+    """
+
+    def __init__(
+        self,
+        config: T5Config,
+        shared: nn.Embedding,
+        prefix: str = "",
+        per_layer_relative_attention_bias: bool = False,
+    ):
         super().__init__()
         self.embed_tokens = shared
+        self.per_layer_relative_attention_bias = per_layer_relative_attention_bias
         self.block = nn.ModuleList(
             [
-                T5Block(config, has_relative_attention_bias=(i == 0), prefix=f"{prefix}.block.{i}")
+                T5Block(
+                    config,
+                    has_relative_attention_bias=(per_layer_relative_attention_bias or i == 0),
+                    prefix=f"{prefix}.block.{i}",
+                )
                 for i in range(config.num_layers)
             ]
         )
@@ -312,11 +335,15 @@ class T5Stack(nn.Module):
 
         position_bias = None
         for block in self.block:
-            hidden_states, position_bias = block(
+            hidden_states, block_position_bias = block(
                 hidden_states,
                 mask=extended_mask,
                 position_bias=position_bias,
             )
+            # UMT5 re-derives bias (and re-adds the mask) in every block; T5
+            # carries block 0's result forward.
+            if not self.per_layer_relative_attention_bias:
+                position_bias = block_position_bias
 
         hidden_states = self.final_layer_norm(hidden_states)
         return hidden_states
@@ -325,12 +352,19 @@ class T5Stack(nn.Module):
 class T5EncoderModel(nn.Module):
     """T5 encoder model applying upstream vLLM layers"""
 
+    per_layer_relative_attention_bias: bool = False
+
     def __init__(self, config: T5Config, prefix: str = ""):
         super().__init__()
         self.config = config
         self.prefix = prefix
         self.shared = VocabParallelEmbedding(config.vocab_size, config.d_model)
-        self.encoder = T5Stack(config, self.shared, prefix=f"{prefix}.encoder")
+        self.encoder = T5Stack(
+            config,
+            self.shared,
+            prefix=f"{prefix}.encoder",
+            per_layer_relative_attention_bias=self.per_layer_relative_attention_bias,
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -421,3 +455,21 @@ class T5EncoderModel(nn.Module):
             loaded_params.add(lookup_name)
 
         return loaded_params
+
+
+class UMT5EncoderModel(T5EncoderModel):
+    """UMT5 encoder, tensor-parallel over the ambient vLLM TP group.
+
+    A drop-in replacement for ``transformers.UMT5EncoderModel`` for inference.
+    UMT5 differs from T5 in exactly one structural way that matters here: every
+    block carries its own ``relative_attention_bias`` table instead of sharing
+    block 0's. Everything else T5's implementation already handles — gated-GELU
+    (``feed_forward_proj="gated-gelu"`` sets ``is_gated_act``), bias-free
+    linears, the tied ``shared``/``encoder.embed_tokens`` embedding,
+    bidirectional position buckets, and no query scaling before the softmax.
+
+    Note ``forward`` returns ``(hidden_states,)``, not a HF ``ModelOutput``, so
+    callers read ``[0]`` rather than ``.last_hidden_state``.
+    """
+
+    per_layer_relative_attention_bias = True
