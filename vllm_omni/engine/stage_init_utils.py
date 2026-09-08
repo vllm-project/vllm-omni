@@ -1087,7 +1087,8 @@ def _project_omni_stage_engine_args(
         ),
         (
             stage_config.runtime_config,
-            frozenset({"devices", "num_replicas", "env", "num_gpus"}),
+            frozenset({"devices", "num_replicas", "env", "num_gpus"})
+            | (frozenset({"additional_config"}) if is_diffusion else frozenset()),
         ),
     ):
         engine_args.update(
