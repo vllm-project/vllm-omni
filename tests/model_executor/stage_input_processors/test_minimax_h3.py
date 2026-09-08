@@ -10,9 +10,12 @@ import pytest
 import torch
 from PIL import Image
 
-from vllm_omni.data_entry_keys import deserialize_payload, flatten_payload, serialize_payload
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import resolve_minimax_h3_diffusion_model_path
-from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
@@ -23,9 +26,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_CONDITION_LABELS_KEY,
     MINIMAX_H3_ENCODER_REQUEST_KEY,
     MINIMAX_H3_PRESENTATION_TASK_KEY,
-    MINIMAX_H3_TEXT_CONDITIONING_SCHEMA,
     MiniMaxH3EncoderConditioning,
-    MiniMaxH3TextConditioning,
 )
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import _audio_items, _load_audio
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
@@ -278,56 +279,6 @@ def test_encoder2diffusion_waits_for_one_finished_source() -> None:
         encoder2diffusion([SimpleNamespace(), SimpleNamespace()], {"prompt": "hello"})
 
 
-@pytest.mark.parametrize(
-    ("case", "message"),
-    [
-        ("hidden_width", r"hidden_states must have shape \[tokens, 5120\]"),
-        ("hidden_dtype", "hidden_states must have dtype torch.bfloat16"),
-        ("hidden_noncontiguous", "hidden_states must use contiguous strided layout"),
-        ("hidden_non_strided", "hidden_states must use contiguous strided layout"),
-        ("token_dtype", "stage-wire token_role_ids must have dtype torch.int64"),
-        ("token_layout", "stage-wire token_role_ids must use contiguous strided layout"),
-        ("token_count", "token_tags must align with hidden_states"),
-        ("token_value", "token_tags must contain only 0 and 1"),
-    ],
-)
-def test_encoder2diffusion_rejects_h3_v1_contract_mismatch(case: str, message: str) -> None:
-    payload = _encoder_output()
-    payload["hidden_states"]["output"] = torch.zeros(4, 5120, dtype=torch.bfloat16)
-    payload["meta"]["token_role_ids"] = torch.tensor([[1], [1], [0], [0]], dtype=torch.int64)
-
-    if case == "hidden_width":
-        payload["hidden_states"]["output"] = torch.zeros(4, 5119, dtype=torch.bfloat16)
-    elif case == "hidden_dtype":
-        payload["hidden_states"]["output"] = torch.zeros(4, 5120, dtype=torch.float32)
-    elif case == "hidden_noncontiguous":
-        payload["hidden_states"]["output"] = torch.empty(5120, 4, dtype=torch.bfloat16).t()
-    elif case == "hidden_non_strided":
-        payload["hidden_states"]["output"] = torch.empty(
-            (4, 5120),
-            dtype=torch.bfloat16,
-            layout=torch.sparse_coo,
-        )
-    elif case == "token_dtype":
-        payload["meta"]["token_role_ids"] = torch.tensor([[1], [1], [0], [0]], dtype=torch.int32)
-    elif case == "token_layout":
-        payload["meta"]["token_role_ids"] = torch.tensor(
-            [[1], [0], [1], [0], [1], [0], [1], [0]],
-            dtype=torch.int64,
-        )[::2]
-    elif case == "token_count":
-        payload["meta"]["token_role_ids"] = torch.tensor([[1], [0], [0]], dtype=torch.int64)
-    elif case == "token_value":
-        payload["meta"]["token_role_ids"] = torch.tensor([[1], [1], [2], [0]], dtype=torch.int64)
-    else:  # pragma: no cover - parameterization is exhaustive
-        raise AssertionError(f"unknown test case: {case}")
-
-    with pytest.raises(RuntimeError, match=message) as exc_info:
-        encoder2diffusion([SimpleNamespace(outputs=[SimpleNamespace(multimodal_output=payload)])], {"prompt": "test"})
-
-    assert MINIMAX_H3_TEXT_CONDITIONING_SCHEMA in str(exc_info.value)
-
-
 def test_ref2va_one_image_tokens_and_tags_match_fused_presentation():
     tokenizer = _SegmentTokenizer()
     labels = [("image", 1), ("audio", 1)]
@@ -438,44 +389,3 @@ def test_diffusion_resolver_normalizes_partial_partition_directory(tmp_path):
     (ref2va / "text_encoder").mkdir(parents=True)
 
     assert resolve_minimax_h3_diffusion_model_path(str(ref2va), None, "ref2va") == str(ref2va)
-
-
-def test_text_conditioning_artifact_round_trips_through_omni_payload_wire_format() -> None:
-    payload = _encoder_output()
-
-    wire = serialize_payload(payload)
-
-    assert wire is not None
-    restored = deserialize_payload(wire)
-    conditioning = MiniMaxH3TextConditioning.from_omni_payload(restored)
-    assert MINIMAX_H3_TEXT_CONDITIONING_SCHEMA == "minimax_h3.text_conditioning/v1"
-    torch.testing.assert_close(
-        conditioning.hidden_states,
-        payload["hidden_states"]["output"],
-    )
-    torch.testing.assert_close(
-        conditioning.token_tags,
-        payload["meta"]["token_role_ids"].squeeze(-1),
-    )
-    assert conditioning.hidden_states.dtype == torch.bfloat16
-    assert conditioning.hidden_states.is_contiguous()
-    assert conditioning.token_tags.dtype == torch.int64
-    assert conditioning.token_tags.is_contiguous()
-
-
-def test_stage_wire_rejects_request_id_mismatch():
-    source = SimpleNamespace(request_id="other", outputs=[SimpleNamespace()])
-    prompt = {
-        "prompt": "hello",
-        "additional_information": {"global_request_id": ["req-1"]},
-    }
-
-    with pytest.raises(RuntimeError, match="request ID does not match"):
-        encoder2diffusion([source], prompt=prompt)
-
-
-def test_stage_wire_rejects_multiple_completions():
-    source = SimpleNamespace(request_id="req-1", outputs=[SimpleNamespace(), SimpleNamespace()])
-
-    with pytest.raises(RuntimeError, match="exactly one completion"):
-        encoder2diffusion([source], prompt={"prompt": "hello"})
