@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -763,11 +764,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
-        """
-        Override: Only extend prompt at stage 0, and replace
-        the existing session with the next streaming update at other stages.
+        """Apply the next streaming update to a persistent session.
 
-        Discards the last sampled output token from the prior input chunk at stage 0.
+        Stage 0 uses upstream prompt extension. A MiniCPM Talker preserves its
+        accumulated prompt while it fits, then rebuilds a bounded window and
+        re-enters admission. Other downstream stages retain their existing
+        replacement or connector-polling behavior.
+
+        Discards the last sampled output token from the prior input chunk at
+        stage 0.
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
@@ -817,6 +822,56 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
+                return
+        streaming_prompt_payload = next(
+            (
+                info
+                for info in update_infos
+                if isinstance(info, dict)
+                and isinstance(info.get("meta"), dict)
+                and "next_stage_prompt_len" in info["meta"]
+            ),
+            None,
+        )
+        update_streaming_prompt = getattr(
+            self.chunk_transfer_adapter,
+            "update_streaming_prompt_for_condition",
+            None,
+        )
+        if stage_id != 0 and streaming_prompt_payload is not None and callable(update_streaming_prompt):
+            mm_feature_base = session.num_computed_tokens
+            try:
+                replaced = update_streaming_prompt(
+                    streaming_prompt_payload,
+                    session,
+                    update_prompt=True,
+                )
+            except ValueError as exc:
+                # This streaming update has already been dequeued. Report the
+                # permanent contract failure so the next scheduling pass
+                # finishes only this request instead of crashing EngineCore.
+                self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                return
+            if replaced is not None:
+                if replaced:
+                    # The window recipe needs the old prompt and confirmed
+                    # codec ids, so it runs before their KV/encoder state is
+                    # released. The rebuilt prompt is then admitted from zero.
+                    self._release_replaced_streaming_prompt_cache(session)
+                    self._reset_streaming_session_replacement_state(session)
+                else:
+                    session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
+                    if update.mm_features:
+                        # Match upstream streaming-session extension semantics.
+                        # The helper has already appended this condition, so use
+                        # the pre-append confirmed length as the MM offset base.
+                        for mm_feature in update.mm_features:
+                            mm_feature.mm_position = replace(
+                                mm_feature.mm_position,
+                                offset=mm_feature.mm_position.offset + mm_feature_base,
+                            )
+                        session.mm_features.extend(update.mm_features)
+                self._finish_streaming_session_update(session, update)
                 return
         replace_streaming_prompt = any(
             isinstance(info, dict)
