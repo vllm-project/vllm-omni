@@ -16,7 +16,7 @@ stages:
           parallel_mode: tp
         video_vae:
           parallel_mode: patch
-        audio_wvae:
+        audio_vae:
           parallel_mode: leader
     default_sampling_params:
       max_tokens: 1

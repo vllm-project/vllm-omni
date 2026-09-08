@@ -28,7 +28,7 @@ Stage 0's `tensor_parallel_size` defines one shared rank group for all three
 encoder roles; it does not choose each role's execution strategy. The required
 `hf_overrides.minimax_h3_encoder_components` mapping declares those strategies
 explicitly: `text_encoder` uses tensor parallelism, `video_vae` uses patch
-parallelism, and `audio_wvae` runs on the group leader. All three role entries
+parallelism, and `audio_vae` runs on the group leader. All three role entries
 are mandatory. They share the stage's `max_num_seqs` scheduler and batch limit;
 the configuration does not create independent role schedulers or world sizes.
 
