@@ -155,9 +155,7 @@ source_file_dependencies:
     - tests/diffusion/quantization/
     - vllm_omni/diffusion/quantization/
 
-  reliability_invalid_param:
-    - tests/dfx/reliability/invalid_param_test/
-
+  # --- models ---
   # --- omni / tts jobs ---
   omni_qwen3_omni_function:
     - *qwen3_omni
@@ -411,3 +409,17 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_lingbot_video.py
     - tests/e2e/online_serving/test_lingbot_video_moe.py
     - tests/e2e/offline_inference/test_lingbot_world_v2.py
+
+
+  # Invalid-param jobs: model business code only, plus the reliability scripts.
+  reliability_invalid_param_h100:
+    - *qwen3_omni
+    - *minicpmo_4_5
+    - *qwen_image
+    - *wan22
+    - tests/dfx/reliability/invalid_param_test/
+
+  reliability_invalid_param_l4:
+    - *qwen3_tts
+    - *stable_audio
+    - tests/dfx/reliability/invalid_param_test/

@@ -50,34 +50,21 @@ steps:
         mirror_hardwares: h100_4
 
       - label: "Reliability Test · Invalid parameters · H100 · Single-GPU"
-        source_file_dependencies:
-          - omni_qwen3_omni
-          - omni_minicpmo_4_5
-          - diffusion_qwen_image
-          - diffusion_wan22
-          - reliability_invalid_param
+        source_file_dependencies: reliability_invalid_param_h100
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_1"
         mirror_hardwares: h100_1
 
       - label: "Reliability Test · Invalid parameters · H100 · 2-GPU"
-        source_file_dependencies:
-          - omni_qwen3_omni
-          - omni_minicpmo_4_5
-          - diffusion_qwen_image
-          - diffusion_wan22
-          - reliability_invalid_param
+        source_file_dependencies: reliability_invalid_param_h100
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_2"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · Invalid parameters · L4"
-        source_file_dependencies:
-          - tts_qwen3_tts
-          - diffusion_stable_audio
-          - reliability_invalid_param
+        source_file_dependencies: reliability_invalid_param_l4
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
