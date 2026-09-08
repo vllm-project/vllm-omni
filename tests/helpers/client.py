@@ -152,11 +152,14 @@ class OpenPIWebSocketResponse:
     action_tensors: list[np.ndarray] | None = None
 
 
-def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke") -> dict[str, Any]:
-    """Build a minimal DROID-style observation payload for the OpenPI robot endpoint."""
+def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke", seed: int | None = None) -> dict[str, Any]:
+    """Build a minimal DROID-style observation payload for the OpenPI robot endpoint.
+
+    ``seed`` pins the policy's sampling noise for this request (see ``docs/serving/openpi_api.md``).
+    """
     identity_eef_9d = np.zeros((1, 1, 9), dtype=np.float32)
     identity_eef_9d[..., 3:] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
-    return {
+    observation: dict[str, Any] = {
         "session_id": session_id,
         "video": {
             "exterior_image_1_left": np.zeros((1, 2, 256, 256, 3), dtype=np.uint8),
@@ -169,6 +172,9 @@ def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke") -> dict[s
         },
         "language": {"annotation.language.language_instruction": [["pick up the object"]]},
     }
+    if seed is not None:
+        observation["seed"] = seed
+    return observation
 
 
 DREAMZERO_DEFAULT_PROMPT = (
@@ -1461,6 +1467,7 @@ class OnlineOmniClient:
             "seed",
             "instructions",
             "speed",
+            "sample_rate",
             "stream_format",
             "x_vector_only_mode",
         ):

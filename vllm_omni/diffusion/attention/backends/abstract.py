@@ -70,7 +70,15 @@ class AttentionBackend(ABC):
         return None
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        """Return whether this backend can consume a nontrivial ``attn_mask``.
+
+        ``attention_spec`` is the resolved per-role config when the user picked
+        a backend explicitly. Implementations that depend on kernel variant
+        (for example FlashInfer cute-dsl vs fa2) must consult it so capability
+        probes match a runnable configuration.
+        """
+        del attention_spec
         return False
 
     @staticmethod

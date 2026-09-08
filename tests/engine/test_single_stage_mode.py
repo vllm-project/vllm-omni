@@ -376,14 +376,26 @@ class TestSingleStageModeDetection:
         mocker: MockerFixture,
         *,
         stage_cfgs: list[Any] | None = None,
+        resolved_config_path: str = "/fake/path",
+        patch_deploy_config: bool = True,
         **kwargs: Any,
     ) -> AsyncOmniEngine:
         mock_stage_configs = stage_cfgs or [_make_stage_cfg(0)]
 
+        if patch_deploy_config:
+            mocker.patch.object(
+                StageConfigFactory,
+                "get_pipeline_config",
+                return_value=None,
+            )
+            mocker.patch(
+                "vllm_omni.engine.async_omni_engine.load_deploy_config",
+                return_value=SimpleNamespace(duplex_session=DuplexSessionRuntimeConfig()),
+            )
         mocker.patch.object(
             AsyncOmniEngine,
             "_resolve_stage_configs",
-            return_value=("/fake/path", mock_stage_configs),
+            return_value=(resolved_config_path, mock_stage_configs),
         )
         mocker.patch.object(AsyncOmniEngine, "_bootstrap_orchestrator")
         mock_thread_cls = mocker.patch("threading.Thread")
@@ -445,6 +457,8 @@ class TestSingleStageModeDetection:
         engine = self._make_engine_no_thread(
             mocker,
             deploy_config="/fake/duplex.yaml",
+            resolved_config_path="/fake/duplex.yaml",
+            patch_deploy_config=False,
         )
 
         get_pipeline_config.assert_called_once_with(
@@ -453,6 +467,30 @@ class TestSingleStageModeDetection:
             deploy_config_path="/fake/duplex.yaml",
         )
         load_deploy_config.assert_called_once_with("/fake/duplex.yaml")
+        assert engine.duplex_session_config is duplex_session
+
+    def test_auto_discovered_deploy_loads_duplex_runtime_config(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        deploy_path = "/resolved/qwen3_omni_moe.yaml"
+        duplex_session = DuplexSessionRuntimeConfig(server_vad_model_path="/models/silero_vad.onnx")
+        mocker.patch(
+            "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
+            return_value=None,
+        )
+        load_deploy_config = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.load_deploy_config",
+            return_value=SimpleNamespace(duplex_session=duplex_session),
+        )
+
+        engine = self._make_engine_no_thread(
+            mocker,
+            resolved_config_path=deploy_path,
+            patch_deploy_config=False,
+        )
+
+        load_deploy_config.assert_called_once_with(deploy_path)
         assert engine.duplex_session_config is duplex_session
 
     def test_single_stage_mode_without_stage_id_has_no_filter(self, mocker: MockerFixture):
@@ -518,6 +556,10 @@ class TestEndpointRestrictionsTrustRemoteCode:
         StageConfigFactory.try_infer_model_type.cache_clear()
 
     def _make_engine_no_thread(self, mocker: MockerFixture, **kwargs: Any) -> AsyncOmniEngine:
+        mocker.patch(
+            "vllm_omni.engine.async_omni_engine.load_deploy_config",
+            return_value=SimpleNamespace(duplex_session=DuplexSessionRuntimeConfig()),
+        )
         mocker.patch.object(
             AsyncOmniEngine,
             "_resolve_stage_configs",
@@ -575,7 +617,6 @@ class TestSingleStageInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=stage_id_filter,
             omni_master_address="127.0.0.1",
@@ -807,7 +848,6 @@ class TestSingleStageInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
         )
         mocker.patch.object(runtime_mod, "prepare_engine_environment")
@@ -860,7 +900,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -928,7 +967,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -950,7 +988,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1002,7 +1039,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1068,7 +1104,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1120,7 +1155,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1141,7 +1175,7 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
+        od_config = SimpleNamespace(max_num_seqs=4, parallel_config=SimpleNamespace(world_size=1))
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
@@ -1178,7 +1212,7 @@ class TestSingleStageReplicaInitialization:
                 os.environ[device_env_var] = prev_device_env
 
         assert result is sentinel_client
-        assert od_config.max_num_seqs is None
+        assert od_config.max_num_seqs == 4
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
@@ -1203,7 +1237,6 @@ class TestSingleStageReplicaInitialization:
             request_address="tcp://127.0.0.1:26002",
             response_address="tcp://127.0.0.1:26003",
             proc_manager=mocker.ANY,
-            batch_size=4,
         )
         assert mock_from_addresses.call_args.kwargs["proc_manager"].proc is proc
 
@@ -1216,7 +1249,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1258,7 +1290,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
