@@ -1,16 +1,20 @@
 # Full-Duplex WebSocket API
 
-vLLM-Omni provides an experimental full-duplex runtime for models that can
+vLLM-Omni provides a full-duplex runtime for models that can
 continue receiving speech while producing speech. It adds persistent session
 state, model-specific turn policy, overlap handling, playback acknowledgement,
 and optional session resume.
 
 Full duplex is distinct from the turn-based [Realtime Audio API](realtime_api.md).
 
+This page is the endpoint overview. For the complete wire contract, the
+`vllm_omni.clients.duplex.DuplexClient` Python library, and the per-model
+capability gates, see the [Realtime Duplex API guide](realtime_duplex_api.md).
+
 ## Choose an Endpoint
 
 | Endpoint | Protocol | Recommended use |
-|----------|----------|-----------------|
+| --- | --- | --- |
 | `WS /v1/realtime?duplex=1` | OpenAI Realtime-style event projection | Applications and browser clients |
 | `WS /v1/duplex` | Native vLLM-Omni duplex events | Runtime integration and low-level testing |
 
@@ -41,8 +45,10 @@ and control plane as part of their registered pipeline.
 
 The current unified-runtime integrations are:
 
-- MiniCPM-o 4.5, using `vllm_omni/deploy/minicpmo_4_5_duplex.yaml`;
-- PersonaPlex, whose default `vllm_omni/deploy/personaplex.yaml` enables duplex.
+- MiniCPM-o 4.5, using `vllm_omni/deploy/minicpmo_4_5.yaml`
+  (`session_mode: duplex`);
+- PersonaPlex, whose default `vllm_omni/deploy/personaplex.yaml` enables duplex;
+- Nemotron VoiceChat, via its registered duplex plugin package.
 
 JoyVL is a separate HTTP interaction orchestrator and does not use these
 WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).
@@ -53,7 +59,7 @@ Start the duplex deployment:
 
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
-  --deploy-config vllm_omni/deploy/minicpmo_4_5_duplex.yaml \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
   --trust-remote-code \
   --port 8091
 ```
@@ -112,5 +118,5 @@ applications should use the provided Realtime client where possible.
 
 See the [MiniCPM-o example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/minicpmo),
 [PersonaPlex example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/personaplex),
-and [full-duplex runtime design](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/experimental/fullduplex/DESIGN.md)
+and the [full-duplex runtime design](../design/fullduplex.md)
 for model-specific validation and architecture details.

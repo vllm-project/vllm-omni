@@ -173,9 +173,14 @@ def test_length_lives_in_device_tensors():
 # ---------------------------------------------------------------------------
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+vllm_flash_attn_only = pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="vLLM's bundled FlashAttention extension is CUDA-only",
+)
 
 
 @cuda_only
+@vllm_flash_attn_only
 @pytest.mark.cuda
 @pytest.mark.L4
 def test_paged_attention_matches_sdpa_over_the_same_buffer():
@@ -217,6 +222,7 @@ def test_paged_attention_matches_sdpa_over_the_same_buffer():
 
 
 @cuda_only
+@vllm_flash_attn_only
 @pytest.mark.cuda
 @pytest.mark.L4
 def test_a_captured_graph_follows_a_later_length():
@@ -278,6 +284,7 @@ def test_a_captured_graph_follows_a_later_length():
 
 
 @cuda_only
+@vllm_flash_attn_only
 @pytest.mark.cuda
 @pytest.mark.L4
 def test_a_captured_graph_writes_each_step_to_its_own_slot():
@@ -339,6 +346,7 @@ def test_a_captured_graph_writes_each_step_to_its_own_slot():
 
 
 @cuda_only
+@vllm_flash_attn_only
 @pytest.mark.cuda
 @pytest.mark.L4
 def test_a_whole_decode_loop_matches_the_unpaged_path():

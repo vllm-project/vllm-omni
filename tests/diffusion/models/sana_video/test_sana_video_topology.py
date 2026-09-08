@@ -3,8 +3,10 @@
 
 """Topology validation for SANA-Video parallelism.
 
-The native pipeline only supports tensor/CFG parallel of size 1 or 2 and rejects
-sequence parallel and text-encoder TP before any large weight is allocated.
+The native pipeline only supports tensor/CFG parallel of size 1 or 2 and
+sequence parallel of degree 1, 2 or 4 (Ulysses flag, frame-sharded manual
+implementation); it rejects ring/AllGather-KV SP, the untested TP x SP combo
+and text-encoder TP before any large weight is allocated.
 """
 
 from types import SimpleNamespace
@@ -24,6 +26,8 @@ def _pc(
     tp: int = 1,
     cfg: int = 1,
     sp: int | None = None,
+    ring: int = 1,
+    allgather: int = 1,
     text_tp: int = 1,
     pp: int = 1,
     hsdp: bool = False,
@@ -32,6 +36,8 @@ def _pc(
         tensor_parallel_size=tp,
         cfg_parallel_size=cfg,
         sequence_parallel_size=sp,
+        ring_degree=ring,
+        allgather_degree=allgather,
         text_encoder_tp_size=text_tp,
         pipeline_parallel_size=pp,
         use_hsdp=hsdp,
@@ -54,9 +60,30 @@ def test_cfg3_rejected() -> None:
         validate_sana_video_parallel_config(_pc(cfg=3))
 
 
-def test_sequence_parallel_rejected() -> None:
-    with pytest.raises(NotImplementedError, match="[Ss]equence parallel"):
-        validate_sana_video_parallel_config(_pc(sp=2))
+@pytest.mark.parametrize("sp", [None, 1, 2, 4])
+def test_supported_sp_sizes_pass(sp: int | None) -> None:
+    validate_sana_video_parallel_config(_pc(sp=sp))
+
+
+@pytest.mark.parametrize("sp", [3, 8])
+def test_unsupported_sp_sizes_rejected(sp: int) -> None:
+    with pytest.raises(NotImplementedError, match="sequence_parallel_size"):
+        validate_sana_video_parallel_config(_pc(sp=sp))
+
+
+def test_ring_sequence_parallel_rejected() -> None:
+    with pytest.raises(NotImplementedError, match="ring"):
+        validate_sana_video_parallel_config(_pc(sp=2, ring=2))
+
+
+def test_allgather_sequence_parallel_rejected() -> None:
+    with pytest.raises(NotImplementedError, match="AllGather"):
+        validate_sana_video_parallel_config(_pc(sp=2, allgather=2))
+
+
+@pytest.mark.parametrize("sp", [2, 4])
+def test_tp2_sp_combos_pass(sp: int) -> None:
+    validate_sana_video_parallel_config(_pc(tp=2, sp=sp))
 
 
 def test_pipeline_parallel_rejected() -> None:
@@ -76,6 +103,10 @@ def test_text_encoder_tp_rejected() -> None:
 
 def test_tp2_cfg2_combo_passes() -> None:
     validate_sana_video_parallel_config(_pc(tp=2, cfg=2))
+
+
+def test_sp2_cfg2_combo_passes() -> None:
+    validate_sana_video_parallel_config(_pc(sp=2, cfg=2))
 
 
 @pytest.mark.parametrize("pipeline_cls", [SanaVideoPipeline, SanaImageToVideoPipeline])

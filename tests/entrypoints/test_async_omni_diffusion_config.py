@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig
+from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
@@ -426,8 +427,8 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
     ]
 
 
-def test_serve_cli_forwards_distributed_offload_residency():
-    """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
+def test_serve_cli_forwards_compact_diffusion_offload_config():
+    """Ensure component-specific layer settings reach the diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
@@ -437,10 +438,11 @@ def test_serve_cli_forwards_distributed_offload_residency():
             "serve",
             "MiniMaxAI/MiniMax-H3",
             "--omni",
-            "--enable-distributed-layerwise-offload",
-            "--dlo-no-use-allgather",
-            "--dlo-resident-layers",
-            "20",
+            "--diffusion-offload-config",
+            '{"mode":"layer","components":["dit","text_encoder"],'
+            '"layer_options":{"dit":{"weight_transfer":"rank-local","resident_layers":20},'
+            '"text_encoder":{"weight_transfer":"allgather"}},'
+            '"pin_memory":true}',
         ]
     )
 
@@ -448,12 +450,45 @@ def test_serve_cli_forwards_distributed_offload_residency():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
     engine_args = stage_cfg["engine_args"]
 
-    assert args.enable_distributed_layerwise_offload is True
-    assert args.dlo_use_allgather is False
-    assert args.dlo_resident_layers == 20
-    assert engine_args["enable_distributed_layerwise_offload"] is True
-    assert engine_args["dlo_use_allgather"] is False
-    assert engine_args["dlo_resident_layers"] == 20
+    expected = {
+        "mode": "layer",
+        "components": ["dit", "text_encoder"],
+        "layer_options": {
+            "dit": {"weight_transfer": "rank-local", "resident_layers": 20},
+            "text_encoder": {"weight_transfer": "allgather"},
+        },
+        "pin_memory": True,
+    }
+    assert args.diffusion_offload_config == expected
+    assert engine_args["diffusion_offload_config"] == expected
+
+
+def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch, mocker):
+    load_model = mocker.patch("vllm_omni.diffusion.model_loader.diffusers_loader.DiffusersPipelineLoader.load_model")
+    create_client = mocker.patch("vllm_omni.diffusion.stage_diffusion_client.create_diffusion_client")
+    monkeypatch.setattr(
+        stage_init_utils,
+        "build_engine_args_dict",
+        lambda *_args, **_kwargs: {
+            "model": "test",
+            "diffusion_offload_config": {
+                "mode": "layerwise",
+                "components": ["dit"],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="Unknown diffusion offload mode"):
+        stage_init_utils.initialize_diffusion_stage(
+            stage_id=0,
+            model="test",
+            stage_cfg=object(),
+            metadata=mocker.Mock(),
+            stage_init_timeout=30,
+        )
+
+    create_client.assert_not_called()
+    load_model.assert_not_called()
 
 
 def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():

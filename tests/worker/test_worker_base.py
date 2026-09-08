@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Characterization tests for ``vllm_omni.worker.base.OmniGPUWorkerBase``.
 
-Pins the CURRENT behaviour of ``determine_available_memory`` (BOTH the NVML /
-process-scoped arm AND the profiling-fallback arm — this base still carries the
-NVML branch), plus the
+Pins the CURRENT behaviour of ``determine_available_memory`` (device-level
+profiling is the only path — the NVML / process-scoped arm was removed with
+parallel stage init, which coordinates concurrent same-device measurement via
+admission + SH/EX device locks instead), plus the
 memory-pool / sleep / wake-up plumbing that a later change may touch.
 
 Workers are constructed via ``object.__new__`` with only the attributes each
@@ -57,27 +58,20 @@ def _make_worker(*, requested_memory: int, kv_cache_memory_bytes: int = 0, model
 # --------------------------------------------------------------------------- #
 # determine_available_memory                                                  #
 # --------------------------------------------------------------------------- #
-def test_determine_available_memory_nvml_arm(monkeypatch):
-    """NVML available -> available = requested - per-process memory."""
+def test_no_process_scoped_collaborators_remain():
+    """The NVML arm is gone from base.py, so the method CANNOT take a
+    process-scoped path on any host: its collaborators are not even imported.
+    (The removal itself happened in the parallel-stage-init feature commit;
+    tests/engine/test_parallel_stage_init.py pins the same invariant.)"""
+    assert not hasattr(base, "is_process_scoped_memory_available")
+    assert not hasattr(base, "detect_pid_host")
+    assert not hasattr(base, "get_process_gpu_memory")
+
+
+def test_determine_available_memory_profiling_path(monkeypatch):
+    """available = requested - (weights + peak + non_torch); the only path."""
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
     monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
-    monkeypatch.setattr(base, "is_process_scoped_memory_available", lambda: True)
-    monkeypatch.setattr(base, "detect_pid_host", lambda: True)
-    monkeypatch.setattr(base, "get_process_gpu_memory", lambda local_rank: 8 * GIB)
-
-    out = OmniGPUWorkerBase.determine_available_memory(worker)
-
-    # NVML arm ignores profiled usage; uses process_memory directly.
-    assert out == 30 * GIB - 8 * GIB
-
-
-def test_determine_available_memory_profiling_fallback_arm(monkeypatch):
-    """NVML unavailable -> available = requested - (weights + peak + non_torch)."""
-    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
-    monkeypatch.setattr(base, "is_process_scoped_memory_available", lambda: False)
-    # detect_pid_host is short-circuited by the `and`, but pin it anyway.
-    monkeypatch.setattr(base, "detect_pid_host", lambda: True)
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
@@ -85,25 +79,20 @@ def test_determine_available_memory_profiling_fallback_arm(monkeypatch):
     assert out == 30 * GIB - profiled
 
 
-def test_determine_available_memory_falls_back_when_not_pid_host(monkeypatch):
-    """detect_pid_host False also routes to the profiling fallback."""
-    worker = _make_worker(requested_memory=20 * GIB, model_memory_usage=5 * GIB)
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=0, torch_peak=0))
-    monkeypatch.setattr(base, "is_process_scoped_memory_available", lambda: True)
-    monkeypatch.setattr(base, "detect_pid_host", lambda: False)
+def test_determine_available_memory_populates_total_consumed(monkeypatch):
+    """total_consumed mirrors upstream's MemoryProfilingResult field."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
 
-    out = OmniGPUWorkerBase.determine_available_memory(worker)
+    OmniGPUWorkerBase.determine_available_memory(worker)
 
-    assert out == 20 * GIB - 5 * GIB
+    assert worker.total_consumed == 3 * GIB
 
 
 def test_determine_available_memory_clamps_to_zero(monkeypatch):
     """Over-subscription clamps the KV budget to 0, never negative."""
-    worker = _make_worker(requested_memory=5 * GIB, model_memory_usage=0)
+    worker = _make_worker(requested_memory=5 * GIB, model_memory_usage=8 * GIB)
     monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=0, torch_peak=0))
-    monkeypatch.setattr(base, "is_process_scoped_memory_available", lambda: True)
-    monkeypatch.setattr(base, "detect_pid_host", lambda: True)
-    monkeypatch.setattr(base, "get_process_gpu_memory", lambda local_rank: 8 * GIB)
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 

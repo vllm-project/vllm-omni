@@ -4,9 +4,11 @@ This directory contains MiniCPM-o 4.5 online serving demos for vLLM-Omni.
 Inputs can include text, image, audio, or video; outputs are text and optional
 24 kHz speech.
 
-For the experimental native duplex runtime architecture, lifecycle invariants,
+For the native duplex runtime architecture, lifecycle invariants,
 capability boundary, and validation scope, see
-[`vllm_omni/experimental/fullduplex/DESIGN.md`](../../../vllm_omni/experimental/fullduplex/DESIGN.md).
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md); for the
+`DuplexClient` API and the `/v1/realtime?duplex=1` wire protocol, see
+[`docs/serving/realtime_duplex_api.md`](../../../docs/serving/realtime_duplex_api.md).
 
 ## Installation
 
@@ -231,7 +233,7 @@ Start the duplex generation server:
 
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
-    --deploy-config vllm_omni/deploy/minicpmo_4_5_duplex.yaml \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
     --served-model-name openbmb/MiniCPM-o-4_5 \
     --host 0.0.0.0 --port 8099
 ```
