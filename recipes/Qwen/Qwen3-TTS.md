@@ -263,7 +263,6 @@ curl -X POST http://localhost:8091/v1/audio/speech \
       gpu_memory_utilization: 0.15
   ```
 
-<!-- 2026-09-08, tianqi, add 1x A100 40GB 0.6B CustomVoice hardware section (measured) -->
 ### 1x A100 40GB (0.6B CustomVoice)
 
 #### Environment
@@ -351,7 +350,6 @@ curl -X POST http://localhost:8091/v1/audio/speech \
   Confirm `torch.__version__` contains `cu129`. If a CPU build is already
   installed, `uv pip install --torch-backend=cu129` is a no-op; use
   `--reinstall`.
-<!-- end -->
 
 ### 1x AMD MI300X, 1.7B checkpoints
 
