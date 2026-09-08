@@ -219,8 +219,9 @@ def wait_for_kv_load(
     connector = active_connector.kv_connector
     active_connector.pre_forward(scheduler_output)
     pending = set(scheduler_output.kv_transfer_request_ids)
+    finished_ids = scheduler_output.kv_finished_request_ids
     if not pending:
-        output = active_connector.post_forward(scheduler_output.finished_req_ids)
+        output = active_connector.post_forward(finished_ids)
         if output.invalid_block_ids:
             raise RuntimeError("Diffusion KV connector reported invalid remote pages")
         return output
@@ -228,7 +229,7 @@ def wait_for_kv_load(
     received, sent = set(), set()
     deadline = time.monotonic() + timeout
     while True:
-        finished_sending, finished_recving = connector.get_finished(scheduler_output.finished_req_ids)
+        finished_sending, finished_recving = connector.get_finished(finished_ids)
         sent.update(finished_sending or ())
         received.update(finished_recving or ())
         pending.difference_update(received)
@@ -239,7 +240,7 @@ def wait_for_kv_load(
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Timed out receiving diffusion KV for {sorted(pending)}")
         time.sleep(0.001)
-    output = active_connector.post_forward(scheduler_output.finished_req_ids)
+    output = active_connector.post_forward(finished_ids)
     output.finished_sending = sent | (output.finished_sending or set())
     output.finished_recving = received | (output.finished_recving or set())
     if output.invalid_block_ids:

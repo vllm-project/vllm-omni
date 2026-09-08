@@ -255,6 +255,8 @@ class DiffusionSchedulerOutput:
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None
     kv_transfer_request_ids: set[str] = field(default_factory=set)
+    # Connector lifecycle uses per-sequence IDs, not public request IDs.
+    kv_finished_request_ids: set[str] = field(default_factory=set)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

@@ -181,11 +181,12 @@ def test_wait_without_pending_load_uses_vllm_post_forward_once() -> None:
     scheduler_output = SimpleNamespace(
         kv_transfer_request_ids=set(),
         finished_req_ids={"finished"},
+        kv_finished_request_ids={"finished/diffusion-kv/0", "finished/diffusion-kv/1"},
     )
 
     result = wait_for_kv_load(active_connector, scheduler_output, timeout=1.0)
 
     assert result is output
     active_connector.pre_forward.assert_called_once_with(scheduler_output)
-    active_connector.post_forward.assert_called_once_with({"finished"})
+    active_connector.post_forward.assert_called_once_with({"finished/diffusion-kv/0", "finished/diffusion-kv/1"})
     connector.get_finished.assert_not_called()
