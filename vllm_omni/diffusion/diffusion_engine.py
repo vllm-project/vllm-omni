@@ -775,9 +775,13 @@ class DiffusionEngine:
         for stream in streams:
             self._put_queue_output(stream, DiffusionOutput.from_exception(exc))
         self._fail_pending_rpcs(exc)
-        self.executor.shutdown()
-        self.scheduler.close()
-        self._shutdown_complete = True
+        try:
+            self.executor.shutdown()
+        finally:
+            try:
+                self.scheduler.close()
+            finally:
+                self._shutdown_complete = True
 
     def _emit_finished_outputs(
         self,
