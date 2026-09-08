@@ -669,17 +669,21 @@ def print_stage_metrics(
 def _build_stage_metrics_from_outputs(
     outputs: list[RequestFuncOutput],
 ) -> list[StageBenchmarkMetrics]:
-    """Aggregate per ``stage_id`` using ``stage_metrics`` snapshots from the client."""
+    """Aggregate final snapshots per stage, with one sample per duplex response."""
     buckets: dict[str, list[tuple[RequestFuncOutput, dict]]] = defaultdict(list)
     for out in outputs:
         if not getattr(out, "success", False):
             continue
-        smap = getattr(out, "stage_metrics", None) or {}
-        if not isinstance(smap, dict) or not smap:
-            continue
-        for sid, info in smap.items():
-            if isinstance(info, dict):
-                buckets[str(sid)].append((out, info))
+        by_response = getattr(out, "stage_metrics_by_response", None)
+        # Duplex snapshots are authoritative, including an empty mapping. Do
+        # not also count the legacy single-request snapshot for this output.
+        snapshots = by_response.values() if by_response is not None else [getattr(out, "stage_metrics", None)]
+        for smap in snapshots:
+            if not isinstance(smap, dict):
+                continue
+            for sid, info in smap.items():
+                if isinstance(info, dict):
+                    buckets[str(sid)].append((out, info))
 
     result: list[StageBenchmarkMetrics] = []
     for sid in sorted(buckets.keys(), key=lambda x: int(x)):
@@ -703,8 +707,12 @@ def _build_stage_metrics_from_outputs(
         vllm_ttfts: list[float] = []
         vllm_tpots: list[float] = []
         vllm_itls: list[float] = []
-        stage_gen_times_ms = [float((info or {}).get(defs.STAGE_GEN_TIME_MS) or 0.0) for _, info in rows]
-        postprocess_times_ms = [float((info or {}).get(defs.POSTPROCESS_TIME_MS) or 0.0) for _, info in rows]
+        stage_gen_times_ms = [
+            float(info[defs.STAGE_GEN_TIME_MS]) for _, info in rows if info.get(defs.STAGE_GEN_TIME_MS) is not None
+        ]
+        postprocess_times_ms = [
+            float(info[defs.POSTPROCESS_TIME_MS]) for _, info in rows if info.get(defs.POSTPROCESS_TIME_MS) is not None
+        ]
         output_unit_count = sum(int((info or {}).get(defs.OUTPUT_UNIT_COUNT) or 0) for _, info in rows)
         inter_output_latencies_ms: list[float] = []
         serving_time_to_first_outputs_ms: list[float] = []

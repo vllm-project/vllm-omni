@@ -8,9 +8,10 @@ Unit tests for metrics.py
 import math
 
 import pytest
+from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
 from vllm.benchmarks.serve import TaskType
 
-from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
+from vllm_omni.benchmarks.metrics.metrics import _build_stage_metrics_from_outputs, calculate_metrics
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
@@ -586,6 +587,48 @@ def test_image_with_generated_text_still_reports_text_result(capsys):
     assert " Text Result " in out
     assert "Time to First Token" in out
     assert " Image Result " in out
+
+
+@pytest.mark.parametrize("by_response", [None, {}, {"resp-1": {"0": {"num_tokens_out": 20}}}])
+def test_stage_metrics_selects_one_snapshot_source(by_response):
+    output = MixRequestFuncOutput(success=True)
+    snapshot = {"stage_name": "thinker", "final_output_type": "text", "num_tokens_out": 99}
+    output.stage_metrics = {"0": snapshot}
+    output.stage_metrics_by_response = by_response
+    if by_response:
+        by_response["resp-1"]["0"] = {**snapshot, "num_tokens_out": 20}
+    stages = _build_stage_metrics_from_outputs([output])
+    expected_tokens = [] if by_response == {} else [99 if by_response is None else 20]
+    assert [stage.total_output for stage in stages] == expected_tokens
+
+
+def test_stage_metrics_tolerates_plain_outputs_and_excludes_failed_sessions():
+    plain = RequestFuncOutput(success=True)
+    failed = MixRequestFuncOutput(success=False)
+    failed.stage_metrics_by_response = {"resp-1": {"0": {"final_output_type": "text", "num_tokens_out": 20}}}
+    assert _build_stage_metrics_from_outputs([plain, failed]) == []
+
+
+@pytest.mark.parametrize("duplex", [False, True])
+def test_stage_timing_excludes_missing_values_but_retains_measured_zero(duplex):
+    outputs = []
+    timings: list[dict[str, float | None]] = [
+        {},
+        {"stage_gen_time_ms": None},
+        {"stage_gen_time_ms": 0.0},
+        {"stage_gen_time_ms": 100.0, "postprocess_time_ms": 5.0},
+    ]
+    for index, timing in enumerate(timings):
+        output = MixRequestFuncOutput(success=True)
+        snapshot: dict[str, dict[str, object]] = {"0": {"final_output_type": "text", **timing}}
+        if duplex:
+            output.stage_metrics_by_response = {f"resp-{index}": snapshot}
+        else:
+            output.stage_metrics = snapshot
+        outputs.append(output)
+    stage = _build_stage_metrics_from_outputs(outputs)[0]
+    assert stage.stage_gen_times_ms == [0.0, 100.0]
+    assert stage.postprocess_times_ms == [5.0]
 
 
 if __name__ == "__main__":
