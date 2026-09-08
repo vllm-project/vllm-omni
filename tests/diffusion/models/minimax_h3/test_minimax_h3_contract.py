@@ -63,6 +63,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.load_text_encoder = False
+    pipeline.load_vae_encoder = False
     pipeline.partition = "fl2va"
     pipeline.supported_tasks = frozenset({"t2va"})
     pipeline.default_video_shift = 12.0
@@ -631,6 +632,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.od_config = SimpleNamespace()
     pipeline._base_schedule_by_partition = schedules
     pipeline.load_text_encoder = False
+    pipeline.load_vae_encoder = False
     pipeline._quality_policy = Mock()
     pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
