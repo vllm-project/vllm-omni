@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,8 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/segmentations`` may serve this model: it takes one
     # video path plus text prompts and returns a ``video_segmentation`` payload.
     supports_video_segmentation: bool = False
+    # Head-sharded MoE uses SP-local groups, not vLLM FusedMoE rank folding.
+    expert_parallel_style: Literal["vllm", "head"] = "vllm"
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
