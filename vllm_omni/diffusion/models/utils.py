@@ -31,6 +31,34 @@ if TYPE_CHECKING:
 Style = Literal["colwise", "colwise_rep", "rowwise", "rowwise_rep", "replicate"]
 
 
+def make_attention_mask(
+    hidden_states: torch.Tensor,
+    seq_lengths: list[int],
+) -> torch.Tensor | None:
+    """Build a padding mask only when the batch contains padding.
+
+    ``seq_lengths`` must be non-empty and contain valid sequence lengths.
+    Returns a boolean mask of shape ``(len(seq_lengths), max(seq_lengths))``
+    on the device of ``hidden_states``, with True marking valid tokens,
+    or None when all sequence lengths are equal.
+
+    Passing an all-true CUDA mask makes attention backends inspect a device
+    scalar to select the dense path, which introduces a host-device sync.
+    """
+    max_seq_len = max(seq_lengths)
+    if all(seq_len == max_seq_len for seq_len in seq_lengths):
+        return None
+
+    attention_mask = hidden_states.new_zeros(
+        len(seq_lengths),
+        max_seq_len,
+        dtype=torch.bool,
+    )
+    for i, seq_len in enumerate(seq_lengths):
+        attention_mask[i, :seq_len] = True
+    return attention_mask
+
+
 def replace_linear_class(
     linear: nn.Linear,
     style: Style = "replicate",

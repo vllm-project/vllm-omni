@@ -658,10 +658,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Wan ``feat_cache`` mutation is incompatible with CUDAGraph capture.
         DiT blocks use per-block ``fullgraph=True``.
         """
-        if not torch.cuda.is_available():
-            logger.info("DreamZero setup_compile skipped: CUDA not available.")
-            return
-
         from vllm_omni.diffusion.models.dreamzero.wan_vae_feat_cache_patch import (
             apply_wan_vae_feat_cache_tensor_patch,
         )

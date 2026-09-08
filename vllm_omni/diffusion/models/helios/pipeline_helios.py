@@ -18,18 +18,20 @@ from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
+from typing_extensions import override
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.prompt_update import PromptUpdateMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
@@ -160,7 +162,7 @@ class HeliosPipeline(
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
-    PromptUpdateMixin,
+    InteractionMixin,
     SupportsComponentDiscovery,
 ):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
@@ -533,10 +535,22 @@ class HeliosPipeline(
                 "zero_steps": int(extra.get("zero_steps", 1)),
             }
         )
-        self._prepare_next_chunk(state)
+        self.prepare_next_chunk(state)
         return state
 
-    def _prepare_next_chunk(self, state: StepRequestState) -> None:
+    def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
+        """Expose this chunk's decoded media extent for interaction timelines."""
+        num_frames = int(state.extra["window_num_frames"])
+        fps = state.sampling.fps
+        if fps is None or float(fps) <= 0:
+            raise ValueError(
+                "sampling.fps is required and must be > 0 for interaction modalities that use the "
+                f"chunk media timeline, got {fps!r} (request_id={state.request_id!r})"
+            )
+        return ChunkMediaSpec(num_frames=num_frames, fps=float(fps))
+
+    @override
+    def prepare_next_chunk(self, state: StepRequestState) -> None:
         extra = state.extra
         k = state.chunk_index
         is_first_chunk = k == 0
@@ -900,14 +914,9 @@ class HeliosPipeline(
 
         output = current_latents if extra["output_type"] == "latent" else current_video
         completed_chunk_index = state.chunk_index
-        prompt_update_metadata = state.extra.pop("prompt_update_chunk_metadata", {})
         state.chunk_index += 1
         finished = state.request_denoise_completed
-        if not finished:
-            # Apply queued/advancing prompt updates before preparing the next chunk.
-            self._apply_prompt_update_at_chunk_boundary(state)
-            self._prepare_next_chunk(state)
-        else:
+        if finished:
             self._current_timestep = None
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()
@@ -917,9 +926,6 @@ class HeliosPipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
             chunk_index=completed_chunk_index,
             total_chunks=state.total_chunks,
-            started_event_ids=prompt_update_metadata.get("started_event_ids", []),
-            active_event_ids=prompt_update_metadata.get("active_event_ids", []),
-            completed_event_ids=prompt_update_metadata.get("completed_event_ids", []),
             finished=finished,
         )
 
@@ -1352,6 +1358,8 @@ class HeliosPipeline(
         """Single-stage denoising loop for one chunk."""
         batch_size = latents.shape[0]
         do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+        # Distilled (DMD) needs the chunk-start noise for renoise; mirror step_scheduler.
+        stage1_start_latents = latents
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
@@ -1414,7 +1422,20 @@ class HeliosPipeline(
                         cfg_normalize=False,
                     )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if self.is_distilled:
+                    latents = self.scheduler.step(
+                        noise_pred,
+                        t,
+                        latents,
+                        return_dict=False,
+                        cur_sampling_step=i,
+                        dmd_noisy_tensor=stage1_start_latents,
+                        dmd_sigmas=self.scheduler.sigmas,
+                        dmd_timesteps=self.scheduler.timesteps,
+                        all_timesteps=timesteps,
+                    )[0]
+                else:
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
                 pbar.update()
 

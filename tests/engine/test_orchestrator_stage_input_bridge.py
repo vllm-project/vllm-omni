@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -14,6 +14,11 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine.duplex.contracts import (
+    DuplexStageRequestContext,
+    DuplexStageSubmission,
+)
+from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
@@ -21,11 +26,6 @@ from vllm_omni.engine.orchestrator import (
     _OrchestratorDuplexStagePort,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.fullduplex.engine.contracts import (
-    DuplexStageRequestContext,
-    DuplexStageSubmission,
-)
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

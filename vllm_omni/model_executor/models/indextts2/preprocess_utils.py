@@ -102,9 +102,6 @@ def load_wav2vec2(model_path: str, device: torch.device):
         except Exception as exc:
             raise RuntimeError(f"Failed to load local IndexTTS Wav2Vec2-BERT assets from {local_dir!r}") from exc
 
-    if local_dir is None and os.path.isdir(model_path):
-        raise FileNotFoundError(f"IndexTTS Wav2Vec2-BERT assets are missing from local bundle {model_path!r}")
-
     # Try a remote model subfolder, then the public base model.
     try:
         if model is None or processor is None:
@@ -173,8 +170,6 @@ def load_semantic_codec(
         state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         codec.load_state_dict(state, strict=False)
     else:
-        if os.path.isdir(model_path):
-            raise FileNotFoundError(f"IndexTTS RepCodec checkpoint is missing from local bundle {model_path!r}")
         import safetensors.torch
 
         from vllm_omni.transformers_utils.repo_utils import hf_api
