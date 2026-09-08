@@ -262,9 +262,12 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
 
 
 @pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
-def test_llm_additional_config_roundtrip_and_isolation(stage_id):
+def test_llm_additional_config_roundtrip_and_isolation(stage_id, monkeypatch):
+    from vllm_omni.engine import stage_init_utils
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
+    # Worker discovery requires hardware support; this test covers config transport.
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     additional_config = {"backend_options": {"enabled": True}}
     pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")
     deploy = DeployConfig(
@@ -285,10 +288,12 @@ def test_llm_additional_config_roundtrip_and_isolation(stage_id):
 
 @pytest.mark.parametrize("deploy_name", ["minicpmo_4_5", "minicpmo_4_5_2gpu", "minicpmo_4_5_3gpu"])
 def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_name):
+    from vllm_omni.engine import stage_init_utils
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
     expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     assert stage.runtime_config.additional_config == expected
