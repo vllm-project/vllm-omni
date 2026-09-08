@@ -374,6 +374,17 @@ def _surviving_labels(doc: dict, changed_files: list[str]) -> set[str]:
     return labels
 
 
+def _iter_steps(doc: dict):
+    def walk(steps: list | None):
+        for step in steps or []:
+            if not isinstance(step, dict):
+                continue
+            yield step
+            yield from walk(step.get("steps"))
+
+    yield from walk(doc.get("steps"))
+
+
 # Synthetic coverage-style job: shared inputs that change what the split measures.
 _COVERAGE_SHARED_INPUTS_DOC = {
     "steps": [
@@ -458,7 +469,7 @@ def test_source_file_dependencies_key_expands_from_registry() -> None:
         "steps": [
             {
                 "label": "Diffusion · Qwen Image Test",
-                "source_file_dependencies": "diffusion_qwen_image",
+                "source_file_dependencies": "diffusion_qwen_image_function",
                 "commands": ["pytest"],
             },
         ],
@@ -470,11 +481,12 @@ def test_source_file_dependencies_key_expands_from_registry() -> None:
     assert "Diffusion · Qwen Image Test" not in _surviving_labels(doc, ["vllm_omni/unrelated.py"])
 
 
-def test_pytest_targets_are_merged_from_commands() -> None:
+def test_registry_lists_pytest_targets() -> None:
+    _load_source_file_dependencies.cache_clear()
     resolved = _resolve_source_file_dependencies(
         {
             "label": "Diffusion · Wan22 Test",
-            "source_file_dependencies": "diffusion_wan22",
+            "source_file_dependencies": "diffusion_wan22_function",
             "commands": [
                 "pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py "
                 "tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model'",
@@ -485,10 +497,12 @@ def test_pytest_targets_are_merged_from_commands() -> None:
     assert "tests/e2e/offline_inference/test_wan22_t2v.py" in resolved
     assert "tests/e2e/online_serving/test_wan22_t2v.py" in resolved
     assert "vllm_omni/diffusion/models/wan2_2/" in resolved
-    assert "tests/e2e/online_serving/test_wan22_t2v.py" not in _load_source_file_dependencies()["diffusion_wan22"]
+    model = _load_source_file_dependencies()["diffusion_wan22"]
+    assert "vllm_omni/diffusion/models/wan2_2/" in model
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" not in model
 
 
-def test_run_cov_split_offline_online_are_extracted() -> None:
+def test_coverage_key_lists_offline_online_scripts() -> None:
     resolved = _resolve_source_file_dependencies(
         {
             "label": "TTS · Qwen3-TTS Base Test",
@@ -538,70 +552,106 @@ def test_source_file_dependencies_rejects_mixed_keys_and_paths() -> None:
         )
 
 
-def test_ready_yaml_key_filter_selects_matching_e2e_job() -> None:
-    doc = yaml.safe_load(Path(".buildkite/cuda/test-ready.yml").read_text(encoding="utf-8"))
-    labels = _surviving_labels(doc, ["vllm_omni/diffusion/models/qwen_image/foo.py"])
-    assert "Diffusion · Qwen Image Test" in labels
-    assert "Omni · Qwen3-Omni Test" not in labels
-    rendered = _render_test_pipeline(doc, changed_files=["vllm_omni/diffusion/models/qwen_image/foo.py"])
-    dumped = yaml.safe_dump(rendered)
-    assert "source_file_dependencies" not in dumped
-    assert "mirror_hardwares" not in dumped
+# Synthetic pipeline: selection depends only on listed deps, not on live job names.
+_SOURCE_FILTER_DOC = {
+    "steps": [
+        {
+            "group": "E2E Tests",
+            "if": 'build.env("NON_CRITICAL") == "1"',
+            "steps": [
+                {
+                    "label": "Dedicated E2E",
+                    "commands": ["pytest -sv tests/e2e/online_serving/test_magi2.py"],
+                },
+            ],
+        },
+        {
+            "label": "Omni Sweep",
+            "source_file_dependencies": ["tests/e2e/online_serving/test_qwen3_omni.py"],
+            "commands": ["pytest -sv tests/e2e/ -m omni"],
+        },
+        {
+            "label": "Z-Image Function",
+            "source_file_dependencies": [
+                "tests/e2e/online_serving/test_zimage_expansion.py",
+                "vllm_omni/diffusion/models/z_image/",
+            ],
+            "mirror_hardwares": "l4_4",
+            "commands": ["pytest -sv tests/e2e/online_serving/test_zimage_expansion.py"],
+        },
+        {
+            "label": "Tiny Model",
+            "source_file_dependencies": ["tests/e2e/online_serving/test_tiny.py"],
+            "commands": ["pytest -sv tests/e2e/ -m tiny"],
+        },
+        {
+            "label": "Wan Function",
+            "source_file_dependencies": [
+                "tests/e2e/offline_inference/test_wan22_t2v.py",
+                "tests/e2e/online_serving/test_wan22_t2v.py",
+                "vllm_omni/diffusion/models/wan2_2/",
+            ],
+            "commands": ["pytest -sv tests/e2e/offline_inference/test_wan22_t2v.py"],
+        },
+        {
+            "label": "Wan Perf",
+            "source_file_dependencies": ["vllm_omni/diffusion/models/wan2_2/"],
+            "commands": ["pytest -sv tests/dfx/perf/scripts/run_benchmark.py"],
+        },
+        {
+            "label": "Doc Test",
+            "source_file_dependencies": [
+                "tests/examples/offline_inference/test_text_to_image.py",
+                "tests/examples/online_serving/test_text_to_image.py",
+                "vllm_omni/diffusion/models/qwen_image/",
+                "vllm_omni/diffusion/models/z_image/",
+            ],
+            "commands": ["pytest -sv tests/examples/*/test_text_to_image.py"],
+        },
+    ],
+}
 
 
-def test_ready_yaml_pytest_target_selects_job() -> None:
-    doc = yaml.safe_load(Path(".buildkite/cuda/test-ready.yml").read_text(encoding="utf-8"))
-    labels = _surviving_labels(doc, ["tests/e2e/online_serving/test_wan22_t2v.py"])
-    assert "Diffusion · Wan22 Test" in labels
-    assert "Diffusion · Qwen Image Test" not in labels
+def test_source_filter_ignores_unrelated_e2e_file() -> None:
+    """A sweep command is not a dependency; only listed paths select a keyed job."""
+    labels = _surviving_labels(_SOURCE_FILTER_DOC, ["tests/e2e/online_serving/test_magi2.py"])
+    assert labels == {"Dedicated E2E"}
 
 
-def test_merge_yaml_pytest_offline_target_selects_shared_key_job() -> None:
-    doc = yaml.safe_load(Path(".buildkite/cuda/test-merge.yml").read_text(encoding="utf-8"))
-    labels = _surviving_labels(doc, ["tests/e2e/offline_inference/test_wan22_t2v.py"])
-    assert "Diffusion · Wan22 Test" in labels
-    assert "Diffusion · Qwen Image Test" not in labels
+def test_source_filter_selects_job_by_listed_script_not_sibling() -> None:
+    labels = _surviving_labels(_SOURCE_FILTER_DOC, ["tests/e2e/online_serving/test_zimage_expansion.py"])
+    assert labels == {"Dedicated E2E", "Z-Image Function"}
 
 
-def test_nightly_yaml_source_key_selects_matching_job() -> None:
-    doc = yaml.safe_load(Path(".buildkite/cuda/test-nightly.yml").read_text(encoding="utf-8"))
-    labels = _surviving_labels(doc, ["vllm_omni/diffusion/models/wan2_2/transformer.py"])
-    assert any("Wan2.2 T2V Function Test" in label for label in labels)
-    assert not any("Single-GPU" in label and "Qwen-Image" in label for label in labels)
+def test_source_filter_selects_every_job_sharing_a_path() -> None:
+    labels = _surviving_labels(_SOURCE_FILTER_DOC, ["vllm_omni/diffusion/models/wan2_2/transformer.py"])
+    assert labels == {"Dedicated E2E", "Wan Function", "Wan Perf"}
 
 
-def test_npu_nightly_yaml_source_key_selects_matching_job() -> None:
-    _load_source_file_dependencies.cache_clear()
-    doc = yaml.safe_load(Path(".buildkite/npu/test-npu-nightly.yml").read_text(encoding="utf-8"))
-    labels = _surviving_labels(doc, ["vllm_omni/diffusion/models/wan2_2/transformer.py"])
-    assert any("Diffusion X2V · Function Test" in label for label in labels)
-    assert any("Diffusion X2V · Perf Test" in label for label in labels)
-    assert not any("MiniCPM" in label for label in labels)
-    assert not any("HunyuanImage3" in label for label in labels)
+def test_source_filter_selects_composed_doc_job_by_example_or_model() -> None:
+    for changed in (
+        "tests/examples/online_serving/test_text_to_image.py",
+        "vllm_omni/diffusion/models/z_image/transformer.py",
+        "vllm_omni/diffusion/models/qwen_image/foo.py",
+    ):
+        labels = _surviving_labels(_SOURCE_FILTER_DOC, [changed])
+        assert "Doc Test" in labels, changed
+        assert "Tiny Model" not in labels
+        assert "Omni Sweep" not in labels
+    assert "Doc Test" not in _surviving_labels(_SOURCE_FILTER_DOC, ["tests/e2e/online_serving/test_magi2.py"])
+
+
+def test_source_filter_strips_deps_and_expands_hardware(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     rendered = _render_test_pipeline(
-        doc,
-        changed_files=["vllm_omni/diffusion/models/wan2_2/transformer.py"],
+        _SOURCE_FILTER_DOC,
+        changed_files=["tests/e2e/online_serving/test_zimage_expansion.py"],
     )
     dumped = yaml.safe_dump(rendered)
     assert "source_file_dependencies" not in dumped
     assert "mirror_hardwares" not in dumped
-
-
-def test_weekly_yaml_source_key_selects_matching_job() -> None:
-    _load_source_file_dependencies.cache_clear()
-    doc = yaml.safe_load(Path(".buildkite/cuda/test-weekly.yml").read_text(encoding="utf-8"))
-    labels = _surviving_labels(doc, ["vllm_omni/diffusion/models/wan2_2/transformer.py"])
-    assert "Reliability Test · wan22" in labels
-    assert "Reliability Test · Invalid parameters · H100 · Single-GPU" in labels
-    assert "Reliability Test · Invalid parameters · H100 · 2-GPU" in labels
-    assert "Reliability Test · qwen3-omni" not in labels
-    assert "Reliability Test · Invalid parameters · L4" not in labels
-    assert not any("Perf Test · vLLM Text" in label for label in labels)
-    rendered = _render_test_pipeline(
-        doc,
-        changed_files=["vllm_omni/diffusion/models/wan2_2/transformer.py"],
-    )
-    assert "source_file_dependencies" not in yaml.safe_dump(rendered)
+    z_image = next(step for step in _iter_steps(rendered) if step.get("label") == "Z-Image Function")
+    assert z_image["agents"]["queue"] == "l4-k8s"
 
 
 def test_source_filter_disabled_on_main_branch(monkeypatch: pytest.MonkeyPatch) -> None:

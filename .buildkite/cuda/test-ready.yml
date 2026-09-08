@@ -139,7 +139,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Omni · Qwen3-Omni Test"
-        source_file_dependencies: omni_qwen3_omni
+        source_file_dependencies: omni_qwen3_omni_function
         commands:
           - |
             timeout 20m bash -c "
@@ -148,7 +148,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: "Omni · MiniCPM-o 4.5 Offline Test"
-        source_file_dependencies: omni_minicpmo_4_5
+        source_file_dependencies: omni_minicpmo_4_5_function
         commands:
           - |
             timeout 20m bash -c "
@@ -157,7 +157,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Online Test"
-        source_file_dependencies: omni_minicpmo_4_5
+        source_file_dependencies: omni_minicpmo_4_5_function
         commands:
           - |
             timeout 20m bash -c "
@@ -166,7 +166,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex
+        source_file_dependencies: omni_minicpmo_4_5_duplex_function
         commands:
           - |
             timeout 35m bash -c "
@@ -183,7 +183,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"
-        source_file_dependencies: tts_qwen3_tts
+        source_file_dependencies: tts_qwen3_tts_function
         commands:
           - |
             timeout 20m bash -c "
@@ -193,7 +193,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Wan22 Test"
-        source_file_dependencies: diffusion_wan22
+        source_file_dependencies: diffusion_wan22_function
         commands:
           - |
             timeout 40m bash -c "
@@ -203,7 +203,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: "Diffusion · Cosmos3 Test"
-        source_file_dependencies: diffusion_cosmos3
+        source_file_dependencies: diffusion_cosmos3_function
         commands:
           - |
             timeout 40m bash -c "
@@ -214,14 +214,7 @@ steps:
 
       - label: "Diffusion · MiniMax-H3 DLO DP2 T2VA Test"
         timeout_in_minutes: 90
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
-          - tests/helpers/assertions.py
-          - tests/helpers/runtime.py
-          - vllm_omni/diffusion/models/minimax_h3/
-          - vllm_omni/diffusion/offloader/
-          - vllm_omni/diffusion/distributed/
-          - vllm_omni/entrypoints/openai/
+        source_file_dependencies: diffusion_minimax_h3_function
         commands:
           - |
             timeout 80m bash -c "
@@ -231,7 +224,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: "Diffusion · Qwen Image Test"
-        source_file_dependencies: diffusion_qwen_image
+        source_file_dependencies: diffusion_qwen_image_function
         commands:
           - |
             timeout 40m bash -c "
@@ -241,7 +234,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: "Diffusion · HunyuanVideo-1.5 Test"
-        source_file_dependencies: diffusion_hunyuan_video
+        source_file_dependencies: diffusion_hunyuan_video_function
         commands:
           - |
             timeout 40m bash -c "

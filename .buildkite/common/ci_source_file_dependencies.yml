@@ -1,18 +1,14 @@
-# Uploader-only extra path-prefix presets for CUDA L2–L5 and NPU L4 test YAML.
-# Referenced as ``source_file_dependencies: omni_qwen3_omni`` (or a list of
-# keys) on a step; ``upload_pipeline.py`` expands the key(s), then **also**
-# appends ``tests/`` paths from the step's pytest / ``run_cov_split.sh``
-# commands. Do **not** list those pytest targets here.
+# Uploader-only path-prefix presets for CUDA L2–L5 and NPU L4 test YAML.
+# Referenced as ``source_file_dependencies: omni_qwen3_omni_function`` (or a list of
+# keys) on a step; ``upload_pipeline.py`` expands the key(s) only.
 #
-# Naming: {domain}_{model}[_{variant}]
-# Shared L2/L3/L4/L5 jobs reuse one key (e.g. diffusion_wan22). ``_cov`` is only for
-# extra non-test inputs that the command does not mention (coverage pilot).
+# Model keys are business code only. Job keys ({model}_function / _perf /
+# _accuracy / _reliability / _doc / _cov) alias that list and add the scripts
+# the job actually runs. Feature keys below are unchanged.
 #
-# YAML anchors below are nested lists; the loader flattens them.
+# YAML anchors are nested lists; the loader flattens them.
 
-x-qwen3-tts-src: &qwen3_tts_src
-  - tests/helpers/media.py
-  - tests/e2e/features/prefill_phase/
+x-qwen3-tts: &qwen3_tts
   - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/model_executor/models/qwen3_tts/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
@@ -24,7 +20,7 @@ x-qwen3-tts-src: &qwen3_tts_src
   - vllm_omni/entrypoints/openai/tts_adapters/
   - vllm_omni/engine/stage_pool.py
 
-x-minicpmo-4-5-src: &minicpmo_4_5_src
+x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/model_executor/models/minicpmo_4_5/
   - vllm_omni/model_executor/models/step_audio2/
   - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
@@ -32,39 +28,14 @@ x-minicpmo-4-5-src: &minicpmo_4_5_src
   - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
   - vllm_omni/deploy/minicpmo_4_5.yaml
 
-x-qwen3-omni-src: &qwen3_omni_src
-  - tests/helpers/runtime.py
-  - vllm_omni/entrypoints/openai/serving_chat.py
-  - vllm_omni/model_executor/models/qwen3_omni/
-  - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
-  - vllm_omni/model_executor/models/common/snake_activation.py
-  - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
-  - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
-  - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
-  - vllm_omni/deploy/qwen3_omni_moe.yaml
-  - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
-
-x-minicpmo-4-5-duplex-src: &minicpmo_4_5_duplex_src
-  - tests/assets/minicpmo_4_5/response_required_16k.wav
-  - tests/assets/minicpmo_4_5/soft_interrupt_16k.wav
-  - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
-  - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
-  - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
-  - tests/e2e/online_serving/run_minicpmo_realtime_duplex_server_vad.py
-  - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
-  - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
-  - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
   - vllm_omni/engine/duplex/
   - vllm_omni/entrypoints/duplex/
   - vllm_omni/clients/
-  - tests/clients/
   - vllm_omni/entrypoints/duplex_request_client.py
   - vllm_omni/outputs/duplex.py
   - vllm_omni/model_executor/duplex_sampling.py
-  - tests/engine/duplex/
-  - tests/entrypoints/duplex/
-  - tests/model_executor/models/minicpmo_4_5/duplex/
   - vllm_omni/experimental/fullduplex/
   - vllm_omni/core/sched/
   - vllm_omni/outputs/multimodal_accumulation.py
@@ -75,17 +46,84 @@ x-minicpmo-4-5-duplex-src: &minicpmo_4_5_duplex_src
   - vllm_omni/entrypoints/openai/api_server.py
   - vllm_omni/entrypoints/openai/duplex_capability.py
   - vllm_omni/config/stage_config.py
-  - *minicpmo_4_5_src
+
+x-qwen2-5-omni: &qwen2_5_omni
+  - vllm_omni/model_executor/models/qwen2_5_omni/
+  - vllm_omni/model_executor/stage_input_processors/qwen2_5_omni.py
+  - vllm_omni/deploy/qwen2_5_omni.yaml
+
+x-qwen3-omni: &qwen3_omni
+  - vllm_omni/entrypoints/openai/serving_chat.py
+  - vllm_omni/model_executor/models/qwen3_omni/
+  - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+  - vllm_omni/model_executor/models/common/snake_activation.py
+  - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
+  - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
+  - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
+  - vllm_omni/deploy/qwen3_omni_moe.yaml
+  - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
+
+x-wan22: &wan22
+  - vllm_omni/diffusion/models/wan2_2/
+  - vllm_omni/diffusion/models/dmd2/
+
+x-cosmos3: &cosmos3
+  - vllm_omni/diffusion/models/cosmos3/
+  - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py
+  - vllm_omni/experimental/world_models/
+  - vllm_omni/model_extras/cosmos3.py
+
+x-qwen-image: &qwen_image
+  - vllm_omni/diffusion/models/qwen_image/
+  - vllm_omni/diffusion/models/dmd2/
+  - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
+
+x-hunyuan-image3: &hunyuan_image3
+  - vllm_omni/diffusion/models/hunyuan_image3/
+  - vllm_omni/model_executor/models/hunyuan_image3/
+  - vllm_omni/deploy/hunyuan_image3_dit.yaml
+
+x-minimax-h3: &minimax_h3
+  - vllm_omni/diffusion/models/minimax_h3/
+
+x-hunyuan-video: &hunyuan_video
+  - vllm_omni/diffusion/models/hunyuan_video/
+  - vllm_omni/model_executor/models/hunyuan_video/
+
+x-ltx2: &ltx2
+  - vllm_omni/diffusion/models/ltx2/
+  - vllm_omni/model_extras/ltx2.py
+
+x-sana-video: &sana_video
+  - vllm_omni/diffusion/models/sana_video/
+  - vllm_omni/model_extras/sana_video.py
+
+x-z-image: &z_image
+  - vllm_omni/diffusion/models/z_image/
+
+x-stable-audio: &stable_audio
+  - vllm_omni/diffusion/models/stable_audio/
+
+x-lingbot-video: &lingbot_video
+  - vllm_omni/diffusion/models/lingbot_video/
+  - vllm_omni/model_extras/lingbot_video.py
+
+x-lingbot-world: &lingbot_world
+  - vllm_omni/diffusion/models/lingbot_world/
 
 
 source_file_dependencies:
+  # --- features (unchanged) ---
   diffusion_distributed_attention:
+    - tests/diffusion/distributed/
+    - tests/diffusion/attention/test_attention_sp.py
     - vllm_omni/diffusion/distributed/
     - vllm_omni/diffusion/attention/
     - vllm_omni/diffusion/data.py
     - vllm_omni/diffusion/models/
 
   custom_pipeline:
+    - tests/e2e/features/custom_pipeline/
     - tests/e2e/features/helpers/custom_pipeline.py
     - vllm_omni/diffusion/
     - vllm_omni/engine/
@@ -94,6 +132,7 @@ source_file_dependencies:
     - vllm_omni/outputs/
 
   rlhf_verl_omni:
+    - tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
     - tests/e2e/features/helpers/verl_omni_server.py
     - tests/e2e/features/helpers/custom_pipeline.py
     - vllm_omni/diffusion/
@@ -102,67 +141,327 @@ source_file_dependencies:
     - vllm_omni/inputs/
     - vllm_omni/outputs/
 
-  omni_qwen3_omni:
-    - *qwen3_omni_src
-
-  omni_minicpmo_4_5:
-    - *minicpmo_4_5_src
-
-  omni_minicpmo_4_5_duplex:
-    - *minicpmo_4_5_duplex_src
-
-  omni_minicpmo_4_5_perf:
-    - vllm_omni/deploy/minicpmo_4_5.yaml
-    - vllm_omni/model_executor/models/minicpmo_4_5/
-    - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
-
-  tts_qwen3_tts:
-    - *qwen3_tts_src
-
-  tts_qwen3_tts_cov:
-    - .buildkite/common/scripts/run_cov_split.sh
-    - pyproject.toml
-    - *qwen3_tts_src
-
-  diffusion_wan22:
-    - vllm_omni/diffusion/models/wan2_2/
-    - vllm_omni/diffusion/models/dmd2/
-
-  diffusion_cosmos3:
-    - vllm_omni/diffusion/models/cosmos3/
-    - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py
-    - vllm_omni/experimental/world_models/
-    - vllm_omni/model_extras/cosmos3.py
-
-  diffusion_qwen_image:
-    - vllm_omni/diffusion/models/qwen_image/
-    - vllm_omni/diffusion/models/dmd2/
-    - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
-
-  diffusion_hunyuan_image3:
-    - vllm_omni/diffusion/models/hunyuan_image3/
-    - vllm_omni/model_executor/models/hunyuan_image3/
-    - vllm_omni/deploy/hunyuan_image3_dit.yaml
-
-  diffusion_hidream_o1:
-    - vllm_omni/diffusion/models/hidream_o1_image/
-    - vllm_omni/diffusion/models/hidream_image/
-
-  diffusion_minimax_h3:
-    - vllm_omni/diffusion/models/minimax_h3/
-
-  diffusion_hunyuan_video:
-    - vllm_omni/diffusion/models/hunyuan_video/
-    - vllm_omni/model_executor/models/hunyuan_video/
-
-  diffusion_x2i:
+  # Tiny-model diffusion jobs (shared across many model trees under models/).
+  diffusion_tiny_model:
+    - tests/model_tests/diffusion/
     - vllm_omni/diffusion/models/
 
   diffusion_offloader:
+    - tests/diffusion/offloader/
     - vllm_omni/diffusion/offloader/
 
   diffusion_quantization:
     - vllm_omni/diffusion/quantization/
 
+  reliability_invalid_param:
+    - tests/dfx/reliability/invalid_param_test/
+
+  # --- models (business code) ---
+  omni_qwen3_omni:
+    - *qwen3_omni
+
+  omni_qwen2_5_omni:
+    - *qwen2_5_omni
+
+  omni_minicpmo_4_5:
+    - *minicpmo_4_5
+
+  tts_qwen3_tts:
+    - *qwen3_tts
+
+  diffusion_wan22:
+    - *wan22
+
+  diffusion_cosmos3:
+    - *cosmos3
+
+  diffusion_qwen_image:
+    - *qwen_image
+
+  diffusion_hunyuan_image3:
+    - *hunyuan_image3
+
+  diffusion_minimax_h3:
+    - *minimax_h3
+
+  diffusion_hunyuan_video:
+    - *hunyuan_video
+
+  diffusion_ltx2:
+    - *ltx2
+
+  diffusion_sana_video:
+    - *sana_video
+
+  diffusion_z_image:
+    - *z_image
+
   diffusion_stable_audio:
-    - vllm_omni/diffusion/models/stable_audio/
+    - *stable_audio
+
+  diffusion_lingbot_video:
+    - *lingbot_video
+
+  diffusion_lingbot_world:
+    - *lingbot_world
+
+  # --- omni / tts jobs ---
+  omni_qwen3_omni_function:
+    - *qwen3_omni
+    - tests/helpers/runtime.py
+    - tests/e2e/offline_inference/test_qwen3_omni.py
+    - tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
+    - tests/e2e/offline_inference/test_qwen3_omni_autoround_w4a16_expansion.py
+    - tests/e2e/offline_inference/test_qwen3_omni_modelopt_nvfp4_w4a4.py
+    - tests/e2e/online_serving/test_qwen3_omni.py
+    - tests/e2e/online_serving/test_qwen3_omni_expansion.py
+    - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+
+  omni_qwen3_omni_accuracy:
+    - *qwen3_omni
+    - tests/e2e/accuracy/qwen3_omni/
+
+  omni_qwen3_omni_perf:
+    - *qwen3_omni
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
+    - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+    - tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
+    - tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
+
+  omni_qwen3_omni_reliability:
+    - *qwen3_omni
+    - tests/dfx/reliability/test_reliability_qwen3_omni.py
+
+  omni_qwen3_omni_doc:
+    - *qwen3_omni
+    - tests/examples/online_serving/test_qwen3_omni.py
+
+  omni_qwen2_5_omni_doc:
+    - *qwen2_5_omni
+    - tests/examples/online_serving/test_qwen2_5_omni.py
+
+  omni_minicpmo_4_5_function:
+    - *minicpmo_4_5
+    - tests/e2e/offline_inference/test_minicpmo_4_5.py
+    - tests/e2e/online_serving/test_minicpmo_4_5.py
+    - tests/e2e/online_serving/test_minicpmo_4_5_expansion.py
+
+  omni_minicpmo_4_5_accuracy:
+    - *minicpmo_4_5
+    - tests/e2e/accuracy/minicpmo_4_5/
+
+  omni_minicpmo_4_5_perf:
+    - *minicpmo_4_5
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_minicpmo_4_5_ready.json
+    - tests/dfx/perf/tests/test_minicpmo_4_5.json
+
+  omni_minicpmo_4_5_doc:
+    - *minicpmo_4_5
+    - tests/examples/test_minicpmo_realtime_web_server.py
+    - tests/examples/test_minicpmo_realtime_web_static.py
+    - tests/examples/test_minicpmo_realtime_duplex_simple_demo.py
+
+  omni_minicpmo_4_5_duplex_function:
+    - *minicpmo_4_5
+    - *minicpmo_4_5_duplex
+    - tests/assets/minicpmo_4_5/response_required_16k.wav
+    - tests/assets/minicpmo_4_5/soft_interrupt_16k.wav
+    - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
+    - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
+    - tests/e2e/online_serving/test_duplex_client_live.py
+    - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
+    - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
+    - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+    - tests/e2e/online_serving/run_minicpmo_realtime_duplex_server_vad.py
+    - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
+    - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+    - tests/clients/
+    - tests/engine/duplex/
+    - tests/entrypoints/duplex/
+    - tests/model_executor/models/minicpmo_4_5/duplex/
+
+  omni_minicpmo_4_5_duplex_perf:
+    - *minicpmo_4_5
+    - *minicpmo_4_5_duplex
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_minicpmo_4_5_duplex_seed_tts.json
+
+  tts_qwen3_tts_function:
+    - *qwen3_tts
+    - tests/helpers/media.py
+    - tests/e2e/features/prefill_phase/
+    - tests/e2e/offline_inference/test_qwen3_tts_base.py
+    - tests/e2e/offline_inference/test_qwen3_tts_customvoice.py
+    - tests/e2e/online_serving/test_qwen3_tts_base.py
+    - tests/e2e/online_serving/test_qwen3_tts_base_expansion.py
+    - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
+    - tests/e2e/online_serving/test_qwen3_tts_customvoice_expansion.py
+
+  tts_qwen3_tts_perf:
+    - *qwen3_tts
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_tts.json
+
+  tts_qwen3_tts_cov:
+    - *qwen3_tts
+    - .buildkite/common/scripts/run_cov_split.sh
+    - pyproject.toml
+    - tests/e2e/offline_inference/test_qwen3_tts_base.py
+    - tests/e2e/online_serving/test_qwen3_tts_base.py
+
+  # --- diffusion jobs ---
+  diffusion_wan22_function:
+    - *wan22
+    - tests/e2e/offline_inference/test_wan22_t2v.py
+    - tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py
+    - tests/e2e/online_serving/test_wan22_t2v.py
+    - tests/e2e/online_serving/test_wan22_expansion.py
+
+  diffusion_wan22_accuracy:
+    - *wan22
+    - tests/e2e/accuracy/wan22_i2v/
+    - tests/e2e/accuracy/test_diffusers_backend_similarity.py
+
+  diffusion_wan22_perf:
+    - *wan22
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
+
+  diffusion_wan22_reliability:
+    - *wan22
+    - tests/dfx/reliability/test_reliability_wan22.py
+
+  # image_to_video README snippets that the X2V Doc Test actually runs:
+  # Wan2.2 TI2V/I2V, HunyuanVideo-1.5 I2V, LTX-2, SANA-Video.
+  # LingBot-Video is in the README but skipped (/path/to/); keep its source so
+  # those code changes still select this job. Skips Python API, Prerequisites,
+  # Advanced Features, FAQ, Wan2.1 VACE.
+  diffusion_image_to_video_doc:
+    - *wan22
+    - *hunyuan_video
+    - *ltx2
+    - *sana_video
+    - *lingbot_video
+    - examples/offline_inference/image_to_video/
+    - tests/examples/offline_inference/test_image_to_video.py
+
+  diffusion_cosmos3_function:
+    - *cosmos3
+    - tests/e2e/online_serving/test_cosmos3.py
+
+  diffusion_cosmos3_accuracy:
+    - *cosmos3
+    - tests/e2e/accuracy/test_cosmos3_similarity.py
+
+  diffusion_cosmos3_perf:
+    - *cosmos3
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
+
+  diffusion_qwen_image_function:
+    - *qwen_image
+    - tests/e2e/online_serving/test_qwen_image.py
+    - tests/e2e/online_serving/test_qwen_image_expansion.py
+
+  diffusion_qwen_image_accuracy:
+    - *qwen_image
+    - tests/e2e/accuracy/test_qwen_image.py
+    - tests/e2e/accuracy/test_diffusers_backend_similarity.py
+
+  diffusion_qwen_image_perf:
+    - *qwen_image
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+
+  diffusion_text_to_image_doc:
+    - *qwen_image
+    - *z_image
+    - tests/examples/offline_inference/test_text_to_image.py
+    - tests/examples/online_serving/test_text_to_image.py
+    - vllm_omni/diffusion/models/nextstep_1_1/
+    - vllm_omni/diffusion/models/longcat_image/
+    - vllm_omni/diffusion/models/ovis_image/
+    - vllm_omni/diffusion/models/omnigen2/
+    - vllm_omni/diffusion/models/sd3/
+    - vllm_omni/diffusion/models/flux/
+    - vllm_omni/diffusion/models/flux2/
+    - vllm_omni/diffusion/models/flux2_klein/
+    - vllm_omni/diffusion/models/hidream_image/
+    - vllm_omni/diffusion/models/krea2/
+    - vllm_omni/diffusion/models/lingbot_video/
+
+  diffusion_hunyuan_image3_function:
+    - *hunyuan_image3
+    - tests/e2e/offline_inference/test_hunyuanimage3_i2t_expansion.py
+
+  diffusion_hunyuan_image3_accuracy:
+    - *hunyuan_image3
+    - tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py
+
+  diffusion_hunyuan_image3_perf:
+    - *hunyuan_image3
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
+    - tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
+    - tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+
+  diffusion_hunyuan_image3_reliability:
+    - *hunyuan_image3
+    - tests/dfx/reliability/test_reliability_hunyuan_image.py
+
+  diffusion_minimax_h3_function:
+    - *minimax_h3
+    - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
+    - tests/e2e/online_serving/minimax_h3/
+    - tests/diffusion/models/minimax_h3/
+    - tests/helpers/assertions.py
+    - tests/helpers/mark.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - vllm_omni/diffusion/lora/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/entrypoints/openai/
+
+  diffusion_minimax_h3_accuracy:
+    - *minimax_h3
+    - tests/e2e/accuracy/minimax_h3/
+
+  diffusion_minimax_h3_perf:
+    - *minimax_h3
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+
+  diffusion_hunyuan_video_function:
+    - *hunyuan_video
+    - tests/e2e/online_serving/test_hunyuan_video_15_expansion.py
+
+  diffusion_hunyuan_video_accuracy:
+    - *hunyuan_video
+    - tests/e2e/accuracy/hunyuanvideo15_t2v/
+    - tests/e2e/accuracy/hunyuanvideo15_i2v/
+
+  diffusion_hunyuan_video_perf:
+    - *hunyuan_video
+    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
+    - tests/dfx/perf/tests/test_hunyuanvideo15_i2v_vllm_omni.json
+
+  diffusion_z_image_function:
+    - *z_image
+    - tests/e2e/online_serving/test_z_image.py
+    - tests/e2e/online_serving/test_zimage_expansion.py
+
+  diffusion_stable_audio_function:
+    - *stable_audio
+    - tests/e2e/offline_inference/test_stable_audio_expansion.py
+    - tests/e2e/online_serving/test_stable_audio_online_expansion.py
+
+  diffusion_lingbot_function:
+    - *lingbot_video
+    - *lingbot_world
+    - tests/e2e/online_serving/test_lingbot_video.py
+    - tests/e2e/online_serving/test_lingbot_video_moe.py
+    - tests/e2e/offline_inference/test_lingbot_world_v2.py

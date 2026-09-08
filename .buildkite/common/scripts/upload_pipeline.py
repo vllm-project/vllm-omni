@@ -12,10 +12,9 @@ Bootstrap mode (``bootstrap-upload-steps.yml``):
 
 Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files
-    (string/list keys from ci_source_file_dependencies.yml plus ``tests/``
-    paths extracted from the step commands, or inline path prefixes).
-    Filtering applies on **PR label** uploads only; ``main`` + env schedule
-    (NIGHTLY/WEEKLY/merge push) keeps every job and still strips the field.
+    (string/list keys from ci_source_file_dependencies.yml, or inline path
+    prefixes). Filtering applies on **PR label** uploads only; ``main`` + env
+    schedule (NIGHTLY/WEEKLY/merge push) keeps every job and still strips the field.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
@@ -294,7 +293,6 @@ def _load_source_file_dependencies() -> dict[str, list[str]]:
 
 
 _REGISTRY_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-_TEST_PATH_RE = re.compile(r"(?:^|[\s='\"])(?P<path>tests/[A-Za-z0-9_./\-]+)")
 
 
 def _parse_command_text(step: dict[str, Any]) -> str:
@@ -309,24 +307,8 @@ def _parse_command_text(step: dict[str, Any]) -> str:
     return str(raw)
 
 
-def _parse_pytest_targets(step: dict[str, Any]) -> list[str]:
-    """Parse ``tests/`` paths from pytest / run_cov_split commands (not ``--ignore``)."""
-    text = _parse_command_text(step)
-    found: list[str] = []
-    seen: set[str] = set()
-    for match in _TEST_PATH_RE.finditer(text):
-        prelude = text[max(0, match.start("path") - 10) : match.start("path")]
-        if "--ignore" in prelude:
-            continue
-        path = match.group("path").split("::", 1)[0].rstrip("\\")
-        if path and path not in seen:
-            seen.add(path)
-            found.append(path)
-    return found
-
-
 def _resolve_source_file_dependencies(step: dict[str, Any]) -> list[str] | None:
-    """Expand a registry key (or list of keys), then append pytest targets from commands."""
+    """Expand a registry key (or list of keys / inline path prefixes)."""
     deps = step.get("source_file_dependencies")
     if deps is None:
         return None
@@ -372,7 +354,7 @@ def _resolve_source_file_dependencies(step: dict[str, Any]) -> list[str] | None:
         raise ValueError(
             f"source_file_dependencies must be a string key or list in step {_get_step_label(step)!r}",
         )
-    return dedupe(_parse_pytest_targets(step), prefixes)
+    return prefixes
 
 
 @lru_cache(maxsize=1)
