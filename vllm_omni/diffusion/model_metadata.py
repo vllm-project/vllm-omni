@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
+    # Head-sharded MoE uses SP-local groups, not vLLM FusedMoE rank folding.
+    expert_parallel_style: Literal["vllm", "head"] = "vllm"
 
 
 # FLUX.2 Klein supports up to four reference images.

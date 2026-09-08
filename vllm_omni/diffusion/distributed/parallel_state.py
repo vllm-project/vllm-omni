@@ -934,13 +934,30 @@ def _initialize_model_parallel(
         return rank_generator.get_ranks(token)
 
     use_moe_parallel_mapping = False
+    use_head_parallel_mapping = False
+    expert_parallel_size = None
     if enable_expert_parallel:
         od_config = get_forward_context().omni_diffusion_config
-        use_moe_parallel_mapping = bool(od_config and od_config.is_moe)
-        if not use_moe_parallel_mapping:
+        expert_parallel_size = getattr(getattr(od_config, "parallel_config", None), "expert_parallel_size", None)
+        use_head_parallel_mapping = bool(od_config and getattr(od_config, "use_head_expert_parallel", False))
+        use_moe_parallel_mapping = bool(od_config and od_config.is_moe and not use_head_parallel_mapping)
+        if not use_moe_parallel_mapping and not use_head_parallel_mapping:
             raise RuntimeError("Expert parallelism enabled for a non-MoE model")
 
     sp_group_ranks = get_rank_groups("sp")
+    if expert_parallel_size is not None and (
+        type(expert_parallel_size) is not int or expert_parallel_size < 1 or not use_head_parallel_mapping
+    ):
+        raise ValueError("expert_parallel_size requires a positive integer and a model with enabled head-sharded EP")
+    if use_head_parallel_mapping:
+        ep_size = expert_parallel_size or sequence_parallel_size
+        if sequence_parallel_size % ep_size:
+            raise ValueError("head-sharded expert_parallel_size must divide sequence_parallel_size")
+        ep_group_ranks = [
+            ranks[start : start + ep_size] for ranks in sp_group_ranks for start in range(0, len(ranks), ep_size)
+        ]
+    else:
+        ep_group_ranks = get_rank_groups("tp-sp-cfg-dp")
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     _DP = init_model_parallel_group(
@@ -1054,7 +1071,7 @@ def _initialize_model_parallel(
             )
 
     global _EXPERT_PARALLEL_GROUP_RANKS
-    _EXPERT_PARALLEL_GROUP_RANKS = get_rank_groups("tp-sp-cfg-dp")
+    _EXPERT_PARALLEL_GROUP_RANKS = ep_group_ranks
     if use_moe_parallel_mapping:
         vllm_parallel_state._EP = init_vllm_model_parallel_group(
             group_ranks=_EXPERT_PARALLEL_GROUP_RANKS,
@@ -1062,6 +1079,13 @@ def _initialize_model_parallel(
             backend=backend,
             group_name="ep",
             use_all2all=True,
+        )
+    elif use_head_parallel_mapping:
+        vllm_parallel_state._EP = init_model_parallel_group(
+            group_ranks=_EXPERT_PARALLEL_GROUP_RANKS,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="expert",
         )
 
 
