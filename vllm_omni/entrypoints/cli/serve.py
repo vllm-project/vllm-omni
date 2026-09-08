@@ -993,6 +993,9 @@ def run_headless(args: TrackingNamespace) -> None:
 
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
+    # This CLI-only negative alias is consumed below when selecting the
+    # launcher log_stats value; it is not a per-stage config override.
+    args_dict.pop("disable_log_stats", None)
 
     deploy_config_path = args_dict.pop("deploy_config", None)
     strategy_config_path = args_dict.pop("strategy_config", None)

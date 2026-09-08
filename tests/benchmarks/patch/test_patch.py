@@ -34,6 +34,8 @@ from vllm_omni.benchmarks.patch.patch import (
     _apply_stage0_token_timings,
     _apply_video_metrics_from_payload,
     _attach_seed_tts_to_request_func_input,
+    _build_benchmark_session,
+    _omni_request_timeout_s,
     _prepare_omniinteract_batch,
     async_request_openai_chat_omni_completions,
     async_request_openai_image_edits_omni,
@@ -1248,6 +1250,71 @@ async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
     assert output.prompt_len == 4992, (
         "prompt_len should be overridden by usage.prompt_tokens to reflect the true multimodal input token count"
     )
+
+
+class TestOmniRequestTimeout:
+    """``--omni-request-timeout-s`` precedence: explicit value > 900 s default."""
+
+    _OVERRIDE = "vllm_omni.benchmarks.patch.patch._REQUEST_TIMEOUT_OVERRIDE_S"
+
+    def test_default_timeout_is_900s_when_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(self._OVERRIDE, None)
+        assert _omni_request_timeout_s() == 900.0
+
+    def test_explicit_value_wins_over_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(self._OVERRIDE, 123.5)
+        assert _omni_request_timeout_s() == 123.5
+
+    def test_non_positive_restores_legacy_6h_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(self._OVERRIDE, 0)
+        assert _omni_request_timeout_s() == 6 * 60 * 60.0
+
+    async def test_benchmark_session_uses_configured_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(self._OVERRIDE, 42.0)
+        session = _build_benchmark_session(max_concurrency=8, ssl_setting=False)
+        try:
+            assert session.timeout.total == 42.0
+            assert session.connector.limit == 8
+            assert session.connector.limit_per_host == 8
+        finally:
+            await session.close()
+
+    async def test_hung_server_request_times_out_as_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A server that accepts the request but never responds must surface as ``failed``."""
+
+        async def handler(reader, writer):
+            # Drain the request but never respond — the original hang failure mode.
+            try:
+                while await reader.read(4096):
+                    pass
+            except ConnectionResetError:
+                pass
+            finally:
+                # Close our side of the socket: the client aborts after the
+                # timeout and only sends FIN, so without writer.close() the
+                # half-closed connection keeps Server.wait_closed() (which on
+                # Python 3.12+ waits for every accepted connection to drop)
+                # blocked forever.
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+
+        monkeypatch.setattr(self._OVERRIDE, 1.0)
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        session = _build_benchmark_session(max_concurrency=1, ssl_setting=False)
+        try:
+            request_input = _seed_tts_request_func_input()
+            request_input.api_url = f"http://127.0.0.1:{port}/v1/chat/completions"
+            output = await async_request_openai_chat_omni_completions(request_input, session)
+            assert output.success is False
+            assert output.error
+        finally:
+            await session.close()
+            server.close()
+            await server.wait_closed()
 
 
 def test_video_rtf_prefers_generation_time_over_poll_latency():
