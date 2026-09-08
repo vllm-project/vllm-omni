@@ -7,6 +7,7 @@ import functools
 import importlib.util
 
 import pytest
+import torch
 from PIL import Image
 
 from tests.examples.helpers import EXAMPLES
@@ -44,6 +45,26 @@ def test_text_to_image_builds_canonical_prompt(
         assert "negative_prompt" not in result
     else:
         assert result["negative_prompt"] == expected_negative_prompt
+
+
+def test_text_to_image_normalizes_batched_tensor_for_save() -> None:
+    mod = _load_example_module(
+        "offline_inference/text_to_image/text_to_image.py",
+        "text_to_image_example",
+    )
+    image = torch.tensor([-1.0, 0.0, 1.0, 2.0]).reshape(1, 1, 2, 2).repeat(1, 3, 1, 1)
+
+    normalized = mod._normalize_images_for_save([image])
+
+    assert len(normalized) == 1
+    assert isinstance(normalized[0], Image.Image)
+    assert normalized[0].size == (2, 2)
+    assert [normalized[0].getpixel((x, y)) for y in range(2) for x in range(2)] == [
+        (0, 0, 0),
+        (128, 128, 128),
+        (255, 255, 255),
+        (255, 255, 255),
+    ]
 
 
 def test_image_to_video_builds_canonical_prompt() -> None:
