@@ -60,6 +60,7 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
         "Cosmos3OmniPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Krea2Pipeline": cd_model_specific.enable_cache_for_krea2,
         "Magi2Pipeline": cd_model_specific.enable_cache_for_magi2,
+        "MammothModa2DiTPipeline": cd_model_specific.enable_cache_for_mammothmoda2,
     }
 
     with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):
@@ -114,6 +115,33 @@ def test_magi2_cache_dit_targets_only_nested_repeated_layers(mock_block_adapter,
     assert result.targets == (adapter,)
     get_transformer = mock_enable_cache.call_args.kwargs["get_pipeline_transformer"]
     assert get_transformer(pipeline) is transformer_block
+
+
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.enable_cache_for_dit")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
+def test_mammothmoda2_cache_dit_targets_only_main_layers(mock_block_adapter, mock_enable_cache):
+    pipeline = Mock()
+    transformer = pipeline.gen_transformer
+    layers = torch.nn.ModuleList([torch.nn.Identity()])
+    transformer.layers = layers
+    adapter = mock_block_adapter.return_value
+    refresh = Mock()
+    mock_enable_cache.return_value = refresh
+
+    result = cd_model_specific.enable_cache_for_mammothmoda2(pipeline, SAMPLE_CACHE_CONFIG)
+
+    mock_block_adapter.assert_called_once()
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    assert adapter_kwargs["transformer"] is transformer
+    assert adapter_kwargs["blocks"] == [layers]
+    assert adapter_kwargs["has_separate_cfg"] is True
+    assert adapter_kwargs["check_forward_pattern"] is True
+    assert result.refresh is refresh
+    assert result.targets == (adapter,)
+    get_transformer = mock_enable_cache.call_args.kwargs["get_pipeline_transformer"]
+    assert get_transformer(pipeline) is transformer
+    # Sequential-CFG parity is mandatory while cache-dit is installed.
+    assert pipeline._cache_dit_requires_paired_cfg is True
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit.summary")
@@ -338,3 +366,79 @@ def test_summary_with_no_transformer_is_nonfatal():
         pass
 
     cache_summary(pipeline=FakePipeline())
+
+
+# This test is skipped on ROCm since rocm_unquantized_gemm doesn't support CPU backend
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="vLLM ROCm custom ops lack CPU fallback",
+)
+def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.FixtureRequest):
+    """A tiny MammothModa2 DiT runs through Cache-DiT with paired CFG forwards.
+
+    Exercises the Pattern_3 contract end to end: after enabling the custom
+    enabler, blocks must be callable as ``block(hidden_states, **kwargs)``
+    and the pipeline's two-forwards-per-step CFG cadence must drive the
+    cache context without shape or parity errors.
+    """
+    from cache_dit import BlockAdapter
+
+    from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
+    from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
+
+    model = Transformer2DModel(
+        patch_size=2,
+        in_channels=4,
+        hidden_size=96,
+        num_layers=4,
+        num_refiner_layers=1,
+        num_attention_heads=2,
+        num_kv_heads=2,
+        multiple_of=8,
+        axes_dim_rope=(16, 16, 16),
+        axes_lens=(300, 512, 512),
+        text_feat_dim=16,
+    )
+    model.eval()
+
+    MammothModa2Pipeline = type("MammothModa2DiTPipeline", (), {})
+    pipeline = MammothModa2Pipeline()
+    pipeline.gen_transformer = model
+    backend = CacheDiTBackend(DiffusionCacheConfig())
+    backend.enable(pipeline)
+    request.addfinalizer(lambda: backend.disable(pipeline))
+    assert BlockAdapter.is_cached(model)
+
+    num_inference_steps = 8
+    backend.refresh(pipeline, num_inference_steps=num_inference_steps)
+
+    freqs_cis = RotaryPosEmbedReal.get_freqs_real((16, 16, 16), (300, 512, 512), theta=10000)
+    latents = torch.randn(1, 4, 8, 8)
+    text = torch.randn(1, 5, 16)
+    negative = torch.randn(1, 3, 16)
+    text_mask = torch.ones(1, 5, dtype=torch.bool)
+    negative_mask = torch.ones(1, 3, dtype=torch.bool)
+
+    with torch.no_grad():
+        for step in range(num_inference_steps):
+            timestep = torch.full((1,), 1.0 - step / num_inference_steps)
+            # Conditional pass ...
+            cond = model(
+                hidden_states=latents,
+                timestep=timestep,
+                text_hidden_states=text,
+                freqs_cis=freqs_cis,
+                text_attention_mask=text_mask,
+            )
+            # ... always followed by the unconditional pass (parity).
+            uncond = model(
+                hidden_states=latents,
+                timestep=timestep,
+                text_hidden_states=negative,
+                freqs_cis=freqs_cis,
+                text_attention_mask=negative_mask,
+            )
+            latents = uncond + 4.0 * (cond - uncond)
+
+    assert latents.shape == (1, 4, 8, 8)
+    assert torch.isfinite(latents).all()
