@@ -1447,6 +1447,8 @@ class OnlineOmniClient:
           - transcript_model: primary Whisper model for content checks; defaults to ``small``
           - transcript_pcm_sample_rate: local-only opt-in to transcribe mono int16 PCM;
             must be the actual output sample rate, also used for HNR
+          - transcript_similarity_threshold: cosine-similarity gate for the transcript
+            check in ``assert_audio_speech_response`` (optional, default 0.9)
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
 

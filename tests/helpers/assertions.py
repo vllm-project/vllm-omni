@@ -1048,7 +1048,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
                     transcript,
                     _speech_audio_for_transcription(getattr(response, "audio_bytes", None), request_config),
                     expected_text,
-                    threshold=0.9,
+                    threshold=float(request_config.get("transcript_similarity_threshold", 0.9)),
                     escalation_model=request_config.get("transcript_escalation_model"),
                     language=request_config.get("transcript_language"),
                 )
