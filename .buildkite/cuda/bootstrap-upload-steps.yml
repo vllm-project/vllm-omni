@@ -40,14 +40,15 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # L4 Test — main+NIGHTLY=1 (full pipeline), or PR nightly-test label (diff-aware)
+  # L4 Test — NIGHTLY=1 (full pipeline; TEMP: any branch), or PR nightly-test label (diff-aware)
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
     commands:
       - |
         EXTRA=""
-        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+        # TEMP: New Build validation — NIGHTLY=1 ignores branch. Restore `&& [ "${BUILDKITE_BRANCH}" = "main" ]`.
+        if [ "${NIGHTLY:-}" = "1" ]; then
           EXTRA="--all"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-nightly.yml
