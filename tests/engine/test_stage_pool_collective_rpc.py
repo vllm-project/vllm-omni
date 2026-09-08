@@ -40,14 +40,14 @@ def test_collective_rpc_normalizes_none_args_on_control_helper():
 def test_collective_rpc_unrelated_async_helper_uses_collective_path():
     async def run() -> None:
         other = AsyncMock(return_value="should-not-run")
-        pool, client = _make_pool(reset_prefix_cache_async=other)
+        pool, client = _make_pool(is_sleeping_async=other)
 
-        result = await pool.collective_rpc(0, "reset_prefix_cache", timeout=1.5, args=("x",), kwargs={"k": 1})
+        result = await pool.collective_rpc(0, "is_sleeping", timeout=1.5, args=("x",), kwargs={"k": 1})
 
         assert result == {"via": "collective"}
         other.assert_not_awaited()
         client.collective_rpc_async.assert_awaited_once_with(
-            method="reset_prefix_cache",
+            method="is_sleeping",
             timeout=1.5,
             args=("x",),
             kwargs={"k": 1},
@@ -81,10 +81,37 @@ def test_collective_rpc_control_method_reraises_worker_error():
 
 
 @pytest.mark.cpu
+def test_collective_rpc_reset_caches_use_control_helpers():
+    async def run() -> None:
+        reset_prefix = AsyncMock(return_value=True)
+        reset_encoder = AsyncMock(return_value=None)
+        reset_mm = AsyncMock(return_value=None)
+        pool, client = _make_pool(
+            reset_prefix_cache_async=reset_prefix,
+            reset_encoder_cache_async=reset_encoder,
+            reset_mm_cache_async=reset_mm,
+        )
+
+        result = await pool.collective_rpc(0, "reset_prefix_cache", args=(True, True), timeout=2.0)
+        assert result is True
+        reset_prefix.assert_awaited_once_with(True, True)
+
+        await pool.collective_rpc(0, "reset_encoder_cache", timeout=2.0)
+        reset_encoder.assert_awaited_once()
+
+        await pool.collective_rpc(0, "reset_mm_cache", timeout=2.0)
+        reset_mm.assert_awaited_once()
+
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_collective_rpc_non_control_method_still_returns_error_dict():
     async def run() -> None:
         pool, _client = _make_pool(collective_rpc_async=AsyncMock(side_effect=RuntimeError("probe failed")))
-        result = await pool.collective_rpc(0, "reset_prefix_cache")
+        result = await pool.collective_rpc(0, "is_sleeping")
         assert result["supported"] is False
         assert "probe failed" in result["error"]
 

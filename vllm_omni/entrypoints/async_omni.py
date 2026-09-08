@@ -1411,10 +1411,14 @@ class AsyncOmni(EngineClient, OmniBase):
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
-        """Reset the frontend (P0) multimodal processor cache.
+        """Reset the multimodal caches: frontend (P0) and stage engine cores.
 
-        ``EngineCore.sleep(level>=1)`` already clears the P1 receiver cache.
-        Clearing P0 avoids hash-only follow-up requests after that reset.
+        The frontend P0 processor cache maps input hashes to processed
+        multimodal data; without clearing it, hash-only follow-up requests
+        would be served from state computed under the previous weights. Stage
+        engine cores clear their worker-level mm caches the same way
+        ``EngineCore.sleep(level>=1)`` clears the P1 receiver cache. Diffusion
+        stages do not maintain a vLLM-style mm cache and are skipped.
         """
         processor = getattr(self, "input_processor", None)
         if processor is None:
@@ -1422,32 +1426,60 @@ class AsyncOmni(EngineClient, OmniBase):
         cache = getattr(processor, "mm_processor_cache", None)
         if cache is None:
             logger.debug("[AsyncOmni] reset_mm_cache: no frontend mm_processor_cache")
-            return
-        for name in ("clear", "reset", "clear_cache"):
-            fn = getattr(cache, name, None)
-            if callable(fn):
-                fn()
-                return
-        logger.debug("[AsyncOmni] reset_mm_cache: cache has no clear/reset method")
+        else:
+            for name in ("clear", "reset", "clear_cache"):
+                fn = getattr(cache, name, None)
+                if callable(fn):
+                    fn()
+                    break
+            else:
+                logger.debug("[AsyncOmni] reset_mm_cache: cache has no clear/reset method")
+
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type()
+        if diffusion_stage_ids:
+            logger.debug("[AsyncOmni] reset_mm_cache: skipping diffusion stage(s) %s", diffusion_stage_ids)
+        if ar_stage_ids:
+            await self._engine_core_rpc("reset_mm_cache", stage_ids=ar_stage_ids)
 
     async def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache for all stages.
+        """Reset the encoder cache on all AR/LLM stage engine cores.
 
-        TODO: Forward to Orchestrator process via message.
+        Forwarded to the stage engine cores via collective_rpc (the same route
+        used by ``sleep``/``wake_up``) so stale encoder outputs computed under
+        previous weights are invalidated after weight updates. Diffusion stages
+        do not maintain a vLLM-style encoder cache and are skipped.
         """
-        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type()
+        if diffusion_stage_ids:
+            logger.debug("[AsyncOmni] reset_encoder_cache: skipping diffusion stage(s) %s", diffusion_stage_ids)
+        if not ar_stage_ids:
+            return
+        await self._engine_core_rpc("reset_encoder_cache", stage_ids=ar_stage_ids)
 
     async def reset_prefix_cache(
         self,
         reset_running_requests: bool = False,
         reset_connector: bool = False,
     ) -> bool:
-        """Reset the prefix cache for all stages.
+        """Reset the prefix cache on all AR/LLM stage engine cores.
 
-        TODO: Forward to Orchestrator process via message.
+        Forwarded to the stage engine cores via collective_rpc (the same route
+        used by ``sleep``/``wake_up``). Without this, prefix-cache KV computed
+        under previous weights is silently reused after weight updates.
+        Diffusion stages do not maintain a vLLM-style prefix cache and are
+        skipped.
         """
-        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
-        return True
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type()
+        if diffusion_stage_ids:
+            logger.debug("[AsyncOmni] reset_prefix_cache: skipping diffusion stage(s) %s", diffusion_stage_ids)
+        if not ar_stage_ids:
+            return True
+        results = await self._engine_core_rpc(
+            "reset_prefix_cache",
+            stage_ids=ar_stage_ids,
+            args=(reset_running_requests, reset_connector),
+        )
+        return all(self._coerce_stage_bool(result) for result in results)
 
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
