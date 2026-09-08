@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-Omni accuracy benchmarks (Daily-Omni MCQ + Seed-TTS WER) via ``vllm bench serve --omni``.
 
 Starts a **module-scoped** Omni OpenAI-compatible server (same pattern as ``tests/dfx/perf`` and
@@ -67,12 +68,8 @@ def get_chunk_config(config_path: str | None = None):
     """Load the qwen3_omni CI deploy yaml with async_chunk modifications for streaming mode."""
     if config_path is None:
         config_path = _CI_DEPLOY
-    # TODO: remove this workaround once legacy `stage_args` path is deleted.
-    # The pipeline (qwen3_omni/pipeline.py) already wires
-    # thinker2talker_async_chunk / talker2code2wav_async_chunk on stage 0/1,
-    # so only async_chunk needs flipping. Writing nested `engine_args:` into
-    # the new-schema overlay trips _parse_stage_deploy's legacy branch and
-    # drops flat fields (load_format, max_num_seqs, ...).
+    # Pipeline already wires thinker2talker_async_chunk / talker2code2wav_async_chunk
+    # on stage 0/1; only the top-level async_chunk flag needs flipping here.
     return modify_stage_config(config_path, updates={"async_chunk": True})
 
 

@@ -733,7 +733,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         )
         width = ar_width or req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.sampling_params.num_inference_steps or 50
-        guidance_scale = req.sampling_params.guidance_scale or 1.5
+        guidance_scale = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else 1.5
 
         # Ensure dimensions are multiples of vae_scale_factor * patch_size
         multiple_of = self.vae_scale_factor * self._patch_size

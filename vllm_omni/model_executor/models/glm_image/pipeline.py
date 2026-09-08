@@ -14,6 +14,7 @@ from vllm_omni.config.stage_config import (
 
 GLM_IMAGE_PIPELINE = PipelineConfig(
     model_type="glm_image",
+    default_deploy_config_name="glm_image.yaml",
     model_arch="GlmImageForConditionalGeneration",
     hf_architectures=("GlmImageForConditionalGeneration",),
     diffusers_class_name="GlmImagePipeline",

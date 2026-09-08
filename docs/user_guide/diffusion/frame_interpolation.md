@@ -47,7 +47,8 @@ For supported Wan2.2 pipelines, the execution order is:
 1. Diffusion worker finishes denoising and decodes the raw video tensor.
 2. Worker-side model-specific post-processing runs.
 3. If frame interpolation is enabled, RIFE interpolates the decoded video
-   tensor on the worker side and records a FPS multiplier in `custom_output`.
+   tensor on the worker side and records a FPS multiplier in
+   `metadata.video.video_fps_multiplier`.
 4. The API server receives the already-interpolated video and only performs
    MP4 export.
 

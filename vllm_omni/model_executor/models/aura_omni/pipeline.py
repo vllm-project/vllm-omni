@@ -24,6 +24,7 @@ _QWEN3_TTS_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 
 AURA_OMNI_PIPELINE = PipelineConfig(
     model_type="aura_omni",
+    default_deploy_config_name="aura_omni.yaml",
     model_arch="Qwen3ASRForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -79,6 +80,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
+            requires_full_payload_input=True,
         ),
     ),
 )

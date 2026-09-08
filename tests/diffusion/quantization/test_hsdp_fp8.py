@@ -36,15 +36,23 @@ class _ToyKernel:
 # --- helper to build a toy module simulating online-FP8 post-load state ---
 
 
-def _make_fp8_toy_module(out_features: int = 16, in_features: int = 32):
+def _make_fp8_toy_module(
+    out_features: int = 16,
+    in_features: int = 32,
+    *,
+    quant_method_cls=None,
+):
     """Return a module whose weight is ``qweight.t()`` (non-contiguous) and whose
     ``quant_method`` is an ``Fp8LinearMethod`` with a ``_ToyKernel``.
     """
     from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 
+    if quant_method_cls is None:
+        quant_method_cls = Fp8LinearMethod
+
     # Create the quant-method instance without calling __init__ (avoids
     # heavyweight upstream config dependencies).  isinstance() still works.
-    qm = object.__new__(Fp8LinearMethod)
+    qm = object.__new__(quant_method_cls)
     qm.fp8_linear = _ToyKernel()
 
     # randn does not support float8 on CPU; zeros does and the test only
@@ -102,6 +110,28 @@ def test_rewrites_non_contiguous_weight():
     assert n_rewritten_layers == 1
     assert module.weight.is_contiguous()
     assert module.weight.shape == (16, 32)
+
+
+def test_rewrites_per_tensor_online_fp8_weight():
+    """Regression test for vLLM's new online FP8 frontend (#45463)."""
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PerTensorOnlineLinearMethod,
+    )
+
+    module = _make_fp8_toy_module(
+        16,
+        32,
+        quant_method_cls=Fp8PerTensorOnlineLinearMethod,
+    )
+
+    n_rewritten_layers = prepare_fp8_layers_for_fsdp(module)
+
+    assert n_rewritten_layers == 1
+    assert module.weight.is_contiguous()
+    assert module.weight.shape == (16, 32)
+    w, *_ = module.quant_method.fp8_linear._get_layer_params(module)
+    assert w.shape == (32, 16)
+    assert w.stride() == (1, 32)
 
 
 def test_patched_get_layer_params_returns_transposed_view():

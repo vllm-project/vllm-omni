@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
+import json
 import mimetypes
 import os
 import time
@@ -11,6 +15,17 @@ import aiohttp
 from tqdm import tqdm
 
 DEFAULT_EDITS_BOT_TASK = "think"
+
+
+def _is_minimax_h3_mixed_reference(model: str) -> bool:
+    """MiniMax-H3 Ref2VA consumes reference videos as file paths.
+
+    Its reference preparer ffprobes / ffmpegs the reference file, so single
+    ``video_reference`` uploads are sent as a base64 data URL: the server
+    persists them to disk and keeps ``source_path``, handing the pipeline a
+    real file path instead of a decoded frame list.
+    """
+    return "MiniMax-H3" in (model or "")
 
 
 @dataclass
@@ -28,8 +43,10 @@ class RequestFuncInput:
     slo_ms: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
+    video_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
+    video_job_timeout: float = 900.0
 
 
 @dataclass
@@ -318,42 +335,64 @@ async def async_request_v1_videos(
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
 
-    files = dict(input.extra_body)
-    if input.prompt:
-        files.setdefault("prompt", input.prompt)
-    if input.width and input.height:
-        files.setdefault("height", input.height)
-        files.setdefault("width", input.width)
-    if input.num_frames:
-        files.setdefault("num_frames", input.num_frames)
-    if input.num_inference_steps:
-        files.setdefault("num_inference_steps", input.num_inference_steps)
-    if input.seed is not None:
-        files.setdefault("seed", input.seed)
-    if input.fps:
-        files.setdefault("fps", input.fps)
-
-    form = aiohttp.FormData()
-    for k, v in files.items():
-        form.add_field(k, str(v))
-
     image_file = None
-    if input.image_paths and len(input.image_paths) > 0:
-        image_path = input.image_paths[0]
-        image_file = open(image_path, "rb")
-        form.add_field(
-            "input_reference",
-            image_file,
-            filename=os.path.basename(image_path),
-            content_type="application/octet-stream",
-        )
-
     job_id = None
-    job_status = None
-    poll_json = {}
-    resp_json = {}
-
     try:
+        files = dict(input.extra_body)
+        if input.prompt:
+            files.setdefault("prompt", input.prompt)
+        if input.width and input.height:
+            files.setdefault("height", input.height)
+            files.setdefault("width", input.width)
+        if input.num_frames:
+            files.setdefault("num_frames", input.num_frames)
+        if input.num_inference_steps:
+            files.setdefault("num_inference_steps", input.num_inference_steps)
+        if input.seed is not None:
+            files.setdefault("seed", input.seed)
+        if input.fps:
+            files.setdefault("fps", input.fps)
+
+        form = aiohttp.FormData()
+        for k, v in files.items():
+            form.add_field(k, str(v))
+
+        if input.image_paths and input.video_paths:
+            output.error = "Only one of image_paths or video_paths can be provided"
+            output.success = False
+            return output
+
+        if input.image_paths and len(input.image_paths) > 0:
+            image_path = input.image_paths[0]
+            image_file = open(image_path, "rb")
+            form.add_field(
+                "input_reference",
+                image_file,
+                filename=os.path.basename(image_path),
+                content_type=_guess_mime_type(image_path),
+            )
+        elif input.video_paths and len(input.video_paths) > 0:
+            video_path = input.video_paths[0]
+            if _is_minimax_h3_mixed_reference(input.model):
+                with open(video_path, "rb") as reference_file:
+                    video_b64 = base64.b64encode(reference_file.read()).decode("ascii")
+                form.add_field(
+                    "video_reference",
+                    json.dumps([{"video_url": f"data:video/mp4;base64,{video_b64}"}]),
+                )
+            else:
+                image_file = open(video_path, "rb")
+                form.add_field(
+                    "input_reference",
+                    image_file,
+                    filename=os.path.basename(video_path),
+                    content_type=_guess_mime_type(video_path),
+                )
+
+        job_status = None
+        poll_json = {}
+        resp_json = {}
+
         # invoke a post request (POST /v1/videos)
         async with session.post(input.api_url, data=form) as response:
             if response.status == 200:
@@ -371,7 +410,7 @@ async def async_request_v1_videos(
 
         # invoke a poll request (GET /v1/videos/{video_id})
         poll_interval = 2.0  # Unit(s)
-        timeout_seconds = 600.0
+        timeout_seconds = input.video_job_timeout
         deadline = time.perf_counter() + timeout_seconds
         job_url = f"{input.api_url}/{job_id}"
 
@@ -387,8 +426,11 @@ async def async_request_v1_videos(
                 poll_json = await poll_response.json()
                 job_status = poll_json.get("status")
 
-                if time.perf_counter() >= deadline:
-                    output.error = f"Timed out waiting for video job {job_id} to complete."
+                if job_status not in {"completed", "failed"} and time.perf_counter() >= deadline:
+                    output.error = (
+                        f"Timed out after {timeout_seconds:g}s waiting for video job {job_id} to complete. "
+                        "Increase --video-job-timeout for long-running or queued video jobs."
+                    )
                     output.success = False
                     return output
 
@@ -417,7 +459,7 @@ async def async_request_v1_videos(
             elif "peak_memory_mb" in resp_json:
                 output.peak_memory_mb = resp_json["peak_memory_mb"]
     except Exception as e:
-        output.error = str(e)
+        output.error = f"{type(e).__name__}: {e}"
         output.success = False
     finally:
         if image_file is not None:
@@ -430,13 +472,13 @@ async def async_request_v1_videos(
             except Exception as e:
                 print(f"Failed to clean up video job {job_id}: {e}")
 
-    output.latency = time.perf_counter() - output.start_time
+        output.latency = time.perf_counter() - output.start_time
+        if pbar is not None:
+            pbar.update(1)
 
     if output.success and input.slo_ms is not None:
         output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
 
-    if pbar:
-        pbar.update(1)
     return output
 
 

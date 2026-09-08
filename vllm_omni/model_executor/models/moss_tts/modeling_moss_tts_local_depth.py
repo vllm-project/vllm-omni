@@ -22,10 +22,14 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     _sample_token,
 )
+from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 
 class _MossTTSLocalAttention(nn.Module):
@@ -48,15 +52,48 @@ class _MossTTSLocalAttention(nn.Module):
         self.c_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("_rope_cos_cache", torch.empty(0), persistent=False)
+        self.register_buffer("_rope_sin_cache", torch.empty(0), persistent=False)
 
-    def _rope_cos_sin(
-        self, seq_len: int, device: torch.device, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        position_ids = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.einsum("s,d->sd", position_ids, self.inv_freq.to(device=device))
+    def prepare_rope_cache(
+        self,
+        max_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Materialize frame-local RoPE values once per device/dtype.
+
+        Local Depth positions always restart at zero and never exceed the
+        number of RVQ codebooks (12 for MOSS-TTS Local v1.5).  Building
+        arange/einsum/cos/sin inside every one of the 12 depth steps creates
+        many tiny kernels and also bloats the enclosing talker CUDA graph.
+        Keep one non-persistent cache and slice it for prefix execution.
+        """
+        if max_seq_len <= 0:
+            return
+        cache = self._rope_cos_cache
+        if cache.numel() > 0 and cache.device == device and cache.dtype == dtype and int(cache.shape[1]) >= max_seq_len:
+            return
+
+        position_ids = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+        inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+        freqs = torch.einsum("s,d->sd", position_ids, inv_freq)
         cos = freqs.cos().repeat_interleave(2, dim=-1).to(dtype)
         sin = freqs.sin().repeat_interleave(2, dim=-1).to(dtype)
-        return cos.view(1, seq_len, 1, self.head_dim), sin.view(1, seq_len, 1, self.head_dim)
+        self._rope_cos_cache = cos.view(1, max_seq_len, 1, self.head_dim)
+        self._rope_sin_cache = sin.view(1, max_seq_len, 1, self.head_dim)
+
+    def _rope_cos_sin(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.prepare_rope_cache(seq_len, device, dtype)
+        return (
+            self._rope_cos_cache[:, :seq_len],
+            self._rope_sin_cache[:, :seq_len],
+        )
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -135,12 +172,31 @@ class MossTTSLocalDepthTransformer(nn.Module):
         rope_base = float(getattr(gpt2_config, "rope_base", 1_000_000.0))
         self.h = nn.ModuleList([_MossTTSLocalBlock(self.hidden_size, n_head, inner_size, rope_base, eps)])
         self.ln_f = nn.LayerNorm(self.hidden_size, eps=eps)
+        self._compiled_forward_prefix = None
 
     def _forward_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
         hidden_states = seq_embeds
         for block in self.h:
             hidden_states = block(hidden_states)
         return self.ln_f(hidden_states)
+
+    def setup_compile(self) -> None:
+        if self._compiled_forward_prefix is not None:
+            return
+        if not current_omni_platform.supports_torch_inductor():
+            self._compiled_forward_prefix = self._forward_prefix
+            logger.warning_once("MOSS-TTS local depth torch.compile disabled on this platform")
+            return
+        self._compiled_forward_prefix = torch.compile(
+            self._forward_prefix,
+            dynamic=False,
+            options={"epilogue_fusion": False},
+        )
+        logger.info("MOSS-TTS local depth prefix enabled with torch.compile")
+
+    def _run_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
+        forward_prefix = self._compiled_forward_prefix or self._forward_prefix
+        return forward_prefix(seq_embeds)
 
     @torch.no_grad()
     def generate_frame(
@@ -177,10 +233,16 @@ class MossTTSLocalDepthTransformer(nn.Module):
         batch_size = backbone_last_hidden.shape[0]
         dtype = self.ln_f.weight.dtype
 
+        # Populate the complete [0, n_vq) table before torch.compile traces
+        # _forward_prefix or the runner captures talker_mtp.  The compiled /
+        # captured body then contains only fixed-address cache slices rather
+        # than cache construction or buffer replacement.
+        for block in self.h:
+            block.attn.prepare_rope_cache(n_vq, backbone_last_hidden.device, dtype)
+
         embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
         embeds[:, 0, :] = backbone_last_hidden.to(dtype)
-
-        hidden = self._forward_prefix(embeds[:, :1, :])
+        hidden = self._run_prefix(embeds[:, :1, :])
         local_hidden = hidden[:, 0, :]
 
         binary_logits = local_text_lm_head(local_hidden).float()
@@ -231,7 +293,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
 
             if channel_index + 1 < n_vq:
                 embeds[:, channel_index + 1, :] = audio_embeddings[channel_index](channel_token).to(dtype)
-                hidden = self._forward_prefix(embeds[:, : channel_index + 2, :])
+                hidden = self._run_prefix(embeds[:, : channel_index + 2, :])
                 local_hidden = hidden[:, channel_index + 1, :]
 
         return should_continue, codes

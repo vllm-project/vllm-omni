@@ -20,8 +20,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
+from tests.helpers.mark import hardware_test
 
+pytestmark = [pytest.mark.core_model]
 DEVICE = torch.device("cuda:0")
 NUM_QUANTIZERS = 8
 TOTAL_UPSAMPLE = 4
@@ -112,6 +113,7 @@ def _random_codes(seq_len, batch_size=1, device=DEVICE):
 # ──────────────────────────────────────────────────────────────────
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [25, 50, 100])
 def test_exact_size_numerical_equivalence(decoder, wrapper, seq_len):
     """When input exactly matches a capture size, output must be bit-identical."""
@@ -127,6 +129,7 @@ def test_exact_size_numerical_equivalence(decoder, wrapper, seq_len):
 # ──────────────────────────────────────────────────────────────────
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99])
 def test_padded_output_shape_and_length(decoder, wrapper, seq_len):
     """Padded decode must return output trimmed to actual input length."""
@@ -139,6 +142,7 @@ def test_padded_output_shape_and_length(decoder, wrapper, seq_len):
     assert graph_out.shape[-1] == expected_len
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99])
 def test_padded_interior_positions_close(decoder, wrapper, seq_len):
     """Interior positions (away from padding boundary) should be very close.
@@ -160,6 +164,7 @@ def test_padded_interior_positions_close(decoder, wrapper, seq_len):
         torch.testing.assert_close(interior_graph, interior_eager, atol=1e-5, rtol=1e-5)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99])
 def test_padded_output_bounded(decoder, wrapper, seq_len):
     """Padded output values must remain in [-1, 1] and max diff should be bounded."""
@@ -175,6 +180,7 @@ def test_padded_output_bounded(decoder, wrapper, seq_len):
     assert max_diff < 1.0, f"Max diff {max_diff} exceeds bound"
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99])
 def test_padded_short_output_decode_length_matches_eager(seq_len):
     """Streaming ``decode()`` of a shorter-than-nominal decoder must match eager length.
@@ -210,6 +216,7 @@ def test_padded_short_output_decode_length_matches_eager(seq_len):
         torch.testing.assert_close(graph_out[..., :-boundary], eager_out[..., :-boundary], atol=1e-5, rtol=1e-5)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_compiled_padded_short_output_length_matches_eager(monkeypatch):
     """Compiled replay path must also trim short-output decoders to eager length.
 
@@ -251,6 +258,7 @@ def test_compiled_padded_short_output_length_matches_eager(monkeypatch):
 # ──────────────────────────────────────────────────────────────────
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [101, 150, 200])
 def test_fallback_eager_exact_match(decoder, wrapper, seq_len):
     """Input larger than all capture sizes falls back to eager -> bit-identical."""
@@ -266,6 +274,7 @@ def test_fallback_eager_exact_match(decoder, wrapper, seq_len):
 # ──────────────────────────────────────────────────────────────────
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("total_len", [60, 100, 150, 250])
 def test_chunked_decode_shape_match(decoder, wrapper, total_len):
     """Chunked decode output shape must match between eager and graph modes."""
@@ -279,6 +288,7 @@ def test_chunked_decode_shape_match(decoder, wrapper, total_len):
     assert eager_out.shape == graph_out.shape
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("total_len", [50, 100])
 def test_chunked_decode_exact_size_equivalence(decoder, wrapper, total_len):
     """Chunked decode with chunks matching capture sizes should be bit-identical."""
@@ -293,6 +303,7 @@ def test_chunked_decode_exact_size_equivalence(decoder, wrapper, total_len):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_chunked_decode_output_survives_later_replay(wrapper):
     """Chunked output must not alias graph static buffers overwritten by later replays."""
     codes = _random_codes(100)
@@ -307,6 +318,7 @@ def test_chunked_decode_output_survives_later_replay(wrapper):
     torch.testing.assert_close(graph_out, expected, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_chunked_decode_preserves_short_chunk_concat_semantics():
     """Chunked decode must allow shorter-than-nominal chunk outputs.
 
@@ -336,6 +348,7 @@ def test_chunked_decode_preserves_short_chunk_concat_semantics():
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_batched_chunked_decode_variable_lengths_matches_per_request_eager(decoder, wrapper):
     """Variable-length chunk batching should match independent chunked decodes."""
     long_codes = _random_codes(100)
@@ -380,6 +393,7 @@ def _eager_chunked(decoder, codes, chunk_size, left_context_size):
 # ──────────────────────────────────────────────────────────────────
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_single_frame(decoder, wrapper):
     """Single-frame input (seq_len=1) should work with padding."""
     codes = _random_codes(1)
@@ -390,6 +404,7 @@ def test_single_frame(decoder, wrapper):
     assert graph_out.shape[-1] == TOTAL_UPSAMPLE
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_disabled_wrapper_matches_eager(decoder, wrapper):
     """Disabled wrapper should produce bit-identical output to eager."""
     codes = _random_codes(30)
@@ -401,6 +416,7 @@ def test_disabled_wrapper_matches_eager(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_batch_size_gt1_uses_matching_graph(decoder, wrapper):
     """Captured batch size > 1 should replay a matching graph."""
     assert (2, 25) in wrapper.graphs
@@ -411,6 +427,7 @@ def test_batch_size_gt1_uses_matching_graph(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_uncaptured_batch_size_falls_back(decoder, wrapper):
     """Uncaptured batch sizes should fall back to eager."""
     assert (3, 25) not in wrapper.graphs
@@ -421,6 +438,7 @@ def test_uncaptured_batch_size_falls_back(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_extra_capture_shape_uses_sparse_graph(decoder):
     """Extra capture shapes should not expand to a full batch x size product."""
     sparse_wrapper = CUDAGraphDecoderWrapper(
@@ -444,6 +462,7 @@ def test_extra_capture_shape_uses_sparse_graph(decoder):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_compile_shape_supports_exact_and_padded_buckets(decoder, monkeypatch):
     """Configured torch.compile shapes should replay exact and padded CUDA Graph buckets."""
 
@@ -490,6 +509,7 @@ def test_compile_shape_supports_exact_and_padded_buckets(decoder, monkeypatch):
     assert compile_kwargs["dynamic"] is False
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_deterministic_across_calls(decoder, wrapper):
     """Same input should produce identical CUDA graph output across calls."""
     codes = _random_codes(30)
@@ -504,6 +524,7 @@ def test_deterministic_across_calls(decoder, wrapper):
 # ──────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "kwargs,expected_in,not_expected",
     [
@@ -545,6 +566,7 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
 # ──────────────────────────────────────────────────────────────────
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "batch,channels,seq_len",
     [(2, 64, 1000), (1, 32, 1), (1, 32, 7), (1, 32, 128), (1, 32, 1024), (1, 32, 4096)],

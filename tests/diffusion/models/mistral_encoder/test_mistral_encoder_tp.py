@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 from vllm_omni.diffusion.models.mistral_encoder.mistral_encoder import (
     MistralEncoderModel,
@@ -491,3 +492,57 @@ class TestComputeLogits:
         assert logits.dim() == 3
         assert logits.shape[0] == 1
         assert logits.shape[1] == 4
+
+
+class TestQuantConfig:
+    """Verify quant_config is threaded into weight linears only, with correct prefixes."""
+
+    def test_quant_config_on_weight_linears(self, mocker):
+        quant_config = mocker.MagicMock(name="QuantizationConfig")
+        # Keep construction on the CPU-safe unquantized path while still
+        # verifying LinearBase consults the supplied quant_config.
+        quant_config.get_quant_method.return_value = UnquantizedLinearMethod()
+
+        config = _make_config(num_hidden_layers=1)
+        model = MistralEncoderModel(config, prefix="text_encoder", quant_config=quant_config)
+
+        layer = model.language_model.model.layers[0]
+        for linear in (
+            layer.self_attn.qkv_proj,
+            layer.self_attn.o_proj,
+            layer.mlp.gate_up_proj,
+            layer.mlp.down_proj,
+        ):
+            assert linear.quant_config is quant_config
+
+        # get_quant_method should be consulted for the four weight linears.
+        assert quant_config.get_quant_method.call_count == 4
+        seen_prefixes = set()
+        for call in quant_config.get_quant_method.call_args_list:
+            if "prefix" in call.kwargs:
+                seen_prefixes.add(call.kwargs["prefix"])
+            elif len(call.args) > 1:
+                seen_prefixes.add(call.args[1])
+        assert any(p.endswith("self_attn.qkv_proj") for p in seen_prefixes)
+        assert any(p.endswith("self_attn.o_proj") for p in seen_prefixes)
+        assert any(p.endswith("mlp.gate_up_proj") for p in seen_prefixes)
+        assert any(p.endswith("mlp.down_proj") for p in seen_prefixes)
+
+        # Embeddings / lm_head stay unquantized (quant_config never passed).
+        embed = model.language_model.model.embed_tokens
+        lm_head = model.language_model.lm_head
+        assert getattr(embed, "quant_config", None) is None
+        assert getattr(lm_head, "quant_config", None) is None
+
+    def test_layer_prefixes_include_text_encoder(self):
+        config = _make_config(num_hidden_layers=2)
+        model = MistralEncoderModel(config, prefix="text_encoder")
+
+        layer0 = model.language_model.model.layers[0]
+        assert layer0.self_attn.qkv_proj.prefix.startswith("text_encoder.language_model.model.layers.0")
+        assert layer0.self_attn.o_proj.prefix.startswith("text_encoder.language_model.model.layers.0")
+        assert layer0.mlp.gate_up_proj.prefix.startswith("text_encoder.language_model.model.layers.0")
+        assert layer0.mlp.down_proj.prefix.startswith("text_encoder.language_model.model.layers.0")
+
+        layer1 = model.language_model.model.layers[1]
+        assert "layers.1" in layer1.self_attn.qkv_proj.prefix

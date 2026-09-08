@@ -20,6 +20,9 @@ import torch
 
 from vllm_omni.quantization import quack_fp8
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 _ENV = "VLLM_OMNI_USE_QUACK_FP8"
 
 

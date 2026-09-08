@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Factory for building quantization configs.
 
 build_quant_config() delegates to vLLM's quantization registry.
-The only extension point is _OVERRIDES for methods that need a
-different QuantizationConfig subclass in the OMNI context (e.g. GGUF).
+Out-of-tree integrations can register Omni-specific builders with
+register_quantization_override().
 """
 
 from __future__ import annotations
@@ -55,12 +55,12 @@ def _register_humming_stubs() -> None:
         registry[name] = mod
 
     # wire parent references
-    registry["humming"].config = registry["humming.config"]
-    registry["humming"].dtypes = registry["humming.dtypes"]
-    registry["humming"].layer = registry["humming.layer"]
-    registry["humming"].schema = registry["humming.schema"]
-    registry["humming"].utils = registry["humming.utils"]
-    registry["humming.utils"].weight = registry["humming.utils.weight"]
+    setattr(registry["humming"], "config", registry["humming.config"])
+    setattr(registry["humming"], "dtypes", registry["humming.dtypes"])
+    setattr(registry["humming"], "layer", registry["humming.layer"])
+    setattr(registry["humming"], "schema", registry["humming.schema"])
+    setattr(registry["humming"], "utils", registry["humming.utils"])
+    setattr(registry["humming.utils"], "weight", registry["humming.utils.weight"])
 
     for name, mod in registry.items():
         sys.modules[name] = mod
@@ -81,18 +81,18 @@ from .component_config import ComponentQuantizationConfig  # noqa: E402
 logger = init_logger(__name__)
 
 
-def _build_gguf(**kw: Any) -> QuantizationConfig:
-    """Lazy import to avoid pulling in CUDA/pynvml at module load time."""
-    from .gguf_config import DiffusionGGUFConfig
-
-    return DiffusionGGUFConfig(**kw)
-
-
 def _build_int8(**kw: Any) -> QuantizationConfig:
     """Lazy import for Int8 diffusion config (supports CUDA + NPU)."""
     from .int8_config import DiffusionInt8Config
 
     return DiffusionInt8Config(**kw)
+
+
+def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
+    """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
+    from .bitsandbytes_config import DiffusionBitsAndBytesConfig
+
+    return DiffusionBitsAndBytesConfig(**kw)
 
 
 def _build_mxfp8(**kw: Any) -> QuantizationConfig:
@@ -125,6 +125,13 @@ def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
     return DiffusionMXFP4DualScaleMixedConfig(**kw)
 
 
+def _build_svdquant(**kw: Any) -> QuantizationConfig:
+    """Build the serialized SVDQuant diffusion checkpoint loader."""
+    from .svdquant_config import DiffusionSVDQuantConfig
+
+    return DiffusionSVDQuantConfig.from_config(kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -139,18 +146,59 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
     return OmniINCConfig(**filtered)
 
 
+def _build_torchao(**kw: Any) -> QuantizationConfig:
+    """Build a TorchAO runtime or serialized-checkpoint config."""
+    from vllm.model_executor.layers.quantization.torchao import TorchAOConfig
+
+    if "quant_type" in kw:
+        return TorchAOConfig.from_config({**kw, "quant_method": "torchao"})
+    return TorchAOConfig(**kw)
+
+
+def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
+    """Build the serialized TorchAO FP8 weight-only checkpoint config."""
+    from torchao.quantization import Float8WeightOnlyConfig
+
+    return _build_torchao(
+        torchao_config=Float8WeightOnlyConfig(
+            set_inductor_config=False,
+        ),
+        is_checkpoint_torchao_serialized=True,
+    )
+
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
-    "gguf": _build_gguf,
     "int8": _build_int8,
+    "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
+    "svdquant": _build_svdquant,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,
+    "torchao": _build_torchao,
+    "torchao_float8_weight_only": _build_torchao_float8_weight_only,
 }
 
-SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))
+
+def _compute_supported_quantization_methods() -> list[str]:
+    return list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))
+
+
+SUPPORTED_QUANTIZATION_METHODS: list[str] = _compute_supported_quantization_methods()
+
+
+def _refresh_registered_methods() -> None:
+    SUPPORTED_QUANTIZATION_METHODS[:] = _compute_supported_quantization_methods()
+    global _CACHED_ALIAS_MAP
+    _CACHED_ALIAS_MAP = None
+
+
+def register_quantization_override(method: str, builder: Callable[..., QuantizationConfig]) -> None:
+    """Register an Omni-specific quantization config builder."""
+    _OVERRIDES[_normalize_method_name(method)] = builder
+    _refresh_registered_methods()
 
 
 def _build_reverse_alias_map() -> dict[str, str]:
@@ -453,10 +501,14 @@ def resolve_quant_config_from_disk(
         )
         return build_quant_config(qc_method, **qc_kwargs)
 
-    # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
-    # is_checkpoint_*_serialized; rebuild so the offline path is selected.
+    # AutoRound MXFP checkpoints use data_type="mx_fp" instead of
+    # is_checkpoint_*_serialized; rebuild so the offline MXFP4/MXFP8 path is
+    # selected according to the checkpoint's bit width.
     if qc_kwargs.get("data_type") == "mx_fp":
-        logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
+        logger.info(
+            "config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP%d.",
+            qc_kwargs.get("bits", getattr(quant_config, "weight_bits", 0)),
+        )
         return build_quant_config(qc_method, **qc_kwargs)
 
     if (

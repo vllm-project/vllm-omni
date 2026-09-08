@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged self-attention helpers for AR-Diffusion DreamZero KV reuse."""
+"""Paged self-attention helpers for AR-Diffusion KV reuse."""
 
 from __future__ import annotations
 
@@ -9,19 +9,6 @@ from typing import Any, ClassVar, NamedTuple
 import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
-
-# Set by ARDiffusionPagedForwardContext.prepare() before each branch forward and
-# read by the fused write+attend custom op below. The pools are process-lifetime
-# allocations owned by one ARDiffusionKVCache per worker process (CFG-parallel /
-# TP ranks are separate processes), mirroring vLLM's forward-context pattern for
-# keeping multi-GiB cache tensors out of the compiled graph's inputs.
-_CURRENT_PAGED_KV_CACHE: Any = None
-
-
-def set_current_paged_kv_cache(kv_cache: Any) -> None:
-    global _CURRENT_PAGED_KV_CACHE
-    _CURRENT_PAGED_KV_CACHE = kv_cache
-
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
@@ -39,7 +26,7 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
 
     A NamedTuple of plain tensors + ints so ``torch.compile`` treats every field
     as a pytree graph input (no object-attribute guards, no recompiles when only
-    tensor *values* change). All layers of one branch forward share the same
+    tensor *values* change). All layers of one KV branch forward share the same
     metadata tensor objects, built once by ``prepare()``.
 
     ``layer_idx`` is a 0-dim CPU tensor, NOT a python int: all 40 DiT blocks
@@ -50,6 +37,9 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     """
 
     layer_idx: torch.Tensor
+    key_pool: torch.Tensor
+    value_pool: torch.Tensor
+    block_size: int
     seq_len: int
     video_slots: torch.Tensor
     action_slots: torch.Tensor
@@ -62,11 +52,11 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
 
 @dataclass
 class ARDiffusionPagedForwardContext:
-    """Mutable branch-level state shared by all layer contexts in one forward."""
+    """Mutable KV-branch state shared by all layer contexts in one forward."""
 
     kv_cache: Any
     adapter: Any
-    is_negative: bool
+    kv_branch: str
     history_block_ids: list[int]
     seq_len: int
     commit_current: bool
@@ -80,7 +70,7 @@ class ARDiffusionPagedForwardContext:
     _allocated_video: bool = False
     _committed: bool = False
     _action_len: int = 0
-    # Set once by prepare(); shared by all layers of the branch forward.
+    # Set once by prepare(); shared by all layers of the KV branch forward.
     block_table: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
@@ -102,7 +92,7 @@ class ARDiffusionPagedForwardContext:
         return self.seq_len // self.block_size
 
     def ensure_video_slots(self, device: torch.device) -> None:
-        """Allocate/write targets for the current video tokens, once per branch."""
+        """Allocate/write targets for the current video tokens, once per KV branch."""
         if self._allocated_video:
             return
 
@@ -116,7 +106,7 @@ class ARDiffusionPagedForwardContext:
             positions = torch.arange(start, start + self.seq_len, dtype=torch.long)
             self.current_video_slot_mapping = compute_slot_mapping(table, positions, self.block_size).to(device=device)
         else:
-            self.current_video_block_ids = self.kv_cache.scratch_block_ids(self.is_negative, 0, n_blocks)
+            self.current_video_block_ids = self.kv_cache.scratch_block_ids(self.kv_branch, 0, n_blocks)
             positions = torch.arange(self.seq_len, dtype=torch.long)
             self.current_video_slot_mapping = compute_slot_mapping(
                 self.current_video_block_ids,
@@ -140,7 +130,7 @@ class ARDiffusionPagedForwardContext:
         action_blocks = (action_len + self.block_size - 1) // self.block_size
         scratch_offset = 0 if self.commit_current else len(self.current_video_block_ids)
         self.action_scratch_block_ids = self.kv_cache.scratch_block_ids(
-            self.is_negative,
+            self.kv_branch,
             scratch_offset,
             action_blocks,
         )
@@ -161,8 +151,15 @@ class ARDiffusionPagedForwardContext:
             )
         all_video_blocks = self.history_block_ids + self.current_video_block_ids
         max_video_blocks = self.max_video_tokens // self.block_size
-        visible_video_blocks = all_video_blocks[-max_video_blocks:] if max_video_blocks else []
-        video_len = min(len(all_video_blocks) * self.block_size, self.max_video_tokens)
+        sink_blocks = int(self.kv_cache.spec.sink_chunks)
+        if len(all_video_blocks) <= max_video_blocks:
+            visible_video_blocks = all_video_blocks
+        else:
+            tail_blocks = max_video_blocks - sink_blocks
+            visible_video_blocks = all_video_blocks[:sink_blocks]
+            if tail_blocks:
+                visible_video_blocks += all_video_blocks[-tail_blocks:]
+        video_len = len(visible_video_blocks) * self.block_size
         return visible_video_blocks, video_len
 
     def build_block_table(
@@ -201,9 +198,9 @@ class ARDiffusionPagedForwardContext:
         return block_table, query_start_loc, seq_lens, self.query_len, max_seq_len
 
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:
-        """Host-side, once-per-branch-forward setup (called OUTSIDE torch.compile).
+        """Host-side, once-per-KV-branch setup (called OUTSIDE torch.compile).
 
-        Allocates the current video/action slots (still lazy: only the branch a
+        Allocates the current video/action slots (still lazy: only the KV branch a
         CFG-parallel rank actually runs reaches its ``_forward_blocks``), builds
         the padded block-table metadata ONCE for all layers, and publishes the
         pool registry for the fused custom op. The compiled per-layer code then
@@ -221,7 +218,6 @@ class ARDiffusionPagedForwardContext:
         ) = self.build_block_table(action_len=action_len, query_len=query_len, device=device)
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
-        set_current_paged_kv_cache(self.kv_cache)
         self._prepared = True
 
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
@@ -229,6 +225,9 @@ class ARDiffusionPagedForwardContext:
             raise RuntimeError("ARDiffusionPagedForwardContext.layer_inputs() before prepare()")
         return ARDiffusionPagedLayerInputs(
             layer_idx=_layer_idx_tensor(layer_idx),
+            key_pool=self.kv_cache._k_pools[layer_idx],
+            value_pool=self.kv_cache._v_pools[layer_idx],
+            block_size=int(self.kv_cache.block_size),
             seq_len=int(self.seq_len),
             video_slots=self.current_video_slot_mapping,
             action_slots=self.action_slot_mapping,
@@ -245,7 +244,7 @@ class ARDiffusionPagedForwardContext:
 
 @dataclass
 class ARDiffusionPagedLayerContext:
-    """Layer-specific handle passed through DreamZero's existing ``kv_cache`` slot."""
+    """Layer-specific handle passed through a model's ``kv_cache`` slot."""
 
     is_ar_diffusion_paged_context: ClassVar[bool] = True
     layer_idx: int
@@ -260,8 +259,8 @@ class ARDiffusionPagedLayerContext:
         return self.forward_ctx.adapter
 
     @property
-    def is_negative(self) -> bool:
-        return self.forward_ctx.is_negative
+    def kv_branch(self) -> str:
+        return self.forward_ctx.kv_branch
 
     @property
     def history_block_ids(self) -> list[int]:
@@ -358,6 +357,22 @@ def _resolve_fa_version(head_size: int) -> int:
     return version
 
 
+def _rocm_flash_attn_varlen_func():
+    """Resolve a ROCm varlen kernel, preferring AITER when available.
+
+    The caller gathers paged KV into packed tensors before invoking this
+    function, avoiding AITER releases whose ``block_table`` kernel is broken.
+    """
+    try:
+        from aiter import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
+    except ImportError:
+        from flash_attn import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
+
+
 def ar_diffusion_paged_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -394,6 +409,34 @@ def ar_diffusion_paged_attention(
             softmax_scale,
             causal=causal,
         )
+    elif torch.version.hip is not None:
+        # vllm.vllm_flash_attn contains CUDA-only extensions. ROCm's AITER and
+        # upstream flash-attn expose the standard cu_seqlens_k API instead of
+        # vLLM's seqused_k/fa_version API. The ROCm flash-attn paged kernel also
+        # requires 128-token blocks, while AR-Diffusion uses frame-aligned
+        # 16-token blocks, so gather the visible blocks on-device first.
+        flash_attn_varlen_func = _rocm_flash_attn_varlen_func()
+        cu_seqlens_k = torch.cat([seq_lens.new_zeros(1), torch.cumsum(seq_lens, dim=0, dtype=torch.int32)])
+        positions = torch.arange(int(max_seq_len), device=query_flat.device)
+        logical_blocks = torch.div(positions, key_cache.shape[1], rounding_mode="floor")
+        offsets = positions % key_cache.shape[1]
+        physical_blocks = block_table[:, logical_blocks].long()
+        gathered_k = key_cache[physical_blocks, offsets]
+        gathered_v = value_cache[physical_blocks, offsets]
+        valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+        packed_k = gathered_k[valid]
+        packed_v = gathered_v[valid]
+        out = flash_attn_varlen_func(
+            q=query_flat,
+            k=packed_k,
+            v=packed_v,
+            cu_seqlens_q=query_start_loc,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=int(max_query_len),
+            max_seqlen_k=int(max_seq_len),
+            softmax_scale=float(softmax_scale),
+            causal=causal,
+        )
     else:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -425,17 +468,18 @@ def ar_diffusion_paged_attention(
 # One opaque op per layer keeps the compiled DiT block fullgraph: dynamo treats
 # it as a single graph node (no eager island, no graph breaks), and the K/V slot
 # writes happen inside the op so write→read ordering with the block-table kernel
-# is internal — no hidden-mutation ordering hazards against a separate reader op
-# and no multi-GiB pool tensors as graph inputs (the flat and paged pool views
-# alias the same storage, which AOTAutograd handles poorly as inputs). Pattern
-# follows sage_attn3.py in-repo and vLLM's own unified attention ops.
+# is internal. The flat pools are explicit mutable inputs: Inductor/CUDA Graph
+# must track their storage lifetime instead of observing an undeclared mutation
+# through a process-global registry.
 def _paged_write_attn_impl(
     query: torch.Tensor,
     k_curr: torch.Tensor,
     v_curr: torch.Tensor,
     k_act: torch.Tensor | None,
     v_act: torch.Tensor | None,
-    layer_idx: torch.Tensor,
+    key_pool: torch.Tensor,
+    value_pool: torch.Tensor,
+    block_size: int,
     video_slots: torch.Tensor,
     action_slots: torch.Tensor,
     block_table: torch.Tensor,
@@ -445,21 +489,17 @@ def _paged_write_attn_impl(
     max_seq_len: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    kv = _CURRENT_PAGED_KV_CACHE
-    if kv is None:
-        raise RuntimeError("ar_diffusion_paged_write_attn called before prepare() set the KV pool registry")
-    layer_idx = int(layer_idx)
-    k_pool = kv._k_pools[layer_idx]
-    v_pool = kv._v_pools[layer_idx]
-    k_pool[video_slots] = k_curr.to(k_pool.dtype)
-    v_pool[video_slots] = v_curr.to(v_pool.dtype)
+    key_pool[video_slots] = k_curr.to(key_pool.dtype)
+    value_pool[video_slots] = v_curr.to(value_pool.dtype)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        k_pool[action_slots] = k_act.to(k_pool.dtype)
-        v_pool[action_slots] = v_act.to(v_pool.dtype)
+        key_pool[action_slots] = k_act.to(key_pool.dtype)
+        value_pool[action_slots] = v_act.to(value_pool.dtype)
+    key_cache = key_pool.unflatten(0, (-1, block_size))
+    value_cache = value_pool.unflatten(0, (-1, block_size))
     return ar_diffusion_paged_attention(
         query,
-        kv.key_cache(layer_idx),
-        kv.value_cache(layer_idx),
+        key_cache,
+        value_cache,
         block_table=block_table,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,
@@ -474,14 +514,19 @@ def _paged_write_attn_impl(
 # the module from sys.modules (same as sage_attn3.py).
 if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
 
-    @torch.library.custom_op("vllm_omni::ar_diffusion_paged_write_attn", mutates_args=())
+    @torch.library.custom_op(
+        "vllm_omni::ar_diffusion_paged_write_attn",
+        mutates_args=("key_pool", "value_pool"),
+    )
     def _paged_write_attn_op(
         query: torch.Tensor,
         k_curr: torch.Tensor,
         v_curr: torch.Tensor,
         k_act: torch.Tensor | None,
         v_act: torch.Tensor | None,
-        layer_idx: torch.Tensor,
+        key_pool: torch.Tensor,
+        value_pool: torch.Tensor,
+        block_size: int,
         video_slots: torch.Tensor,
         action_slots: torch.Tensor,
         block_table: torch.Tensor,
@@ -497,7 +542,9 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             v_curr,
             k_act,
             v_act,
-            layer_idx,
+            key_pool,
+            value_pool,
+            block_size,
             video_slots,
             action_slots,
             block_table,
@@ -515,7 +562,9 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         v_curr,
         k_act,
         v_act,
-        layer_idx,
+        key_pool,
+        value_pool,
+        block_size,
         video_slots,
         action_slots,
         block_table,
@@ -538,7 +587,9 @@ def paged_write_attn(
         v_curr,
         k_act,
         v_act,
-        inputs.layer_idx,
+        inputs.key_pool,
+        inputs.value_pool,
+        inputs.block_size,
         inputs.video_slots,
         inputs.action_slots,
         inputs.block_table,

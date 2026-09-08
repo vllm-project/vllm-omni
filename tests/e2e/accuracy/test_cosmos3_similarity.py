@@ -42,8 +42,6 @@ def _server_args() -> list[str]:
     return [
         "--num-gpus",
         "1",
-        "--model-class-name",
-        "Cosmos3OmniDiffusersPipeline",
         "--stage-init-timeout",
         "900",
         "--init-timeout",

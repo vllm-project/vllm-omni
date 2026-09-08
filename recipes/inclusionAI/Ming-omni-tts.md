@@ -5,20 +5,21 @@
 ## Summary
 
 - Vendor: inclusionAI
-- Model: `inclusionAI/Ming-omni-tts-0.5B`
+- Model: `inclusionAI/Ming-omni-tts-16.8B-A3B`, `inclusionAI/Ming-omni-tts-0.5B`
 - Task: Text-to-speech with style, dialect, cloning, and multi-speaker controls
 - Mode: Online serving via the OpenAI-compatible `/v1/audio/speech` API
 - Maintainer: Community
 
 ## References
 
-- [Huggingface Model card](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B)
+- [Huggingface: inclusionAI/Ming-omni-tts-16.8B-A3B](https://huggingface.co/inclusionAI/Ming-omni-tts-16.8B-A3B)
+- [Huggingface: inclusionAI/Ming-omni-tts-0.5B](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B)
 - Upstream repository [inclusionAI/Ming-omni-tts](https://github.com/inclusionAI/Ming-omni-tts)
 
 
 ## Hardware Support
 
-This recipe documents a validated ROCm configuration and a CUDA configuration for the dense 0.5B two-stage TTS pipeline deployment.
+This recipe documents a validated ROCm configuration and a CUDA configuration for the dense 0.5B and the MoE 16.8B two-stage TTS pipeline deployment.
 Other hardware is welcome as community validation lands.
 
 ## CUDA
@@ -39,11 +40,7 @@ Other hardware is welcome as community validation lands.
 Launch the two-stage talker:
 
 ```bash
-vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
-    --deploy-config vllm_omni/deploy/ming_tts.yaml \
-    --omni \
-    --port 8091 \
-    --enforce-eager
+vllm serve inclusionAI/Ming-omni-tts-16.8B-A3B --omni --port 8091
 ```
 
 #### Verification
@@ -54,7 +51,7 @@ Basic synthesis (save the WAV bytes):
 curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "inclusionAI/Ming-omni-tts-0.5B",
+      "model": "inclusionAI/Ming-omni-tts-16.8B-A3B",
       "input": "你好，这是 Ming 在线语音合成测试。",
       "response_format": "wav"
     }' --output ming_tts_basic.wav
@@ -74,7 +71,7 @@ Reference-audio zero-shot cloning:
 REF_AUDIO="$BASE/10002287-00000094.wav"
 jq -n --arg ref_audio "$REF_AUDIO" \
     '{
-       model: "inclusionAI/Ming-omni-tts-0.5B",
+       model: "inclusionAI/Ming-omni-tts-16.8B-A3B",
        input: "我们的愿景是构建未来服务业的数字化基础设施，为世界带来更多微小而美好的改变。",
        ref_audio: $ref_audio,
        ref_text: "在此奉劝大家别乱打美白针。",
@@ -107,7 +104,7 @@ jq -n \
     --arg a "$REF_A" \
     --arg b "$REF_B" \
     '{
-       model: "inclusionAI/Ming-omni-tts-0.5B",
+       model: "inclusionAI/Ming-omni-tts-16.8B-A3B",
        input: $input,
        ref_audio: [$a, $b],
        ref_text: $ref_text,
@@ -169,6 +166,35 @@ python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
 
 `--ref-audio` matches upstream `use_spk_emb=True`; do not add `--ref-text`
 for the dialect case.
+
+**Offline smoke result on ROCm 7.2:**
+
+A later offline smoke run used the same MI300X model with the following software:
+
+- GPU: one AMD Instinct MI300X with 191.69 GiB visible HBM and gfx942
+- Kernel: Linux 6.8.0-134-generic, x86_64
+- Python: 3.12.13
+- PyTorch: 2.11.0+gitd0c8b1f
+- ROCm or HIP: 7.2.53211
+- vLLM: 0.27.0+rocm723
+- vLLM Omni checkout: `73e1368c7bb940efe1a025859c9d6c8eeeb2e3f0`
+
+```bash
+python3 examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --model inclusionAI/Ming-omni-tts-0.5B \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --case basic \
+    --text "你好，这是 AMD MI300X ROCm 配方验证。" \
+    --output-dir ./ming_tts_output \
+    --output-name ming_omni_tts_mi300x.wav \
+    --enforce-eager \
+    --log-stats \
+    --metadata-json ./ming_tts_manifest.json
+```
+
+The checked run produced a valid 44.1 kHz mono WAV with 4.80 seconds of audio, RMS 0.1449, and peak absolute amplitude 0.8621. The first request took 20.406 seconds, which gives a real time factor of 4.25. The stage weight loads used 1.31 GiB and 1.47 GiB and took 1.756 seconds and 1.264 seconds. The largest one second whole device memory sample was 91.05 GiB, including the reserved KV cache. Both stages used eager mode, and the AR stage selected `TRITON_ATTN`.
+
+The run used the official ROCm image built from `docker/Dockerfile.rocm`.
 
 ## Notes
 

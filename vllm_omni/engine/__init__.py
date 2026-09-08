@@ -75,6 +75,10 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
     # Optional additional information dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
+    # Runner-owned runtime payload. This is materialized directly into
+    # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
+    # additional_information request transport.
+    model_intermediate_buffer: dict[str, Any] | None = None
 
     @classmethod
     def from_request(
@@ -83,6 +87,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         *,
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
+        model_intermediate_buffer: dict[str, Any] | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -90,6 +95,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             prompt_embeds = request.prompt_embeds
         if additional_information is None:
             additional_information = getattr(request, "additional_information", None)
+        if model_intermediate_buffer is None:
+            model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
 
         return cls(
             request_id=request.request_id,
@@ -113,6 +120,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
             additional_information=additional_information,
+            model_intermediate_buffer=model_intermediate_buffer,
         )
 
 

@@ -12,6 +12,8 @@ from openpyxl import load_workbook
 import vllm_omni.profiler.omni_torch_profiler as profiler_mod
 from vllm_omni.profiler.omni_torch_profiler import OmniTorchProfilerWrapper
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 @pytest.fixture(autouse=True)
 def patch_worker_profiler_init(monkeypatch):

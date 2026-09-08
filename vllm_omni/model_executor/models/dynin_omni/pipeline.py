@@ -23,6 +23,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.dynin_omni"
 
 DYNIN_OMNI_PIPELINE = PipelineConfig(
     model_type="dynin_omni",
+    default_deploy_config_name="dynin_omni.yaml",
     model_arch="DyninOmniForConditionalGeneration",
     # Arch-fallback safety net: route by hf_config.architectures when the
     # auto-detected model_type does not match the registry key exactly.
@@ -49,6 +50,7 @@ DYNIN_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.token2text_to_token2image",
             custom_process_next_stage_input_func=f"{_PROC}.token2image_to_token2audio_full_payload",
+            requires_full_payload_input=True,
         ),
         StagePipelineConfig(
             stage_id=2,
@@ -59,6 +61,7 @@ DYNIN_OMNI_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.token2image_to_token2audio",
+            requires_full_payload_input=True,
         ),
     ),
 )

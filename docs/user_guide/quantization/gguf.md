@@ -9,6 +9,15 @@ for the transformer.
 
 GGUF is static quantization: the quantized weights are produced before serving.
 
+!!! note
+    GGUF support has migrated to OOT [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin). Make sure you have GGUF plugin installed before serving a GGUF model.
+
+Before serving a GGUF model, make sure to install the [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin):
+
+```bash
+uv pip install vllm-gguf-plugin>=0.0.3
+```
+
 ## Hardware Support
 
 | Device | Support |

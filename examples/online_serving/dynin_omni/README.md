@@ -1,4 +1,4 @@
-# Dynin-Omni Online Serving Example
+# Dynin-Omni: Online serving
 
 ## Installation
 

@@ -29,10 +29,10 @@ def test_diffusion_model(tmp_path: Path, omni_runner):
             raise ValueError("Empty outputs from Omni.generate()")
         first_output = outputs[0]
         assert first_output.final_output_type == "image"
-        if not hasattr(first_output, "request_output") or not first_output.request_output:
+        if not isinstance(first_output, OmniRequestOutput) or not first_output:
             raise ValueError("No request_output found in OmniRequestOutput")
 
-        req_out = first_output.request_output
+        req_out = first_output
         if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
             raise ValueError("Invalid request_output structure or missing 'images' key")
         return req_out.images

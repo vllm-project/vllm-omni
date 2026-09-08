@@ -1,12 +1,8 @@
 from collections.abc import Callable
 from enum import Enum, auto
-from typing import (
-    Any,
-    Literal,
-    NotRequired,
-    TypeAlias,
-    TypedDict,
-)
+from typing import Any, Literal, TypeAlias
+
+from typing_extensions import NotRequired, TypedDict
 
 AudioFormat: TypeAlias = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
 
@@ -24,6 +20,14 @@ class QwenTTSModelSpecificParams(dict):
 
 
 class WanModelSpecificParams(dict):
+    pass
+
+
+class MiniMaxH3ModelSpecificParams(dict):
+    pass
+
+
+class VideoReferences(dict):
     pass
 
 
@@ -47,9 +51,11 @@ class ModelModeSpec(TypedDict):
 
 
 PayloadPreprocessor: TypeAlias = Callable[[dict[str, Any]], dict[str, Any]]
+ParamsBuilder: TypeAlias = Callable[..., dict[str, Any]]
 
 
 class Spec(TypedDict):
     stages: list[Literal["diffusion", "autoregression"]]
     modes: list[ModelModeSpec]
     payload_preprocessor: NotRequired[PayloadPreprocessor]
+    params_builder: NotRequired[ParamsBuilder]

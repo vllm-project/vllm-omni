@@ -22,6 +22,7 @@ from .constants import (
     DEFAULT_SIGMA,
     DEFAULT_TEMPERATURE,
     HISTORY_PATCH_SIZE,
+    INITIAL_LATENT_CHUNK_SIZE,
     KEY_CFG,
     KEY_CHUNK_ID,
     KEY_DECODE_STEP,
@@ -34,6 +35,9 @@ from .constants import (
     KEY_REQUEST_ID,
     KEY_SIGMA,
     KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_SAMPLE_RATES,
+    KEY_SPEAKER_WAVEFORM,
+    KEY_SPEAKER_WAVEFORM_LENGTHS,
     KEY_TEMPERATURE,
     KEY_TEXT_MODE,
     LATENT_CHUNK_SIZE,
@@ -239,6 +243,7 @@ class MingTTSConfig:
     max_decode_steps: int = MAX_DECODE_STEPS
 
     latent_chunk_size: int = LATENT_CHUNK_SIZE
+    initial_latent_chunk_size: int = INITIAL_LATENT_CHUNK_SIZE
     latent_left_context: int = LATENT_LEFT_CONTEXT
 
     text_eos_token_id: int = TEXT_EOS_TOKEN_ID
@@ -324,6 +329,9 @@ __all__ = [
     "KEY_REQUEST_ID",
     "KEY_SIGMA",
     "KEY_SPEAKER_EMBEDDING",
+    "KEY_SPEAKER_SAMPLE_RATES",
+    "KEY_SPEAKER_WAVEFORM",
+    "KEY_SPEAKER_WAVEFORM_LENGTHS",
     "KEY_TEMPERATURE",
     "KEY_TEXT_MODE",
     "LATENT_CHUNK_SIZE",

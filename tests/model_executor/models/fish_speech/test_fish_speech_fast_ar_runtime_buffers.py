@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -12,6 +13,8 @@ from vllm_omni.model_executor.models.fish_speech.fish_speech_fast_ar import Fish
 from vllm_omni.model_executor.models.fish_speech.fish_speech_slow_ar import (
     FishSpeechSlowARForConditionalGeneration,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_fast_ar_reuses_dense_position_id_buffer(monkeypatch):

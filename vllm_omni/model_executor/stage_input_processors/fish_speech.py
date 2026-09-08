@@ -114,37 +114,6 @@ def _extract_last_frame(multimodal_output: dict[str, Any]) -> torch.Tensor | Non
     raise ValueError(f"Invalid audio_codes shape for Fish Speech async_chunk: {tuple(audio_codes.shape)}")
 
 
-def slow_ar_to_dac_decoder(
-    source_outputs: list[Any],
-    _prompt: Any = None,
-    _requires_multimodal_data: bool = False,
-) -> list[Any]:
-    """Non-async processor: wait for Slow AR to finish, then pass all codes to DAC decoder."""
-    from vllm_omni.inputs.data import OmniTokensPrompt
-
-    slow_ar_outputs = source_outputs
-    dac_inputs: list[OmniTokensPrompt] = []
-
-    for output in slow_ar_outputs:
-        out = output.outputs[0]
-        # audio_codes shape: [num_frames, num_codebooks]
-        audio_codes = out.multimodal_output["audio_codes"].to(torch.long)
-        # Filter zero-padded frames.
-        valid_mask = audio_codes.any(dim=1)
-        audio_codes = audio_codes[valid_mask]
-        # Codebook-major flat: [num_codebooks * num_frames]
-        codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
-        dac_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=codec_codes,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-                additional_information=None,
-            )
-        )
-    return dac_inputs
-
-
 def slow_ar_to_dac_decoder_async_chunk(
     transfer_manager: Any,
     multimodal_output: dict[str, Any] | None,

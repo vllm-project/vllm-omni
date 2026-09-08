@@ -1,0 +1,90 @@
+# PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory chunk streaming.
+#
+# PersonaPlex is a Moshi finetune (full-duplex S2S), served offline as a 2-stage
+# audio->audio pipeline that reuses the Qwen3-TTS staged deploy layout. Fields
+# omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py).
+#
+# Notable choices for this model:
+#   * Stage 0 (talker) keeps a small max_num_batched_tokens for async-chunk
+#     first-chunk latency (not correctness).
+#   * Stage 1 (code2wav) wraps the external Mimi codec. Each codec frame is
+#     8 active codebooks (cb 0..7) -> 1920 PCM samples @ 24 kHz / 12.5 Hz.
+#   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) is eager because the
+#     external decoder performs host-to-device copies that cannot be captured.
+pipeline: personaplex
+session_mode: duplex
+duplex_session:
+  max_sessions: 2
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk.
+      codec_chunk_frames: 5
+      codec_left_context_frames: 10
+      # Emit only the first audio chunk early, then return to codec_chunk_frames.
+      initial_codec_chunk_frames: 1
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 10
+    gpu_memory_utilization: 0.4
+    trust_remote_code: true
+    skip_tokenizer_init: true
+    # Prompt IDs are placeholders; voice/persona/audio semantics live in
+    # request-specific embeddings, so token-ID prefix caching is invalid.
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    # Temporal transformer sliding_window is 3000 frames; keep model len within.
+    max_model_len: 3000
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      # Greedy talker decoding: the HeliumModel temporal matches Moshi within cos
+      # 0.999 (not bit-exact), and chaotic sampling amplifies that into divergence.
+      # Greedy is reliably coherent; raise temperature only once the temporal is
+      # bit-exact.
+      temperature: 0.0
+      top_k: 1
+      max_tokens: 3000
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 10
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    trust_remote_code: true
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    # Codec prefill length is num_codebooks * num_frames; keep ample headroom.
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        enforce_eager: false

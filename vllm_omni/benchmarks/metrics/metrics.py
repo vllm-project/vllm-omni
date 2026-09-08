@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import warnings
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import field, make_dataclass
 
 import numpy as np
@@ -15,6 +19,11 @@ _FLOAT_LIST_TYPE = list[float]
 _INT_LIST_TYPE = list[int]
 
 _MULTIMODAL_BENCHMARK_FIELDS = [
+    ("num_ttft_samples", int, field(default=0)),
+    ("num_tpot_samples", int, field(default=0)),
+    ("num_itl_samples", int, field(default=0)),
+    ("num_audio_ttfp_samples", int, field(default=0)),
+    ("num_audio_rtf_samples", int, field(default=0)),
     (defs.MEAN_AUDIO_TTFP_MS, float, field(default=0.0)),
     (defs.MEDIAN_AUDIO_TTFP_MS, float, field(default=0.0)),
     (defs.STD_AUDIO_TTFP_MS, float, field(default=0.0)),
@@ -43,6 +52,21 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_IMAGE_GENERATION_MS, float, field(default=0.0)),
     (defs.STD_IMAGE_GENERATION_MS, float, field(default=0.0)),
     (defs.PERCENTILES_IMAGE_GENERATION_MS, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.TOTAL_VIDEO_DURATION_S, float, field(default=0.0)),
+    (defs.TOTAL_VIDEO_FRAMES, int, field(default=0)),
+    (defs.VIDEO_THROUGHPUT, float, field(default=0.0)),
+    (defs.MEAN_VIDEO_RTF, float, field(default=0.0)),
+    (defs.MEDIAN_VIDEO_RTF, float, field(default=0.0)),
+    (defs.STD_VIDEO_RTF, float, field(default=0.0)),
+    (defs.PERCENTILES_VIDEO_RTF, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MEAN_VIDEO_GENERATION_MS, float, field(default=0.0)),
+    (defs.MEDIAN_VIDEO_GENERATION_MS, float, field(default=0.0)),
+    (defs.STD_VIDEO_GENERATION_MS, float, field(default=0.0)),
+    (defs.PERCENTILES_VIDEO_GENERATION_MS, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MEAN_PEAK_MEMORY_MB, float, field(default=0.0)),
+    (defs.MEDIAN_PEAK_MEMORY_MB, float, field(default=0.0)),
+    (defs.STD_PEAK_MEMORY_MB, float, field(default=0.0)),
+    (defs.PERCENTILES_PEAK_MEMORY_MB, _PERCENTILE_ROWS_TYPE, field(default=None)),
 ]
 
 MultiModalsBenchmarkMetrics = make_dataclass(
@@ -162,8 +186,10 @@ def _stage_modality_flags(
 ) -> tuple[bool, bool, bool, bool, bool]:
     is_text_stage = final_output_type == "text" or output_unit_type == "text"
     is_audio_stage = final_output_type == "audio" or output_unit_type == "audio"
-    is_image_stage = final_output_type in {"image", "images"} or output_unit_type == "image"
     is_video_stage = final_output_type in {"video", "videos"} or output_unit_type == "video"
+    # Video diffusion may still report output_unit_type="image" when frames are
+    # stored in ``images``; prefer video when final_output_type says so.
+    is_image_stage = (not is_video_stage) and (final_output_type in {"image", "images"} or output_unit_type == "image")
     is_internal_stream_stage = (
         output_unit_type in _STREAMING_OUTPUT_UNIT_TYPES and not is_text_stage and not is_audio_stage
     )
@@ -174,6 +200,17 @@ def _stage_modality_flags(
         is_video_stage,
         is_internal_stream_stage,
     )
+
+
+def has_metric_samples(metrics: object, metric_name: str) -> bool:
+    sample_count_attr = {
+        "ttft": "num_ttft_samples",
+        "tpot": "num_tpot_samples",
+        "itl": "num_itl_samples",
+        defs.AUDIO_TTFP: "num_audio_ttfp_samples",
+        defs.AUDIO_RTF: "num_audio_rtf_samples",
+    }.get(metric_name)
+    return sample_count_attr is None or getattr(metrics, sample_count_attr, 0) > 0
 
 
 def print_metrics(
@@ -202,6 +239,7 @@ def print_metrics(
         print("{:<40} {:<10.2f}".format("Request goodput (req/s):", metrics.request_goodput))
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
         print("{:<40} {:<10.2f}".format("Peak concurrent requests:", metrics.max_concurrent_requests))
+        print_peak_memory_metrics(metrics)
     if task_type != TaskType.GENERATION or "e2el" in selected_percentile_metrics:
         process_one_metric("e2el", metrics)
     print_text_metrics(task_type, selected_percentile_metrics, metrics)
@@ -210,9 +248,13 @@ def print_metrics(
             print_audio_metrics(selected_percentile_metrics, metrics)
         if _has_image_output(metrics):
             print_image_metrics(selected_percentiles or [], metrics)
+        if _has_video_output(metrics):
+            print_video_metrics(selected_percentiles or [], metrics)
         if print_stage and outputs and selected_percentiles is not None:
-            print("\n{s:{c}^{n}}".format(s=" Stage Benchmark Result ", n=50, c="="))
-            for sm in _build_stage_metrics_from_outputs(outputs):
+            stage_metrics = _build_stage_metrics_from_outputs(outputs)
+            if stage_metrics:
+                print("\n{s:{c}^{n}}".format(s=" Stage Benchmark Result ", n=50, c="="))
+            for sm in stage_metrics:
                 print_stage_metrics(
                     task_type,
                     selected_percentile_metrics,
@@ -223,6 +265,11 @@ def print_metrics(
 
 
 def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiModalsBenchmarkMetrics):
+    # Pure image/video runs have no user-facing text tokens; skip the whole
+    # Text Result section (token throughput / peak would be misleading).
+    if metrics.total_output <= 0 and (_has_image_output(metrics) or _has_video_output(metrics)):
+        return
+
     print("{s:{c}^{n}}".format(s=" Text Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
@@ -255,6 +302,14 @@ def _has_image_output(metrics: MultiModalsBenchmarkMetrics) -> bool:
     return int(getattr(metrics, defs.TOTAL_IMAGES, 0) or 0) > 0
 
 
+def _has_video_output(metrics: MultiModalsBenchmarkMetrics) -> bool:
+    return (
+        float(getattr(metrics, defs.TOTAL_VIDEO_DURATION_S, 0.0) or 0.0) > 0.0
+        or int(getattr(metrics, defs.TOTAL_VIDEO_FRAMES, 0) or 0) > 0
+        or float(getattr(metrics, defs.MEAN_VIDEO_GENERATION_MS, 0.0) or 0.0) > 0.0
+    )
+
+
 def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchmarkMetrics):
     print("{s:{c}^{n}}".format(s=" Audio Result ", n=50, c="="))
     print(
@@ -271,6 +326,16 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     for metric in selected_percentile_metrics:
         if metric.startswith("audio"):
             process_one_metric(metric, metrics)
+
+
+def print_peak_memory_metrics(metrics: MultiModalsBenchmarkMetrics):
+    if getattr(metrics, defs.MEAN_PEAK_MEMORY_MB) <= 0:
+        return
+    print("{s:{c}^{n}}".format(s="Peak Memory", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean PEAK_MEMORY_MB (MB):", getattr(metrics, defs.MEAN_PEAK_MEMORY_MB)))
+    print("{:<40} {:<10.2f}".format("Median PEAK_MEMORY_MB (MB):", getattr(metrics, defs.MEDIAN_PEAK_MEMORY_MB)))
+    for p, value in getattr(metrics, defs.PERCENTILES_PEAK_MEMORY_MB) or []:
+        print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} PEAK_MEMORY_MB (MB):", value))
 
 
 def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsBenchmarkMetrics):
@@ -291,7 +356,7 @@ def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsB
             )
         )
     if getattr(metrics, defs.MEAN_IMAGE_GENERATION_MS) > 0:
-        print("-----------------Image Generation-----------------")
+        print("{s:{c}^{n}}".format(s=" Image Generation ", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean IMAGE_GENERATION (ms):", getattr(metrics, defs.MEAN_IMAGE_GENERATION_MS)))
         print(
             "{:<40} {:<10.2f}".format(
@@ -304,10 +369,49 @@ def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsB
                 print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} IMAGE_GENERATION (ms):", value))
 
 
+def print_video_metrics(selected_percentiles: list[float], metrics: MultiModalsBenchmarkMetrics):
+    print("{s:{c}^{n}}".format(s=" Video Result ", n=50, c="="))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total video duration generated(s):",
+            getattr(metrics, defs.TOTAL_VIDEO_DURATION_S),
+        )
+    )
+    print("{:<40} {:<10}".format("Total video frames generated:", getattr(metrics, defs.TOTAL_VIDEO_FRAMES)))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Video throughput(video duration/s):",
+            getattr(metrics, defs.VIDEO_THROUGHPUT),
+        )
+    )
+    if getattr(metrics, defs.MEAN_VIDEO_RTF) > 0:
+        print("{s:{c}^{n}}".format(s=" Video RTF ", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean VIDEO_RTF:", getattr(metrics, defs.MEAN_VIDEO_RTF)))
+        print("{:<40} {:<10.2f}".format("Median VIDEO_RTF:", getattr(metrics, defs.MEDIAN_VIDEO_RTF)))
+        for p, value in getattr(metrics, defs.PERCENTILES_VIDEO_RTF) or []:
+            if p in selected_percentiles:
+                print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} VIDEO_RTF:", value))
+    if getattr(metrics, defs.MEAN_VIDEO_GENERATION_MS) > 0:
+        print("{s:{c}^{n}}".format(s=" Video Generation ", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean VIDEO_GENERATION (ms):", getattr(metrics, defs.MEAN_VIDEO_GENERATION_MS)))
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Median VIDEO_GENERATION (ms):",
+                getattr(metrics, defs.MEDIAN_VIDEO_GENERATION_MS),
+            )
+        )
+        for p, value in getattr(metrics, defs.PERCENTILES_VIDEO_GENERATION_MS) or []:
+            if p in selected_percentiles:
+                print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} VIDEO_GENERATION (ms):", value))
+
+
 def process_one_metric(
     metric_attribute_name: str,
     metrics: MultiModalsBenchmarkMetrics,
 ):
+    if not has_metric_samples(metrics, metric_attribute_name):
+        return
+
     metric_header_map = {
         "ttft": "Time to First Token",
         "tpot": "Time per Output Token (excl. 1st token)",
@@ -472,6 +576,21 @@ def _print_image_stage_metrics(
     )
 
 
+def _print_video_stage_metrics(
+    selected_percentiles: list[float],
+    sm: StageBenchmarkMetrics,
+) -> None:
+    print("{s:{c}^{n}}".format(s=" Video Result ", n=50, c="="))
+    _print_percentile_metric(
+        "Video Generation",
+        "VIDEO_GENERATION",
+        getattr(sm, defs.STAGE_GEN_TIMES_MS),
+        selected_percentiles,
+        values_are_ms=True,
+        to_ms=True,
+    )
+
+
 def _print_internal_stream_stage_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
@@ -526,11 +645,12 @@ def print_stage_metrics(
     ) = _stage_modality_flags(getattr(sm, "final_output_type"), getattr(sm, "output_unit_type"))
 
     print("{s:{c}^{n}}".format(s=title, n=50, c="="))
-    if is_image_stage:
-        _print_image_stage_metrics(selected_percentiles, sm)
+    if is_video_stage:
+        _print_video_stage_metrics(selected_percentiles, sm)
         return
 
-    if is_video_stage:
+    if is_image_stage:
+        _print_image_stage_metrics(selected_percentiles, sm)
         return
 
     _print_stage_timing(sm, selected_percentiles)
@@ -718,10 +838,12 @@ def calculate_metrics(
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
-    all_tpots: list[float] = []
+    all_tpots: list[float | None] = []
     ttfts: list[float] = []
+    goodput_ttfts: list[float | None] = []
     e2els: list[float] = []
     audio_ttfps: list[float] = []
+    goodput_audio_ttfps: list[float | None] = []
     audio_rtfs: list[float] = []
     audio_duration: list[float] = []
     audio_frames: list[int] = []
@@ -729,6 +851,11 @@ def calculate_metrics(
     denoise_step_latencies_ms: list[float] = []
     total_images = 0
     total_image_pixels = 0
+    video_durations: list[float] = []
+    video_rtfs: list[float] = []
+    total_video_frames = 0
+    video_generation_times_ms: list[float] = []
+    peak_memories_mb: list[float] = []
     audio_underruns: list[float] = []
     audio_continuity_ok: list[bool] = []
     input_audio_duration = 0.0
@@ -737,7 +864,18 @@ def calculate_metrics(
             output_len = outputs[i].output_tokens
 
             if not output_len:
-                if tokenizer is None:
+                # Pure image/video (no generated text) must stay at 0 tokens.
+                # Do not invent output_len=1 via the tokenizer-is-None placeholder.
+                generated_text = getattr(outputs[i], "generated_text", None) or ""
+                has_image = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0) > 0
+                has_video = (
+                    float(getattr(outputs[i], defs.VIDEO_DURATION, 0.0) or 0.0) > 0.0
+                    or int(getattr(outputs[i], defs.VIDEO_FRAMES, 0) or 0) > 0
+                    or float(getattr(outputs[i], defs.VIDEO_GENERATION_TIME_MS, 0.0) or 0.0) > 0.0
+                )
+                if not generated_text and (has_image or has_video):
+                    output_len = 0
+                elif tokenizer is None:
                     output_len = 1
                 else:
                     # We use the tokenizer to count the number of output tokens
@@ -748,27 +886,49 @@ def calculate_metrics(
                     output_len = len(tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
-            tpot = 0
+            tpot: float | None = None
             if output_len > 1:
                 if outputs[i].itl:
                     # Use mean(ITL) directly so per-request TPOT == mean(ITL).
                     # The ITL list records one entry per SSE chunk; server may
                     # bundle multiple tokens per chunk, so len(itl)+1 != output_len.
                     # Using mean(itl) keeps TPOT and ITL on the same footing.
-                    tpot = sum(outputs[i].itl) / len(outputs[i].itl)
-                else:
-                    try:
-                        latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
-                    except Exception:
-                        latency_minus_ttft = outputs[i].latency - outputs[i].ttft
-                    tpot = latency_minus_ttft / (output_len - 1)
-                tpots.append(tpot)
-            # Note: if output_len <= 1, we regard tpot as 0 for goodput
+                    measured_tpot = sum(outputs[i].itl) / len(outputs[i].itl)
+                    if np.isfinite(measured_tpot) and measured_tpot > 0:
+                        tpot = measured_tpot
+                elif getattr(outputs[i], "tpot_measured", True):
+                    text_latency = getattr(outputs[i], "text_latency", None)
+                    ttft = getattr(outputs[i], "ttft", None)
+                    if (
+                        isinstance(text_latency, (int, float))
+                        and isinstance(ttft, (int, float))
+                        and np.isfinite(text_latency)
+                        and np.isfinite(ttft)
+                        and text_latency > ttft > 0
+                    ):
+                        tpot = (text_latency - ttft) / (output_len - 1)
+                if tpot is not None:
+                    tpots.append(tpot)
+            # TPOT is not measurable for a single-token response or when the
+            # client did not observe a positive decode interval. In
+            # particular, stage-level output token counts alone must not turn
+            # an unset text_latency into a negative TPOT sample.
             all_tpots.append(tpot)
             itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
-            audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
-            audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            session_metrics = getattr(outputs[i], "duplex_session_metrics", None)
+            ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_ttft_ms") is not None
+            audio_ttfp_measured = (
+                not isinstance(session_metrics, dict) or session_metrics.get("mean_ttfp_ms") is not None
+            )
+            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_rtf") is not None
+            if ttft_measured:
+                ttfts.append(outputs[i].ttft)
+            if audio_ttfp_measured:
+                audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
+            if audio_rtf_measured:
+                audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
+            goodput_audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) if audio_ttfp_measured else None)
             audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
             audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0.0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
@@ -780,6 +940,19 @@ def calculate_metrics(
             denoise_step_latency_ms = float(getattr(outputs[i], defs.DENOISE_STEP_LATENCY_MS, 0.0) or 0.0)
             if denoise_step_latency_ms > 0:
                 denoise_step_latencies_ms.append(denoise_step_latency_ms)
+            video_duration = float(getattr(outputs[i], defs.VIDEO_DURATION, 0.0) or 0.0)
+            if video_duration > 0:
+                video_durations.append(video_duration)
+            total_video_frames += int(getattr(outputs[i], defs.VIDEO_FRAMES, 0) or 0)
+            video_rtf = float(getattr(outputs[i], defs.VIDEO_RTF, 0.0) or 0.0)
+            if video_rtf > 0:
+                video_rtfs.append(video_rtf)
+            video_generation_time_ms = float(getattr(outputs[i], defs.VIDEO_GENERATION_TIME_MS, 0.0) or 0.0)
+            if video_generation_time_ms > 0:
+                video_generation_times_ms.append(video_generation_time_ms)
+            peak_memory_mb = float(getattr(outputs[i], defs.PEAK_MEMORY_MB, 0.0) or 0.0)
+            if peak_memory_mb > 0:
+                peak_memories_mb.append(peak_memory_mb)
             audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
             audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
             e2els.append(outputs[i].latency)
@@ -789,14 +962,14 @@ def calculate_metrics(
             actual_output_lens.append(0)
 
     if goodput_config_dict:
-        valid_metrics = []
+        valid_metrics: list[Sequence[float | None]] = []
         slo_values = []
 
         if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
+            valid_metrics.append(goodput_ttfts)
             slo_values.append(goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "audio_ttft" in goodput_config_dict:
-            valid_metrics.append(audio_ttfps)
+            valid_metrics.append(goodput_audio_ttfps)
             slo_values.append(goodput_config_dict["audio_ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
@@ -806,7 +979,7 @@ def calculate_metrics(
             slo_values.append(goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION)
 
         for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+            is_good_req = all(r is not None and s >= r for s, r in zip(slo_values, req_metric))
             if is_good_req:
                 good_completed += 1
 
@@ -822,6 +995,7 @@ def calculate_metrics(
     # Calculate max output tokens per second metric
     max_output_tokens_per_s = 0.0
     max_concurrent_requests = 0
+    token_timeline_available = True
 
     # Find the time range across all successful requests
     successful_outputs = [output for output in outputs if output.success]
@@ -836,19 +1010,32 @@ def calculate_metrics(
         concurrent_requests_per_second = np.zeros(duration_seconds)
 
         for i, output in enumerate(successful_outputs):
-            # Calculate token generation timestamp using
-            # start_time, ttft, and itl
-            token_times = [output.start_time + output.ttft]
-            current_time = token_times[0]
-            for itl_value in output.itl:
-                current_time += itl_value
-                token_times.append(current_time)
+            session_metrics = getattr(output, "duplex_session_metrics", None)
+            if isinstance(session_metrics, dict):
+                # Duplex TTFT/ITL samples are response-local. Without each
+                # response.created offset they cannot form a session-global
+                # token timeline, so do not publish a misleading peak rate.
+                token_timeline_available = False
+            else:
+                # Calculate token generation timestamp using
+                # start_time, ttft, and itl. Skip requests with no text tokens
+                # (empty itl, zero output_tokens, and no generated_text) so pure
+                # image/video runs do not seed a fake peak of 1 tok/s from
+                # start_time+ttft alone.
+                output_token_count = int(getattr(output, "output_tokens", 0) or 0)
+                has_generated_text = bool(getattr(output, "generated_text", None) or "")
+                if output_token_count > 0 or output.itl or has_generated_text:
+                    token_times = [output.start_time + output.ttft]
+                    current_time = token_times[0]
+                    for itl_value in output.itl:
+                        current_time += itl_value
+                        token_times.append(current_time)
 
-            # Add tokens to second buckets
-            for token_time in token_times:
-                second_bucket = int(token_time - min_start_time)
-                if 0 <= second_bucket < duration_seconds:
-                    tokens_per_second[second_bucket] += 1
+                    # Add tokens to second buckets
+                    for token_time in token_times:
+                        second_bucket = int(token_time - min_start_time)
+                        if 0 <= second_bucket < duration_seconds:
+                            tokens_per_second[second_bucket] += 1
 
             # Track concurrent requests for each second this request was active
             request_start_second = int(output.start_time - min_start_time)
@@ -860,18 +1047,22 @@ def calculate_metrics(
         # Find the maximum tokens per second and corresponding
         # concurrent requests
         if len(tokens_per_second) > 0:
-            max_output_tokens_per_s = float(np.max(tokens_per_second))
+            if token_timeline_available:
+                max_output_tokens_per_s = float(np.max(tokens_per_second))
+            else:
+                max_output_tokens_per_s = float("nan")
             max_concurrent_requests = int(np.max(concurrent_requests_per_second))
 
         if TERM_PLOTLIB_AVAILABLE:
             import termplotlib as tpl
 
             fig = tpl.figure()
-            fig.plot(
-                np.arange(len(tokens_per_second)),
-                tokens_per_second,
-                title="Output tokens per second",
-            )
+            if token_timeline_available:
+                fig.plot(
+                    np.arange(len(tokens_per_second)),
+                    tokens_per_second,
+                    title="Output tokens per second",
+                )
             fig.plot(
                 np.arange(len(concurrent_requests_per_second)),
                 concurrent_requests_per_second,
@@ -881,6 +1072,10 @@ def calculate_metrics(
         else:
             print("tip: install termplotlib and gnuplot to plot the metrics")
 
+    duplex_metrics_present = any(
+        isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs
+    )
+    missing_duplex_value = float("nan") if duplex_metrics_present else 0
     metrics = MultiModalsBenchmarkMetrics(
         completed=completed,
         failed=len(failed_outputs),
@@ -890,18 +1085,18 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) * 1000,  # ttfts is empty if streaming is not supported by the endpoint
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
-        percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000) for p in selected_percentiles],
-        mean_tpot_ms=np.mean(tpots or 0) * 1000,
-        std_tpot_ms=np.std(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
-        percentiles_tpot_ms=[(p, np.percentile(tpots or 0, p) * 1000) for p in selected_percentiles],
-        mean_itl_ms=np.mean(itls or 0) * 1000,
-        std_itl_ms=np.std(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
-        percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000) for p in selected_percentiles],
+        mean_ttft_ms=np.mean(ttfts or missing_duplex_value) * 1000,
+        std_ttft_ms=np.std(ttfts or missing_duplex_value) * 1000,
+        median_ttft_ms=np.median(ttfts or missing_duplex_value) * 1000,
+        percentiles_ttft_ms=[(p, np.percentile(ttfts or missing_duplex_value, p) * 1000) for p in selected_percentiles],
+        mean_tpot_ms=np.mean(tpots or float("nan")) * 1000,
+        std_tpot_ms=np.std(tpots or float("nan")) * 1000,
+        median_tpot_ms=np.median(tpots or float("nan")) * 1000,
+        percentiles_tpot_ms=[(p, np.percentile(tpots or float("nan"), p) * 1000) for p in selected_percentiles],
+        mean_itl_ms=np.mean(itls or missing_duplex_value) * 1000,
+        std_itl_ms=np.std(itls or missing_duplex_value) * 1000,
+        median_itl_ms=np.median(itls or missing_duplex_value) * 1000,
+        percentiles_itl_ms=[(p, np.percentile(itls or missing_duplex_value, p) * 1000) for p in selected_percentiles],
         mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
         median_e2el_ms=np.median(e2els or 0) * 1000,
@@ -910,11 +1105,16 @@ def calculate_metrics(
         max_concurrent_requests=max_concurrent_requests,
         rtfx=input_audio_duration / dur_s,
         **{
-            defs.MEAN_AUDIO_TTFP_MS: np.mean(audio_ttfps or 0) * 1000,
-            defs.STD_AUDIO_TTFP_MS: np.std(audio_ttfps or 0) * 1000,
-            defs.MEDIAN_AUDIO_TTFP_MS: np.median(audio_ttfps or 0) * 1000,
+            "num_ttft_samples": len(ttfts),
+            "num_tpot_samples": len(tpots),
+            "num_itl_samples": len(itls),
+            "num_audio_ttfp_samples": len(audio_ttfps),
+            "num_audio_rtf_samples": len(audio_rtfs),
+            defs.MEAN_AUDIO_TTFP_MS: np.mean(audio_ttfps or missing_duplex_value) * 1000,
+            defs.STD_AUDIO_TTFP_MS: np.std(audio_ttfps or missing_duplex_value) * 1000,
+            defs.MEDIAN_AUDIO_TTFP_MS: np.median(audio_ttfps or missing_duplex_value) * 1000,
             defs.PERCENTILES_AUDIO_TTFP_MS: [
-                (p, np.percentile(audio_ttfps or 0, p) * 1000) for p in selected_percentiles
+                (p, np.percentile(audio_ttfps or missing_duplex_value, p) * 1000) for p in selected_percentiles
             ],
             defs.MEAN_AUDIO_DURATION_S: np.mean(audio_duration or 0),
             defs.STD_AUDIO_DURATION_S: np.std(audio_duration or 0),
@@ -925,10 +1125,12 @@ def calculate_metrics(
             defs.TOTAL_AUDIO_DURATION_S: sum(audio_duration),
             defs.TOTAL_AUDIO_FRAMES: sum(audio_frames),
             defs.AUDIO_THROUGHPUT: sum(audio_duration) / dur_s,
-            defs.MEAN_AUDIO_RTF: np.mean(audio_rtfs or 0),
-            defs.STD_AUDIO_RTF: np.std(audio_rtfs or 0),
-            defs.MEDIAN_AUDIO_RTF: np.median(audio_rtfs or 0),
-            defs.PERCENTILES_AUDIO_RTF: [(p, np.percentile(audio_rtfs or 0, p)) for p in selected_percentiles],
+            defs.MEAN_AUDIO_RTF: np.mean(audio_rtfs or missing_duplex_value),
+            defs.STD_AUDIO_RTF: np.std(audio_rtfs or missing_duplex_value),
+            defs.MEDIAN_AUDIO_RTF: np.median(audio_rtfs or missing_duplex_value),
+            defs.PERCENTILES_AUDIO_RTF: [
+                (p, np.percentile(audio_rtfs or missing_duplex_value, p)) for p in selected_percentiles
+            ],
             defs.TOTAL_IMAGES: total_images,
             defs.IMAGE_THROUGHPUT: total_images / dur_s,
             defs.AVERAGE_PIXELS_PER_IMAGE: (total_image_pixels / total_images) if total_images > 0 else 0.0,
@@ -938,6 +1140,25 @@ def calculate_metrics(
             defs.MEDIAN_IMAGE_GENERATION_MS: np.median(image_generation_times_ms or 0),
             defs.PERCENTILES_IMAGE_GENERATION_MS: [
                 (p, np.percentile(image_generation_times_ms or 0, p)) for p in selected_percentiles
+            ],
+            defs.TOTAL_VIDEO_DURATION_S: sum(video_durations),
+            defs.TOTAL_VIDEO_FRAMES: total_video_frames,
+            defs.VIDEO_THROUGHPUT: sum(video_durations) / dur_s,
+            defs.MEAN_VIDEO_RTF: np.mean(video_rtfs or 0),
+            defs.STD_VIDEO_RTF: np.std(video_rtfs or 0),
+            defs.MEDIAN_VIDEO_RTF: np.median(video_rtfs or 0),
+            defs.PERCENTILES_VIDEO_RTF: [(p, np.percentile(video_rtfs or 0, p)) for p in selected_percentiles],
+            defs.MEAN_VIDEO_GENERATION_MS: np.mean(video_generation_times_ms or 0),
+            defs.STD_VIDEO_GENERATION_MS: np.std(video_generation_times_ms or 0),
+            defs.MEDIAN_VIDEO_GENERATION_MS: np.median(video_generation_times_ms or 0),
+            defs.PERCENTILES_VIDEO_GENERATION_MS: [
+                (p, np.percentile(video_generation_times_ms or 0, p)) for p in selected_percentiles
+            ],
+            defs.MEAN_PEAK_MEMORY_MB: np.mean(peak_memories_mb or 0),
+            defs.STD_PEAK_MEMORY_MB: np.std(peak_memories_mb or 0),
+            defs.MEDIAN_PEAK_MEMORY_MB: np.median(peak_memories_mb or 0),
+            defs.PERCENTILES_PEAK_MEMORY_MB: [
+                (p, np.percentile(peak_memories_mb or 0, p)) for p in selected_percentiles
             ],
             defs.MEAN_AUDIO_UNDERRUN_S: np.mean(audio_underruns or 0),
             defs.STD_AUDIO_UNDERRUN_S: np.std(audio_underruns or 0),

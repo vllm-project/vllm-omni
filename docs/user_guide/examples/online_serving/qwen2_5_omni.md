@@ -1,4 +1,4 @@
-# Qwen2.5-Omni
+# Qwen2.5-Omni: Online serving
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen2_5_omni>.
 
@@ -15,9 +15,9 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
-If you have custom stage configs file, launch the server with command below
+To use a custom deploy config, launch the server with the command below:
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
 ```
 
 ### Send Multi-modal Request
@@ -182,7 +182,7 @@ The script supports the following arguments:
 - `--model`: Model name/path (default: Qwen/Qwen2.5-Omni-7B)
 - `--server-port`: Port for vLLM server (default: 8091)
 - `--gradio-port`: Port for Gradio demo (default: 7861)
-- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
+- `--deploy-config`: Path to a custom deploy config YAML file (optional)
 - `--server-host`: Host for vLLM server (default: 0.0.0.0)
 - `--gradio-ip`: IP for Gradio demo (default: 127.0.0.1)
 - `--share`: Share Gradio demo publicly (creates a public link)
@@ -195,9 +195,9 @@ The script supports the following arguments:
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
-If you have custom stage configs file:
+To use a custom deploy config:
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
 ```
 
 **Step 2: Run the Gradio demo**

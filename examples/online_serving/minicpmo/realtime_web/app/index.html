@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>MiniCPM-o 4.5 Voice</title>
+    <link rel="stylesheet" href="static/styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Experimental full-duplex runtime</p>
+        <h1>MiniCPM-o 4.5 Voice</h1>
+      </div>
+      <span id="connectionState" class="status status-offline">Offline</span>
+    </header>
+
+    <main>
+      <section class="call-bar" aria-label="Session controls">
+        <div class="call-actions">
+          <button id="callButton" class="primary" type="button">Start session</button>
+          <button id="muteButton" class="secondary" type="button" disabled>Mute</button>
+          <button id="cameraButton" class="secondary" type="button" disabled>Camera</button>
+          <video id="cameraPreview" muted playsinline style="display:none;width:96px;height:72px;border-radius:8px;object-fit:cover;background:#000"></video>
+        </div>
+        <div style="display:flex;gap:8px;align-items:flex-start;margin-top:8px;width:100%">
+          <label style="display:inline-flex;flex-direction:column;gap:4px;font-size:13px;opacity:.85;white-space:nowrap">
+            Prompt preset
+            <select id="promptPreset" style="font-size:13px;padding:4px 6px;border-radius:6px">
+              <option value="omni" selected>Omni (official omni preset)</option>
+              <option value="chinese_call">中文通话 (official audio preset)</option>
+              <option value="english_call">English Call (official audio preset)</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <textarea id="systemPrompt" rows="2" placeholder="System prompt" style="flex:1;font-size:13px;padding:6px 8px;border-radius:6px;resize:vertical">Streaming Omni Conversation.</textarea>
+        </div>
+        <div class="meter" aria-label="Microphone level">
+          <span>Mic</span>
+          <div class="meter-track"><div id="meterFill" class="meter-fill"></div></div>
+        </div>
+        <dl class="runtime-status">
+          <div><dt>Model</dt><dd id="modelState">Idle</dd></div>
+          <div><dt>Playback</dt><dd id="playbackState">Idle</dd></div>
+          <div><dt>Session</dt><dd id="sessionTimer">00:00</dd></div>
+        </dl>
+      </section>
+
+      <section class="conversation-section" aria-labelledby="conversationTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Live transcript</p>
+            <h2 id="conversationTitle">Conversation</h2>
+          </div>
+          <span class="policy-label">Model-controlled listen / speak</span>
+        </div>
+        <div id="conversation" class="conversation" aria-live="polite">
+          <p id="emptyConversation" class="empty-state">Start a session and speak naturally.</p>
+        </div>
+      </section>
+
+      <details class="diagnostics" open>
+        <summary>
+          <span>Event log</span>
+          <span id="eventCount" class="event-count">0 events</span>
+        </summary>
+        <div class="log-toolbar">
+          <span id="runtimeDetail">No active connection</span>
+          <button id="clearLogButton" class="icon-button" type="button" title="Clear event log">Clear</button>
+        </div>
+        <pre id="eventLog" class="event-log" aria-live="polite"></pre>
+      </details>
+    </main>
+
+    <script>window.FULL_DUPLEX_CONFIG = __FULL_DUPLEX_CONFIG__;</script>
+    <script src="static/app.js?v=__FULL_DUPLEX_APP_VERSION__"></script>
+  </body>
+</html>

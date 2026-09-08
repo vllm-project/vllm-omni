@@ -36,11 +36,30 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
 | `HunyuanImage-3.0` | 1024 x 1024 | 80.0 (TP≥3)  | 160 |
 | `HiDream-I1-Full` | 1024 x 1024 | 63.7  | 57.7 |
+| `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | 1024 (Raw) / 2048 (Turbo) | — | ~30 |
 
 !!! info
 *Peak VRAM:  based on basic single-card usage, batch size =1, without any acceleration/optimization features. FLUX.2-dev requires `--enable-cpu-offload` on a single 80 GiB GPU.
 
 Default model: `Qwen/Qwen-Image`
+
+### LingBot-Video
+
+LingBot-Video uses the same checkpoint for image and video generation. Run the
+shared T2I entry point with:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a red fox standing in fresh snow" \
+  --height 192 --width 320 --num-inference-steps 2 \
+  --guidance-scale 3.0 --extra-body '{"flow_shift":3.0}' \
+  --output lingbot_t2i.png
+```
+
+The shared T2I entry point selects the `image` output modality. The LingBot
+pipeline validates that T2I requests produce one frame and do not include an
+input image.
 
 ## Quick Start
 
@@ -55,7 +74,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output.images
+    images = outputs[0].images
     images[0].save("coffee.png")
 ```
 
@@ -91,8 +110,9 @@ python text_to_image.py \
 | `--ring-degree` | int | `1` | Ring sequence parallel degree for hybrid Ulysses + Ring inference |
 | `--ulysses-mode` | str | `"strict"` | Ulysses SP mode: `"strict"` or `"advanced_uaa"` |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
+| `--lora-path` | str | — | Path to PEFT LoRA adapter folder or checkpoint file |
 | `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--lora-backend` | str |`"peft"`| LoRA backend for loading LoRA adapters. Default: peft. Available options: peft, distill |
 | `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
 | `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 | `--auxiliary-text-encoder` | str | `None` | Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full). |
@@ -196,6 +216,37 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output /output.png
 ```
 
+### Krea 2
+
+Krea 2 is published as diffusers-format checkpoints: `krea/Krea-2-Turbo` (few-step distilled) and `krea/Krea-2-Raw`.
+The pipeline class (`Krea2Pipeline`) is auto-detected from `model_index.json`. The distilled Turbo checkpoint sets
+`is_distilled=true` and is best run at 2048x2048 with few steps and guidance disabled:
+
+```bash
+# Few-step distilled (Turbo) checkpoint
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model krea/Krea-2-Turbo \
+  --prompt "a fox in the snow" \
+  --num-inference-steps 8 \
+  --guidance-scale 0.0 \
+  --height 2048 --width 2048 \
+  --output krea2.png
+```
+
+For the Raw checkpoint, use more steps with CFG enabled:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model krea/Krea-2-Raw \
+  --prompt "a fox in the snow" \
+  --num-inference-steps 28 \
+  --guidance-scale 4.5 \
+  --output krea2.png
+```
+
+`guidance-scale` follows the Krea 2 convention (`velocity = cond + guidance_scale * (cond - uncond)`); CFG is enabled
+whenever `guidance-scale > 0`.
+
 ### Batch Requests (Multiple Prompts)
 
 You can pass multiple prompts in a single `Omni.generate` call. `Omni`
@@ -214,7 +265,7 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 !!! info
@@ -228,7 +279,7 @@ if __name__ == "__main__":
     For diffusion pipelines, the input list is sliced into single-item requests
     before feeding into the diffusion pipeline. For request-level batching
     controls such as `max_num_seqs`, see
-    [Request-Level Batching](../../../docs/user_guide/diffusion/request_batching.md).
+    [Diffusion Execution Modes](../../../docs/user_guide/diffusion/execution_modes.md).
 
 ### Negative Prompts
 
@@ -250,7 +301,7 @@ if __name__ == "__main__":
         }
     ])
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 You can also pass a negative prompt via the CLI argument `--negative-prompt`:

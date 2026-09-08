@@ -60,6 +60,9 @@ class OmniInputPreprocessor(InputPreprocessor):
             additional_information = parsed_content.get("additional_information")
             if additional_information is not None:
                 inputs["additional_information"] = additional_information
+            model_intermediate_buffer = parsed_content.get("model_intermediate_buffer")
+            if model_intermediate_buffer is not None:
+                inputs["model_intermediate_buffer"] = model_intermediate_buffer
         elif "mm_processor_kwargs" in parsed_content:
             # Presence — not truthiness. An explicitly-set empty dict still
             # signals "route through the multimodal processor" (needed for
@@ -81,6 +84,7 @@ class OmniInputPreprocessor(InputPreprocessor):
                 prompt_token_ids,
                 prompt_embeds=parsed_content.get("prompt_embeds"),
                 additional_information=parsed_content.get("additional_information"),
+                model_intermediate_buffer=parsed_content.get("model_intermediate_buffer"),
             )
         prompt_embeds = parsed_content.get("prompt_embeds")
         if prompt_embeds is not None:
@@ -88,6 +92,9 @@ class OmniInputPreprocessor(InputPreprocessor):
         additional_information = parsed_content.get("additional_information")
         if additional_information is not None:
             inputs["additional_information"] = additional_information
+        model_intermediate_buffer = parsed_content.get("model_intermediate_buffer")
+        if model_intermediate_buffer is not None:
+            inputs["model_intermediate_buffer"] = model_intermediate_buffer
         if cache_salt := parsed_content.get("cache_salt"):
             inputs["cache_salt"] = cache_salt
 
@@ -101,6 +108,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         prompt_token_ids = self._truncate_inputs(parsed_content["prompt_token_ids"], tokenization_kwargs)
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
+        model_intermediate_buffer = parsed_content.get("model_intermediate_buffer")
 
         multi_modal_data = parsed_content.get("multi_modal_data")
 
@@ -119,11 +127,14 @@ class OmniInputPreprocessor(InputPreprocessor):
                 prompt_token_ids=prompt_token_ids,
                 prompt_embeds=prompt_embeds,
                 additional_information=additional_information,
+                model_intermediate_buffer=model_intermediate_buffer,
             )
         if prompt_embeds is not None:
             inputs["prompt_embeds"] = prompt_embeds
         if additional_information is not None:
             inputs["additional_information"] = additional_information
+        if model_intermediate_buffer is not None:
+            inputs["model_intermediate_buffer"] = model_intermediate_buffer
         if prompt_text := parsed_content.get("prompt"):
             inputs["prompt"] = prompt_text
         if cache_salt := parsed_content.get("cache_salt"):
@@ -147,6 +158,9 @@ class OmniInputPreprocessor(InputPreprocessor):
         additional_information = parsed_content.get("additional_information")
         if additional_information is not None:
             inputs["additional_information"] = additional_information  # type: ignore[typeddict-unknown-key]
+        model_intermediate_buffer = parsed_content.get("model_intermediate_buffer")
+        if model_intermediate_buffer is not None:
+            inputs["model_intermediate_buffer"] = model_intermediate_buffer  # type: ignore[typeddict-unknown-key]
 
         return inputs
 

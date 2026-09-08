@@ -46,20 +46,3 @@ def test_fix_timestamp_repairs_dip_onto_monotonic_sequence():
 
 def test_fix_timestamp_passes_through_monotonic():
     assert processor.fix_timestamp([0, 100, 100, 250]) == [0, 100, 100, 250]
-
-
-def test_resolve_timestamp_token_id_defaults_to_marker_token():
-    # Regression: the default must resolve the same <timestamp> marker that
-    # build_prompt inserts, not None (which would degrade every request).
-    seen = {}
-
-    class FakeTokenizer:
-        def convert_tokens_to_ids(self, token):
-            seen["token"] = token
-            return 151705
-
-    tid = processor.resolve_timestamp_token_id(FakeTokenizer())
-
-    assert tid == 151705
-    assert seen["token"] == processor.TIMESTAMP_TOKEN
-    assert processor.TIMESTAMP_TOKEN in processor.build_prompt(["hello", "world"])

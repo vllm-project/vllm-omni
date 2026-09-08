@@ -47,7 +47,7 @@ def _text_result(text: str) -> OmniRequestOutput:
     output.text = text
     request_output = RequestOutput()
     request_output.outputs = [output]
-    return OmniRequestOutput(final_output_type="text", request_output=request_output)
+    return OmniRequestOutput.from_stage_output(request_output, final_output_type="text")
 
 
 def _audio_result(audio_data: Any) -> OmniRequestOutput:
@@ -61,7 +61,7 @@ def _audio_result(audio_data: Any) -> OmniRequestOutput:
     output.multimodal_output = {"audio": audio_data}
     request_output = RequestOutput()
     request_output.outputs = [output]
-    return OmniRequestOutput(final_output_type="audio", request_output=request_output)
+    return OmniRequestOutput.from_stage_output(request_output, final_output_type="audio")
 
 
 class MockWebSocket:
@@ -136,6 +136,112 @@ async def test_receive_config_accepts_client_legacy_aliases():
     assert config.num_frames == 7
     assert config.enable_frame_filter is False
     assert config.frame_filter_threshold == 0.87
+
+
+@pytest.mark.asyncio
+async def test_video_frame_ack_reports_receiver_buffer_state():
+    ws = MockWebSocket(
+        [
+            json.dumps(
+                {
+                    "type": "session.config",
+                    "model": "test",
+                    "enable_frame_filter": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "video.frame",
+                    "data": _b64(_make_jpeg()),
+                    "frame_id": "frame-7",
+                    "pts_ms": 700,
+                    "capture_ts_ms": 1234.5,
+                }
+            ),
+            json.dumps({"type": "video.done"}),
+        ]
+    )
+    handler = QwenOmniStreamingVideoHandler(chat_service=object())
+
+    await handler.handle_session(ws)
+
+    ack = next(message for message in ws.sent if message.get("type") == "video.frame.ack")
+    assert ack["frame_id"] == "frame-7"
+    assert ack["pts_ms"] == 700
+    assert ack["capture_ts_ms"] == 1234.5
+    assert ack["accepted"] is True
+    assert ack["buffered_frames"] == 1
+    assert ack["server_receive_ts_ms"] > 0
+
+
+@pytest.mark.asyncio
+async def test_video_frames_consumed_is_emitted_after_engine_uses_frame_prompt():
+    class OneOutputEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                await asyncio.sleep(0.05)
+                yield _text_result("visible")
+
+            return _gen()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt": "with-video"}
+
+    ws = MockWebSocket(
+        [
+            json.dumps(
+                {
+                    "type": "session.config",
+                    "model": "test",
+                    "modalities": ["text"],
+                    "num_frames": 1,
+                    "enable_frame_filter": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "video.frame",
+                    "data": _b64(_make_jpeg()),
+                    "frame_id": "frame-9",
+                    "pts_ms": 900,
+                    "source_pts_ms": 880,
+                    "quality_profile": "balanced",
+                }
+            ),
+            json.dumps({"type": "video.query", "text": "describe"}),
+            json.dumps({"type": "video.done"}),
+        ]
+    )
+    handler = CapturingHandler(
+        chat_service=object(),
+        engine_client=OneOutputEngine(),
+        idle_timeout=2.0,
+    )
+
+    await handler.handle_session(ws)
+
+    consumed = next(message for message in ws.sent if message.get("type") == "video.frames.consumed")
+    assert consumed["frame_ids"] == ["frame-9"]
+    assert consumed["latest_pts_ms"] == 900
+    assert consumed["request_id"].startswith("video-")
+    assert consumed["model_selected_ts_ms"] > 0
+    assert consumed["frames"] == [
+        {
+            "frame_id": "frame-9",
+            "pts_ms": 900,
+            "source_pts_ms": 880,
+            "quality_profile": "balanced",
+            "receiver_received_ts_ms": consumed["frames"][0]["receiver_received_ts_ms"],
+            "decoded_ready_ts_ms": consumed["frames"][0]["decoded_ready_ts_ms"],
+        }
+    ]
+    assert consumed["frames"][0]["receiver_received_ts_ms"] > 0
+    assert consumed["frames"][0]["decoded_ready_ts_ms"] >= consumed["frames"][0]["receiver_received_ts_ms"]
+    assert consumed["model_selected_ts_ms"] >= consumed["frames"][0]["decoded_ready_ts_ms"]
+    assert ws.sent.index(consumed) < next(
+        index for index, message in enumerate(ws.sent) if message.get("type") == "response.text.delta"
+    )
 
 
 @pytest.mark.asyncio
