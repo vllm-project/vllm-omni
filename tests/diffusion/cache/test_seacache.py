@@ -21,13 +21,14 @@ from vllm_omni.diffusion.cache.seacache.sea_filter import (
     indicator_distance,
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
+from vllm_omni.diffusion.cache.teacache.extractors import EXTRACTOR_REGISTRY, CacheContext
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class TinyCosmos3Transformer(torch.nn.Module):
-    """Small model that implements the SeaCache forward-control contract."""
+    """Small model that exposes a cache-neutral execution boundary."""
 
     def _run_gen_layers(self, hidden_gen: torch.Tensor) -> torch.Tensor:
         return hidden_gen * 2
@@ -41,8 +42,11 @@ class TinyCosmos3Transformer(torch.nn.Module):
         video_shape: tuple[int, int, int] | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         control_latents: list[torch.Tensor] | torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         del timestep, text_ids, text_mask, video_shape, noisy_frame_mask
+        if kwargs:
+            raise TypeError(f"Unexpected tiny transformer kwargs: {sorted(kwargs)}")
         controls = (
             []
             if control_latents is None
@@ -55,13 +59,47 @@ class TinyCosmos3Transformer(torch.nn.Module):
             [value.movedim(1, -1).flatten(1, 3) for value in inputs],
             dim=1,
         )
-        residual = getattr(self, "_seacache_residual", None)
-        if getattr(self, "_seacache_skip", False) and isinstance(residual, torch.Tensor):
-            return gen_input + residual
-        output = self._run_gen_layers(gen_input)
-        if getattr(self, "_seacache_record", False):
-            self._seacache_last_residual = output - gen_input
-        return output
+        return self._run_gen_layers(gen_input)
+
+
+def _extract_tiny_cosmos3_context(
+    module: TinyCosmos3Transformer,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_ids: torch.Tensor | None = None,
+    text_mask: torch.Tensor | None = None,
+    video_shape: tuple[int, int, int] | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+    control_latents: list[torch.Tensor] | torch.Tensor | None = None,
+    **kwargs,
+) -> CacheContext:
+    del timestep, text_ids, text_mask, video_shape
+    if kwargs:
+        raise TypeError(f"Unexpected tiny transformer kwargs: {sorted(kwargs)}")
+    controls = (
+        []
+        if control_latents is None
+        else [control_latents]
+        if isinstance(control_latents, torch.Tensor)
+        else list(control_latents)
+    )
+    vision_items = [*controls, hidden_states]
+    gen_input = torch.cat(
+        [value.movedim(1, -1).flatten(1, 3) for value in vision_items],
+        dim=1,
+    )
+    return CacheContext(
+        modulated_input=gen_input,
+        hidden_states=gen_input,
+        encoder_hidden_states=None,
+        temb=torch.zeros_like(gen_input[:, 0]),
+        run_transformer_blocks=lambda: (module._run_gen_layers(gen_input),),
+        postprocess=lambda output: output,
+        extra_states={
+            "sea_cache_latents": vision_items,
+            "sea_cache_noisy_frame_mask": noisy_frame_mask,
+        },
+    )
 
 
 class Cosmos3OmniDiffusersPipeline:
@@ -120,6 +158,7 @@ def _apply_test_hook(
         current_step_callback=lambda: metadata.step,
         current_sigma_callback=lambda: metadata.sigma,
         num_inference_steps_callback=lambda: metadata.num_steps,
+        extractor_fn=_extract_tiny_cosmos3_context,
     )
 
 
@@ -356,7 +395,8 @@ def test_hook_uses_exact_sigma_callback(monkeypatch: pytest.MonkeyPatch) -> None
     assert all(sigma == pytest.approx(0.37) for sigma in observed_sigmas)
 
 
-def test_backend_selector_and_refresh() -> None:
+def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(EXTRACTOR_REGISTRY, "TinyCosmos3Transformer", _extract_tiny_cosmos3_context)
     backend = get_cache_backend(
         "sea_cache",
         {
@@ -371,6 +411,9 @@ def test_backend_selector_and_refresh() -> None:
     backend.enable(pipeline)
     hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
     assert isinstance(hook, SeaCacheRootHook)
+    assert callable(getattr(pipeline, "_cache_context_factory", None))
+    for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
+        assert not hasattr(pipeline.transformer, name)
     pipeline._current_step_index = 0
     pipeline._current_sigma = 1.0
     pipeline._num_timesteps = 7
@@ -383,7 +426,8 @@ def test_backend_selector_and_refresh() -> None:
     assert hook.state_manager._states == {}
 
 
-def test_backend_uses_resolved_pipeline_metadata_not_refresh_argument() -> None:
+def test_backend_uses_resolved_pipeline_metadata_not_refresh_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(EXTRACTOR_REGISTRY, "TinyCosmos3Transformer", _extract_tiny_cosmos3_context)
     pipeline = Cosmos3OmniDiffusersPipeline()
     backend = SeaCacheBackend(DiffusionCacheConfig())
     backend.enable(pipeline)

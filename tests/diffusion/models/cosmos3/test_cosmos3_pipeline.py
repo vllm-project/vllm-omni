@@ -2122,7 +2122,7 @@ def test_diffuse_publishes_exact_seacache_metadata_and_cfg_contexts(make_cosmos3
             )
             yield
 
-    pipeline._sea_cache_hook = RecordingHook()
+    pipeline._cache_context_factory = RecordingHook().cache_context
     pipeline.diffuse(
         latents=torch.zeros(1, 2, 1, 1, 1),
         timesteps=torch.tensor([900, 100]),
@@ -2222,7 +2222,7 @@ def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, se
             )
             yield
 
-    pipeline._sea_cache_hook = RecordingHook()
+    pipeline._cache_context_factory = RecordingHook().cache_context
     latents = torch.zeros(1, 2, 1, 1, 1)
     velocity_mask = torch.ones(1, 1, 1, 1, 1)
     pipeline.diffuse_transfer(

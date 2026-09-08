@@ -25,8 +25,6 @@ def enable_cosmos3_seacache(
     transformer = getattr(pipeline, "transformer", None)
     if transformer is None:
         raise ValueError("SeaCache requires a pipeline with a transformer")
-    if not callable(getattr(transformer, "_run_gen_layers", None)):
-        raise ValueError("Pipeline transformer does not expose the block boundary required by SeaCache")
 
     sea_config = SeaCacheConfig(
         threshold=config.sea_threshold,
@@ -77,7 +75,7 @@ class SeaCacheBackend(CacheBackend):
         hook = enabler(pipeline, self.config)
         self._transformer_id = id(pipeline.transformer)
         self.enabled = True
-        pipeline._sea_cache_hook = hook
+        pipeline._cache_context_factory = hook.cache_context
 
     def refresh(
         self,
@@ -97,6 +95,6 @@ class SeaCacheBackend(CacheBackend):
         if not isinstance(hook, SeaCacheRootHook):
             raise RuntimeError("SeaCache hook is not installed on the pipeline transformer")
         hook.refresh(transformer)
-        pipeline._sea_cache_hook = hook
+        pipeline._cache_context_factory = hook.cache_context
         if verbose:
             logger.debug("SeaCache state refreshed")

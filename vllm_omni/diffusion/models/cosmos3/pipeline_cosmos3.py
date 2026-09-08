@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
 One pipeline class serves the Cosmos3 family modes. Output modality is selected
@@ -1325,7 +1325,7 @@ class Cosmos3OmniDiffusersPipeline(
             return prediction.to(self.sampling_dtype)
 
         cache_key = kwargs.pop("_cosmos3_cache_key", None)
-        context_name = str(kwargs.pop("_sea_cache_context", "cond"))
+        context_name = str(kwargs.pop("_cache_context", "cond"))
         for key in (
             "hidden_states",
             "action_latents",
@@ -1337,8 +1337,7 @@ class Cosmos3OmniDiffusersPipeline(
             if key in kwargs and kwargs[key] is not None:
                 kwargs[key] = _to_model_dtype(kwargs[key])
 
-        hook = getattr(self, "_sea_cache_hook", None)
-        context_factory = getattr(hook, "cache_context", None)
+        context_factory = getattr(self, "_cache_context_factory", None)
         context = context_factory(context_name) if callable(context_factory) else nullcontext()
         with context:
             if cache_key is None:
@@ -2907,7 +2906,7 @@ class Cosmos3OmniDiffusersPipeline(
                         do_true_cfg=True,
                         true_cfg_scale=step_scale,
                         positive_kwargs=dict(
-                            _sea_cache_context="cond",
+                            _cache_context="cond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -2917,7 +2916,7 @@ class Cosmos3OmniDiffusersPipeline(
                             **shared_kwargs,
                         ),
                         negative_kwargs=dict(
-                            _sea_cache_context="uncond",
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -2945,7 +2944,7 @@ class Cosmos3OmniDiffusersPipeline(
                     if not self._kv_load_und(kv_state, is_negative=False):
                         self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
                     noise_cond = self.predict_noise(
-                        _sea_cache_context="cond",
+                        _cache_context="cond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=cond_ids,
@@ -2963,7 +2962,7 @@ class Cosmos3OmniDiffusersPipeline(
                         if not self._kv_load_und(kv_state, is_negative=True):
                             self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
                         noise_uncond = self.predict_noise(
-                            _sea_cache_context="uncond",
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -2999,7 +2998,7 @@ class Cosmos3OmniDiffusersPipeline(
                     timestep = t.unsqueeze(0)
                     self._kv_load_und(kv_state, is_negative=False)
                     noise_pred = self.predict_noise(
-                        _sea_cache_context="cond",
+                        _cache_context="cond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=cond_ids,
@@ -3206,7 +3205,7 @@ class Cosmos3OmniDiffusersPipeline(
                 needs_control_cfg = step_control != 1.0
 
                 cond_full_kwargs = dict(
-                    _sea_cache_context="cond",
+                    _cache_context="cond",
                     hidden_states=latents,
                     timestep=timestep,
                     text_ids=cond_ids,
@@ -3220,7 +3219,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
-                            _sea_cache_context="cond_no_control",
+                            _cache_context="cond_no_control",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -3230,7 +3229,7 @@ class Cosmos3OmniDiffusersPipeline(
                             **shared_kwargs,
                         ),
                         dict(
-                            _sea_cache_context="uncond",
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -3256,7 +3255,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
-                            _sea_cache_context="cond_no_control",
+                            _cache_context="cond_no_control",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -3280,7 +3279,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
-                            _sea_cache_context="uncond",
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,

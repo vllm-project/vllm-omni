@@ -1466,6 +1466,77 @@ def extract_minimax_h3_context(
     )
 
 
+def extract_cosmos3_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    video_shape: tuple[int, int, int],
+    fps: float | None = None,
+    action_latents: torch.Tensor | None = None,
+    action_domain_ids: torch.Tensor | None = None,
+    action_noisy_mask: torch.Tensor | None = None,
+    action_start_frame_offset: int = 1,
+    action_fps: float | None = None,
+    sound_latents: torch.Tensor | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+    control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+    control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+    transfer_share_vision_temporal_positions: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """Build the shared cache execution context for Cosmos3's GEN pathway."""
+    if kwargs:
+        raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+
+    prep = module._gen_preprocess(
+        hidden_states,
+        timestep,
+        text_ids,
+        text_mask,
+        video_shape,
+        fps=fps,
+        action_latents=action_latents,
+        action_domain_ids=action_domain_ids,
+        action_noisy_mask=action_noisy_mask,
+        action_start_frame_offset=action_start_frame_offset,
+        action_fps=action_fps,
+        sound_latents=sound_latents,
+        noisy_frame_mask=noisy_frame_mask,
+        control_latents=control_latents,
+        control_weights=control_weights,
+        transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+    )
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        return (module._run_gen_stack(prep),)
+
+    def postprocess(hidden: torch.Tensor) -> Any:
+        return module._gen_postprocess(hidden, prep)
+
+    if control_latents is None:
+        controls: list[torch.Tensor] = []
+    elif isinstance(control_latents, torch.Tensor):
+        controls = [control_latents]
+    else:
+        controls = list(control_latents)
+
+    return CacheContext(
+        # SeaCache uses the separate inputs in extra_states for its decision.
+        modulated_input=prep.hidden_gen,
+        hidden_states=prep.hidden_gen,
+        encoder_hidden_states=None,
+        temb=prep.time_embed,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "sea_cache_latents": [*controls, hidden_states],
+            "sea_cache_noisy_frame_mask": noisy_frame_mask,
+        },
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1475,6 +1546,8 @@ def extract_minimax_h3_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,
+    "Cosmos3VFMTransformer": extract_cosmos3_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,

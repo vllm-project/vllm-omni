@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -513,7 +513,8 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
-def test_seacache_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
     class TrackingNorm(nn.Module):
@@ -539,7 +540,6 @@ def test_seacache_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch)
         return hidden_gen + 2.0
 
     monkeypatch.setattr(model, "_run_gen_layers", run_gen_layers)
-    model._seacache_record = True
     forward_kwargs = {
         "hidden_states": torch.zeros(1, 2, 1, 2, 2),
         "timestep": torch.tensor([1.0]),
@@ -552,25 +552,34 @@ def test_seacache_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch)
     full_output = model(**forward_kwargs)
 
     assert norm.calls == 1
-    torch.testing.assert_close(
-        model._seacache_last_residual,
-        torch.full_like(captured["input"], 7.0),
-    )
+    norm.calls = 0
+
+    ctx = extract_cosmos3_context(model, **forward_kwargs)
+    execution_input = ctx.hidden_states.detach().clone()
+    execution_output = ctx.run_transformer_blocks()[0]
+    residual = execution_output - execution_input
+    extracted_output = ctx.postprocess(execution_output)
+
+    assert norm.calls == 1
+    expected_residual = ((captured["input"] + 2.0) + 5.0) - captured["input"]
+    assert torch.equal(residual, expected_residual)
+    assert torch.equal(extracted_output, full_output)
 
     norm.calls = 0
-    model._seacache_record = False
-    model._seacache_skip = True
-    model._seacache_residual = model._seacache_last_residual
 
     def fail_if_gen_layers_run(*args, **kwargs):
         del args, kwargs
         raise AssertionError("SeaCache hit unexpectedly executed GEN layers")
 
     monkeypatch.setattr(model, "_run_gen_layers", fail_if_gen_layers_run)
-    cached_output = model(**forward_kwargs)
+
+    cached_ctx = extract_cosmos3_context(model, **forward_kwargs)
+    cached_output = cached_ctx.postprocess(cached_ctx.hidden_states + residual)
 
     assert norm.calls == 0
-    torch.testing.assert_close(cached_output, full_output, rtol=0, atol=0)
+    assert torch.equal(cached_output, full_output)
+    for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
+        assert not hasattr(model, name)
 
 
 def test_no_cache_still_runs_final_gen_norm_once(monkeypatch: pytest.MonkeyPatch) -> None:
