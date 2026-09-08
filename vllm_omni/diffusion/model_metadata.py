@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ class DiffusionModelMetadata:
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
     supports_latent_mask_editing: bool = False
+    # Head-sharded MoE uses SP-local groups, not vLLM FusedMoE rank folding.
+    expert_parallel_style: Literal["vllm", "head"] = "vllm"
 
 
 # FLUX.2 Klein supports up to four reference images.
