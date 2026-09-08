@@ -404,6 +404,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def encode_image(self, image: Image.Image) -> torch.Tensor:
         if getattr(self, "decode_only", False):
             raise RuntimeError("MiniMax H3 decode-only video VAE cannot encode images")
+        previous_parallel = self.model.parallel_tiling
+        if int(getattr(self, "parallel_size", 1)) <= 1:
+            self.model.parallel_tiling = False
         parameter = next(self.parameters())
         previous_dtype = parameter.dtype
         if previous_dtype != torch.float32:
@@ -426,6 +429,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                     use_fp16_latent=True,
                 )[0]
         finally:
+            self.model.parallel_tiling = previous_parallel
             if previous_dtype != torch.float32:
                 self.to(previous_dtype)
 
