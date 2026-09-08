@@ -325,7 +325,7 @@ def _runner(
         model_config=SimpleNamespace(max_model_len=max_len),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=max_num_batched_tokens,
-            max_num_seqs=max_num_seqs,
+            max_num_seqs=max_num_seqs * max_rows_per_request,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=cp_size,
@@ -403,7 +403,7 @@ def test_initialize_failure_does_not_publish_partial_cache_state(
     successful_init_cache = model_runner_backend_module.init_kv_cache
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=16),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=32, max_num_seqs=1),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32, max_num_seqs=2),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
@@ -445,7 +445,7 @@ def test_initialize_failure_does_not_publish_partial_cache_state(
     assert backend.block_tables is None
     assert backend.paged_attention_adapter is None
     assert backend._kv_cache_layer_adapters["layer-0"].kv_cache == "placeholder-0"
-    assert backend.vllm_config.scheduler_config.max_num_seqs == 1
+    assert backend.vllm_config.scheduler_config.max_num_seqs == 2
 
     monkeypatch.setattr(model_runner_backend_module, "init_kv_cache", successful_init_cache)
     backend.initialize_kv_cache(config)

@@ -1,0 +1,75 @@
+pipeline: hunyuan_image_3_moe
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    num_replicas: 2
+    devices: "0,1,2,3"
+    tensor_parallel_size: 2
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    kv_cache_memory_bytes: 2147483648
+    gpu_memory_utilization: 0.95
+    enforce_eager: true
+    moe_backend: triton
+    env:
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    kv_transfer_config:
+      kv_connector: MooncakeConnector
+      kv_connector_module_path: vllm_omni.diffusion.diffusion_kv.kv_connector
+      kv_role: kv_producer
+      engine_id: hunyuan-image3-ar
+      kv_ip: 127.0.0.1
+      kv_connector_extra_config:
+        mooncake_protocol: tcp
+        bootstrap_port: 8998
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 8192
+      detokenize: true
+      skip_special_tokens: false
+      include_stop_str_in_output: true
+
+  - stage_id: 1
+    num_replicas: 2
+    devices: "4,5,6,7"
+    max_num_seqs: 1
+    max_num_batched_tokens: 16384
+    max_model_len: 12288
+    kv_cache_memory_bytes: 1073741824
+    enforce_eager: true
+    enable_sleep_mode: true
+    moe_backend: triton
+    env:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    distributed_executor_backend: mp
+    diffusion_kv_mode: paged_scheduler
+    diffusion_kv_max_rows_per_request: 2
+    kv_transfer_config:
+      kv_connector: MooncakeConnector
+      kv_role: kv_consumer
+      engine_id: hunyuan-image3-dit
+      kv_connector_extra_config:
+        mooncake_protocol: tcp
+    parallel_config:
+      tensor_parallel_size: 2
+      enable_expert_parallel: true
+    default_sampling_params:
+      num_inference_steps: 2
+      guidance_scale: 2.0
+      height: 512
+      width: 512
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    max_inflight: 1

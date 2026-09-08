@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -253,9 +253,8 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
-    # Opaque metadata emitted by a future Scheduler-role connector. PR0 keeps
-    # the input port but does not build or consume it.
     kv_connector_metadata: KVConnectorMetadata | None = None
+    kv_transfer_request_ids: set[str] = field(default_factory=set)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:
@@ -273,4 +272,4 @@ class DiffusionSchedulerOutput:
 
     @property
     def is_empty(self) -> bool:
-        return self.num_scheduled_reqs == 0
+        return self.num_scheduled_reqs == 0 and self.kv_connector_metadata is None

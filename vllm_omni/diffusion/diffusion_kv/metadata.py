@@ -41,6 +41,7 @@ class DiffusionKVSequenceMetadata:
     seq_len: int
     block_ids: tuple[list[int], ...]
     context_ids: tuple[str, ...] = ()
+    num_computed_tokens: int = 0
 
 
 @dataclass
