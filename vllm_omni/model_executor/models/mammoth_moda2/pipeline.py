@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MammothModa2 pipeline topology (frozen).
 
 Stage 0: AR  — multimodal understanding + latent generation
@@ -35,14 +35,15 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="dit",
-            execution_type=StageExecutionType.LLM_GENERATION,
+            execution_type=StageExecutionType.DIFFUSION,
             input_sources=(0,),
             final_output=True,
             final_output_type="image",
             owns_tokenizer=False,
             requires_multimodal_data=False,
-            engine_output_type="image",
-            custom_process_input_func=f"{_PROC}.ar2dit",
+            model_arch="MammothModa2DiTPipeline",
+            custom_process_input_func=f"{_PROC}.ar2diffusion",
+            omni_kv_config={"need_recv_cache": False},
         ),
     ),
 )
