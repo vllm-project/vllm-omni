@@ -4,8 +4,9 @@
 """
 End-to-end test for MammothModa2 text-to-image generation.
 
-Verifies that the AR->DiT pipeline produces an image tensor whose pixel values
-match a golden reference.
+Verifies that the AR->DiT pipeline produces a valid image tensor. When an
+optional golden fixture is present, the test also compares fixed pixel samples;
+the portable golden/stability oracle remains tracked in #7090.
 
 Model Hub repo id: ``bytedance-research/MammothModa2-Preview``.
 Deploy config: ``get_deploy_config_path("mammoth_moda2.yaml")`` -> ``vllm_omni/deploy/mammoth_moda2.yaml``
@@ -45,7 +46,7 @@ T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
 _OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
 
-# Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
+# Optional golden pixel reference file. Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
 # Fixed sampling coordinates: (channel, row_fraction, col_fraction)
 # Covers corners, centre, and mid-edges across all 3 channels.
@@ -130,8 +131,8 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     Verifies:
       - Omni pipeline initialises with the two-stage YAML config.
       - DiT stage outputs an image tensor with the correct shape.
-      - A fixed set of pixel values matches a golden reference
-        (regenerate with ``UPDATE_GOLDEN=1``).
+      - When the optional fixture exists, fixed pixel samples match its golden
+        reference (regenerate with ``UPDATE_GOLDEN=1``).
     """
     gen_cfg = _load_t2i_gen_config(MODEL_PATH)
     eol_token_id = int(gen_cfg["eol_token_id"])
