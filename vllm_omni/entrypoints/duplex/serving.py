@@ -32,6 +32,8 @@ from vllm_omni.entrypoints.duplex.protocol import (
     DuplexCommittedInput,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
+    DuplexRequestBinding,
+    DuplexRequestIdScope,
     DuplexSession,
     DuplexSessionConfig,
     DuplexSessionRegistry,
@@ -2048,7 +2050,7 @@ class OmniDuplexSessionHandler(
             return False
 
         old_epoch = session.epoch
-        old_request_id = session.active_request_id
+        old_request = session.active_request_binding
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
         committed_message = session.end_response(
@@ -2062,15 +2064,15 @@ class OmniDuplexSessionHandler(
             elif committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
         new_epoch, old_playback = self._advance_barge_in_epoch(session)
-        if old_request_id is not None:
+        if old_request is not None:
             # Epoch-scoped request ids prevent state reuse, but explicitly
             # release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
             if self._serving_runtime_adapter is not None:
-                self._serving_runtime_adapter.data_plane.close_stream(old_request_id)
+                self._serving_runtime_adapter.data_plane.close_stream(old_request.request_id)
             await self._abort_request_background(
                 session,
-                old_request_id,
+                old_request,
                 send_json,
                 notify=notify,
             )
@@ -2098,21 +2100,25 @@ class OmniDuplexSessionHandler(
     async def _abort_request_background(
         self,
         session: DuplexSession,
-        request_id: str,
+        request: DuplexRequestBinding,
         send_json,
         *,
         notify: bool,
     ) -> None:
         try:
-            abort_internal = getattr(self._chat_service.engine_client, "_abort_internal_requests", None)
-            if callable(abort_internal):
-                result = abort_internal([request_id])
+            engine_client = self._chat_service.engine_client
+            if request.scope == DuplexRequestIdScope.EXTERNAL:
+                result = engine_client.abort([request.request_id])
             else:
-                result = self._chat_service.engine_client.abort([request_id])
+                abort_internal = getattr(engine_client, "_abort_internal_requests", None)
+                if callable(abort_internal):
+                    result = abort_internal([request.request_id])
+                else:
+                    result = engine_client.abort([request.request_id])
             if inspect.isawaitable(result):
                 await result
         except Exception as exc:
-            logger.exception("Failed to abort duplex request %s: %s", request_id, exc)
+            logger.exception("Failed to abort duplex request %s: %s", request.request_id, exc)
             if notify and session.state != DuplexSessionState.CLOSED:
                 await self._send_runtime_error(send_json, "runtime_abort_failed", exc, session=session)
 

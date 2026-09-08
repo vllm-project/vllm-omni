@@ -36,6 +36,7 @@ from vllm_omni.entrypoints.duplex.protocol import (
     DuplexCapabilities,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
+    DuplexRequestIdScope,
     DuplexSession,
     DuplexSessionConfig,
     ResponseCreateOptions,
@@ -5181,7 +5182,8 @@ async def test_duplex_handler_aborts_current_chat_request_id_on_barge_in():
     assert "audio.cancelled" in ws.sent_types()
     assert chat_service.seen_request_ids == ["duplex-sid-a-0-1"]
     assert engine.aborted == ["chatcmpl-duplex-sid-a-0-1"]
-    assert engine.internal_abort_batches == [["chatcmpl-duplex-sid-a-0-1"]]
+    assert engine.abort_batches == [["chatcmpl-duplex-sid-a-0-1"]]
+    assert engine.internal_abort_batches == []
 
 
 @pytest.mark.asyncio
@@ -5845,7 +5847,10 @@ async def test_cancel_chat_fallback_response_aborts_request_and_task():
     handler = OmniDuplexSessionHandler(chat_service=TurnBasedFakeChatService(engine))
     session = DuplexSession("sid-chat-cancel", DuplexSessionConfig())
     response_id = session.begin_response()
-    session.bind_request("chatcmpl-cancel")
+    session.bind_request(
+        "chatcmpl-cancel",
+        scope=DuplexRequestIdScope.EXTERNAL,
+    )
     ws = TimedWebSocket()
     task = asyncio.create_task(asyncio.sleep(60))
     try:
@@ -5853,7 +5858,8 @@ async def test_cancel_chat_fallback_response_aborts_request_and_task():
 
         assert cancelled is True
         assert task.cancelled()
-        assert engine.internal_abort_batches == [["chatcmpl-cancel"]]
+        assert engine.abort_batches == [["chatcmpl-cancel"]]
+        assert engine.internal_abort_batches == []
         assert "error" not in ws.sent_types()
         (event,) = [event for event in ws.sent if event["type"] == "audio.cancelled"]
         assert event["response_id"] == response_id
