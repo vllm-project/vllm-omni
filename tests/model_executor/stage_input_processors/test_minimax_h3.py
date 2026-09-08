@@ -16,6 +16,7 @@ from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
     resolve_minimax_h3_encoder_model_root,
@@ -160,6 +161,73 @@ def test_prepare_ref2va_keeps_original_text_and_exact_condition_order():
     assert media.task == "ref2va"
     assert len(media.images) == 1
     assert len(media.audios) == 1
+
+
+def _mock_ref2va_video_with_audio(monkeypatch, *, duration_seconds: float) -> None:
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+
+    sample_rate = 16_000
+    frames = np.zeros((4, 32, 32, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        encoder_processing,
+        "prepare_reference_videos",
+        lambda *args, **kwargs: [
+            {
+                "prepared_path": "prepared.mp4",
+                "original_path": "original.mp4",
+                "input_has_audio": True,
+                "duration_seconds": duration_seconds,
+                "audio_duration_seconds": duration_seconds,
+            }
+        ],
+    )
+    monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: frames)
+    monkeypatch.setattr(
+        encoder_processing,
+        "sample_reference_video_frames",
+        lambda *args, **kwargs: {"block_timestamps": [0.0], "frames": frames[:1]},
+    )
+    monkeypatch.setattr(
+        encoder_processing,
+        "load_video_audio",
+        lambda *args, **kwargs: (torch.zeros(round(duration_seconds * sample_rate)), sample_rate),
+    )
+
+
+def test_prepare_ref2va_rejects_short_embedded_video_audio(monkeypatch):
+    _mock_ref2va_video_with_audio(monkeypatch, duration_seconds=1.0)
+    sampling = OmniDiffusionSamplingParams(
+        height=256,
+        width=448,
+        num_frames=96,
+        extra_args={"task": "ref2va"},
+    )
+    prompt = {"prompt": "hello", "multi_modal_data": {"video": "original.mp4"}}
+
+    with pytest.raises(OmniClientError, match=r"duration must be in \[2, 15\] seconds, got 1\.000"):
+        prepare_encoder_prompt(prompt, [sampling])
+
+
+def test_prepare_ref2va_rejects_combined_embedded_and_standalone_audio_duration(monkeypatch):
+    duration_seconds = 8.0
+    sample_rate = 16_000
+    _mock_ref2va_video_with_audio(monkeypatch, duration_seconds=duration_seconds)
+    sampling = OmniDiffusionSamplingParams(
+        height=256,
+        width=448,
+        num_frames=240,
+        extra_args={"task": "ref2va"},
+    )
+    prompt = {
+        "prompt": "hello",
+        "multi_modal_data": {
+            "video": "original.mp4",
+            "audio": (torch.zeros(int(duration_seconds * sample_rate)), sample_rate),
+        },
+    }
+
+    with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
+        prepare_encoder_prompt(prompt, [sampling])
 
 
 def _encoder_output() -> dict:

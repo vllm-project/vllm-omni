@@ -290,6 +290,21 @@ class PreparedEncoderInputs:
     condition_labels: list[tuple[str, int]]
 
 
+def _effective_audio_inputs(
+    video_audios: Sequence[tuple[torch.Tensor, int] | None],
+    standalone_audios: Sequence[tuple[torch.Tensor, int]],
+    *,
+    max_standalone_seconds: float,
+) -> list[tuple[torch.Tensor, int]]:
+    """Return the waveforms exactly as the audio WVAE will consume them."""
+    audio_inputs = [item for item in video_audios if item is not None]
+    audio_inputs.extend(
+        (waveform[..., : int(round(max_standalone_seconds * sample_rate))], sample_rate)
+        for waveform, sample_rate in standalone_audios
+    )
+    return audio_inputs
+
+
 def prepare_encoder_inputs(
     prompt: Any,
     sampling: Any,
@@ -433,6 +448,13 @@ def prepare_encoder_inputs(
         audios=tuple((waveform.float().contiguous(), int(sample_rate)) for waveform, sample_rate in standalone_audios),
         keyframe_frame_indices=tuple(keyframe_indices),
     )
+    validate_reference_audio_waveforms(
+        _effective_audio_inputs(
+            media_input.video_audios,
+            media_input.audios,
+            max_standalone_seconds=float(media_input.num_frames) / MINIMAX_H3_FPS,
+        )
+    )
 
     return PreparedEncoderInputs(
         prompt=text,
@@ -487,11 +509,10 @@ def encode_media(
     audio_rows: list[torch.Tensor] = []
     audio_lengths: list[int] = []
     embedded_audio_count = sum(item is not None for item in media.video_audios)
-    audio_inputs = [item for item in media.video_audios if item is not None]
-    max_samples_seconds = float(media.num_frames) / 24.0
-    audio_inputs.extend(
-        (waveform[..., : int(round(max_samples_seconds * sample_rate))], sample_rate)
-        for waveform, sample_rate in media.audios
+    audio_inputs = _effective_audio_inputs(
+        media.video_audios,
+        media.audios,
+        max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
     )
     if audio_inputs:
         if audio_vae is None:
