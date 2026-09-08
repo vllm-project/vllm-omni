@@ -116,14 +116,14 @@ Canonical layout (prefer these paths for new changes):
     - **`depends_on`:** leaf jobs depend on `upload-ready-pipeline`, `upload-merge-pipeline`, etc.
     - **`group` / `label`:** `:card_index_dividers:` groups; labels like `Diffusion · Qwen Image Test`.
     - **`commands`:** `timeout … pytest …` with markers and `--run-level` for the pipeline level.
-    - **`source_file_dependencies`:** required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; name a preset from `ci_source_file_dependencies.yml` (see [Step filtering](#step-filtering)).
+    - **`source_file_dependencies`:** required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; name a job key from `ci_source_file_dependencies.yml` (see [Step filtering](#step-filtering)). The key must list every script the step runs; `commands` is not scanned.
 
     **Adding a job**
 
     1. Pick the level file (`test-ready.yml` / `test-merge.yml` / `test-nightly.yml` / `test-weekly.yml`).
     2. Add a step under the right **group** (usually **E2E Test** for model pytest).
     3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-<level>-pipeline`.
-    4. For L2–L5 jobs that should be diff-gated, add a named preset in `common/ci_source_file_dependencies.yml` (model + deploy YAML prefixes only; pytest targets come from `commands`) and set `source_file_dependencies: <preset>` on the step.
+    4. For L2–L5 jobs that should be diff-gated, add a job key in `common/ci_source_file_dependencies.yml` and set `source_file_dependencies: <key>` on the step. YAML anchors hold model business-code paths only. The job key (`{model}_function` / `_perf` / `_accuracy` / `_reliability` / `_doc` / `_cov`) aliases that anchor and lists the pytest / example / benchmark scripts the step actually runs. The uploader does **not** parse `commands` for path filters—omitting a script from the key means editing that script will not select the job.
     5. Dry-run:
 
     ```bash
@@ -153,7 +153,7 @@ Canonical layout (prefer these paths for new changes):
 
     1. Edit `test-npu-ready.yml` (L2) or `test-npu-nightly.yml` (L4).
     2. Add a step with `mirror_hardwares` (add a new preset in `ci_mirror_hardwares.yml` first if needed).
-    3. Set `commands` to your pytest file and markers. For L4, set `source_file_dependencies` to a CUDA-shared preset from `ci_source_file_dependencies.yml`.
+    3. Set `commands` to your pytest file and markers. For L4, set `source_file_dependencies` to a job key from `ci_source_file_dependencies.yml` that aliases the model anchor and lists that pytest file.
     4. Dry-run:
 
     ```bash
@@ -312,25 +312,27 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 | Key | Purpose |
 | --- | ------- |
-| `source_file_dependencies` | Named preset (or list of presets) from [`ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml), expanded to extra path **prefixes**, then merged with `tests/` paths parsed from the step `commands`. If any changed file equals a prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. Inline path-prefix lists are still accepted. |
+| `source_file_dependencies` | Named preset (or list of presets) from [`ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml). The uploader expands only that key; it does **not** scan `commands`. If any changed file equals a listed prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. Inline path-prefix lists are still accepted. |
 | `mirror_hardwares` | Expand to `agents` + `plugins` (+ optional `image`) from `ci_mirror_hardwares.yml`. |
 
 ### Policy
 
 - **Always uploaded** (no key): L2/L3 groups outside **E2E Test**—Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1` or `NON_CRITICAL=1` have no `source_file_dependencies`. `upload_pipeline.py` already treats `tests/` paths in the step `commands` (pytest targets, plus `run_cov_split.sh --offline` / `--online`) as prefixes—do **not** repeat those in `ci_source_file_dependencies.yml`. Put only extra prefixes there: model code under `vllm_omni/model_executor/models/` or `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1` or `NON_CRITICAL=1` have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 ### YAML examples
 
 ```yaml
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies: diffusion_qwen_image_function
+        # diffusion_qwen_image_function: *qwen_image + tests/e2e/online_serving/test_qwen_image.py
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' ...
         mirror_hardwares: h100_1
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies: tts_qwen3_tts_function
+        # tts_qwen3_tts_function: *qwen3_tts + tests/e2e/online_serving/test_qwen3_tts_customvoice.py
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py ...
         mirror_hardwares: l4_1
