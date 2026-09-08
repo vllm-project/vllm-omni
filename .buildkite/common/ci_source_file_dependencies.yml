@@ -2,9 +2,10 @@
 # Referenced as ``source_file_dependencies: omni_qwen3_omni_function`` (or a list of
 # keys) on a step; ``upload_pipeline.py`` expands the key(s) only.
 #
-# Model keys are business code only. Job keys ({model}_function / _perf /
-# _accuracy / _reliability / _doc / _cov) alias that list and add the scripts
-# the job actually runs. Feature keys below are unchanged.
+# YAML anchors above the registry hold model business-code paths. Job keys
+# ({model}_function / _perf / _accuracy / _reliability / _doc / _cov) alias
+# those anchors and add the scripts the job actually runs. Feature keys below
+# are unchanged.
 #
 # YAML anchors are nested lists; the loader flattens them.
 
@@ -113,7 +114,7 @@ x-lingbot-world: &lingbot_world
 
 
 source_file_dependencies:
-  # --- features (unchanged) ---
+  # --- features ---
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
     - tests/diffusion/attention/test_attention_sp.py
@@ -151,59 +152,11 @@ source_file_dependencies:
     - vllm_omni/diffusion/offloader/
 
   diffusion_quantization:
+    - tests/diffusion/quantization/
     - vllm_omni/diffusion/quantization/
 
   reliability_invalid_param:
     - tests/dfx/reliability/invalid_param_test/
-
-  # --- models (business code) ---
-  omni_qwen3_omni:
-    - *qwen3_omni
-
-  omni_qwen2_5_omni:
-    - *qwen2_5_omni
-
-  omni_minicpmo_4_5:
-    - *minicpmo_4_5
-
-  tts_qwen3_tts:
-    - *qwen3_tts
-
-  diffusion_wan22:
-    - *wan22
-
-  diffusion_cosmos3:
-    - *cosmos3
-
-  diffusion_qwen_image:
-    - *qwen_image
-
-  diffusion_hunyuan_image3:
-    - *hunyuan_image3
-
-  diffusion_minimax_h3:
-    - *minimax_h3
-
-  diffusion_hunyuan_video:
-    - *hunyuan_video
-
-  diffusion_ltx2:
-    - *ltx2
-
-  diffusion_sana_video:
-    - *sana_video
-
-  diffusion_z_image:
-    - *z_image
-
-  diffusion_stable_audio:
-    - *stable_audio
-
-  diffusion_lingbot_video:
-    - *lingbot_video
-
-  diffusion_lingbot_world:
-    - *lingbot_world
 
   # --- omni / tts jobs ---
   omni_qwen3_omni_function:
@@ -266,8 +219,6 @@ source_file_dependencies:
   omni_minicpmo_4_5_duplex_function:
     - *minicpmo_4_5
     - *minicpmo_4_5_duplex
-    - tests/assets/minicpmo_4_5/response_required_16k.wav
-    - tests/assets/minicpmo_4_5/soft_interrupt_16k.wav
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
     - tests/e2e/online_serving/test_duplex_client_live.py
@@ -333,11 +284,6 @@ source_file_dependencies:
     - *wan22
     - tests/dfx/reliability/test_reliability_wan22.py
 
-  # image_to_video README snippets that the X2V Doc Test actually runs:
-  # Wan2.2 TI2V/I2V, HunyuanVideo-1.5 I2V, LTX-2, SANA-Video.
-  # LingBot-Video is in the README but skipped (/path/to/); keep its source so
-  # those code changes still select this job. Skips Python API, Prerequisites,
-  # Advanced Features, FAQ, Wan2.1 VACE.
   diffusion_image_to_video_doc:
     - *wan22
     - *hunyuan_video

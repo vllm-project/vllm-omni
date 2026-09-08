@@ -497,9 +497,6 @@ def test_registry_lists_pytest_targets() -> None:
     assert "tests/e2e/offline_inference/test_wan22_t2v.py" in resolved
     assert "tests/e2e/online_serving/test_wan22_t2v.py" in resolved
     assert "vllm_omni/diffusion/models/wan2_2/" in resolved
-    model = _load_source_file_dependencies()["diffusion_wan22"]
-    assert "vllm_omni/diffusion/models/wan2_2/" in model
-    assert "tests/e2e/online_serving/test_wan22_t2v.py" not in model
 
 
 def test_coverage_key_lists_offline_online_scripts() -> None:
@@ -525,7 +522,7 @@ def test_source_file_dependencies_list_of_keys_concatenates() -> None:
     resolved = _resolve_source_file_dependencies(
         {
             "label": "composed",
-            "source_file_dependencies": ["omni_qwen3_omni", "tts_qwen3_tts"],
+            "source_file_dependencies": ["omni_qwen3_omni_function", "tts_qwen3_tts_function"],
         },
     )
     assert resolved is not None
@@ -547,7 +544,7 @@ def test_source_file_dependencies_rejects_mixed_keys_and_paths() -> None:
         _resolve_source_file_dependencies(
             {
                 "label": "bad",
-                "source_file_dependencies": ["omni_qwen3_omni", "tests/e2e/online_serving/test_qwen3_omni.py"],
+                "source_file_dependencies": ["omni_qwen3_omni_function", "tests/e2e/online_serving/test_qwen3_omni.py"],
             },
         )
 

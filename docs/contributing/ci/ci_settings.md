@@ -324,13 +324,13 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 ```yaml
       - label: "Diffusion · Qwen Image Test"
-        source_file_dependencies: diffusion_qwen_image
+        source_file_dependencies: diffusion_qwen_image_function
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' ...
         mirror_hardwares: h100_1
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"
-        source_file_dependencies: tts_qwen3_tts
+        source_file_dependencies: tts_qwen3_tts_function
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py ...
         mirror_hardwares: l4_1
