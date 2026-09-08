@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,8 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
     # and returns a ``video_depth`` payload of per-frame depth maps.
     supports_video_depth: bool = False
+    # Head-sharded MoE uses SP-local groups, not vLLM FusedMoE rank folding.
+    expert_parallel_style: Literal["vllm", "head"] = "vllm"
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
