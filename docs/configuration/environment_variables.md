@@ -119,6 +119,22 @@ settings.
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
 it is unset.
 
+### Torch compilation
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_TORCH_DYNAMO_RECOMPILE_LIMIT` | Positive integer; unset preserves the current Torch setting | Process default for Torch Dynamo; read when `vllm_omni` is imported | Sets `torch._dynamo.config.recompile_limit` to the requested value. A non-positive or non-integer value raises `ValueError`. Later backend-specific overrides still take precedence. | Diagnostic |
+
+Set this variable before launching Omni, for example:
+
+```bash
+export VLLM_OMNI_TORCH_DYNAMO_RECOMPILE_LIMIT=64
+```
+
+The setting applies across model families and platforms. vLLM compilation
+contexts and backends can subsequently apply their own limits; this variable
+does not replace those backend-specific policies.
+
 ## Per-stage environment
 
 Deploy configurations can set arbitrary environment keys for one stage:
