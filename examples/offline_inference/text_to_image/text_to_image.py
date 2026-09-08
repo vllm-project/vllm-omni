@@ -335,7 +335,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        help="Enable diffusion pipeline profiler to display stage durations. "
+        "Not supported for pipelines without a DIFFUSION stage (e.g. mammoth_moda2) — "
+        "enable it via the deploy config's additional_config there.",
     )
     parser.add_argument(
         "--profiler-config",
@@ -545,22 +547,11 @@ def main():
 
     omni_kwargs = {
         "model": args.model,
-        "enable_layerwise_offload": args.enable_layerwise_offload,
-        "vae_use_slicing": args.vae_use_slicing,
-        "vae_use_tiling": args.vae_use_tiling,
         "cache_backend": args.cache_backend,
         "cache_config": cache_config,
-        "enable_cache_dit_summary": args.enable_cache_dit_summary,
-        "ulysses_degree": args.ulysses_degree,
-        "ring_degree": args.ring_degree,
-        "ulysses_mode": args.ulysses_mode,
-        "cfg_parallel_size": args.cfg_parallel_size,
-        "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
-        "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
-        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         "profiler_config": args.profiler_config,
         "init_timeout": args.init_timeout,
         "stage_init_timeout": args.stage_init_timeout,
@@ -568,6 +559,10 @@ def main():
         **lora_args,
         **quant_kwargs,
     }
+    # Diffusion-only engine args: pass only when explicitly set, so pipelines
+    # without a DIFFUSION stage (e.g. mammoth_moda2) pass ownership validation.
+    if args.enable_cpu_offload:
+        omni_kwargs["enable_cpu_offload"] = True
     if args.tensor_parallel_size is not None:
         omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
     if args.enforce_eager is not None:
@@ -583,6 +578,27 @@ def main():
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
+    if args.enable_layerwise_offload:
+        omni_kwargs["enable_layerwise_offload"] = True
+    if args.vae_use_slicing:
+        omni_kwargs["vae_use_slicing"] = True
+    if args.vae_use_tiling:
+        omni_kwargs["vae_use_tiling"] = True
+    if args.enable_cache_dit_summary:
+        omni_kwargs["enable_cache_dit_summary"] = True
+    if args.enable_diffusion_pipeline_profiler:
+        omni_kwargs["enable_diffusion_pipeline_profiler"] = True
+    if args.ulysses_degree and args.ulysses_degree > 1:
+        omni_kwargs["ulysses_degree"] = args.ulysses_degree
+    if args.ring_degree and args.ring_degree > 1:
+        omni_kwargs["ring_degree"] = args.ring_degree
+    if args.ulysses_mode != "strict":
+        omni_kwargs["ulysses_mode"] = args.ulysses_mode
+    if args.cfg_parallel_size and args.cfg_parallel_size > 1:
+        omni_kwargs["cfg_parallel_size"] = args.cfg_parallel_size
+    if args.vae_patch_parallel_size and args.vae_patch_parallel_size > 1:
+        omni_kwargs["vae_patch_parallel_size"] = args.vae_patch_parallel_size
+
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)

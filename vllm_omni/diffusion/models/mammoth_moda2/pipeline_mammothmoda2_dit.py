@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -23,7 +24,7 @@ from .schedulers import FlowMatchEulerDiscreteScheduler
 logger = init_logger(__name__)
 
 
-class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
+class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -113,6 +114,16 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.make_empty_intermediate_tensors = lambda: None
 
         self._llm_hidden_size = llm_hidden_size
+
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        self.setup_diffusion_pipeline_profiler(
+            profiler_targets=[
+                "gen_transformer.forward",
+                "gen_vae.decode",
+                "gen_image_condition_refiner.forward",
+            ],
+            enable_diffusion_pipeline_profiler=bool(additional_config.get("enable_diffusion_pipeline_profiler", False)),
+        )
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
