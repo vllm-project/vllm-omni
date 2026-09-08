@@ -29,6 +29,12 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from vllm_omni.diffusion.distributed.head_parallel import (
+    HeadParallelLayout,
+    scatter_heads_gather_tokens,
+    scatter_tokens_gather_heads,
+)
+
 
 @dataclass(frozen=True)
 class Magi2ParallelGroup:
@@ -305,30 +311,16 @@ def ep_dispatch(
         raise ValueError(
             f"MoE head count {tensor.shape[1] if tensor.ndim >= 2 else '?'} must divide by EP size {group.world_size}"
         )
-    sequence, heads, dim = tensor.shape
-    local_heads = heads // group.world_size
+    sequence = tensor.shape[0]
     if sequence_split_sizes is None:
         local_size = torch.tensor([sequence], dtype=torch.int64, device=tensor.device)
         gathered_sizes = [torch.empty_like(local_size) for _ in range(group.world_size)]
         dist.all_gather(gathered_sizes, local_size, group=group.group)
         sequence_split_sizes = [int(size.item()) for size in gathered_sizes]
-    if len(sequence_split_sizes) != group.world_size or sequence_split_sizes[group.rank] != sequence:
+    if len(sequence_split_sizes) != group.world_size:
         raise ValueError("EP sequence split sizes do not describe the local tensor")
-    send = tensor.contiguous().view(sequence, group.world_size, local_heads, dim).permute(1, 0, 2, 3).contiguous()
-    output = torch.empty(
-        (sum(sequence_split_sizes), local_heads, dim),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    row_width = local_heads * dim
-    dist.all_to_all_single(
-        output.view(-1),
-        send.view(-1),
-        output_split_sizes=[size * row_width for size in sequence_split_sizes],
-        input_split_sizes=[sequence * row_width] * group.world_size,
-        group=group.group,
-    )
-    return output
+    layout = HeadParallelLayout(tuple(sequence_split_sizes), group.rank)
+    return scatter_heads_gather_tokens(tensor, group.group, layout)
 
 
 def ep_undispatch(
@@ -347,25 +339,10 @@ def ep_undispatch(
         if tensor.shape[0] % group.world_size:
             raise ValueError("uneven EP sequence requires explicit split sizes")
         sequence_split_sizes = [tensor.shape[0] // group.world_size] * group.world_size
-    if len(sequence_split_sizes) != group.world_size or sum(sequence_split_sizes) != tensor.shape[0]:
+    if len(sequence_split_sizes) != group.world_size:
         raise ValueError("EP sequence split sizes do not partition the global tensor")
-    sequence = sequence_split_sizes[group.rank]
-    local_heads, dim = tensor.shape[1:]
-    send = tensor.contiguous()
-    output = torch.empty(
-        (group.world_size, sequence, local_heads, dim),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    row_width = local_heads * dim
-    dist.all_to_all_single(
-        output.view(-1),
-        send.view(-1),
-        output_split_sizes=[sequence * row_width] * group.world_size,
-        input_split_sizes=[size * row_width for size in sequence_split_sizes],
-        group=group.group,
-    )
-    return output.permute(1, 0, 2, 3).contiguous().view(sequence, group.world_size * local_heads, dim)
+    layout = HeadParallelLayout(tuple(sequence_split_sizes), group.rank)
+    return scatter_tokens_gather_heads(tensor, group.group, layout)
 
 
 class Magi2SequenceDispatcher:
