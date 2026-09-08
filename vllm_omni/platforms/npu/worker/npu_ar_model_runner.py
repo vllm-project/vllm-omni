@@ -47,6 +47,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.engine.serialization import request_needs_downstream_stage
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
@@ -344,7 +345,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if cached is not None:
             return cached
         final_stage_id = self._request_final_stage_id(req_id)
-        needs_payload = final_stage_id is None or final_stage_id > 0
+        current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+        needs_payload = request_needs_downstream_stage(final_stage_id, current_stage_id)
         self._downstream_payload_cache[req_id] = needs_payload
         return needs_payload
 

@@ -25,7 +25,10 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    request_needs_downstream_stage,
+)
 
 logger = init_logger(__name__)
 
@@ -206,7 +209,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return getattr(config, key, default) if config is not None else default
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
-        """True when this stage-zero-final request does not need downstream KV.
+        """True when this stage is the request's final pipeline stage.
 
         The result is cached per request to avoid repeated deserialization of
         additional_information on every scheduler tick.
@@ -221,7 +224,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             result = False
         else:
             info = deserialize_additional_information(payload)
-            result = info.get("omni_final_stage_id") == 0 and not bool(info.get("omni_force_kv_transfer", False))
+            current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+            result = not request_needs_downstream_stage(
+                info.get("omni_final_stage_id"),
+                current_stage_id,
+            ) and not bool(info.get("omni_force_kv_transfer", False))
 
         self._omits_kv_transfer_cache[rid] = result
         return result
@@ -238,7 +245,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not self.kv_transfer_criteria:
             return False
 
-        # Text-only requests finalize at stage 0; do not prefill-stop for DiT KV.
+        # Do not prefill-stop for downstream KV when this request ends here.
         if self._request_omits_kv_transfer_to_next_stage(request):
             return False
 
