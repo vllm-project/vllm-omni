@@ -70,7 +70,7 @@ def _encoder_config(root, *, video_mode="patch", roles=None):
         {
             "text_encoder": {"parallel_mode": "tp"},
             "video_vae": {"parallel_mode": video_mode},
-            "audio_wvae": {"parallel_mode": "leader"},
+            "audio_vae": {"parallel_mode": "leader"},
         }
         if roles is None
         else roles
@@ -125,7 +125,7 @@ def test_encoder_requires_all_role_policies(monkeypatch, tmp_path) -> None:
         },
     )
 
-    with pytest.raises(ValueError, match=r"requires exactly.*audio_wvae"):
+    with pytest.raises(ValueError, match=r"requires exactly.*audio_vae"):
         encoder_module.MiniMaxH3Encoder(vllm_config=config)
 
 

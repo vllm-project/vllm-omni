@@ -31,7 +31,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 _MEDIA_CONDITIONING_CACHE_KEY = "_minimax_h3_encoder_media_conditioning"
 _MEDIA_CACHE_KEY = "_minimax_h3_encoder_media"
 _COMPONENT_CONFIG_KEY = "minimax_h3_encoder_components"
-_COMPONENT_ROLES = frozenset({"text_encoder", "video_vae", "audio_wvae"})
+_COMPONENT_ROLES = frozenset({"text_encoder", "video_vae", "audio_vae"})
 
 
 def _partition_root(model_path: str) -> Path:
@@ -53,7 +53,7 @@ class MiniMaxH3EncoderComponentConfig:
         if self.video_parallel_mode not in {"leader", "patch"}:
             raise ValueError("MiniMax H3 video VAE parallel_mode must be 'leader' or 'patch'")
         if self.audio_parallel_mode != "leader":
-            raise ValueError("MiniMax H3 audio WVAE currently supports parallel_mode='leader' only")
+            raise ValueError("MiniMax H3 audio VAE currently supports parallel_mode='leader' only")
 
     @staticmethod
     def _parallel_mode(raw: Mapping[str, Any], role: str) -> str:
@@ -81,7 +81,7 @@ class MiniMaxH3EncoderComponentConfig:
         return cls(
             text_parallel_mode=cls._parallel_mode(raw, "text_encoder"),
             video_parallel_mode=cls._parallel_mode(raw, "video_vae"),
-            audio_parallel_mode=cls._parallel_mode(raw, "audio_wvae"),
+            audio_parallel_mode=cls._parallel_mode(raw, "audio_vae"),
         )
 
 

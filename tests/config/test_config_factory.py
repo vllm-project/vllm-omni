@@ -1417,7 +1417,7 @@ stages:
         assert stages[0].yaml_engine_args["hf_overrides"]["minimax_h3_encoder_components"] == {
             "text_encoder": {"parallel_mode": "tp"},
             "video_vae": {"parallel_mode": "patch"},
-            "audio_wvae": {"parallel_mode": "leader"},
+            "audio_vae": {"parallel_mode": "leader"},
         }
         assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
         assert stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
