@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniConnectorModelRunnerMixin.
 
 These tests use a mock connector (in-memory dict store) and do not require
@@ -379,7 +379,7 @@ class TestLoadCustomFuncSelection(unittest.TestCase):
     def test_skips_non_payload_stage_input_processors_for_full_payload_mode(self):
         incompatible_paths = [
             "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav",
-            "vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit",
+            "vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2diffusion",
             "vllm_omni.model_executor.stage_input_processors.cosyvoice3.text2flow",
             "vllm_omni.model_executor.stage_input_processors.glm_image.ar2diffusion",
         ]
