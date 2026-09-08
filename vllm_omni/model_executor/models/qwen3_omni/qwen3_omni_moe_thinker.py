@@ -577,7 +577,10 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                 if layer_idx in capture_set:
                     hs = captured_hidden_states.setdefault("hidden_states", {})
                     layers = hs.setdefault("layers", {})
-                    layers[layer_idx] = hidden_states.clone().view(-1, hidden_states.shape[-1])
+                    # vLLM defers the residual addition until the next RMSNorm.
+                    # Reconstruct the logical decoder state before capturing it.
+                    captured = hidden_states.clone() if residual is None else hidden_states + residual
+                    layers[layer_idx] = captured.view(-1, captured.shape[-1])
 
             hidden_states, residual = layer(
                 positions,
