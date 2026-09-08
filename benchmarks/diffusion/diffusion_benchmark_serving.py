@@ -1502,8 +1502,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--video-job-timeout",
         type=float,
-        default=600.0,
-        help="Maximum polling time in seconds per video job, including server queue time (default: 600). "
+        default=900.0,
+        help="Maximum polling time in seconds per video job, including server queue time (default: 900). "
         "Increase this for long-running video generation or high concurrency.",
     )
     parser.add_argument(

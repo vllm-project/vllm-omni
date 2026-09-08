@@ -46,7 +46,7 @@ class RequestFuncInput:
     video_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
-    video_job_timeout: float = 600.0
+    video_job_timeout: float = 900.0
 
 
 @dataclass

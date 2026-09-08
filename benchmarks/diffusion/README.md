@@ -143,7 +143,7 @@ Traffic / concurrency flags:
 ### Video job timeout and failures
 
 `--video-job-timeout` controls how long each `/v1/videos` job may be polled,
-including time queued on the server (default: `600` seconds). For long video
+including time queued on the server (default: `900` seconds). For long video
 jobs at high concurrency, use a larger budget, for example
 `--video-job-timeout 1800`. This also applies to warmup jobs. The polling budget
 starts after job creation; it excludes time waiting for the client concurrency
