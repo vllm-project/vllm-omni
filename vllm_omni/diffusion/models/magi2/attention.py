@@ -12,19 +12,21 @@ PyTorch path is an exact, portable oracle for small tests.
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from functools import cache
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.utils.fa import (
+    flash_attn_3_varlen,
     resolve_vllm_flash_attn_version,
     vllm_flash_attn_varlen_with_lse,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .parallel import (
     Magi2ParallelGroup,
@@ -33,7 +35,7 @@ from .parallel import (
     scatter_seqlen_gather_heads,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 @cache
@@ -192,7 +194,7 @@ def packed_attention_with_sink(
     cu_q, cu_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
     cu_q = cu_q.to(device=q.device, dtype=torch.int32).contiguous()
     cu_k = cu_k.to(device=q.device, dtype=torch.int32).contiguous()
-    if q.is_cuda:
+    if q.is_cuda and current_omni_platform.is_cuda():
         out, lse = vllm_flash_attn_varlen_with_lse(
             q,
             k,
@@ -206,6 +208,40 @@ def packed_attention_with_sink(
             fa_version=_resolve_flash_attn_version(),
         )
         return correct_out_lse_with_sink(out, lse, sink)[0]
+    if (
+        current_omni_platform.is_musa()
+        and q.device.type == current_omni_platform.device_type
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.shape[0] > 0
+        and k.shape[0] > 0
+    ):
+        requested_version = os.environ.get("MAGI2_FLASH_ATTN_VERSION")
+        if requested_version is not None and int(requested_version) != 3:
+            raise ValueError("MAGI-2 MUSA attention supports FlashAttention version 3 only")
+        try:
+            result = flash_attn_3_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                softmax_scale=q.shape[-1] ** -0.5,
+                softcap=softcap,
+                causal=False,
+                deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1",
+                return_softmax_lse=True,
+            )
+        except (ImportError, NotImplementedError) as exc:
+            logger.warning_once(
+                "MAGI-2 standalone FA3 is unavailable; using dense Torch reference attention: %s", str(exc)
+            )
+        else:
+            assert isinstance(result, tuple)
+            # Use the same correction as CUDA. Do not round learned FP32 sinks
+            # to the activation dtype or require native provider sink support.
+            return correct_out_lse_with_sink(result[0], result[1], sink)[0]
     return torch_varlen_attention_with_sink(
         q,
         k,
