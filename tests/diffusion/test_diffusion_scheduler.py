@@ -582,16 +582,22 @@ class TestRequestScheduler:
         assert sched_output.finished_req_ids == {"impossible"}
         assert _new_ids(sched_output) == ["schedulable"]
 
-    def test_diffusion_kv_internal_allocation_error_propagates(self, monkeypatch) -> None:
+    def test_diffusion_kv_internal_allocation_error_is_request_scoped(self, monkeypatch) -> None:
         _initialize_paged_scheduler(self.scheduler)
         request = _make_request("native-error")
         _attach_diffusion_kv(request)
         self.scheduler.add_request(request)
         manager = self.scheduler._diffusion_kv_manager
         assert manager is not None
+        reserve_request = manager.reserve_request
+        next_request = _make_request("after-error")
+        _attach_diffusion_kv(next_request)
+        self.scheduler.add_request(next_request)
 
         def raise_native_error(*args, **kwargs):
-            raise ValueError("native allocation bug")
+            if args[0] == "native-error":
+                raise ValueError("native allocation bug")
+            return reserve_request(*args, **kwargs)
 
         monkeypatch.setattr(
             manager,
@@ -599,8 +605,13 @@ class TestRequestScheduler:
             raise_native_error,
         )
 
-        with pytest.raises(ValueError, match="native allocation bug"):
-            self.scheduler.schedule()
+        output = self.scheduler.schedule()
+        state = self.scheduler.get_request_state("native-error")
+        assert state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert state.error == "native allocation bug"
+        assert output.finished_req_ids == {"native-error"}
+        assert _new_ids(output) == ["after-error"]
+        assert not manager.has_request("native-error")
 
     def test_diffusion_kv_preemption_retains_allocation(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3)

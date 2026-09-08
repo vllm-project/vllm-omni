@@ -474,12 +474,13 @@ async def test_cancelled_future_does_not_kill_busy_loop():
 
 
 @pytest.mark.asyncio
-async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loop():
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loop(error_type):
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop)
 
     def fail_reservation(*args, **kwargs):
-        raise RuntimeError("native allocation bug")
+        raise error_type("native allocation bug")
 
     engine.scheduler._diffusion_kv_manager = SimpleNamespace(
         has_request=lambda request_id: False,
