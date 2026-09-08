@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
 One pipeline class serves the Cosmos3 family modes. Output modality is selected
