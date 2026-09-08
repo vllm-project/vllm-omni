@@ -53,7 +53,7 @@ dev = [
     "soundfile==0.14.0",
     "imageio[ffmpeg]==2.37.4",
     "opencv-python==5.0.0.93",
-    "mooncake-transfer-engine-cuda13==0.3.11.post1",
+    "mooncake-transfer-engine-cuda13==0.3.12.post1",
     "av==18.0.0", # for ComfyUI tests
     "openpyxl==3.1.5", # for nightly CI
     "pyttsx3==2.99",

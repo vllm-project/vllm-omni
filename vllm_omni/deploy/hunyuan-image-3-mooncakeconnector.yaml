@@ -17,6 +17,8 @@ stages:
     enforce_eager: true
     moe_backend: triton
     env:
+      MC_TCP_ENABLE_CONNECTION_POOL: "1"
+      MC_TCP_SLICE_SIZE: "4194304"
       VLLM_USE_FLASHINFER_SAMPLER: "0"
     hf_overrides:
       rope_parameters:
@@ -24,7 +26,6 @@ stages:
         rope_type: default
     kv_transfer_config:
       kv_connector: MooncakeConnector
-      kv_connector_module_path: vllm_omni.diffusion.diffusion_kv.kv_connector
       kv_role: kv_producer
       engine_id: hunyuan-image3-ar
       kv_ip: 127.0.0.1
@@ -49,6 +50,8 @@ stages:
     enable_sleep_mode: true
     moe_backend: triton
     env:
+      MC_TCP_ENABLE_CONNECTION_POOL: "1"
+      MC_TCP_SLICE_SIZE: "4194304"
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     distributed_executor_backend: mp
     diffusion_kv_mode: paged_scheduler

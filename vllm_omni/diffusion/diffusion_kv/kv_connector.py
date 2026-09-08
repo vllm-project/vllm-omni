@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from dataclasses import replace
-from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import KVTransferConfig, VllmConfig
@@ -29,42 +27,6 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 
 logger = init_logger(__name__)
-
-
-async def _build_prefix_transfer_params(build_transfer_params, ready_reqs, agent_meta, local_regions, remote_regions):
-    prefix_reqs = []
-    for request_id, send_meta in ready_reqs:
-        remote_groups = agent_meta.req_blocks[request_id][1]
-        if len(send_meta.local_block_ids) == len(remote_groups):
-            send_meta = replace(
-                send_meta,
-                local_block_ids=[
-                    local[: len(remote)] for local, remote in zip(send_meta.local_block_ids, remote_groups, strict=True)
-                ],
-            )
-        prefix_reqs.append((request_id, send_meta))
-    return await build_transfer_params(prefix_reqs, agent_meta, local_regions, remote_regions)
-
-
-def __getattr__(name: str) -> Any:
-    if name != "MooncakeConnector":
-        raise AttributeError(name)
-
-    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
-        MooncakeConnector as NativeMooncakeConnector,
-    )
-
-    class MooncakeConnector(NativeMooncakeConnector):
-        """Use source prefixes for AR-to-diffusion pulls, not decode suffixes."""
-
-        def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig):
-            super().__init__(vllm_config, role, kv_cache_config)
-            worker = self.connector_worker
-            if worker is not None and worker.is_kv_producer:
-                worker._build_transfer_params = partial(_build_prefix_transfer_params, worker._build_transfer_params)
-
-    globals()[name] = MooncakeConnector
-    return MooncakeConnector
 
 
 def mint_transfer_id(request_id: str) -> str:
@@ -224,9 +186,23 @@ def commit_kv_load(
     expected = set()
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
         blocks = manager.get_blocks(request.request_id)
+        # Mooncake's producer advertises complete physical blocks. Keep every
+        # CFG receiver on that same block boundary so the native connector can
+        # use its normal one-to-one page mapping even when the branches have
+        # different logical prefix lengths. Bytes beyond ``num_tokens`` are
+        # not marked computed and are overwritten by the DiT prefill.
+        transfer_tokens = num_tokens
+        if num_tokens > 0 and request.kv_transfer_params is not None:
+            transfer_tokens = request.kv_transfer_params["num_transfer_tokens"]
+            if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
+                raise ValueError(
+                    "Diffusion KV transfer boundary must cover the reusable prefix "
+                    f"without exceeding the allocated sequence: reusable={num_tokens}, "
+                    f"transfer={transfer_tokens!r}, allocated={request.num_tokens}"
+                )
         prefix_blocks = KVCacheBlocks(
             tuple(
-                group[: (num_tokens + spec.kv_cache_spec.block_size - 1) // spec.kv_cache_spec.block_size]
+                group[: (transfer_tokens + spec.kv_cache_spec.block_size - 1) // spec.kv_cache_spec.block_size]
                 for group, spec in zip(blocks.blocks, manager.kv_cache_config.kv_cache_groups, strict=True)
             )
         )
@@ -243,6 +219,12 @@ def wait_for_kv_load(
     connector = active_connector.kv_connector
     active_connector.pre_forward(scheduler_output)
     pending = set(scheduler_output.kv_transfer_request_ids)
+    if not pending:
+        output = active_connector.post_forward(scheduler_output.finished_req_ids)
+        if output.invalid_block_ids:
+            raise RuntimeError("Diffusion KV connector reported invalid remote pages")
+        return output
+
     received, sent = set(), set()
     deadline = time.monotonic() + timeout
     while True:

@@ -231,6 +231,7 @@ class DiffusionPagedAttentionMetadata:
                 "Paged attention prefill and denoise rows must use the same ordered identities: "
                 f"prefill={prefill_identities!r}, denoise={denoise_identities!r}"
             )
+
     def rows_for_step(self, step_idx: int | None) -> tuple[DiffusionPagedAttentionRow, ...]:
         if type(step_idx) is not int or step_idx < 0:
             raise ValueError(f"Paged attention requires a non-negative denoise step index, got {step_idx!r}")
@@ -379,70 +380,6 @@ class DiffusionPagedAttentionAdapter:
         self._active_piecewise_native_metadata: tuple[dict[str, Any], ...] | None = None
         self._causal_by_group = self._resolve_group_causality()
         self._reorder_batch_threshold = self._resolve_reorder_batch_threshold()
-
-    def materialize_prefix_kv(self, layer_name: str) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        batch = self._active_batch
-        if batch is None:
-            raise RuntimeError("Paged prefix materialization requires an active prepared batch")
-        try:
-            layer = self.layers[layer_name]
-        except KeyError as exc:
-            raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
-        cache = layer.kv_cache
-        if cache is None:
-            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {layer_name!r}")
-
-        matching_groups = [
-            group_index
-            for group_index, group in enumerate(self.kv_cache_config.kv_cache_groups)
-            if layer_name in group.layer_names
-        ]
-        if len(matching_groups) != 1:
-            raise ValueError(
-                f"Diffusion paged layer {layer_name!r} must belong to exactly one cache group; "
-                f"found {matching_groups}"
-            )
-        group_index = matching_groups[0]
-        block_multiplier = int(self.block_tables.blocks_per_kv_block[group_index])
-        if block_multiplier != 1:
-            raise NotImplementedError(
-                "Dense prefix compatibility requires one native kernel block per Scheduler KV block"
-            )
-
-        block_size = int(layer.spec.block_size)
-        num_heads = int(layer.num_kv_heads)
-        head_size = int(layer.head_size)
-        expected_tail = (num_heads, block_size, 2 * head_size)
-        if cache.ndim != 4 or tuple(cache.shape[1:]) != expected_tail:
-            raise NotImplementedError(
-                "Dense prefix compatibility requires the native FlashAttention logical cache layout "
-                f"[blocks, heads, block, 2 * head_size]; got {tuple(cache.shape)}"
-            )
-
-        materialized: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for row in batch.rows:
-            prefix_len = row.kv_start_pos
-            if prefix_len == 0:
-                empty = cache.new_empty((0, num_heads, head_size))
-                materialized.append((empty, empty.clone()))
-                continue
-            binding = self.resolve_row(row.request_id, row.sequence_id, row.context_id)
-            block_ids = binding.block_ids[group_index]
-            required_blocks = cdiv(prefix_len, block_size)
-            if len(block_ids) < required_blocks:
-                raise ValueError(
-                    f"Paged prefix row {row.identity!r} has {len(block_ids)} blocks; "
-                    f"requires {required_blocks} for {prefix_len} tokens"
-                )
-            page_ids = torch.tensor(block_ids[:required_blocks], dtype=torch.long, device=cache.device)
-            packed = (
-                cache.index_select(0, page_ids)
-                .permute(0, 2, 1, 3)
-                .reshape(-1, num_heads, 2 * head_size)[:prefix_len]
-            )
-            key, value = packed.split(head_size, dim=-1)
-            materialized.append((key.contiguous(), value.contiguous()))
-        return materialized
 
     def _resolve_group_causality(self) -> dict[int, bool]:
         causal_by_group: dict[int, bool] = {}
@@ -822,6 +759,19 @@ class DiffusionPagedAttentionAdapter:
                 slot_mappings=slot_mappings,
                 causal=(row_segments[0].mode == "causal"),
             )
+            # FA2's ``num_splits=0`` auto policy selects SplitKV for these
+            # already-small piecewise calls. Reuse vLLM's supported metadata
+            # control to select the single-pass kernel and avoid its extra
+            # partial-output/reduction work. Leave newer native backends and
+            # metadata without this control untouched.
+            for layer_name, native_metadata in segment_metadata.items():
+                layer = self.layers.get(layer_name)
+                if (
+                    layer is not None
+                    and getattr(layer.impl, "vllm_flash_attn_version", None) == 2
+                    and hasattr(native_metadata, "max_num_splits")
+                ):
+                    native_metadata.max_num_splits = 1
             # FA3's full-CUDA-graph metadata builder reuses one persistent
             # scheduler buffer across builds. Piecewise attention prepares all
             # segments before executing any of them, so each segment needs its
@@ -965,9 +915,17 @@ class DiffusionPagedAttentionAdapter:
                 raise KeyError(
                     f"No piecewise native attention metadata was built for diffusion layer {layer_name!r}"
                 ) from exc
+        # Identical rows are sliced and packed once per segment by the
+        # homogeneous piecewise runner.  Keeping the projection view here
+        # avoids first copying the complete Q tensor only to copy each segment
+        # again immediately afterwards.  Other native paths still require one
+        # packed query buffer.
+        query_input = query_flat
+        if piecewise_plan is None or piecewise_plan.homogeneous_batch_shape is None:
+            query_input = query_flat.contiguous()
         return DiffusionPagedAttentionContext(
             layer=layer,
-            query=query_flat.contiguous(),
+            query=query_input,
             key_write=key_flat,
             value_write=value_flat,
             slot_mapping=slot_mapping,

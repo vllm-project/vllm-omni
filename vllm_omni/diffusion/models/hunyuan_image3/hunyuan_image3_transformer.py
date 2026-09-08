@@ -61,7 +61,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_allgather_parallel_world_size,
     get_cfg_group,
@@ -77,7 +76,6 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
-    get_forward_context,
     get_paged_kv_computed_tokens,
     paged_kv_prefill,
     set_forward_context_denoise_step_idx,
@@ -924,10 +922,6 @@ class ImageKVCacheManager(nn.Module):
         self.sp_size = get_sequence_parallel_world_size()
         self.allgather_size = get_allgather_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
-        diffusion_config = get_current_diffusion_config_or_none()
-        self._use_dense_paged_attention = bool(
-            diffusion_config is not None and diffusion_config.kv_transfer_config is not None
-        )
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -948,23 +942,6 @@ class ImageKVCacheManager(nn.Module):
             num_kv_heads=self.num_kv_heads,
             prefix="",
         )
-
-    def _materialize_paged_prefix(self, *, uncond_cfg_prefill: bool) -> None:
-        adapter = get_forward_context().paged_kv_adapter
-        if adapter is None:
-            raise RuntimeError("Hunyuan bitwise paged attention requires an active Worker adapter")
-        materialize = getattr(adapter, "materialize_prefix_kv", None)
-        if not callable(materialize):
-            raise RuntimeError("The active paged adapter cannot materialize imported prefix KV")
-        prefixes = materialize(self.attn.prefix)
-
-        previous = self._injected_ar_kv
-        if not uncond_cfg_prefill and previous is not None and len(previous) > 1:
-            if len(prefixes) > 1:
-                prefixes[1] = previous[1]
-            elif get_classifier_free_guidance_world_size() == 2 and get_classifier_free_guidance_rank() == 1:
-                prefixes[0] = previous[1]
-        self._injected_ar_kv = prefixes
 
     @staticmethod
     def _get_current_starts(
@@ -1284,15 +1261,8 @@ class ImageKVCacheManager(nn.Module):
     ) -> torch.Tensor:
         self.image_token_len = kwargs.get("num_image_tokens")
         if self.attn.is_paged_kv_active():
-            computed_tokens = get_paged_kv_computed_tokens()
-            if self._use_dense_paged_attention:
-                if attention_mask is None:
-                    raise ValueError("Hunyuan Scheduler-paged KV requires an attention mask")
-                if kwargs.get("first_step") and any(computed_tokens):
-                    self._materialize_paged_prefix(
-                        uncond_cfg_prefill=kwargs.get("uncond_cfg_prefill", False)
-                    )
-                return self._forward_dense_legacy(query, key, value, attention_mask, **kwargs)
+            # A native connector fills the same Scheduler-owned pages as
+            # local prefill. Imported prefixes need no dense reconstruction.
             full_attn_spans = kwargs.get("full_attn_spans")
             if full_attn_spans is None:
                 raise ValueError("Hunyuan Scheduler-paged KV requires full_attn_spans metadata")

@@ -745,11 +745,7 @@ class DiffusionEngine:
         if unique_request_ids:
             scheduler = getattr(self, "scheduler", None)
             target_builder = getattr(scheduler, "get_diffusion_kv_cleanup_targets", None)
-            cleanup_targets = (
-                target_builder(unique_request_ids)
-                if target_builder is not None
-                else unique_request_ids
-            )
+            cleanup_targets = target_builder(unique_request_ids) if target_builder is not None else unique_request_ids
             try:
                 self.executor.remove_diffusion_kv_requests(cleanup_targets)
             except Exception as exc:
@@ -809,11 +805,7 @@ class DiffusionEngine:
     ) -> None:
         """Emit output chunks for every request through the unified output stream."""
         finished_ids = set(finished_ids)
-        worker_cleaned_ids = (
-            finished_ids.intersection(scheduled_request_ids)
-            if worker_execution_completed
-            else set()
-        )
+        worker_cleaned_ids = finished_ids.intersection(scheduled_request_ids) if worker_execution_completed else set()
         if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
             self._emit_finished_outputs(
                 finished_ids,

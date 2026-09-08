@@ -59,6 +59,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_hsdp_replicate_group,
     get_pp_group,
     get_sp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
@@ -112,7 +113,11 @@ def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
     values: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(values, value)
+    # Object collectives are control-plane traffic. Using the default NCCL
+    # group serializes them through temporary CUDA tensors, adding pointless
+    # H2D/DtoH copies to every rank-wide status check. Reuse the world
+    # coordinator's Gloo group, as vLLM does for CPU metadata collectives.
+    dist.all_gather_object(values, value, group=get_world_group().cpu_group)
     return values
 
 
@@ -1248,7 +1253,11 @@ class WorkerProc:
 
         world_size = torch.distributed.get_world_size()
         statuses: list[dict[str, Any] | None] = [None] * world_size
-        torch.distributed.all_gather_object(statuses, status)
+        torch.distributed.all_gather_object(
+            statuses,
+            status,
+            group=get_world_group().cpu_group,
+        )
         missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
         if missing_ranks:
             logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)

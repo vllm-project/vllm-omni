@@ -287,8 +287,7 @@ def paged_kv_prefill(sequence_id: int, num_tokens: int):
     matching_rows = [row for row in rows if row.sequence_id == sequence_id]
     if len(matching_rows) != 1:
         raise ValueError(
-            "Paged KV prefill requires exactly one active row for sequence "
-            f"{sequence_id}; found {len(matching_rows)}"
+            f"Paged KV prefill requires exactly one active row for sequence {sequence_id}; found {len(matching_rows)}"
         )
     row = matching_rows[0]
     if type(num_tokens) is not int or not row.kv_start_pos < num_tokens <= row.seq_len:

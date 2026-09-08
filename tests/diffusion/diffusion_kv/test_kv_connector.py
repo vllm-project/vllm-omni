@@ -9,8 +9,10 @@ from vllm.config import KVTransferConfig
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
+    commit_kv_load,
     parse_kv_transfer_config,
     shutdown_kv_connector,
+    wait_for_kv_load,
 )
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
@@ -138,3 +140,52 @@ def test_shutdown_kv_connector_is_idempotent() -> None:
 
     assert ensure_shutdown.call_count == 2
     scheduler_connector.shutdown.assert_called_once()
+
+
+def test_commit_aligns_cfg_transport_pages_without_extending_computed_prefix() -> None:
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
+    requests = tuple(
+        SimpleNamespace(
+            request_id=f"req/{sequence_id}",
+            kv_transfer_params={"num_transfer_tokens": 9},
+            num_tokens=16,
+            num_computed_tokens=0,
+        )
+        for sequence_id in range(2)
+    )
+    manager = SimpleNamespace(
+        get_blocks=lambda _request_id: KVCacheBlocks(([0, 1, 2, 3],)),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4))]),
+    )
+    connector = mock.Mock()
+
+    expected = commit_kv_load(connector, manager, requests, [7, 5])
+
+    assert expected == {"req/0", "req/1"}
+    calls = connector.update_state_after_alloc.call_args_list
+    assert [len(call.args[1].blocks[0]) for call in calls] == [3, 3]
+    assert [call.args[2] for call in calls] == [7, 5]
+    assert [request.num_computed_tokens for request in requests] == [7, 5]
+
+
+def test_wait_without_pending_load_uses_vllm_post_forward_once() -> None:
+    from types import SimpleNamespace
+
+    connector = mock.Mock()
+    output = mock.Mock(invalid_block_ids=set())
+    active_connector = mock.Mock(kv_connector=connector)
+    active_connector.post_forward.return_value = output
+    scheduler_output = SimpleNamespace(
+        kv_transfer_request_ids=set(),
+        finished_req_ids={"finished"},
+    )
+
+    result = wait_for_kv_load(active_connector, scheduler_output, timeout=1.0)
+
+    assert result is output
+    active_connector.pre_forward.assert_called_once_with(scheduler_output)
+    active_connector.post_forward.assert_called_once_with({"finished"})
+    connector.get_finished.assert_not_called()

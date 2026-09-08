@@ -301,11 +301,17 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
         prewrite_kv = current_omni_platform.requires_diffusion_paged_kv_prewrite()
-        read_kv_from_cache = prewrite_kv and layer.attn_backend.forward_includes_kv_cache_update
+        forward_updates_cache = layer.attn_backend.forward_includes_kv_cache_update
+        # Match vLLM's split update/attention contract. Once K/V has been
+        # written by do_kv_cache_update(), decoder attention consumes the
+        # paged cache and does not need segment-local K/V tensors. In
+        # particular, this avoids packing the same K/V projection view once
+        # for every piecewise segment.
+        read_kv_from_cache = not forward_updates_cache or prewrite_kv
         # The GPU/default path preserves native cache-update ownership. Ascend
         # prewrites through vLLM-Ascend's normal-layout writer so piecewise FIA
         # segments do not repeatedly scatter the same layer K/V.
-        if not layer.attn_backend.forward_includes_kv_cache_update or prewrite_kv:
+        if not forward_updates_cache or prewrite_kv:
             cache_update = getattr(native_impl, "do_kv_cache_update", None)
             if not callable(cache_update):
                 raise RuntimeError(
@@ -343,14 +349,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         if paged_kv_context.piecewise_plan is not None:
-            # Ascend FIA can execute identical CFG rows as one batched call
-            # per piece.  Keep that batch layout through the piecewise runner
-            # so it can concatenate row-major results instead of emitting an
-            # indexed ScatterUpdate for every segment.  The CUDA path keeps
-            # its existing output-buffer contract (including graph capture).
-            use_homogeneous_batch = (
-                current_omni_platform.is_npu() and paged_kv_context.piecewise_plan.homogeneous_batch_shape is not None
-            )
+            # Identical CFG rows can execute as one batched call per piece.
+            # Keep that batch layout through the piecewise runner so Q/K/V use
+            # strided slices instead of indexed gathers and results can be
+            # concatenated in row-major order.
+            use_homogeneous_batch = paged_kv_context.piecewise_plan.homogeneous_batch_shape is not None
             output = None
             if not use_homogeneous_batch:
                 output = torch.empty(

@@ -93,7 +93,7 @@ class _FakeAttentionGroup:
         return self.builder
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _FakeNativeMetadata:
     build_id: int
     causal: bool
@@ -101,6 +101,7 @@ class _FakeNativeMetadata:
     query_start_loc_cpu: torch.Tensor
     positions: torch.Tensor
     slot_mappings: torch.Tensor
+    max_num_splits: int = 0
 
 
 class _FakeLayer:
@@ -287,6 +288,8 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert output.shape == query.shape
     assert torch.equal(output, query)
     assert layer.calls[0][0].shape == (5, 2, 4)
+    assert layer.calls[0][1] is None
+    assert layer.calls[0][2] is None
     assert layer.native_events == ["update", "forward"]
     assert layer.calls[0][3] is events[0][2]
 
@@ -439,9 +442,7 @@ def test_platform_prewrite_updates_once_then_piecewise_reads_cache(monkeypatch: 
 
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, events = _make_adapter(monkeypatch)
-    # Exercise the Ascend-only homogeneous batch path. CUDA keeps its native
-    # output-buffer contract and is covered by the GPU adapter tests.
-    monkeypatch.setattr(adapter_module.current_omni_platform, "is_npu", lambda: True)
+    layer.impl.vllm_flash_attn_version = 2
     batch = adapter.prepare_batch(
         [
             DiffusionPagedAttentionRow(
@@ -498,10 +499,10 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
     assert torch.equal(layer.updates[0][0], key.reshape(12, 2, 4))
     assert torch.equal(layer.updates[0][1], value.reshape(12, 2, 4))
     assert [call[0].shape[0] for call in layer.calls] == [4, 6, 2]
-    assert [call[1].shape[0] for call in layer.calls] == [4, 6, 2]
-    assert [call[2].shape[0] for call in layer.calls] == [4, 6, 2]
+    assert all(call[1] is None and call[2] is None for call in layer.calls)
     assert all(call[3] is event[2] for call, event in zip(layer.calls, events[1:], strict=True))
     assert [metadata.build_id for metadata in context.piecewise_native_metadata] == [1, 2, 3]
+    assert [metadata.max_num_splits for metadata in context.piecewise_native_metadata] == [1, 1, 1]
 
     # The first metadata build is the normal whole-query path. Piecewise calls
     # then use causal [3, 5), full [5, 8), and causal [8, 9) segments.
@@ -536,6 +537,51 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
         [[5, 6, 7, 5, 6, 7]],
         [[8, 8]],
     ]
+
+
+def test_homogeneous_piecewise_packs_strided_query_only_per_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=6,
+                seq_len=9,
+                kv_start_pos=3,
+            ),
+            DiffusionPagedAttentionRow(
+                request_id="req-1",
+                sequence_id=1,
+                query_len=6,
+                seq_len=9,
+                kv_start_pos=3,
+            ),
+        ]
+    )
+    packed_qkv = torch.randn(2, 6, 3, 2, 4)
+    query, key, value = packed_qkv.unbind(dim=2)
+    assert not query.is_contiguous()
+    metadata = SimpleNamespace(
+        attn_mask=None,
+        full_attn_spans=[[(5, 8)], [(5, 8)]],
+        query_ranges=None,
+        extra={},
+    )
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+        )
+
+    assert not context.query.is_contiguous()
+    assert context.query.data_ptr() == query.data_ptr()
 
 
 def test_piecewise_metadata_snapshots_reused_native_scheduler_buffer(monkeypatch: pytest.MonkeyPatch) -> None:

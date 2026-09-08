@@ -247,10 +247,7 @@ class DiffusionKVModelRunnerBackend:
 
         max_num_reqs = max_num_seqs
         if max_num_reqs % max_rows_per_request:
-            raise ValueError(
-                "scheduler_config.max_num_seqs must be a multiple of "
-                "diffusion_kv_max_rows_per_request"
-            )
+            raise ValueError("scheduler_config.max_num_seqs must be a multiple of diffusion_kv_max_rows_per_request")
         max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", None)
         if type(max_num_batched_tokens) is not int or max_num_batched_tokens <= 0:
             raise ValueError("scheduler_config.max_num_batched_tokens must be a positive integer")
@@ -605,10 +602,7 @@ class DiffusionKVModelRunnerBackend:
             for request_id, generation in (item,)
             if isinstance(request_id, str) and type(generation) is int
         }
-        request_id_set = {
-            item if isinstance(item, str) else item[0]
-            for item in request_ids
-        }
+        request_id_set = {item if isinstance(item, str) else item[0] for item in request_ids}
         identities_and_rows = [
             (identity, row)
             for identity, row in self._diffusion_kv_identity_to_row.items()
