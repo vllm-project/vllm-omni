@@ -11,18 +11,14 @@ import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.attention.mindiesd_usp import (
-    MindIESDUSPAdapter,
-    MindIESDUSPOptions,
-)
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.platforms.npu.usp import AscendUSPExecutor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 @dataclass
 class _ParallelConfigStub:
-    enable_mindiesd_usp: bool = True
     ulysses_degree: int = 2
     ring_degree: int = 2
     allgather_degree: int = 1
@@ -49,37 +45,43 @@ def _usp_module(usp_attention, usp_error: USPErrorType = RuntimeError) -> Module
     return module
 
 
-def _adapter(**overrides):
+def _executor(**overrides):
     config = _parallel_config(**overrides)
     groups = _SPGroupsStub(
         ulysses_group=object(),
         ring_group=object(),
     )
-    return MindIESDUSPAdapter(MindIESDUSPOptions.from_parallel_config(config), groups)
+    return AscendUSPExecutor(
+        sp_group=groups,
+        ulysses_degree=config.ulysses_degree,
+        ring_degree=config.ring_degree,
+        allgather_degree=config.allgather_degree,
+        ulysses_mode=config.ulysses_mode,
+    )
 
 
-def test_parallel_config_exposes_one_mindiesd_usp_switch():
+def test_parallel_config_exposes_technical_usp_switch():
     config = DiffusionParallelConfig(
         ulysses_degree=2,
-        enable_mindiesd_usp=True,
+        enable_usp=True,
     )
 
     assert config.sequence_parallel_size == 2
-    assert config.enable_mindiesd_usp is True
+    assert config.enable_usp is True
 
 
-def test_adapter_maps_vllm_owned_state_to_explicit_mindie_contract(monkeypatch):
-    adapter = _adapter()
+def test_executor_maps_vllm_owned_state_to_explicit_mindie_contract(monkeypatch):
+    executor = _executor()
     usp_attention = Mock(return_value=torch.full((1, 3, 4, 8), 7.0))
     module = _usp_module(usp_attention)
-    monkeypatch.setattr(adapter, "_load_usp_module", lambda: module)
+    monkeypatch.setattr(executor, "_load_usp_module", lambda: module)
 
     query = torch.randn(1, 3, 4, 8)
     key = torch.randn(1, 3, 4, 8)
     value = torch.randn(1, 3, 4, 8)
     metadata = AttentionMetadata()
 
-    output = adapter.try_forward(
+    output = executor.try_forward(
         query,
         key,
         value,
@@ -96,22 +98,22 @@ def test_adapter_maps_vllm_owned_state_to_explicit_mindie_contract(monkeypatch):
         query,
         key,
         value,
-        ulysses_group=adapter.sp_group.ulysses_group,
-        kv_gather_group=adapter.sp_group.ring_group,
+        ulysses_group=executor.sp_group.ulysses_group,
+        kv_gather_group=executor.sp_group.ring_group,
     )
 
 
-def test_adapter_maps_pure_ring_to_kv_gather(monkeypatch):
-    adapter = _adapter(ulysses_degree=1, ring_degree=2)
+def test_executor_maps_pure_ring_to_kv_gather(monkeypatch):
+    executor = _executor(ulysses_degree=1, ring_degree=2)
     usp_attention = Mock(return_value=torch.zeros(1, 3, 4, 8))
     monkeypatch.setattr(
-        adapter,
+        executor,
         "_load_usp_module",
         lambda: _usp_module(usp_attention),
     )
     query = torch.randn(1, 3, 4, 8)
 
-    adapter.try_forward(
+    executor.try_forward(
         query,
         query,
         query,
@@ -125,7 +127,7 @@ def test_adapter_maps_pure_ring_to_kv_gather(monkeypatch):
 
     kwargs = usp_attention.call_args.kwargs
     assert kwargs["ulysses_group"] is None
-    assert kwargs["kv_gather_group"] is adapter.sp_group.ring_group
+    assert kwargs["kv_gather_group"] is executor.sp_group.ring_group
 
 
 def test_attention_delegates_before_native_sequence_parallel_collectives():
@@ -147,7 +149,7 @@ def test_attention_delegates_before_native_sequence_parallel_collectives():
     layer.scatter_idx = 2
     layer.gather_idx = 1
     expected = torch.zeros(1, 3, 4, 8)
-    layer._mindiesd_usp_adapter = Mock(try_forward=Mock(return_value=expected))
+    layer._usp_executor = Mock(try_forward=Mock(return_value=expected))
     query = torch.randn(1, 3, 4, 8)
 
     output = layer._forward_impl(query, query, query)
@@ -165,7 +167,7 @@ def test_attention_does_not_delegate_outside_sp_sharded_region():
     layer._active_paged_kv_adapter = Mock(return_value=None)
     layer._scheduler_paged_kv = False
     layer.paged_kv_cache_role = None
-    layer._mindiesd_usp_adapter = Mock()
+    layer._usp_executor = Mock()
     layer.use_ring = False
     layer._with_kv_cache_dtype = Mock(side_effect=lambda metadata: metadata)
     layer._run_local_attention = Mock(return_value=torch.zeros(1, 3, 4, 8))
@@ -181,13 +183,12 @@ def test_attention_does_not_delegate_outside_sp_sharded_region():
 
     layer._forward_impl(query, query, query)
 
-    layer._mindiesd_usp_adapter.try_forward.assert_not_called()
+    layer._usp_executor.try_forward.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    ("adapter_overrides", "call_overrides", "metadata"),
+    ("executor_overrides", "call_overrides", "metadata"),
     [
-        ({"enable_mindiesd_usp": False}, {}, None),
         ({}, {"backend_name": "TORCH_SDPA"}, None),
         ({}, {"causal": True}, None),
         ({}, {"softmax_scale": 0.25}, None),
@@ -199,16 +200,16 @@ def test_attention_does_not_delegate_outside_sp_sharded_region():
         ({}, {}, AttentionMetadata(extra={"kv_cache_dtype": "fp8"})),
     ],
 )
-def test_adapter_skips_semantics_not_covered_by_mindie(
+def test_executor_skips_semantics_not_covered_by_mindie(
     monkeypatch,
-    adapter_overrides,
+    executor_overrides,
     call_overrides,
     metadata,
 ):
-    adapter = _adapter(**adapter_overrides)
+    executor = _executor(**executor_overrides)
     usp_attention = Mock(return_value=torch.zeros(1, 3, 4, 8))
     monkeypatch.setattr(
-        adapter,
+        executor,
         "_load_usp_module",
         lambda: _usp_module(usp_attention),
     )
@@ -223,25 +224,25 @@ def test_adapter_skips_semantics_not_covered_by_mindie(
     }
     call.update(call_overrides)
 
-    assert adapter.try_forward(query, query, query, **call) is None
+    assert executor.try_forward(query, query, query, **call) is None
     usp_attention.assert_not_called()
 
 
-def test_adapter_falls_back_only_for_structured_mindie_errors(monkeypatch):
+def test_executor_falls_back_only_for_structured_mindie_errors(monkeypatch):
     class USPError(RuntimeError):
         pass
 
-    adapter = _adapter()
+    executor = _executor()
     usp_attention = Mock(side_effect=USPError("unsupported shape"))
     monkeypatch.setattr(
-        adapter,
+        executor,
         "_load_usp_module",
         lambda: _usp_module(usp_attention, USPError),
     )
     query = torch.randn(1, 3, 4, 8)
 
     assert (
-        adapter.try_forward(
+        executor.try_forward(
             query,
             query,
             query,
@@ -257,7 +258,7 @@ def test_adapter_falls_back_only_for_structured_mindie_errors(monkeypatch):
 
     usp_attention.side_effect = ValueError("programming error")
     with pytest.raises(ValueError, match="programming error"):
-        adapter.try_forward(
+        executor.try_forward(
             query,
             query,
             query,

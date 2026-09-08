@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Optional MindIE-SD unified sequence-parallel attention adapter."""
+"""Ascend implementation of unified sequence-parallel attention."""
 
 from __future__ import annotations
 
 import importlib
 import math
-from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING, Protocol
 
@@ -27,42 +26,27 @@ class SequenceParallelGroups(Protocol):
     ring_group: object
 
 
-@dataclass(frozen=True, slots=True)
-class MindIESDUSPOptions:
-    """vLLM-Omni-owned, normalized options for the MindIE-SD USP call."""
+class AscendUSPExecutor:
+    """Execute supported Ascend SP attention through MindIE-SD.
 
-    enabled: bool = False
-    ulysses_degree: int = 1
-    ring_degree: int = 1
-    allgather_degree: int = 1
-    ulysses_mode: str = "strict"
-
-    @classmethod
-    def from_parallel_config(cls, config: object) -> MindIESDUSPOptions:
-        return cls(
-            enabled=bool(getattr(config, "enable_mindiesd_usp", False)),
-            ulysses_degree=int(getattr(config, "ulysses_degree", 1)),
-            ring_degree=int(getattr(config, "ring_degree", 1)),
-            allgather_degree=int(getattr(config, "allgather_degree", 1)),
-            ulysses_mode=str(getattr(config, "ulysses_mode", "strict")),
-        )
-
-
-class MindIESDUSPAdapter:
-    """Translate vLLM-Omni attention state to MindIE-SD's explicit USP ABI.
-
-    The adapter deliberately returns ``None`` when the optional fast path does
-    not cover the current semantics. The caller then executes its existing
-    native Ulysses/Ring path unchanged.
+    Unsupported calls return ``None`` so the portable attention layer can use
+    its existing Ulysses/Ring implementation without duplicating collectives.
     """
 
     def __init__(
         self,
-        options: MindIESDUSPOptions,
+        *,
         sp_group: SequenceParallelGroups,
+        ulysses_degree: int,
+        ring_degree: int,
+        allgather_degree: int,
+        ulysses_mode: str,
     ) -> None:
-        self.options = options
         self.sp_group = sp_group
+        self.ulysses_degree = ulysses_degree
+        self.ring_degree = ring_degree
+        self.allgather_degree = allgather_degree
+        self.ulysses_mode = ulysses_mode
         self._usp_module: ModuleType | None = None
         self._load_attempted = False
 
@@ -74,7 +58,7 @@ class MindIESDUSPAdapter:
             module = importlib.import_module("mindiesd.layers.usp")
         except ImportError as exc:
             logger.warning_once(
-                "MindIE-SD USP is enabled but mindiesd.layers.usp is unavailable; "
+                "Ascend USP is enabled but mindiesd.layers.usp is unavailable; "
                 "using vLLM-Omni native sequence-parallel attention: %s",
                 exc,
             )
@@ -84,23 +68,17 @@ class MindIESDUSPAdapter:
             getattr(module, "USPError", None), type
         ):
             logger.warning_once(
-                "MindIE-SD USP is enabled but its installed API is incompatible; "
+                "Ascend USP is enabled but the installed MindIE-SD API is incompatible; "
                 "using vLLM-Omni native sequence-parallel attention."
             )
             return None
         self._usp_module = module
-        logger.info_once("Using MindIE-SD unified sequence-parallel attention.")
+        logger.info_once("Using the Ascend unified sequence-parallel attention executor.")
         return module
 
-    def _groups(self):
-        ulysses_group = self.sp_group.ulysses_group if self.options.ulysses_degree > 1 else None
-        if self.options.ring_degree > 1:
-            # MindIE-SD currently materializes K/V with AllGather over this
-            # group. It is numerically equivalent to Omni's Ring path but is
-            # intentionally not described as a true P2P Ring implementation.
-            kv_gather_group = self.sp_group.ring_group
-        else:
-            kv_gather_group = None
+    def _groups(self) -> tuple[object | None, object | None]:
+        ulysses_group = self.sp_group.ulysses_group if self.ulysses_degree > 1 else None
+        kv_gather_group = self.sp_group.ring_group if self.ring_degree > 1 else None
         return ulysses_group, kv_gather_group
 
     def _supports_call(
@@ -114,12 +92,11 @@ class MindIESDUSPAdapter:
         scatter_dim: int,
         gather_dim: int,
     ) -> bool:
-        options = self.options
-        if not options.enabled or backend_name != "FLASH_ATTN":
+        if backend_name != "FLASH_ATTN":
             return False
-        if options.allgather_degree > 1 or options.ulysses_degree * options.ring_degree == 1:
+        if self.allgather_degree > 1 or self.ulysses_degree * self.ring_degree == 1:
             return False
-        if options.ulysses_mode != "strict" or causal:
+        if self.ulysses_mode != "strict" or causal:
             return False
         if scatter_dim != 2 or gather_dim != 1 or query.ndim != 4:
             return False
@@ -137,8 +114,6 @@ class MindIESDUSPAdapter:
             )
         ):
             return False
-        # Omni may still hold a rank-local mask here; its native SP strategy
-        # normalizes that mask only after the interception point.
         if attn_metadata.attn_mask is not None:
             return False
         if attn_metadata.full_attn_spans is not None or attn_metadata.query_ranges is not None:
@@ -170,7 +145,7 @@ class MindIESDUSPAdapter:
         scatter_dim: int,
         gather_dim: int,
     ) -> torch.Tensor | None:
-        """Run MindIE-SD once when compatible, otherwise request native fallback."""
+        """Run the Ascend USP executor when compatible, else request fallback."""
         if not self._supports_call(
             query,
             attn_metadata,
@@ -197,11 +172,11 @@ class MindIESDUSPAdapter:
             )
         except module.USPError as exc:
             logger.warning_once(
-                "MindIE-SD USP rejected the current attention contract; "
+                "Ascend USP rejected the current attention contract; "
                 "using vLLM-Omni native sequence-parallel attention: %s",
                 exc,
             )
             return None
 
 
-__all__ = ["MindIESDUSPAdapter", "MindIESDUSPOptions"]
+__all__ = ["AscendUSPExecutor"]

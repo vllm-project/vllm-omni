@@ -85,13 +85,14 @@ omni = Omni(
 )
 ```
 
-### Optional MindIE-SD USP path (Ascend NPU)
+### Optional unified SP executor (Ascend NPU)
 
 On Ascend NPU, vLLM-Omni can delegate the complete Ulysses and ring-group
-attention hot path to MindIE-SD in one call. The public attention backend
-remains `FLASH_ATTN`; this option only replaces its sequence-parallel
-communication and local FA execution. The configured ring process group is
-passed to MindIE-SD as `kv_gather_group`.
+attention hot path to the platform's unified sequence-parallel (USP) executor.
+The public attention backend remains `FLASH_ATTN`; this option only replaces
+its sequence-parallel communication and local FA execution. The Ascend
+implementation is provided by MindIE-SD, and receives the configured ring
+process group as `kv_gather_group`.
 
 ```python
 omni = Omni(
@@ -99,17 +100,17 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(
         ulysses_degree=2,
         ring_degree=2,
-        enable_mindiesd_usp=True,
+        enable_usp=True,
     ),
 )
 ```
 
-The initial integration intentionally exposes only this switch. vLLM-Omni
-passes its Ulysses group and its ring group (as `kv_gather_group`) while
-MindIE-SD uses its own defaults for chunking, communication dtype, overlap,
-and FA backend selection.
+The initial integration intentionally exposes only the technical `enable_usp`
+switch. vLLM-Omni passes its Ulysses group and its ring group (as
+`kv_gather_group`) while the platform executor uses its own defaults for
+chunking, communication dtype, overlap, and FA backend selection.
 
-This is an opt-in path and requires a MindIE-SD build that provides
+The Ascend implementation requires a MindIE-SD build that provides
 `mindiesd.layers.usp`. If the package is absent or MindIE-SD raises one of its
 structured `USPError` capability exceptions, vLLM-Omni logs the reason once
 and uses its existing native Ulysses/Ring implementation. Unexpected errors
@@ -200,7 +201,7 @@ In `DiffusionParallelConfig`:
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
-| `enable_mindiesd_usp` | bool | `False` | Delegate supported Ascend sequence-parallel attention to `mindiesd.layers.usp`. |
+| `enable_usp` | bool | `False` | Use the platform's unified sequence-parallel executor for supported attention calls. |
 
 **Notes:**
 - Total sequence parallel size equals to `ulysses_degree × ring_degree`

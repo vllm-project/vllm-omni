@@ -233,8 +233,8 @@ class DiffusionParallelConfig:
     ulysses_a2a_permute: bool = False
     """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
 
-    enable_mindiesd_usp: bool = False
-    """Use MindIE-SD's optional single-call sequence-parallel attention path."""
+    enable_usp: bool = False
+    """Use the platform's unified sequence-parallel attention executor."""
 
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
