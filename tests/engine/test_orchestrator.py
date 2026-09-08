@@ -2666,6 +2666,8 @@ async def test_duplex_reaper_loop_waits_between_ticks():
 
 @pytest.mark.asyncio
 async def test_duplex_reaper_loop_survives_one_cleanup_failure():
+    cleanup_succeeded = asyncio.Event()
+
     class _Plane:
         def __init__(self) -> None:
             self.calls = 0
@@ -2674,6 +2676,7 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("transient cleanup failure")
+            cleanup_succeeded.set()
             return 0
 
     orchestrator = object.__new__(Orchestrator)
@@ -2682,9 +2685,12 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
     orchestrator._shutdown_event = asyncio.Event()
 
     task = asyncio.create_task(orchestrator._duplex_reaper_loop())
-    await asyncio.sleep(0.035)
-    orchestrator._shutdown_event.set()
-    await task
+    try:
+        # Wait for recovery rather than relying on CI scheduling within 35 ms.
+        await asyncio.wait_for(cleanup_succeeded.wait(), timeout=5.0)
+    finally:
+        orchestrator._shutdown_event.set()
+        await task
 
     assert orchestrator.duplex_control_plane.calls >= 2
 
