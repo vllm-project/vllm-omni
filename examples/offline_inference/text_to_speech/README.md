@@ -130,11 +130,7 @@ Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24
 ## Fish Speech S2 Pro
 
 4B dual-AR text-to-speech model from FishAudio with the DAC codec at 44.1 kHz.
-
-### Prerequisites
-```bash
-pip install fish-speech
-```
+No extra packages are required; the DAC codec is vendored in vLLM-Omni.
 
 ### Quick start
 ```bash

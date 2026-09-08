@@ -1818,6 +1818,24 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", quality="medium")
 
 
+def test_async_create_accepts_fractional_fps(test_client, mocker: MockerFixture):
+    """Queued VideoResponse must accept fractional fps from the request path."""
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "fractional fps", "fps": "12.5", "num_frames": "5"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["fps"] == 12.5
+    assert body["num_frames"] == 5
+    video_id = body["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_sampling_params_list[0].fps == 12.5
+    assert engine.captured_sampling_params_list[0].frame_rate == 12.5
+
+
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
