@@ -509,6 +509,15 @@ class Magi2Pipeline(
     dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _PROFILER_TARGETS = [
+        "_encode_prompts",
+        "_encode_reference_image",
+        "_pool_figure_token",
+        "sampler.sample",
+        "sampler.denoise_step",
+        "_decode_video",
+        "_decode_audio",
+    ]
     _vae_modules: ClassVar[list[str]] = [
         "image_vae",
         "video_decoder",
@@ -678,14 +687,7 @@ class Magi2Pipeline(
             )
         ]
         self.setup_diffusion_pipeline_profiler(
-            profiler_targets=[
-                "_encode_prompts",
-                "_encode_reference_image",
-                "_pool_figure_token",
-                "sampler.sample",
-                "_decode_video",
-                "_decode_audio",
-            ],
+            profiler_targets=self._PROFILER_TARGETS,
             enable_diffusion_pipeline_profiler=bool(getattr(od_config, "enable_diffusion_pipeline_profiler", False)),
         )
 
