@@ -18,6 +18,13 @@ logger = init_logger(__name__)
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
     """Inject connector configuration into stage engine arguments."""
+    typed_connector_config = getattr(stage, "connector_config", None)
+    if typed_connector_config is not None:
+        omni_conf_dict = dict(typed_connector_config.omni_kv_config or {})
+        omni_conf_dict.update(connector_config=omni_conn_cfg, omni_from_stage=omni_from, omni_to_stage=omni_to)
+        typed_connector_config.omni_kv_config = omni_conf_dict
+        return
+
     # Prepare omni_kv_config dict
     omni_conf_dict = {}
     try:

@@ -232,8 +232,8 @@ class AsyncOmniEngine:
             )
 
         self.num_stages = len(self.stage_configs)
-        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
-        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        stage0_connector = getattr(self.stage_configs[0], "connector_config", None) if self.num_stages > 0 else None
+        self.async_chunk = bool(getattr(stage0_connector, "async_chunk", False))
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -317,6 +317,7 @@ class AsyncOmniEngine:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
         self._runtime = create_stage_runtime(
             stage_configs=self.stage_configs,
+            typed_stage_configs=self.stage_configs,
             model=self.model,
             config_path=self.config_path,
             single_stage_mode=self.single_stage_mode,
@@ -774,13 +775,12 @@ class AsyncOmniEngine:
             if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
                 processed_info = deserialize_additional_information(request.additional_information)
                 processed_meta = processed_info.get("meta")
-                if isinstance(processed_meta, dict):
-                    if isinstance(original_prompt, dict):
-                        original_info = dict(original_prompt.get("additional_information") or {})
-                        original_meta = dict(original_info.get("meta") or {})
-                        original_meta.update(processed_meta)
-                        original_info["meta"] = original_meta
-                        original_prompt["additional_information"] = original_info
+                if isinstance(processed_meta, dict) and isinstance(original_prompt, dict):
+                    original_info = dict(original_prompt.get("additional_information") or {})
+                    original_meta = dict(original_info.get("meta") or {})
+                    original_meta.update(processed_meta)
+                    original_info["meta"] = original_meta
+                    original_prompt["additional_information"] = original_info
 
             if reasoning_ended is not None:
                 request.reasoning_ended = reasoning_ended

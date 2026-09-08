@@ -202,7 +202,7 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
         strategy_config_path=None,
     )
     assert resolved.config_path is None
-    assert resolved.stage_by_id(0).engine_args.model_class_name == "MiniMaxH3ModularPipeline"
+    assert resolved.stage_by_id(0).diffusion_config.model_class_name == "MiniMaxH3ModularPipeline"
 
     config = OmniDiffusionConfig(model=str(tmp_path))
     config.enrich_config()

@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 from pydantic import ValidationError
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
+from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -117,7 +119,7 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
         trust_remote_code=False,
     )
 
-    assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
+    assert stage_configs[0].diffusion_config.extras["ltx2_use_conv_vae"] is True
 
 
 def test_default_stage_rejects_unknown_nested_parallel_config_key():
@@ -726,3 +728,107 @@ def test_default_stage_config_includes_quantization_config():
     stage_cfg = StageConfigFactory.create_default_diffusion({"quantization_config": quantization_config})[0]
 
     assert stage_cfg["engine_args"]["quantization_config"] == quantization_config
+
+
+@pytest.mark.parametrize("model_class_name", ["HeliosPipeline", "HunyuanVideo15Pipeline"])
+def test_generic_diffusion_uses_canonical_video_output_type(model_class_name):
+    config = StageConfigFactory.create_typed_default_diffusion(
+        "generic-video",
+        {"model_class_name": model_class_name},
+    )
+
+    assert config.stage_configs[0].final_output_type == "video"
+
+
+def test_generic_diffusion_resolves_structured_stage_without_legacy_conversion(mocker):
+    """Generic diffusion reaches runtime as the structured stage itself."""
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "FakeDiffusionPipeline"),
+    )
+
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides={
+            "num_gpus": 4,
+            "tensor_parallel_size": 2,
+            "default_sampling_params": '{"0": {"guidance_scale": 7.5}}',
+        },
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+
+    assert resolved.pipeline_config is not None
+    assert resolved.pipeline_config.model_type == "generic_diffusion"
+    assert len(resolved.stage_configs) == 1
+    stage = resolved.stage_configs[0]
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.model_config.model == "generic-diffusion"
+    assert stage.model_config.default_sampling_params == {"guidance_scale": 7.5}
+    assert stage.parallel_config.tensor_parallel_size == 2
+    assert stage.parallel_config.data_parallel_size == 2
+    assert stage.parallel_config.world_size == 4
+    assert stage.runtime_config.devices == "0,1,2,3"
+
+
+def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
+    """Standard runtime resolves and starts the typed stage through the real launcher."""
+    from vllm_omni.engine import stage_engine_startup as startup_module
+    from vllm_omni.engine import stage_runtime as runtime_module
+    from vllm_omni.engine.stage_runtime import StageRuntime
+
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "FakeDiffusionPipeline"),
+    )
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides={"num_gpus": 1},
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    stage = resolved.stage_configs[0]
+    launched: dict[str, Any] = {}
+    client = SimpleNamespace(input_address=None, shutdown=mocker.Mock())
+
+    mocker.patch.object(runtime_module, "prepare_engine_environment")
+    mocker.patch.object(runtime_module, "load_omni_transfer_config_for_model", return_value=None)
+    mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+
+    def _initialize_typed_stage(stage_id, model, stage_config, metadata, **kwargs):
+        launched.update(
+            stage_id=stage_id,
+            model=model,
+            stage_config=stage_config,
+            metadata=metadata,
+            **kwargs,
+        )
+        return client
+
+    mocker.patch.object(startup_module, "initialize_diffusion_stage", side_effect=_initialize_typed_stage)
+
+    runtime = StageRuntime(
+        stage_configs=list(resolved.stage_configs),
+        typed_stage_configs=list(resolved.stage_configs),
+        model="generic-diffusion",
+        config_path="",
+        stage_init_timeout=10,
+        async_chunk=False,
+    )
+    runtime.initialize()
+
+    assert launched["stage_config"] is stage
+    assert isinstance(launched["stage_config"], VllmOmniDiffusionStageConfig)
+    assert launched["metadata"].stage_type == "diffusion"
+    assert launched["metadata"].model_stage == "diffusion"
+    assert launched["use_inline"] is True
+    assert launched["model"] == "generic-diffusion"
+    assert launched["stage_id"] == 0
+    assert runtime.stage_pools[0].clients == [client]

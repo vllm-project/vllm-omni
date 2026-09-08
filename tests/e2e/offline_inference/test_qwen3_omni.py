@@ -17,6 +17,10 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_video
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.config.omni_config import (
+    VllmOmniARStageConfig,
+    VllmOmniGenerationStageConfig,
+)
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
@@ -57,6 +61,54 @@ def get_question(prompt_type="video"):
         "video": "Describe the video briefly.",
     }
     return prompts.get(prompt_type, prompts["video"])
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_structured_multistage_config_reaches_runtime(omni_runner) -> None:
+    """User deploy settings survive resolution and affect the live stages."""
+    stage_configs = omni_runner.omni.engine.stage_configs
+    assert len(stage_configs) == 3
+    thinker, talker, code2wav = stage_configs
+    assert isinstance(thinker, VllmOmniARStageConfig)
+    assert isinstance(talker, VllmOmniARStageConfig)
+    assert isinstance(code2wav, VllmOmniGenerationStageConfig)
+    assert [stage.stage_id for stage in stage_configs] == [0, 1, 2]
+    assert [stage.model_stage for stage in stage_configs] == ["thinker", "talker", "code2wav"]
+    assert code2wav.final_output_type == "audio"
+    assert thinker.runtime_config.devices == "0"
+    assert talker.runtime_config.devices == code2wav.runtime_config.devices == "1"
+    assert thinker.scheduler_config.max_num_seqs == talker.scheduler_config.max_num_seqs == 64
+    assert code2wav.scheduler_config.max_num_seqs == 64
+    assert thinker.scheduler_config.max_num_batched_tokens == talker.scheduler_config.max_num_batched_tokens == 32768
+    assert code2wav.scheduler_config.max_num_batched_tokens == 65536
+    assert thinker.cache_config.gpu_memory_utilization == 0.9
+    assert talker.cache_config.gpu_memory_utilization == 0.6
+    assert code2wav.cache_config.gpu_memory_utilization == 0.1
+    assert all(stage.cache_config.enable_prefix_caching is False for stage in stage_configs)
+    assert all(stage.model_config.trust_remote_code is True for stage in stage_configs)
+    assert thinker.model_config.default_sampling_params == {"temperature": 0.0, "max_tokens": 2048}
+    assert talker.model_config.default_sampling_params == {
+        "temperature": 0.9,
+        "top_k": 50,
+        "max_tokens": 4096,
+        "repetition_penalty": 1.05,
+    }
+    assert code2wav.model_config.default_sampling_params == {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "max_tokens": 65536,
+        "repetition_penalty": 1.1,
+    }
+    assert talker.connector_config.input_connectors == {"from_stage_0": "connector_of_shared_memory"}
+    assert code2wav.connector_config.input_connectors == {"from_stage_1": "connector_of_shared_memory"}
+
+    if current_omni_platform.is_cuda():
+        assert thinker.model_config.enforce_eager is True
+        assert talker.model_config.enforce_eager is True
 
 
 @pytest.mark.advanced_model

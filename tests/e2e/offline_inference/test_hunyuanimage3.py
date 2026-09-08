@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E501
 from collections.abc import Generator
 
@@ -7,9 +10,14 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
+from vllm_omni.config.omni_config import (
+    VllmOmniARStageConfig,
+    VllmOmniDiffusionStageConfig,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -18,7 +26,10 @@ MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
 DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3.yaml")
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
+pytestmark = [
+    pytest.mark.advanced_model,
+    pytest.mark.diffusion,
+]
 
 # System prompt type. Options: None, dynamic, en_vanilla, en_recaption, en_think_recaption, en_unified
 # Below are the CLIP embedding tensors from the official HunyuanImage model (seed=1234, prompt: "A brown and white dog is running on the grass").
@@ -278,6 +289,54 @@ def omni() -> Generator[Omni, None, None]:
         trust_remote_code=True,
     ) as runner:
         yield runner.omni
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
+@hardware_test(res={"cuda": "H100"}, num_cards=8)
+def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
+    """Mixed-pipeline deploy settings affect the live structured stages."""
+    stage_configs = omni.engine.stage_configs
+    assert len(stage_configs) == 2
+    ar_stage, diffusion_stage = stage_configs
+    assert isinstance(ar_stage, VllmOmniARStageConfig)
+    assert ar_stage.stage_id == 0
+    assert ar_stage.model_stage == "AR"
+    assert ar_stage.model_config.enforce_eager is True
+    assert ar_stage.final_output_type == "text"
+    assert ar_stage.runtime_config.devices == "0,1"
+    assert ar_stage.parallel_config.tensor_parallel_size == 2
+    assert ar_stage.scheduler_config.max_num_seqs == 1
+    assert ar_stage.scheduler_config.max_num_batched_tokens == 32768
+    assert ar_stage.cache_config.gpu_memory_utilization == 0.95
+    assert ar_stage.model_config.default_sampling_params == {
+        "temperature": 0.0,
+        "top_p": 1,
+        "top_k": -1,
+        "max_tokens": 8192,
+        "detokenize": True,
+        "skip_special_tokens": False,
+        "include_stop_str_in_output": True,
+    }
+    assert ar_stage.connector_config.omni_kv_config["need_send_cache"] is True
+    assert ar_stage.connector_config.output_connectors == {"to_stage_1": "rdma_connector"}
+    assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
+    assert diffusion_stage.stage_id == 1
+    assert diffusion_stage.model_stage == "dit"
+    assert diffusion_stage.model_config.enforce_eager is True
+    assert diffusion_stage.final_output_type == "image"
+    assert diffusion_stage.input_sources == [0]
+    assert diffusion_stage.runtime_config.devices == "2,3"
+    assert diffusion_stage.runtime_config.distributed_executor_backend == "mp"
+    assert diffusion_stage.parallel_config.tensor_parallel_size == 2
+    assert diffusion_stage.parallel_config.enable_expert_parallel is True
+    assert diffusion_stage.scheduler_config.max_num_seqs == 1
+    assert diffusion_stage.model_config.default_sampling_params == {"num_inference_steps": 50, "guidance_scale": 0}
+    assert diffusion_stage.connector_config.omni_kv_config == {
+        "need_recv_cache": True,
+        "enable_kv_async_prefetch": True,
+        "kv_prefetch_min_free_mem_ratio": 0.2,
+    }
+    assert diffusion_stage.connector_config.input_connectors == {"from_stage_0": "rdma_connector"}
 
 
 def _extract_generated_image(outputs: list[object]) -> Image.Image:

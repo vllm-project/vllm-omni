@@ -11,6 +11,7 @@ from pathlib import Path
 
 import msgspec
 import pytest
+import torch
 from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 from transformers import Qwen3OmniMoeConfig
@@ -544,6 +545,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "load_config",
         "cache_config",
         "scheduler_config",
+        "pooling_config",
         "connector_config",
         "runtime_config",
         "parallel_config",
@@ -763,6 +765,17 @@ def test_structured_llm_stage_registration_payloads_remain_msgpack_transport_saf
             "stage_config": _serialize_stage_config(stage_config),
         }
         msgspec.msgpack.encode(payload)
+
+
+def test_structured_diffusion_torch_dtype_is_msgpack_transport_safe():
+    stage_config = _from_pipeline_key(
+        "hunyuan_image3_dit",
+        cli_overrides={"dtype": torch.bfloat16},
+    ).stage_by_id(0)
+
+    serialized = _serialize_stage_config(stage_config)
+    assert serialized["diffusion_config"]["dtype"] == "bfloat16"
+    msgspec.msgpack.encode(serialized)
 
 
 def test_diffusion_parallel_config_fields_cover_legacy_surface():

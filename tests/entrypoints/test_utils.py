@@ -13,6 +13,14 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.composable_parallel import (
+    Broadcast,
+    FanInByStage,
+    MeshAxisSpec,
+    RouteByStage,
+    StrategySpec,
+    TakeRank,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.resolver import (
     OmniConfigResolution,
@@ -21,7 +29,6 @@ from vllm_omni.config.resolver import (
     resolve_omni_config,
 )
 from vllm_omni.config.stage_config import PipelineConfig
-from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.utils import (
@@ -330,16 +337,12 @@ class TestResolveOmniConfig:
         )
         assert resolved.config_path is None
         assert len(resolved.stage_configs) == 1
-        engine_args = resolved.stage_configs[0]["engine_args"]
-        assert "dtype" in engine_args
-        assert engine_args["engine_backend"] == engine_backend
-        assert engine_args["revision"] == "pinned-revision"
+        assert resolved.stage_configs[0].diffusion_config.dtype is torch.float32
+        assert resolved.stage_configs[0].diffusion_config.engine_backend == engine_backend
+        assert resolved.stage_configs[0].diffusion_config.revision == "pinned-revision"
 
     def test_generic_diffusion_uses_registered_model_metadata(self, mocker: MockerFixture):
-        mocker.patch(
-            "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
-            return_value=None,
-        )
+        mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
         resolve_model_class = mocker.patch(
             "vllm_omni.config.resolver.resolve_model_class_name",
             return_value="WanImageToVideoPipeline",
@@ -348,58 +351,97 @@ class TestResolveOmniConfig:
             "vllm_omni.config.resolver.DiffusionModelRegistry.get_supported_archs",
             return_value={"WanImageToVideoPipeline"},
         )
+        load_model_class = mocker.patch("vllm_omni.config.resolver.DiffusionModelRegistry._try_load_model_cls")
 
         resolved = resolve_omni_config(
             "/models/Wan2.2-I2V",
             trust_remote_code=False,
             deploy_config_path=None,
-            cli_overrides={
-                "diffusion_load_format": "diffusers",
-                "revision": "pinned-revision",
-            },
+            cli_overrides={"diffusion_load_format": "diffusers", "revision": "pinned-revision"},
             stage_overrides=None,
             strategy_config_path=None,
         )
 
+        resolve_model_class.assert_called_once_with("/models/Wan2.2-I2V", "diffusers", "pinned-revision")
+        load_model_class.assert_not_called()
         stage = resolved.stage_configs[0]
-        resolve_model_class.assert_called_once_with(
-            "/models/Wan2.2-I2V",
-            "diffusers",
-            "pinned-revision",
-        )
-        assert stage.engine_args.model_class_name == "WanImageToVideoPipeline"
+        assert stage.diffusion_config.model_class_name == "WanImageToVideoPipeline"
+        assert stage.diffusion_config.revision == "pinned-revision"
         assert stage.final_output_type == "video"
+
+    def test_generic_diffusion_stage_overrides_reach_typed_backend(self, mocker: MockerFixture):
+        from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+        mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+        mocker.patch(
+            "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+            return_value=(True, "LTX2Pipeline"),
+        )
+        resolved = resolve_omni_config(
+            "/models/LTX-2.5-Diffusers",
+            trust_remote_code=False,
+            deploy_config_path=None,
+            cli_overrides={
+                "extras": {"ltx2_use_conv_vae": False, "keep": "global"},
+                "tensor_parallel_size": 1,
+                "diffusion_streaming_output": True,
+            },
+            stage_overrides={
+                "0": {
+                    "extras": {"ltx2_use_conv_vae": True},
+                    "tensor_parallel_size": 2,
+                    "devices": "2,3",
+                    "engine_backend": "custom.backend",
+                },
+            },
+            strategy_config_path=None,
+        )
+        stage = resolved.stage_by_id(0)
+        engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="/models/LTX-2.5-Diffusers")
+
+        assert stage.runtime_config.devices == "2,3"
+        assert stage.parallel_config.world_size == 2
+        assert engine_args["engine_backend"] == "custom.backend"
+        assert engine_args["extras"]["ltx2_use_conv_vae"] is True
+        assert engine_args["extras"]["keep"] == "global"
+        assert engine_args["streaming_output"] is True
 
     def test_registered_pipeline_uses_structured_metadata_and_preserves_override_trust(self, mocker: MockerFixture):
         endpoint_restriction = SimpleNamespace(name="chat")
+        typed_stage = SimpleNamespace(stage_id=1)
         structured_config = SimpleNamespace(
-            orchestrator_config=SimpleNamespace(deploy_config_path="/resolved/deploy.yaml"),
+            orchestrator_config=SimpleNamespace(
+                deploy_config_path="/resolved/deploy.yaml",
+                omni_lb_policy="round_robin",
+            ),
             pipeline_config=SimpleNamespace(endpoint_restrictions=(endpoint_restriction,)),
+            stage_configs=(typed_stage,),
+            strategy_omni_lb_policy="round-robin",
         )
-        runtime_stage = create_config(
-            {
-                "stage_id": 1,
-                "runtime": {"devices": "1,2,3", "num_replicas": 3},
-                "engine_args": {"model": "dummy-model"},
-            }
-        )
-        legacy_stage = SimpleNamespace(to_omegaconf=lambda: runtime_stage)
         create_structured = mocker.patch(
             "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
             return_value=structured_config,
         )
         create_legacy = mocker.patch(
-            "vllm_omni.config.resolver.StageConfigFactory._resolve_legacy_from_registry",
-            return_value=SimpleNamespace(
-                stage_configs=[legacy_stage],
-                pipeline_config=structured_config.pipeline_config,
-                omni_lb_policy="round_robin",
-            ),
+            "vllm_omni.config.resolver.StageConfigFactory.create_legacy_stage_configs_from_model",
         )
-        strategy_specs = {"stage_1": {"dp": 3}}
+        strategy_specs = {
+            "stage_1": [
+                StrategySpec(
+                    "stage_replica",
+                    MeshAxisSpec("stage_replica", 2),
+                    RouteByStage("round_robin"),
+                    FanInByStage(),
+                )
+            ]
+        }
         load_strategy = mocker.patch(
             "vllm_omni.config.resolver._load_strategy_specs",
             return_value=strategy_specs,
+        )
+        apply_strategy = mocker.patch(
+            "vllm_omni.config.composable_parallel.apply_strategy_specs",
+            return_value=SimpleNamespace(omni_lb_policy="round_robin"),
         )
 
         resolved = resolve_omni_config(
@@ -421,30 +463,62 @@ class TestResolveOmniConfig:
             trust_remote_code=None,
             cli_overrides=expected_overrides,
             deploy_config_path="deploy.yaml",
-        )
-        create_legacy.assert_called_once_with(
-            structured_config.pipeline_config,
-            expected_overrides,
-            "/resolved/deploy.yaml",
             strategy_specs=strategy_specs,
         )
+        create_legacy.assert_not_called()
         load_strategy.assert_called_once_with("strategy.yaml")
+        apply_strategy.assert_not_called()
         assert resolved.config_path == "/resolved/deploy.yaml"
         assert resolved.pipeline_config is structured_config.pipeline_config
-        assert resolved.omni_lb_policy == "round_robin"
+        assert resolved.omni_lb_policy == "round-robin"
         assert resolved.endpoint_restrictions == (endpoint_restriction,)
-        assert resolved.stage_configs == (runtime_stage,)
+        assert resolved.stage_configs == (typed_stage,)
 
-    def test_registered_resolution_exposes_forced_aligner_topology(self, mocker: MockerFixture):
-        pipeline = OMNI_PIPELINES["qwen3_tts"]
-        assert isinstance(pipeline, PipelineConfig)
+    def test_tp_only_strategy_does_not_report_default_lb_policy_as_derived(self, mocker: MockerFixture):
         structured_config = SimpleNamespace(
-            orchestrator_config=SimpleNamespace(deploy_config_path=None),
-            pipeline_config=pipeline,
+            orchestrator_config=SimpleNamespace(
+                deploy_config_path="/resolved/deploy.yaml",
+                omni_lb_policy="round-robin",
+            ),
+            pipeline_config=SimpleNamespace(endpoint_restrictions=()),
+            stage_configs=(SimpleNamespace(stage_id=0),),
+            strategy_omni_lb_policy=None,
         )
         mocker.patch(
             "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
             return_value=structured_config,
+        )
+        mocker.patch(
+            "vllm_omni.config.resolver._load_strategy_specs",
+            return_value={
+                "thinker": [
+                    StrategySpec(
+                        "tp",
+                        MeshAxisSpec("tp", 2),
+                        Broadcast(),
+                        TakeRank(),
+                    )
+                ]
+            },
+        )
+
+        resolved = resolve_omni_config(
+            "dummy-model",
+            trust_remote_code=True,
+            deploy_config_path="deploy.yaml",
+            cli_overrides={"omni_lb_policy": "round-robin"},
+            stage_overrides=None,
+            strategy_config_path="strategy.yaml",
+        )
+
+        assert resolved.omni_lb_policy is None
+
+    def test_registered_resolution_exposes_forced_aligner_topology(self, mocker: MockerFixture):
+        pipeline = OMNI_PIPELINES["qwen3_tts"]
+        assert isinstance(pipeline, PipelineConfig)
+        mocker.patch(
+            "vllm_omni.config.config_factory.StageConfigFactory.get_pipeline_config",
+            return_value=pipeline,
         )
 
         resolved = resolve_omni_config(
@@ -457,9 +531,9 @@ class TestResolveOmniConfig:
         )
 
         assert resolved.pipeline_config is not None
-        pipeline_stage_ids = [stage.stage_id for stage in resolved.pipeline_config.stages]
-        runtime_stage_ids = [stage.stage_id for stage in resolved.stage_configs]
-        assert pipeline_stage_ids == runtime_stage_ids
+        assert [stage.stage_id for stage in resolved.pipeline_config.stages] == [
+            stage.stage_id for stage in resolved.stage_configs
+        ]
         assert resolved.pipeline_config.stages[-1].model_stage == "forced_aligner"
         assert len(resolved.pipeline_config.stages) == len(pipeline.stages) + 1
 

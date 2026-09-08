@@ -63,6 +63,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # TODO: extend this set and the expected census if @router.head / @router.options appear.
 _HTTP_METHODS = {"GET", "POST", "DELETE", "PUT", "PATCH"}
 
+
+def test_profiler_endpoints_detect_typed_stage_config():
+    stage = SimpleNamespace(profiler_config=SimpleNamespace(profiler="torch"))
+
+    assert api_server._should_enable_profiler_endpoints([stage])
+
+
 # Exact Omni router census on main. Update intentionally when routes change.
 _EXPECTED_ROUTER_ROUTES = {
     ("POST", "/v1/chat/completions"),

@@ -16,7 +16,8 @@ from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, StageExecutionType, StagePipelineConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -57,6 +58,10 @@ def _make_llm_plan(
     vllm_config: Any | None = None,
 ) -> LogicalStageInitPlan:
     stage_cfg = _make_stage_cfg(stage_id)
+    if launch_mode == "remote":
+        stage_cfg = VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(stage_id=stage_id, model_stage="thinker"),
+        )
     metadata = SimpleNamespace(
         stage_id=stage_id,
         stage_type="llm",
@@ -98,6 +103,16 @@ def _make_diffusion_plan(
     launch_mode: str,
 ) -> LogicalStageInitPlan:
     stage_cfg = _make_stage_cfg(stage_id, stage_type="diffusion")
+    if launch_mode == "remote":
+        stage_cfg = VllmOmniDiffusionStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+        )
     metadata = SimpleNamespace(
         stage_id=stage_id,
         stage_type="diffusion",
@@ -917,6 +932,7 @@ class TestSingleStageReplicaInitialization:
         assert mock_connect.call_args.kwargs["stage_id"] == 1
         assert mock_connect.call_args.kwargs["replica_id"] == 0
         assert client_kwargs["log_stats"] is True
+        assert client_kwargs["metadata"].model_stage == "thinker"
         assert events == ["enter", "exit", "attach"]
 
     def test_initialize_llm_replica_remote_missing_registered_stage_config_raises(self, mocker: MockerFixture):
@@ -1082,11 +1098,9 @@ class TestSingleStageReplicaInitialization:
 
             return _ctx()
 
-        remote_metadata = _make_diffusion_plan(1, stage_id=1, launch_mode="remote").replicas[0].metadata
         plan = _make_diffusion_plan(1, stage_id=1, launch_mode="remote").replicas[0]
         sentinel_client = SimpleNamespace()
 
-        mocker.patch.object(runtime_mod, "extract_legacy_stage_metadata", return_value=remote_metadata)
         mock_connect = mocker.patch.object(runtime_mod, "connect_remote_diffusion_proc", side_effect=_fake_connect)
         mock_from_addresses = mocker.patch(
             "vllm_omni.diffusion.stage_diffusion_client.StageDiffusionClient.from_addresses",
@@ -1103,6 +1117,7 @@ class TestSingleStageReplicaInitialization:
             replica_id=0,
         )
         mock_from_addresses.assert_called_once()
+        assert mock_from_addresses.call_args.args[0].final_output_type == "image"
 
     def test_initialize_local_diffusion_replica_registers_with_master(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod

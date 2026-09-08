@@ -967,6 +967,7 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     from vllm_omni.engine.stage_init_utils import (
         build_engine_args_dict,
+        build_engine_args_dict_from_omni_stage_config,
         build_vllm_config,
         get_stage_connector_spec,
         inject_omni_kv_connector_config,
@@ -1055,21 +1056,21 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=bool(stage_cfg.engine_args.get("async_chunk", False)),
+        async_chunk=bool(
+            getattr(getattr(stage_cfg, "connector_config", None), "async_chunk", None)
+            if hasattr(stage_cfg, "connector_config")
+            else stage_cfg.engine_args.get("async_chunk", False)
+        ),
     )
 
-    # ``runtime_cfg`` is mostly inherited from the parent's
-    # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
-    # bracket each replica's spawn below with setup_stage_devices so they
-    # don't all stack on cuda:0 (see ``per_replica_devices`` above).
-    # Headless startup still supplies the legacy OmegaConf stage shape through
-    # the stable adapter entry point. The implementation switches only when
-    # RFC #4021 threads structured stage configs through the launch plan.
-    engine_args_dict = build_engine_args_dict(
-        stage_cfg,
-        model,
-        stage_connector_spec=stage_connector_spec,
-        cli_tokenizer=getattr(args, "tokenizer", None),
+    engine_args_dict = (
+        build_engine_args_dict_from_omni_stage_config(
+            stage_cfg, model, stage_connector_spec=stage_connector_spec, cli_tokenizer=getattr(args, "tokenizer", None)
+        )
+        if hasattr(stage_cfg, "connector_config")
+        else build_engine_args_dict(
+            stage_cfg, model, stage_connector_spec=stage_connector_spec, cli_tokenizer=getattr(args, "tokenizer", None)
+        )
     )
 
     inject_omni_kv_connector_config(engine_args_dict, omni_kv_connector, stage_id)

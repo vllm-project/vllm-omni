@@ -324,7 +324,7 @@ inputs, fields, and ownership rules are described below.
 flowchart TB
     layer1["Layer 1 · Authoring inputs<br/>PipelineConfig + DeployConfig"]
     layer2["Layer 2 · Production resolution boundary<br/>resolve_omni_config()<br/>(StageConfigFactory + VllmOmniConfig internally)"]
-    layer3["Layer 3 · Startup hand-off<br/>OmniConfigResolution<br/>PipelineConfig + temporary OmegaConf stage bridge"]
+    layer3["Layer 3 · Startup hand-off<br/>OmniConfigResolution<br/>PipelineConfig + typed stage configs"]
     layer4["Layer 4 · Runtime launch planning<br/>StageRuntime"]
     layer5["Layer 5 · Engine materialization<br/>VllmConfig / OmniDiffusionConfig"]
 
@@ -336,10 +336,10 @@ The production resolution boundary is `resolve_omni_config()` in
 It delegates typed construction to `StageConfigFactory.create_from_model()` and
 `VllmOmniConfig.from_pipeline_config()`, then returns an
 `OmniConfigResolution` consumed by both `AsyncOmniEngine` and headless startup.
-Until `StageRuntime` consumes typed stage configs directly, this envelope carries
-the effective `PipelineConfig` alongside OmegaConf-compatible `stage_configs` as
-a temporary runtime bridge; both views describe the same resolved topology,
-including injected stages.
+This envelope carries the effective `PipelineConfig` alongside typed
+`stage_configs`, which `StageRuntime` consumes directly. Both views describe the
+same resolved topology, including injected stages. Backend arguments are
+projected from these typed stages when each engine is initialized.
 
 The legacy `stage_args` YAML path has been removed. Model topology now resolves
 through `PipelineConfig`, with runtime overrides supplied by `DeployConfig`.
@@ -361,7 +361,7 @@ The important ownership rules are:
 3. CLI and Python overrides are applied at the resolution boundary, with
    per-stage overrides taking precedence over global values where supported.
 4. `OmniConfigResolution` is the sole startup hand-off. Its `pipeline_config`
-   and temporary `stage_configs` compatibility view must describe the same
+   and typed `stage_configs` must describe the same
    topology.
 5. `StageRuntime` owns launch planning and replica lifecycle. `ReplicaInitPlan`
    is runtime-private state, not a user configuration object.
