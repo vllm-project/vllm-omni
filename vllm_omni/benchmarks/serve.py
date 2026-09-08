@@ -20,6 +20,7 @@ from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
     maybe_enable_stage_metrics,
     set_print_stage,
+    set_save_detailed,
     should_request_stage_metrics,
 )
 
@@ -64,6 +65,7 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
     _use_endpoint_backend_when_implicit(args)
     set_print_stage(getattr(args, "print_stage", False))
+    set_save_detailed(getattr(args, "save_detailed", False))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),
