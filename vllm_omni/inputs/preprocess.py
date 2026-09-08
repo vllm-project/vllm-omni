@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 from typing_extensions import assert_never
@@ -188,6 +191,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         if "prompt_token_ids" in prompt:
             return self._process_tokens(
                 prompt,  # type: ignore[arg-type]
+                tokenization_kwargs=tokenization_kwargs,
             )
 
         if "prompt" in prompt:
