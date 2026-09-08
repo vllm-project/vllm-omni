@@ -2401,6 +2401,42 @@ def test_forward_transfer_runs_multichunk_overlap_path(
     torch.testing.assert_close(captured["targets"][1][:, :, 0], torch.full((1, 3, 16, 16), -0.2))
 
 
+def test_forward_transfer_non_output_rank_uses_canonical_envelope(
+    make_cosmos3_pipeline,
+    sequential_cfg_parallel,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.vae.distributed_executor = SimpleNamespace(rank=1)
+    pipeline.vae.is_distributed_enabled = lambda: True
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16, "1,1")
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(2), _mask(), _ids(1), _mask())
+    pipeline._set_flow_shift = lambda *_args, **_kwargs: None
+    decoded = torch.zeros(1, 3, 1, 16, 16)
+    pipeline._decode_latents = lambda latents: decoded
+
+    request = SimpleNamespace(
+        prompts=[{"prompt": "transfer", "modalities": ["video"]}],
+        sampling_params=make_sampling_params(
+            height=16,
+            width=16,
+            num_inference_steps=1,
+            guidance_scale=1.0,
+            extra_args={
+                "edge": {"control": torch.zeros(3, 1, 16, 16, dtype=torch.uint8)},
+                "max_frames": 1,
+                "num_video_frames_per_chunk": 1,
+            },
+        ),
+    )
+
+    output = pipeline.forward(request)
+
+    assert set(output.output) == {"payload", "metadata"}
+    assert set(output.output["payload"]) == {"video"}
+    torch.testing.assert_close(output.output["payload"]["video"], decoded)
+    assert output.output["metadata"] == {"video": {"fps": 24.0}}
+
+
 def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -> None:
     """With cache-dit active the uncond pass is kept even outside the guidance
     interval (so cache-dit's has_separate_cfg parity stays in phase), and the

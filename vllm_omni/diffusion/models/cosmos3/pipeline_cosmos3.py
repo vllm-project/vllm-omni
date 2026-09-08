@@ -3522,7 +3522,12 @@ class Cosmos3OmniDiffusersPipeline(
                         control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
 
         if not is_output_rank:
-            return DiffusionOutput(output={"video": output_video}, custom_output={"fps": frame_rate})
+            return DiffusionOutput(
+                output={
+                    "payload": {"video": output_video},
+                    "metadata": {"video": {"fps": frame_rate}},
+                },
+            )
 
         full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
         full_controls = {
