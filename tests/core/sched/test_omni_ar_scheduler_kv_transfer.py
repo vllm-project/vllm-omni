@@ -115,6 +115,38 @@ def test_decode_to_dit_transfer_keeps_prefill_and_decode_blocks():
 
 
 @pytest.mark.parametrize(
+    ("current_stage_id", "final_stage_id", "expected"),
+    [
+        (0, 0, False),
+        (0, 1, True),
+        (1, 1, False),
+        (1, 2, True),
+    ],
+)
+def test_downstream_kv_transfer_is_relative_to_current_stage(
+    current_stage_id: int,
+    final_stage_id: int,
+    expected: bool,
+):
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_id=current_stage_id,
+            omni_kv_config={"need_send_cache": True},
+        )
+    )
+    scheduler._omits_kv_transfer_cache = {}
+    scheduler.requests = {
+        "req": SimpleNamespace(
+            request_id="req",
+            additional_information={"omni_final_stage_id": final_stage_id},
+        )
+    }
+
+    assert scheduler._should_transfer_kv_for_request("req") is expected
+
+
+@pytest.mark.parametrize(
     "status",
     [
         RequestStatus.FINISHED_ABORTED,
