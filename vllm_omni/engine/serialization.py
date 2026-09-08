@@ -40,3 +40,15 @@ def deserialize_additional_information(
     if isinstance(payload, dict):
         return payload
     return deserialize_payload(payload)  # type: ignore[return-value]
+
+
+def request_needs_downstream_stage(final_stage_id: Any, current_stage_id: Any) -> bool:
+    """Return whether a request must produce data for a later pipeline stage.
+
+    Missing or malformed metadata keeps the historical conservative behavior:
+    preserve the downstream payload instead of dropping data that may be needed.
+    """
+    try:
+        return int(final_stage_id) > int(current_stage_id)
+    except (TypeError, ValueError):
+        return True
