@@ -199,4 +199,40 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 !!! tip
     You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
 
+Or build the image from **source code**:
+
+```bash
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+```
+
+All hardware variants use `docker/Dockerfile.npu`. Choose the device suffix for your hardware:
+
+=== "A2"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu .
+    ```
+
+=== "A3"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a3 .
+    ```
+
+=== "A5"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a5 .
+    ```
+
+=== "310P (Experimental)"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-310p .
+    ```
+
 # --8<-- [end:pre-built-images]
