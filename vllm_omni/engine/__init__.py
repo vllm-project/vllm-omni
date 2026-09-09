@@ -15,6 +15,8 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+from vllm_omni.engine.pd_continuation import PDContinuation
+
 # Where a receiver gets a request's stage payload: the sender's connector address, or the
 # serialized payload itself for a run request.
 PayloadSenderInfo: TypeAlias = dict[str, Any] | bytes
@@ -82,6 +84,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
     # Optional additional information dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
+    pd_continuation: PDContinuation | None = None
     # Runner-owned runtime payload. This is materialized directly into
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
@@ -135,6 +138,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
             payload_sender_info=payload_sender_info,
+            pd_continuation=getattr(request, "pd_continuation", None),
         )
 
 
