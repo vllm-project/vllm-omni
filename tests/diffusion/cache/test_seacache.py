@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import datetime
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.cache.seacache import (
     SeaCacheBackend,
     SeaCacheConfig,
@@ -21,7 +23,7 @@ from vllm_omni.diffusion.cache.seacache.sea_filter import (
     indicator_distance,
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
-from vllm_omni.diffusion.cache.teacache.extractors import EXTRACTOR_REGISTRY, CacheContext
+from vllm_omni.diffusion.cache.teacache.extractors import EXTRACTOR_REGISTRY, CacheContext, get_extractor
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -243,23 +245,24 @@ def test_hook_skips_middle_steps_and_forces_endpoints() -> None:
     assert [step for step, _ in hook.state_manager._states["cond"].history] == [0, 3]
 
 
-def test_parameter_sharded_hook_skips_when_all_world_ranks_agree(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parameter_sharded_hook_skips_when_all_shard_ranks_agree(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.distributed import parallel_state
 
     transformer = TinyCosmos3Transformer()
     metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
     hook = _apply_test_hook(transformer, metadata)
     hook._parameter_sharded = True
-    world_group = object()
+    fs_group = object()
     reduced_groups: list[object] = []
 
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
         parallel_state,
-        "get_world_group",
-        lambda: SimpleNamespace(world_size=2, device_group=world_group),
+        "get_fs_group",
+        lambda: SimpleNamespace(world_size=2, device_group=fs_group),
     )
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 1)
 
     def all_reduce(decision, *, op, group):
         assert op == torch.distributed.ReduceOp.MAX
@@ -274,7 +277,7 @@ def test_parameter_sharded_hook_skips_when_all_world_ranks_agree(monkeypatch: py
 
     assert hook.full_count == 1
     assert hook.skip_count == 1
-    assert reduced_groups == [world_group, world_group]
+    assert reduced_groups == [fs_group, fs_group]
 
 
 def test_parameter_sharded_peer_forces_full_compute(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -289,9 +292,10 @@ def test_parameter_sharded_peer_forces_full_compute(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
         parallel_state,
-        "get_world_group",
+        "get_fs_group",
         lambda: SimpleNamespace(world_size=2, device_group=object()),
     )
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 1)
     reduce_count = 0
 
     def all_reduce(decision, *, op, group):
@@ -311,6 +315,154 @@ def test_parameter_sharded_peer_forces_full_compute(monkeypatch: pytest.MonkeyPa
     assert hook.full_count == 2
     assert hook.skip_count == 0
     assert hook.state_manager._states["cond"].accumulated_distance == 0.0
+
+
+def _uneven_cfg_sharded_worker(
+    rank: int,
+    init_method: str,
+    result_queue: torch.multiprocessing.Queue,
+) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=4,
+        timeout=datetime.timedelta(seconds=10),
+    )
+    try:
+        fs_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        sp_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        cfg_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 2], [1, 3])
+        ]
+        fs_group = next(group for ranks, group in fs_groups if rank in ranks)
+        sp_group = next(group for ranks, group in sp_groups if rank in ranks)
+        cfg_group = next(group for ranks, group in cfg_groups if rank in ranks)
+        parallel_state._FS = SimpleNamespace(world_size=2, device_group=fs_group)
+        parallel_state._SP = SimpleNamespace(world_size=2, device_group=sp_group)
+
+        hook = SeaCacheRootHook(SeaCacheConfig())
+        hook._parameter_sharded = True
+        hook._synchronize_compute(False, torch.device("cpu"))
+        if rank in (0, 1):
+            hook._synchronize_compute(False, torch.device("cpu"))
+
+        gathered = [torch.zeros(1) for _ in range(2)]
+        torch.distributed.all_gather(
+            gathered,
+            torch.tensor([rank], dtype=torch.float32),
+            group=cfg_group,
+        )
+        result_queue.put((rank, [int(value.item()) for value in gathered]))
+    finally:
+        parallel_state._FS = None
+        parallel_state._SP = None
+        torch.distributed.destroy_process_group()
+
+
+def test_parameter_sharded_hook_handles_uneven_cfg_branch_dispatch() -> None:
+    mp_context = torch.multiprocessing.get_context("spawn")
+    manager = mp_context.Manager()
+    result_queue = manager.Queue()
+    torch.multiprocessing.spawn(
+        _uneven_cfg_sharded_worker,
+        args=(get_distributed_init_method("seacache_uneven_cfg_"), result_queue),
+        nprocs=4,
+    )
+
+    results = sorted(result_queue.get(timeout=2) for _ in range(4))
+    assert results == [
+        (0, [0, 2]),
+        (1, [1, 3]),
+        (2, [0, 2]),
+        (3, [1, 3]),
+    ]
+
+
+def _hybrid_sp_worker(
+    rank: int,
+    init_method: str,
+    result_queue: torch.multiprocessing.Queue,
+) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=4,
+        timeout=datetime.timedelta(seconds=10),
+    )
+    try:
+        fs_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        ulysses_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        ring_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 2], [1, 3])
+        ]
+        sp_group = torch.distributed.new_group(
+            [0, 1, 2, 3],
+            timeout=datetime.timedelta(seconds=10),
+        )
+        fs_group = next(group for ranks, group in fs_groups if rank in ranks)
+        ulysses_group = next(group for ranks, group in ulysses_groups if rank in ranks)
+        ring_group = next(group for ranks, group in ring_groups if rank in ranks)
+        parallel_state._FS = SimpleNamespace(world_size=2, device_group=fs_group)
+        parallel_state._SP = SimpleNamespace(
+            world_size=4,
+            device_group=sp_group,
+            ulysses_world_size=2,
+            ulysses_group=ulysses_group,
+            ring_world_size=2,
+            ring_group=ring_group,
+        )
+
+        compute = rank == 3
+        non_sharded_hook = SeaCacheRootHook(SeaCacheConfig())
+        non_sharded_result = non_sharded_hook._synchronize_compute(compute, torch.device("cpu"))
+
+        sharded_hook = SeaCacheRootHook(SeaCacheConfig())
+        sharded_hook._parameter_sharded = True
+        sharded_result = sharded_hook._synchronize_compute(compute, torch.device("cpu"))
+        result_queue.put((rank, non_sharded_result, sharded_result))
+    finally:
+        parallel_state._FS = None
+        parallel_state._SP = None
+        torch.distributed.destroy_process_group()
+
+
+def test_hook_synchronizes_full_hybrid_sequence_parallel_group() -> None:
+    mp_context = torch.multiprocessing.get_context("spawn")
+    manager = mp_context.Manager()
+    result_queue = manager.Queue()
+    torch.multiprocessing.spawn(
+        _hybrid_sp_worker,
+        args=(get_distributed_init_method("seacache_hybrid_sp_"), result_queue),
+        nprocs=4,
+    )
+
+    results = sorted(result_queue.get(timeout=2) for _ in range(4))
+    assert results == [
+        (0, True, True),
+        (1, True, True),
+        (2, True, True),
+        (3, True, True),
+    ]
 
 
 def test_parameter_sharded_hook_fails_open_without_distributed_state(
@@ -397,6 +549,11 @@ def test_hook_uses_exact_sigma_callback(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(EXTRACTOR_REGISTRY, "TinyCosmos3Transformer", _extract_tiny_cosmos3_context)
+
+    class FSDPTinyCosmos3Transformer(TinyCosmos3Transformer):
+        pass
+
+    assert get_extractor(FSDPTinyCosmos3Transformer) is _extract_tiny_cosmos3_context
     backend = get_cache_backend(
         "sea_cache",
         {

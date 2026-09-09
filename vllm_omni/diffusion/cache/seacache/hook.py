@@ -76,7 +76,7 @@ class SeaCacheRootHook(ModelHook):
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         if self.extractor_fn is None:
-            self.extractor_fn = get_extractor(module.__class__.__name__)
+            self.extractor_fn = get_extractor(type(module))
         self._parameter_sharded = _is_parameter_sharded(module)
         seen_groups: set[int] = set()
         for block in getattr(module, "gen_layers", ()):
@@ -183,14 +183,24 @@ class SeaCacheRootHook(ModelHook):
             return True if self._parameter_sharded else compute
         decision = torch.tensor(int(compute), dtype=torch.int32, device=device)
         if self._parameter_sharded:
-            from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_fs_group,
+                get_sequence_parallel_world_size,
+                get_sp_group,
+            )
 
-            world_group = get_world_group()
-            if world_group.world_size > 1:
+            fs_group = get_fs_group()
+            if fs_group.world_size > 1:
                 torch.distributed.all_reduce(
                     decision,
                     op=torch.distributed.ReduceOp.MAX,
-                    group=world_group.device_group,
+                    group=fs_group.device_group,
+                )
+            if get_sequence_parallel_world_size() > 1:
+                torch.distributed.all_reduce(
+                    decision,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=get_sp_group().device_group,
                 )
             return bool(decision.item())
 
@@ -201,15 +211,15 @@ class SeaCacheRootHook(ModelHook):
                 group=group,
             )
         from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_world_size,
             get_sp_group,
-            get_ulysses_parallel_world_size,
         )
 
-        if get_ulysses_parallel_world_size() > 1:
+        if get_sequence_parallel_world_size() > 1:
             torch.distributed.all_reduce(
                 decision,
                 op=torch.distributed.ReduceOp.MAX,
-                group=get_sp_group().ulysses_group,
+                group=get_sp_group().device_group,
             )
         return bool(decision.item())
 

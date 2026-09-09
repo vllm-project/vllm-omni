@@ -1594,16 +1594,15 @@ def register_extractor(transformer_cls_name: str, extractor_fn: Callable) -> Non
     EXTRACTOR_REGISTRY[transformer_cls_name] = extractor_fn
 
 
-def get_extractor(transformer_cls_name: str) -> Callable:
+def get_extractor(transformer_type: str | type) -> Callable:
     """
     Get extractor function for given transformer class.
 
-    This function looks up the extractor based on the exact transformer_cls_name string,
-    which should match the transformer type in the pipeline (i.e., pipeline.transformer.__class__.__name__).
+    String lookups match an exact registered name. Type lookups also check base
+    classes so runtime wrappers such as FSDP retain the underlying model extractor.
 
     Args:
-        transformer_cls_name: Transformer class name (e.g., "QwenImageTransformer2DModel")
-                                Must exactly match a key in EXTRACTOR_REGISTRY.
+        transformer_type: Transformer class name or runtime type.
 
     Returns:
         Extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1616,14 +1615,18 @@ def get_extractor(transformer_cls_name: str) -> Callable:
         >>> extractor = get_extractor("QwenImageTransformer2DModel")
         >>> ctx = extractor(transformer, hidden_states, encoder_hidden_states, timestep, ...)
     """
-    # Direct lookup - no substring matching
-    if transformer_cls_name in EXTRACTOR_REGISTRY:
-        return EXTRACTOR_REGISTRY[transformer_cls_name]
+    candidate_names: tuple[str, ...]
+    if isinstance(transformer_type, str):
+        candidate_names = (transformer_type,)
+    else:
+        candidate_names = tuple(candidate.__name__ for candidate in transformer_type.__mro__)
+    for candidate_name in candidate_names:
+        if candidate_name in EXTRACTOR_REGISTRY:
+            return EXTRACTOR_REGISTRY[candidate_name]
 
-    # No match found
     available_types = list(EXTRACTOR_REGISTRY.keys())
     raise ValueError(
-        f"Unknown model type: '{transformer_cls_name}'. "
+        f"Unknown model type: '{transformer_type}'. "
         f"Available types: {available_types}\n"
         f"To add support for a new model, use register_extractor() or add to EXTRACTOR_REGISTRY."
     )
