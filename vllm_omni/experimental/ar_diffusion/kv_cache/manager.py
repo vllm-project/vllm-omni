@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 import os
 from collections.abc import Collection, Iterable, Sequence
+from typing import cast
 
 import torch
 from vllm.logger import init_logger
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.diffusion_kv.layout import build_kv_cache_tensor
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
+    ChunkWindowManager,
     ChunkWindowSpec,
     allocate_kv_pool_with_views,
     chunk_slot_mapping,
@@ -49,10 +51,10 @@ class ARDiffusionRequestAdapter:
     real ``KVCacheManager`` against this adapter so the surface cannot silently
     drift across vLLM versions.
 
-    An AR-Diffusion request advances one *chunk* at a time: ``allocate_slots`` is called
-    once per chunk and ``num_computed_tokens`` advances only when a chunk is
-    committed (:meth:`on_chunk_committed`), so the ``T`` denoise steps of a chunk
-    reuse the same slots.
+    ``completed_chunks`` and ``absolute_num_computed_tokens`` track the model
+    timeline. vLLM sees compacted storage positions through ``num_computed_tokens``
+    and ``num_tokens``. A chunk's denoise steps reuse the same slots; only a
+    successful commit advances the timeline and compacts evicted metadata.
     """
 
     def __init__(
@@ -66,6 +68,7 @@ class ARDiffusionRequestAdapter:
         self._chunk_size = chunk_size
         self._prefill = prefill_prefix_tokens
         self._completed_chunks = 0
+        self.compacted_tokens = 0
         # Filled only when cross-request prefix reuse is enabled (Phase 3).
         self.block_hashes: list = []
         self.skip_reading_prefix_cache = True
@@ -79,14 +82,19 @@ class ARDiffusionRequestAdapter:
         self.num_in_flight_tokens = 0
 
     @property
-    def num_computed_tokens(self) -> int:
-        """Persistent KV already materialized (committed chunks + prefill)."""
+    def absolute_num_computed_tokens(self) -> int:
+        """Cumulative model position, unaffected by storage compaction."""
         return self._prefill + self._completed_chunks * self._chunk_size
 
     @property
+    def num_computed_tokens(self) -> int:
+        """Committed position in the compact vLLM block table."""
+        return self.absolute_num_computed_tokens - self.compacted_tokens
+
+    @property
     def num_tokens(self) -> int:
-        """Total tokens once the in-flight chunk is committed."""
-        return self._prefill + (self._completed_chunks + 1) * self._chunk_size
+        """Storage position once the in-flight chunk is committed."""
+        return self.num_computed_tokens + self._chunk_size
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -540,12 +548,9 @@ class ARDiffusionKVCache:
     def allocate_chunk(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         """Allocate a chunk's blocks (evicting out-of-window blocks first).
 
-        Returns the request's full block table (incl. null_block placeholders).
+        Returns the request's compact storage block table.
         """
-        blocks = self.manager.allocate_slots(adapter, num_new_tokens=self.spec.chunk_size)
-        if blocks is None:
-            raise RuntimeError("AR-Diffusion KV pool exhausted while allocating a chunk")
-        table = self.block_table(adapter)
+        table = self.allocate_token_slots(adapter, self.spec.chunk_size)
         resident = resident_block_ids(table, self.null_block_id)
         _log.debug(
             "AR-Diffusion allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
@@ -561,6 +566,10 @@ class ARDiffusionKVCache:
         """Allocate managed blocks for an in-flight video span without committing it."""
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        # vLLM clips slot allocation at max_model_len. Admit the entire
+        # in-flight span in compact storage coordinates, independent of the
+        # model's absolute frame positions.
+        self.manager.max_model_len = max(self.manager.max_model_len, adapter.num_computed_tokens + num_tokens)
         blocks = self.manager.allocate_slots(adapter, num_new_tokens=num_tokens)
         if blocks is None:
             raise RuntimeError("AR-Diffusion KV pool exhausted while allocating paged attention slots")
@@ -618,6 +627,8 @@ class ARDiffusionKVCache:
             adapter.num_computed_tokens,
             num_prompt_tokens=adapter.num_prompt_tokens,
         )
+        window_manager = cast(ChunkWindowManager, self.manager.coordinator.single_type_managers[0])
+        adapter.compacted_tokens += window_manager.compact_block_table(adapter.request_id)
         _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
     # -- pool-backed K/V access --------------------------------------------
