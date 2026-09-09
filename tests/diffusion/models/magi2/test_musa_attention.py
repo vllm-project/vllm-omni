@@ -171,6 +171,9 @@ def test_cuda_still_uses_bundled_version_selection(monkeypatch):
 def test_real_musa_fa3_matches_sink_oracle(monkeypatch, dtype, head_dim, kv_heads, sink_count, softcap):
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")
+    # Force FA3 for operator coverage; the production short-sequence policy is
+    # exercised separately by the tiny-transformer test below.
+    monkeypatch.setattr(attention, "_MUSA_FA3_MIN_TOKENS", 0)
     q, k, v, varlen = _inputs(dtype, head_dim, kv_heads)
     sink = None if not sink_count else torch.linspace(-1.98765, 2.12345, sink_count * 4).reshape(sink_count, 4)
     expected = attention.torch_varlen_attention_with_sink(
