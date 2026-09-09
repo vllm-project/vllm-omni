@@ -131,8 +131,10 @@ def test_is_a5_detects_a5_device(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_module(monkeypatch, "vllm_ascend.utils", is_950=lambda: True)
 
     assert module.is_a5() is True
+
     class NpuDevice:
         type = "npu"
+    
     assert module.is_a5(NpuDevice()) is True
     assert module.is_a5(torch.device("cpu")) is False
 
