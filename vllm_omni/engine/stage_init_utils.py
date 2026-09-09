@@ -26,7 +26,13 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import regex as re
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.multimodal.cache import (
+    MultiModalProcessorOnlyCache,
+    MultiModalProcessorSenderCache,
+    ShmObjectStoreSenderCache,
+)
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
@@ -1552,8 +1558,70 @@ def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
     return _TokenOnlyRenderer(stage_vllm_config, tokenizer=None)
 
 
-def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
-    """Build the shared stage-0 input processor."""
+def use_replica_safe_mm_processor_cache(
+    input_processor: InputProcessor,
+    stage_vllm_config: VllmConfig,
+    num_replicas: int,
+    *,
+    allow_dynamic_replicas: bool = False,
+) -> bool:
+    """Make the shared stage-0 multimodal processor cache safe for a replicated stage.
+
+    vLLM's IPC processor cache is split in two: the frontend (P0) keeps a
+    metadata-only shadow and strips the tensors of any item it has already
+    sent, trusting that the *one* engine (P1) still holds them. vllm-omni
+    runs ``num_replicas`` engine cores behind that single frontend, each with
+    its own receiver cache, so a request whose media was first sent to
+    replica A arrives at replica B without data -> ``MultiModalCacheMissError``
+    -> ``finish_reason="error"`` with no text. (vLLM itself avoids this
+    for data-parallel engines by selecting the "processor_only" cache type.)
+
+    ``multi_modal_uuids`` scoping in ``AsyncOmniEngine`` only helps prompts
+    that still carry raw ``multi_modal_data``; the OpenAI chat path arrives
+    already rendered (``mm_kwargs``/``mm_hashes``), after the frontend cache
+    has stripped the data. So for a replicated stage the frontend keeps the
+    processor-only cache: HF processing is still reused, but every request
+    carries its tensors and each replica's receiver cache fills on its own.
+
+    Distributed stages can add replicas after startup, so they must use
+    this cache even when only one replica is initially present. Switching
+    after serving starts would discard cached items and can race rendering.
+
+    Returns True when the cache was replaced.
+    """
+    if num_replicas <= 1 and not allow_dynamic_replicas:
+        return False
+    mm_processor = input_processor.renderer.mm_processor
+    if mm_processor is None:
+        return False
+    cache = mm_processor.cache
+    if not isinstance(cache, (MultiModalProcessorSenderCache, ShmObjectStoreSenderCache)):
+        return False
+    # renderer.mm_processor_cache is a read-only proxy to this attribute.
+    mm_processor.cache = MultiModalProcessorOnlyCache(stage_vllm_config.model_config)
+    logger.warning(
+        "Stage 0 is replacing %s with a processor-only multimodal cache "
+        "(replicas=%d, dynamic_replicas=%s) to send full data to every replica.",
+        type(cache).__name__,
+        num_replicas,
+        allow_dynamic_replicas,
+    )
+    return True
+
+
+def build_stage0_input_processor(
+    stage_vllm_config: VllmConfig,
+    *,
+    num_replicas: int = 1,
+    allow_dynamic_replicas: bool = False,
+) -> InputProcessor:
+    """Build the shared stage-0 input processor.
+
+    ``num_replicas`` is the stage-0 replica count; with more than one replica
+    or when ``allow_dynamic_replicas`` permits later replica additions,
+    the frontend multimodal cache must not strip data (see
+    :func:`use_replica_safe_mm_processor_cache`).
+    """
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
     if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
@@ -1566,6 +1634,9 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     input_processor.input_preprocessor = OmniInputPreprocessor(
         vllm_config=stage_vllm_config,
         renderer=input_processor.renderer,
+    )
+    use_replica_safe_mm_processor_cache(
+        input_processor, stage_vllm_config, num_replicas, allow_dynamic_replicas=allow_dynamic_replicas
     )
     return input_processor
 

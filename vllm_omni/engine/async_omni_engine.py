@@ -343,7 +343,13 @@ class AsyncOmniEngine:
         self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
         self.output_processors = [pool.output_processor for pool in self.stage_pools]
         self.input_processor = (
-            build_stage0_input_processor(self.stage_vllm_configs[0])
+            build_stage0_input_processor(
+                self.stage_vllm_configs[0],
+                num_replicas=self._stage_pool_replica_count(self.stage_pools[0]),
+                # DistStageRuntime accepts new replicas after startup. Its
+                # membership controller is attached only after this method.
+                allow_dynamic_replicas=self.single_stage_mode,
+            )
             if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
             else None
         )

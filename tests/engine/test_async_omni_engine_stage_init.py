@@ -5,11 +5,27 @@ import concurrent.futures
 import contextlib
 import importlib
 import json
+import multiprocessing
 import os
 import time
 import types
+import uuid
 
 import pytest
+import torch
+from vllm.config import ModelConfig, MultiModalConfig, ParallelConfig, VllmConfig
+from vllm.multimodal.cache import (
+    MultiModalProcessorCacheInItem,
+    MultiModalProcessorOnlyCache,
+    MultiModalProcessorSenderCache,
+    MultiModalReceiverCache,
+    ShmObjectStoreReceiverCache,
+    ShmObjectStoreSenderCache,
+)
+from vllm.multimodal.inputs import MultiModalBatchedField, MultiModalFieldElem, MultiModalKwargsItem
+from vllm.multimodal.processing import BaseMultiModalProcessor
+from vllm.renderers import BaseRenderer
+from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
@@ -20,8 +36,11 @@ from vllm_omni.engine.stage_init_utils import (
     build_stage0_input_processor,
     compute_replica_layout,
     split_devices_for_replicas,
+    use_replica_safe_mm_processor_cache,
 )
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import StageRuntime
+from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1844,3 +1863,156 @@ def test_port_from_zmq_address_parsing():
     assert _port_from_zmq_address(None) is None
     assert _port_from_zmq_address("ipc:///tmp/sock") is None
     assert _port_from_zmq_address("tcp://host:not-a-port") is None
+
+
+@pytest.fixture
+def mm_cache_frontend(mocker):
+    """Avoid model/tokenizer loading while using real vLLM cache implementations."""
+    model_config = mocker.Mock(spec=ModelConfig, skip_tokenizer_init=False)
+    model_config.get_multimodal_config.return_value = MultiModalConfig(mm_processor_cache_gb=0.01)
+    model_config.try_get_generation_config.return_value = {}
+    config = mocker.Mock(
+        spec=VllmConfig,
+        model_config=model_config,
+        parallel_config=mocker.Mock(spec=ParallelConfig, world_size=1),
+    )
+    processor = mocker.Mock(spec=BaseMultiModalProcessor, cache=MultiModalProcessorSenderCache(model_config))
+    renderer = mocker.Mock(spec=BaseRenderer, mm_processor=processor)
+    return config, mocker.Mock(spec=InputProcessor, renderer=renderer)
+
+
+@pytest.fixture
+def mm_cache_item():
+    return MultiModalKwargsItem({"audio": MultiModalFieldElem(data=torch.arange(16), field=MultiModalBatchedField())})
+
+
+@pytest.mark.parametrize("num_replicas", [1, 2, 3])
+def test_replica_safe_mm_processor_cache(mm_cache_frontend, mm_cache_item, num_replicas):
+    """A frontend hit must supply data even to a replica that never saw the item."""
+    config, frontend = mm_cache_frontend
+    sender_cache = frontend.renderer.mm_processor.cache
+    assert use_replica_safe_mm_processor_cache(frontend, config, num_replicas) is (num_replicas > 1)
+    cache = frontend.renderer.mm_processor.cache
+    assert (cache is sender_cache) is (num_replicas == 1)
+    receivers = [MultiModalReceiverCache(config.model_config) for _ in range(num_replicas)]
+
+    for request in range(num_replicas * 3):
+        # None on a hit means no HF processing: the cache must supply the item.
+        processed: MultiModalProcessorCacheInItem = (mm_cache_item, []) if request == 0 else None
+        data, updates = cache.get_and_update_item(processed, "audio-A")
+        received = receivers[request % num_replicas].get_and_update_item(data, "audio-A")
+        assert torch.equal(received["audio"].data, mm_cache_item["audio"].data)
+        assert updates == []
+
+
+def test_replica_safe_mm_processor_cache_after_receiver_eviction(mm_cache_frontend, mm_cache_item):
+    config, frontend = mm_cache_frontend
+    use_replica_safe_mm_processor_cache(frontend, config, 2)
+    cache = frontend.renderer.mm_processor.cache
+    receiver = MultiModalReceiverCache(config.model_config)
+    data, _ = cache.get_and_update_item((mm_cache_item, []), "audio-A")
+    receiver.get_and_update_item(data, "audio-A")
+    receiver.clear_cache()
+
+    data, _ = cache.get_and_update_item(None, "audio-A")
+    received = receiver.get_and_update_item(data, "audio-A")
+    assert torch.equal(received["audio"].data, mm_cache_item["audio"].data)
+
+
+@pytest.mark.parametrize("num_replicas", [1, 2, 3])
+def test_replica_safe_shm_processor_cache(monkeypatch, mm_cache_frontend, mm_cache_item, num_replicas):
+    config, frontend = mm_cache_frontend
+    config.model_config.get_multimodal_config.return_value = MultiModalConfig(
+        mm_processor_cache_type="shm", mm_processor_cache_gb=0.01, mm_shm_cache_max_object_size_mb=1
+    )
+    monkeypatch.setenv("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", f"omni-test-{uuid.uuid4().hex}")
+    with contextlib.ExitStack() as cleanup:
+        sender = ShmObjectStoreSenderCache(config)
+        cleanup.callback(sender.close)
+        frontend.renderer.mm_processor.cache = sender
+        receivers = []
+        for _ in range(num_replicas):
+            receiver = ShmObjectStoreReceiverCache(config, multiprocessing.Lock())
+            # vLLM exposes close on the store, but not on the receiver cache.
+            cleanup.callback(receiver._shm_cache.close)
+            receivers.append(receiver)
+
+        assert use_replica_safe_mm_processor_cache(frontend, config, num_replicas) is (num_replicas > 1)
+        cache = frontend.renderer.mm_processor.cache
+        assert (cache is sender) is (num_replicas == 1)
+        for request in range(num_replicas * 3):
+            processed: MultiModalProcessorCacheInItem = (mm_cache_item, []) if request == 0 else None
+            data, _ = cache.get_and_update_item(processed, "audio-A")
+            receiver = receivers[request % num_replicas]
+            received = receiver.get_and_update_item(data, "audio-A")
+            receiver.touch_receiver_cache_item("audio-A", data)
+            assert torch.equal(received["audio"].data, mm_cache_item["audio"].data)
+
+
+@pytest.mark.parametrize("cache_factory", [lambda _: None, MultiModalProcessorOnlyCache])
+def test_replica_safe_mm_processor_cache_leaves_non_ipc_caches_alone(mm_cache_frontend, cache_factory):
+    config, frontend = mm_cache_frontend
+    cache = cache_factory(config.model_config)
+    frontend.renderer.mm_processor.cache = cache
+    assert not use_replica_safe_mm_processor_cache(frontend, config, 2, allow_dynamic_replicas=True)
+    assert frontend.renderer.mm_processor.cache is cache
+
+
+def test_replica_safe_mm_processor_cache_leaves_text_only_renderer_alone(mm_cache_frontend):
+    config, frontend = mm_cache_frontend
+    frontend.renderer.mm_processor = None
+    assert not use_replica_safe_mm_processor_cache(frontend, config, 2, allow_dynamic_replicas=True)
+
+
+@pytest.mark.parametrize("initial_replicas", [0, 1])
+def test_replica_safe_mm_processor_cache_with_later_replica(mm_cache_frontend, mm_cache_item, initial_replicas):
+    config, frontend = mm_cache_frontend
+    assert use_replica_safe_mm_processor_cache(frontend, config, initial_replicas, allow_dynamic_replicas=True)
+    cache = frontend.renderer.mm_processor.cache
+    data, _ = cache.get_and_update_item((mm_cache_item, []), "audio-A")
+    MultiModalReceiverCache(config.model_config).get_and_update_item(data, "audio-A")
+
+    # A new replica joins after the frontend has already cached this media.
+    new_receiver = MultiModalReceiverCache(config.model_config)
+    data, _ = cache.get_and_update_item(None, "audio-A")
+    received = new_receiver.get_and_update_item(data, "audio-A")
+    assert torch.equal(received["audio"].data, mm_cache_item["audio"].data)
+
+
+@pytest.mark.parametrize("num_replicas, distributed", [(1, False), (2, False), (3, False), (0, True), (1, True)])
+def test_initialize_stages_builds_replica_safe_mm_cache(mocker, mm_cache_frontend, num_replicas, distributed):
+    """Exercise both the engine-to-builder and builder-to-cache connections."""
+    config, frontend = mm_cache_frontend
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_configs = []
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.single_stage_mode = distributed
+    engine.async_chunk = False
+    engine.tokenizer = None
+    engine._single_stage_id_filter = 0 if distributed else None
+    engine._omni_master_address = "127.0.0.1"
+    engine._omni_master_port = 12345
+    engine._omni_dp_size_local = 1
+    engine._omni_heartbeat_timeout = 30.0
+    engine._omni_lb_policy = "random"
+    engine.request_queue = None
+    engine._log_stats = False
+    engine._parallel_stage_init = False
+    pool = mocker.Mock(
+        spec=StagePool,
+        stage_client=None,
+        stage_vllm_config=config,
+        output_processor=None,
+        live_num_replicas=num_replicas,
+    )
+    runtime = mocker.Mock(spec=StageRuntime, stage_pools=[pool])
+    mocker.patch.object(async_omni_engine_module, "create_stage_runtime", return_value=runtime)
+    mocker.patch("vllm_omni.engine.stage_init_utils.InputProcessor", return_value=frontend)
+    mocker.patch("vllm_omni.engine.stage_init_utils.OmniInputPreprocessor", spec=OmniInputPreprocessor)
+
+    engine._initialize_stages(stage_init_timeout=7)
+
+    assert engine.input_processor is frontend
+    expected_type = MultiModalProcessorOnlyCache if distributed or num_replicas > 1 else MultiModalProcessorSenderCache
+    assert isinstance(frontend.renderer.mm_processor.cache, expected_type)
