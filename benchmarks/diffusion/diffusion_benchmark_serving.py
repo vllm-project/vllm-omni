@@ -1,6 +1,6 @@
 # adapted from fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Benchmark online serving for diffusion models (Image/Video Generation).
