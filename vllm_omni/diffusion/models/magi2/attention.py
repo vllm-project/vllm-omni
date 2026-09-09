@@ -12,6 +12,7 @@ PyTorch path is an exact, portable oracle for small tests.
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass
 from functools import cache
@@ -60,7 +61,14 @@ def _musa_fa3_varlen(**kwargs):
         kwargs = dict(kwargs)
         kwargs["softcap"] = max(float(kwargs.get("softcap", 0.0)), 0.0)
         if "return_softmax_lse" in kwargs:
-            kwargs["return_attn_probs"] = kwargs.pop("return_softmax_lse")
+            want_lse = kwargs.pop("return_softmax_lse")
+            mate_params = inspect.signature(flash_attn_varlen_func).parameters
+            if "return_softmax_lse" in mate_params:
+                kwargs["return_softmax_lse"] = want_lse
+            elif "return_attn_probs" in mate_params:
+                kwargs["return_attn_probs"] = want_lse
+            else:
+                raise TypeError("MATE FA3 provider has no LSE return parameter")
         args = (kwargs.pop("q"), kwargs.pop("k"), kwargs.pop("v"))
         result = flash_attn_varlen_func(*args, **kwargs, backend="mutlass")
         # Normalize a non-square packed [T, H] result to Omni's [H, T]
