@@ -285,7 +285,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 2
         }
