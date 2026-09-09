@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for LayerNorm and RMSNorm custom ops in diffusion layers."""
 
 import sys
@@ -331,6 +331,7 @@ def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.Mo
         return (x,)
 
     monkeypatch.setitem(sys.modules, "torch_npu", types.SimpleNamespace(npu_rms_norm=npu_rms_norm))
+    monkeypatch.setattr("vllm_omni.diffusion.layers.norm._is_npu_tensor", lambda _: True)
     norm = RMSNorm(64, eps=1e-5, dtype=torch.bfloat16)
     x = torch.randn(2, 4, 64, dtype=torch.bfloat16)
 
@@ -338,6 +339,26 @@ def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.Mo
     assert captured["gamma"] is norm.weight
     assert captured["gamma"].dtype == torch.bfloat16
     assert captured["epsilon"].item() == pytest.approx(1e-5)
+
+
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_rmsnorm_npu_dispatch_falls_back_for_cpu_tensor(with_residual: bool):
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(64, eps=1e-5, dtype=torch.bfloat16)
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16)
+    residual = torch.randn_like(x) if with_residual else None
+
+    actual = norm.forward_npu(x, residual)
+    expected = norm.forward_native(x, residual)
+
+    if with_residual:
+        actual_output, actual_residual = actual
+        expected_output, expected_residual = expected
+        torch.testing.assert_close(actual_output, expected_output)
+        torch.testing.assert_close(actual_residual, expected_residual)
+    else:
+        torch.testing.assert_close(actual, expected)
 
 
 # ── RMSNorm residual tests ──
@@ -417,6 +438,7 @@ def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.Monkey
         "torch_npu",
         types.SimpleNamespace(npu_add_rms_norm=npu_add_rms_norm),
     )
+    monkeypatch.setattr("vllm_omni.diffusion.layers.norm._is_npu_tensor", lambda _: True)
     norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
     x = torch.randn(2, 4, dtype=torch.bfloat16)
     residual = torch.randn(2, 4, dtype=torch.bfloat16)
