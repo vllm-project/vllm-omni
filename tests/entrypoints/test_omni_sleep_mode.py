@@ -3,9 +3,10 @@
 
 """Omni sleep mode: entrypoint-level VRAM/ACK tests plus multi-stage e2e.
 
-Class-scoped engines amortize BAGEL load across sleep/wake assertions within
-each suite (LLM vs diffusion). Suites are separate classes so only one heavy
-engine is alive at a time. Device cleanup runs once per module.
+BAGEL diffusion sleep/wake stays on a class-scoped TP=2 engine. LLM protocol
+checks (sleep ACK, partial wake, duplicate wake) run on the multistage
+llm+diffusion engine so L3 H100 does not load a separate thinker+talker
+process pair. Device cleanup runs once per module.
 """
 
 import asyncio
@@ -120,35 +121,6 @@ async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int]) -> None:
         logger.warning("ensure_resume failed (stage_ids=%s): %s", stage_ids, e)
 
 
-def _build_llm_stages() -> tuple[list[dict], list[dict]]:
-    common_args = {
-        "worker_type": "ar",
-        "enable_sleep_mode": True,
-        "dtype": "bfloat16",
-        "trust_remote_code": True,
-        "max_model_len": 2048,
-        "max_num_batched_tokens": 8192,
-        "enforce_eager": True,
-    }
-    stages = [
-        {
-            "stage_id": 0,
-            "stage_type": "llm",
-            "runtime": {"process": True, "devices": "0", "max_batch_size": 1},
-            "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.1},
-        },
-        {
-            "stage_id": 1,
-            "stage_type": "llm",
-            "engine_input_source": [0],
-            "runtime": {"process": True, "devices": "1", "max_batch_size": 1, "connector_type": "queue"},
-            "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.1},
-        },
-    ]
-    connectors = [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}]
-    return stages, connectors
-
-
 @pytest.fixture(scope="module", autouse=True)
 def _module_device_cleanup():
     """One device cleanup pass around the module (engines are class-scoped)."""
@@ -159,18 +131,6 @@ def _module_device_cleanup():
     yield
     print("\n=== POST-MODULE DEVICE CLEANUP (sleep_mode) ===")
     cleanup_test_environment()
-
-
-@pytest_asyncio.fixture(scope="class", loop_scope="class")
-async def llm_engine():
-    """Shared 2-stage BAGEL LLM engine for sleep/wake protocol tests."""
-    if current_omni_platform.is_rocm():
-        clean_device_envs()
-    stages, connectors = _build_llm_stages()
-    engine = AsyncOmni(model=MODEL, stages=stages, connectors=connectors, init_timeout=600, enable_sleep_mode=True)
-    yield engine
-    engine.shutdown()
-    await asyncio.sleep(1.5)
 
 
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
@@ -202,70 +162,6 @@ async def diffusion_engine():
     yield engine
     engine.shutdown()
     await asyncio.sleep(1.5)
-
-
-class TestOmniLlmSleepMode:
-    """LLM sleep/wake protocol tests sharing one class-scoped engine."""
-
-    @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
-    async def test_llm_sleep_ack(self, llm_engine: AsyncOmni):
-        """LLM Thinker (GPU0) Signal and Physical Recycling Audit"""
-        device_id = 0
-        try:
-            used_before = get_device_global_memory_used_gib(device_id)
-            acks = await llm_engine.sleep(stage_ids=[0], level=1)
-            await asyncio.sleep(1.5)
-            used_after = get_device_global_memory_used_gib(device_id)
-            drop_gib = used_before - used_after
-            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
-            total_freed_bytes = sum(get_ack_info(ack, "freed_bytes", 0) for ack in acks)
-            freed_gib = total_freed_bytes / 1024**3
-            logger.info(
-                "Thinker: ACK freed=%.2f GiB, global GPU used drop=%.2f GiB (before=%.2f, after=%.2f)",
-                freed_gib,
-                drop_gib,
-                used_before,
-                used_after,
-            )
-            assert freed_gib > 5.0 or drop_gib > 3.0, (
-                "Expected either ACK freed_bytes or global VRAM drop after sleep. "
-                f"ACK={freed_gib:.2f} GiB, global_drop={drop_gib:.2f} GiB"
-            )
-        finally:
-            await _ensure_awake(llm_engine, [0])
-
-    @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    async def test_partial_wake_blocks_generate(self, llm_engine: AsyncOmni):
-        """Regression for #4473 Repro B: generate() must be rejected if kv_cache
-        is still asleep after wake_up(tags=["weights"]), instead of crashing with
-        CUDA illegal memory access."""
-        try:
-            await llm_engine.sleep(stage_ids=[0], level=1)
-            await llm_engine.wake_up(stage_ids=[0], tags=["weights"])
-            # wake_up restores weights but keeps the AR admission hold.
-            # Resume so generate() can reach the sleeping-tags rejection.
-            await llm_engine.resume_generation(stage_ids=[0])
-            with pytest.raises(RuntimeError, match="partially or fully asleep"):
-                async for _ in llm_engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
-                    pass
-        finally:
-            await _ensure_awake(llm_engine, [0])
-
-    @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    async def test_duplicate_wake_is_idempotent(self, llm_engine: AsyncOmni):
-        """Regression for #4473 Repro C: duplicate wake_up(tags=None) must be a
-        safe no-op instead of raising a cumem CUDA invalid argument error."""
-        try:
-            await llm_engine.sleep(stage_ids=[0], level=1)
-            first_acks = await llm_engine.wake_up(stage_ids=[0])
-            assert len(first_acks) > 0, "First wake_up() should return ACKs"
-            second_acks = await llm_engine.wake_up(stage_ids=[0])
-            assert second_acks == [], f"Duplicate wake_up() should return [] but got {second_acks}"
-        finally:
-            await _ensure_awake(llm_engine, [0])
 
 
 class TestOmniDiffusionSleepMode:
@@ -394,21 +290,81 @@ class TestOmniDiffusionSleepMode:
             await _ensure_awake(diffusion_engine, [0])
 
 
+def _build_llm_stages() -> tuple[list[dict], list[dict]]:
+    """Thinker+talker topology used only if the skipped coordinated case is re-enabled."""
+    common_args = {
+        "worker_type": "ar",
+        "enable_sleep_mode": True,
+        "dtype": "bfloat16",
+        "trust_remote_code": True,
+        "max_model_len": 2048,
+        "max_num_batched_tokens": 8192,
+        "enforce_eager": True,
+    }
+    stages = [
+        {
+            "stage_id": 0,
+            "stage_type": "llm",
+            "runtime": {"process": True, "devices": "0", "max_batch_size": 1},
+            "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.1},
+        },
+        {
+            "stage_id": 1,
+            "stage_type": "llm",
+            "engine_input_source": [0],
+            "runtime": {"process": True, "devices": "1", "max_batch_size": 1, "connector_type": "queue"},
+            "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.1},
+        },
+    ]
+    connectors = [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}]
+    return stages, connectors
+
+
 class TestOmniCoordinatedSleepMode:
-    """Dual-engine coordination (kept skipped; do not delete)."""
+    """Dual-engine coordination (kept skipped; do not delete).
+
+    No engine fixtures: ``pytest.mark.skip`` must not cold-start thinker+talker
+    or a second diffusion engine. Engines are built in the body only if this
+    case is re-enabled.
+    """
 
     @pytest.mark.skip(
         reason=(
             "Flaky/CI: dual AsyncOmni can fail with "
             "RuntimeError: Orchestrator init failed, StageDiffusionProc died during handshake. "
-            "Re-enable when stable (no OOM on coordinated talker+diffusion). "
-            "Note: this test is fixture-free so skip does not init llm/diffusion engines."
+            "Re-enable when stable (no OOM on coordinated talker+diffusion)."
         )
     )
     @pytest.mark.asyncio(loop_scope="class")
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    async def test_coordinated_cross_device(self, llm_engine: AsyncOmni, diffusion_engine: AsyncOmni):
-        """Heterogeneous Coordinated Cleanup Test (Talker and Diffusion on GPU 1)"""
+    async def test_coordinated_cross_device(self):
+        """Heterogeneous Coordinated Cleanup Test (Talker and Diffusion on GPU 1)."""
+        if current_omni_platform.is_rocm():
+            clean_device_envs()
+
+        llm_stages, llm_connectors = _build_llm_stages()
+        llm_engine = AsyncOmni(
+            model=MODEL, stages=llm_stages, connectors=llm_connectors, init_timeout=600, enable_sleep_mode=True
+        )
+        diffusion_stages = [
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "runtime": {"process": True, "devices": "0,1", "max_batch_size": 1},
+                "engine_args": {
+                    "model_stage": "base",
+                    "gpu_memory_utilization": 0.1,
+                    "model_class_name": "BagelPipeline",
+                    "enable_sleep_mode": True,
+                    "enforce_eager": True,
+                    "max_num_batched_tokens": 8192,
+                    "parallel_config": {"tensor_parallel_size": 2},
+                },
+                "final_output": True,
+                "final_output_type": "image",
+            }
+        ]
+        diffusion_engine = AsyncOmni(model=MODEL, stages=diffusion_stages, init_timeout=600, enable_sleep_mode=True)
         device_id = 1
         try:
             logger.info(f"Waking up both engines on GPU {device_id}...")
@@ -422,7 +378,6 @@ class TestOmniCoordinatedSleepMode:
             initial_vram = get_vram_info(device_id)["reserved"]
             logger.info(f"GPU {device_id} Peak Pressure: {initial_vram:.2f} GiB")
 
-            # coordinated sleep
             logger.info("Issuing concurrent SLEEP commands...")
             await llm_engine.sleep(stage_ids=[1], level=2)
             await asyncio.sleep(1.0)
@@ -438,7 +393,7 @@ class TestOmniCoordinatedSleepMode:
             logger.info(f"SUCCESS: Heterogeneous VRAM drop verified on GPU {device_id}.")
         except Exception as e:
             logger.error(f"Coordinated test failed: {e}")
-            raise e
+            raise
         finally:
             logger.info("Triggering mandatory cleanup for both engines...")
             llm_engine.shutdown()
@@ -447,23 +402,76 @@ class TestOmniCoordinatedSleepMode:
 
 
 # ---------------------------------------------------------------------------
-# Multi-stage (H100) / pure diffusion TP=1 (2×L4): sleep→wake→generate
+# Multi-stage (H100): one BAGEL llm+diffusion load covers AR protocol + e2e
+# sleep/wake/generate. tp_size=2 needs 4 GPUs and is not collected on h100_2.
 # (BAGEL TP=2 diffusion path covered by TestOmniDiffusionSleepMode)
 # ---------------------------------------------------------------------------
 
 
+async def _assert_stage0_sleep_ack(engine: AsyncOmni) -> None:
+    """Stage-0 AR sleep ACK + VRAM drop (former ``test_llm_sleep_ack``)."""
+    device_id = 0
+    used_before = get_device_global_memory_used_gib(device_id)
+    acks = await engine.sleep(stage_ids=[0], level=1)
+    await asyncio.sleep(1.5)
+    used_after = get_device_global_memory_used_gib(device_id)
+    drop_gib = used_before - used_after
+    assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
+    total_freed_bytes = sum(get_ack_info(ack, "freed_bytes", 0) for ack in acks)
+    freed_gib = total_freed_bytes / 1024**3
+    logger.info(
+        "Stage0: ACK freed=%.2f GiB, global GPU used drop=%.2f GiB (before=%.2f, after=%.2f)",
+        freed_gib,
+        drop_gib,
+        used_before,
+        used_after,
+    )
+    assert freed_gib > 5.0 or drop_gib > 3.0, (
+        "Expected either ACK freed_bytes or global VRAM drop after stage-0 sleep. "
+        f"ACK={freed_gib:.2f} GiB, global_drop={drop_gib:.2f} GiB"
+    )
+    await _ensure_awake(engine, [0])
+
+
+async def _assert_partial_wake_blocks_generate(engine: AsyncOmni) -> None:
+    """#4473 Repro B: generate() rejected while kv_cache stays asleep."""
+    await engine.sleep(stage_ids=[0], level=1)
+    await engine.wake_up(stage_ids=[0], tags=["weights"])
+    # wake_up restores weights but keeps the AR admission hold.
+    # Resume so generate() can reach the sleeping-tags rejection.
+    await engine.resume_generation(stage_ids=[0])
+    with pytest.raises(RuntimeError, match="partially or fully asleep"):
+        async for _ in engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
+            pass
+    await _ensure_awake(engine, [0])
+
+
+async def _assert_duplicate_wake_is_idempotent(engine: AsyncOmni) -> None:
+    """#4473 Repro C: duplicate wake_up(tags=None) is a safe no-op."""
+    await engine.sleep(stage_ids=[0], level=1)
+    first_acks = await engine.wake_up(stage_ids=[0])
+    assert len(first_acks) > 0, "First wake_up() should return ACKs"
+    second_acks = await engine.wake_up(stage_ids=[0])
+    assert second_acks == [], f"Duplicate wake_up() should return [] but got {second_acks}"
+    await _ensure_awake(engine, [0])
+
+
 @pytest.mark.omni
 @pytest.mark.advanced_model
-@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("tp_size", [1])
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_multistage_llm_diffusion_sleep_wake(tp_size: int):
-    """Explicit 2-stage (llm + diffusion) + connectors; sleep/wake both stages."""
+    """One BAGEL llm+diffusion load: AR protocol on stage 0, then both stages.
+
+    Folded from the former thinker+talker ``llm_engine``:
+    - stage-0 sleep ACK + VRAM drop
+    - partial ``wake_up(tags=["weights"])`` blocks ``generate`` (#4473 Repro B)
+    - duplicate ``wake_up`` is idempotent (#4473 Repro C)
+    - sleep → wake → generate across llm + diffusion
+    """
     if current_omni_platform.is_rocm():
         clean_device_envs()
-    num_gpus = torch.accelerator.device_count()
-    if num_gpus < tp_size * 2:
-        pytest.skip("Not enough GPUs")
 
     stages = []
     for i in range(2):
@@ -491,6 +499,10 @@ async def test_multistage_llm_diffusion_sleep_wake(tp_size: int):
         model=MODEL, stages=stages, connectors=connectors, enable_sleep_mode=True, stage_init_timeout=1200
     )
     try:
+        await _assert_stage0_sleep_ack(engine)
+        await _assert_partial_wake_blocks_generate(engine)
+        await _assert_duplicate_wake_is_idempotent(engine)
+
         sp = OmniDiffusionSamplingParams(num_inference_steps=2)
         async for _ in engine.generate("warmup", sampling_params_list=[SamplingParams(), sp]):
             pass
