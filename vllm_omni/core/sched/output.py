@@ -8,6 +8,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine.pd_continuation import initial_output_tokens
 
 
 @dataclass
@@ -28,6 +29,7 @@ class OmniNewRequestData(NewRequestData):
             GPUModelRunner.model_intermediate_buffer
     """
 
+    initial_output_token_ids: list[int] = field(default_factory=list)
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
@@ -47,6 +49,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            initial_output_token_ids=initial_output_tokens(request),
         )
 
     @classmethod
@@ -82,6 +85,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            initial_output_token_ids=initial_output_tokens(request),
         )
 
 
