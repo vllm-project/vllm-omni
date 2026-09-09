@@ -279,10 +279,15 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 
 ## Streaming Text Input (WebSocket)
 
-The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and generates audio per sentence as boundaries are detected.
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
+By default (`split_granularity=none`) it buffers until `input.done` and
+synthesizes that flush as **one** TTS request, which keeps long-form timbre
+stable. Set `split_granularity` to `sentence` or `clause` to emit a request
+at each detected boundary (lower time-to-first-audio for STT/LLM pipelines).
 
-> Note: text input is always streamed incrementally. Audio output remains sentence-scoped:
-> use `stream_audio=false` for one binary frame per sentence, or `stream_audio=true` for one or more PCM chunks per sentence.
+> Note: `stream_audio` only changes how **audio bytes** are framed (one WAV/PCM
+> payload vs chunked PCM). Text segmentation is controlled separately by
+> `split_granularity`.
 
 ### WebSocket Protocol
 
@@ -314,14 +319,16 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 - The session config is sticky. Send `input.text` again straight after
   `session.done` to reuse it, or send another `session.config` first to change
-  voice, format, or reference audio. A `session.config` sent while text is
-  still buffered is rejected so no pending input is silently dropped.
-- An utterance is the flush unit, not a linguistic one: it is whatever text was
-  buffered when `input.done` arrived, of any length, synthesized as one request.
-  `utterance_index` counts those flushes across the connection, so it tells you
-  which `input.done` a frame belongs to. `sentence_index` counts within one
-  flush and so pairs with `total_sentences`, which means every utterance reports
-  `sentence_index: 0` of `total_sentences: 1` (or `0` for an empty buffer).
+  voice, format, or reference audio. A `session.config` sent in the middle of
+  an utterance is rejected so no pending input is silently dropped and so a
+  split utterance cannot end up half in one voice and half in another.
+- An utterance is the flush unit, not a linguistic one: it is one `input.done`
+  cycle. `utterance_index` counts those flushes across the connection, so it
+  tells you which `input.done` a frame belongs to. `sentence_index` counts the
+  TTS requests inside one flush and so pairs with `total_sentences`: with the
+  default `split_granularity=none` that is always `sentence_index: 0` of
+  `total_sentences: 1` (or `0` for an empty buffer), while `sentence` or
+  `clause` counts the linguistic units actually synthesized.
 - End the connection with `session.close`, or by closing the socket. An idle
   connection is still closed after the server's idle timeout, which now also
   applies to the gap between utterances.
@@ -332,7 +339,15 @@ All REST API parameters are supported, plus:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
-| `stream_audio` | bool | false | Stream one or more PCM chunks for the buffered input over WebSocket |
+| `stream_audio` | bool | false | Stream one or more PCM chunks for each TTS request over WebSocket |
+| `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
+| `seed` | integer | null | Forwarded to the speech engine for this session |
+
+ASCII punctuation only ends a unit when whitespace or `input.done` follows it,
+and decimals (`3.14`), thousands separators (`1,000`), abbreviations (`Dr.`,
+`e.g.`) and initials (`J. R.`) are not treated as boundaries. A punctuation run
+and any closing quote or bracket stay with the unit they close, so `Wait...`
+and `He said "Hello."` are one request each.
 
 ```bash
 DELETE /v1/audio/voices/{name}
