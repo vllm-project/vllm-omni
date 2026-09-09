@@ -140,6 +140,8 @@ except (ImportError, ModuleNotFoundError):
 
 logger = init_logger(__name__)
 
+PP_CAPTURE_PREFIX = "capture_"
+
 _THINKER_ARCHITECTURE = "Qwen3OmniMoeThinkerForConditionalGeneration"
 
 
@@ -568,7 +570,17 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         capture_set = set(capture_layer_indices) if capture_layer_indices else None
-        captured_hidden_states: dict[str, torch.Tensor] | None = {} if return_hidden_states else None
+        captured_hidden_states: dict[str, dict[str, dict[int, torch.Tensor]]] | None = (
+            {} if return_hidden_states else None
+        )
+
+        if captured_hidden_states is not None and capture_set and intermediate_tensors is not None:
+            for layer_idx in capture_set:
+                if layer_idx < self.start_layer:
+                    hs = captured_hidden_states.setdefault("hidden_states", {})
+                    layers = hs.setdefault("layers", {})
+                    # Receive buffers are reused on the next step; retain an independent snapshot.
+                    layers[layer_idx] = intermediate_tensors[f"{PP_CAPTURE_PREFIX}{layer_idx}"].clone()
 
         for layer_idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             layer_idx = layer_idx + self.start_layer
@@ -589,7 +601,15 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                 hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if captured_hidden_states:
+                tensors.update(
+                    {
+                        f"{PP_CAPTURE_PREFIX}{index}": value
+                        for index, value in captured_hidden_states["hidden_states"]["layers"].items()
+                    }
+                )
+            return IntermediateTensors(tensors)
         hidden_states, _ = self.norm(hidden_states, residual)
         if captured_hidden_states is not None:
             return hidden_states, captured_hidden_states
