@@ -964,6 +964,7 @@ class OmniDiffusionConfig:
             "transformer": True,
             "vae": True,
             "text_encoder": True,
+            "vae_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None

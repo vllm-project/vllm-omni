@@ -4,11 +4,32 @@ async_chunk: false
 trust_remote_code: true
 distributed_executor_backend: mp
 
+connectors:
+  nixl_connector:
+    name: NixlConnector
+    extra:
+      host: "auto"
+      zmq_port: 50071
+      backends: ["UCX"]
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
 stages:
   - stage_id: 0
     devices: "0,1"
     max_num_seqs: 1
+    gpu_memory_utilization: 0.6
     tensor_parallel_size: 2
+    output_connectors:
+      to_stage_1: nixl_connector
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
     default_sampling_params:
       max_tokens: 1
       temperature: 0.0
@@ -19,10 +40,13 @@ stages:
     max_num_seqs: 1
     model_loaded:
       text_encoder: false
+      vae_encoder: false
     parallel_config:
       tensor_parallel_size: 1
       ulysses_degree: 4
       vae_patch_parallel_size: 4
+    input_connectors:
+      from_stage_0: nixl_connector
     default_sampling_params:
       seed: 42
       num_inference_steps: 5

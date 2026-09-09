@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Regression tests for MiniMax H3's disaggregated text-encoder contract."""
+"""Regression tests for MiniMax H3's disaggregated encoder contract."""
 
-import os
-import shutil
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,42 +10,40 @@ import pytest
 import torch
 from PIL import Image
 
-from vllm_omni.data_entry_keys import OmniPayload, deserialize_payload, serialize_payload
-from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-    _load_audio,
-    resolve_minimax_h3_diffusion_model_path,
+from vllm_omni.data_entry_keys import flatten_payload, to_struct
+from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import resolve_minimax_h3_diffusion_model_path
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
-    resolve_minimax_h3_model_root,
+    resolve_minimax_h3_encoder_model_root,
     resolve_minimax_h3_partition,
 )
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_CONDITION_LABELS_KEY,
+    MINIMAX_H3_ENCODER_LAYOUT_KEY,
+    MINIMAX_H3_ENCODER_REQUEST_KEY,
     MINIMAX_H3_PRESENTATION_TASK_KEY,
     MINIMAX_H3_TEXT_CONDITIONING_SCHEMA,
-    MINIMAX_H3_TEXT_HIDDEN_SIZE,
-    MiniMaxH3TextConditioning,
+    MiniMaxH3EncoderConditioning,
 )
-from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
+from vllm_omni.model_executor.models.minimax_h3.encoder_processing import _audio_items, _load_audio
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     minimax_h3_ref2va_presentation,
     minimax_h3_ref2va_video_presentation,
-)
-from vllm_omni.model_executor.models.minimax_h3.reference_video import (
-    MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
-    deserialize_prepared_reference_videos,
 )
 from vllm_omni.model_executor.models.minimax_h3.text_encoder import (
     MiniMaxH3MultiModalProcessor,
     _build_minimax_h3_presentation,
 )
 from vllm_omni.model_executor.stage_input_processors.minimax_h3 import (
-    _audio_items,
     _diffusion_sampling_params,
-    prepare_text_encoder_prompt,
-    text_encoder2diffusion,
-    text_encoder2diffusion_full_payload,
+    encoder2diffusion,
+    encoder2diffusion_full_payload,
+    prepare_encoder_prompt,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -69,13 +65,14 @@ class _SegmentTokenizer:
         return self._special_ids[token]
 
 
-def test_h3_processor_reprocesses_media_instead_of_using_partial_sender_cache(mocker):
+def test_h3_processor_reprocesses_media_instead_of_using_partial_sender_cache(monkeypatch):
     processor = object.__new__(MiniMaxH3MultiModalProcessor)
     sentinel = ([1, 2, 3], object(), True)
-    apply_processor = mocker.patch.object(
+    apply_processor = Mock(return_value=sentinel)
+    monkeypatch.setattr(
         MiniMaxH3MultiModalProcessor,
         "_apply_hf_processor",
-        return_value=sentinel,
+        apply_processor,
     )
     inputs = object()
     timing_ctx = object()
@@ -122,9 +119,11 @@ def test_fused_audio_loader_accepts_list_waveform_pair():
 def test_prepare_ref2va_keeps_original_text_and_exact_condition_order():
     prompt = {
         "prompt": "hello",
+        "additional_information": {"global_request_id": ["request-1"]},
+        "model_intermediate_buffer": {"private": "preserved"},
         "multi_modal_data": {
             "image": Image.new("RGB", (256, 256)),
-            "audio": [np.zeros(16), 16_000],
+            "audio": [np.zeros(32_000), 16_000],
         },
     }
     sampling = OmniDiffusionSamplingParams(
@@ -133,7 +132,7 @@ def test_prepare_ref2va_keeps_original_text_and_exact_condition_order():
         extra_args={"task": "ref2va"},
     )
 
-    transformed = prepare_text_encoder_prompt(prompt, [sampling])
+    transformed = prepare_encoder_prompt(prompt, [sampling])
 
     assert transformed["prompt"] == "hello"
     assert len(transformed["multi_modal_data"]["image"]) == 1
@@ -143,175 +142,144 @@ def test_prepare_ref2va_keeps_original_text_and_exact_condition_order():
         ("image", 1),
         ("audio", 1),
     ]
+    assert transformed["model_intermediate_buffer"] == {"private": "preserved"}
+    runner_info = transformed["additional_information"]
+    for _ in range(2):
+        wire = serialize_additional_information(runner_info)
+        runner_info = deserialize_additional_information(wire)
+    assert runner_info["global_request_id"] == ["request-1"]
+    request_metadata = runner_info["meta"][MINIMAX_H3_ENCODER_REQUEST_KEY]
+    assert request_metadata["task"] == "ref2va"
+    assert isinstance(
+        runner_info["hidden_states"]["layers"][0],
+        torch.Tensor,
+    )
+    assert isinstance(
+        runner_info["hidden_states"]["layers"][1],
+        torch.Tensor,
+    )
+    from vllm_omni.model_executor.models.minimax_h3.encoder import MiniMaxH3Encoder
+
+    media = MiniMaxH3Encoder._media_input(runner_info)
+    assert media.task == "ref2va"
+    assert len(media.images) == 1
+    assert len(media.audios) == 1
 
 
-def test_text_encoder_prompt_rejects_injected_prepared_video_descriptor():
-    prompt = {
-        "prompt": "hello",
-        "additional_information": {"meta": {MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY: '{"artifact_dir":"/tmp/user"}'}},
-    }
-    sampling = OmniDiffusionSamplingParams(height=256, width=448, extra_args={"task": "t2va"})
+def _mock_ref2va_video_with_audio(monkeypatch, *, duration_seconds: float) -> None:
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
 
-    transformed = prepare_text_encoder_prompt(prompt, [sampling])
-
-    assert MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY not in transformed["additional_information"]["meta"]
-
-
-def test_prepare_ref2va_video_uses_shared_frame_sampler_once(monkeypatch):
-    prepare_videos = Mock()
-
-    def prepare(_videos, *, target_frame_count, workdir, start_time_seconds):
-        prepare_videos(_videos, target_frame_count, workdir, start_time_seconds)
-        prepared_path = os.path.join(workdir, "prepared.mp4")
-        open(prepared_path, "wb").close()
-        return [
-            {
-                "original_path": "/tmp/input.mp4",
-                "prepared_path": prepared_path,
-                "input_has_audio": True,
-                "width": 448,
-                "height": 256,
-                "start_time_seconds": 0.0,
-                "duration_seconds": 5.2,
-                "audio_duration_seconds": 5.2,
-            }
-        ]
-
-    sample_frames = Mock(return_value={"frames": [np.zeros((4, 4, 3), dtype=np.uint8)]})
-    monkeypatch.setattr("vllm_omni.model_executor.stage_input_processors.minimax_h3.prepare_reference_videos", prepare)
+    sample_rate = 16_000
+    frames = np.zeros((4, 32, 32, 3), dtype=np.uint8)
     monkeypatch.setattr(
-        "vllm_omni.model_executor.stage_input_processors.minimax_h3.sample_reference_video_frames",
-        sample_frames,
-    )
-    prompt = {
-        "prompt": "hello",
-        "multi_modal_data": {"video": "/tmp/input.mp4"},
-    }
-    sampling = OmniDiffusionSamplingParams(height=256, width=448, num_frames=124, extra_args={"task": "ref2va"})
-
-    transformed = prepare_text_encoder_prompt(prompt, [sampling])
-
-    prepare_videos.assert_called_once()
-    _, target_frame_count, artifact_dir, start_time_seconds = prepare_videos.call_args.args
-    assert target_frame_count == 124
-    assert start_time_seconds is None
-    descriptor = transformed["additional_information"]["meta"][MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY]
-    described_dir, described_videos = deserialize_prepared_reference_videos(descriptor)
-    assert described_dir == artifact_dir
-    assert os.path.isfile(described_videos[0]["prepared_path"])
-    sample_frames.assert_called_once_with(described_videos[0]["prepared_path"])
-    assert prompt["multi_modal_data"] == {"video": "/tmp/input.mp4"}
-    assert transformed["mm_processor_kwargs"][MINIMAX_H3_CONDITION_LABELS_KEY] == [
-        ("audio", 1),
-        ("video", 1),
-    ]
-    shutil.rmtree(artifact_dir)
-
-
-def test_stage_wire_rejects_multiple_text_encoder_sources():
-    with pytest.raises(RuntimeError, match="exactly one text-encoder source"):
-        text_encoder2diffusion([SimpleNamespace(), SimpleNamespace()], prompt={"prompt": "hello"})
-
-
-def test_stage_wire_rejects_request_id_mismatch():
-    source = SimpleNamespace(request_id="other", outputs=[SimpleNamespace()])
-    prompt = {
-        "prompt": "hello",
-        "additional_information": {"global_request_id": ["req-1"]},
-    }
-
-    with pytest.raises(RuntimeError, match="request ID does not match"):
-        text_encoder2diffusion([source], prompt=prompt)
-
-
-def test_stage_wire_rejects_multiple_completions():
-    source = SimpleNamespace(request_id="req-1", outputs=[SimpleNamespace(), SimpleNamespace()])
-
-    with pytest.raises(RuntimeError, match="exactly one completion"):
-        text_encoder2diffusion([source], prompt={"prompt": "hello"})
-
-
-def _source_output(payload: dict) -> SimpleNamespace:
-    completion = SimpleNamespace(multimodal_output=payload)
-    return SimpleNamespace(request_id="request-1", outputs=[completion])
-
-
-def _diffusion_prompt() -> dict:
-    return {
-        "request_id": "request-1",
-        "prompt": "test prompt",
-        "additional_information": {},
-    }
-
-
-def _valid_text_conditioning_payload() -> OmniPayload:
-    return {
-        "hidden_states": {
-            "output": torch.zeros(4, 5120, dtype=torch.bfloat16),
-        },
-        "meta": {
-            "token_role_ids": torch.tensor([[1], [1], [0], [0]], dtype=torch.int64),
-        },
-    }
-
-
-def test_text_encoder2diffusion_reads_hidden_states_output_and_token_role_ids() -> None:
-    payload = _valid_text_conditioning_payload()
-    hidden = payload["hidden_states"]["output"]
-    token_role_ids = payload["meta"]["token_role_ids"]
-
-    result = text_encoder2diffusion(
-        [_source_output(payload)],
-        _diffusion_prompt(),
-    )
-
-    conditioning = result["additional_information"]["text_encoder_output"]
-    torch.testing.assert_close(conditioning["hidden_states"], hidden)
-    torch.testing.assert_close(conditioning["token_tags"], token_role_ids.squeeze(-1))
-
-
-def test_text_conditioning_artifact_round_trips_through_omni_payload_wire_format() -> None:
-    payload = _valid_text_conditioning_payload()
-
-    wire = serialize_payload(payload)
-
-    assert wire is not None
-    restored = deserialize_payload(wire)
-    conditioning = MiniMaxH3TextConditioning.from_omni_payload(restored)
-    assert MINIMAX_H3_TEXT_CONDITIONING_SCHEMA == "minimax_h3.text_conditioning/v1"
-    torch.testing.assert_close(
-        conditioning.hidden_states,
-        payload["hidden_states"]["output"],
-    )
-    torch.testing.assert_close(
-        conditioning.token_tags,
-        payload["meta"]["token_role_ids"].squeeze(-1),
-    )
-    assert conditioning.hidden_states.dtype == torch.bfloat16
-    assert conditioning.hidden_states.is_contiguous()
-    assert conditioning.token_tags.dtype == torch.int64
-    assert conditioning.token_tags.is_contiguous()
-
-
-@pytest.mark.parametrize(
-    ("payload", "message"),
-    [
-        ({"meta": {"token_role_ids": torch.ones(4, 1)}}, "no hidden_states payload"),
-        ({"hidden_states": {}, "meta": {"token_role_ids": torch.ones(4, 1)}}, "no hidden_states.output tensor"),
-        ({"hidden_states": {"output": torch.randn(4, 5120)}}, "no conditioning metadata"),
-        ({"hidden_states": {"output": torch.randn(4, 5120)}, "meta": {}}, "no token_role_ids tensor"),
-        (
+        encoder_processing,
+        "prepare_reference_videos",
+        lambda *args, **kwargs: [
             {
-                "hidden_states": {"output": torch.randn(4, 5120)},
-                "meta": {"token_role_ids": torch.ones(4)},
-            },
-            r"must have shape \[tokens, 1\]",
-        ),
-    ],
-)
-def test_text_encoder2diffusion_rejects_invalid_conditioning_payload(payload: dict, message: str) -> None:
-    with pytest.raises(RuntimeError, match=message):
-        text_encoder2diffusion([_source_output(payload)], _diffusion_prompt())
+                "prepared_path": "prepared.mp4",
+                "original_path": "original.mp4",
+                "input_has_audio": True,
+                "duration_seconds": duration_seconds,
+                "audio_duration_seconds": duration_seconds,
+            }
+        ],
+    )
+    monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: frames)
+    monkeypatch.setattr(
+        encoder_processing,
+        "sample_reference_video_frames",
+        lambda *args, **kwargs: {"block_timestamps": [0.0], "frames": frames[:1]},
+    )
+    monkeypatch.setattr(
+        encoder_processing,
+        "load_video_audio",
+        lambda *args, **kwargs: (torch.zeros(round(duration_seconds * sample_rate)), sample_rate),
+    )
+
+
+def test_prepare_ref2va_rejects_short_embedded_video_audio(monkeypatch):
+    _mock_ref2va_video_with_audio(monkeypatch, duration_seconds=1.0)
+    sampling = OmniDiffusionSamplingParams(
+        height=256,
+        width=448,
+        num_frames=96,
+        extra_args={"task": "ref2va"},
+    )
+    prompt = {"prompt": "hello", "multi_modal_data": {"video": "original.mp4"}}
+
+    with pytest.raises(OmniClientError, match=r"duration must be in \[2, 15\] seconds, got 1\.000"):
+        prepare_encoder_prompt(prompt, [sampling])
+
+
+def test_prepare_ref2va_rejects_combined_embedded_and_standalone_audio_duration(monkeypatch):
+    duration_seconds = 8.0
+    sample_rate = 16_000
+    _mock_ref2va_video_with_audio(monkeypatch, duration_seconds=duration_seconds)
+    sampling = OmniDiffusionSamplingParams(
+        height=256,
+        width=448,
+        num_frames=240,
+        extra_args={"task": "ref2va"},
+    )
+    prompt = {
+        "prompt": "hello",
+        "multi_modal_data": {
+            "video": "original.mp4",
+            "audio": (torch.zeros(int(duration_seconds * sample_rate)), sample_rate),
+        },
+    }
+
+    with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
+        prepare_encoder_prompt(prompt, [sampling])
+
+
+def _encoder_output() -> dict:
+    return MiniMaxH3EncoderConditioning(
+        hidden_states=torch.randn(3, 5120, dtype=torch.bfloat16),
+        token_tags=torch.tensor([1, 0, 1], dtype=torch.int64),
+        task="t2va",
+        height=256,
+        width=448,
+        num_frames=17,
+        latent_t=5,
+        audio_t=10,
+    ).to_omni_payload()
+
+
+def test_encoder2diffusion_reuses_encoder_handoff() -> None:
+    prompt = {
+        "prompt": "test prompt",
+        "multi_modal_data": {"image": object()},
+        "additional_information": {
+            "private": "preserved",
+            "meta": {MINIMAX_H3_ENCODER_REQUEST_KEY: {"task": "t2va"}},
+            "hidden_states": {"layers": {0: torch.zeros(1)}},
+        },
+        "model_intermediate_buffer": {"private": "encoder-only"},
+    }
+    source = SimpleNamespace(
+        finished=True,
+        request_id="request-1",
+        outputs=[SimpleNamespace(multimodal_output=flatten_payload(_encoder_output()))],
+    )
+
+    result = encoder2diffusion([source], prompt)
+
+    assert result["prompt"] == "test prompt"
+    assert result["multi_modal_data"] is None
+    assert "model_intermediate_buffer" not in result
+    additional_information = result["additional_information"]
+    assert additional_information["private"] == "preserved"
+    assert "hidden_states" not in additional_information
+    assert "meta" not in additional_information
+    parsed = MiniMaxH3EncoderConditioning.from_omni_payload(additional_information["encoder_output"])
+    assert parsed.task == "t2va"
+
+
+def test_encoder2diffusion_waits_for_one_finished_source() -> None:
+    assert encoder2diffusion([SimpleNamespace(finished=False)], {"prompt": "hello"}) is None
+    with pytest.raises(RuntimeError, match="exactly one encoder source"):
+        encoder2diffusion([SimpleNamespace(), SimpleNamespace()], {"prompt": "hello"})
 
 
 @pytest.mark.parametrize(
@@ -321,14 +289,17 @@ def test_text_encoder2diffusion_rejects_invalid_conditioning_payload(payload: di
         ("hidden_dtype", "hidden_states must have dtype torch.bfloat16"),
         ("hidden_noncontiguous", "hidden_states must use contiguous strided layout"),
         ("hidden_non_strided", "hidden_states must use contiguous strided layout"),
-        ("token_dtype", "stage-wire token_role_ids must have dtype torch.int64"),
-        ("token_layout", "stage-wire token_role_ids must use contiguous strided layout"),
+        ("token_dtype", "token_tags must have dtype torch.int64"),
+        ("token_layout", "token_tags must use contiguous strided layout"),
         ("token_count", "token_tags must align with hidden_states"),
         ("token_value", "token_tags must contain only 0 and 1"),
     ],
 )
-def test_text_encoder2diffusion_rejects_h3_v1_contract_mismatch(case: str, message: str) -> None:
-    payload = _valid_text_conditioning_payload()
+@pytest.mark.parametrize("via_connector", [False, True])
+def test_encoder2diffusion_rejects_h3_v1_contract_mismatch(case: str, message: str, via_connector: bool) -> None:
+    payload = _encoder_output()
+    payload["hidden_states"]["output"] = torch.zeros(4, 5120, dtype=torch.bfloat16)
+    payload["meta"]["token_role_ids"] = torch.tensor([[1], [1], [0], [0]], dtype=torch.int64)
 
     if case == "hidden_width":
         payload["hidden_states"]["output"] = torch.zeros(4, 5119, dtype=torch.bfloat16)
@@ -357,7 +328,10 @@ def test_text_encoder2diffusion_rejects_h3_v1_contract_mismatch(case: str, messa
         raise AssertionError(f"unknown test case: {case}")
 
     with pytest.raises(RuntimeError, match=message) as exc_info:
-        text_encoder2diffusion([_source_output(payload)], _diffusion_prompt())
+        if via_connector:
+            encoder2diffusion_full_payload(pooling_output=payload)
+        else:
+            encoder2diffusion([_source_output(payload)], {"prompt": "hello"})
 
     assert MINIMAX_H3_TEXT_CONDITIONING_SCHEMA in str(exc_info.value)
 
@@ -424,15 +398,20 @@ def test_checkpoint_resolver_selects_local_partition(tmp_path):
     (root / "FL2VA" / "text_encoder").mkdir(parents=True)
     (root / "Ref2VA" / "text_encoder").mkdir(parents=True)
 
-    assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
-    assert resolve_minimax_h3_model_root(str(root), None, "ref2va") == str(root / "Ref2VA" / "text_encoder")
-    assert resolve_minimax_h3_model_root(str(root / "Ref2VA"), None, None) == str(root / "Ref2VA" / "text_encoder")
-    assert resolve_minimax_h3_model_root(str(root / "FL2VA"), None, "ref2va") == str(root / "Ref2VA" / "text_encoder")
+    assert resolve_minimax_h3_encoder_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+    assert resolve_minimax_h3_encoder_model_root(str(root), None, "ref2va") == str(root / "Ref2VA" / "text_encoder")
+    assert resolve_minimax_h3_encoder_model_root(str(root), None, "combined") == str(root / "FL2VA" / "text_encoder")
+    assert resolve_minimax_h3_encoder_model_root(str(root / "Ref2VA"), None, None) == str(
+        root / "Ref2VA" / "text_encoder"
+    )
+    assert resolve_minimax_h3_encoder_model_root(str(root / "FL2VA"), None, "ref2va") == str(
+        root / "Ref2VA" / "text_encoder"
+    )
 
 
 def test_checkpoint_resolver_rejects_unknown_task(tmp_path):
     with pytest.raises(ValueError, match="task_type must be one of"):
-        resolve_minimax_h3_model_root(str(tmp_path), None, "unknown")
+        resolve_minimax_h3_encoder_model_root(str(tmp_path), None, "unknown")
 
 
 def test_partition_resolver_preserves_consumer_auto_default(tmp_path):
@@ -469,57 +448,228 @@ def test_diffusion_resolver_normalizes_partial_partition_directory(tmp_path):
     assert resolve_minimax_h3_diffusion_model_path(str(ref2va), None, "ref2va") == str(ref2va)
 
 
-def _stage0_payload(tokens=4):
-    hidden = torch.randn(tokens, MINIMAX_H3_TEXT_HIDDEN_SIZE, dtype=torch.bfloat16)
-    token_role_ids = torch.zeros(tokens, 1, dtype=torch.long)
-    return {"hidden_states": {"output": hidden}, "meta": {"token_role_ids": token_role_ids}}
+def _source_output(payload) -> SimpleNamespace:
+    return SimpleNamespace(
+        finished=True,
+        request_id="request-1",
+        outputs=[SimpleNamespace(multimodal_output=payload)],
+    )
 
 
-def test_full_payload_hook_emits_the_diffusion_ready_structure():
-    payload = _stage0_payload()
+def _full_encoder_output() -> dict:
+    return MiniMaxH3EncoderConditioning(
+        hidden_states=torch.randn(4, 5120, dtype=torch.bfloat16),
+        token_tags=torch.tensor([1, 1, 0, 0], dtype=torch.int64),
+        task="ref2va",
+        height=256,
+        width=448,
+        num_frames=17,
+        latent_t=5,
+        audio_t=10,
+        visual_condition=torch.arange(12 * 96, dtype=torch.float32).reshape(12, 96),
+        visual_condition_shapes=((1, 4, 4), (2, 4, 4)),
+        audio_condition=torch.arange(10 * 32, dtype=torch.float32).reshape(10, 32),
+        audio_condition_lengths=(3, 2),
+        ref_blocks=(
+            {"kind": "image", "latent_t": 1, "latent_h": 4, "latent_w": 4},
+            {"kind": "video_audio", "ref_audio_t": 3, "latent_t": 2, "latent_h": 4, "latent_w": 4},
+            {"kind": "audio", "ref_audio_t": 2},
+        ),
+        keyframe_frame_indices=(0, 16),
+    ).to_omni_payload()
 
-    result = text_encoder2diffusion_full_payload(pooling_output=payload)
 
-    assert set(result) == {"text_encoder_output"}
-    conditioning = result["text_encoder_output"]
-    assert torch.equal(conditioning["hidden_states"], payload["hidden_states"]["output"])
-    assert conditioning["token_tags"].shape == (4,)
+def _runner_payload(payload: dict) -> dict:
+    # Encoder.make_omni_output emits dotted private layout metadata. The runner
+    # selects each request's media tensors and flattens its nested categories.
+    payload = dict(payload)
+    payload[f"kv_metadata.{MINIMAX_H3_ENCODER_LAYOUT_KEY}"] = payload.pop("kv_metadata")[MINIMAX_H3_ENCODER_LAYOUT_KEY]
+    payload["meta"] = {"token_role_ids": payload["meta"]["token_role_ids"].reshape(-1, 1)}
+    return flatten_payload(payload)
 
 
-def test_full_payload_hook_accepts_flattened_runner_payload():
-    payload = _stage0_payload()
-    flattened = {
-        "hidden_states.output": payload["hidden_states"]["output"],
-        "meta.token_role_ids": payload["meta"]["token_role_ids"],
+@pytest.mark.parametrize("representation", ["nested", "struct", "flat", "runner"])
+@pytest.mark.parametrize("with_media", [False, True])
+@pytest.mark.parametrize("via_connector", [False, True])
+def test_encoder_handoff_preserves_all_components(representation, with_media, via_connector):
+    payload = _full_encoder_output() if with_media else _encoder_output()
+    inputs = {
+        "nested": payload,
+        "struct": to_struct(payload),
+        "flat": flatten_payload(payload),
+        "runner": _runner_payload(payload),
     }
+    if via_connector:
+        result = encoder2diffusion_full_payload(pooling_output=inputs[representation], request_id="request-1")
+        assert set(result) == {"encoder_output"}
+    else:
+        result = encoder2diffusion([_source_output(inputs[representation])], {"prompt": "hello"})[
+            "additional_information"
+        ]
+    output = result["encoder_output"]
+    for group in ("hidden_states", "embed", "meta", "kv_metadata"):
+        for key, tensor in payload[group].items():
+            torch.testing.assert_close(output[group][key], tensor, rtol=0, atol=0)
+    # Nonempty tensors must not be stripped, copied to CPU, or coerced to a
+    # different dtype by the adapter. Empty FP32 optional slots remain on wire.
+    assert output["hidden_states"]["output"] is payload["hidden_states"]["output"]
+    if with_media:
+        assert output["embed"]["embedding"] is payload["embed"]["embedding"]
+        assert output["embed"]["speech_feat"] is payload["embed"]["speech_feat"]
+    else:
+        for tensor in output["embed"].values():
+            assert tensor.shape == (0,)
+            assert tensor.dtype == torch.float32
+    for _ in range(2):
+        result = deserialize_additional_information(serialize_additional_information(result))
+    restored = MiniMaxH3EncoderConditioning.from_omni_payload(result["encoder_output"])
+    original = MiniMaxH3EncoderConditioning.from_omni_payload(payload)
+    for name in (
+        "task",
+        "height",
+        "width",
+        "num_frames",
+        "latent_t",
+        "audio_t",
+        "visual_condition_shapes",
+        "audio_condition_lengths",
+        "ref_blocks",
+        "keyframe_frame_indices",
+    ):
+        assert getattr(restored, name) == getattr(original, name)
+    for group, fields in output.items():
+        for key, tensor in fields.items():
+            torch.testing.assert_close(result["encoder_output"][group][key], tensor, rtol=0, atol=0)
 
-    result = text_encoder2diffusion_full_payload(pooling_output=flattened)
 
-    assert torch.equal(result["text_encoder_output"]["hidden_states"], flattened["hidden_states.output"])
-    assert result["text_encoder_output"]["token_tags"].shape == (4,)
-
-
-def test_full_payload_hook_tolerates_a_connector_less_stage():
-    assert text_encoder2diffusion_full_payload(pooling_output=None) is None
-    assert text_encoder2diffusion_full_payload(pooling_output={"hidden_states": None}) is None
+def test_full_payload_hook_skips_only_absent_output():
+    assert encoder2diffusion_full_payload(pooling_output=None) is None
 
 
-def test_full_payload_hook_rejects_mismatched_conditioning():
-    payload = _stage0_payload()
-    payload["meta"]["token_role_ids"] = torch.zeros(9, 1, dtype=torch.long)
+@pytest.mark.parametrize("via_connector", [False, True])
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("not_mapping", "no conditioning payload"),
+        ("text_only", "requires text, visual and audio tensors"),
+        ("missing_hidden", "requires text, visual and audio tensors"),
+        ("missing_tags", "requires text, visual and audio tensors"),
+        ("missing_layout", "requires private layout metadata"),
+        ("truncated_layout", "header is truncated"),
+        ("layout_dtype", "one-dimensional integer tensor"),
+        ("schema", "unsupported MiniMax H3 encoder wire schema"),
+        ("visual_shape", "visual condition must be FP32"),
+        ("audio_dtype", "audio condition must be FP32"),
+        ("empty_visual", "empty visual condition slot"),
+        ("empty_audio", "empty audio condition slot"),
+    ],
+)
+def test_encoder_handoff_rejects_invalid_full_payload(case, message, via_connector):
+    payload = _full_encoder_output()
+    layout = payload["kv_metadata"][MINIMAX_H3_ENCODER_LAYOUT_KEY]
+    if case == "not_mapping":
+        payload = []
+    elif case == "text_only":
+        payload.pop("embed")
+    elif case == "missing_hidden":
+        payload.pop("hidden_states")
+    elif case == "missing_tags":
+        payload["meta"] = {}
+    elif case == "missing_layout":
+        payload.pop("kv_metadata")
+    elif case == "truncated_layout":
+        payload["kv_metadata"][MINIMAX_H3_ENCODER_LAYOUT_KEY] = layout[:5]
+    elif case == "layout_dtype":
+        payload["kv_metadata"][MINIMAX_H3_ENCODER_LAYOUT_KEY] = layout.float()
+    elif case == "schema":
+        layout[1] = 99
+    elif case == "visual_shape":
+        payload["embed"]["embedding"] = torch.zeros(11, 96)
+    elif case == "audio_dtype":
+        payload["embed"]["speech_feat"] = payload["embed"]["speech_feat"].to(torch.bfloat16)
+    elif case == "empty_visual":
+        payload = _encoder_output()
+        payload["embed"]["embedding"] = torch.empty(0, 96)
+    elif case == "empty_audio":
+        payload = _encoder_output()
+        payload["embed"]["speech_feat"] = torch.empty(0, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match=message):
+        if via_connector:
+            encoder2diffusion_full_payload(pooling_output=payload)
+        else:
+            encoder2diffusion([_source_output(payload)], {"prompt": "hello"})
 
-    with pytest.raises(RuntimeError, match="align"):
-        text_encoder2diffusion_full_payload(pooling_output=payload)
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_encoder_handoff_cleans_media_without_mutating_prompt_or_stripping_outputs(inline):
+    incoming = _full_encoder_output()
+    retained_hidden = torch.ones(1)
+    media = torch.zeros(2)
+    prompt = {
+        "prompt": "hello",
+        "negative_prompt": "blur",
+        "multi_modal_data": {"image": object(), "audio": object(), "video": object()},
+        "model_intermediate_buffer": {"media": media},
+        "additional_information": {
+            "global_request_id": ["request-1"],
+            "private": "preserved",
+            "hidden_states": {"layers": {0: media}, "output": retained_hidden},
+            "meta": {MINIMAX_H3_ENCODER_REQUEST_KEY: {"task": "ref2va"}, "private": 42},
+            "encoder_output": incoming,
+        },
+    }
+    source = _source_output(_runner_payload(incoming) if inline else None)
+    if not inline:
+        del source.outputs[0].multimodal_output
+    result = encoder2diffusion([source], [prompt])
+    info = result["additional_information"]
+    assert result["multi_modal_data"] is None
+    assert "model_intermediate_buffer" not in result
+    assert result["negative_prompt"] == "blur"
+    assert info["global_request_id"] == ["request-1"]
+    assert info["private"] == "preserved"
+    assert info["meta"] == {"private": 42}
+    assert set(info["hidden_states"]) == {"output"}
+    assert info["hidden_states"]["output"] is retained_hidden
+    assert info["encoder_output"]["embed"]["embedding"] is incoming["embed"]["embedding"]
+    assert info["encoder_output"]["embed"]["speech_feat"] is incoming["embed"]["speech_feat"]
+    if not inline:
+        assert info["encoder_output"] is incoming
+    assert prompt["multi_modal_data"] is not None
+    assert prompt["model_intermediate_buffer"]["media"] is media
+    assert prompt["additional_information"]["hidden_states"]["layers"][0] is media
+    assert MINIMAX_H3_ENCODER_REQUEST_KEY in prompt["additional_information"]["meta"]
 
 
-def test_prompt_passes_through_when_conditioning_travels_over_the_connector():
-    source = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output=None)])
+def test_connector_handoff_without_inline_output_cleans_encoder_only_information():
+    prompt = {
+        "prompt": "hello",
+        "multi_modal_data": {"image": object()},
+        "model_intermediate_buffer": {"private": object()},
+        "additional_information": {
+            "hidden_states": {"layers": {0: torch.zeros(1)}},
+            "meta": {MINIMAX_H3_ENCODER_REQUEST_KEY: {"task": "t2va"}},
+        },
+    }
+    result = encoder2diffusion([_source_output(None)], prompt)
+    assert result == {"prompt": "hello", "multi_modal_data": None, "additional_information": {}}
 
-    assert text_encoder2diffusion([source], {"prompt": "a cat"}) == {"prompt": "a cat"}
+
+@pytest.mark.parametrize("payload", [None, _encoder_output()])
+@pytest.mark.parametrize("request_id", ["other", ["other"], ("other",)])
+def test_stage_wire_rejects_request_id_mismatch(payload, request_id):
+    prompt = {"prompt": "hello", "additional_information": {"global_request_id": request_id}}
+    with pytest.raises(RuntimeError, match="request ID does not match"):
+        encoder2diffusion([_source_output(payload)], prompt)
 
 
-def test_stage0_declares_the_producer_hook_the_connector_path_needs():
-    stage0, stage1 = MINIMAX_H3_PIPELINE.stages
+@pytest.mark.parametrize("outputs", [None, [], (), [SimpleNamespace(), SimpleNamespace()]])
+def test_stage_wire_rejects_invalid_completion_count(outputs):
+    with pytest.raises(RuntimeError, match="exactly one completion"):
+        encoder2diffusion([SimpleNamespace(outputs=outputs)], {"prompt": "hello"})
 
-    assert stage0.custom_process_next_stage_input_func.endswith(".text_encoder2diffusion_full_payload")
-    assert stage1.stage_input_payload_keys == ("text_encoder_output",)
+
+def test_stage_wire_empty_sources_and_invalid_prompt():
+    assert encoder2diffusion([], {"prompt": "hello"}) is None
+    with pytest.raises(TypeError, match="invalid MiniMax H3 prompt type"):
+        encoder2diffusion([_source_output(None)], object())

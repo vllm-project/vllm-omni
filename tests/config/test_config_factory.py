@@ -1483,7 +1483,10 @@ stages:
         monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
 
         deploy = load_deploy_config(get_deploy_config_path("minimax_h3_disaggregated.yaml"))
-        assert deploy.stages[1].engine_extras["model_loaded"] == {"text_encoder": False}
+        assert deploy.stages[1].engine_extras["model_loaded"] == {
+            "text_encoder": False,
+            "vae_encoder": False,
+        }
         stages = merge_pipeline_deploy(OMNI_PIPELINES["minimax_h3_disaggregated"], deploy)
         resolved = [stage_init_utils.build_engine_args_dict(stage.to_omegaconf(), str(model_root)) for stage in stages]
 
@@ -1503,17 +1506,38 @@ stages:
         assert "text_encoder_tp_size" not in stages[1].runtime_overrides
         assert stages[1].yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 1
 
-    def test_minimax_h3_disaggregated_defaults_match_validated_topology(self):
+    @pytest.mark.parametrize(
+        "deploy_name",
+        ["minimax_h3_disaggregated.yaml", "minimax_h3_disaggregated_turbo.yaml"],
+    )
+    def test_minimax_h3_disaggregated_defaults(self, deploy_name):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
-        deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
         stages = merge_pipeline_deploy(pipeline, deploy)
 
-        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3TextEncoder"
+        assert pipeline.model_arch == "MiniMaxH3Encoder"
+        assert stages[0].model_stage == "encoder"
+        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3Encoder"
+        processor = "vllm_omni.model_executor.stage_input_processors.minimax_h3"
+        assert stages[0].yaml_extras["prompt_transform_func"] == f"{processor}.prepare_encoder_prompt"
+        assert (
+            stages[0].yaml_engine_args["custom_process_next_stage_input_func"]
+            == f"{processor}.encoder2diffusion_full_payload"
+        )
+        assert stages[1].custom_process_input_func == f"{processor}.encoder2diffusion"
+        assert tuple(stages[1].yaml_engine_args["stage_input_payload_keys"]) == ("encoder_output",)
+        assert stages[1].yaml_engine_args["omni_kv_config"]["need_recv_cache"] is False
         assert stages[1].yaml_engine_args["model_arch"] == "MiniMaxH3Pipeline"
         assert stages[0].yaml_runtime["num_replicas"] == 1
         assert stages[1].yaml_runtime["num_replicas"] == 1
-        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False}
+        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False, "vae_encoder": False}
+        assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
+        assert stages[0].yaml_engine_args["hf_overrides"]["minimax_h3_encoder_components"] == {
+            "text_encoder": {"parallel_mode": "tp"},
+            "video_vae": {"parallel_mode": "patch"},
+            "audio_vae": {"parallel_mode": "leader"},
+        }
         assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
         assert stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
         parallel = stages[1].yaml_engine_args["parallel_config"]
@@ -1521,13 +1545,72 @@ stages:
         assert parallel["ulysses_degree"] == 4
         assert parallel["vae_patch_parallel_size"] == 4
         assert stages[1].yaml_engine_args["inline_diffusion"] is True
-        assert stages[1].yaml_extras["default_sampling_params"]["num_inference_steps"] == 50
+        sampling = stages[1].yaml_extras["default_sampling_params"]
+        if "turbo" in deploy_name:
+            assert sampling["num_inference_steps"] == 5
+            assert sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
+        else:
+            assert sampling["num_inference_steps"] == 50
 
-        turbo = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated_turbo.yaml")))
-        turbo_stages = merge_pipeline_deploy(pipeline, turbo)
-        turbo_sampling = turbo_stages[1].yaml_extras["default_sampling_params"]
-        assert turbo_sampling["num_inference_steps"] == 5
-        assert turbo_sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
+    @pytest.mark.parametrize(
+        "deploy_name",
+        ["minimax_h3_disaggregated.yaml", "minimax_h3_disaggregated_turbo.yaml"],
+    )
+    @pytest.mark.parametrize("shared_memory", [False, True], ids=["nixl", "shared_memory"])
+    def test_minimax_h3_deploy_connector_wiring_and_roles(self, deploy_name, shared_memory):
+        import yaml
+
+        from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+        from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+        config = yaml.safe_load(Path(get_deploy_config_path(deploy_name)).read_text())
+        assert config["async_chunk"] is False
+        assert config["stages"][0]["output_connectors"] == {"to_stage_1": "nixl_connector"}
+        assert config["stages"][1]["input_connectors"] == {"from_stage_0": "nixl_connector"}
+        if shared_memory:
+            # The optional same-host profile must switch BOTH ends of the edge.
+            config["stages"][0]["output_connectors"]["to_stage_1"] = "shared_memory_connector"
+            config["stages"][1]["input_connectors"]["from_stage_0"] = "shared_memory_connector"
+        transfer = load_omni_transfer_config(config_dict=config)
+        assert transfer is not None
+        assert set(transfer.connectors) == {("0", "1")}
+        edge = transfer.connectors[("0", "1")]
+        expected_name = "SharedMemoryConnector" if shared_memory else "NixlConnector"
+        assert edge.name == expected_name
+        assert "role" not in edge.extra
+        for stage_id, role in ((0, "sender"), (1, "receiver")):
+            spec = get_stage_connector_spec(transfer, stage_id, async_chunk=False)
+            assert spec["name"] == expected_name
+            assert spec["extra"]["role"] == role
+            if shared_memory:
+                assert "from_stage" not in spec["extra"]
+                assert "to_stage" not in spec["extra"]
+            else:
+                assert spec["extra"]["from_stage"] == 0
+                assert spec["extra"]["to_stage"] == 1
+                assert spec["extra"]["host"] == "auto"
+                assert spec["extra"]["zmq_port"] == 50071
+                assert spec["extra"]["backends"] == ["UCX"]
+        assert "role" not in edge.extra
+
+    @pytest.mark.parametrize(
+        "deploy_name",
+        ["minimax_h3_disaggregated.yaml", "minimax_h3_disaggregated_turbo.yaml"],
+    )
+    def test_minimax_h3_builtin_stage_one_tp4_ulysses1_override(self, deploy_name):
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            OMNI_PIPELINES["minimax_h3_disaggregated"],
+            {"stage_1_tensor_parallel_size": 4, "stage_1_ulysses_degree": 1},
+            deploy_config_path=get_deploy_config_path(deploy_name),
+        )
+        encoder_args = stages[0].to_omegaconf().engine_args
+        diffusion_args = stages[1].to_omegaconf().engine_args
+        assert encoder_args.tensor_parallel_size == 2
+        assert "ulysses_degree" not in stages[0].runtime_overrides
+        assert diffusion_args.parallel_config.tensor_parallel_size == 4
+        assert diffusion_args.parallel_config.ulysses_degree == 1
+        assert diffusion_args.parallel_config.vae_patch_parallel_size == 4
+        assert tuple(diffusion_args.stage_input_payload_keys) == ("encoder_output",)
 
     def test_minimax_h3_text_encoder_tp_alias_targets_stage_zero(self):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]

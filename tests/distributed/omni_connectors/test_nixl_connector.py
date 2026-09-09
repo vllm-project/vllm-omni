@@ -8,6 +8,7 @@ NIXL itself is stubbed out, so these tests exercise the ZMQ control plane and
 the payload normalisation rather than any actual RDMA transfer.
 """
 
+import ctypes
 import sys
 import time
 import types
@@ -31,6 +32,7 @@ class _FakeNixlAgent:
         self.registered = []
 
     def get_reg_descs(self, regions, memory_type):
+        assert regions and all(region[0] > 0 and region[1] > 0 for region in regions)
         return ("reg", tuple(regions), memory_type)
 
     def register_memory(self, descs, backends=None):
@@ -277,7 +279,8 @@ def test_active_sibling_transfer_requires_deferred_ownership(nixl_connector_cls)
         connector.close()
 
 
-def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_connector_cls):
+@pytest.mark.parametrize("with_empty", [False, True])
+def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_connector_cls, with_empty):
     connector = nixl_connector_cls({"role": "receiver"})
     connector._agent.add_remote_agent = lambda metadata: "producer"
     connector._agent.get_xfer_descs = lambda regions, memory_type: (regions, memory_type)
@@ -305,6 +308,9 @@ def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_conn
         ],
         "size": 8,
     }
+    if with_empty:
+        metadata["tensor_specs"].insert(1, {"shape": [2, 0, 3], "dtype": "torch.int64", "device": "cpu", "size": 0})
+        metadata["descriptor_groups"][1]["tensor_indices"] = [2]
 
     try:
         assert connector.get("0", "1", "req-active-sibling", metadata) is None
@@ -315,7 +321,9 @@ def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_conn
         assert len(deferred.registrations) == 2
         assert len(deferred.dlists) == 4
         assert deferred.remote_agent == "producer"
-        assert len(deferred.tensors) == 2
+        assert len(deferred.tensors) == 2 + with_empty
+        if with_empty:
+            assert deferred.tensors[1].shape == (2, 0, 3)
     finally:
         connector._agent.check_xfer_state = lambda handle: "DONE"
         connector.close()
@@ -458,7 +466,9 @@ def test_descriptor_groups_require_exact_tensor_index_partition(nixl_connector_c
     }
 
     with pytest.raises(RuntimeError, match="exact partition"):
-        nixl_connector_cls._validated_descriptor_groups(metadata, 2)
+        nixl_connector_cls._validated_descriptor_groups(
+            metadata, [{"shape": [1], "dtype": "torch.float32", "size": 4}] * 2
+        )
 
 
 def test_receive_device_ignores_the_producer_index(nixl_connector_cls):
@@ -477,3 +487,191 @@ def test_receive_device_config_wins(nixl_connector_cls):
         assert connector._resolve_receive_device("cuda:3") == torch.device("cpu")
     finally:
         connector.close()
+
+
+@pytest.fixture
+def copying_native_agent(consumer, monkeypatch):
+    """Enforce native nonzero descriptors and copy only the submitted regions."""
+    agent = consumer._agent
+    calls = {"agents": [], "descs": [], "transfers": [], "released": []}
+
+    def add_remote(metadata):
+        calls["agents"].append(metadata)
+        return "producer"
+
+    def descriptors(regions, memory_type):
+        assert regions and all(len(region) == 3 and region[0] > 0 and region[1] > 0 for region in regions)
+        calls["descs"].append((regions, memory_type))
+        return regions
+
+    def prepare(operation, local, local_ids, remote, remote_ids):
+        assert operation == "READ"
+        assert local_ids == remote_ids == list(range(len(local)))
+        assert len(local) == len(remote)
+        pairs = list(zip(local, remote, strict=True))
+        for destination, source in pairs:
+            assert destination[1] == source[1] > 0
+        calls["transfers"].append(pairs)
+        return pairs
+
+    def transfer(pairs):
+        for destination, source in pairs:
+            ctypes.memmove(destination[0], source[0], source[1])
+
+    monkeypatch.setattr(agent, "add_remote_agent", add_remote, raising=False)
+    monkeypatch.setattr(agent, "get_xfer_descs", descriptors, raising=False)
+    monkeypatch.setattr(agent, "prep_xfer_dlist", lambda agent, descs: descs, raising=False)
+    monkeypatch.setattr(agent, "make_prepped_xfer", prepare, raising=False)
+    monkeypatch.setattr(agent, "transfer", transfer, raising=False)
+    monkeypatch.setattr(agent, "check_xfer_state", lambda handle: "DONE", raising=False)
+    for method in ("release_xfer_handle", "release_dlist_handle", "remove_remote_agent"):
+        monkeypatch.setattr(
+            agent, method, lambda handle, method=method: calls["released"].append((method, handle)), raising=False
+        )
+    return calls
+
+
+@pytest.mark.parametrize("case", ["empty", "all_empty", "mixed", "scalar", "structured_empty", "structured_mixed"])
+def test_zero_byte_leaves_roundtrip_without_native_descriptors(
+    producer, consumer, copying_native_agent, monkeypatch, case
+):
+    empty = torch.empty((2, 0, 3), dtype=torch.float64)
+    other_empty = torch.empty((0,), dtype=torch.int64)
+    scalar = torch.tensor(7, dtype=torch.int64)
+    vector = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    payloads = {
+        "empty": empty,
+        "all_empty": [empty, other_empty],
+        "mixed": [empty, scalar, other_empty, vector, empty],
+        "scalar": scalar,
+        "structured_empty": {"leaves": (empty, [other_empty]), "label": "empty slots"},
+        "structured_mixed": {"leaves": (empty, [scalar, other_empty, vector, empty]), "label": "mixed slots"},
+    }
+    payload = payloads[case]
+    # Simulate mixed source memory groups without requiring a GPU in unit tests.
+    monkeypatch.setattr(producer, "_resolve_memory_type", lambda t: "VRAM" if t.dtype == torch.int64 else "DRAM")
+    # Splitting the producer's DRAM group on receipt also exercises local IDs:
+    # IDs are group-relative, whereas spec/skeleton indices remain global.
+    monkeypatch.setattr(consumer, "_resolve_memory_type", lambda t: "VRAM" if t.dtype == torch.float32 else "DRAM")
+    consumer._receive_device = torch.device("cpu")
+    success, size, metadata = producer.put("0", "1", "req-empty-slots", payload)
+    assert success
+    tensors = producer._pending["req-empty-slots"].tensors
+    specs = metadata["tensor_specs"]
+    assert len(specs) == len(tensors)
+    assert size == sum(t.numel() * t.element_size() for t in tensors)
+    for tensor, spec in zip(tensors, specs, strict=True):
+        assert spec["shape"] == list(tensor.shape)
+        assert spec["dtype"] == str(tensor.dtype)
+        assert spec["device"] == str(tensor.device)
+    indices = [i for group in metadata["descriptor_groups"] for i in group["tensor_indices"]]
+    assert sorted(indices) == [i for i, tensor in enumerate(tensors) if tensor.numel()]
+    # Verify receiver override applies to empty specs too, without trusting a
+    # producer's device index. Real CUDA placement is covered by the native suite.
+    for spec in specs:
+        if spec["size"] == 0:
+            spec["device"] = "cuda:7"
+    received = consumer.get("0", "1", "req-empty-slots", metadata)
+    assert received is not None
+    actual, received_size = received
+    assert received_size == size
+    if isinstance(payload, dict):
+        assert actual.keys() == payload.keys()
+        assert actual["label"] == payload["label"]
+        assert isinstance(actual["leaves"], tuple)
+        assert isinstance(actual["leaves"][1], list)
+        torch.testing.assert_close(actual["leaves"], payload["leaves"], rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(actual, payload, rtol=0, atol=0)
+    calls = copying_native_agent
+    assert sum(len(pairs) for pairs in calls["transfers"]) == len(indices)
+    if case in ("empty", "all_empty"):
+        assert metadata["descriptor_groups"] == []
+        assert calls == {"agents": [], "descs": [], "transfers": [], "released": []}
+        assert size == 0
+    else:
+        assert len(calls["agents"]) == 1
+        assert len(calls["released"]) == 3 * len(calls["transfers"]) + 1
+    assert producer._pending == producer._published == {}
+    assert producer._registered_descs == producer._agent.registered == []
+    assert consumer._agent.registered == consumer._remote_agents == consumer._deferred_transfers == []
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_groups",
+        "missing_nonempty",
+        "duplicate",
+        "empty_index",
+        "zero_region",
+        "wrong_region_size",
+        "null_pointer",
+        "negative_device",
+        "short_region",
+        "bad_region_type",
+        "bool_index",
+        "float_index",
+        "empty_group",
+        "unequal_lengths",
+        "missing_memory_type",
+        "fake_empty_size",
+        "fake_nonempty_size",
+        "negative_shape",
+        "float_shape",
+        "bad_dtype",
+        "bad_spec",
+    ],
+)
+def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, consumer, copying_native_agent, defect):
+    success, _, metadata = producer.put(
+        "0", "1", "req-invalid-empty", [torch.empty((0, 2)), torch.tensor(3.0), torch.empty((1, 0))]
+    )
+    assert success
+    group = metadata["descriptor_groups"][0]
+    region = group["regions"][0]
+    if defect == "missing_groups":
+        metadata.pop("descriptor_groups")
+    elif defect == "missing_nonempty":
+        metadata["descriptor_groups"] = []
+    elif defect == "duplicate":
+        group["tensor_indices"] *= 2
+        group["regions"] *= 2
+    elif defect == "empty_index":
+        group["tensor_indices"] = [0]
+    elif defect in ("zero_region", "wrong_region_size"):
+        group["regions"] = [(region[0], 0 if defect == "zero_region" else 8, 0, "")]
+    elif defect == "null_pointer":
+        group["regions"] = [(0, 4, 0, "")]
+    elif defect == "negative_device":
+        group["regions"] = [(region[0], 4, -1, "")]
+    elif defect == "short_region":
+        group["regions"] = [(region[0], 4)]
+    elif defect == "bad_region_type":
+        group["regions"] = [None]
+    elif defect in ("bool_index", "float_index"):
+        group["tensor_indices"] = [True if defect == "bool_index" else 1.0]
+    elif defect == "empty_group":
+        metadata["descriptor_groups"].append({"memory_type": "DRAM", "tensor_indices": [], "regions": []})
+    elif defect == "unequal_lengths":
+        group["regions"] = []
+    elif defect == "missing_memory_type":
+        group.pop("memory_type")
+    elif defect == "fake_empty_size":
+        metadata["tensor_specs"][1]["size"] = 0
+        metadata["descriptor_groups"] = []
+    elif defect == "fake_nonempty_size":
+        metadata["tensor_specs"][0]["size"] = 4
+    elif defect == "negative_shape":
+        metadata["tensor_specs"][0]["shape"] = [-1, 0]
+    elif defect == "float_shape":
+        metadata["tensor_specs"][0]["shape"] = [0.0, 2]
+    elif defect == "bad_dtype":
+        metadata["tensor_specs"][0]["dtype"] = "torch.not_a_dtype"
+    elif defect == "bad_spec":
+        metadata["tensor_specs"][0] = None
+    assert consumer.get("0", "1", "req-invalid-empty", metadata) is None
+    assert copying_native_agent == {"agents": [], "descs": [], "transfers": [], "released": []}
+    assert consumer._agent.registered == []
+    assert "req-invalid-empty" in producer._pending  # No false completion ACK.
+    assert consumer._metrics["errors"] == 1

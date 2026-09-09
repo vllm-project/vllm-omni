@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import sys
@@ -244,6 +245,10 @@ class NixlConnector(OmniConnectorBase):
 
             grouped_tensors: dict[str, list[tuple[int, torch.Tensor]]] = {}
             for tensor_index, tensor in enumerate(tensors):
+                # Empty leaves still occupy their original spec/skeleton slots,
+                # but have no storage that NIXL can register or transfer.
+                if tensor.numel() == 0:
+                    continue
                 memory_type = self._resolve_memory_type(tensor)
                 grouped_tensors.setdefault(memory_type, []).append((tensor_index, tensor))
 
@@ -326,11 +331,12 @@ class NixlConnector(OmniConnectorBase):
             tensor_specs = metadata.get("tensor_specs")
             if not isinstance(tensor_specs, list):
                 raise RuntimeError(f"Invalid NIXL metadata for {get_key}: missing tensor_specs")
-            descriptor_groups = self._validated_descriptor_groups(metadata, len(tensor_specs))
+            descriptor_groups = self._validated_descriptor_groups(metadata, tensor_specs)
 
             local_tensors = [self._allocate_tensor_from_spec(spec, metadata.get("kind")) for spec in tensor_specs]
-            remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
-            self._remote_agents.append(remote_agent)
+            if descriptor_groups:
+                remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
+                self._remote_agents.append(remote_agent)
             for descriptor_group in descriptor_groups:
                 remote_memory_type = descriptor_group["memory_type"]
                 indexed_regions = list(
@@ -787,9 +793,28 @@ class NixlConnector(OmniConnectorBase):
         return "VRAM"
 
     @staticmethod
-    def _validated_descriptor_groups(metadata: dict[str, Any], tensor_count: int) -> list[dict[str, Any]]:
+    def _validated_descriptor_groups(
+        metadata: dict[str, Any], tensor_specs: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        # Derive emptiness from shape/dtype, not an untrusted advertised size:
+        # otherwise a nonempty destination could silently bypass DMA.
+        sizes = []
+        for spec in tensor_specs:
+            if not isinstance(spec, dict):
+                raise RuntimeError("Invalid NIXL metadata: tensor spec must be a mapping")
+            shape = spec.get("shape")
+            if not isinstance(shape, list) or any(type(dim) is not int or dim < 0 for dim in shape):
+                raise RuntimeError("Invalid NIXL metadata: invalid tensor shape")
+            dtype = getattr(torch, str(spec.get("dtype", "")).removeprefix("torch."), None)
+            if not isinstance(dtype, torch.dtype):
+                raise RuntimeError("Invalid NIXL metadata: invalid tensor dtype")
+            size = math.prod(shape) * dtype.itemsize
+            if type(spec.get("size")) is not int or spec["size"] != size:
+                raise RuntimeError("Invalid NIXL metadata: tensor size does not match shape/dtype")
+            sizes.append(size)
+
         groups = metadata.get("descriptor_groups")
-        if not isinstance(groups, list) or not groups:
+        if not isinstance(groups, list):
             raise RuntimeError("Invalid NIXL metadata: missing descriptor_groups")
 
         seen_indices = []
@@ -800,11 +825,28 @@ class NixlConnector(OmniConnectorBase):
             regions = group.get("regions")
             if not isinstance(indices, list) or not isinstance(regions, list) or len(indices) != len(regions):
                 raise RuntimeError("Invalid NIXL metadata: tensor_indices and regions must have equal lengths")
+            if not indices:
+                raise RuntimeError("Invalid NIXL metadata: empty descriptor group")
             if not group.get("memory_type"):
                 raise RuntimeError("Invalid NIXL metadata: descriptor group is missing memory_type")
+            if any(type(index) is not int or not 0 <= index < len(sizes) for index in indices):
+                raise RuntimeError("Invalid NIXL metadata: tensor indices must form an exact partition")
+            for index, region in zip(indices, regions, strict=True):
+                if (
+                    not isinstance(region, (list, tuple))
+                    or len(region) not in (3, 4)
+                    or type(region[0]) is not int
+                    or region[0] <= 0
+                    or type(region[1]) is not int
+                    or region[1] <= 0
+                    or region[1] != sizes[index]
+                    or type(region[2]) is not int
+                    or region[2] < 0
+                ):
+                    raise RuntimeError("Invalid NIXL metadata: invalid tensor region or byte size")
             seen_indices.extend(indices)
 
-        if sorted(seen_indices) != list(range(tensor_count)):
+        if sorted(seen_indices) != [index for index, size in enumerate(sizes) if size > 0]:
             raise RuntimeError("Invalid NIXL metadata: tensor indices must form an exact partition")
         return groups
 

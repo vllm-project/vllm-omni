@@ -180,7 +180,7 @@ class _ResidualMerge(nn.Module):
     info=Qwen3VLProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class MiniMaxH3TextEncoder(Qwen3VLForConditionalGeneration):
+class MiniMaxH3TextEncoderBackbone(Qwen3VLForConditionalGeneration):
     """Qwen3-VL encoder used by MiniMax H3.
 
     MiniMax H3 consumes the residual stream after decoder layer 50.  The
@@ -309,3 +309,6 @@ class MiniMaxH3TextEncoder(Qwen3VLForConditionalGeneration):
             encoder_weights(),
             mapper=self.hf_to_vllm_mapper,
         )
+
+
+MiniMaxH3TextEncoder = MiniMaxH3TextEncoderBackbone

@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax H3 checkpoint resolution for the AR text-encoder stage."""
-
 from pathlib import Path
 
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 
-MINIMAX_H3_TEXT_ENCODER_DOWNLOAD_PATTERNS = {
-    "fl2va": ["FL2VA/text_encoder/**"],
-    "ref2va": ["Ref2VA/text_encoder/**"],
+MINIMAX_H3_ENCODER_DOWNLOAD_PATTERNS = {
+    partition: [
+        f"{subdir}/text_encoder/**",
+        f"{subdir}/video_vae/**",
+        f"{subdir}/audio_vae/**",
+    ]
+    for partition, subdir in {"fl2va": "FL2VA", "ref2va": "Ref2VA"}.items()
 }
+MINIMAX_H3_ENCODER_DOWNLOAD_PATTERNS["combined"] = MINIMAX_H3_ENCODER_DOWNLOAD_PATTERNS["fl2va"]
 
 
 def resolve_minimax_h3_partition(
@@ -32,7 +35,7 @@ def resolve_minimax_h3_partition(
     return "ref2va" if task == "ref2va" else "fl2va"
 
 
-def resolve_minimax_h3_model_root(
+def resolve_minimax_h3_encoder_model_root(
     model: str,
     revision: str | None,
     task_type: str | None,
@@ -50,7 +53,7 @@ def resolve_minimax_h3_model_root(
     snapshot = download_weights_from_hf_specific(
         model_name_or_path=model,
         cache_dir=None,
-        allow_patterns=MINIMAX_H3_TEXT_ENCODER_DOWNLOAD_PATTERNS[partition],
+        allow_patterns=MINIMAX_H3_ENCODER_DOWNLOAD_PATTERNS[partition],
         revision=revision,
         require_all=True,
     )
@@ -59,4 +62,11 @@ def resolve_minimax_h3_model_root(
     return str(Path(snapshot) / subdir / "text_encoder")
 
 
-__all__ = ["resolve_minimax_h3_model_root", "resolve_minimax_h3_partition"]
+resolve_minimax_h3_model_root = resolve_minimax_h3_encoder_model_root
+
+
+__all__ = [
+    "resolve_minimax_h3_encoder_model_root",
+    "resolve_minimax_h3_model_root",
+    "resolve_minimax_h3_partition",
+]
