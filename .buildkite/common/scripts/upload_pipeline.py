@@ -4,7 +4,8 @@
 """Render and optionally upload Buildkite pipeline YAML with diff-aware logic.
 
 Bootstrap mode (``bootstrap-upload-steps.yml``):
-  - Hook uploads the entry YAML (``pipeline.yml`` / ``pipeline-npu.yml``) with one step that runs
+  - Hook uploads the entry YAML (``pipeline.yml`` / ``pipeline-npu.yml`` /
+    ``amd/pipeline.yml``) with one step that runs
     ``upload_pipeline.py --upload <platform>/bootstrap-upload-steps.yml``.
   - Injects ``if`` by step ``key`` from skip-ci and uploads child steps (image build, L2–L5 upload).
   - Detect docs-only, pytest skip-mark-only, or combined skip-ci from git diff.
@@ -14,6 +15,7 @@ Test pipeline mode (e.g. test-merge.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
+  - Preserve AMD ``mirror_hardwares`` metadata for native MI300 rendering.
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -38,11 +40,14 @@ import argparse
 import copy
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
+from urllib.request import urlopen
 
 try:
     import yaml
@@ -76,6 +81,7 @@ BOOTSTRAP_UPLOAD_IF_KEYS = {
     "upload-merge-pipeline": "merge",
     "upload-nightly-pipeline": "nightly",
     "upload-weekly-pipeline": "weekly",
+    "upload-amd-pipeline": "amd",
 }
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
@@ -121,7 +127,11 @@ def _log(message: str) -> None:
 
 def _get_bootstrap_platform(path: Path) -> str:
     parts = path.as_posix().split("/")
-    return "npu" if "npu" in parts else "cuda"
+    if "npu" in parts:
+        return "npu"
+    if "amd" in parts:
+        return "amd"
+    return "cuda"
 
 
 def _load_bootstrap_steps(path: Path) -> str:
@@ -142,6 +152,10 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         ready_upload = READY_LABEL_IF
         merge_upload = BOOTSTRAP_DISABLED_IF
         weekly_label_if = BOOTSTRAP_DISABLED_IF
+    elif platform == "amd":
+        ready_upload = READY_LABEL_IF
+        merge_upload = MERGE_UPLOAD_IF
+        weekly_label_if = BOOTSTRAP_DISABLED_IF
     else:
         ready_upload = READY_UPLOAD_IF
         merge_upload = MERGE_UPLOAD_IF
@@ -152,13 +166,25 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
         # main+WEEKLY=1 also uploads L2/L3 (those steps then pass --e2e).
         image_expr = f"({NIGHTLY_MAIN_IF}) || ({WEEKLY_MAIN_IF})" if platform == "cuda" else NIGHTLY_MAIN_IF
-        ready_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        merge_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        ready_expr = (
+            WEEKLY_E2E_IF if platform == "cuda" else READY_LABEL_IF if platform == "amd" else BOOTSTRAP_DISABLED_IF
+        )
+        merge_expr = (
+            WEEKLY_E2E_IF if platform == "cuda" else MERGE_UPLOAD_IF if platform == "amd" else BOOTSTRAP_DISABLED_IF
+        )
         nightly_expr = NIGHTLY_MAIN_IF
         weekly_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
     elif decision.skip_l2_l3:
-        l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
-        l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
+        l2_enabled = (
+            decision.is_run(platform, "l2")
+            if platform == "amd"
+            else decision.is_run("npu", "l2")
+            if platform == "npu"
+            else decision.is_run("cuda", "l2")
+        )
+        l3_enabled = (
+            decision.is_run("amd", "l3") if platform == "amd" else platform == "cuda" and decision.is_run("cuda", "l3")
+        )
 
         ready_expr = ready_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
         merge_expr = merge_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
@@ -176,17 +202,26 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     else:
         image_expr = BOOTSTRAP_ENABLED_IF
         ready_expr = ready_upload
-        merge_expr = merge_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        merge_expr = merge_upload if platform in ("cuda", "amd") else BOOTSTRAP_DISABLED_IF
         nightly_expr = NIGHTLY_LABEL_IF
         weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
-    return {
+    expressions = {
         "image": _format_bootstrap_if(image_expr),
         "ready": _format_bootstrap_if(ready_expr),
         "merge": _format_bootstrap_if(merge_expr),
         "nightly": _format_bootstrap_if(nightly_expr),
         "weekly": _format_bootstrap_if(weekly_expr),
     }
+    if platform == "amd":
+        if decision.skip_all:
+            amd_expr = NIGHTLY_MAIN_IF
+        elif decision.skip_l2_l3 and not (decision.is_run("amd", "l2") or decision.is_run("amd", "l3")):
+            amd_expr = NIGHTLY_LABEL_IF
+        else:
+            amd_expr = BOOTSTRAP_ENABLED_IF
+        expressions["amd"] = _format_bootstrap_if(amd_expr)
+    return expressions
 
 
 def _apply_bootstrap_if(steps: list[Any], if_exprs: dict[str, str]) -> list[Any]:
@@ -523,6 +558,8 @@ def _get_step_label(step: dict[str, Any]) -> str:
 def _process_test_steps(
     steps: list[Any],
     changed_files: list[str] | None,
+    *,
+    platform: str = "cuda",
 ) -> list[Any]:
     """Drop steps by ``source_file_dependencies`` when *changed_files* is set; always strip that field."""
     processed: list[Any] = []
@@ -542,7 +579,11 @@ def _process_test_steps(
 
         nested = step.get("steps")
         if nested is not None:
-            kept_nested = _process_test_steps(nested, changed_files)
+            kept_nested = _process_test_steps(
+                nested,
+                changed_files,
+                platform=platform,
+            )
             if not kept_nested:
                 _log(f"omit empty group {_get_step_label(step)!r}")
                 continue
@@ -552,7 +593,7 @@ def _process_test_steps(
             continue
 
         leaf = {key: value for key, value in step.items() if key != "source_file_dependencies"}
-        expanded = _expand_mirror_hardwares(leaf)
+        expanded = leaf if platform == "amd" else _expand_mirror_hardwares(leaf)
         if expanded is None:
             continue
         processed.append(expanded)
@@ -579,6 +620,7 @@ def _render_test_pipeline(
     changed_files: list[str] | None,
     *,
     e2e_only: bool = False,
+    platform: str = "cuda",
 ) -> dict[str, Any]:
     """Filter steps by PR diff and strip uploader-only ``source_file_dependencies`` metadata."""
     # Validate MIRROR_HW once up front. Per-step skip must not run for typos
@@ -590,8 +632,130 @@ def _render_test_pipeline(
         return doc
     if e2e_only:
         steps = _select_e2e_group_steps(steps)
-    steps = _process_test_steps(steps, changed_files)
+    steps = _process_test_steps(steps, changed_files, platform=platform)
     return {**doc, "steps": steps}
+
+
+def _amd_pr_labels() -> tuple[str, ...]:
+    pull_request = os.environ.get("BUILDKITE_PULL_REQUEST", "false")
+    if pull_request == "false":
+        return ()
+    url = f"https://api.github.com/repos/vllm-project/vllm-omni/pulls/{pull_request}"
+    with urlopen(url) as response:  # noqa: S310
+        payload = yaml.safe_load(response.read())
+    return tuple(label["name"] for label in payload.get("labels", []))
+
+
+def _combine_amd_suites(
+    suites: tuple[str, ...],
+    changed_files: list[str] | None,
+) -> Path:
+    amd_scripts = ROOT / ".buildkite/amd/scripts"
+    if str(amd_scripts) not in sys.path:
+        sys.path.insert(0, str(amd_scripts))
+    from select_test_suites import SUITE_SPECS  # noqa: PLC0415
+
+    combined: dict[str, Any] = {"env": {}, "steps": []}
+    for suite_name in suites:
+        suite_path = ROOT / ".buildkite/amd" / SUITE_SPECS[suite_name].split(":", 1)[1]
+        suite = yaml.safe_load(suite_path.read_text(encoding="utf-8"))
+        for name, value in (suite.get("env") or {}).items():
+            previous = combined["env"].get(name, value)
+            if previous != value:
+                raise ValueError(f"conflicting AMD environment value for {name}")
+            combined["env"][name] = value
+        for entry in suite.get("steps") or []:
+            if isinstance(entry, dict) and "group" in entry:
+                children = _process_test_steps(
+                    entry.get("steps") or [],
+                    changed_files,
+                    platform="amd",
+                )
+                if children:
+                    combined["steps"].append(
+                        {"group": entry["group"], "steps": children},
+                    )
+            else:
+                combined["steps"].extend(
+                    _process_test_steps([entry], changed_files, platform="amd"),
+                )
+
+    temporary = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".yml",
+        prefix="amd-selected-",
+        delete=False,
+    )
+    with temporary:
+        yaml.safe_dump(combined, temporary, sort_keys=False)
+    return Path(temporary.name)
+
+
+def _ensure_minijinja() -> str:
+    executable = shutil.which("minijinja-cli")
+    if executable:
+        return executable
+    subprocess.run(
+        [
+            "bash",
+            "-o",
+            "pipefail",
+            "-c",
+            "curl -sSfL https://github.com/mitsuhiko/minijinja/releases/download/2.3.1/minijinja-cli-installer.sh | sh",
+        ],
+        check=True,
+    )
+    for candidate in (
+        "/var/lib/buildkite-agent/.cargo/bin/minijinja-cli",
+        str(Path.home() / ".cargo/bin/minijinja-cli"),
+    ):
+        if Path(candidate).is_file():
+            return candidate
+    raise FileNotFoundError("minijinja-cli installer completed without an executable")
+
+
+def _render_amd_tests(context: Any) -> str:
+    amd_scripts = ROOT / ".buildkite/amd/scripts"
+    if str(amd_scripts) not in sys.path:
+        sys.path.insert(0, str(amd_scripts))
+    from select_test_suites import select_amd_test_suites  # noqa: PLC0415
+
+    suites = select_amd_test_suites(
+        branch=os.environ.get("BUILDKITE_BRANCH", "main"),
+        labels=_amd_pr_labels(),
+        debug_test_yaml=os.environ.get("DEBUG_TEST_YAML", ""),
+        nightly=os.environ.get("NIGHTLY", "0") == "1",
+    )
+    runnable = tuple(
+        suite
+        for suite in suites
+        if suite == "nightly"
+        or context.decision.is_run(
+            "amd",
+            "l2" if suite == "ready" else "l3",
+        )
+    )
+    if not runnable:
+        return ""
+
+    selected = _combine_amd_suites(runnable, context.changed_files)
+    try:
+        result = subprocess.run(
+            [
+                _ensure_minijinja(),
+                str(ROOT / ".buildkite/amd/test-template-amd-omni.j2"),
+                str(selected),
+                "-D",
+                "mirror_hw=amdproduction",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        selected.unlink(missing_ok=True)
+    return result.stdout
 
 
 # --- Entry (read file → bootstrap or test render → YAML string) ---
@@ -620,7 +784,12 @@ def _render_pipeline(
     if not isinstance(doc, dict):
         raise ValueError(f"invalid pipeline YAML: {path}")
 
-    doc = _render_test_pipeline(doc, changed_files, e2e_only=e2e_only)
+    doc = _render_test_pipeline(
+        doc,
+        changed_files,
+        e2e_only=e2e_only,
+        platform=_get_bootstrap_platform(path),
+    )
     return yaml.safe_dump(doc, sort_keys=False)
 
 
@@ -660,7 +829,20 @@ def main() -> int:
         action="store_true",
         help="Keep only the E2E Test group",
     )
+    mode.add_argument(
+        "--amd",
+        action="store_true",
+        help="Render the native AMD test pipeline with AMD suite selection",
+    )
     args = parser.parse_args()
+
+    if args.amd:
+        rendered = _render_amd_tests(resolve_ci_context_from_git())
+        if args.upload and rendered:
+            _upload_to_buildkite(rendered)
+        elif not args.upload:
+            sys.stdout.write(rendered)
+        return 0
 
     path = Path(args.pipeline)
     if not path.is_absolute():

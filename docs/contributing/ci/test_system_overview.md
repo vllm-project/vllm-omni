@@ -182,6 +182,15 @@ CUDA **L4** (`full_model`) jobs are defined once in [`.buildkite/cuda/test-night
 - **Nightly:** scheduled `main` builds with `NIGHTLY=1` (and PR labels such as `nightly-test` / `omni-test`). Default fleet is typically H100.
 - **Pre-release:** the same L4 suite runs again on extra GPU SKUs before a release (for example B200 via `MIRROR_HW=b200`), so `full_model` coverage is not limited to the nightly machine type.
 
+AMD has an experimental, non-blocking L4 vertical slice in
+[`.buildkite/amd/test-amd-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-amd-nightly.yml).
+It runs ROCm Qwen3-Omni expansion, accuracy, and documentation-example
+coverage on the native MI300 pool. PRs select it with
+`nightly-test`; scheduled `main` builds select it with `NIGHTLY=1`.
+Ready/PR CI separately runs bounded two-GPU text and targeted AITER smoke
+cases with collection validation and uploads model, cache, ROCm, collection,
+and pytest diagnostics.
+
 How count-form `mirror_hardwares` and `MIRROR_HW` pick a SKU: [CI Settings](./ci_settings.md).
 
 ### L2 / L3 diff-aware CI (CUDA)

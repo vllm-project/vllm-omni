@@ -1,0 +1,61 @@
+# AMD CI L4 (`full_model`): experimental nightly coverage during burn-in.
+# All jobs remain non-blocking until runtime stability is established.
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 60
+
+steps:
+  - group: ":full_moon: Qwen3-Omni L4"
+    steps:
+      - label: "Qwen3-Omni Function Expansion"
+        agent_pool: mi300_2
+        depends_on: image-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        artifact_paths:
+          - qwen3-omni-ci/*.log
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export QWEN3_TEST_TARGET="tests/e2e/online_serving/test_qwen3_omni_expansion.py"
+          - export QWEN3_TEST_MARKER="full_model and rocm and MI325 and cards_2"
+          - export QWEN3_LOG_PREFIX="nightly-function-expansion"
+          - export QWEN3_RUN_LEVEL="full_model"
+          - export QWEN3_TEST_TIMEOUT="165m"
+          - bash .buildkite/amd/scripts/run-qwen3-omni-ci-test.sh
+      - label: "Qwen3-Omni Accuracy"
+        agent_pool: mi300_2
+        depends_on: image-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
+          - qwen3-omni-ci/*.log
+        commands:
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_EVAL_DEVICE=cuda:1
+          - export QWEN3_TEST_TARGET="tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py"
+          - export QWEN3_TEST_MARKER="full_model and rocm and MI325 and cards_2"
+          - export QWEN3_LOG_PREFIX="nightly-accuracy"
+          - export QWEN3_RUN_LEVEL="full_model"
+          - export QWEN3_TEST_TIMEOUT="165m"
+          - bash .buildkite/amd/scripts/run-qwen3-omni-ci-test.sh
+
+      - label: "Qwen3-Omni Documentation Examples"
+        agent_pool: mi300_2
+        depends_on: image-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        artifact_paths:
+          - qwen3-omni-ci/*.log
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export QWEN3_TEST_TARGET="tests/examples/online_serving/test_qwen3_omni.py"
+          - export QWEN3_TEST_MARKER="full_model and rocm and MI325 and cards_2"
+          - export QWEN3_LOG_PREFIX="nightly-documentation"
+          - export QWEN3_RUN_LEVEL="full_model"
+          - export QWEN3_TEST_TIMEOUT="105m"
+          - bash .buildkite/amd/scripts/run-qwen3-omni-ci-test.sh

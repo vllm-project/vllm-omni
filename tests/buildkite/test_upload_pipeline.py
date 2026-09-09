@@ -22,6 +22,9 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+AMD_BOOTSTRAP_STEPS = Path(".buildkite/amd/bootstrap-upload-steps.yml")
+AMD_READY_STEPS = Path(".buildkite/amd/test-amd-ready.yml")
+AMD_NIGHTLY_STEPS = Path(".buildkite/amd/test-amd-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
   - key: upload-ready-pipeline
@@ -115,6 +118,90 @@ def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
     rendered = _render([".buildkite/cuda/test-ready.yml"])
     assert 'build.pull_request.labels includes "ready"' in rendered
     assert "if: true" not in rendered
+
+
+def test_amd_bootstrap_conditions_and_command_use_shared_uploader() -> None:
+    rendered = _render_bootstrap_pipeline(
+        AMD_BOOTSTRAP_STEPS.read_text(encoding="utf-8"),
+        decision=resolve_ci_decision(["docs/foo.md"]),
+        path=AMD_BOOTSTRAP_STEPS,
+    )
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "upload-amd-pipeline" in by_key
+    assert 'build.branch == "main"' in by_key["upload-amd-pipeline"]["if"]
+    assert "common/scripts/upload_pipeline.py" in by_key["upload-amd-pipeline"]["command"]
+    assert "--amd" in by_key["upload-amd-pipeline"]["command"]
+    assert "if: false" not in rendered
+
+
+def test_amd_rendering_preserves_native_hardware_metadata() -> None:
+    rendered = _render_test_pipeline(
+        {
+            "steps": [
+                {
+                    "label": "AMD native",
+                    "mirror_hardwares": ["amdproduction"],
+                    "commands": ["pytest -m 'full_model and rocm'"],
+                },
+            ],
+        },
+        changed_files=None,
+        platform="amd",
+    )
+    step = rendered["steps"][0]
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert "agents" not in step
+
+
+def _amd_leaf_commands(path: Path) -> list[str]:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    commands: list[str] = []
+
+    def walk(steps: list[dict]) -> None:
+        for step in steps:
+            if "steps" in step:
+                walk(step["steps"])
+            else:
+                commands.append("\n".join(step.get("commands", [])))
+
+    walk(document["steps"])
+    return commands
+
+
+def _amd_leaf_steps(path: Path) -> list[dict]:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    leaves: list[dict] = []
+
+    def walk(steps: list[dict]) -> None:
+        for step in steps:
+            if "steps" in step:
+                walk(step["steps"])
+            else:
+                leaves.append(step)
+
+    walk(document["steps"])
+    return leaves
+
+
+def test_amd_qwen3_jobs_use_guarded_runner_and_diagnostics() -> None:
+    for path in (AMD_READY_STEPS, AMD_NIGHTLY_STEPS):
+        qwen_steps = [
+            step for step in _amd_leaf_steps(path) if "QWEN3_TEST_TARGET" in "\n".join(step.get("commands", []))
+        ]
+        assert qwen_steps
+        for step in qwen_steps:
+            command = "\n".join(step["commands"])
+            assert "run-qwen3-omni-ci-test.sh" in command
+            assert 'QWEN3_TEST_MARKER="' in command
+            assert 'QWEN3_RUN_LEVEL="' in command
+            assert step["depends_on"] == "image-build"
+            assert step["mirror_hardwares"] == ["amdproduction"]
+
+    ready = "\n".join(_amd_leaf_commands(AMD_READY_STEPS))
+    nightly = "\n".join(_amd_leaf_commands(AMD_NIGHTLY_STEPS))
+    assert "VLLM_ROCM_USE_AITER=1" in ready
+    assert "VLLM_ROCM_USE_AITER=1" not in nightly
 
 
 def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
