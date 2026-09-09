@@ -27,15 +27,14 @@ The expected layout is `data/level_1/dataset.json` and
 metadata hashes and whether they match this revision; media content is not
 verified by those hashes.
 
-Run the client on the server host, or share identical absolute media paths.
-Both the dataset and prefix cache must be under the server's allowed media
-directory. For example, with the dataset at `/data/socialomni`:
+The client embeds video bytes in each request, following the shared
+multimodal client. The server does not need access to the client's dataset or
+prefix cache. Start a text-output server:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --host 127.0.0.1 --port 8091 \
-    --deploy-config vllm_omni/deploy/qwen3_omni_moe_thinking.yaml \
-    --allowed-local-media-path /data/socialomni
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
 ```
 
 The upstream deployment configuration uses two GPUs and text output only,
@@ -43,8 +42,8 @@ including when loading Instruct weights. Choose device and context settings
 that fit the videos and hardware; see the
 [Qwen3-Omni serving guide](../../examples/online_serving/qwen3_omni/README.md).
 The request contains one `video_url` and
-`mm_processor_kwargs.use_audio_in_video=true`, following the shared multimodal
-client. No separate audio item is sent.
+`mm_processor_kwargs.use_audio_in_video=true`. The video URL contains the
+base64-encoded video; no separate audio item is sent.
 
 ## Evaluation
 
@@ -116,7 +115,9 @@ Latency and throughput are client diagnostics, not paper quality metrics.
 `--max-concurrency` bounds model requests. Each non-empty model phase runs one
 warmup request per configured concurrent worker; `--warmup N` overrides this
 count. Warmup repeats initial samples and is discarded. Model wall time
-excludes prefix preparation, warmup, and judging. Judges have separate
+excludes prefix encoding, warmup, and judging, but includes reading and
+base64-encoding the request media. Request latency starts after that media
+preparation. Judges have separate
 concurrency limits and no warmup. Transient requests are retried up to three
 times; an invalid judge score can trigger up to three scoring attempts.
 

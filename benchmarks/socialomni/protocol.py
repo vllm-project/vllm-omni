@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -290,13 +291,14 @@ def build_judge_prompt(sample: SocialOmniLevel2Sample, candidate: str) -> str:
 
 
 def model_payload(model: str, prompt: str, video_path: str, max_tokens: int) -> dict[str, Any]:
+    video = base64.b64encode(Path(video_path).read_bytes()).decode("ascii")
     return {
         "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "video_url", "video_url": {"url": Path(video_path).resolve().as_uri()}},
+                    {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{video}"}},
                     {"type": "text", "text": prompt},
                 ],
             }
@@ -319,19 +321,36 @@ def judge_payload(judge: JudgeSpec, prompt: str) -> dict[str, Any]:
     }
 
 
+async def _request_model(
+    session: aiohttp.ClientSession,
+    *,
+    model: str,
+    base_url: str,
+    prompt: str,
+    video_path: str,
+    max_tokens: int,
+    request_id: str,
+) -> RequestResult:
+    try:
+        payload = await asyncio.to_thread(model_payload, model, prompt, video_path, max_tokens)
+    except OSError as exc:
+        return RequestResult(request_id=request_id, error=f"media preparation failed: {exc}")
+    return await request_chat_completion(
+        session, api_url=chat_completions_url(base_url), payload=payload, request_id=request_id
+    )
+
+
 def make_level1_send_fn(
     model: str, base_url: str
 ) -> Callable[[aiohttp.ClientSession, SocialOmniLevel1Sample], Awaitable[RequestResult]]:
     async def send(session: aiohttp.ClientSession, sample: SocialOmniLevel1Sample) -> RequestResult:
-        return await request_chat_completion(
+        return await _request_model(
             session,
-            api_url=chat_completions_url(base_url),
-            payload=model_payload(
-                model,
-                build_level1_prompt(sample),
-                sample.video_path,
-                LEVEL1_MAX_TOKENS,
-            ),
+            model=model,
+            base_url=base_url,
+            prompt=build_level1_prompt(sample),
+            video_path=sample.video_path,
+            max_tokens=LEVEL1_MAX_TOKENS,
             request_id=sample.sample_id,
         )
 
@@ -389,10 +408,13 @@ async def run_level2_model(
             sample, prefix = item
             prompt = build_when_prompt(sample) if phase == "when" else build_response_prompt(sample)
             max_tokens = LEVEL2_WHEN_MAX_TOKENS if phase == "when" else LEVEL2_RESPONSE_MAX_TOKENS
-            return await request_chat_completion(
+            return await _request_model(
                 session,
-                api_url=chat_completions_url(base_url),
-                payload=model_payload(model, prompt, str(prefix), max_tokens),
+                model=model,
+                base_url=base_url,
+                prompt=prompt,
+                video_path=str(prefix),
+                max_tokens=max_tokens,
                 request_id=f"{sample.sample_id}:{phase}",
             )
 

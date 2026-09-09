@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import base64
 import json
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -198,7 +199,14 @@ def _completion(text, **extra):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed_judge", [None, "qwen3-omni"])
 async def test_complete_protocol_over_http(tmp_path, monkeypatch, failed_judge):
-    samples = [replace(_level2(0), gold_when="YES"), _level2(1)]
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"before-query\x00after-query")
+    prefix = tmp_path / "prefix.mp4"
+    prefix.write_bytes(b"before-query\x00")
+    samples = [
+        replace(_level2(0), gold_when="YES", video_path=str(source)),
+        replace(_level2(1), video_path=str(source)),
+    ]
     seen = []
 
     async def completion(request):
@@ -216,19 +224,21 @@ async def test_complete_protocol_over_http(tmp_path, monkeypatch, failed_judge):
             content = payload["messages"][0]["content"]
             assert [part["type"] for part in content] == ["video_url", "text"]
             video_uri = content[0]["video_url"]["url"]
-            expected_path = Path("/tmp/video.mp4") if limit == 32 else tmp_path / "prefix.mp4"
-            assert video_uri == expected_path.resolve().as_uri()
+            media_type, encoded = video_uri.split(",", 1)
+            assert media_type == "data:video/mp4;base64"
+            expected = source.read_bytes() if limit == 32 else prefix.read_bytes()
+            assert base64.b64decode(encoded, validate=True) == expected
             assert "private reference" not in json.dumps(payload)
             assert "videos" not in payload and "use_audio_in_video" not in payload
         text = {32: "Answer: A", 8: "Answer: B", 256: "candidate", 8192: "75"}[limit]
         return _completion(text, usage={"prompt_tokens": 2, "completion_tokens": 1})
 
     async def prepared(*args):
-        return tmp_path / "prefix.mp4"
+        return prefix
 
     monkeypatch.setenv("no_proxy", "127.0.0.1")
     monkeypatch.setattr(protocol, "create_video_prefix", prepared)
-    monkeypatch.setattr(entrypoint, "load_socialomni_level1_samples", lambda *a, **k: [_level1()])
+    monkeypatch.setattr(entrypoint, "load_socialomni_level1_samples", lambda *a, **k: [_level1(str(source))])
     monkeypatch.setattr(entrypoint, "load_socialomni_level2_samples", lambda *a, **k: samples)
     monkeypatch.setattr(
         entrypoint,
@@ -321,11 +331,13 @@ async def test_phase_warmup_concurrency_order_and_failures(monkeypatch):
 @pytest.mark.asyncio
 async def test_prefix_failure_stays_in_denominator_and_response_uses_gold(tmp_path, monkeypatch):
     samples = [replace(_level2(i), gold_when="YES", video_path=f"/tmp/{i}.mp4") for i in range(2)]
+    prefix = tmp_path / "prefix.mp4"
+    prefix.write_bytes(b"prefix bytes")
 
     async def prepared(path, *_args):
         if path.endswith("/0.mp4"):
             raise RuntimeError("broken media")
-        return tmp_path / "prefix.mp4"
+        return prefix
 
     sent = []
 
@@ -353,6 +365,38 @@ async def test_prefix_failure_stays_in_denominator_and_response_uses_gold(tmp_pa
     assert requests[0].error == "RuntimeError: broken media"
     assert records[1]["predicted_when"] == "NO" and records[1]["gold_response"] == "candidate"
     assert sent == ["1:when", "1:response"]
+
+
+def test_model_payload_embeds_video_bytes(tmp_path):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00\xff\x80video content")
+    payload = protocol.model_payload("qwen3-omni", "prompt", str(video), 8)
+    video_part, text_part = payload["messages"][0]["content"]
+    assert video_part["type"] == "video_url"
+    media_type, encoded = video_part["video_url"]["url"].split(",", 1)
+    assert media_type == "data:video/mp4;base64"
+    assert base64.b64decode(encoded, validate=True) == video.read_bytes()
+    assert text_part == {"type": "text", "text": "prompt"}
+    assert payload["mm_processor_kwargs"] == {"use_audio_in_video": True}
+    assert payload["modalities"] == ["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("directory", [False, True])
+async def test_unreadable_media_is_request_failure(tmp_path, monkeypatch, directory):
+    media = tmp_path if directory else tmp_path / "missing.mp4"
+
+    async def unexpected_request(*args, **kwargs):
+        pytest.fail("unreadable media must fail before an HTTP request")
+
+    monkeypatch.setattr(protocol, "request_chat_completion", unexpected_request)
+    send = protocol.make_level1_send_fn("qwen3-omni", "http://localhost:8000")
+    async with aiohttp.ClientSession() as session:
+        result = await send(session, _level1(str(media)))
+    assert not result.is_success
+    assert result.request_id == "one"
+    assert result.error
+    assert result.prompt_tokens == result.completion_tokens == 0
 
 
 @pytest.mark.asyncio
