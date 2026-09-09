@@ -112,6 +112,40 @@ failures, and metrics. Client versions do not identify a remote server; retain
 its launch command, model revision, and software versions alongside results.
 Latency and throughput are client diagnostics, not paper quality metrics.
 
+Progress is written to stderr after warmup, at most once every five seconds
+and at the end of each phase. The final stdout JSON contains the result path
+and summary. `summary.elapsed_s` includes dataset loading, prefix preparation,
+warmup, model requests, and judging; it excludes server startup and result
+writing. `config.judges` records each judge's name, model, endpoint, and
+concurrency, omitting credentials and URL query strings.
+
+For example, a mini run with Qwen3-Omni-30B-A3B-Instruct on two H20 96 GB GPUs
+produced the following summary excerpt. All five measured model requests and
+three judge requests succeeded. With one warmup per model phase and cached
+prefixes, the run took 11.1 seconds, excluding server startup. This small
+selection checks the evaluation flow, not representative model quality.
+
+```json
+{
+  "status": "complete",
+  "elapsed_s": 11.134776549879462,
+  "level2": {
+    "metrics": {
+      "judge_status": {
+        "complete": true,
+        "eligible_responses": 1,
+        "completed_scores": 3,
+        "required_scores": 3
+      }
+    }
+  }
+}
+```
+
+This run used vLLM 0.28.0, PyTorch 2.13.0+cu130, and Transformers 5.14.1.
+Judge latency depends on the provider and its load; elapsed time also depends
+on video duration, prefix cache state, and request concurrency.
+
 `--max-concurrency` bounds model requests. Each non-empty model phase runs one
 warmup request per configured concurrent worker; `--warmup N` overrides this
 count. Warmup repeats initial samples and is discarded. Model wall time
@@ -120,5 +154,34 @@ base64-encoding the request media. Request latency starts after that media
 preparation. Judges have separate
 concurrency limits and no warmup. Transient requests are retried up to three
 times; an invalid judge score can trigger up to three scoring attempts.
+
+## Tests
+
+Run the client tests in the repository development environment:
+
+```bash
+uv run --no-sync python -m pytest \
+    tests/benchmarks/test_socialomni_dataset.py \
+    tests/benchmarks/test_socialomni_metrics.py \
+    tests/benchmarks/test_socialomni_protocol.py \
+    -m 'core_model and cpu' --run-level core_model
+```
+
+The GPU regression test starts the official two-GPU Qwen3-Omni server and
+runs the public command on the mini set. Install the benchmark dependencies
+above and set the dataset location to opt in:
+
+```bash
+VLLM_SOCIALOMNI_DATASET_ROOT=/path/to/socialomni \
+uv run --no-sync python -m pytest -sv \
+    tests/e2e/accuracy/test_qwen3_omni_socialomni_expansion.py \
+    -m 'full_model and omni and benchmark and cuda' --run-level full_model
+```
+
+Set `VLLM_SOCIALOMNI_MODEL` to use a local checkpoint. The test checks parsed
+answers, response generation, and the incomplete-quality result without
+external judges. It is included in the existing nightly accuracy test command
+and skips when `VLLM_SOCIALOMNI_DATASET_ROOT` is unset. It does not run the full
+dataset or contact external judge services.
 
 Reference: [SocialOmni paper](https://arxiv.org/abs/2603.16859).

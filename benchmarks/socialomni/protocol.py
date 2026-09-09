@@ -47,13 +47,17 @@ class JudgeSpec:
     max_concurrency: int
 
     def public_dict(self) -> dict[str, str | int]:
-        endpoint = urlsplit(self.base_url)
         return {
             "name": self.name,
             "model": self.model,
-            "base_url": endpoint._replace(netloc=endpoint.netloc.rsplit("@", 1)[-1], query="", fragment="").geturl(),
+            "base_url": public_endpoint(self.base_url),
             "max_concurrency": self.max_concurrency,
         }
+
+
+def public_endpoint(url: str) -> str:
+    endpoint = urlsplit(url)
+    return endpoint._replace(netloc=endpoint.netloc.rsplit("@", 1)[-1], query="", fragment="").geturl()
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -162,7 +166,7 @@ async def request_chat_completion(
                     last = RequestResult(
                         request_id=request_id,
                         latency_s=time.perf_counter() - request_started,
-                        error=f"HTTP {response.status}: {raw[:2000]}",
+                        error=f"HTTP {response.status}",
                     )
                     retry = response.status in RETRYABLE_STATUS or 500 <= response.status < 600
                 else:
@@ -172,7 +176,7 @@ async def request_chat_completion(
                         last = RequestResult(
                             request_id=request_id,
                             latency_s=time.perf_counter() - request_started,
-                            error=f"invalid JSON response: {exc}: {raw[:1000]}",
+                            error=f"invalid JSON response: {exc}",
                         )
                         retry = True
                     else:
@@ -180,7 +184,7 @@ async def request_chat_completion(
                             last = RequestResult(
                                 request_id=request_id,
                                 latency_s=time.perf_counter() - request_started,
-                                error=f"invalid JSON response object: {raw[:1000]}",
+                                error="invalid JSON response object",
                             )
                             retry = True
                         else:
@@ -218,7 +222,7 @@ async def request_chat_completion(
             last = RequestResult(
                 request_id=request_id,
                 latency_s=time.perf_counter() - request_started,
-                error=f"{type(exc).__name__}: {exc}",
+                error=f"{type(exc).__name__}: {public_endpoint(api_url)}",
             )
             retry = True
         if not retry or attempt + 1 == max_attempts:

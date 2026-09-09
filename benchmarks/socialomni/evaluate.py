@@ -40,6 +40,7 @@ from benchmarks.socialomni.protocol import (
     build_level1_result_records,
     load_judge_config,
     make_level1_send_fn,
+    public_endpoint,
     run_judges,
     run_level2_model,
     validate_judge_credentials,
@@ -113,6 +114,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     output: dict[str, Any] = {
         "config": {
             **asdict(config),
+            "base_url": public_endpoint(config.base_url),
             "dataset_root": str(Path(config.dataset_root).resolve()),
             "judge_config": None,
             "judges": [judge.public_dict() for judge in judges],

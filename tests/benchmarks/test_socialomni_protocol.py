@@ -434,7 +434,7 @@ async def test_phase_warmup_concurrency_order_and_failures(monkeypatch, capsys):
     assert peak == 2
     assert [result.request_id for result in results] == ["0", "1", "2"]
     assert [result.is_success for result in results] == [True, True, False]
-    assert "HTTP 400: bad input" in results[-1].error
+    assert results[-1].error == "HTTP 400"
     assert wall_s >= max(result.latency_s for result in results)
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -549,3 +549,43 @@ def test_judge_completeness_requires_configuration_and_every_score():
     assert not entrypoint._judges_complete([row], False)
     del scores["gpt-4o"]
     assert not entrypoint._judges_complete([row], True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [(401, "secret-token"), (200, "secret-token"), (200, '["secret-token"]')])
+async def test_error_responses_do_not_record_credentials(status, body, monkeypatch):
+    monkeypatch.setenv("TEST_JUDGE_KEY", "secret-token")
+
+    async def completion(request):
+        assert request.headers["Authorization"] == "Bearer secret-token"
+        return web.Response(status=status, text=body)
+
+    async with _server(completion) as base_url:
+        async with aiohttp.ClientSession() as session:
+            result = await request_chat_completion(
+                session,
+                api_url=f"{base_url}/v1/chat/completions",
+                payload={},
+                request_id="credentials",
+                api_key_env="TEST_JUDGE_KEY",
+                max_attempts=1,
+            )
+    assert not result.is_success
+    assert result.error
+    assert "secret-token" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_connection_error_does_not_record_url_credentials(monkeypatch):
+    url = "https://user:password@example.com/v1/chat/completions?key=secret#token"
+
+    def invalid_url(*args, **kwargs):
+        raise aiohttp.InvalidURL(url)
+
+    async with aiohttp.ClientSession() as session:
+        monkeypatch.setattr(session, "post", invalid_url)
+        result = await request_chat_completion(
+            session, api_url=url, payload={}, request_id="invalid-url", max_attempts=1
+        )
+    assert not result.is_success
+    assert result.error == "InvalidURL: https://example.com/v1/chat/completions"
