@@ -89,6 +89,7 @@ def _judges_complete(records: list[dict[str, Any]], configured: bool) -> bool:
 
 
 async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
+    started = time.perf_counter()
     if config.max_concurrency < 1 or config.timeout_s <= 0:
         raise ValueError("max_concurrency and timeout_s must be positive")
     if config.warmup is not None and config.warmup < 0:
@@ -114,6 +115,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             **asdict(config),
             "dataset_root": str(Path(config.dataset_root).resolve()),
             "judge_config": None,
+            "judges": [judge.public_dict() for judge in judges],
             "dataset_id": SOCIALOMNI_DATASET_ID,
             "expected_dataset_revision": SOCIALOMNI_DATASET_REVISION,
             "warmup_per_nonempty_model_phase": warmup,
@@ -146,6 +148,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             max_concurrency=config.max_concurrency,
             timeout_s=config.timeout_s,
             warmup=config.warmup,
+            description="level1",
         )
         records = build_level1_result_records(samples, request_results)
         for record, result in zip(records, request_results, strict=True):
@@ -186,7 +189,6 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             if failure:
                 output["failures"].append(failure)
 
-        output["config"]["judges"] = [asdict(judge) for judge in judges]
         judge_requests = []
         judge_failures: list[dict[str, str]] = []
         judge_wall_s = 0.0
@@ -255,6 +257,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
 
     level2_complete = "level2" not in levels or (output["summary"]["level2"]["metrics"]["judge_status"]["complete"])
     output["summary"]["status"] = "complete" if level2_complete and not output["failures"] else "incomplete"
+    output["summary"]["elapsed_s"] = time.perf_counter() - started
     return output
 
 
@@ -292,6 +295,7 @@ def main() -> None:
             {
                 "status": output["summary"]["status"],
                 "result": str(path),
+                "summary": output["summary"],
             }
         )
     )

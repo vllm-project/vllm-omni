@@ -6,7 +6,7 @@ import base64
 import json
 from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 
 import aiohttp
@@ -142,7 +142,7 @@ def test_judge_config_has_only_fixed_public_fields(tmp_path: Path, monkeypatch) 
                     {
                         "name": name,
                         "model": name,
-                        "base_url": "http://localhost:8000",
+                        "base_url": "https://user:password@example.com:443/v1?api_key=secret#token",
                         "api_key_env": "SECRET_VALUE" if index == 0 else None,
                         "max_concurrency": 1,
                     }
@@ -152,9 +152,14 @@ def test_judge_config_has_only_fixed_public_fields(tmp_path: Path, monkeypatch) 
         ),
         encoding="utf-8",
     )
-    public = [asdict(judge) for judge in load_judge_config(path)]
+    public = [judge.public_dict() for judge in load_judge_config(path)]
     assert "must-not-appear" not in json.dumps(public)
-    assert public[0]["api_key_env"] == "SECRET_VALUE"
+    assert public[0] == {
+        "name": "gpt-4o",
+        "model": "gpt-4o",
+        "base_url": "https://example.com:443/v1",
+        "max_concurrency": 1,
+    }
 
 
 @pytest.mark.parametrize("api_key_env", ["", " ", " KEY", "KEY ", 1])
@@ -274,6 +279,11 @@ async def test_complete_protocol_over_http(tmp_path, monkeypatch, failed_judge):
             )
         )
     assert len(seen) == 7
+    assert result["config"]["judges"] == [
+        {"name": name, "model": name, "base_url": base_url, "max_concurrency": 1}
+        for name in entrypoint.SOCIALOMNI_JUDGE_NAMES
+    ]
+    assert result["summary"]["elapsed_s"] > 0
     positive, negative = result["per_sample"]["level2"]
     assert positive["predicted_when"] == "NO"
     assert positive["gold_response"] == "candidate"
@@ -388,7 +398,7 @@ async def test_empty_completion_remains_successful(content, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_phase_warmup_concurrency_order_and_failures(monkeypatch):
+async def test_phase_warmup_concurrency_order_and_failures(monkeypatch, capsys):
     monkeypatch.setenv("no_proxy", "127.0.0.1")
     active, peak = 0, 0
     seen: Counter[int] = Counter()
@@ -418,6 +428,7 @@ async def test_phase_warmup_concurrency_order_and_failures(monkeypatch):
             send,
             max_concurrency=2,
             timeout_s=5,
+            description="requests",
         )
     assert seen == {0: 2, 1: 2, 2: 1}
     assert peak == 2
@@ -425,6 +436,11 @@ async def test_phase_warmup_concurrency_order_and_failures(monkeypatch):
     assert [result.is_success for result in results] == [True, True, False]
     assert "HTTP 400: bad input" in results[-1].error
     assert wall_s >= max(result.latency_s for result in results)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "requests: warming up 2 requests" in captured.err
+    assert "requests: 0/3" in captured.err
+    assert "requests: 3/3, 1 failed" in captured.err
 
 
 @pytest.mark.asyncio

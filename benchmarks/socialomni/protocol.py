@@ -14,10 +14,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
-from benchmarks.socialomni.client import RequestResult, run_phase
+from benchmarks.socialomni.client import Progress, RequestResult, run_phase
 from benchmarks.socialomni.dataset import (
     SocialOmniLevel1Sample,
     SocialOmniLevel2Sample,
@@ -44,6 +45,15 @@ class JudgeSpec:
     base_url: str
     api_key_env: str | None
     max_concurrency: int
+
+    def public_dict(self) -> dict[str, str | int]:
+        endpoint = urlsplit(self.base_url)
+        return {
+            "name": self.name,
+            "model": self.model,
+            "base_url": endpoint._replace(netloc=endpoint.netloc.rsplit("@", 1)[-1], query="", fragment="").geturl(),
+            "max_concurrency": self.max_concurrency,
+        }
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -376,6 +386,7 @@ async def run_level2_model(
     records: list[dict[str, Any]] = []
     prepared: list[tuple[SocialOmniLevel2Sample, Path]] = []
     requests: list[RequestResult] = []
+    progress = Progress("level2 prefixes", len(samples)) if samples else None
     for sample in samples:
         record = {
             "sample_id": sample.sample_id,
@@ -401,6 +412,8 @@ async def run_level2_model(
             record["requests"].append(asdict(failure))
         else:
             prepared.append((sample, prefix))
+        if progress:
+            progress.update(not record["requests"])
 
     by_id = {record["sample_id"]: record for record in records}
     measured_wall_s = 0.0
@@ -424,7 +437,12 @@ async def run_level2_model(
             )
 
         outcomes, wall_s = await run_phase(
-            cohort, send, max_concurrency=max_concurrency, timeout_s=timeout_s, warmup=warmup
+            cohort,
+            send,
+            max_concurrency=max_concurrency,
+            timeout_s=timeout_s,
+            warmup=warmup,
+            description=f"level2 {phase}",
         )
         measured_wall_s += wall_s
         requests.extend(outcomes)
@@ -491,7 +509,12 @@ async def run_judges(
             return result
 
         results, _ = await run_phase(
-            eligible, send, max_concurrency=judge.max_concurrency, timeout_s=timeout_s, warmup=0
+            eligible,
+            send,
+            max_concurrency=judge.max_concurrency,
+            timeout_s=timeout_s,
+            warmup=0,
+            description=f"judge {judge.name}",
         )
         return results
 

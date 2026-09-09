@@ -51,7 +51,7 @@ steps:
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - |
             set +e
-            pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model" --run-level full_model
+            pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py tests/e2e/accuracy/test_qwen3_omni_socialomni_expansion.py -m "full_model" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"
             exit $$EXIT
