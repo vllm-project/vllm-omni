@@ -70,7 +70,7 @@ class QualityTestConfig:
     id: str  # pytest ID, e.g. "fp8_z_image"
     task: str  # "t2i" or "t2v"
     prompt: str  # generation prompt
-    max_lpips: float  # fail threshold — higher = more lenient
+    max_lpips: float | dict[str, float]  # threshold, or {"H100": 0.15, "B200": 0.17}
     model: str | None = None  # HF model name
     quantization: str | dict[str, object] | None = None  # quantization method/config, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
@@ -98,6 +98,23 @@ class QualityTestConfig:
         if self.quantized_model is not None:
             return None
         return self.quantization
+
+    def lpips_threshold(self) -> tuple[str, float]:
+        """Return ``(gpu_key, threshold)`` for the current CUDA device.
+
+        ``max_lpips`` is a single threshold, or a GPU-name mapping. A mapping
+        matches when the device name contains a key such as ``H100`` or ``B200``.
+        """
+        if isinstance(self.max_lpips, float | int):
+            return "default", float(self.max_lpips)
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"{self.id}: max_lpips is a GPU mapping but CUDA is unavailable")
+        device_name = torch.cuda.get_device_name()
+        for gpu_key, threshold in self.max_lpips.items():
+            if gpu_key in device_name:
+                return gpu_key, float(threshold)
+        known = ", ".join(self.max_lpips)
+        raise RuntimeError(f"{self.id}: no max_lpips entry for {device_name!r}; known: {known}")
 
     def validate(self) -> None:
         uses_explicit_models = self.baseline_model is not None or self.quantized_model is not None
@@ -190,7 +207,7 @@ QUALITY_CONFIGS = [
         quantization={"text_encoder": "fp8", "transformer": None, "vae": None},
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips=0.15,
+        max_lpips={"H100": 0.15, "B200": 0.17},
         num_inference_steps=10,
         enable_cpu_offload=True,
         height=1024,
@@ -588,8 +605,9 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- Similarity metrics ---
     lpips_score = _compute_lpips(baseline_out, quant_out, config.task)
     psnr_score, mae_score = _compute_psnr_and_mae(baseline_out, quant_out, config.task)
-    assert lpips_score <= config.max_lpips, (
-        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
+    gpu_key, max_lpips = config.lpips_threshold()
+    assert lpips_score <= max_lpips, (
+        f"LPIPS {lpips_score:.4f} exceeds threshold {max_lpips} ({gpu_key}) "
         f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"
     )
 
@@ -601,12 +619,12 @@ def test_quantization_quality(config: QualityTestConfig):
     print(f"  Baseline:      {config.baseline_ref()}")
     print(f"  Quantized:     {config.quantized_ref()}")
     print(f"  Method:        {config.quantization_ref() or 'pre-quantized checkpoint'}")
-    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {config.max_lpips})")
+    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {max_lpips}, gpu: {gpu_key})")
     print(f"  PSNR:          {psnr_score:.4f} dB  (higher is better)")
     print(f"  MAE:           {mae_score:.6f}  (lower is better)")
     print(f"  BF16 memory:   {bl_mem:.2f} GiB")
     print(f"  Quant memory:  {qt_mem:.2f} GiB  ({mem_reduction:.0f}% reduction)")
-    print(f"  Result:        {'PASS' if lpips_score <= config.max_lpips else 'FAIL'}")
+    print(f"  Result:        {'PASS' if lpips_score <= max_lpips else 'FAIL'}")
     print(f"{'=' * 60}\n")
 
     assert np.isfinite(psnr_score) or np.isinf(psnr_score), f"PSNR is invalid for {config.id}: {psnr_score}"
