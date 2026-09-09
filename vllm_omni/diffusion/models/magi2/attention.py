@@ -45,16 +45,16 @@ _MUSA_FA3_MIN_TOKENS = 32
 
 
 def _musa_fa3_varlen(**kwargs):
-    """Run MUSA FA3 with the numerically stable MATE backend.
+    """Run MUSA FA3 through the provider's default (auto) backend.
 
     Older torchada ``flash_attn_3`` wrappers do not expose the provider's
-    backend selector.  Prefer the shared adapter, then use MATE's public
-    varlen wrapper when that selector is unavailable; this keeps backend
-    selection out of the generic CUDA path.
+    backend selector. Prefer the shared adapter, then use MATE's public
+    varlen wrapper when that selector is unavailable; backend selection stays
+    out of both the generic adapter and this consumer.
     """
 
     try:
-        return flash_attn_3_varlen(**kwargs, backend="mutlass")
+        return flash_attn_3_varlen(**kwargs)
     except NotImplementedError as exc:
         q = kwargs["q"]
         if not current_omni_platform.is_musa() or not getattr(q, "is_cuda", False):
@@ -75,7 +75,7 @@ def _musa_fa3_varlen(**kwargs):
             else:
                 raise TypeError("MATE FA3 provider has no LSE return parameter")
         args = (kwargs.pop("q"), kwargs.pop("k"), kwargs.pop("v"))
-        result = flash_attn_varlen_func(*args, **kwargs, backend="mutlass")
+        result = flash_attn_varlen_func(*args, **kwargs)
         # Normalize a non-square packed [T, H] result to Omni's [H, T]
         # contract; square layouts are already shape-ambiguous and unchanged.
         if isinstance(result, tuple) and len(result) > 1:
