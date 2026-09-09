@@ -38,6 +38,11 @@ from .parallel import (
 
 logger = init_logger(__name__)
 
+# MATE's fast-exp2 approximation can accumulate error across tiny transformer
+# sequences. Use the exact Torch reference below this bound; MAGI-2 production
+# sequences are much longer and continue to use FA3.
+_MUSA_FA3_MIN_TOKENS = 32
+
 
 def _musa_fa3_varlen(**kwargs):
     """Run MUSA FA3 with the numerically stable MATE backend.
@@ -261,6 +266,7 @@ def packed_attention_with_sink(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.shape[0] > 0
         and k.shape[0] > 0
+        and q.shape[0] >= _MUSA_FA3_MIN_TOKENS
     ):
         requested_version = os.environ.get("MAGI2_FLASH_ATTN_VERSION")
         if requested_version is not None and int(requested_version) != 3:
