@@ -298,7 +298,7 @@ def _create_ltx25_natten_processor() -> LTX2VideoVaeNeighborhoodNattenProcessor:
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
             "LTX-2.5 DiffVAE requires the shi-labs/natten Hub kernel. "
-            "Install kernels==0.15.2, use a supported GPU, leave "
+            "Install kernels==0.16.1, use a supported GPU, leave "
             "DIFFUSERS_DISABLE_REMOTE_CODE unset, and allow Hub access during kernel initialization."
         ) from exc
 
@@ -662,7 +662,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         revision=revision,
     )
     if profile.text_encoder_cls is None:
-        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15.")
+        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.13.0,<5.15.")
     with torch.device("cpu"):
         pipeline.text_encoder = _load_component(
             profile.text_encoder_cls,
