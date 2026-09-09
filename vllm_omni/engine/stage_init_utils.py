@@ -1668,6 +1668,41 @@ def record_lock_holder_pid(fd: int, writable: bool) -> None:
         pass
 
 
+def parse_physical_device_ids(devices: str | None) -> frozenset[int] | None:
+    """Parse ``"0,1"`` into ``{0, 1}``; ``None`` if missing, empty or non-integer (UUID/MIG)."""
+    tokens = [tok.strip() for tok in str(devices or "").split(",") if tok.strip()]
+    if not tokens or not all(tok.isdigit() for tok in tokens):
+        return None
+    return frozenset(int(tok) for tok in tokens)
+
+
+def device_overlap_group_keys(device_sets: Sequence[frozenset[int] | None]) -> list[str]:
+    """Key each device set by the connected component of sets it shares a GPU with.
+
+    Transitively overlapping sets get one key, the sorted union of the component
+    (``{0,1}`` and ``{0}`` -> ``device-group:0,1``); disjoint sets get distinct
+    keys. ``None`` (unresolved: may touch any GPU) overlaps everything, so one
+    ``None`` collapses all sets into a single group.
+    """
+    resolved = [devices for devices in device_sets if devices is not None]
+    if len(resolved) != len(device_sets):
+        return ["device-group:*"] * len(device_sets)
+
+    components: list[set[int]] = []
+    for devices in resolved:
+        merged = set(devices)
+        disjoint = []
+        for comp in components:
+            if comp & merged:
+                merged |= comp
+            else:
+                disjoint.append(comp)
+        components = [*disjoint, merged]
+
+    key_of = {device: "device-group:" + ",".join(map(str, sorted(comp))) for comp in components for device in comp}
+    return [key_of[next(iter(devices))] for devices in resolved]
+
+
 def acquire_device_locks(
     stage_id: int,
     engine_args_dict: dict[str, Any],
