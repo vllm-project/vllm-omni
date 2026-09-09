@@ -75,6 +75,61 @@ def _tiny_cosmos3_edge_config(**overrides):
     return config
 
 
+@pytest.mark.parametrize("config_kind", ["flat", "transformer", "other_component"])
+def test_transformer_resolves_component_quant_config(
+    monkeypatch: pytest.MonkeyPatch,
+    config_kind: str,
+) -> None:
+    """Resolve the pipeline-level quantization config at the Cosmos3 boundary."""
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    received: list[tuple[str, object]] = []
+    inner_config = object()
+
+    class _StubLanguageModel(nn.Module):
+        def __init__(self, *, quant_config, **kwargs) -> None:
+            del kwargs
+            super().__init__()
+            received.append(("language_model", quant_config))
+            self.layers = nn.ModuleList()
+
+    class _StubGenDecoderLayer(nn.Module):
+        def __init__(self, *, quant_config, **kwargs) -> None:
+            del kwargs
+            super().__init__()
+            received.append(("gen_layer", quant_config))
+
+    monkeypatch.setattr(Cosmos3VFMTransformer, "_language_model_cls", _StubLanguageModel)
+    monkeypatch.setattr(transformer_cosmos3, "Cosmos3GenDecoderLayer", _StubGenDecoderLayer)
+
+    if config_kind == "flat":
+        top_level_config = inner_config
+        expected_config = inner_config
+    elif config_kind == "transformer":
+        top_level_config = ComponentQuantizationConfig({"transformer": inner_config})
+        expected_config = inner_config
+    else:
+        top_level_config = ComponentQuantizationConfig({"vae": inner_config})
+        expected_config = None
+
+    Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(num_hidden_layers=1),
+            dtype=torch.float32,
+            quantization_config=top_level_config,
+            custom_pipeline_args={},
+            model_config={},
+        )
+    )
+
+    assert received == [
+        ("language_model", expected_config),
+        ("gen_layer", expected_config),
+    ]
+
+
 def test_mrope_position_ids_cover_text_video_sound_and_action() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
         compute_mrope_position_ids_action,

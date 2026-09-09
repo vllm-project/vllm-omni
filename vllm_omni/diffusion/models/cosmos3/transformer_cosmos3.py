@@ -39,6 +39,7 @@ from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, Seque
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -1240,7 +1241,10 @@ class Cosmos3VFMTransformer(nn.Module):
         self.use_und_k_norm_for_gen = _tf_config_get(model_config, "use_und_k_norm_for_gen", None)
 
         dtype = od_config.dtype
-        quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        quant_config = resolve_component_quant_config(
+            getattr(od_config, "quantization_config", None),
+            "transformer",
+        )
 
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
