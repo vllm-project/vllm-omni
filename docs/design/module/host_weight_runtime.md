@@ -311,9 +311,41 @@ point-in-time evidence only; kernel locks are not a persistent owner registry.
 Capacity policy covers all store-owned bytes, including ready, temporary, and
 quarantined data. The local writer preflights `max_artifact_bytes`,
 `max_store_bytes`, and `min_free_bytes`, and preallocates payloads where the
-filesystem supports it. `ENOSPC` remains a normal typed store failure because
-concurrent preflight is inherently racy. Automatic eviction and strict
-concurrent reservations are not implemented.
+filesystem supports it. `ENOSPC` remains a normal typed store failure.
+
+`CapacityPolicy.build_admission` defaults to `concurrent`, preserving parallel
+production for different identities and best-effort capacity preflight. An
+explicit `serialized` policy, which requires `max_store_bytes`, admits one
+cooperative build/publication operation per domain through
+`locks/domain-build.lock`. Production lock order becomes domain admission,
+per-key build, then artifact. Validated warm hits bypass admission; queued
+same-key callers still recheck and join a completed artifact. Admission waiting
+uses the caller's existing coordination deadline and returns a retryable build
+timeout without interrupting its owner.
+
+The kernel releases admission on process exit. An explicit same-key retry uses
+the existing stale-temp recovery; files from unrelated dead builds continue to
+count toward capacity. A synchronous producer that hangs still requires
+external process supervision. Admission release errors are logged without
+revising an already determined publication result.
+
+Concurrent domains retain their exact schema-1 capacity document. Serialized
+domains use a schema-2 capacity document with `build_admission=serialized`, so
+mixed policies and old readers fail initialization rather than bypass admission.
+Opt into serialization using a new root with an agreed policy; in-place policy
+migration while old workers may exist is unsupported. For example:
+
+```python
+from vllm_omni.host_weight_runtime import CapacityPolicy
+
+capacity = CapacityPolicy(max_store_bytes=192 * 1024**3, build_admission="serialized")
+```
+
+Serialization prevents cooperative producers from racing each other's
+allocation checks. It is not a filesystem quota: control metadata, finalization,
+and outside writers can still affect total usage. Automatic eviction and
+parallel byte reservations are not implemented. This policy trades parallel
+cold-build throughput for predictable producer admission.
 
 For tmpfs, artifact bytes are host-memory consumption and may consume swap;
 they must not be reported operationally as ordinary disk capacity. The store
