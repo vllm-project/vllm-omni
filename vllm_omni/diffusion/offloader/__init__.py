@@ -20,6 +20,12 @@ from .distributed_layerwise_backend import (
 from .layerwise_backend import LayerWiseOffloadBackend
 from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 from .offload_plan import OffloadPlan, get_offload_plan
+from .plan_resolver import (
+    BlockStack,
+    ResolvedComponent,
+    ResolvedOffloadPlan,
+    resolve_offload_plan,
+)
 from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
@@ -42,6 +48,10 @@ __all__ = [
     "OffloadConfig",
     "OffloadPlan",
     "OffloadStrategy",
+    "BlockStack",
+    "ResolvedComponent",
+    "ResolvedOffloadPlan",
+    "resolve_offload_plan",
     "SupportsModelCpuOffload",
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",

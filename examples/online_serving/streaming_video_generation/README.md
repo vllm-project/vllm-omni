@@ -1,7 +1,7 @@
 # Streaming Video Generation
 
 This example uses the custom WebSocket endpoint `WS /v1/realtime/video` to receive a video byte stream as chunks are produced.
-It covers text-only video generation. Image/reference input is intentionally not included for now.
+It covers text-to-video, and image-conditioned models through `--image-reference`.
 
 ## Start The Server
 
@@ -20,7 +20,7 @@ The `--diffusion-streaming-output` CLI flag is forwarded as `streaming_output=Tr
 
 | Direction | Message | Format | Description |
 | --- | --- | --- | --- |
-| Client to server | `session.start` | JSON text: `{"type":"session.start","model":"...","prompt":"...","format":"m4s"}` | Starts generation. `format` is optional and accepts `m4s` (default). Sampling fields such as `width`, `height`, `fps`, `num_frames`, and `extra_params` may be included. |
+| Client to server | `session.start` | JSON text: `{"type":"session.start","model":"...","prompt":"...","format":"m4s"}` | Starts generation. `format` is optional and accepts `m4s` (default). Sampling fields such as `width`, `height`, `fps`, `num_frames`, and `extra_params` may be included. Image-conditioned models take a first frame as `image_reference`: `{"image_url":"https://..."}` or a `data:` URL. |
 | Client to server | `session.interaction` | JSON text: `{"type":"session.interaction","interaction":{"event_id":"xxx","event":{"prompt":"..."},"transition_chunks":3}}` | Updates the active prompt midway through generation. `event_id` is optional and `transition_chunks` defaults to the model setting. |
 | Server to client | `video.start` | JSON text: `{"type":"video.start","request_id":"...","format":"m4s","config":{...}}` | Confirms the session and mirrors the accepted `format`. |
 | Server to client | `video.chunk_metadata` | JSON text: `{"type":"video.chunk_metadata","request_id":"...","kind":"media","transport_chunk_index":0,"generation_chunk_index":0,"num_frames":9,"byte_length":1234,"started_event_ids":[],"active_event_ids":[],"completed_event_ids":[]}` | Precedes each binary frame and describes the immediately following payload. |
@@ -62,7 +62,7 @@ python streaming_video_client.py \
 The client sends one `session.start` message, prints each received binary video chunk with its byte size and elapsed time, and saves the received bytes to `--output` after `session.done`.
 The client remuxes the gathered stream to a regular progressive MP4 file so that local playback knows the video duration.
 
-Schedule midway prompt updates with `--prompt-updates`. Each entry uses `"at"` as seconds on the client clock after the server sends `video.start`:
+Schedule midway prompt updates with `--prompt-updates`. None are sent unless you ask for them, and only pipelines that implement midway prompt updates accept them (LingBot-World, for one, does not, and rejects the whole session). Each entry uses `"at"` as seconds on the client clock after the server sends `video.start`:
 
 ```bash
 python streaming_video_client.py \
@@ -70,6 +70,19 @@ python streaming_video_client.py \
   --prompt-updates '[
     {"at": 2.5, "prompt": "A sea turtle glides past the reeds"},
     {"at": 5.0, "prompt": "Sunlight breaks through the morning mist", "transition_chunks": 2}
+  ]'
+```
+
+The Helios demo continues the default prompt into an underwater storm:
+
+```bash
+python streaming_video_client.py \
+  --model BestWishYsh/Helios-Distilled \
+  --prompt-updates '[
+    {"at": 4,
+     "prompt": "An underwater tornado appears and affects the ocean floor in a dramatic and chaotic scene. The water is murky, swirling violently, carrying debris and marine life into the vortex. The tropical fish on the scene all swim in panic, trying to avoid the powerful currents. The camera remains stationary, capturing the intensity of the underwater tornado as it disrupts the serene ocean floor. Close-up shot emphasizing the turbulent motion and destruction."},
+    {"at": 11,
+     "prompt": "The swirling underwater vortex now seizes a heavy, encrusted treasure chest, its lid flapping open as it is smashed onto the ocean floor. Gold coins and silver trinkets spill out, glittering briefly in the murky water before being swept instantly into the violent funnel. The heavy wooden box tumbles end over end, colliding with floating rocks and adding to the debris field. Swirling sediment and bubbles surround the spilling fortune, highlighting the chaotic power of the storm as it ravages the seabed. Close-up shot emphasizing the turbulent motion and destruction."}
   ]'
 ```
 
@@ -106,3 +119,31 @@ Disable it in the CLI example with `--no-helios-distilled-preset`, or override/e
 python streaming_video_client.py \
   --extra-params '{"pyramid_num_inference_steps_list":[2, 2, 2]}'
 ```
+
+### LingBot-World 2.0
+
+`robbyant/lingbot-world-v2-14b-causal-fast-diffusers` is image-conditioned and runs on the
+AR-Diffusion engine, so it needs the stepwise deploy config and a first frame. See
+[the recipe](../../../recipes/Robbyant/LingBot-World-2.0.md) for the constraints on
+`width`/`height` and `num_frames`.
+
+```bash
+vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
+  --omni \
+  --deploy-config vllm_omni/deploy/lingbot_world_v2_stepwise.yaml \
+  --port 8000
+```
+
+```bash
+python streaming_video_client.py \
+  --model robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
+  --prompt "The camera moves slowly forward through the scene." \
+  --image-reference /path/to/first_frame.png \
+  --width 832 --height 480 --num-frames 33 --fps 16 --seed 42 \
+  --extra-params '{"camera_action_script":[[["w"],["w"],["w"]],[["a"],[],[]],[[],[],[]]]}' \
+  --output lingbot_world_v2_stream.mp4
+```
+
+`camera_action_script` carries one three-latent-frame WASD action list per generated
+chunk. Mid-session `session.interaction` only updates the prompt, so a LingBot rollout
+follows the camera script it started with.

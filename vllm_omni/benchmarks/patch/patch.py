@@ -14,7 +14,7 @@ import time
 import traceback
 import uuid
 import wave
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import aiohttp
 import numpy as np
 import pybase64 as base64
+from PIL import Image
 from tqdm.asyncio import tqdm
 from vllm.benchmarks import datasets
 from vllm.benchmarks.datasets import SampleRequest
@@ -85,7 +86,7 @@ from vllm_omni.benchmarks.omniinteract import (
     write_batch_artifacts as write_omniinteract_batch_artifacts,
 )
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.utils import coerce_positive_int_scalar
+from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
 
 if TYPE_CHECKING:
     from vllm_omni.clients.duplex import DuplexClient
@@ -100,7 +101,13 @@ logger = init_logger(__name__)
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
-_IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
+_IMAGE_STAGE_METRICS_BACKENDS = frozenset(
+    {
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "openai-image-edits-omni",
+    }
+)
 _PRINT_STAGE = False
 
 
@@ -201,6 +208,61 @@ def _seed_tts_capture_pcm_for_wer() -> bool:
         "1",
         "true",
         "yes",
+    )
+
+
+_DEFAULT_REQUEST_TIMEOUT_S = 900.0
+_LEGACY_REQUEST_TIMEOUT_S = 6 * 60 * 60.0
+
+# Set from the ``--omni-request-timeout-s`` CLI flag by ``vllm bench serve``
+# before the benchmark session is built (``None`` = use the default above).
+_REQUEST_TIMEOUT_OVERRIDE_S: float | None = None
+
+
+def set_request_timeout_s(value: float) -> None:
+    """Record the explicitly requested per-request timeout (from the CLI)."""
+    global _REQUEST_TIMEOUT_OVERRIDE_S
+    _REQUEST_TIMEOUT_OVERRIDE_S = float(value)
+
+
+def _omni_request_timeout_s() -> float:
+    """Per-request total timeout for the shared benchmark ``aiohttp`` session.
+
+    An explicit ``--omni-request-timeout-s`` value wins over the 900 s default;
+    ``<= 0`` restores the legacy 6 h cap. A bounded per-request timeout makes a
+    hung server surface as ``failed`` requests once the deadline fires instead
+    of pinning the benchmark slot indefinitely.
+    """
+    value = _REQUEST_TIMEOUT_OVERRIDE_S
+    if value is None:
+        return _DEFAULT_REQUEST_TIMEOUT_S
+    if value <= 0:
+        return _LEGACY_REQUEST_TIMEOUT_S
+    return value
+
+
+def _build_benchmark_session(
+    max_concurrency: int | None,
+    ssl_setting: ssl.SSLContext | bool,
+) -> aiohttp.ClientSession:
+    """Build the session shared by every benchmark request.
+
+    Connections are reused across requests to reduce TLS handshake overhead;
+    the per-request total timeout comes from ``_omni_request_timeout_s()``.
+    """
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrency or 0,
+        limit_per_host=max_concurrency or 0,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        enable_cleanup_closed=True,
+        force_close=True,
+        ssl=ssl_setting,
+    )
+    return aiohttp.ClientSession(
+        connector=connector,
+        trust_env=True,
+        timeout=aiohttp.ClientTimeout(total=_omni_request_timeout_s()),
     )
 
 
@@ -662,6 +724,11 @@ class MixRequestFuncOutput(RequestFuncOutput):
     image_generation_time_ms: float = 0.0
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
+    video_duration: float = 0.0
+    video_rtf: float = 0.0
+    video_frames: int = 0
+    video_generation_time_ms: float = 0.0
+    peak_memory_mb: float = 0.0
     text_latency: float = 0.0
     tpot_measured: bool = True
     #: Worst-case streaming-audio underrun (wall-clock seconds the player
@@ -849,7 +916,7 @@ def _record_text_token_stream_intervals(
 
 def _update_output_stage_metrics_from_payload(
     output: MixRequestFuncOutput,
-    data: dict[str, Any],
+    data: Mapping[str, object],
     *,
     update_output_tokens: bool = True,
 ) -> None:
@@ -897,7 +964,55 @@ def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
     )
 
 
-def _image_metrics_from_stage_metrics(metrics: dict[str, Any] | None) -> tuple[int, float, int, float]:
+def _peak_memory_mb_from_payload(data: Mapping[str, object]) -> float:
+    peak_memory_mb = coerce_positive_float_scalar(data.get(defs.PEAK_MEMORY_MB))
+    if peak_memory_mb is not None:
+        return peak_memory_mb
+
+    for key in ("metrics", "usage"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            peak_memory_mb = coerce_positive_float_scalar(nested.get(defs.PEAK_MEMORY_MB))
+            if peak_memory_mb is not None:
+                return peak_memory_mb
+
+    response_data = data.get("data")
+    if isinstance(response_data, list):
+        for item in response_data:
+            if isinstance(item, dict):
+                peak_memory_mb = coerce_positive_float_scalar(item.get(defs.PEAK_MEMORY_MB))
+                if peak_memory_mb is not None:
+                    return peak_memory_mb
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            contents = []
+            message = choice.get("message")
+            if isinstance(message, dict):
+                contents.append(message.get("content"))
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                contents.append(delta.get("content"))
+            for content in contents:
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            peak_memory_mb = coerce_positive_float_scalar(item.get(defs.PEAK_MEMORY_MB))
+                            if peak_memory_mb is not None:
+                                return peak_memory_mb
+    return 0.0
+
+
+def _update_output_peak_memory_from_payload(output: MixRequestFuncOutput, data: Mapping[str, object]) -> None:
+    peak_memory_mb = _peak_memory_mb_from_payload(data)
+    if peak_memory_mb > output.peak_memory_mb:
+        output.peak_memory_mb = peak_memory_mb
+
+
+def _image_metrics_from_stage_metrics(metrics: object) -> tuple[int, float, int, float]:
     if not isinstance(metrics, dict):
         return 0, 0.0, 0, 0.0
     stage_snapshot = metrics.get("stage_metrics")
@@ -924,7 +1039,7 @@ def _image_metrics_from_stage_metrics(metrics: dict[str, Any] | None) -> tuple[i
     return image_count, image_generation_ms, image_pixels, denoise_step_latency_ms
 
 
-def _image_generation_ms_from_content(content: Any) -> float:
+def _image_generation_ms_from_content(content: object) -> float:
     if not isinstance(content, list):
         return 0.0
     for item in content:
@@ -941,6 +1056,263 @@ def _image_generation_ms_from_content(content: Any) -> float:
         if gen_values:
             return max(gen_values)
     return 0.0
+
+
+def _image_info_from_response_data(content: object) -> tuple[int, int]:
+    if not isinstance(content, list):
+        return 0, 0
+    image_count = 0
+    total_pixels = 0
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        b64_json = item.get("b64_json")
+        if not isinstance(b64_json, str) or not b64_json:
+            continue
+        try:
+            with Image.open(io.BytesIO(base64.b64decode(b64_json, validate=True))) as img:
+                width, height = img.size
+                img.verify()
+                image_count += 1
+                total_pixels += int(width) * int(height)
+        except Exception:
+            logger.debug("Failed to decode generated image payload", exc_info=True)
+    return image_count, total_pixels
+
+
+def _apply_image_metrics_from_payload(output: MixRequestFuncOutput, data: Mapping[str, object]) -> int:
+    """Populate image benchmark fields from an OpenAI-compatible image payload."""
+    _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
+    _update_output_peak_memory_from_payload(output, data)
+
+    payload_image_count = 0
+    response_data = data.get("data")
+    if isinstance(response_data, list):
+        payload_image_count, content_image_pixels = _image_info_from_response_data(response_data)
+        output.image_count = max(output.image_count, payload_image_count)
+        content_image_ms = _image_generation_ms_from_content(response_data)
+        if content_image_ms > 0:
+            output.image_generation_time_ms = max(output.image_generation_time_ms, content_image_ms)
+        if content_image_pixels > 0:
+            output.image_pixels = max(output.image_pixels, content_image_pixels)
+
+    (
+        metrics_image_count,
+        metrics_image_ms,
+        metrics_image_pixels,
+        metrics_denoise_step_ms,
+    ) = _image_metrics_from_stage_metrics(data.get("metrics"))
+    if metrics_image_count > output.image_count:
+        output.image_count = metrics_image_count
+    if metrics_image_ms > output.image_generation_time_ms:
+        output.image_generation_time_ms = metrics_image_ms
+    if metrics_image_pixels > output.image_pixels:
+        output.image_pixels = metrics_image_pixels
+    if metrics_denoise_step_ms > output.denoise_step_latency_ms:
+        output.denoise_step_latency_ms = metrics_denoise_step_ms
+    return payload_image_count
+
+
+_VIDEO_FORM_FIELDS = (
+    "seconds",
+    "num_frames",
+    "fps",
+    "num_inference_steps",
+    "seed",
+    "negative_prompt",
+    "guidance_scale",
+    "guidance_scale_2",
+    "boundary_ratio",
+    "flow_shift",
+    "true_cfg_scale",
+    "generate_sound",
+    "sound_duration",
+    "enable_frame_interpolation",
+    "frame_interpolation_exp",
+    "frame_interpolation_scale",
+    "frame_interpolation_model_path",
+    "lora",
+    "extra_params",
+)
+
+
+def _video_generation_ms_from_stage_durations(stage_durations: object) -> float:
+    if not isinstance(stage_durations, dict):
+        return 0.0
+    gen_values = [
+        float(value)
+        for key, value in stage_durations.items()
+        if str(key).endswith("_gen_ms") and isinstance(value, (int, float))
+    ]
+    return max(gen_values) if gen_values else 0.0
+
+
+def _video_duration_from_payload(data: Mapping[str, object], request_body: Mapping[str, object]) -> float:
+    duration_s = coerce_positive_float_scalar(data.get("duration_s"))
+    if duration_s is not None and duration_s > 0:
+        return duration_s
+
+    num_frames = coerce_positive_float_scalar(data.get("num_frames"))
+    fps = coerce_positive_float_scalar(data.get("fps"))
+    if num_frames is not None and fps is not None and num_frames > 0 and fps > 0:
+        return num_frames / fps
+
+    seconds = coerce_positive_float_scalar(request_body.get("seconds"))
+    if seconds is not None and seconds > 0:
+        return seconds
+
+    num_frames = coerce_positive_float_scalar(request_body.get("num_frames"))
+    fps = coerce_positive_float_scalar(request_body.get("fps"))
+    if num_frames is not None and fps is not None and num_frames > 0 and fps > 0:
+        return num_frames / fps
+
+    return 0.0
+
+
+def _video_frames_from_payload(data: Mapping[str, object], request_body: Mapping[str, object]) -> int:
+    for key in ("num_frames", "video_frames", "frames"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return len(value)
+        num_frames = coerce_positive_int_scalar(value)
+        if num_frames is not None:
+            return num_frames
+
+    duration_s = coerce_positive_float_scalar(data.get("duration_s"))
+    fps = coerce_positive_float_scalar(data.get("fps"))
+    if duration_s is not None and fps is not None and duration_s > 0 and fps > 0:
+        return int(round(duration_s * fps))
+
+    num_frames = coerce_positive_int_scalar(request_body.get("num_frames"))
+    if num_frames is not None:
+        return num_frames
+
+    seconds = coerce_positive_float_scalar(request_body.get("seconds"))
+    fps = coerce_positive_float_scalar(request_body.get("fps"))
+    if seconds is not None and fps is not None and seconds > 0 and fps > 0:
+        return int(round(seconds * fps))
+
+    return 0
+
+
+def _is_structured_image_reference(reference: Mapping[str, object]) -> bool:
+    """True for API image_reference objects ({image_url}/{file_id})."""
+    image_url = reference.get("image_url")
+    file_id = reference.get("file_id")
+    has_url = isinstance(image_url, str) and bool(image_url)
+    has_file_id = isinstance(file_id, str) and bool(file_id)
+    return has_url or has_file_id
+
+
+def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> bool:
+    if isinstance(reference, dict) and "bytes" in reference:
+        form.add_field(
+            "input_reference",
+            reference["bytes"],
+            filename="benchmark-reference",
+            content_type=reference.get("content_type", "application/octet-stream"),
+        )
+        return True
+
+    if isinstance(reference, Mapping) and _is_structured_image_reference(reference):
+        form.add_field("image_reference", json.dumps(dict(reference)))
+        return True
+
+    if isinstance(reference, list):
+        if reference and all(isinstance(item, Mapping) and _is_structured_image_reference(item) for item in reference):
+            form.add_field("image_reference", json.dumps([dict(item) for item in reference]))
+            return True
+        raise ValueError(
+            "Unsupported image_reference list; expected non-empty list of "
+            '{"image_url": "..."} and/or {"file_id": "..."} objects.'
+        )
+
+    if isinstance(reference, str):
+        if reference.startswith(("data:image", "http://", "https://")):
+            form.add_field("image_reference", json.dumps({"image_url": reference}))
+            return True
+        local_path = reference.removeprefix("file://")
+        if os.path.exists(local_path):
+            with open(local_path, "rb") as f:
+                reference_bytes = f.read()
+            form.add_field(
+                "input_reference",
+                reference_bytes,
+                filename=os.path.basename(local_path),
+                content_type=_guess_mime_type(local_path),
+            )
+            return True
+        raise ValueError(f"Unsupported image_reference path or URL: {reference!r}")
+
+    raise ValueError(
+        "Unsupported image_reference; expected upload bytes, local path/URL string, "
+        'or {"image_url": "..."} / {"file_id": "..."} object '
+        f"(got {type(reference).__name__})."
+    )
+
+
+def _add_video_extra_body_to_form(
+    form: aiohttp.FormData,
+    extra_body: Mapping[str, object],
+    request_body: Mapping[str, object],
+) -> None:
+    for key in _VIDEO_FORM_FIELDS:
+        value = request_body.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            form.add_field(key, json.dumps(value))
+        else:
+            form.add_field(key, str(value))
+
+    reserved = {
+        "model",
+        "prompt",
+        "size",
+        "width",
+        "height",
+        "poll_interval_s",
+        "poll_timeout_s",
+        # Handled only by _add_video_reference_to_form (upload / JSON image_url).
+        "image_reference",
+        "input_reference",
+        *_VIDEO_FORM_FIELDS,
+    }
+    for key, value in extra_body.items():
+        if key in reserved or value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            form.add_field(key, json.dumps(value))
+        else:
+            form.add_field(key, str(value))
+
+
+def _apply_video_metrics_from_payload(
+    output: MixRequestFuncOutput,
+    data: Mapping[str, object],
+    request_body: Mapping[str, object],
+) -> None:
+    output.video_duration = _video_duration_from_payload(data, request_body)
+    output.video_frames = _video_frames_from_payload(data, request_body)
+    _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
+    _update_output_peak_memory_from_payload(output, data)
+
+    stage_durations = data.get("stage_durations")
+    stage_gen_ms = _video_generation_ms_from_stage_durations(stage_durations)
+    if stage_gen_ms <= 0:
+        inference_time_s = coerce_positive_float_scalar(data.get("inference_time_s"))
+        if inference_time_s is not None and inference_time_s > 0:
+            stage_gen_ms = inference_time_s * 1000.0
+    output.video_generation_time_ms = max(output.video_generation_time_ms, stage_gen_ms)
+    if output.video_duration <= 0:
+        return
+    # Prefer server-reported generation time so RTF is independent of client
+    # poll_interval_s sleep/overshoot baked into output.latency.
+    generation_s = output.video_generation_time_ms / 1000.0
+    if generation_s > 0:
+        output.video_rtf = generation_s / output.video_duration
+    elif output.latency > 0:
+        output.video_rtf = output.latency / output.video_duration
 
 
 async def async_request_openai_chat_omni_completions(
@@ -1036,6 +1408,7 @@ async def async_request_openai_chat_omni_completions(
         output.image_generation_time_ms = 0.0
         output.image_pixels = 0
         output.denoise_step_latency_ms = 0.0
+        output.peak_memory_mb = 0.0
         completion_tokens_seen = 0
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
@@ -1065,6 +1438,7 @@ async def async_request_openai_chat_omni_completions(
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
                                 _update_output_stage_metrics_from_payload(output, data)
+                                _update_output_peak_memory_from_payload(output, data)
                                 usage = data.get("usage")
                                 completion_tokens = None
                                 if isinstance(usage, dict):
@@ -1281,16 +1655,243 @@ async def async_request_openai_chat_omni_completions(
     return output
 
 
+def _finalize_image_json_http_response(
+    output: MixRequestFuncOutput,
+    *,
+    start_time: float,
+    status: int,
+    data: Mapping[str, object] | None,
+    error_text: str | None,
+) -> None:
+    """Set e2el after the image JSON body has been fully read and validated."""
+    output.latency = time.perf_counter() - start_time
+    if status != 200:
+        output.error = f"HTTP {status}: {error_text or ''}"
+        output.success = False
+        return
+    if not isinstance(data, Mapping):
+        output.error = "HTTP 200 response did not contain a JSON object"
+        output.success = False
+        return
+    payload_image_count = _apply_image_metrics_from_payload(output, data)
+    if payload_image_count <= 0:
+        output.error = "HTTP 200 response did not contain a valid image payload"
+        output.success = False
+        return
+    output.success = True
+
+
+async def async_request_openai_image_generations_omni(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """JSON request to /v1/images/generations for image generation benchmarks."""
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Image Generations API", "images/generations")
+
+    extra_body = dict(request_func_input.extra_body or {})
+    model = request_func_input.model_name if request_func_input.model_name else request_func_input.model
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.itl = []
+    output.stage_metrics = {}
+    output.output_tokens = 0
+    output.image_count = 0
+    output.image_generation_time_ms = 0.0
+    output.image_pixels = 0
+    output.denoise_step_latency_ms = 0.0
+
+    size = extra_body.get("size")
+    if size is None:
+        width, height = extra_body.get("width"), extra_body.get("height")
+        if width is not None and height is not None:
+            size = f"{width}x{height}"
+
+    payload: dict[str, object] = {
+        "model": model,
+        "prompt": request_func_input.prompt,
+        "n": int(extra_body.pop("n", extra_body.pop("num_outputs_per_prompt", 1)) or 1),
+        "response_format": "b64_json",
+    }
+    if size is not None:
+        payload["size"] = str(size)
+
+    for key, value in extra_body.items():
+        if key in {"height", "width"}:
+            continue
+        payload.setdefault(key, value)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    st = time.perf_counter()
+    output.start_time = st
+    try:
+        async with session.post(url=api_url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=data if isinstance(data, Mapping) else None,
+                    error_text=None,
+                )
+            else:
+                error_text = await response.text()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=None,
+                    error_text=error_text,
+                )
+    except Exception:
+        output.latency = time.perf_counter() - st
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(f"ERROR: send image generation request failed, reason is: {output.error}")
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_openai_videos_omni(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Multipart request to async /v1/videos, polling metadata until completion."""
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Videos API", "videos")
+
+    extra_body = dict(request_func_input.extra_body or {})
+    model = request_func_input.model_name if request_func_input.model_name else request_func_input.model
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.itl = []
+    output.stage_metrics = {}
+    output.output_tokens = 0
+    output.video_duration = 0.0
+    output.video_generation_time_ms = 0.0
+
+    request_body: dict[str, object] = {
+        "model": model,
+        "prompt": request_func_input.prompt,
+    }
+    request_body.update(extra_body)
+
+    size = request_body.get("size")
+    if size is None:
+        width, height = request_body.get("width"), request_body.get("height")
+        if width is not None and height is not None:
+            size = f"{width}x{height}"
+    if size is not None:
+        request_body["size"] = str(size)
+
+    form = aiohttp.FormData()
+    form.add_field("model", str(model))
+    form.add_field("prompt", str(request_func_input.prompt))
+    if request_body.get("size") is not None:
+        form.add_field("size", str(request_body["size"]))
+    _add_video_extra_body_to_form(form, extra_body, request_body)
+
+    reference_added = False
+    for reference in _iter_image_edit_inputs(request_func_input.multi_modal_content):
+        if _add_video_reference_to_form(form, reference):
+            reference_added = True
+            break
+    if not reference_added:
+        image_reference = extra_body.get("image_reference")
+        if image_reference is not None:
+            _add_video_reference_to_form(form, image_reference)
+
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    poll_interval_s = float(extra_body.get("poll_interval_s", 2.0) or 2.0)
+    timeout_s = float(extra_body.get("poll_timeout_s", 6 * 60 * 60) or (6 * 60 * 60))
+    st = time.perf_counter()
+    output.start_time = st
+    try:
+        async with session.post(url=api_url, data=form, headers=headers) as response:
+            if response.status != 200:
+                output.latency = time.perf_counter() - st
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+                return output
+            create_payload = await response.json()
+
+        job_id = create_payload.get("id")
+        job_status = create_payload.get("status")
+        if not isinstance(job_id, str) or not job_id:
+            output.latency = time.perf_counter() - st
+            output.error = "Video creation response missing job id."
+            output.success = False
+            return output
+
+        job_url = f"{api_url.rstrip('/')}/{job_id}"
+        poll_payload = create_payload
+        deadline = time.perf_counter() + timeout_s
+        while job_status not in {"completed", "failed"}:
+            if time.perf_counter() >= deadline:
+                output.latency = time.perf_counter() - st
+                output.error = f"Timed out waiting for video job {job_id} to complete."
+                output.success = False
+                return output
+            await asyncio.sleep(poll_interval_s)
+            async with session.get(job_url, headers=headers) as poll_response:
+                if poll_response.status != 200:
+                    output.latency = time.perf_counter() - st
+                    output.error = f"Polling failed HTTP {poll_response.status}: {await poll_response.text()}"
+                    output.success = False
+                    return output
+                poll_payload = await poll_response.json()
+                job_status = poll_payload.get("status")
+
+        output.latency = time.perf_counter() - st
+        if job_status == "failed":
+            output.error = f"Video job failed: {poll_payload}"
+            output.success = False
+            return output
+
+        _apply_video_metrics_from_payload(output, poll_payload, request_body)
+        output.success = True
+    except Exception:
+        output.latency = time.perf_counter() - st
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(f"ERROR: send video request failed, reason is: {output.error}")
+    finally:
+        if pbar:
+            pbar.update(1)
+    return output
+
+
 async def async_request_openai_image_edits_omni(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> MixRequestFuncOutput:
-    """Streaming request to /v1/images/edits for multi-stage image-edit benchmarks."""
+    """Multipart request to /v1/images/edits.
+
+    Defaults to non-streaming JSON so single-stage edit models work. The server
+    rejects ``stream=true`` when ``len(stage_configs) <= 1``. Pass
+    ``stream: true`` in ``--extra-body`` for multi-stage SSE (AR TTFT / image
+    chunks).
+    """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Image Edits API", "images/edits")
 
     extra_body = dict(request_func_input.extra_body or {})
+    want_stream = coerce_bool(extra_body.pop("stream", None), default=False)
     model = request_func_input.model_name if request_func_input.model_name else request_func_input.model
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
@@ -1307,7 +1908,7 @@ async def async_request_openai_image_edits_omni(
     form.add_field("prompt", request_func_input.prompt)
     form.add_field("response_format", "b64_json")
     form.add_field("output_format", str(extra_body.get("output_format", "png")))
-    form.add_field("stream", "true")
+    form.add_field("stream", "true" if want_stream else "false")
 
     size = extra_body.get("size")
     if size is None:
@@ -1340,12 +1941,21 @@ async def async_request_openai_image_edits_omni(
 
     st = time.perf_counter()
     output.start_time = st
-    timestamp = st
-    most_recent_text_timestamp = st
-    generated_text = ""
     try:
         async with session.post(url=api_url, data=form, headers=headers) as response:
-            if response.status == 200:
+            if response.status != 200:
+                error_text = await response.text()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=None,
+                    error_text=error_text,
+                )
+            elif want_stream:
+                timestamp = st
+                most_recent_text_timestamp = st
+                generated_text = ""
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
                     if not chunk_bytes:
@@ -1366,6 +1976,7 @@ async def async_request_openai_image_edits_omni(
                             data,
                             update_output_tokens=(data.get("type") == "ar_delta"),
                         )
+                        _update_output_peak_memory_from_payload(output, data)
 
                         chunk_type = data.get("type")
                         if chunk_type == "ar_delta":
@@ -1401,9 +2012,16 @@ async def async_request_openai_image_edits_omni(
                 output.generated_text = generated_text
                 output.success = True
             else:
-                output.error = f"HTTP {response.status}: {await response.text()}"
-                output.success = False
+                data = await response.json()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=data if isinstance(data, Mapping) else None,
+                    error_text=None,
+                )
     except Exception:
+        output.latency = time.perf_counter() - st
         output.success = False
         output.error = traceback.format_exc()
         logger.error(f"ERROR: send image edit request failed, reason is: {output.error}")
@@ -1951,6 +2569,18 @@ ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_complet
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
 
+ASYNC_REQUEST_FUNCS["/v1/images/edits"] = async_request_openai_image_edits_omni
+if "/v1/images/edits" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("/v1/images/edits")
+
+ASYNC_REQUEST_FUNCS["/v1/images/generations"] = async_request_openai_image_generations_omni
+if "/v1/images/generations" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("/v1/images/generations")
+
+ASYNC_REQUEST_FUNCS["/v1/videos"] = async_request_openai_videos_omni
+if "/v1/videos" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("/v1/videos")
+
 ASYNC_REQUEST_FUNCS["openai-audio-speech"] = async_request_openai_audio_speech
 if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-audio-speech")
@@ -2041,21 +2671,8 @@ async def benchmark(
 
     # Reuses connections across requests to reduce TLS handshake overhead.
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
-    connector = aiohttp.TCPConnector(
-        limit=max_concurrency or 0,
-        limit_per_host=max_concurrency or 0,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-        enable_cleanup_closed=True,
-        force_close=True,
-        ssl=ssl_setting,
-    )
-
-    session = aiohttp.ClientSession(
-        connector=connector,
-        trust_env=True,
-        timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
-    )
+    session = _build_benchmark_session(max_concurrency, ssl_setting)
+    print(f"Per-request timeout: {_omni_request_timeout_s():g}s")
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
@@ -2330,6 +2947,18 @@ async def benchmark(
             defs.IMAGE_THROUGHPUT: getattr(metrics, defs.IMAGE_THROUGHPUT),
             defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
             defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
+            defs.TOTAL_VIDEO_DURATION_S: getattr(metrics, defs.TOTAL_VIDEO_DURATION_S),
+            defs.TOTAL_VIDEO_FRAMES: getattr(metrics, defs.TOTAL_VIDEO_FRAMES),
+            defs.VIDEO_THROUGHPUT: getattr(metrics, defs.VIDEO_THROUGHPUT),
+            defs.MEAN_VIDEO_RTF: getattr(metrics, defs.MEAN_VIDEO_RTF),
+            defs.MEDIAN_VIDEO_RTF: getattr(metrics, defs.MEDIAN_VIDEO_RTF),
+            defs.PERCENTILES_VIDEO_RTF: getattr(metrics, defs.PERCENTILES_VIDEO_RTF),
+            defs.MEAN_VIDEO_GENERATION_MS: getattr(metrics, defs.MEAN_VIDEO_GENERATION_MS),
+            defs.MEDIAN_VIDEO_GENERATION_MS: getattr(metrics, defs.MEDIAN_VIDEO_GENERATION_MS),
+            defs.PERCENTILES_VIDEO_GENERATION_MS: getattr(metrics, defs.PERCENTILES_VIDEO_GENERATION_MS),
+            defs.MEAN_PEAK_MEMORY_MB: getattr(metrics, defs.MEAN_PEAK_MEMORY_MB),
+            defs.MEDIAN_PEAK_MEMORY_MB: getattr(metrics, defs.MEDIAN_PEAK_MEMORY_MB),
+            defs.PERCENTILES_PEAK_MEMORY_MB: getattr(metrics, defs.PERCENTILES_PEAK_MEMORY_MB),
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,

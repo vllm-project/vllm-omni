@@ -125,7 +125,7 @@ from .denoise_loop import (
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
-from .lora import load_minimax_h3_turbo_lora
+from .lora import TurboSpec, load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
@@ -188,9 +188,6 @@ MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
 MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
-MINIMAX_H3_TURBO_SIGMA_POINTS = 5
-MINIMAX_H3_TURBO_VIDEO_SHIFT = 6.0
-MINIMAX_H3_TURBO_AUDIO_SHIFT = 3.0
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
     "Ref2VA/model_index.json",
@@ -706,7 +703,7 @@ class MiniMaxH3Pipeline(
     ) -> tuple[LoRAModel, PEFTHelper] | None:
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
-        self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
@@ -726,8 +723,9 @@ class MiniMaxH3Pipeline(
             unsupported_offload_mode=" or ".join(offload_modes) or None,
         )
         if loaded is not None:
-            self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
-            return loaded
+            lora_model, peft_helper, turbo_spec = loaded
+            self._turbo_lora_specs[lora_request.lora_int_id] = turbo_spec
+            return lora_model, peft_helper
 
         # Selection is by the artifact's safetensors ``key_format``, not by the
         # running platform: the native loader is checkpoint-format parsing with
@@ -753,7 +751,7 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
-        if lora_model.id in self._turbo_lora_adapter_ids:
+        if lora_model.id in self._turbo_lora_specs:
             missing = sorted(set(lora_model.loras) - bound_lora_names)
             if missing:
                 raise ValueError(
@@ -769,14 +767,6 @@ class MiniMaxH3Pipeline(
                 "MiniMax-H3 native LoRA binding is incomplete: "
                 f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
             )
-
-    def _has_active_turbo_lora(self, sampling: Any) -> bool:
-        lora_request = sampling.lora_request
-        return (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._turbo_lora_adapter_ids
-        )
 
     def _has_active_native_lora(self, sampling: Any) -> bool:
         lora_request = sampling.lora_request
@@ -837,27 +827,46 @@ class MiniMaxH3Pipeline(
             return adapter_schedule
         return self._base_schedule_for_task(task)
 
-    def _validate_turbo_sampling(self, sampling: Any) -> None:
+    def _active_turbo_spec(self, sampling: Any) -> TurboSpec | None:
+        """Return the spec of the Turbo adapter this request actually applies.
+
+        A recognized adapter at scale 0 contributes nothing, so it neither
+        constrains the task nor imposes its sampler contract.
+        """
+
+        lora_request = sampling.lora_request
+        if lora_request is None or math.isclose(0.0, float(sampling.lora_scale)):
+            return None
+        return self._turbo_lora_specs.get(lora_request.lora_int_id)
+
+    def _validate_turbo_sampling(self, sampling: Any, spec: TurboSpec) -> None:
+        """Hold a request to the contract of the artifact that is loaded.
+
+        Sigma-point count and both flow shifts vary across the Turbo family, so
+        each is checked against the adapter's own spec rather than a single
+        published configuration.
+        """
+
         extra = sampling.extra_args or {}
         sigma_points = sampling.num_inference_steps
-        if sigma_points != MINIMAX_H3_TURBO_SIGMA_POINTS:
+        if sigma_points != spec.sigma_points:
             raise OmniClientError(
-                "MiniMax-H3 Turbo requires num_inference_steps=5 (five sigma points produce four denoiser evaluations)"
+                f"{spec.filename} is a {spec.denoise_steps}-step artifact and requires "
+                f"num_inference_steps={spec.sigma_points} "
+                f"({spec.sigma_points} sigma points produce {spec.denoise_steps} denoiser evaluations)"
             )
         try:
             video_shift = float(extra.get("flow_shift", self.default_video_shift))
         except (TypeError, ValueError) as exc:
-            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}") from exc
-        if not math.isclose(video_shift, MINIMAX_H3_TURBO_VIDEO_SHIFT):
-            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}")
+            raise OmniClientError(f"{spec.filename} requires flow_shift={spec.video_shift:g}") from exc
+        if not math.isclose(video_shift, spec.video_shift):
+            raise OmniClientError(f"{spec.filename} requires flow_shift={spec.video_shift:g}")
         try:
             audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
         except (TypeError, ValueError) as exc:
-            raise OmniClientError(
-                f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}"
-            ) from exc
-        if not math.isclose(audio_shift, MINIMAX_H3_TURBO_AUDIO_SHIFT):
-            raise OmniClientError(f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}")
+            raise OmniClientError(f"{spec.filename} requires audio_flow_shift={spec.audio_shift:g}") from exc
+        if not math.isclose(audio_shift, spec.audio_shift):
+            raise OmniClientError(f"{spec.filename} requires audio_flow_shift={spec.audio_shift:g}")
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -890,7 +899,7 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
-        self._turbo_lora_adapter_ids: set[int] = set()
+        self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
@@ -1177,7 +1186,7 @@ class MiniMaxH3Pipeline(
         requested: str | None,
         multi_modal_data: dict[str, Any],
         *,
-        has_turbo_lora: bool = False,
+        turbo_spec: TurboSpec | None = None,
         has_native_lora: bool = False,
     ) -> str:
         if requested is None:
@@ -1196,8 +1205,11 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"checkpoint partition {self.partition!r} supports {sorted(self.supported_tasks)}, got task={task!r}"
             )
-        if task == "ref2va" and has_turbo_lora:
-            raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
+        if turbo_spec is not None and task not in turbo_spec.supported_tasks:
+            raise OmniClientError(
+                f"{turbo_spec.filename} is a {turbo_spec.task_family} Turbo artifact and serves "
+                f"{sorted(turbo_spec.supported_tasks)}, got task={task!r}"
+            )
         if has_native_lora and task != "t2va":
             raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
         if self._fasth3 is not None:
@@ -2216,16 +2228,16 @@ class MiniMaxH3Pipeline(
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
-        has_turbo_lora = self._has_active_turbo_lora(sampling)
+        turbo_spec = self._active_turbo_spec(sampling)
         has_native_lora = self._has_active_native_lora(sampling)
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
-            has_turbo_lora=has_turbo_lora,
+            turbo_spec=turbo_spec,
             has_native_lora=has_native_lora,
         )
-        if has_turbo_lora:
-            self._validate_turbo_sampling(sampling)
+        if turbo_spec is not None:
+            self._validate_turbo_sampling(sampling, turbo_spec)
         if has_native_lora:
             self._validate_native_sampling(sampling, task=task)
         if self._fasth3 is not None:

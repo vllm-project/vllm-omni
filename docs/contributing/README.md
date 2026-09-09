@@ -262,6 +262,28 @@ or serving, explain the required L2/L3 environment and provide the exact command
 
 Repository skills guide the agent, but they do not replace contributor judgment, the accepted issue or RFC, required test evidence, or maintainer review. Review all generated changes before submitting them.
 
+## AI Usage Policy
+
+AI tools are welcome in vLLM-Omni contributions. Contributors, including maintainers, remain responsible for everything they submit. These requirements apply to pull requests, issues, discussions, and review comments:
+
+- **Disclose AI assistance.** Name the tools used and describe their role in the submission, including assistance with code, tests, documentation, or writing.
+- **Understand your changes.** Review every generated change and be able to explain its behavior, design choices, and interaction with vLLM-Omni without relying on AI to answer for you.
+- **Validate before submitting.** Run relevant checks and report actual results. For model, kernel, or performance changes, include the hardware, model, configuration, and commands needed to reproduce accuracy or benchmark evidence. Clearly identify checks you could not run; generated claims are not test results.
+- **Keep communication useful.** Verify technical claims, search for existing reports, and edit AI-assisted text for accuracy and brevity. Submit only content you have personally reviewed, and take responsibility for responding to review feedback.
+- **Label generated media.** Model-generated images, video, and audio are valid examples or test artifacts for this multimodal project. Identify them as generated output and provide the model, inputs, and reproduction settings. Do not present them as ground-truth references or independent evidence of correctness.
+
+For example, a PR description could include:
+
+```text
+AI assistance: Used Codex to draft the regression test and PR description.
+I reviewed the changes and verified the test reproduces the reported failure.
+Validation: <commands, results, hardware, and any checks not run>.
+```
+
+Maintainer review time is limited. Contributions that are unverified, misleading, or beyond the author's understanding may be closed. Repeated violations may lead to contribution restrictions. New contributors are welcome to ask for help and submit small, well-understood changes.
+
+This policy is adapted from [Ghostty's AI Usage Policy](https://github.com/ghostty-org/ghostty/blob/main/AI_POLICY.md) for vLLM-Omni's contribution and multimodal validation workflows. The [coding-agent workflow](#using-repository-skills-with-coding-agents) provides practical guidance for applying it.
+
 ## Issues
 
 If you encounter a bug or have a feature request, please search existing issues first to see if it has already been reported. If not, please file a new issue, providing as much relevant information as possible.

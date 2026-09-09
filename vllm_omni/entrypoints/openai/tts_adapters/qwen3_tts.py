@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS serving adapter."""
 
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import regex as re
+from vllm.inputs import tokens_input
 from vllm.logger import init_logger
+from vllm.utils.async_utils import make_async
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -15,6 +18,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     PreparedRequest,
     TTSGenerationError,
+    conditioning_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
@@ -23,6 +27,7 @@ if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
+_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 
 QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_qwen3_tts_effective_max_tokens"
 _MIN_CODEC_FRAMES = 192
@@ -44,6 +49,33 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
     supported_output_sample_rates = frozenset({8000, 24000})
+
+    def __init__(self, ctx) -> None:
+        super().__init__(ctx)
+        self._estimate_prompt_len_async = make_async(
+            self._estimate_prompt_len, executor=getattr(ctx.server, "_tts_executor", None)
+        )
+
+    def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
+        codec_frame_rate = self.capabilities.codec_frame_rate
+        if codec_frame_rate is None:
+            return None
+        try:
+            item = ref_audio
+            while isinstance(item, list) and item:
+                if len(item) == 2 and isinstance(item[1], (int, float)):
+                    break
+                item = item[0]
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                return None
+            wav, sr = item
+            sr = int(sr)
+            n_samples = len(wav) if hasattr(wav, "__len__") else wav.shape[-1]
+            if sr <= 0 or n_samples <= 0:
+                return None
+            return math.ceil(n_samples / sr * codec_frame_rate)
+        except Exception:
+            return None
 
     def _get_model_variant(self) -> str | None:
         """Return the task supported by the loaded Qwen3-TTS checkpoint.
@@ -223,15 +255,208 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
         return None
 
+    def _build_tts_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
+        """Build TTS parameters from request.
+
+        Processes each parameter if present, skips if not.
+        Values are wrapped in lists as required by the model.
+        """
+        server = self.ctx.server
+
+        params: dict[str, Any] = {}
+
+        # Text content (always required)
+        params["text"] = [request.input]
+
+        # Task type
+        if request.task_type is not None:
+            params["task_type"] = [request.task_type]
+        else:
+            params["task_type"] = ["CustomVoice"]
+
+        # Language
+        if request.language is not None:
+            params["language"] = [request.language]
+        else:
+            params["language"] = ["Auto"]
+
+        # Speaker (voice)
+        if request.voice is not None:
+            voice_lower = request.voice.lower()
+            precomputed_speakers = self.capabilities.precomputed_speakers
+            params["speaker"] = [request.voice]
+            params["voice_created_at"] = [server._voice_created_at(voice_lower)]
+
+            # Uploaded voices use task_type="Base" (CustomVoice requires built-in spk_id).
+            # If ref_text was provided at upload time, use in-context cloning; otherwise x_vector only.
+            if voice_lower in server.uploaded_speakers and request.ref_audio is None:
+                speaker_info = server.uploaded_speakers[voice_lower]
+
+                # Check if this voice was uploaded with a pre-computed embedding.
+                # Populate request.speaker_embedding so the existing code path
+                # (below) handles voice_clone_prompt and x_vector_only_mode.
+                embedding = server._get_uploaded_speaker_embedding(request.voice)
+                if embedding is not None:
+                    request.speaker_embedding = embedding
+                    params["speaker"] = [voice_lower]
+                    params["task_type"] = ["Base"]
+                    logger.info("Auto-set speaker_embedding for uploaded voice: %s", request.voice)
+                else:
+                    audio_data = server._get_uploaded_audio_data(request.voice)
+                    if not audio_data:
+                        raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
+                    stored_ref_text = speaker_info.get("ref_text")
+                    params["speaker"] = [voice_lower]
+                    params["ref_audio"] = [audio_data]
+                    params["task_type"] = ["Base"]
+                    if stored_ref_text:
+                        params["ref_text"] = [stored_ref_text]
+                        params["x_vector_only_mode"] = [False]
+                    else:
+                        params["x_vector_only_mode"] = [True]
+                    logger.info(
+                        "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
+                    )
+            elif voice_lower in precomputed_speakers and request.ref_audio is None:
+                profile = precomputed_speakers[voice_lower]
+                mode = str(profile.get("mode") or "xvec").lower()
+                params["speaker"] = [voice_lower]
+                params["task_type"] = ["Base"]
+                params["x_vector_only_mode"] = [mode != "icl"]
+                ref_text = request.ref_text or profile.get("ref_text")
+                if isinstance(ref_text, str) and ref_text.strip():
+                    params["ref_text"] = [ref_text]
+                ref_code_length = profile.get("ref_code_length")
+                if mode == "icl" and ref_code_length:
+                    params["ref_code_length"] = [int(ref_code_length)]
+                logger.info("Using precomputed Qwen3-TTS custom voice profile: %s (mode=%s)", voice_lower, mode)
+
+        elif params["task_type"][0] == "CustomVoice":
+            params["speaker"] = ["Vivian"]  # Default for CustomVoice
+
+        # Instructions for style/emotion control
+        if request.instructions is not None:
+            params["instruct"] = [request.instructions]
+        else:
+            params["instruct"] = [""]
+
+        # Voice clone: ref_audio resolved in create_speech(), not here.
+        if request.ref_text is not None:
+            params["ref_text"] = [request.ref_text]
+        if request.speaker_embedding is not None:
+            # Store as plain float list (not tensor) so it survives msgspec
+            # serialization through the EngineCore IPC boundary.  The talker's
+            # _build_prompt_embeds converts it back to a tensor on the GPU.
+            params["voice_clone_prompt"] = [
+                {
+                    "ref_spk_embedding": list(request.speaker_embedding),
+                }
+            ]
+            # speaker_embedding implies x_vector_only_mode
+            params["x_vector_only_mode"] = [True]
+        elif request.x_vector_only_mode is not None:
+            params["x_vector_only_mode"] = [request.x_vector_only_mode]
+
+        # Generation parameters
+        if request.max_new_tokens is not None:
+            params["max_new_tokens"] = [request.max_new_tokens]
+        else:
+            params["max_new_tokens"] = [2048]
+
+        if request.initial_codec_chunk_frames is not None:
+            params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
+
+        if request.non_streaming_mode is not None:
+            params["non_streaming_mode"] = [request.non_streaming_mode]
+        # Preserve the legacy VoiceDesign fallback when the request omits an
+        # explicit override. CustomVoice and Base rely on model defaults
+        # (True and False respectively).
+        elif params["task_type"][0] == "VoiceDesign":
+            params["non_streaming_mode"] = [True]
+
+        return params
+
+    def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
+        """Estimate prompt length so the placeholder matches model-side embeddings."""
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+                Qwen3TTSPromptEmbedsBuilder,
+            )
+
+            server = self.ctx.server
+            if server._tts_tokenizer is None:
+                from transformers import AutoTokenizer
+
+                model_name = self.ctx.engine_client.model_config.model
+                server._tts_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    padding_side="left",
+                )
+            hf_config = self.ctx.engine_client.model_config.hf_config
+            talker_config = hf_config.talker_config
+            task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+            return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+                additional_information=tts_params,
+                task_type=task_type,
+                tokenize_prompt=lambda t: server._tts_tokenizer(t, padding=False)["input_ids"],
+                codec_language_id=getattr(talker_config, "codec_language_id", None),
+                spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
+                estimate_ref_code_len=self._estimate_ref_code_len,
+            )
+        except Exception as e:
+            logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
+            return 2048
+
+    def _qwen3_tts_can_use_ref_audio_artifact_only(self, tts_params: dict[str, Any], artifact_key: str | None) -> bool:
+        server = self.ctx.server
+        x_vector_only = server._tts_x_vector_only(tts_params)
+        if not artifact_key or (artifact_key, x_vector_only) not in server._ref_audio_model_artifact_ready:
+            return False
+        return (tts_params.get("task_type") or ["CustomVoice"])[0] == "Base"
+
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        prompt, tts_params, warmup_key = await self.ctx.server._build_qwen3_tts_request(request)
+        """Build prompt + tts_params for Qwen3-TTS.
+
+        Called from ``Qwen3TTSAdapter.build``. Returns
+        ``(prompt, tts_params, warmup_artifact_key)`` where the warmup key is the
+        Qwen3-TTS ref-audio artifact tracked after ``generate()``.
+        """
+        server = self.ctx.server
+        qwen3_ref_audio_warmup_artifact_key: str | None = None
+        tts_params = self._build_tts_params(request)
+        # Resolve ref_audio (explicit or auto-set for uploaded voices)
+        # to [[wav_list, sr]] so the model doesn't re-decode base64.
+        ref_audio_source = request.ref_audio
+        if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
+            # Uploaded voice: ref_audio was auto-set as [base64_data_url]
+            ref_audio_source = tts_params["ref_audio"][0]
+        if ref_audio_source is not None and isinstance(ref_audio_source, str):
+            wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio_source)
+            tts_params["ref_audio_cache_key"] = cache_key
+            artifact_key = server._get_resolved_ref_audio_artifact_key(cache_key)
+            if artifact_key:
+                tts_params[_REF_AUDIO_CACHE_KEY] = [artifact_key]
+            ref_code_length = self._estimate_ref_code_len([wav_list, sr])
+            if ref_code_length is not None:
+                tts_params["ref_code_length"] = [int(ref_code_length)]
+            if self._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
+                logger.debug("Using Qwen3-TTS ref_audio artifact-only path: %s", artifact_key)
+            else:
+                tts_params["ref_audio"] = [[wav_list, sr]]
+                qwen3_ref_audio_warmup_artifact_key = artifact_key
+
+        ph_len = await self._estimate_prompt_len_async(tts_params)
+        prompt = tokens_input(prompt_token_ids=[1] * ph_len)
+        prompt["additional_information"] = tts_params
+        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(
             prompt=prompt,
             tts_params=tts_params,
             model_type=tts_params.get("task_type", ["unknown"])[0],
-            warmup_artifact_key=warmup_key,
+            warmup_artifact_key=qwen3_ref_audio_warmup_artifact_key,
         )
 
     def _get_expected_speaker_embedding_dim(self) -> int:
@@ -339,6 +564,16 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             additional_information = prompt.get("additional_information")
             if isinstance(additional_information, dict) and effective_cap is not None:
                 additional_information[QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
+
+        # Propagate the deploy/YAML stage seed to residual MTP sampling. The
+        # generic serving layer applies an explicit request.seed afterwards,
+        # so the request value still has higher precedence.
+        stage0_params = sampling_params_list[0]
+        default_seed = getattr(stage0_params, "seed", None)
+        if default_seed is not None:
+            if stage0_params.extra_args is None:
+                stage0_params.extra_args = {}
+            stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
 
         logger.debug(
             "Qwen3-TTS codec budget: task_type=%s text_tokens=%s dynamic_cap=%s "

@@ -1,17 +1,17 @@
 # Realtime Duplex API
 
 vLLM-Omni serves full-duplex speech models over a WebSocket endpoint,
-`/v1/realtime?duplex=1`, that speaks the OpenAI Realtime vocabulary plus a
+`/v1/realtime`, that speaks the OpenAI Realtime vocabulary plus a
 set of duplex extensions: the model decides when to listen and when to speak,
 the user can talk over the assistant, playback progress is reported back so
 history stays honest, and a dropped connection can resume the same session.
 This page covers how to run a duplex deployment, how to drive it from Python
 with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 
-The endpoint is served for models that ship a duplex plugin — currently
-MiniCPM-o 4.5, PersonaPlex, and Nemotron VoiceChat — and only for deploy
-configurations that declare `session_mode: duplex`. The runtime architecture
-is described in [Full-Duplex Runtime (MiniCPM-o 4.5)](../design/fullduplex.md).
+The handler is enabled by either a model-native `session_mode: duplex`
+deployment or an explicit `duplex_session` configuration for turn-based
+Server VAD. The runtime architecture is described in
+[Full-Duplex Runtime (MiniCPM-o 4.5)](../design/fullduplex.md).
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 
 `vllm_omni/deploy/minicpmo_4_5.yaml` declares `session_mode: duplex` and
 `duplex_session.max_sessions: 4`, which mounts the WebSocket routes
-`ws://<host>:8099/v1/realtime?duplex=1` (this page) and `ws://<host>:8099/v1/duplex`
+`ws://<host>:8099/v1/realtime` (this page) and `ws://<host>:8099/v1/duplex`
 (the native dialect for raw-protocol clients) next to the usual HTTP API.
 PersonaPlex and Nemotron VoiceChat use `vllm_omni/deploy/personaplex.yaml` and
 `vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml` in the same way.
@@ -240,7 +240,7 @@ on the same helpers.
 
 ## API Reference
 
-This section is the complete wire contract of `/v1/realtime?duplex=1`: how
+This section is the complete wire contract of `/v1/realtime`: how
 the dialect relates to the OpenAI Realtime protocol, which surfaces each
 model's capability flags gate, a catalogue of every client-to-server and
 server-to-client event, and a JSON example for each. `DuplexClient` speaks
@@ -253,10 +253,11 @@ its protocol tests.
 
 ### Endpoint and transport
 
-The endpoint is `ws(s)://<host>/v1/realtime?duplex=1`; the `duplex` query
-parameter (`1`, `true`, or `on`) selects the duplex session handler, and the
-route is mounted only for deployments whose deploy configuration declares
-`session_mode: duplex`. Optional query parameters are `model`, `session_id`,
+The endpoint is `ws(s)://<host>/v1/realtime`. Bare connections select the
+session handler when the deployment declares either `session_mode: duplex`
+or `duplex_session`. `?duplex=1` remains a compatibility alias, while
+`?duplex=0` selects the legacy Realtime handler. Optional query parameters
+are `model`, `session_id`,
 `autostart` (`0` means resume-only), `resume`, and `native_duplex`
 (`minicpmo45_native_duplex` is accepted as a deprecated alias and folded
 into the canonical name). Every message is one JSON object per WebSocket
@@ -342,9 +343,14 @@ Semantic divergences hidden behind shared names:
   before any commit; a commit may end in `response.listen` and no
   response, and the model may open a response with no commit at all.
   OpenAI: commit ⇒ item, `response.create` ⇒ exactly one response.
-- `turn_detection.interrupt_response=false` is rejected;
-  `create_response` is ignored; `semantic_vad` is unsupported; the VAD
-  runs per session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+- With `turn_detection={"type":"server_vad"}`, omitted `interrupt_response`
+  defaults to `false` on turn-based models such as Qwen3-Omni, enabling
+  endpointing and automatic responses without interruption. Explicit `true`
+  is rejected there. Model-native duplex keeps the `true` default and rejects
+  `false`; its VAD implies `overlap_policy=barge_in_on_speech`.
+  This capability-dependent default differs from OpenAI's `true` default;
+  the effective configuration is returned in `session.created` / `session.updated`.
+  `semantic_vad` is unsupported.
 - `rate_limits.updated` is always an empty list (compatibility only).
 - Cancellation never reuses a `response_id`; truncation is driven by
   `playback.ack` as well as `conversation.item.truncate`.
@@ -1201,9 +1207,10 @@ Realtime projector renames and fans out these events before they reach a
   barge-in, or audio truncation; Nemotron VoiceChat does not support barge-in
   or audio truncation; camera frames are consumed only by MiniCPM-o 4.5; tool
   calls are produced only by Nemotron VoiceChat.
-- `turn_detection` supports only `server_vad` with `interrupt_response=true`;
-  `semantic_vad`, `interrupt_response=false`, and `create_response` are not
-  supported. Server VAD requires a model-native session.
+- `turn_detection` supports `server_vad` or `null`, not `semantic_vad`.
+  Turn-based models support endpointing without interruption, including
+  `create_response=false` for explicit response creation. Model-native duplex
+  requires `interrupt_response=true` and `create_response=true`.
 - `input_audio_transcription` and `input_audio_noise_reduction` are accepted
   and echoed but no separate transcription or noise-reduction stage runs;
   transcripts come from the model.
