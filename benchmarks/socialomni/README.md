@@ -62,7 +62,8 @@ uv run --no-sync python -m benchmarks.socialomni.evaluate \
 
 Remove `--mini` for all 2,000 Level 1 and 209 Level 2 samples. Use
 `--level level1` or `--level level2` to select one level. The first 200 Level 2
-records in source order also produce the paper subset metrics.
+records in source order also produce `first_200` metrics. This selection is
+not a verified manifest of the paper's 200-item core set.
 
 Create a local judge configuration with exactly these three names. Set each
 `model` to the corresponding model ID served by that endpoint:
@@ -89,6 +90,15 @@ Level 2 re-encodes video and audio up to the annotated timestamp before model
 requests. Model prompts receive neither the reference transcript nor the
 reference continuation. Responses are generated for every ground-truth YES,
 even when the model predicts NO. Only the judges receive reference material.
+
+The task questions and answer options come from the pinned dataset. The
+formatting instructions and judge rubric are implemented in the four
+`build_*_prompt` functions in [protocol.py](protocol.py). These are adapted
+prompts, not verbatim paper templates. The judge receives the target
+participant, reference context, reference continuation, and candidate text.
+The public [reference implementation](https://github.com/MAC-AutoML/SocialOmni/tree/0fab46ac73387675afc44c48f126e56615dbefb6)
+uses different prompting and scoring defaults; this runner follows the
+fixed-prefix, forced-response, complete three-judge protocol described above.
 
 Level 1 reports accuracy, macro-F1 (the mean F1 score over four answer
 positions), and accuracy by speaker visibility. Level 2 reports YES/NO
@@ -163,9 +173,19 @@ unparsable answers. Level 1 accuracy was 74.40%. Level 2 results were:
 The run used benchmark commit `0c96505280b1` and model snapshot
 `ea64d566a2a0731823dc44965e7f89bad78f95cb`, with model concurrency 1, one warmup
 per model phase, and judge concurrency 2/2/1 for GPT-4o/Gemini/Qwen3-Omni.
-These are observed results for this deployment, not a cross-framework
-performance comparison. The full command is the mini command above with
+These are observed results for this deployment, not a controlled reproduction
+of the paper or a cross-framework performance comparison. Prompts, model
+snapshot, serving templates, and media preprocessing must be matched before
+attributing score differences to the serving framework. The full command is the mini command above with
 `--mini` removed; set the judge concurrency values in `judges.json` accordingly.
+
+The first 200 decisions included 119 correct YES, 70 incorrect YES, nine
+incorrect NO, and two correct NO predictions. Predicting YES for every item
+would achieve 64% accuracy on this selection, above the observed 60.50%; high
+`Cov+` alone does not indicate better turn-entry decisions. Macro-F1, the
+mean of the YES and NO F1 scores, was 39.95%. Level 1 accuracy was 76.29%
+for visible speakers and 62.55% for visibility mismatches. These diagnostics
+are included in the result JSON alongside aggregate scores.
 
 `--max-concurrency` bounds model requests. Each non-empty model phase runs one
 warmup request per configured concurrent worker; `--warmup N` overrides this
@@ -190,7 +210,8 @@ uv run --no-sync python -m pytest \
 
 The GPU regression test starts the official two-GPU Qwen3-Omni server and
 runs the public command on the mini set. Install the benchmark dependencies
-above and set the dataset location to opt in:
+above. By default the test downloads the pinned metadata and four mini-set
+videos (about 17 MiB) under `HF_HOME` (the Hugging Face cache directory). To use an existing dataset:
 
 ```bash
 VLLM_SOCIALOMNI_DATASET_ROOT=/path/to/socialomni \
@@ -202,7 +223,7 @@ uv run --no-sync python -m pytest -sv \
 Set `VLLM_SOCIALOMNI_MODEL` to use a local checkpoint. The test checks parsed
 answers, response generation, and the incomplete-quality result without
 external judges. It is included in the existing nightly accuracy test command
-and skips when `VLLM_SOCIALOMNI_DATASET_ROOT` is unset. It does not run the full
-dataset or contact external judge services.
+and runs without a dataset-path override. It does not run the full dataset
+or contact external judge services.
 
 Reference: [SocialOmni paper](https://arxiv.org/abs/2603.16859).

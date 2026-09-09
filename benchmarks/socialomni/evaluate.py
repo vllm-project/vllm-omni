@@ -19,7 +19,7 @@ from benchmarks.socialomni.client import RequestResult, request_metrics, run_pha
 from benchmarks.socialomni.dataset import (
     SOCIALOMNI_DATASET_ID,
     SOCIALOMNI_DATASET_REVISION,
-    SOCIALOMNI_PAPER_CORE_SIZE,
+    SOCIALOMNI_SUBSET_SIZE,
     inspect_socialomni_dataset,
     load_socialomni_level1_samples,
     load_socialomni_level2_samples,
@@ -242,19 +242,20 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 "judges": request_metrics(judge_requests, wall_clock_s=judge_wall_s),
             },
         }
-        if len(records) >= SOCIALOMNI_PAPER_CORE_SIZE:
-            core = records[:SOCIALOMNI_PAPER_CORE_SIZE]
+        if len(records) >= SOCIALOMNI_SUBSET_SIZE:
+            core = records[:SOCIALOMNI_SUBSET_SIZE]
             core_complete = _judges_complete(core, bool(judges))
             core_metrics = compute_socialomni_level2_metrics(core) if core_complete else None
             core_summary: dict[str, Any] = {
                 "sample_count": len(core),
+                "selection": "source_order_first_200",
                 "when": (core_metrics["when"] if core_metrics else compute_socialomni_when_metrics(core)),
                 "quality": None,
                 "judges_complete": core_complete,
             }
             if core_metrics:
                 core_summary["quality"] = core_metrics["quality"]
-            output["paper_core_200"] = core_summary
+            output["first_200"] = core_summary
         output["per_sample"]["level2"] = records
 
     level2_complete = "level2" not in levels or (output["summary"]["level2"]["metrics"]["judge_status"]["complete"])

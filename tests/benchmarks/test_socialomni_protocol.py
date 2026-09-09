@@ -251,6 +251,7 @@ async def test_complete_protocol_over_http(tmp_path, monkeypatch, failed_judge):
     monkeypatch.setattr(protocol, "create_video_prefix", prepared)
     monkeypatch.setattr(entrypoint, "load_socialomni_level1_samples", lambda *a, **k: [_level1(str(source))])
     monkeypatch.setattr(entrypoint, "load_socialomni_level2_samples", lambda *a, **k: samples)
+    monkeypatch.setattr(entrypoint, "SOCIALOMNI_SUBSET_SIZE", 2)
     monkeypatch.setattr(
         entrypoint,
         "inspect_socialomni_dataset",
@@ -279,6 +280,10 @@ async def test_complete_protocol_over_http(tmp_path, monkeypatch, failed_judge):
             )
         )
     assert len(seen) == 7
+    assert "paper_core_200" not in result
+    assert result["first_200"]["selection"] == "source_order_first_200"
+    assert result["first_200"]["sample_count"] == 2
+    assert result["first_200"]["judges_complete"] is (failed_judge is None)
     assert result["config"]["judges"] == [
         {"name": name, "model": name, "base_url": base_url, "max_concurrency": 1}
         for name in entrypoint.SOCIALOMNI_JUDGE_NAMES

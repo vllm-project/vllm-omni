@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Run the SocialOmni mini set against a real Qwen3-Omni thinker server.
 
-Set VLLM_SOCIALOMNI_DATASET_ROOT to the extracted dataset to opt in. The model
+Downloads the pinned mini set by default. Set VLLM_SOCIALOMNI_DATASET_ROOT
+to use an extracted local dataset. The model
 defaults to Qwen/Qwen3-Omni-30B-A3B-Instruct; VLLM_SOCIALOMNI_MODEL can select a
 local checkpoint. Requires two H100-class GPUs and the benchmark dependencies.
 External judges are intentionally not configured, so quality stays incomplete.
@@ -16,16 +17,15 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.socialomni.dataset import SOCIALOMNI_DATASET_ID, SOCIALOMNI_DATASET_REVISION
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-DATASET_ROOT = os.environ.get("VLLM_SOCIALOMNI_DATASET_ROOT")
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.omni,
     pytest.mark.benchmark,
-    pytest.mark.skipif(not DATASET_ROOT, reason="Set VLLM_SOCIALOMNI_DATASET_ROOT to run SocialOmni"),
 ]
 
 SERVER_PARAMS = OmniServerParams(
@@ -35,16 +35,43 @@ SERVER_PARAMS = OmniServerParams(
 )
 
 
+@pytest.fixture(scope="module")
+def socialomni_dataset_root() -> Path:
+    if dataset_root := os.environ.get("VLLM_SOCIALOMNI_DATASET_ROOT"):
+        return Path(dataset_root).expanduser().resolve()
+
+    from huggingface_hub.constants import HF_HOME
+
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    root = Path(HF_HOME) / "socialomni" / SOCIALOMNI_DATASET_REVISION
+    hf_api().snapshot_download(
+        repo_id=SOCIALOMNI_DATASET_ID,
+        repo_type="dataset",
+        revision=SOCIALOMNI_DATASET_REVISION,
+        local_dir=root,
+        allow_patterns=[
+            "data/level_1/dataset.json",
+            "data/level_2/annotations.json",
+            "data/level_1/videos/video_1.mp4",
+            "data/level_1/videos/video_21.mp4",
+            "data/level_2/videos/video_0001.mp4",
+            "data/level_2/videos/video_0005.mp4",
+        ],
+    )
+    return root
+
+
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", [SERVER_PARAMS], indirect=True)
-def test_socialomni_mini_without_judges(omni_server, tmp_path: Path) -> None:
+def test_socialomni_mini_without_judges(socialomni_dataset_root: Path, omni_server, tmp_path: Path) -> None:
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "benchmarks.socialomni.evaluate",
             "--dataset-root",
-            str(DATASET_ROOT),
+            str(socialomni_dataset_root),
             "--model",
             omni_server.model,
             "--base-url",

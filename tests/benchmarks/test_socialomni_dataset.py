@@ -96,6 +96,58 @@ def test_loaders_preserve_nested_paths_and_mini_groups(tmp_path: Path) -> None:
     assert second[0].timestamp_s == 3.25
 
 
+@pytest.mark.parametrize("level", ["level1", "level2"])
+def test_mini_requires_only_selected_media(tmp_path: Path, level: str) -> None:
+    if level == "level1":
+        directory = tmp_path / "data" / "level_1"
+        metadata = directory / "dataset.json"
+        rows = [
+            _level1("first", "first.mp4", "consistent"),
+            _level1("second", "second.mp4", "inconsistent"),
+            _level1("unused", "missing.mp4", "consistent"),
+        ]
+        loader = load_socialomni_level1_samples
+        path_key, id_key = "video_path", "id"
+    else:
+        directory = tmp_path / "data" / "level_2"
+        metadata = directory / "annotations.json"
+        rows = [
+            _level2("first", "first.mp4", "YES"),
+            _level2("second", "second.mp4", "NO"),
+            _level2("unused", "missing.mp4", "YES"),
+        ]
+        loader = load_socialomni_level2_samples
+        path_key, id_key = "video_file", "video_id"
+    videos = directory / "videos"
+    videos.mkdir(parents=True)
+    (videos / "first.mp4").touch()
+    (videos / "second.mp4").touch()
+    _write(metadata, rows)
+
+    assert [sample.sample_id for sample in loader(tmp_path, mini=True)] == ["first", "second"]
+    with pytest.raises(FileNotFoundError, match="missing.mp4"):
+        loader(tmp_path)
+    (videos / "second.mp4").unlink()
+    with pytest.raises(FileNotFoundError, match="second.mp4"):
+        loader(tmp_path, mini=True)
+    (videos / "second.mp4").touch()
+
+    rows[-1][path_key] = "../escape.mp4"
+    _write(metadata, rows)
+    with pytest.raises(ValueError, match="unsafe"):
+        loader(tmp_path, mini=True)
+    rows[-1][path_key] = "missing.mp4"
+    rows[-1][id_key] = "first"
+    _write(metadata, rows)
+    with pytest.raises(ValueError, match="Duplicate"):
+        loader(tmp_path, mini=True)
+    rows[-1][id_key] = "unused"
+    rows[-1]["question" if level == "level1" else "full_asr"] = ""
+    _write(metadata, rows)
+    with pytest.raises(ValueError, match="non-empty"):
+        loader(tmp_path, mini=True)
+
+
 def test_inspect_dataset_matches_expected_metadata_hashes(tmp_path: Path, monkeypatch) -> None:
     level1 = tmp_path / "data" / "level_1" / "dataset.json"
     level2 = tmp_path / "data" / "level_2" / "annotations.json"

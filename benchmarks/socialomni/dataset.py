@@ -27,7 +27,7 @@ PREFIX_ENCODING = {
 
 SOCIALOMNI_DATASET_ID = "alexisty/SocialOmni"
 SOCIALOMNI_DATASET_REVISION = "3b76009b45090eaa54007454c93a831f3cc8e1e6"
-SOCIALOMNI_PAPER_CORE_SIZE = 200
+SOCIALOMNI_SUBSET_SIZE = 200
 SOCIALOMNI_METADATA_SHA256 = {
     "level1": "051f2e7ca0618de6e78843c64a3800606904be819f47c1e5c771f1c6a49faa23",
     "level2": "87137aa2270f65e9c9e124e54dc5b73d9fe9c4bf9317219a4efe88feb036c058",
@@ -137,12 +137,10 @@ def _video_path(level_dir: Path, raw: str, level: str, description: str) -> str:
     path = videos.joinpath(*parts).resolve()
     if not videos.is_relative_to(level_dir) or not path.is_relative_to(videos):
         raise ValueError(f"{description} media path escapes videos/")
-    if not path.is_file():
-        raise FileNotFoundError(f"{description} video is missing: {path}")
     return str(path)
 
 
-T = TypeVar("T")
+T = TypeVar("T", SocialOmniLevel1Sample, SocialOmniLevel2Sample)
 
 
 def _mini(samples: Sequence[T], groups: tuple[str, str], group: Callable[[T], str]) -> list[T]:
@@ -157,7 +155,11 @@ def _mini(samples: Sequence[T], groups: tuple[str, str], group: Callable[[T], st
 def _limit(samples: list[T], max_samples: int | None) -> list[T]:
     if max_samples is not None and max_samples < 0:
         raise ValueError("max_samples must be non-negative")
-    return samples if max_samples is None else samples[:max_samples]
+    selected = samples if max_samples is None else samples[:max_samples]
+    for sample in selected:
+        if not Path(sample.video_path).is_file():
+            raise FileNotFoundError(f"SocialOmni sample {sample.sample_id} video is missing: {sample.video_path}")
+    return selected
 
 
 def load_socialomni_level1_samples(
