@@ -134,7 +134,7 @@ def test_is_a5_detects_a5_device(monkeypatch: pytest.MonkeyPatch) -> None:
 
     class NpuDevice:
         type = "npu"
-    
+
     assert module.is_a5(NpuDevice()) is True
     assert module.is_a5(torch.device("cpu")) is False
 
