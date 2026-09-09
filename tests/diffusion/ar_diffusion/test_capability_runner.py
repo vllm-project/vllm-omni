@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU contracts for capability-driven AR-Diffusion sessions."""
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
@@ -18,12 +20,29 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
 BLOCK = 16
 POS = "positive"
 NEG = "negative"
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def platform_synchronize_calls(monkeypatch) -> list[None]:
+    """Stub the platform barrier the runner takes at every chunk boundary.
+
+    These tests run on a CPU host, where the resolved platform is
+    ``UnspecifiedOmniPlatform`` and ``synchronize()`` raises. Tests that need
+    a failing barrier override this with their own fake.
+    """
+    calls: list[None] = []
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=lambda: calls.append(None)),
+    )
+    return calls
 
 
 def lingbot_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
@@ -53,6 +72,21 @@ def dreamzero_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
         kv_branches=(ARDiffusionKVBranchSpec(POS, 0), ARDiffusionKVBranchSpec(NEG, 1)),
         session_capacity=capacity,
         cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 8),),
+    )
+
+
+def tiny_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
+    return ARDiffusionKVCacheSpec(
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=1,
+        tokens_per_frame=1,
+        frames_per_block=3,
+        window_frames=3,
+        sink_frames=3,
+        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+        session_capacity=capacity,
+        cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 2),),
     )
 
 
@@ -98,11 +132,49 @@ class BatchCapablePipeline(CapablePipeline):
     supports_request_batch = True
 
 
+class StepCapablePipeline(CapablePipeline):
+    supports_step_execution = True
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        return state
+
+    def denoise_step(self, input_batch, *, states=None, **kwargs):
+        del input_batch, states, kwargs
+        return None
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del state, noise_pred, kwargs
+
+    def post_decode(self, state, **kwargs):
+        del state, kwargs
+        from vllm_omni.diffusion.data import DiffusionOutput
+
+        return DiffusionOutput()
+
+
+def scheduler_output(
+    request_ids: tuple[str, ...] = ("req-1",),
+    *,
+    finished: tuple[str, ...] = (),
+) -> DiffusionSchedulerOutput:
+    """Build the real scheduler payload; stepwise requests arrive as cached rows."""
+    return DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=list(request_ids)),
+        finished_req_ids=set(finished),
+        num_running_reqs=len(request_ids),
+        num_waiting_reqs=0,
+    )
+
+
 def make_runner(
     pipeline: object,
     *,
     available_bytes: int = 1 << 28,
     step_execution: bool = False,
+    gpu_memory_fraction: float = 0.1,
 ) -> ARDiffusionModelRunner:
     runner = object.__new__(ARDiffusionModelRunner)
     runner.od_config = SimpleNamespace(
@@ -113,13 +185,17 @@ def make_runner(
     )
     runner.device = torch.device("cpu")
     runner.pipeline = pipeline
-    runner.ar_diffusion_kv_config = ARDiffusionKVConfig(enable=True)
+    runner.ar_diffusion_kv_config = ARDiffusionKVConfig(
+        enable=True,
+        gpu_memory_fraction=gpu_memory_fraction,
+    )
     runner.kv_cache = None
     runner._ar_diffusion_capability = None
     runner._ar_diffusion_kv_cache_spec = None
     runner._sessions = OrderedDict()
     runner._session_capacity = 0
     runner._perf_e2e_times = []
+    runner._stepwise_chunk_started = {}
     runner._preallocate_kv_cache(available_bytes=available_bytes)
     return runner
 
@@ -132,12 +208,59 @@ def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch:
     return state
 
 
+def commit_one_block(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
+    state = runner._get_or_create_session(session_id)
+    assert runner.kv_cache is not None
+    seq_len = BLOCK * runner.kv_cache.frames_per_block
+    ctx = state.get_kv_caches(kv_branch, seq_len=seq_len, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(torch.device("cpu"))
+    state.commit_paged_context(kv_branch)
+    return state
+
+
 def test_ar_runner_rejects_pipeline_without_capability():
     runner = object.__new__(ARDiffusionModelRunner)
     runner.od_config = SimpleNamespace(max_num_seqs=1)
     runner.pipeline = object()
     with pytest.raises(TypeError, match="SupportsARDiffusionPipeline"):
         runner._preallocate_kv_cache(available_bytes=1 << 20)
+
+
+def test_runner_uses_typed_tick_as_authoritative_session_contract():
+    tick = ARDiffusionTickRequest(
+        session_id="world-7",
+        request_id="request-3",
+        chunk_index=3,
+        reset=True,
+    )
+    req = SimpleNamespace(
+        request_id="request-3",
+        sampling_params=SimpleNamespace(extra_args=tick.to_extra_args()),
+    )
+
+    session_id, extra_args, parsed = ARDiffusionModelRunner._request_session(req)
+
+    assert session_id == "world-7"
+    assert extra_args == tick.to_extra_args()
+    assert parsed == tick
+
+
+def test_runner_keeps_engine_request_id_separate_from_tick_correlation_id():
+    tick = ARDiffusionTickRequest(
+        session_id="world-7",
+        request_id="client-request-3",
+        chunk_index=3,
+    )
+    req = SimpleNamespace(
+        request_id="engine-request-uuid",
+        sampling_params=SimpleNamespace(extra_args=tick.to_extra_args()),
+    )
+
+    session_id, _, parsed = ARDiffusionModelRunner._request_session(req)
+
+    assert session_id == "world-7"
+    assert req.request_id == "engine-request-uuid"
+    assert parsed.request_id == "client-request-3"
 
 
 def test_lingbot_like_single_branch_session_reuse_reset_and_close():
@@ -170,6 +293,31 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert pipeline.closes == ["s1"]
 
 
+def test_lingbot_like_interleaved_sessions_keep_independent_kv_partitions():
+    runner = make_runner(CapablePipeline(lingbot_like_spec(capacity=2)))
+    kv = runner.kv_cache
+    assert kv is not None
+
+    session_a = commit_one_block(runner, "world-a", "main")
+    a0_blocks = kv.window_block_ids(session_a.adapter("main"))
+    session_b = commit_one_block(runner, "world-b", "main")
+    b0_blocks = kv.window_block_ids(session_b.adapter("main"))
+    session_a_again = commit_one_block(runner, "world-a", "main")
+    a1_blocks = kv.window_block_ids(session_a_again.adapter("main"))
+
+    assert session_a_again is session_a
+    assert session_a.adapter("main").request_id == "ar::world-a::main"
+    assert session_b.adapter("main").request_id == "ar::world-b::main"
+    assert session_a.adapter("main").completed_chunks == 6
+    assert session_b.adapter("main").completed_chunks == 3
+    assert len(a0_blocks) == 3
+    assert len(b0_blocks) == 3
+    assert len(a1_blocks) == 6
+    assert set(a0_blocks) <= set(a1_blocks)
+    assert set(a1_blocks).isdisjoint(b0_blocks)
+    assert tuple(runner._sessions) == ("world-b", "world-a")
+
+
 def test_lingbot_like_sink_survives_sliding_window_eviction():
     runner = make_runner(CapablePipeline(lingbot_like_spec()))
     kv = runner.kv_cache
@@ -198,12 +346,12 @@ def test_dreamzero_like_two_branches_are_independent():
 
 
 def test_lru_eviction_releases_blocks_and_notifies_pipeline():
-    pipeline = CapablePipeline(lingbot_like_spec(capacity=8))
+    pipeline = CapablePipeline(lingbot_like_spec(capacity=2))
     runner = make_runner(pipeline)
     kv = runner.kv_cache
     assert kv is not None
-    assert runner._session_capacity == 1
-    assert kv.session_capacity == 1
+    assert runner._session_capacity == 2
+    assert kv.session_capacity == 2
     free_total = kv.manager.block_pool.get_num_free_blocks()
     old = commit_one_frame(runner, "old", "main")
     k = torch.randn(1, 8, 4, 64)
@@ -211,11 +359,54 @@ def test_lru_eviction_releases_blocks_and_notifies_pipeline():
     assert kv.manager.block_pool.get_num_free_blocks() < free_total
 
     runner._get_or_create_session("new")
+    assert tuple(runner._sessions) == ("old", "new")
+    runner._get_or_create_session("newest")
 
-    assert tuple(runner._sessions) == ("new",)
+    assert tuple(runner._sessions) == ("new", "newest")
     assert pipeline.closes == ["old"]
     assert "old" not in kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_budget_reduced_capacity_drives_runner_lru():
+    pipeline = CapablePipeline(tiny_spec(capacity=2))
+    # One tiny LingBot-like session requires 128 bytes; two require 192.
+    runner = make_runner(
+        pipeline,
+        available_bytes=128,
+        gpu_memory_fraction=1.0,
+    )
+    kv = runner.kv_cache
+    assert kv is not None
+    assert kv.requested_session_capacity == 2
+    assert kv.session_capacity == 1
+    assert runner._session_capacity == 1
+
+    runner._get_or_create_session("old")
+    runner._get_or_create_session("new")
+
+    assert tuple(runner._sessions) == ("new",)
+    assert pipeline.closes == ["old"]
+
+
+def test_dreamzero_like_requested_capacity_is_capped_by_budget():
+    spec = dreamzero_like_spec(capacity=64)
+    # Per all-layer self-KV page: 65,536 bytes. Two resident sessions need:
+    # managed=(2 * (2 * 6 + 4) + 2)=34 pages, scratch=8 pages,
+    # cross-attention=1 page/session, for 44 pages total.
+    page_bytes = 65_536
+    pipeline = CapablePipeline(spec)
+    runner = make_runner(
+        pipeline,
+        available_bytes=44 * page_bytes,
+        gpu_memory_fraction=1.0,
+    )
+    kv = runner.kv_cache
+    assert kv is not None
+    assert kv.requested_session_capacity == 64
+    assert kv.session_capacity == 2
+    assert runner._session_capacity == 2
+    assert kv.cross_attention_reserved_bytes == 2 * page_bytes
 
 
 def test_forward_exception_releases_pending_allocation_and_model_state(monkeypatch):
@@ -232,7 +423,10 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
         raise RuntimeError("layer exploded")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", boom)
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}))
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
 
     with pytest.raises(RuntimeError, match="layer exploded"):
         runner.execute_model(request)
@@ -257,13 +451,20 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
         ctx.ensure_video_slots(torch.device("cpu"))
         return object()
 
-    def synchronize_boom(device):
+    def synchronize_boom():
         raise RuntimeError("asynchronous kernel failed")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", return_after_allocation)
-    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize_boom)
-    runner.device = torch.device("cuda")
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}))
+    # The runner defers the device barrier to the platform, so the failure is
+    # injected there rather than on a device-specific torch entry point.
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=synchronize_boom),
+    )
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
 
     with pytest.raises(RuntimeError, match="asynchronous kernel failed"):
         runner.execute_model(request)
@@ -283,12 +484,155 @@ def test_ar_runner_rejects_step_and_request_batch_modes():
         make_runner(BatchCapablePipeline(lingbot_like_spec()))
 
 
+def test_ar_runner_allows_step_execution_when_pipeline_implements_the_contract():
+    runner = make_runner(StepCapablePipeline(lingbot_like_spec()), step_execution=True)
+    assert runner.kv_cache is not None
+
+
 def test_ar_runner_defensively_rejects_inherited_batch_and_step_entrypoints():
     runner = object.__new__(ARDiffusionModelRunner)
     with pytest.raises(RuntimeError, match="request-batch execution"):
         runner.execute_model_batch(None, None)
     with pytest.raises(RuntimeError, match="step execution"):
         runner.execute_stepwise(None)
+
+
+def test_execute_stepwise_binds_request_id_session_and_unbinds_after_call(monkeypatch):
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    bound_during = []
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        bound_during.append(pipeline.bound_state is not None)
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=False)])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    output = runner.execute_stepwise(scheduler_output())
+
+    assert bound_during == [True]
+    assert pipeline.bound_state is None
+    assert pipeline.binds == ["req-1"]
+    assert "req-1" in runner._sessions
+    assert output.get_request_output("req-1") is not None
+    assert not pipeline.closes
+
+
+def test_execute_stepwise_closes_session_when_request_finishes(monkeypatch):
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=True)])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    runner.execute_stepwise(scheduler_output())
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["req-1"]
+    assert "req-1" not in runner._sessions
+
+
+def test_execute_stepwise_exception_releases_kv_and_does_not_resume_pages(monkeypatch):
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    first = runner._get_or_create_session("req-1")
+
+    def boom(self, scheduler_output):
+        del self, scheduler_output
+        raise RuntimeError("step failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", boom)
+    with pytest.raises(RuntimeError, match="step failed"):
+        runner.execute_stepwise(scheduler_output())
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["req-1"]
+    assert "req-1" not in runner._sessions
+    second = runner._get_or_create_session("req-1")
+    assert second is not first
+
+
+def test_execute_stepwise_closes_session_for_scheduler_aborted_request(monkeypatch):
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    runner._get_or_create_session("req-1")
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    # An aborted request is never scheduled again and never reports finished,
+    # so the retire path is the only thing that can free its KV.
+    runner.execute_stepwise(scheduler_output(request_ids=(), finished=("req-1",)))
+
+    assert "req-1" not in runner._sessions
+    assert pipeline.closes == ["req-1"]
+
+
+def test_execute_stepwise_times_once_per_chunk_not_once_per_step(monkeypatch, platform_synchronize_calls):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    results = [None, None, None, DiffusionOutput()]
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=False, result=results.pop(0))])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    for _ in range(4):
+        runner.execute_stepwise(scheduler_output())
+
+    # Four denoise steps, one emitted AR block: one timing sample, matching the
+    # one-sample-per-block meaning request mode already has.
+    assert len(runner._perf_e2e_times) == 1
+    assert len(platform_synchronize_calls) == 1
+    assert "req-1" not in runner._stepwise_chunk_started
+
+
+def test_execute_stepwise_synchronize_exception_fails_closed(monkeypatch):
+    """The chunk barrier is where an asynchronous device error surfaces. It must
+    clean up like an in-step failure instead of leaving the session, the cached
+    step state and the timing entry to the scheduler's next cycle."""
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    runner.state_cache = {"req-1": object()}
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=False, result=object())])
+
+    def synchronize_boom():
+        raise RuntimeError("asynchronous kernel failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=synchronize_boom),
+    )
+
+    with pytest.raises(RuntimeError, match="asynchronous kernel failed"):
+        runner.execute_stepwise(scheduler_output())
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["req-1"]
+    assert "req-1" not in runner._sessions
+    assert "req-1" not in runner.state_cache
+    assert "req-1" not in runner._stepwise_chunk_started
+    assert not runner._perf_e2e_times
 
 
 def test_model_specific_warmup_provider_is_consumed(monkeypatch):

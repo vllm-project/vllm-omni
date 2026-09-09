@@ -788,10 +788,16 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
             self.last_codes = codes.detach().clone()
             return codes.sum(dim=1).to(torch.float32)
 
+        def batched_chunked_decode(self, codes, lengths, caches, **kwargs):
+            assert lengths == [codes.shape[-1]]
+            assert caches is None
+            return self.chunked_decode(codes, **kwargs)
+
     decoder = _Decoder()
     model = Qwen3TTSCode2Wav.__new__(Qwen3TTSCode2Wav)
     torch.nn.Module.__init__(model)
     model.decoder = decoder
+    model._async_chunk = False
     model._num_quantizers = 2
     model._total_upsample = 1
     model._output_sample_rate = 24000

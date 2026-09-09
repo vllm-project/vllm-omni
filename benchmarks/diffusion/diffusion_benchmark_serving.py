@@ -1,6 +1,6 @@
 # adapted from fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Benchmark online serving for diffusion models (Image/Video Generation).
@@ -87,6 +87,7 @@ import base64
 import glob
 import json
 import logging
+import math
 import os
 import random
 import tempfile
@@ -858,7 +859,12 @@ class RandomDataset(BaseDataset):
             height = int(self.args.height or profile.get("height") or 720)
             num_frames = int(self.args.num_frames or profile.get("num_frames") or 16)
             fps = float(self.args.fps or profile.get("fps") or 8)
-            writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+            # cv2 typically writes MPEG-4 Part 2 (``mp4v``), which pipelines such
+            # as MiniMax-H3 Ref2VA reject because they require H.264/H.265
+            # reference videos. Write the synthetic clip first, then re-encode
+            # it to H.264 when ffmpeg is available; otherwise keep ``mp4v``.
+            raw_path = video_path + ".raw.mp4"
+            writer = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             if not writer.isOpened():
                 raise RuntimeError("cv2.VideoWriter failed to open")
             for frame_idx in range(num_frames):
@@ -871,11 +877,49 @@ class RandomDataset(BaseDataset):
                 frame[max(y - 36, 0) : min(y + 36, height), x : min(x + 96, width), :] = (64, 128, 220)
                 writer.write(frame)
             writer.release()
+            if _reencode_video_to_h264(raw_path, video_path):
+                os.unlink(raw_path)
+            else:
+                os.replace(raw_path, video_path)
             return [video_path]
         except Exception as e:
             raise RuntimeError(
                 "Failed to generate synthetic v2v input video. Install opencv-python or provide a custom dataset."
             ) from e
+
+
+def _reencode_video_to_h264(source: str, destination: str) -> bool:
+    """Re-encode a video to H.264/MP4 using ffmpeg when available.
+
+    Returns False when ffmpeg is missing or the re-encode fails so callers can
+    fall back to the original container/codec.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                source,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                destination,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and os.path.exists(destination)
+    except Exception:
+        return False
 
 
 def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_time_ms: float | None) -> float | None:
@@ -1073,6 +1117,11 @@ def calculate_metrics(
         "duration": total_duration,
         "completed_requests": num_success,
         "failed_requests": len(error_outputs),
+        "request_errors": [
+            {"request_id": req.request_id, "error": out.error}
+            for req, out in zip(requests_list, outputs)
+            if not out.success
+        ],
         "throughput_qps": num_success / total_duration if total_duration > 0 else 0,
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,
@@ -1218,6 +1267,9 @@ def _default_endpoint_for_task(task: str) -> str:
 
 
 async def benchmark(args):
+    if not math.isfinite(args.video_job_timeout) or args.video_job_timeout <= 0:
+        raise ValueError("--video-job-timeout must be a positive finite number of seconds.")
+
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
@@ -1269,6 +1321,8 @@ async def benchmark(args):
     print("Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+    for req in requests_list:
+        req.video_job_timeout = args.video_job_timeout
 
     if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
         for req in requests_list:
@@ -1333,6 +1387,8 @@ async def benchmark(args):
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
+    if args.endpoint == "/v1/videos":
+        metrics["video_job_timeout"] = args.video_job_timeout
     if args.endpoint == "/v1/images/edits":
         metrics["bot_task"] = args.bot_task
 
@@ -1355,6 +1411,11 @@ async def benchmark(args):
         )
     )
     print("{:<40} {}/{:<15}".format("Successful requests:", metrics["completed_requests"], len(requests_list)))
+    print("{:<40} {:<15}".format("Failed requests:", metrics["failed_requests"]))
+    for failure in metrics["request_errors"][:10]:
+        print(f"Request {failure['request_id']} failed: {failure['error']}")
+    if metrics["failed_requests"] > 10:
+        print("Showing first 10 failures; use --output-file to save all request errors.")
 
     # Section 3: Performance Metrics
     print(f"{'-' * 50}")
@@ -1438,6 +1499,13 @@ if __name__ == "__main__":
         help="Path to local dataset file (optional).",
     )
     parser.add_argument("--num-prompts", type=int, default=10, help="Number of prompts to benchmark.")
+    parser.add_argument(
+        "--video-job-timeout",
+        type=float,
+        default=900.0,
+        help="Maximum polling time in seconds per video job, including server queue time (default: 900). "
+        "Increase this for long-running video generation or high concurrency.",
+    )
     parser.add_argument(
         "--max-concurrency",
         type=int,

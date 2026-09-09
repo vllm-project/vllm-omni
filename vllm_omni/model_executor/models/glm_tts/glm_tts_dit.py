@@ -332,7 +332,7 @@ class DiTAttention(nn.Module):
         self,
         x: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
-        rope=None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
@@ -406,7 +406,7 @@ class DiTBlock(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
-        rope=None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm & modulation for attention
@@ -575,6 +575,8 @@ class GLMTTSDiT(nn.Module):
         is_causal: bool = False,
         attn_mask: torch.Tensor | None = None,
         block_pattern: list[int] | None = None,
+        text_embed: torch.Tensor | None = None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -588,6 +590,9 @@ class GLMTTSDiT(nn.Module):
             is_causal: Use block-causal attention
             attn_mask: Custom attention mask (overrides is_causal)
             block_pattern: Token-level block sizes for block-causal mask
+            text_embed: Precomputed text embedding (must already be in model
+                dtype); skips the internal embedding + ConvNeXt pass
+            rope: Precomputed rotary embedding tuple for ``seq_len``
 
         Returns:
             Predicted mel-spectrogram [B, T, mel_dim]
@@ -610,13 +615,21 @@ class GLMTTSDiT(nn.Module):
             time_emb = torch.cat([time_emb, spkr_emb], dim=-1)
 
         # Text embedding - ensure cast to model dtype
-        text_embed = self.text_emb_layer(text, seq_len, text_lens=text_lens).to(model_dtype)
+        if text_embed is None:
+            text_embed = self.text_emb_layer(text, seq_len, text_lens=text_lens).to(model_dtype)
+        else:
+            # A precomputed text_embed replaces `text` entirely, so its length must
+            # match middle_point; a mismatch would apply the wrong rotary/mask silently.
+            assert text_embed.shape[1] == seq_len, (
+                f"precomputed text_embed len {text_embed.shape[1]} != seq_len {seq_len}"
+            )
 
         # Input projection
         x = self.emb_concator(middle_point, condition, text_embed, drop_audio_cond=False)
 
         # Rotary embeddings
-        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+        if rope is None:
+            rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         # Build block-causal mask when is_causal and no explicit attn_mask
         if attn_mask is None and is_causal and block_pattern is not None:

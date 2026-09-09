@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Typed pipeline contract for the model-neutral AR-Diffusion runtime."""
 
 from __future__ import annotations
@@ -58,6 +59,9 @@ class ARDiffusionKVCacheSpec:
 
     ``max_scratch_tokens_per_branch`` is the maximum non-video KV (for example,
     action/state registers) that must coexist with an uncommitted video block.
+    ``model_owned_state_bytes_per_session`` is a conservative upper bound for
+    persistent per-session CUDA state outside runner-owned self/cross-attention
+    KV and scratch pools.
     ``session_capacity`` is the pipeline's upper bound; a runner may retain
     fewer sessions when its current memory and execution policy is stricter.
 
@@ -79,6 +83,7 @@ class ARDiffusionKVCacheSpec:
     cross_attention: tuple[ARDiffusionCrossAttentionKVSpec, ...] = ()
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
+    model_owned_state_bytes_per_session: int = 0
 
     def __post_init__(self) -> None:
         positive_fields = {
@@ -100,6 +105,11 @@ class ARDiffusionKVCacheSpec:
             raise ValueError(
                 "AR-Diffusion max_scratch_tokens_per_branch must be non-negative, "
                 f"got {self.max_scratch_tokens_per_branch}"
+            )
+        if self.model_owned_state_bytes_per_session < 0:
+            raise ValueError(
+                "AR-Diffusion model_owned_state_bytes_per_session must be non-negative, "
+                f"got {self.model_owned_state_bytes_per_session}"
             )
         if not self.kv_branches:
             raise ValueError("AR-Diffusion requires at least one KV branch")
@@ -130,10 +140,13 @@ class SupportsARDiffusionPipeline(Protocol):
     """Required pipeline capability for :class:`ARDiffusionModelRunner`.
 
     A session begins when the runner first sees its ``session_id`` and persists
-    across requests until reset, explicit close, LRU eviction, or a failed
-    forward. ``bind_ar_diffusion_state`` exposes the runner-owned KV state only
-    for the duration of one request. The pipeline must not retain the state
-    after the context exits.
+    until reset, explicit close, LRU eviction, a failed forward, or request
+    completion on the stepwise path. ``bind_ar_diffusion_state`` exposes the
+    runner-owned KV state only for the duration of one runner invocation
+    (``execute_model`` or ``execute_stepwise``). The pipeline must not retain
+    the state after the context exits. Uncommitted scratch lives on the
+    runner-owned session object and survives across stepwise invocations of
+    the same request.
     """
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
@@ -145,7 +158,7 @@ class SupportsARDiffusionPipeline(Protocol):
         session_id: str,
         state: ARDiffusionKVState,
     ) -> AbstractContextManager[None]:
-        """Bind ``state`` to model execution for one request."""
+        """Bind ``state`` to model execution for one runner invocation."""
         ...
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:

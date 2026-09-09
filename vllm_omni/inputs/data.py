@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
@@ -10,6 +13,8 @@ from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
+
+DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
 
 class OmniTextPrompt(TextPrompt):
@@ -41,11 +46,14 @@ class OmniInteractionEvent(OmniTextPrompt, total=False):
     pass
 
 
-class OmniInteractionPrompt(TypedDict, total=False):
-    """Mid-stream interaction payload."""
+class OmniInteractionPrompt(TypedDict):
+    """Normalized mid-stream interaction payload passed to ``submit_interaction``.
 
-    event_id: NotRequired[str]
-    event: NotRequired[OmniInteractionEvent]
+    WebSocket clients payload may omit ``event_id``; the API layer assigns a fallback ID in this case.
+    """
+
+    event_id: str
+    event: OmniInteractionEvent
     transition_chunks: NotRequired[int]
 
 
@@ -208,6 +216,10 @@ class OmniDiffusionSamplingParams:
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
 
+    # Request-scoped quality intent. ``None`` delegates the default behavior
+    # to the model; explicit levels select a model-owned quality policy.
+    quality: str | None = None
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int | None = None
@@ -245,7 +257,7 @@ class OmniDiffusionSamplingParams:
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
+    fps: float | None = None  # Request/output-encoding FPS; fractional rates are supported.
     frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
@@ -336,6 +348,10 @@ class OmniDiffusionSamplingParams:
 
     # results
     output: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
+            raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
 
     @property
     def batch_size(self):

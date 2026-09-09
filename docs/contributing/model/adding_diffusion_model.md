@@ -653,7 +653,7 @@ python end2end.py --model your-org/your-model-name --modality text2img --prompts
 Mirror BAGEL’s online serving setup:
 
 - Server launcher: `examples/online_serving/your_model_name/run_server.sh`
-  - Wrap `vllm serve ... --omni --port ...` (and `--stage-configs-path ...` if needed)
+  - Wrap `vllm serve ... --omni --port ...` (and `--deploy-config ...` if needed)
 - Client: `examples/online_serving/your_model_name/openai_chat_client.py`
   - Send requests to `POST /v1/chat/completions`
   - Support multimodal inputs (e.g., base64 image) if your model needs it
@@ -755,7 +755,8 @@ omni = Omni(model="your-model", ulysses_degree=2, ring_degree=2)
 
 ### Step Execution
 
-See detailed design guide: [How to add step execution support](../../design/feature/diffusion_step_execution.md)
+See the detailed
+[Diffusion Continuous Batching design guide](../../design/feature/diffusion_continuous_batching.md).
 
 Use this only when your pipeline can be split into stable request-scoped and
 step-scoped phases. The reference implementation is
@@ -769,15 +770,39 @@ step-scoped phases. The reference implementation is
 Do not enable `step_execution=True` until those four methods are implemented
 and validated against the request-level path.
 
-If you want the pipeline to work with the experimental batched step-wise path
-(`max_num_seqs > 1`), also see:
-[Continuous Batching for Step-Wise Diffusion](../../design/feature/diffusion_continuous_batching.md).
+The same design guide covers the experimental batched step-wise path used when
+`max_num_seqs > 1`.
 
 If you expose this in example scripts or recipes, keep it opt-in. Surface
 runtime features like `step_execution` as optional flags instead of silently
 turning them on. For Qwen-Image-style serving examples, document
 `--step-execution` as the feature gate and `--max-num-seqs N` as the
 companion batching knob.
+
+### Streaming Output and Mid-Stream Interactions
+
+To add streaming generation with optional mid-stream prompt updates to a new diffusion pipeline (often a video generation pipeline):
+
+0. **Model should internally support** chunked video emission and bounded VAE decode of a chunk.
+1. **Implement stepwise execution** so interaction RPCs can be consumed at chunk
+   boundaries (see [Step Execution](#step-execution) above).
+2. **Mix in** ``InteractionMixin`` on the pipeline class.
+3. **Implement** ``peek_chunk_media(StepRequestState) -> ChunkMediaSpec`` to offer information
+   about the next chunk to generate.
+   This is called whenever one supported interaction modality needs frame-level calculation,
+   e.g., per-frame camera trajectory. If only chunk-level calculation is involved, peeking is skipped.
+4. **Optionally implement** ``prepare_next_chunk(StepRequestState)`` if the
+   pipeline must rebuild something (e.g., per-chunk state) after an interaction is applied.
+   This function is called at chunk boundary.
+5. **Register** supported modalities and handlers in ``vllm_omni/diffusion/interaction/registry.py``
+   (keyed by ``od_config.model_class_name`` → modality key as in ``req["multi_modal_data"]``).
+
+Serve with ``--diffusion-streaming-output`` (auto-enables step execution). See
+[Diffusion Execution Modes](../../user_guide/diffusion/execution_modes.md#streaming-output)
+and the example script at `examples/online_serving/streaming_video_generation/`.
+
+**Interaction payload contract:** Although ``OmniInteractionPrompt`` type annocation requires ``event_id``,
+the WebSocket API payload may omit ``event_id`` and let the API layer assigns one.
 
 ### Cache Acceleration
 
@@ -824,7 +849,7 @@ omni = Omni(model="your-model",
 
 ### CPU Offload
 
-See detailed guide: [CPU Offloading for Diffusion Models](../../user_guide/diffusion/cpu_offload_diffusion.md)
+See detailed guide: [CPU Offloading for Diffusion Models](../../user_guide/diffusion/cpu_offload.md)
 
 vLLM-Omni provides two offloading strategies to reduce GPU memory usage:
 

@@ -8,7 +8,6 @@ The stage-based CLI is designed for deployments that require launching each pipe
 - For **migrated models** that utilize the bundled deployment YAML configurations located in
   `vllm_omni/deploy/`, the `--deploy-config` flag is only required to override the default configuration. By default, executing `vllm serve MODEL --omni ...`
   automatically loads the bundled deployment configuration.
-- For custom legacy `stage_args` YAMLs, pass the file with `--stage-configs-path`.
 
 Example: Initializing Stage 0 (Orchestrator and API Server):
 The commands below show a common device mapping where Stage 0 uses GPU 0 and
@@ -32,7 +31,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --omni-master-port 26000
 ```
 
-When utilizing a custom deployment YAML based on the new schema, append `--deploy-config /path/to/override.yaml` to each command execution. Conversely, for legacy models, substitute this parameter with `--stage-configs-path /path/to/stage_configs.yaml`.
+When utilizing a custom deployment YAML, append `--deploy-config /path/to/override.yaml` to each command execution.
 
 In the standard execution paradigm, the `--stage-overrides` argument is utilized to apply stage-specific configurations from a single CLI command.
 However, under the **stage-based CLI** paradigm, where each process strictly encapsulates a single stage, it is recommended to specify tuning parameters directly via discrete command-line flags for the respective stage, rather than constructing a composite `--stage-overrides` JSON string.

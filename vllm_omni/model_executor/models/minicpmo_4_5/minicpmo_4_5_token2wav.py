@@ -120,6 +120,10 @@ class MiniCPMO45Token2wav:
         """Delegate prompt feature extraction to the wrapped core."""
         return self._core._prepare_prompt(prompt_wav)
 
+    def enable_trt_spk_embedding(self) -> None:
+        """Run the campplus speaker-embedding model on TensorRT."""
+        self._core.enable_trt_spk_embedding()
+
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""
         return self._core.forward(

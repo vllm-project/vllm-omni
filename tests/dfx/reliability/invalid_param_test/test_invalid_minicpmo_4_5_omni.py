@@ -50,12 +50,12 @@ def _prompt() -> str:
     return "What is the capital of China? Answer in 20 words."
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _MINICPMO_SERVER, indirect=True)
 def test_invalid_audio_format_rejected(omni_server: OmniServerParams, openai_client: OpenAIClientHandler) -> None:
     """
     Test that invalid audio format is properly rejected.
-    Deploy Setting: default 2GPU
+    Deploy Setting: default single GPU
     Input Modal: text + invalid audio format
     Output Modal: error
     """

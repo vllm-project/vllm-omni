@@ -117,7 +117,22 @@ After (async D2H):
 
 ### Batch Split
 
-When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_id` for the entire batch, the executor splits it into per-request `async_output_id`s (format `{batch_id}/{request_id}`) via `_batch_split_map`. When `OUTPUT_READY` arrives, the pump extracts per-request results from the batch output and resolves each request's output future independently.
+When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_id` for the entire batch, the executor splits it into per-request `async_output_id`s (format `{batch_id}/{request_id}`) via `_batch_split_map`. When `OUTPUT_READY` arrives, the pump extracts per-request results from the batch output and resolves each request's output future independently. If `OUTPUT_READY` arrives before `execute_batch` registers the split map, `execute_batch` directly adopts the early output.
+
+### Reliability, Lifecycle & Timeout Behavior
+
+1. **Drain Before Memory Release (`drain_async_outputs` / `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S`)**:
+   When workers transition into sleep states (`handle_sleep_task`) or invoke memory-releasing methods, `WorkerProc.drain_async_outputs()` blocks up to `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S` (10.0s) until all in-flight background D2H/SHM packing tasks finish. This acts as a synchronization barrier preventing worker sleep cycles from releasing device tensors while the side CUDA stream is still actively reading them. Draining typically completes within 10–50 ms under normal operation.
+
+2. **Timeout Diagnostics (`_async_output_timeout()`)**:
+   The engine waits for `wait_output_ready()` with a timeout of `_async_output_timeout()` — 600.0s by default, overridable per run with the `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` environment variable (a non-numeric or non-positive value is ignored with a warning and the default applies, since this resolves on the request path). If a timeout occurs, the executor logs detailed diagnostic bookkeeping (pending futures, cached outputs, and batch split maps) to identify whether the stall occurred in the worker, pump, or waiter. The packing itself takes milliseconds, but the wait is queued behind the step's GPU work, so its wall-clock duration tracks step time; the bound is generous because a hung engine is surfaced by the worker monitor and `check_health()`, not by this timeout.
+
+3. **Queue Serialization & Atomic Future Resolution**:
+   - `result_mq` writes are serialized with `_result_mq_lock` to protect the single-writer `MessageQueue` against concurrent writes from the worker main loop (`COMPUTE_DONE`) and background thread (`OUTPUT_READY`).
+   - `ResultPumpThread` unpacks shared-memory payloads first, and then atomically resolves waiting futures or populates `_completed_outputs` under `_futures_lock`, avoiding race conditions with concurrent `wait_output_ready()` invocations.
+
+4. **Storage-Aware IPC Packing**:
+   `pack_diffusion_output_shm()` evaluates `max(view_bytes, storage_bytes)` against `_SHM_TENSOR_THRESHOLD` (1 MB) to ensure that per-request slices sharing a large batch storage are moved to POSIX shared memory rather than serialized through pickle over the MessageQueue inline buffer.
 
 ## Model Coverage
 
@@ -131,6 +146,7 @@ All models running in request-mode (`step_execution=False`, the default) automat
 |---|---|---|
 | **HunyuanImage-3.0** | Image | `False` |
 | **Qwen-Image** | Image | `True` |
+| **LTX-2.3** | Video / Audio | `False` |
 
 Other models with `step_execution=False` are also supported but not yet verified.
 

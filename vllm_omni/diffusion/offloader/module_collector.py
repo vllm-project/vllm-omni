@@ -19,6 +19,7 @@ class PipelineModules:
     encoders: list[nn.Module]
     encoder_names: list[str]
     vaes: list[nn.Module]
+    vae_names: list[str] = field(default_factory=list)
     resident_modules: list[nn.Module] = field(default_factory=list)
     resident_names: list[str] = field(default_factory=list)
 
@@ -153,7 +154,7 @@ class ModuleDiscovery:
 
         dit_modules, dit_names = ModuleDiscovery._collect_modules(pipeline, dit_attrs, warn_missing=declared)
         encoders, encoder_names = ModuleDiscovery._collect_modules(pipeline, enc_attrs, warn_missing=declared)
-        vaes, _ = ModuleDiscovery._collect_modules(pipeline, vae_attrs, warn_missing=declared)
+        vaes, vae_names = ModuleDiscovery._collect_modules(pipeline, vae_attrs, warn_missing=declared)
         residents, resident_names = ModuleDiscovery._collect_modules(pipeline, res_attrs, warn_missing=declared)
 
         return PipelineModules(
@@ -163,5 +164,6 @@ class ModuleDiscovery:
             encoder_names=encoder_names,
             vaes=vaes,
             resident_modules=residents,
+            vae_names=vae_names,
             resident_names=resident_names,
         )

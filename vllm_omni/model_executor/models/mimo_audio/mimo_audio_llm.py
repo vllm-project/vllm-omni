@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 Xiaomi Corporation.
 import logging
 import threading
@@ -540,6 +543,11 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # hf_config=thinker_config.text_config,
             architectures=["Qwen2ForCausalLM"],
         )
+
+        # vLLM 0.28 turned SupportsPP.make_empty_intermediate_tensors from a
+        # method into a bare annotation, so declaring SupportsPP no longer
+        # supplies one. Delegate to the inner model, as the other omni talkers do.
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
         self.device = current_omni_platform.get_torch_device()
         # global_sampler MUST stay greedy (do_sample=False) so its token decision

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 import torch.nn as nn
@@ -175,7 +175,7 @@ class ConformerEncoderLayer(nn.Module):
              instance.
             `PositionwiseFeedForward` instance can be used as the argument.
         conv_module (torch.nn.Module): Convolution module instance.
-            `ConvlutionModule` instance can be used as the argument.
+            `ConvolutionModule` instance can be used as the argument.
         dropout_rate (float): Dropout rate.
         normalize_before (bool):
             True: use layer_norm before each sub-block.

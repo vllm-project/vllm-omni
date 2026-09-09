@@ -1,4 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 from prometheus_client import REGISTRY, generate_latest
@@ -10,6 +15,7 @@ from vllm_omni.metrics.modality import (
     observe_audio_streaming_finalize,
     observe_modality_at_finalize,
 )
+from vllm_omni.metrics.stats import OrchestratorAggregator
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -42,6 +48,15 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_UNDERRUN_S,
     defs.AUDIO_CONTINUITY_OK_METRIC,
     defs.AUDIO_SKIPPED_REQUESTS_METRIC,
+    defs.DIFFUSION_EXEC_S,
+    defs.DIFFUSION_EXEC_PER_STEP_S,
+    defs.DIFFUSION_PREPROCESS_S,
+    defs.DIFFUSION_POSTPROCESS_S,
+    defs.VAE_DECODE_S,
+    defs.DIFFUSION_FORWARD_S,
+    defs.DIFFUSION_KV_LOAD_S,
+    defs.IMAGE_TTFP_S,
+    defs.DENOISE_STEP_LATENCY_S,
 ]
 
 
@@ -55,6 +70,15 @@ class TestRegistration:
         mod.observe_audio_underrun("s", "r", 0.01)
         mod.inc_audio_continuity_ok("s", "r", 100)
         mod.inc_audio_skipped("s", "r", "malformed_codec")
+        mod.observe_diffusion_exec("s", "r", 0.5)
+        mod.observe_diffusion_exec_per_step("s", "r", 0.01)
+        mod.observe_diffusion_preprocess("s", "r", 0.01)
+        mod.observe_diffusion_postprocess("s", "r", 0.2)
+        mod.observe_vae_decode("s", "r", 0.3)
+        mod.observe_diffusion_forward("s", "r", 0.8)
+        mod.observe_diffusion_kv_load("s", "r", 0.04)
+        mod.observe_image_ttfp("s", "r", 2.5)
+        mod.observe_denoise_step_latency("s", "r", 0.05)
 
         out = generate_latest(REGISTRY).decode()
         for name in _EXPECTED_FAMILIES:
@@ -157,6 +181,50 @@ class TestAudio:
 
 
 # ---------------------------------------------------------------------------
+# Diffusion observe API
+# ---------------------------------------------------------------------------
+
+
+class TestDiffusion:
+    def test_diffusion_exec_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_exec", "0"
+        mod.observe_diffusion_exec(stage, replica, 1.25)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DIFFUSION_EXEC_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 1.25
+
+    def test_diffusion_preprocess_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_pre", "0"
+        mod.observe_diffusion_preprocess(stage, replica, 0.03)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DIFFUSION_PREPROCESS_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == pytest.approx(0.03)
+
+    def test_diffusion_postprocess_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_post", "0"
+        mod.observe_diffusion_postprocess(stage, replica, 0.8)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DIFFUSION_POSTPROCESS_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 0.8
+
+    def test_diffusion_exec_per_step_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_per_step", "0"
+        mod.observe_diffusion_exec_per_step(stage, replica, 0.078)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DIFFUSION_EXEC_PER_STEP_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == pytest.approx(0.078)
+
+    def test_log_stats_false_skips(self) -> None:
+        silent = OmniModalityMetrics(model_name="silent-model", log_stats=False)
+        silent.observe_diffusion_exec("s", "r", 1.0)
+        silent.observe_diffusion_exec_per_step("s", "r", 0.02)
+        silent.observe_diffusion_preprocess("s", "r", 0.01)
+        silent.observe_diffusion_postprocess("s", "r", 0.5)
+        out = generate_latest(REGISTRY).decode()
+        assert 'model_name="silent-model"' not in out
+
+
+# ---------------------------------------------------------------------------
 # Stub-driven routing tests for the finalize / streaming helpers.
 # ---------------------------------------------------------------------------
 
@@ -182,6 +250,33 @@ class _StubModMetrics:
 
     def inc_audio_skipped(self, s, r, reason):
         self.calls.append(("inc_audio_skipped", s, r, reason))
+
+    def observe_diffusion_exec(self, s, r, v):
+        self.calls.append(("observe_diffusion_exec", s, r, v))
+
+    def observe_diffusion_exec_per_step(self, s, r, v):
+        self.calls.append(("observe_diffusion_exec_per_step", s, r, v))
+
+    def observe_diffusion_preprocess(self, s, r, v):
+        self.calls.append(("observe_diffusion_preprocess", s, r, v))
+
+    def observe_diffusion_postprocess(self, s, r, v):
+        self.calls.append(("observe_diffusion_postprocess", s, r, v))
+
+    def observe_vae_decode(self, s, r, seconds):
+        self.calls.append(("observe_vae_decode", s, r, seconds))
+
+    def observe_diffusion_forward(self, s, r, seconds):
+        self.calls.append(("observe_diffusion_forward", s, r, seconds))
+
+    def observe_diffusion_kv_load(self, s, r, seconds):
+        self.calls.append(("observe_diffusion_kv_load", s, r, seconds))
+
+    def observe_image_ttfp(self, s, r, seconds):
+        self.calls.append(("observe_image_ttfp", s, r, seconds))
+
+    def observe_denoise_step_latency(self, s, r, seconds):
+        self.calls.append(("observe_denoise_step_latency", s, r, seconds))
 
 
 class _Bag:
@@ -239,8 +334,155 @@ class TestObserveModalityAtFinalize:
         )
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
 
-    def test_non_audio_output_type_skipped(self):
-        # Image / video / text output types are out of scope for this module.
+    def test_diffusion_path_full(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            output_unit_type="image",
+            stage_gen_time_ms=1000.0,
+            diffusion_metrics={
+                "preprocess_time_s": 0.05,
+                "diffusion_engine_exec_time_s": 1.2,
+                "postprocess_time_s": 0.3,
+                "forward_time_s": 1.0,
+                "image_num": 1,
+                "resolution": 1024,
+                "num_inference_steps": 50,
+            },
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert ("observe_diffusion_preprocess", "2", "0", 0.05) in stub.calls
+        assert ("observe_diffusion_exec", "2", "0", 1.2) in stub.calls
+        assert ("observe_diffusion_postprocess", "2", "0", 0.3) in stub.calls
+        assert ("observe_diffusion_exec_per_step", "2", "0", pytest.approx(0.024)) in stub.calls
+        assert ("observe_denoise_step_latency", "2", "0", pytest.approx(0.02)) in stub.calls
+
+    def test_denoise_step_latency_requires_forward_time(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            output_unit_type="image",
+            num_inference_steps=20,
+            diffusion_metrics={"diffusion_engine_exec_time_s": 1.2},
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert not any(c[0] == "observe_denoise_step_latency" for c in stub.calls)
+
+    def test_stage_snapshot_keeps_forward_based_denoise_latency(self):
+        aggregator = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=False,
+            wall_start_ts=0.0,
+            final_stage_id_for_e2e=0,
+        )
+        aggregator.diffusion_metrics["req-image"]["forward_time_s"] = 0.8
+        stage_metrics = _Bag(
+            stage_id=None,
+            request_id=None,
+            final_output_type=None,
+            num_tokens_in=0,
+            num_tokens_out=0,
+            stage_gen_time_ms=1200.0,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=_Bag(),
+            diffusion_metrics=None,
+            num_inference_steps=20,
+            output_unit_type="image",
+            denoise_step_latency_ms=0.0,
+        )
+
+        stats = aggregator._as_stage_request_stats(0, "req-image", stage_metrics, "image")
+
+        assert stats.denoise_step_latency_ms == pytest.approx(40.0)
+
+    def test_stage_snapshot_falls_back_to_stage_time_without_profiler(self):
+        aggregator = object.__new__(OrchestratorAggregator)
+        stage_metrics = _Bag(
+            stage_id=None,
+            request_id=None,
+            final_output_type=None,
+            stage_gen_time_ms=1200.0,
+            diffusion_metrics=None,
+            num_inference_steps=20,
+            output_unit_type="image",
+            denoise_step_latency_ms=0.0,
+        )
+
+        stats = aggregator._as_stage_request_stats(0, "req-image", stage_metrics, "image")
+
+        assert stats.diffusion_metrics is None
+        assert stats.denoise_step_latency_ms == pytest.approx(60.0)
+
+    def test_diffusion_per_step_skipped_without_num_inference_steps(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            stage_gen_time_ms=1000.0,
+            diffusion_metrics={
+                "diffusion_engine_exec_time_s": 1.2,
+                "preprocess_time_s": 0.05,
+                "postprocess_time_s": 0.3,
+            },
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert ("observe_diffusion_exec", "2", "0", 1.2) in stub.calls
+        assert not any(c[0] == "observe_diffusion_exec_per_step" for c in stub.calls)
+
+    def test_diffusion_metrics_none_skipped(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=500.0, diffusion_metrics=None),
+            engine_outputs=_Bag(),
+        )
+        assert not any(c[0].startswith("observe_diffusion") for c in stub.calls)
+
+    def test_diffusion_zero_values_observed(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            stage_gen_time_ms=500.0,
+            diffusion_metrics={
+                "preprocess_time_s": 0.0,
+                "diffusion_engine_exec_time_s": 0.0,
+                "postprocess_time_s": 0.0,
+            },
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert ("observe_diffusion_preprocess", "2", "0", 0.0) in stub.calls
+        assert ("observe_diffusion_exec", "2", "0", 0.0) in stub.calls
+        assert ("observe_diffusion_postprocess", "2", "0", 0.0) in stub.calls
+
+    def test_non_audio_output_type_skips_audio_but_still_checks_diffusion(self):
         stub = _StubModMetrics()
         for output_type in ("text", "image", "video"):
             observe_modality_at_finalize(
@@ -251,7 +493,7 @@ class TestObserveModalityAtFinalize:
                 stage_metrics=_Bag(stage_gen_time_ms=100.0),
                 engine_outputs=_Bag(),
             )
-        assert stub.calls == []
+        assert not any(c[0].startswith("observe_audio") or c[0].startswith("inc_audio") for c in stub.calls)
 
     def test_replica_id_none_skipped(self):
         stub = _StubModMetrics()
@@ -276,6 +518,80 @@ class TestObserveModalityAtFinalize:
             engine_outputs=_Bag(multimodal_output={}),
         )
         assert stub.calls == []
+
+
+class TestDiffusionUnitConversion:
+    def test_accumulator_converts_all_engine_milliseconds_to_seconds(self):
+        aggregator = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=False,
+            wall_start_ts=0.0,
+            final_stage_id_for_e2e=0,
+        )
+        engine_output = SimpleNamespace(
+            metrics={
+                "preprocess_time_ms": 50.0,
+                "diffusion_engine_exec_time_ms": 1500.0,
+                "postprocess_time_ms": 20.0,
+                "vae_decode_time_ms": 300.0,
+                "forward_time_ms": 800.0,
+                "scheduler_queue_wait_ms": 125.0,
+                "kv_recv_time_ms": 40.0,
+            }
+        )
+
+        aggregator.accumulate_diffusion_metrics("diffusion", "req-units", engine_output)
+
+        assert dict(aggregator.diffusion_metrics["req-units"]) == {
+            "preprocess_time_s": pytest.approx(0.05),
+            "diffusion_engine_exec_time_s": pytest.approx(1.5),
+            "postprocess_time_s": pytest.approx(0.02),
+            "vae_decode_time_s": pytest.approx(0.3),
+            "forward_time_s": pytest.approx(0.8),
+            "scheduler_queue_wait_s": pytest.approx(0.125),
+            "kv_recv_time_s": pytest.approx(0.04),
+        }
+
+
+class TestObserveDiffusionFinalize:
+    @pytest.mark.parametrize(
+        ("metric_key", "call_name", "value"),
+        [
+            ("vae_decode_time_s", "observe_vae_decode", 0.3),
+            ("forward_time_s", "observe_diffusion_forward", 0.8),
+            ("kv_recv_time_s", "observe_diffusion_kv_load", 0.04),
+        ],
+    )
+    def test_emits_optional_breakdown_metric(self, metric_key, call_name, value):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(diffusion_metrics={metric_key: value}),
+            engine_outputs=_Bag(),
+        )
+
+        assert (call_name, "2", "0", value) in stub.calls
+
+    def test_audio_diffusion_stage_fires_both_paths(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="audio",
+            stage_id=1,
+            replica_id=0,
+            stage_metrics=_Bag(
+                stage_gen_time_ms=1500.0,
+                audio_generated_frames=24000,
+                diffusion_metrics={"diffusion_engine_exec_time_s": 1.2},
+            ),
+            engine_outputs=_Bag(multimodal_output={"audio_sample_rate": 24000}),
+        )
+
+        assert ("observe_diffusion_exec", "1", "0", 1.2) in stub.calls
+        assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
 
 
 class TestObserveAudioFirstPacket:
@@ -397,3 +713,39 @@ class TestBucketSelection:
         # SECONDS_FAST_BUCKETS includes le=0.001 which is absent from SECONDS_BUCKETS.
         fast_marker = f'{defs.AUDIO_UNDERRUN_S}_bucket{{le="0.001"'
         assert fast_marker in out, "audio_underrun_s should use SECONDS_FAST_BUCKETS containing le=0.001"
+
+    def test_vae_decode_uses_seconds_buckets(self, mod: OmniModalityMetrics) -> None:
+        # VAE decode can stretch into seconds for high-resolution latents;
+        # stays on the wide bucket so the 300 s ceiling covers video VAE.
+        stage, replica = "vae_decode_sec", "0"
+        mod.observe_vae_decode(stage, replica, 1.5)
+        out = generate_latest(REGISTRY).decode()
+        sec_marker = f'{defs.VAE_DECODE_S}_bucket{{le="300.0"'
+        assert sec_marker in out, "vae_decode_s should use SECONDS_BUCKETS containing le=300.0"
+
+    def test_diffusion_forward_uses_seconds_buckets(self, mod: OmniModalityMetrics) -> None:
+        # Denoise loop can exceed the 60s fast-bucket ceiling for video gen.
+        stage, replica = "diff_forward_sec", "0"
+        mod.observe_diffusion_forward(stage, replica, 2.0)
+        out = generate_latest(REGISTRY).decode()
+        sec_marker = f'{defs.DIFFUSION_FORWARD_S}_bucket{{le="300.0"'
+        assert sec_marker in out, "diffusion_forward_s should use SECONDS_BUCKETS containing le=300.0"
+
+    def test_denoise_step_latency_uses_seconds_fast_buckets(self, mod: OmniModalityMetrics) -> None:
+        # Per-step denoise is sub-second; stays on the fast bucket for ms-level
+        # resolution.
+        stage, replica = "denoise_fast", "0"
+        mod.observe_denoise_step_latency(stage, replica, 0.075)
+        out = generate_latest(REGISTRY).decode()
+        fast_marker = f'{defs.DENOISE_STEP_LATENCY_S}_bucket{{le="0.001"'
+        assert fast_marker in out, "denoise_step_latency_s should use SECONDS_FAST_BUCKETS containing le=0.001"
+
+
+class TestDenoiseStepLatencyGuard:
+    @pytest.mark.parametrize(("value", "expected_count"), [(0.0, None), (-0.1, None), (0.05, 1.0)])
+    def test_nonpositive_values_are_skipped(self, mod: OmniModalityMetrics, value, expected_count) -> None:
+        stage, replica = f"denoise_{value}", "0"
+        mod.observe_denoise_step_latency(stage, replica, value)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DENOISE_STEP_LATENCY_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == expected_count

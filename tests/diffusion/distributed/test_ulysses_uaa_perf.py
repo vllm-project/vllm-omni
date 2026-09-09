@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Perf smoke tests for Ulysses advanced_uaa communication overhead.
 
 This test is intended for CI monitoring only:
@@ -9,8 +9,6 @@ This test is intended for CI monitoring only:
 
 from __future__ import annotations
 
-import os
-import socket
 from dataclasses import dataclass
 
 import pytest
@@ -18,6 +16,7 @@ import torch
 import torch.distributed as dist
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.attention.parallel.ulysses import (
     _all_gather_int,
     _ulysses_all_to_all_any_o,
@@ -31,20 +30,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.platforms import current_omni_platform
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _set_dist_env(*, rank: int, world_size: int, master_port: int) -> None:
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(master_port)
 
 
 def _max_all_reduce(pg: dist.ProcessGroup, value: float, *, device: torch.device) -> float:
@@ -77,22 +62,20 @@ def test_ulysses_advanced_uaa_comm_overhead(case: _PerfCase) -> None:
     if available_gpus < case.world_size:
         pytest.skip(f"Requires {case.world_size} GPUs, got {available_gpus}")
 
-    master_port = _find_free_port()
+    init_method = get_distributed_init_method()
     torch.multiprocessing.spawn(
         _perf_worker,
-        args=(case.world_size, master_port, case.ulysses_degree, case.ring_degree),
+        args=(case.world_size, init_method, case.ulysses_degree, case.ring_degree),
         nprocs=case.world_size,
     )
 
 
-def _perf_worker(local_rank: int, world_size: int, master_port: int, ulysses_degree: int, ring_degree: int) -> None:
+def _perf_worker(local_rank: int, world_size: int, init_method: str, ulysses_degree: int, ring_degree: int) -> None:
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
 
-    _set_dist_env(rank=local_rank, world_size=world_size, master_port=master_port)
-
     try:
-        init_distributed_environment(world_size=world_size, rank=local_rank)
+        init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
         initialize_model_parallel(
             data_parallel_size=1,
             cfg_parallel_size=1,

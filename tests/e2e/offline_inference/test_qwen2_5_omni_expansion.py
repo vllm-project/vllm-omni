@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E tests for Qwen2.5-Omni model with mixed modality inputs, audio and text output.
 """
@@ -55,7 +58,7 @@ def get_question(prompt_type="mix"):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
+def test_mix_to_audio(omni_runner, offline_client) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -79,14 +82,14 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     }
 
     # Test single completion
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_text_to_text(omni_runner, omni_runner_handler) -> None:
+def test_text_to_text(omni_runner, offline_client) -> None:
     """
     Test text input processing and text output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -99,4 +102,4 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     request_config = {"prompts": get_question("text_only"), "modalities": ["text"]}
 
     # Test single completion
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)

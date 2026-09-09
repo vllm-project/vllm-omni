@@ -47,7 +47,7 @@ def _text_result(text: str) -> OmniRequestOutput:
     output.text = text
     request_output = RequestOutput()
     request_output.outputs = [output]
-    return OmniRequestOutput(final_output_type="text", request_output=request_output)
+    return OmniRequestOutput.from_stage_output(request_output, final_output_type="text")
 
 
 def _audio_result(audio_data: Any) -> OmniRequestOutput:
@@ -61,7 +61,7 @@ def _audio_result(audio_data: Any) -> OmniRequestOutput:
     output.multimodal_output = {"audio": audio_data}
     request_output = RequestOutput()
     request_output.outputs = [output]
-    return OmniRequestOutput(final_output_type="audio", request_output=request_output)
+    return OmniRequestOutput.from_stage_output(request_output, final_output_type="audio")
 
 
 class MockWebSocket:

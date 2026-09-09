@@ -7,7 +7,10 @@ from collections.abc import Collection, Mapping
 
 from vllm.logger import init_logger
 
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import (
+    DIFFUSION_QUALITY_LEVELS,
+    OmniDiffusionSamplingParams,
+)
 
 logger = init_logger(__name__)
 
@@ -90,6 +93,9 @@ def normalize_diffusion_request_args(
     for alias, canonical_name in aliases.items():
         if alias in request_args:
             request_args[canonical_name] = request_args.pop(alias)
+    quality = request_args.get("quality")
+    if quality is not None and quality not in DIFFUSION_QUALITY_LEVELS:
+        raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {quality!r}")
     return normalized_extra_args, request_args
 
 

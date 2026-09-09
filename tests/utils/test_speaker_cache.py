@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import threading
 
 import pytest
@@ -144,7 +147,7 @@ class TestSpeakerEmbeddingCacheBehavior:
 
 
 class TestSingleton:
-    def test_singleton_identity(self, fresh_speaker_cache):
+    def test_singleton_identity(self, clean_speaker_cache):
         a = get_speaker_cache()
         b = get_speaker_cache()
         assert a is b

@@ -682,6 +682,10 @@ class TestDistributedReceive:
         mgr = _make_manager(from_tp=2, to_tp=2, local_rank=1)
         req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
         world_group = _MockBroadcastGroup(world_size=2, rank_in_group=1)
+        # broadcast_value=True: rank 0's verdict says every TP rank has the
+        # same KV state, so the per-rank receive result stands (see #5627
+        # consensus). The exchange runs on the TP group, not world.
+        tp_group = _MockBroadcastGroup(world_size=2, rank_in_group=1, broadcast_value=True)
         mgr.receive_multi_kv_cache = MagicMock(return_value=True)
 
         with (
@@ -704,10 +708,19 @@ class TestDistributedReceive:
                 return_value=0,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=None),
+            patch("vllm.distributed.parallel_state.get_tp_group", return_value=tp_group),
         ):
             assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         mgr.receive_multi_kv_cache.assert_called_once_with(req, None, torch.device("cpu"))
+        # Pure TP still fetches per-rank (no leader→follower distribution),
+        # but each rank now reports its KV-state signature on the TP group
+        # for the identical-state verdict instead of silently diverging on a
+        # miss (#5627). World must stay untouched — it holds DP/PP ranks.
+        assert len(tp_group.send_calls) == 1
+        dst, sig = tp_group.send_calls[0]
+        assert dst == 0 and sig[0] is True
+        assert world_group.send_calls == []
 
     # ── SP-only scenarios ────────────────────────────────────────────
 

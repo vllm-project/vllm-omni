@@ -38,17 +38,6 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "fishaudio/s2-pro"
-DEFAULT_STAGE_CONFIG = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "..",
-    "vllm_omni",
-    "model_executor",
-    "stage_configs",
-    "fish_speech_s2_pro.yaml",
-)
 
 
 def build_prompt(
@@ -154,8 +143,6 @@ def _build_omni_kwargs(args, model_name: str) -> dict:
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
-    else:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path or DEFAULT_STAGE_CONFIG
     return omni_kwargs
 
 
@@ -179,7 +166,7 @@ def main(args):
 
     t_start = time.perf_counter()
     for stage_outputs in omni.generate(inputs):
-        request_output = stage_outputs.request_output
+        request_output = stage_outputs
         if request_output is None or not request_output.outputs:
             continue
         _save_wav(
@@ -215,7 +202,7 @@ async def main_streaming(args):
     sample_rate = None
 
     async for stage_output in omni.generate(prompt, request_id=request_id):
-        mm = stage_output.request_output.outputs[0].multimodal_output
+        mm = stage_output.outputs[0].multimodal_output
         if not stage_output.finished:
             t_now = time.perf_counter()
             sample_rate, n = _collect_audio_chunk(mm, all_audio_chunks, sample_rate)
@@ -277,12 +264,6 @@ def parse_args():
         type=str,
         default=None,
         help="Deploy config YAML path (under vllm_omni/deploy/).",
-    )
-    parser.add_argument(
-        "--stage-configs-path",
-        type=str,
-        default=None,
-        help="Path to stage configs YAML (legacy, prefer --deploy-config).",
     )
     parser.add_argument(
         "--output-dir",

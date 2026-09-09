@@ -431,7 +431,10 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
         mm_items = inputs.mm_data_items
 
         with timing_ctx.record("get_mm_hashes"):
-            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+            mm_hashes = inputs.get_mm_hashes(
+                self.info.model_id,
+                self.info.ctx.get_mm_config().mm_hasher_algorithm,
+            )
 
         tokenizer = self.info.ctx.tokenizer
         prompt_token_ids = self._encode_prompt_to_token_ids(prompt, tokenizer)

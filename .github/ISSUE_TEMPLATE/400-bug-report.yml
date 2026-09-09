@@ -83,7 +83,7 @@ body:
 
       omni = Omni(
           model="Qwen/Qwen-Image",
-          stage_configs_path="/path/to/stage_configs.yaml",
+          deploy_config="/path/to/deploy_config.yaml",
       )
 
       prompts = [{"prompt": "A scenic watercolor painting of a lighthouse at sunset"}]

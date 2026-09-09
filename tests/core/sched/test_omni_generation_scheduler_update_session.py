@@ -110,6 +110,9 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     session.status = RequestStatus.RUNNING
     session.resumable = True
     session.num_computed_tokens = len(session.prompt_token_ids)
+    # schedule() has counted this step's token as in flight; update_from_output()
+    # must settle it before handling the segment boundary.
+    session.num_in_flight_tokens = 1
 
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -118,15 +121,24 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
         is_done_receiving_chunks=lambda _request_id: True,
         segment_finished_requests={session.request_id},
     )
-    sched._handle_stopped_request.return_value = False
+
+    def rearm_resumable_request(request: Request) -> bool:
+        request.status = RequestStatus.WAITING
+        return False
+
+    sched._handle_stopped_request.side_effect = rearm_resumable_request
     sched.running = [session]
     sched.waiting = MagicMock()
     sched.skipped_waiting = MagicMock()
     sched.structured_output_manager.should_advance.return_value = False
-    sched._pending_finish_reqs = []
+    # Async scheduling can observe the segment boundary in the next schedule()
+    # before this model output is applied and defer the same request for finish.
+    # update_from_output() must not re-arm the resumable request twice.
+    sched._pending_finish_reqs = [session]
     sched.recompute_kv_load_failures = False
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
 
@@ -155,6 +167,8 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     output = outputs[session.client_index].outputs[0]
     assert output.finish_reason is not None
     assert output.is_segment_finished is True
+    sched._handle_stopped_request.assert_called_once_with(session)
+    assert sched._pending_finish_reqs == []
 
 
 def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:
@@ -397,12 +411,13 @@ class TestRealignRequestStatusToQueues:
         assert stale.status == RequestStatus.RUNNING
         assert clean.status == RequestStatus.RUNNING
 
-    def test_finished_request_is_skipped(self) -> None:
+    def test_non_resumable_finished_request_is_skipped(self) -> None:
         """Already-finished requests must not be touched -- they may
         have legitimate finished statuses (FINISHED_STOPPED etc.) that
         a status flip would corrupt.
         """
         req = _make_request(request_id="req-finished")
+        req.resumable = False
         req.status = RequestStatus.FINISHED_STOPPED
 
         sched = _RealignSchedulerStub(

@@ -1,6 +1,11 @@
 # CODEOWNERS is used to automatically assign PR reviewers
 # Format: path pattern @username or @team
 # More info: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# The vllm_omni/** source-tree rules below are derived from the `owners` and
+# `primary_code_paths` front matter in docs/design/module/*.md. When updating
+# ownership, update the design doc first, then regenerate the matching rule here.
+# Last-match-wins: more specific rules must come AFTER broader ones.
 
 # Default owners (fallback reviewers for all files)
 * @Gaohan123 @hsliuustc0106 @ywang96
@@ -16,30 +21,15 @@
 /.claude/ @hsliuustc0106
 
 # Tests
-/tests/ @yenuo26
+/tests/ @yenuo26 @NickCao
 
 # CI
-/.buildkite/ @yenuo26 @congw729
+/.buildkite/ @yenuo26 @congw729 @NickCao
 
-# Engine and model_executor
-/vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan @Sy0307
-/vllm_omni/engine/ @tzhouam @yinpeiqi @fake0fan @Sy0307
-/vllm_omni/entrypoints/ @tzhouam @yinpeiqi @fake0fan @alex-jw-brooks
-/vllm_omni/model_executor/ @tzhouam @gcanlin
-/vllm_omni/worker/ @tzhouam @gcanlin
+# ComfyUI / external apps
+/apps/ @fhfuih @alex-jw-brooks
 
-# Diffusion
-/vllm_omni/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @david6666666 @xuechendi
-/vllm_omni/lora/ @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @yuanheng-zhao
-
-# Diffusion CPU offloading
-/vllm_omni/diffusion/offloader/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @yuanheng-zhao @xuechendi
-
-# Omni and TTS support
-/vllm_omni/transformers_utils/ @tzhouam @yuanheng-zhao
-/vllm_omni/model_executor/models/ @linyueqian @ZeldaHuang @princepride @yuanheng-zhao @amy-why-3459 @Bounty-hunter @Sy0307 @gcanlin
-
-# Benchmarks
+# Benchmarks (out-of-tree)
 /benchmarks/accuracy/ @david6666666
 /benchmarks/build_dataset/ @linyueqian @yuanheng-zhao
 /benchmarks/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @xuechendi
@@ -47,20 +37,110 @@
 /benchmarks/glm_image/ @princepride @JaredforReal
 /benchmarks/tts/ @linyueqian @ZeldaHuang @princepride @Sy0307 @gcanlin
 
-# Usability and Observability
-/vllm_omni/deploy/ @tzhouam @lishunyang12
-/vllm_omni/metrics/ @lishunyang12
-/vllm_omni/profiler/ @gcanlin
+# =====================================================================
+# Module design ownership (docs/design/module/*.md)
+# Each section header cites the source design doc.
+# =====================================================================
 
-# ComfyUI
-/apps/ @fhfuih @alex-jw-brooks
+# Autoregressive runtime — docs/design/module/ar_runtime.md
+/vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan @Sy0307 @Gaohan123
+/vllm_omni/worker/ @tzhouam @yinpeiqi @fake0fan @Sy0307 @Gaohan123
 
-# Large Scale Serving
+# Engine orchestration & stage runtime — docs/design/module/engine_orchestration.md, stage_runtime.md
+/vllm_omni/engine/ @tzhouam @fake0fan
+# File-level overrides: input/output modality contracts own these engine files
+# — docs/design/module/input_output_modality_contracts.md
+/vllm_omni/engine/messages.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+/vllm_omni/engine/serialization.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+/vllm_omni/engine/mm_outputs.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+/vllm_omni/engine/output_modality.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+/vllm_omni/engine/output_processor.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+
+# Input/output modality contracts — docs/design/module/input_output_modality_contracts.md
+/vllm_omni/inputs/ @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+/vllm_omni/outputs/ @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+/vllm_omni/request.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+/vllm_omni/data_entry_keys.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
+
+# Entrypoints and serving boundaries — docs/design/module/entrypoints.md
+/vllm_omni/entrypoints/ @alex-jw-brooks @linyueqian @NickCao
+# File-level overrides within entrypoints/
+/vllm_omni/entrypoints/openai/errors.py @alex-jw-brooks @NickCao
+/vllm_omni/entrypoints/cli/benchmark/ @alex-jw-brooks @Bounty-hunter
+
+# Error contracts — docs/design/module/error_contracts.md
+/vllm_omni/errors.py @alex-jw-brooks @NickCao
+
+# OmniConnector (inter-stage transport) — docs/design/module/omni_connector.md
 /vllm_omni/distributed/ @princepride @yuanheng-zhao @xuechendi @natureofnature @fake0fan
 
-# Quantization and configuration
+# Model integration — docs/design/module/model_integration.md
+/vllm_omni/model_executor/ @tzhouam @gcanlin
+/vllm_omni/model_executor/models/ @tzhouam @gcanlin @Sy0307 @amy-why-3459 @linyueqian
+/vllm_omni/model_extras/ @tzhouam @gcanlin @princepride
+/vllm_omni/plugins/ @gcanlin @tjtanaa @xuechendi
+
+# Execution platforms (hardware backends) — docs/design/module/execution_platforms.md
+/vllm_omni/platforms/ @gcanlin @tjtanaa @xuechendi
+/vllm_omni/attention/ @gcanlin @tjtanaa @xuechendi @david6666666 @lishunyang12
+
+# Configuration & deploy — docs/design/module/vllm_omni_config.md
 /vllm_omni/config/ @lishunyang12 @alex-jw-brooks
+/vllm_omni/deploy/ @lishunyang12 @alex-jw-brooks
+
+# Quantization — docs/design/module/quantization.md
 /vllm_omni/quantization/ @david6666666 @Isotr0py @lishunyang12
 
-# Hardware plugins and accelerators
-/vllm_omni/platforms/ @gcanlin @tjtanaa @xuechendi
+# Observability — docs/design/module/observability.md
+/vllm_omni/metrics/ @lishunyang12 @vraiti
+
+# Profiling — docs/design/module/profiling.md
+/vllm_omni/profiler/ @gcanlin
+
+# Benchmarking (in-tree) — docs/design/module/benchmarking.md
+/vllm_omni/benchmarks/ @alex-jw-brooks @Bounty-hunter
+
+# LoRA (no dedicated design doc; ownership intentionally narrowed)
+/vllm_omni/lora/ @SamitHuang @wtomin
+
+# Transformers utils (related path only in design docs; preserves prior ownership)
+/vllm_omni/transformers_utils/ @tzhouam @yuanheng-zhao
+
+# =====================================================================
+# Diffusion module family — docs/design/module/diffusion/
+# Umbrella rule first; sub-module rules after it win via last-match.
+# =====================================================================
+
+# Diffusion umbrella (top-level files: data.py, forward_context.py, etc.)
+# — docs/design/module/diffusion/index.md
+/vllm_omni/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @david6666666 @xuechendi
+
+# Cache management — docs/design/module/cache_management.md
+/vllm_omni/diffusion/cache/ @Isotr0py @princepride @SamitHuang
+
+# Diffusion quantization — docs/design/module/quantization.md
+/vllm_omni/diffusion/quantization/ @david6666666 @Isotr0py @lishunyang12
+
+# Diffusion profiling — docs/design/module/profiling.md
+/vllm_omni/diffusion/profiler/ @gcanlin
+
+# Diffusion runtime (scheduler, executor, worker)
+# — docs/design/module/diffusion/diffusion_runtime.md, continuous_batching.md
+/vllm_omni/diffusion/sched/ @Isotr0py @princepride @SamitHuang @fhfuih
+/vllm_omni/diffusion/executor/ @Isotr0py @princepride @SamitHuang @fhfuih
+/vllm_omni/diffusion/worker/ @Isotr0py @princepride @SamitHuang @fhfuih
+
+# Diffusion model integration (pipelines, registration, checkpoint loading)
+# — docs/design/module/diffusion/diffusion_model_integration.md
+/vllm_omni/diffusion/models/ @fhfuih @Bounty-hunter @wtomin
+/vllm_omni/diffusion/model_loader/ @fhfuih @Bounty-hunter @wtomin @RuixiangMa
+/vllm_omni/diffusion/lora/ @fhfuih @Bounty-hunter @wtomin @RuixiangMa
+
+# Diffusion parallelism (rank topology, TP/SP/PP/VAE patch)
+# — docs/design/module/diffusion/parallelism.md
+/vllm_omni/diffusion/distributed/ @princepride @yuanheng-zhao @xuechendi @Bounty-hunter
+/vllm_omni/diffusion/attention/parallel/ @princepride @yuanheng-zhao @xuechendi @Bounty-hunter
+
+# Diffusion offloader (CPU offloading, DLO)
+# — docs/design/module/diffusion/offloader.md
+/vllm_omni/diffusion/offloader/ @yuanheng-zhao @david6666666 @lishunyang12

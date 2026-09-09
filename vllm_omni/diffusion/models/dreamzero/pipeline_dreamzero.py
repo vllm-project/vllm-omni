@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """DreamZero pipeline for vllm-omni.
 
@@ -21,7 +21,6 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -67,9 +66,13 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
+# Shipped DreamZero geometry retains 24 Wan VAE causal-convolution cache
+# entries. This is the measured persistent CUDA upper bound per live session.
+DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 
 # The pipeline's per-session state is a bespoke ``DreamZeroState`` by default, or
 # a ``DreamZeroStateAdapter`` view when the opt-in session manager is enabled.
@@ -149,6 +152,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             session_capacity=MAX_DREAMZERO_SESSIONS,
             cross_attention=tuple(cross_attention),
             max_scratch_tokens_per_branch=int(transformer.num_action_per_block + transformer.num_state_per_block),
+            model_owned_state_bytes_per_session=DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
         )
 
     @contextmanager
@@ -577,7 +581,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 return json.load(f)
 
         try:
-            json_path = hf_hub_download(model_path, relative_path)
+            json_path = hf_api().hf_hub_download(model_path, relative_path)
             with open(json_path) as f:
                 return json.load(f)
         except Exception:
@@ -654,10 +658,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Wan ``feat_cache`` mutation is incompatible with CUDAGraph capture.
         DiT blocks use per-block ``fullgraph=True``.
         """
-        if not torch.cuda.is_available():
-            logger.info("DreamZero setup_compile skipped: CUDA not available.")
-            return
-
         from vllm_omni.diffusion.models.dreamzero.wan_vae_feat_cache_patch import (
             apply_wan_vae_feat_cache_tensor_patch,
         )

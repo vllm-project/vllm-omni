@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E402, I001
 import argparse
 import math
 import os
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -42,7 +44,10 @@ from benchmarks.accuracy.text_to_image.gbench import (
     summarize_generated_records as summarize_gebench_generated_records,
     summarize_gebench_results,
 )
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import seed_tts_bench_argv
+from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
+    build_serve_common_argv,
+    seed_tts_bench_argv,
+)
 from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import sync_dataset_env_from_ns
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
 
@@ -55,6 +60,25 @@ def test_seed_tts_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
 
     dataset_idx = argv.index("--dataset-path")
     assert argv[dataset_idx + 1] == "zhaochenyang20/seed-tts-eval"
+
+
+def test_build_serve_common_argv_accepts_realtime_seed_tts_route(tmp_path):
+    argv = build_serve_common_argv(
+        host="127.0.0.1",
+        port=8000,
+        model="openbmb/MiniCPM-o-4_5",
+        num_prompts=4,
+        max_concurrency=1,
+        num_warmups=0,
+        percentile_metrics="ttft,audio_ttfp,audio_rtf",
+        result_dir=tmp_path,
+        result_filename="result.json",
+        backend="openai-realtime-tts",
+        endpoint="/v1/realtime",
+    )
+
+    assert argv[argv.index("--backend") + 1] == "openai-realtime-tts"
+    assert argv[argv.index("--endpoint") + 1] == "/v1/realtime"
 
 
 def test_sync_dataset_env_preserves_seed_tts_hf_repo_id(monkeypatch):
@@ -84,11 +108,9 @@ def test_resolve_seed_tts_root_downloads_only_requested_locale(monkeypatch, tmp_
         captured["allow_patterns"] = allow_patterns
         return str(downloaded_root)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "huggingface_hub",
-        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
-    )
+    from vllm_omni.transformers_utils import repo_utils
+
+    monkeypatch.setattr(repo_utils.hf_api(), "snapshot_download", fake_snapshot_download)
 
     resolved = resolve_seed_tts_root(
         "zhaochenyang20/seed-tts-eval",

@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online expansion tests for higgs-audio v2 against /v1/audio/speech.
 
 v1 scope is plain text -> 24 kHz speech plus shallow voice clone via
 ref_audio + ref_text (inline) or voice=<name> (after POST /v1/audio/voices).
-The model-aware request validator
-(vllm_omni/entrypoints/openai/tts_adapters/higgs_audio_v2::validate)
-rejects multi-speaker tags, language overrides, task_type, and bare
-voice=<name> for names that do not match an uploaded speaker — this suite
-exercises both the happy path (plain text in, audio bytes out) and the
-validator rejections, so a regression that loosens the schema will fail
-loudly.
+Model-aware validator rejections live in L1
+``tests/entrypoints/openai_api/test_tts_adapter.py``
+(``test_higgs_audio_v2_validate_*``).
 """
 
 from __future__ import annotations
@@ -27,7 +23,7 @@ os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -63,7 +59,7 @@ _MIN_AUDIO_BYTES = 20_000
 # speech) + its transcript. See tests/e2e/online_serving/test_qwen3_tts_base.py
 # for the asset rationale — keeping a single shared reference clip across TTS
 # tests avoids duplicating WAVs in the repo.
-_REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+_REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 _REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
@@ -72,9 +68,9 @@ class TestHiggsAudioV2OnlineHappyPath:
     """Plain-text -> audio happy paths against the live HTTP server."""
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_plain_text_wav(self, omni_server, openai_client) -> None:
+    def test_plain_text_wav(self, omni_server, online_client) -> None:
         """Single non-streaming WAV request — covers the canonical TTS happy path."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Hello world.",
@@ -86,7 +82,7 @@ class TestHiggsAudioV2OnlineHappyPath:
         )
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_plain_text_pcm_streaming(self, omni_server, openai_client) -> None:
+    def test_plain_text_pcm_streaming(self, omni_server, online_client) -> None:
         """Streaming PCM via the shared-memory connector's codec_streaming path.
 
         higgs_audio_v2.yaml pins ``codec_streaming: true`` + ``async_chunk: false``,
@@ -102,7 +98,7 @@ class TestHiggsAudioV2OnlineHappyPath:
         content correctness is separately guarded by the full_model transcript
         check.
         """
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Streaming the quick brown fox over the lazy dog.",
@@ -116,9 +112,9 @@ class TestHiggsAudioV2OnlineHappyPath:
         )
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_plain_text_with_max_new_tokens(self, omni_server, openai_client) -> None:
+    def test_plain_text_with_max_new_tokens(self, omni_server, online_client) -> None:
         """max_new_tokens is one of the few extra fields the higgs validator accepts."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Innovation distinguishes between a leader and a follower.",
@@ -131,9 +127,9 @@ class TestHiggsAudioV2OnlineHappyPath:
         )
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_concurrent_plain_text(self, omni_server, openai_client) -> None:
+    def test_concurrent_plain_text(self, omni_server, online_client) -> None:
         """Three concurrent non-streaming requests — guards the per-slot audio state."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "It was the night before my birthday.",
@@ -143,104 +139,6 @@ class TestHiggsAudioV2OnlineHappyPath:
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
             },
             request_num=3,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Validator rejections served over HTTP. Each case targets one out-of-scope
-# field; the validator returns 4xx via the OpenAI error path. We keep the
-# error-message substring loose so a phrasing tweak in the validator does not
-# break CI, but tight enough to catch a regression that silently accepts the
-# field.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-class TestHiggsAudioV2OnlineValidatorRejections:
-    """Out-of-scope fields must come back as 4xx with a higgs-named message."""
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_rejects_ref_audio_without_ref_text(self, omni_server, openai_client) -> None:
-        """Voice clone needs the transcript too — half-supplied is a 4xx."""
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "Hello world.",
-                "ref_audio": _REF_AUDIO_URL,
-                "response_format": "wav",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
-                "err_message": "ref_text",
-            }
-        )
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_rejects_ref_text_without_ref_audio(self, omni_server, openai_client) -> None:
-        """Symmetric guard: ref_text alone is not enough — must come with ref_audio."""
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "Hello world.",
-                "ref_text": "some transcript",
-                "response_format": "wav",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
-                "err_message": "ref_audio",
-            }
-        )
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_rejects_task_type(self, omni_server, openai_client) -> None:
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "Hello world.",
-                "task_type": "Base",
-                "response_format": "wav",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
-                "err_message": "task_type",
-            }
-        )
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_rejects_language_override(self, omni_server, openai_client) -> None:
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "Hello world.",
-                "language": "Chinese",
-                "response_format": "wav",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
-                "err_message": "language",
-            }
-        )
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_rejects_multi_speaker_tag_in_text(self, omni_server, openai_client) -> None:
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "[SPEAKER0] hi",
-                "response_format": "wav",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
-                "err_message": "multi-speaker",
-            }
-        )
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_rejects_empty_input(self, omni_server, openai_client) -> None:
-        openai_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "   ",
-                "response_format": "wav",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "status_code": (400, 422),
-                "err_message": "empty",
-            }
         )
 
 
@@ -256,9 +154,9 @@ class TestHiggsAudioV2OnlineVoiceClone:
     """
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_voice_clone_basic(self, omni_server, openai_client) -> None:
+    def test_voice_clone_basic(self, omni_server, online_client) -> None:
         """Single non-streaming WAV request driven by the qwen3_tts ref clip."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Hello world.",
@@ -272,9 +170,9 @@ class TestHiggsAudioV2OnlineVoiceClone:
         )
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_voice_clone_pcm_streaming(self, omni_server, openai_client) -> None:
+    def test_voice_clone_pcm_streaming(self, omni_server, online_client) -> None:
         """Voice clone over the streaming PCM path."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Innovation distinguishes a leader from a follower.",

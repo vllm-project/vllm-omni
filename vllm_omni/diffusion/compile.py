@@ -56,23 +56,50 @@ def regionally_compile(
     # Build all compiled callables before mutating the model. This keeps setup
     # failures atomic: callers can safely continue with the uncompiled model if
     # torch.compile raises synchronously for any repeated block.
-    compiled_forwards: list[tuple[nn.Module, Any]] = []
+    # Keep the pre-hook callable separately.  DLO and the ordinary layerwise
+    # offloader install a HookRegistry wrapper in ``module.forward``.  That
+    # wrapper performs stream/event synchronization and storage rebinding, so
+    # compiling it pulls offload control flow into the graph.  Compile the
+    # original block compute instead and leave the wrapper outside the graph.
+    compiled_forwards: list[tuple[nn.Module, Any | None, Any]] = []
     for name, submod in model.named_modules():
         if _matches_repeated_block(name, submod, repeated_blocks, repeated_block_attrs):
             # Compile the block compute while keeping nn.Module.__call__ hooks
-            # outside the compiled graph.
+            # outside the compiled graph. If a HookRegistry is already
+            # installed, ``submod.forward`` is the hook dispatcher and the
+            # original callable is stored in ``_omni_original_forward``.
+            # NOTE: anything that wraps this callable must stay
+            # signature-transparent — cache-dit's BlockAdapter matches blocks
+            # by inspecting forward's parameter names and return annotation,
+            # which torch.compile preserves.
+            original_forward = getattr(submod, "_omni_original_forward", None)
+            forward_to_compile = original_forward if original_forward is not None else submod.forward
             compiled_forwards.append(
                 (
                     submod,
-                    torch.compile(submod.forward, *compile_args, **compile_kwargs),
+                    original_forward,
+                    torch.compile(forward_to_compile, *compile_args, **compile_kwargs),
                 )
             )
 
     if not compiled_forwards:
         logger.warning(f"Regional compilation skipped because {repeated_blocks} classes are not found in the model.")
     else:
-        for submod, compiled_forward in compiled_forwards:
-            submod.forward = compiled_forward
+        for submod, original_forward, compiled_forward in compiled_forwards:
+            if original_forward is None:
+                submod.forward = compiled_forward
+                continue
+
+            # Keep HookRegistry's dispatcher as ``forward`` and replace only
+            # the callable it dispatches to.  Hooks such as MagCache retain a
+            # reference to the original callable as well, so update those
+            # references when they still point at the pre-compile function.
+            submod._omni_original_forward = compiled_forward
+            registry = getattr(submod, "_hook_registry", None)
+            for hook in getattr(registry, "_hooks", {}).values():
+                fn_ref = getattr(hook, "fn_ref", None)
+                if fn_ref is not None and fn_ref.original_forward is original_forward:
+                    fn_ref.original_forward = compiled_forward
         logger.info(
             "Regional compilation applied to %d module(s) for repeated blocks %s.",
             len(compiled_forwards),

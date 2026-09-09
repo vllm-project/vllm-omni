@@ -285,7 +285,17 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
         captured["mm_cache_keys"] = kwargs["mm_hashes"]
         return MagicMock(name="mm_kwargs"), {"video": [[]], "audio": [[]]}
 
-    fake_self = SimpleNamespace(cache=cache, info=SimpleNamespace(model_id="m"))
+    fake_self = SimpleNamespace(
+        cache=cache,
+        info=SimpleNamespace(
+            model_id="m",
+            ctx=SimpleNamespace(
+                get_mm_config=lambda: SimpleNamespace(
+                    mm_hasher_algorithm="sha256",
+                )
+            ),
+        ),
+    )
     fake_self._get_hf_mm_data = MagicMock(return_value=({}, {}))
     # Bound methods called via self inside _cached_apply_hf_processor.
     fake_self._get_audio_in_video_pairs = lambda mm_data_items, hf_processor_mm_kwargs: (

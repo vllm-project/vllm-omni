@@ -43,6 +43,24 @@ This folder provides several entrypoints for experimenting with text-to-image di
 
 Default model: `Qwen/Qwen-Image`
 
+### LingBot-Video
+
+LingBot-Video uses the same checkpoint for image and video generation. Run the
+shared T2I entry point with:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a red fox standing in fresh snow" \
+  --height 192 --width 320 --num-inference-steps 2 \
+  --guidance-scale 3.0 --extra-body '{"flow_shift":3.0}' \
+  --output lingbot_t2i.png
+```
+
+The shared T2I entry point selects the `image` output modality. The LingBot
+pipeline validates that T2I requests produce one frame and do not include an
+input image.
+
 ## Quick Start
 
 ### Python API
@@ -56,7 +74,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output.images
+    images = outputs[0].images
     images[0].save("coffee.png")
 ```
 
@@ -92,8 +110,9 @@ python text_to_image.py \
 | `--ring-degree` | int | `1` | Ring sequence parallel degree for hybrid Ulysses + Ring inference |
 | `--ulysses-mode` | str | `"strict"` | Ulysses SP mode: `"strict"` or `"advanced_uaa"` |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
+| `--lora-path` | str | — | Path to PEFT LoRA adapter folder or checkpoint file |
 | `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--lora-backend` | str |`"peft"`| LoRA backend for loading LoRA adapters. Default: peft. Available options: peft, distill |
 | `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
 | `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 | `--auxiliary-text-encoder` | str | `None` | Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full). |
@@ -246,7 +265,7 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 !!! info
@@ -260,7 +279,7 @@ if __name__ == "__main__":
     For diffusion pipelines, the input list is sliced into single-item requests
     before feeding into the diffusion pipeline. For request-level batching
     controls such as `max_num_seqs`, see
-    [Request-Level Batching](../../../docs/user_guide/diffusion/request_batching.md).
+    [Diffusion Execution Modes](../../../docs/user_guide/diffusion/execution_modes.md).
 
 ### Negative Prompts
 
@@ -282,7 +301,7 @@ if __name__ == "__main__":
         }
     ])
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 You can also pass a negative prompt via the CLI argument `--negative-prompt`:

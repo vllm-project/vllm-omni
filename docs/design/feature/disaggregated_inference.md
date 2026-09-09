@@ -59,19 +59,18 @@ This `metadata` must be passed through the control plane so `get()` can locate t
 
 ## Configuration Model
 
-Define connectors in runtime:
+Define connectors at the top level of the deploy YAML:
 
 ```yaml
-runtime:
-  connectors:
-    connector_of_shared_memory:
-      name: SharedMemoryConnector
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
 ```
 
 Wire stages to connectors:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
     output_connectors:
       to_stage_1: connector_of_shared_memory

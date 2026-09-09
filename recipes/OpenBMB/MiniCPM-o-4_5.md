@@ -30,8 +30,9 @@ also provided.
   `hf_config.version="4.5"`):
   - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - 2-GPU and 3-GPU layouts:
+  - Recommended 2-GPU continuous-batching layout:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
+  - 3-GPU layout:
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
@@ -69,6 +70,35 @@ reference-voice prompt features. `minicpmo_4_5.yaml` remains the stable
 single-GPU entry point; `minicpmo_4_5_2gpu.yaml` is the recommended
 two-GPU profile. The removed fused two-stage implementation is not retained as
 a fallback because it would duplicate state machines and correctness paths.
+
+### Graph execution
+
+Graph boundaries follow each stage's state model:
+
+| Stage | Graph mode on Ascend | Eager boundary |
+| --- | --- | --- |
+| 0 Thinker | vLLM `PIECEWISE` | multimodal preprocessing and output routing |
+| 1 Talker | vLLM `PIECEWISE` | conditioning preprocessing, codec sampling, request-state updates |
+| 2 Code2Wav | inner exact-shape NPUGraph for the CFM DiT estimator | encoder, timestep embedding, HiFT/RNG, request parsing, stream-state commit |
+
+Stage 2 keeps `enforce_eager: true` for the generation runner because its
+Python request metadata and per-request cache dictionaries are not valid
+outer-graph inputs. The backend captures only the deterministic CFM DiT
+estimator, with an exact graph key for each tensor shape. Timestep embedding
+stays eager because the upstream implementation creates a CPU frequency tensor;
+HiFT stays eager because it generates random phase. The graph cache stores up
+to 32 entries by default, after which unseen shapes run eagerly.
+
+An ACL graph capture failure is fatal to that Stage-2 process because older
+torch-npu releases can leave allocator and RNG capture state invalid. Restart
+the service after a capture failure. To run without capture, set
+`code2wav_enable_npu_graph: false` under the Stage-2
+`platforms.npu.stages[].additional_config` block before startup. Tune the cache
+limit there with `code2wav_max_npu_graphs`. Graph mode also requires
+`ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
+
+The inner NPUGraph is independent of the outer runner setting, so do not use a
+global `--enforce-eager` override when Stage 0/1 `PIECEWISE` replay is desired.
 
 ## GPU
 
@@ -210,9 +240,9 @@ speech output (TTS)"** checkbox on / off.
   model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
-- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 remains
-  eager because its request-owned Flow/HiFT caches and variable chunk/cache
-  shapes are not yet exposed through a static exact-shape graph wrapper.
+- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 keeps its
+  request orchestration eager while using inner CFM and HiFT CUDA Graphs. On
+  Ascend, the exact-shape CFM DiT estimator instead uses inner NPUGraph replay.
 - All default stages use `max_num_seqs: 4` to reduce cross-process GPU
   contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
@@ -223,8 +253,8 @@ speech output (TTS)"** checkbox on / off.
 - `StageRequestStats.batch_size` is a request-scoped placeholder, not the
   scheduler's execution batch.
 - Single-GPU co-location trades throughput for hardware density: Stage 0/1
-  CUDA Graph replay and eager Stage 2 vocoder kernels compete across three
-  CUDA contexts. Use the 8x4090 config or a custom multi-GPU mapping for
+  CUDA Graph replay and Stage 2 vocoder kernels compete across three CUDA
+  contexts. Use the 8x4090 config or a custom multi-GPU mapping for
   throughput-sensitive serving.
 
 ### 8 x RTX 4090 24GB (consumer-GPU layout)

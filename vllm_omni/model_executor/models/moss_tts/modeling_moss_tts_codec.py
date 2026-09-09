@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -226,6 +229,7 @@ class MossTTSCodecDecoder(nn.Module):
     has_postprocess: bool = False
     enable_update_additional_information: bool = True
     requires_raw_input_tokens: bool = True
+    requires_exact_input_shape: bool = True
 
     _OUTPUT_SAMPLE_RATE: int = 24_000
 
@@ -793,18 +797,23 @@ class MossTTSCodecDecoder(nn.Module):
         return {f"_codec.{name}" for name, _ in codec.named_parameters()}
 
     def _build_codec(self, codec_path: str) -> tuple[Any, nn.Module]:
-        try:
-            codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
-            codec = MossAudioTokenizerV2Model(codec_cfg)
-            logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
-            return codec_cfg, codec
-        except Exception:
-            logger.exception(
-                "Failed to instantiate vendored MOSS Audio Tokenizer v2; falling back to legacy vendored codec."
-            )
+        config_dict, _ = MossAudioTokenizerV2Config.get_config_dict(codec_path)
+        is_v2 = config_dict.get("number_channels", 1) >= 2
+
+        if is_v2:
+            try:
+                codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
+                codec = MossAudioTokenizerV2Model(codec_cfg)
+                logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
+                return codec_cfg, codec
+            except Exception:
+                logger.exception(
+                    "Failed to instantiate vendored MOSS Audio Tokenizer v2; falling back to legacy vendored codec."
+                )
 
         codec_cfg = MossAudioTokenizerConfig.from_pretrained(codec_path)
         codec = MossAudioTokenizerModel(codec_cfg)
+        logger.info("Using vendored MOSS Audio Tokenizer v1 classes from %s", codec_path)
         return codec_cfg, codec
 
     def _configure_decoder_cudagraph(self, device: torch.device) -> None:

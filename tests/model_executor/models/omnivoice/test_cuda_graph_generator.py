@@ -31,6 +31,7 @@ NUM_CB = 8
 VOCAB = 1025
 HIDDEN = 64
 CAPTURE_SIZES = [32, 64, 128]
+HEAD_DIM = 64
 
 
 # ---------------------------------------------------------------------------
@@ -53,22 +54,23 @@ class _SyntheticGenerator:
         self.config = self._Cfg()
         self.text_embedding = nn.Embedding(1000, HIDDEN).to(device).eval()
         self._linear = nn.Linear(HIDDEN, NUM_CB * VOCAB, bias=False).to(device).eval()
-        self._rope_cos: torch.Tensor | None = None
-        self._rope_sin: torch.Tensor | None = None
+        self._rope_table: torch.Tensor | None = None
 
-    def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
-        if self._rope_cos is None or self._rope_cos.shape[0] < seq_len:
-            max_len = max(seq_len, 512)
-            self._rope_cos = torch.zeros(max_len, 64, device=device)
-            self._rope_sin = torch.zeros(max_len, 64, device=device)
+    @property
+    def model_dtype(self) -> torch.dtype:
+        """Part of the interface _OmniVoiceCUDAGraphForward expects of a generator."""
+        return self.text_embedding.weight.dtype
+
+    def _rope_table_for(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Part of the interface _OmniVoiceCUDAGraphForward expects of a generator."""
+        return torch.zeros(seq_len, HEAD_DIM, device=device, dtype=dtype)
 
     def _step_forward(
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        rope_table: torch.Tensor,
     ) -> torch.Tensor:
         two_b, _, S = input_ids.shape
         x = self.text_embedding(input_ids[:, 0, :].clamp(0, 999))  # [two_b, S, H]
@@ -82,11 +84,9 @@ class _SyntheticGenerator:
 
 
 def _eager(gen: _SyntheticGenerator, ids: torch.Tensor, mask: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
-    """Run _step_forward with zero RoPE tensors (synthetic gen ignores them)."""
-    S = ids.shape[-1]
-    cos = torch.zeros(S, 64, device=ids.device)
-    sin = torch.zeros(S, 64, device=ids.device)
-    return gen._step_forward(ids, mask, attn, cos, sin)
+    """Run _step_forward with a zero RoPE table (synthetic gen ignores it)."""
+    two_b, _, S = ids.shape
+    return gen._step_forward(ids, mask, attn, gen._rope_table_for(S, ids.device, torch.float32))
 
 
 def _make_inputs(seq_len: int, device: torch.device = DEVICE):
@@ -251,13 +251,10 @@ def test_cuda_graph_disabled_matches_eager_generator():
     mask = torch.ones(2, seq_len, dtype=torch.bool, device=DEVICE)
     attn = torch.ones(2, 1, seq_len, seq_len, dtype=torch.bool, device=DEVICE)
 
-    gen_eager._ensure_rope(seq_len, DEVICE)
-    dtype = gen_eager.text_embedding.weight.dtype
-    cos = gen_eager._rope_cos[:seq_len].to(device=DEVICE, dtype=dtype)
-    sin = gen_eager._rope_sin[:seq_len].to(device=DEVICE, dtype=dtype)
+    rope_table = gen_eager._rope_table_for(seq_len, DEVICE, gen_eager.model_dtype)
 
     with torch.no_grad():
-        eager_logits = gen_eager._step_forward(ids, mask, attn, cos, sin)
+        eager_logits = gen_eager._step_forward(ids, mask, attn, rope_table)
         graph_logits = gen_graph._cuda_graph_fwd(ids, mask, attn)
 
     torch.testing.assert_close(graph_logits, eager_logits, atol=0, rtol=0)

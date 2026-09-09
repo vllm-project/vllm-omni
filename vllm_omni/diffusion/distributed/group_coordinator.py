@@ -991,6 +991,18 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def _pipeline_isend_skip(self, tensor: torch.tensor):
         return torch.distributed.isend(tensor, dst=self.skip_rank, group=self.skip_device_group)
 
+    def destroy(self):
+        groups = [*self.device_groups, *self.cpu_groups, self.skip_device_group]
+        seen = {id(self.device_group), id(self.cpu_group)}
+        for group in groups:
+            if group is not None and id(group) not in seen:
+                torch.distributed.destroy_process_group(group)
+                seen.add(id(group))
+        self.device_groups = []
+        self.cpu_groups = []
+        self.skip_device_group = None
+        super().destroy()
+
 
 class SequenceParallelGroupCoordinator(GroupCoordinator):
     def __init__(
@@ -1031,3 +1043,15 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
         self.allgather_world_size = torch.distributed.get_world_size(self.allgather_group)
         self.allgather_rank = torch.distributed.get_rank(self.allgather_group)
+
+    def destroy(self):
+        groups = [self.ulysses_group, self.ring_group, self.allgather_group]
+        seen = {id(self.device_group), id(self.cpu_group)}
+        for group in groups:
+            if group is not None and id(group) not in seen:
+                torch.distributed.destroy_process_group(group)
+                seen.add(id(group))
+        self.ulysses_group = None
+        self.ring_group = None
+        self.allgather_group = None
+        super().destroy()
