@@ -1630,7 +1630,8 @@ def test_generic_video_model_rejects_mixed_image_and_video_references(test_clien
     assert "does not support mixed image and video" in response.json()["detail"].lower()
 
 
-def test_h3_multipart_rejects_bmp_image_reference(test_client):
+def test_h3_multipart_rejects_bmp_image_reference(test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
     image = Image.new("RGB", (64, 64), color="blue")
     image_buffer = io.BytesIO()
     image.save(image_buffer, format="BMP")
@@ -1644,6 +1645,37 @@ def test_h3_multipart_rejects_bmp_image_reference(test_client):
 
     assert response.status_code == 400
     assert "must use jpg" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("field", ["input_reference", "input_references"])
+def test_h3_multipart_rejects_image_over_pixel_limit(field, test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "reject oversized image", "extra_params": '{"task":"ref2va"}'},
+        files=[(field, ("reference.png", _make_test_image_bytes((20, 20)), "image/png"))],
+    )
+
+    assert response.status_code == 400
+    assert "VLLM_MAX_IMAGE_PIXELS" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("field", ["input_reference", "input_references"])
+def test_h3_multipart_maps_pillow_pixel_limit_error(field, test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 0)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "reject decoder bomb", "extra_params": '{"task":"ref2va"}'},
+        files=[(field, ("reference.png", _make_test_image_bytes((20, 20)), "image/png"))],
+    )
+
+    assert response.status_code == 400
+    assert "decoder pixel limit" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -1816,6 +1848,24 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", sound_duration=0)
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", quality="medium")
+
+
+def test_async_create_accepts_fractional_fps(test_client, mocker: MockerFixture):
+    """Queued VideoResponse must accept fractional fps from the request path."""
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "fractional fps", "fps": "12.5", "num_frames": "5"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["fps"] == 12.5
+    assert body["num_frames"] == 5
+    video_id = body["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_sampling_params_list[0].fps == 12.5
+    assert engine.captured_sampling_params_list[0].frame_rate == 12.5
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):

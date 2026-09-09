@@ -5,6 +5,7 @@
 
 import json
 from dataclasses import replace
+from threading import Lock
 from types import SimpleNamespace
 from typing import Any
 
@@ -498,6 +499,32 @@ def test_ltx25_checkpoint_selects_distilled_two_stage_profile(tmp_path, monkeypa
 
     assert pipe.component_profile is LTX25_DISTILLED_COMPONENT_PROFILE
     assert pipe.pipeline_recipe is LTX25_DISTILLED_TWO_STAGE_RECIPE
+
+
+def test_ltx_runtime_profiles_phase_methods_separately(monkeypatch):
+    pipe = object.__new__(LTX2DistilledTwoStagePipeline)
+    pipe.enable_diffusion_pipeline_profiler = True
+    pipe._profiler_lock = Lock()
+    pipe._stage_durations = {}
+    monkeypatch.setattr(ltx2_runtime.current_omni_platform, "is_available", lambda: False)
+
+    with pipe._profile_phase_method("run_phase", "generate_lowres"):
+        pass
+    with pipe._profile_phase_method("run_phase", "refine"):
+        pass
+    with pipe._profile_phase_method("decode_phase"):
+        pass
+    output = DiffusionOutput()
+    assert pipe._attach_profiled_stage_durations(output) is output
+
+    expected_keys = {
+        "LTX2DistilledTwoStagePipeline.generate_lowres.run_phase",
+        "LTX2DistilledTwoStagePipeline.refine.run_phase",
+        "LTX2DistilledTwoStagePipeline.decode_phase",
+    }
+    assert set(pipe.stage_durations) == expected_keys
+    assert set(output.stage_durations) == expected_keys
+    assert all(duration >= 0.0 for duration in pipe.stage_durations.values())
 
 
 def test_ltx25_full_config_enrichment_uses_selected_transformer_subfolder(tmp_path):

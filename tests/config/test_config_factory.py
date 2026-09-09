@@ -6,7 +6,6 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +36,7 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     pipeline_cfg_resolver,
 )
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -451,13 +451,8 @@ class TestStageConfigFactory:
 
     def test_default_diffusion_with_parallel_config(self):
         """Test diffusion config calculates devices from parallel_config."""
-
-        @dataclass
-        class MockParallelConfig:
-            world_size: int = 4
-
         kwargs = {
-            "parallel_config": MockParallelConfig(),
+            "parallel_config": DiffusionParallelConfig(tensor_parallel_size=4),
             "cache_backend": "tea_cache",
         }
         configs = StageConfigFactory.create_default_diffusion(kwargs)
@@ -936,6 +931,44 @@ class TestPipelineRegistration:
 
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
+
+    def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
+        snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+        model = str(snapshot)
+        deploy_path = get_deploy_config_path("cosyvoice3.yaml")
+
+        assert StageConfigFactory.try_infer_model_type(model, trust_remote_code=False) is None
+        assert StageConfigFactory.get_pipeline_config(model, trust_remote_code=False) is None
+
+        omni_config = StageConfigFactory.create_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+        legacy_configs, _ = StageConfigFactory.create_legacy_stage_configs_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+
+        assert omni_config is not None
+        assert omni_config.pipeline_config.model_type == "cosyvoice3"
+        assert [
+            (stage.stage_id, stage.stage_type, stage.worker_type, stage.model_stage)
+            for stage in omni_config.stage_configs
+        ] == [
+            (0, StageType.LLM, "ar", "cosyvoice3_talker"),
+            (1, StageType.LLM, "generation", "cosyvoice3_code2wav"),
+        ]
+        assert all(stage.model_config.model == model for stage in omni_config.stage_configs)
+        assert all(stage.stage_type is not StageType.DIFFUSION for stage in omni_config.stage_configs)
+
+        assert legacy_configs is not None
+        assert [stage.stage_type for stage in legacy_configs] == [StageType.LLM, StageType.LLM]
 
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
@@ -1602,7 +1635,7 @@ stages:
         assert stage.max_model_len == 1024
         assert stage.max_num_batched_tokens == 1024
         assert stage.max_num_seqs == 1
-        assert stage.gpu_memory_utilization == 0.7
+        assert stage.gpu_memory_utilization == 0.8
         assert stage.skip_mm_profiling is True
         assert stage.enforce_eager is True
         assert stage.async_scheduling is False

@@ -38,7 +38,14 @@ class ChatFallbackProjectorMixin:
             request = self._build_chat_request(session, request_id)
             result = await self._chat_service.create_chat_completion(request, raw_request=None)
             if isinstance(result, ErrorResponse):
-                await send_json({"type": "error", "error": result.message, "code": result.type or "chat_error"})
+                error = result.error
+                await send_json(
+                    {
+                        "type": "error",
+                        "error": error.message if error else "Chat request failed",
+                        "code": error.type if error else "chat_error",
+                    }
+                )
                 session.end_response(commit_text=False)
                 return
             if hasattr(result, "__aiter__"):

@@ -131,7 +131,7 @@ class TestCreateDefaultDiffusion:
 
     def test_dtype_serialized_as_string(self):
         stages = StageConfigFactory.create_default_diffusion({"dtype": torch.float16, "model": "x"})
-        assert stages[0]["engine_args"]["dtype"] == "torch.float16"
+        assert stages[0]["engine_args"]["dtype"] == "float16"
 
     def test_cache_backend_defaults_to_none(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})

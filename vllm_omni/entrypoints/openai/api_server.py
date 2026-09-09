@@ -15,7 +15,7 @@ import tempfile
 import time
 import uuid
 from argparse import Namespace
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from numbers import Integral
@@ -131,6 +131,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
+    VideoAction,
     VideoDeleteResponse,
     VideoError,
     VideoGenerationRequest,
@@ -160,6 +161,8 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
+    _decode_image_bytes,
+    _validate_image_pixel_limit,
     decode_audio_url,
     decode_input_reference,
 )
@@ -200,9 +203,9 @@ def _load_model_chat_template_json(model: str) -> str | None:
 
     if template_path is None:
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            template_path = hf_hub_download(
+            template_path = hf_api().hf_hub_download(
                 repo_id=model,
                 filename="chat_template.json",
                 local_files_only=True,
@@ -1289,10 +1292,12 @@ async def omni_init_app_state(
     state.openai_serving_duplex = None
     if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
         state.stage_configs,
-        config_path=getattr(args, "deploy_config", None),
+        config_path=getattr(engine_client, "config_path", None) or getattr(args, "deploy_config", None),
     ):
         state.openai_serving_duplex = OmniDuplexSessionHandler(
             chat_service=state.openai_serving_chat,
+            served_model_name=model_name,
+            log_stats=state.log_stats,
             duplex_session_config=getattr(engine_client, "duplex_session_config", None),
             serving_runtime_adapter_path=getattr(engine_client, "duplex_serving_adapter_path", None),
         )
@@ -1849,8 +1854,8 @@ async def realtime_websocket(websocket: WebSocket):
             logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     duplex_query = websocket.query_params.get("duplex")
-    use_duplex_realtime = (
-        duplex_handler is not None and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
+    use_duplex_realtime = duplex_handler is not None and (
+        duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
     )
     if use_duplex_realtime and duplex_handler is not None:
         await duplex_handler.handle_realtime_session(websocket)
@@ -1946,12 +1951,26 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 # Image generation API endpoints
 
 
+def _build_image_response_metrics(
+    *,
+    response_metrics: Any,
+    stage_durations: Any,
+    peak_memory_mb: Any,
+) -> dict[str, Any]:
+    """Merge detailed stage metrics with the legacy image timing fields."""
+    metrics = dict(response_metrics) if isinstance(response_metrics, dict) else {}
+    metrics["stage_durations"] = stage_durations or None
+    metrics["peak_memory_mb"] = float(peak_memory_mb) if peak_memory_mb else None
+    return metrics
+
+
 def _build_image_generation_response(
     *,
     images: list[Image.Image],
     request: ImageGenerationRequest,
     stage_durations: Any,
     peak_memory_mb: Any,
+    response_metrics: Any = None,
 ) -> ImageGenerationResponse | StreamingResponse:
     """Encode generated images and apply the requested response format."""
     output_format = _choose_output_format(request.output_format or "png", None)
@@ -1966,10 +1985,11 @@ def _build_image_generation_response(
         "created": int(time.time()),
         "data": image_data,
         "output_format": output_format,
-        "metrics": {
-            "stage_durations": stage_durations or None,
-            "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
-        },
+        "metrics": _build_image_response_metrics(
+            response_metrics=response_metrics,
+            stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
+        ),
     }
     if request.size is not None:
         response_kwargs["size"] = request.size
@@ -2066,6 +2086,8 @@ async def generate_images(
                 extra_body["use_system_prompt"] = request.use_system_prompt
             if request.system_prompt is not None:
                 extra_body["system_prompt"] = request.system_prompt
+            if request.return_stage_metrics is not None:
+                extra_body["return_stage_metrics"] = request.return_stage_metrics
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
@@ -2079,12 +2101,13 @@ async def generate_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
-            flat_images, stage_durations, peak_memory_mb, _ = generation_result
+            flat_images, stage_durations, peak_memory_mb, _, response_metrics = generation_result
             return _build_image_generation_response(
                 images=flat_images,
                 request=request,
                 stage_durations=stage_durations,
                 peak_memory_mb=peak_memory_mb,
+                response_metrics=response_metrics,
             )
 
         # Build params - pass through user values directly
@@ -2174,11 +2197,13 @@ async def generate_images(
 
         stage_durations = getattr(result, "stage_durations", None)
         peak_memory_mb = getattr(result, "peak_memory_mb", None)
+        response_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
         return _build_image_generation_response(
             images=images,
             request=request,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
+            response_metrics=response_metrics,
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2510,7 +2535,7 @@ async def edit_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     detail=generation_result.message,
                 )
-            images, stage_durations, peak_memory_mb, cot_output = generation_result
+            images, stage_durations, peak_memory_mb, cot_output, response_metrics = generation_result
         else:
             # Single-stage diffusion: use the direct path.
             result = await _generate_with_async_omni(
@@ -2523,6 +2548,7 @@ async def edit_images(
             images = _extract_images_from_result(result)
             stage_durations = getattr(result, "stage_durations", None)
             peak_memory_mb = getattr(result, "peak_memory_mb", None)
+            response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
@@ -2543,10 +2569,11 @@ async def edit_images(
             output_format=output_format,
             size=size_str,
             cot_output=cot_output,
-            metrics={
-                "stage_durations": stage_durations or None,
-                "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
-            },
+            metrics=_build_image_response_metrics(
+                response_metrics=response_metrics,
+                stage_durations=stage_durations,
+                peak_memory_mb=peak_memory_mb,
+            ),
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -3010,12 +3037,22 @@ def _reference_video_decode_spec(
 
 
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
+    video_params = req.resolve_video_params()
+    duration_s = None
+    if req.seconds is not None:
+        duration_s = float(req.seconds)
+    elif video_params.num_frames is not None and video_params.fps is not None:
+        duration_s = video_params.num_frames / video_params.fps
+
     resp = VideoResponse(
         model=model_name,
         status=VideoGenerationStatus.QUEUED,
         size=req.size,
         prompt=req.prompt,
         quality=req.quality or "default",
+        fps=video_params.fps,
+        num_frames=video_params.num_frames,
+        duration_s=duration_s,
     )
     resp.seconds = str(req.seconds or resp.seconds)
     return resp
@@ -3091,6 +3128,25 @@ def _cleanup_video_references(
         os.unlink(control_path)
 
 
+def _unpack_video_generation_result(
+    result: Sequence[object],
+) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
+    video_metadata: dict[str, object] = {}
+    if len(result) == 5:
+        video_bytes, stage_durations, peak_memory_mb, action, raw_metadata = result
+        if isinstance(raw_metadata, dict):
+            video_metadata = {str(key): value for key, value in raw_metadata.items()}
+    else:
+        video_bytes, stage_durations, peak_memory_mb, action = result
+    return (
+        cast(bytes, video_bytes),
+        cast(dict[str, float], stage_durations),
+        float(cast(float, peak_memory_mb)),
+        cast(VideoAction | None, action),
+        video_metadata,
+    )
+
+
 async def _run_video_generation_job(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
@@ -3110,12 +3166,14 @@ async def _run_video_generation_job(
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
     try:
-        video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
-            request,
-            video_id,
-            reference_image=reference_image,
-            reference_video=reference_video,
-            reference_audio=reference_audio,
+        video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
+            await handler.generate_video_bytes(
+                request,
+                video_id,
+                reference_image=reference_image,
+                reference_video=reference_video,
+                reference_audio=reference_audio,
+            )
         )
 
         save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
@@ -3131,6 +3189,7 @@ async def _run_video_generation_job(
             "peak_memory_mb": peak_memory_mb,
             "action": action,
         }
+        updated_fields.update({key: value for key, value in video_metadata.items() if value is not None})
         if save_context.expires_at is not None:
             updated_fields["expires_at"] = save_context.expires_at
 
@@ -3381,6 +3440,15 @@ def _validate_minimax_h3_image_payload(
     try:
         with Image.open(io.BytesIO(payload)) as image:
             image_format = str(image.format or "").lower()
+            if image_format in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
+                _validate_image_pixel_limit(image)
+    except InvalidInputReferenceError as exc:
+        raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    except Image.DecompressionBombError as exc:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid uploaded image reference: {filename}; image exceeds the decoder pixel limit.",
+        ) from exc
     except (OSError, ValueError) as exc:
         if allow_non_image:
             return
@@ -3421,10 +3489,14 @@ async def _persist_uploaded_media_references(
             if kind == "image":
                 try:
                     _validate_minimax_h3_image_payload(payload, filename=upload.filename)
-                    with Image.open(io.BytesIO(payload)) as image:
-                        images.append(image.convert("RGB"))
-                except (OSError, ValueError) as exc:
-                    raise HTTPException(400, detail=f"Invalid uploaded image reference: {upload.filename}") from exc
+                    images.append(
+                        _decode_image_bytes(
+                            payload,
+                            source=f"uploaded image reference: {upload.filename}",
+                        )
+                    )
+                except InvalidInputReferenceError as exc:
+                    raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
                 continue
             suffix = Path(upload.filename or "").suffix.lower()
             if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
@@ -3494,6 +3566,7 @@ async def _parse_video_form(
     frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
+    return_stage_metrics: bool | None = Form(default=None),
 ) -> tuple[
     VideoGenerationRequest,
     "OmniOpenAIServingVideo",
@@ -3564,6 +3637,7 @@ async def _parse_video_form(
         "frame_interpolation_model_path": frame_interpolation_model_path,
         "lora": _parse_form_json(lora, expected_type=dict),
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
+        "return_stage_metrics": return_stage_metrics,
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}
     request = VideoGenerationRequest(**request_data)
@@ -3844,15 +3918,17 @@ async def create_video_sync(
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
-        video_bytes, stage_durations, peak_memory_mb, _action = await asyncio.wait_for(
-            handler.generate_video_bytes(
-                request,
-                request_id,
-                reference_image=reference_image,
-                reference_video=reference_video,
-                reference_audio=reference_audio,
+        video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
+            await asyncio.wait_for(
+                handler.generate_video_bytes(
+                    request,
+                    request_id,
+                    reference_image=reference_image,
+                    reference_video=reference_video,
+                    reference_audio=reference_audio,
+                ),
+                timeout=VIDEO_SYNC_TIMEOUT_S,
             ),
-            timeout=VIDEO_SYNC_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         raise HTTPException(
