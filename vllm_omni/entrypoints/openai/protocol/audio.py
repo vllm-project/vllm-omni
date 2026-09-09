@@ -578,6 +578,22 @@ class StreamingSpeechSessionConfig(BaseModel):
             "frames (existing behavior)."
         ),
     )
+    seed: int | None = Field(
+        default=None,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
+        description="Random seed forwarded to /v1/audio/speech for this session.",
+    )
+    split_granularity: Literal["none", "sentence", "clause"] = Field(
+        default="none",
+        description=(
+            "How incoming input.text is segmented before TTS. 'none' (default) "
+            "buffers until input.done and runs one request, matching the "
+            "long-form timbre-continuity path. 'sentence' emits a request at "
+            "each sentence boundary (Latin .!? plus CJK/Indic/Arabic marks). "
+            "'clause' also splits on commas/semicolons for lower TTFA."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":

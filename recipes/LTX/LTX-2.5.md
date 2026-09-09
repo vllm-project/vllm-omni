@@ -110,6 +110,29 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 
 Use the T2V or I2V request below after the server is ready.
 
+### Multi-GPU low-latency path
+
+For low-latency 1920x1088 distilled two-stage serving, match the Ulysses and
+VAE patch-parallel degrees to the GPU count. For example, on four GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --model-class-name LTX2DistilledTwoStagePipeline \
+  --usp 4 \
+  --vae-patch-parallel-size 4 \
+  --vae-use-tiling \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --stage-init-timeout 900
+```
+
+Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
+SP attention head counts must be divisible by `ulysses_degree`. Use each
+phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
+Each GPU must still fit the resident weights. Warm up with the production shape.
+
 ## Offline inference
 
 Choose values from the pipeline table. For example, the distilled two-stage

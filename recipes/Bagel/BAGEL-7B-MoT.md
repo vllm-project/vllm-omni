@@ -212,8 +212,9 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
   --stage-overrides '{"1":{"max_num_seqs":4}}'
 ```
 
-For image requests, BAGEL builds exactly `num_inference_steps` scheduler
-updates, including one-step requests. The scheduler automatically separates
+Use at least two inference steps for image requests. BAGEL builds
+`num_inference_steps - 1` scheduler updates, so a one-step image request has no
+denoising iteration to schedule. The scheduler automatically separates
 requests with incompatible image shapes or BAGEL CFG/renormalization settings.
 
 Step execution currently does not support BAGEL sequence parallelism or a

@@ -155,12 +155,12 @@ imply continuous-batching support: Qwen-Image accepts batched step states.
 BAGEL accepts batched step states for image generation with its default,
 think-mode, and single-stage deploy configs. Only the diffusion stage uses the
 step protocol in two-stage deployments; explicit single-stage text output
-retains complete-request execution. BAGEL schedules exactly
-`num_inference_steps` denoising updates, including a one-step request. When a
-finished stepwise request is followed by an explicit text fallback wave, the
-runner retires its step state and paged diffusion-KV rows before the full
-forward dispatch. BAGEL's step path does not currently support sequence
-parallelism or a diffusion cache backend.
+retains complete-request execution. BAGEL requires at least two inference steps
+because it schedules `num_inference_steps - 1` denoising updates, and its step
+path does not currently support sequence parallelism or a diffusion cache
+backend. When a finished stepwise request is followed by an explicit text
+fallback wave, the runner retires its step state and paged diffusion-KV rows
+before the full forward dispatch.
 HunyuanImage3 accepts batched step states only when its resolved self-attention
 backend is `TORCH_SDPA`; otherwise it rejects groups larger than one request.
 Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or

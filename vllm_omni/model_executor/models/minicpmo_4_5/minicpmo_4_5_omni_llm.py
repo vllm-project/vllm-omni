@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from:
 # https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
 #
@@ -3310,7 +3310,7 @@ class MiniCPMOAudioEmbeddingItems(DictEmbeddingItems):
     ) -> None:
         super().__init__(
             data,
-            modality="image",
+            modality="audio",
             required_fields={"audio_embeds"},
             fields_factory=fields_factory,
         )
@@ -3733,7 +3733,8 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
 
             if isinstance(audios, MiniCPMOAudioEmbeddingItems):
                 single_audio_embeds = audios.get(item_idx)["audio_embeds"]
-                audio_len = self.info.get_audio_len_by_num_chunks(sum(map(len, single_audio_embeds)))
+                # One item is ``(s, h)``, so its leading dim is the audio embedding count.
+                audio_len = self.info.get_audio_len_by_num_chunks(len(single_audio_embeds))
             else:
                 audio_len = audios.get_audio_length(item_idx)
 
@@ -3796,11 +3797,17 @@ class MiniCPMOAudioFeatureInputs(TensorSchema):
 
     audio_feature_lens: Annotated[
         torch.Tensor | list[torch.Tensor],
-        TensorShape("bn", "s"),
+        TensorShape("bn", "s", dynamic_dims={"s"}),
     ]
     """
     This should be feature length of each audio slice,
     which equals to `audio_features.shape[-1]`
+
+    Each audio in the batch may be split into a different number of slices
+    (e.g. audio >30s splits into multiple slices while shorter audio doesn't),
+    so `s` must be dynamic: batching audios with different slice counts is a
+    normal, valid input and is already handled below via `hstack` + per-audio
+    iteration, not a schema violation.
     """
 
 
@@ -3941,7 +3948,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             text_config = Qwen2Config.from_dict(config_dict)
             llm_arch = "Qwen2ForCausalLM"
-        from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
             patch_minicpmo_remote_config,
         )
 

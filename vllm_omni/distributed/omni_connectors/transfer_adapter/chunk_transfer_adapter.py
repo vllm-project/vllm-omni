@@ -51,13 +51,21 @@ class _LoadEntry:
         return self.request.external_req_id
 
 
-def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int]:
-    """Return the effective Talker context limit and recompute window."""
+def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int, bool]:
+    """Return the Talker context limit and streaming recompute policy."""
     max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+    if getattr(model_config, "hf_config_name", None) != "tts_config":
+        return max_model_len, 0, False
     hf_config = getattr(model_config, "hf_config", None)
     tts_config = getattr(hf_config, "tts_config", None)
-    if tts_config is None and getattr(hf_config, "model_type", None) == "minicpmtts":
+    if tts_config is None:
         tts_config = hf_config
+    if isinstance(tts_config, Mapping):
+        tts_model_type = tts_config.get("model_type")
+    else:
+        tts_model_type = getattr(tts_config, "model_type", None)
+    if tts_model_type not in {"conditional_chattts", "minicpmtts"}:
+        return max_model_len, 0, False
     tts_max_model_len = (
         tts_config.get("max_position_embeddings", 0)
         if isinstance(tts_config, Mapping)
@@ -71,11 +79,17 @@ def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int
         if isinstance(tts_config, Mapping)
         else getattr(tts_config, "attention_type", None)
     )
-    # Official MiniCPMTTS supports both full_attention and
-    # sliding_recompute. Only an explicit Talker-stage policy enables the
-    # latter; native duplex alone must not override checkpoint semantics.
-    previous_chunks = 1 if attention_type == "sliding_recompute" else 0
-    return max_model_len, previous_chunks
+    if tts_config is not None and attention_type is None:
+        attention_type = "full_attention"
+    # ``full_attention`` keeps the complete prompt until its next condition
+    # would exceed the Talker context. It then falls back to the same supported
+    # one-previous-chunk recompute recipe. An explicitly configured
+    # ``sliding_recompute`` applies that recipe at every condition boundary.
+    if attention_type == "sliding_recompute":
+        return max_model_len, 1, False
+    if attention_type == "full_attention":
+        return max_model_len, 1, True
+    return max_model_len, 0, False
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -113,9 +127,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._registered_load_entries: dict[str, _LoadEntry] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._max_model_len, self._streaming_prompt_previous_chunks = _resolve_talker_streaming_prompt_config(
-            model_config
-        )
+        (
+            self._max_model_len,
+            self._streaming_prompt_previous_chunks,
+            self._streaming_prompt_recompute_on_capacity,
+        ) = _resolve_talker_streaming_prompt_config(model_config)
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
@@ -962,6 +978,99 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
 
+    def update_streaming_prompt_for_condition(
+        self,
+        payload_data: dict[str, Any],
+        request: Request,
+        *,
+        update_prompt: bool,
+    ) -> bool | None:
+        """Track one Talker condition and optionally update its prompt.
+
+        Returns ``None`` when the payload is not governed by the Talker
+        streaming-window contract. Otherwise returns whether the prompt was
+        replaced, as opposed to extended in place.
+        """
+        if self._streaming_prompt_previous_chunks != 1:
+            return None
+        meta = payload_data.get("meta")
+        if not isinstance(meta, dict):
+            return None
+        condition_len = meta.get("next_stage_prompt_len")
+        if not isinstance(condition_len, int) or isinstance(condition_len, bool) or condition_len <= 0:
+            return None
+
+        request_id = request.request_id
+        previous_condition_seq = self._streaming_condition_seqs.get(request_id)
+        previous_condition_len = self._streaming_condition_lengths.get(request_id)
+        if (previous_condition_seq is None) != (previous_condition_len is None):
+            raise ValueError("streaming Talker condition tracking is incomplete")
+        if previous_condition_seq is None and not self.receives_chunks:
+            # A sender-only Talker is admitted with its first real condition,
+            # before this adapter observes any StreamingUpdate. Seed that
+            # condition as sequence zero from the active request so its first
+            # continuation follows the same lifecycle as receiver stages.
+            initial_info = getattr(request, "model_intermediate_buffer", None)
+            initial_meta = initial_info.get("meta") if isinstance(initial_info, dict) else None
+            initial_condition_len = (
+                initial_meta.get("next_stage_prompt_len") if isinstance(initial_meta, dict) else None
+            )
+            initial_condition_seq = (
+                initial_meta.get("streaming_condition_seq") if isinstance(initial_meta, dict) else None
+            )
+            if (
+                isinstance(initial_info, dict)
+                and initial_info.get("native_duplex") is True
+                and isinstance(initial_condition_len, int)
+                and not isinstance(initial_condition_len, bool)
+                and initial_condition_len > 0
+                and isinstance(initial_condition_seq, int)
+                and not isinstance(initial_condition_seq, bool)
+                and initial_condition_seq == 0
+            ):
+                if initial_condition_len != request.num_prompt_tokens:
+                    raise ValueError(
+                        "initial streaming Talker condition length does not match its prompt: "
+                        f"condition={initial_condition_len}, prompt={request.num_prompt_tokens}"
+                    )
+                previous_condition_seq = initial_condition_seq
+                previous_condition_len = initial_condition_len
+        supplied_condition_seq = meta.get("streaming_condition_seq")
+        if supplied_condition_seq is None:
+            if payload_data.get("native_duplex") is True and not self.receives_chunks:
+                raise ValueError("native duplex Talker condition is missing streaming_condition_seq")
+            condition_seq = previous_condition_seq + 1 if previous_condition_seq is not None else 0
+            meta["streaming_condition_seq"] = condition_seq
+        elif (
+            not isinstance(supplied_condition_seq, int)
+            or isinstance(supplied_condition_seq, bool)
+            or supplied_condition_seq < 0
+        ):
+            raise ValueError("streaming_condition_seq must be a non-negative integer")
+        else:
+            condition_seq = supplied_condition_seq
+        expected_condition_seq = previous_condition_seq + 1 if previous_condition_seq is not None else 0
+        if condition_seq != expected_condition_seq:
+            raise ValueError(
+                "native duplex Talker condition sequence is not contiguous: "
+                f"expected={expected_condition_seq}, received={condition_seq}"
+            )
+        replaced = False
+        if update_prompt:
+            replaced = construct_next_stage_streaming_input_prompt(
+                payload_data,
+                request,
+                max_model_len=self._max_model_len,
+                previous_condition_len=previous_condition_len,
+                previous_condition_seq=previous_condition_seq,
+                condition_seq=condition_seq,
+                recompute_previous_chunks=self._streaming_prompt_previous_chunks,
+                recompute_on_capacity=self._streaming_prompt_recompute_on_capacity,
+            )
+        self._streaming_condition_lengths[request_id] = condition_len
+        self._streaming_condition_seqs[request_id] = condition_seq
+        return replaced
+
     def _apply_pending_ar_prompt_updates(self, scheduler_requests: dict[str, Request] | None) -> None:
         """Finalize ready AR prompt updates on the scheduler thread."""
         for request_id in tuple(self.requests_with_ready_chunks):
@@ -981,41 +1090,37 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     continue
 
                 request.additional_information = payload_data
-                meta = payload_data.get("meta")
-                meta = meta if isinstance(meta, dict) else {}
-                previous_condition_seq = self._streaming_condition_seqs.get(request_id)
-                condition_seq = previous_condition_seq + 1 if previous_condition_seq is not None else 0
                 is_window_condition = window_condition_len is not None
                 if is_window_condition:
-                    meta["streaming_condition_seq"] = condition_seq
-                if is_window_condition:
+                    previous_condition_seq = self._streaming_condition_seqs.get(request_id)
+                    meta = payload_data.get("meta")
+                    assert isinstance(meta, dict)
                     update_prompt = bool(
                         was_resumable
                         and (previous_condition_seq is not None or meta.get("replace_streaming_prompt") is True)
                     )
                 try:
-                    if update_prompt:
+                    replaced = self.update_streaming_prompt_for_condition(
+                        payload_data,
+                        request,
+                        update_prompt=update_prompt,
+                    )
+                    if replaced is None and update_prompt:
+                        # Non-window AR receivers still use the generic
+                        # prompt-extension contract from the base adapter.
                         replaced = construct_next_stage_streaming_input_prompt(
                             payload_data,
                             request,
                             max_model_len=self._max_model_len,
-                            previous_condition_len=self._streaming_condition_lengths.get(request_id),
-                            previous_condition_seq=previous_condition_seq,
-                            condition_seq=condition_seq,
-                            recompute_previous_chunks=self._streaming_prompt_previous_chunks,
                         )
-                        if replaced:
-                            self.replaced_streaming_prompt_ids.add(request_id)
+                    if replaced:
+                        self.replaced_streaming_prompt_ids.add(request_id)
                 except ValueError as exc:
                     # The connector chunk was consumed, so retrying would skip
                     # this transition and desynchronize Talker. Let the
                     # scheduler fail it.
                     self.record_receive_failure(request_id, str(exc))
                     continue
-
-                if window_condition_len is not None:
-                    self._streaming_condition_lengths[request_id] = window_condition_len
-                    self._streaming_condition_seqs[request_id] = condition_seq
 
     def _requeue_replaced_prompts(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         """Move a replaced running prompt back through scheduler admission."""

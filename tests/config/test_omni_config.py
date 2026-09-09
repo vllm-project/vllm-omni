@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 from inspect import Parameter, signature
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 
 import msgspec
@@ -258,6 +259,57 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
 
     with pytest.raises(ValueError, match=rf"no structured config owner: {unowned_field}"):
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
+def test_llm_additional_config_roundtrip_and_isolation(stage_id, monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    # Worker discovery requires hardware support; this test covers config transport.
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    additional_config = {"backend_options": {"enabled": True}}
+    pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=i, engine_extras={"additional_config": additional_config}) for i in (0, 2)]
+    )
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    stage = config.stage_by_id(stage_id)
+    assert stage.runtime_config.additional_config == additional_config
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == additional_config
+
+    engine_args["additional_config"]["backend_options"]["enabled"] = False
+    assert stage.runtime_config.additional_config["backend_options"]["enabled"] is True
+    stage.runtime_config.additional_config["backend_options"]["enabled"] = False
+    assert config.stage_by_id(2 if stage_id == 0 else 0).runtime_config.additional_config == additional_config
+    assert additional_config["backend_options"]["enabled"] is True
+
+
+@pytest.mark.parametrize("deploy_name", ["minicpmo_4_5", "minicpmo_4_5_2gpu", "minicpmo_4_5_3gpu"])
+def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_name):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
+    expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    assert stage.runtime_config.additional_config == expected
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == expected
+
+
+def test_diffusion_additional_config_keeps_diffusion_owner():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    additional_config = {"torchair_graph_config": {"enabled": True}}
+    stage = _from_pipeline_key("dreamzero", cli_overrides={"additional_config": additional_config}).stage_by_id(0)
+    assert stage.runtime_config.additional_config is None
+    assert stage.diffusion_config.additional_config == additional_config
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == additional_config
 
 
 @pytest.mark.parametrize(
@@ -531,6 +583,17 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 
+def test_joyai_code2wav_waits_for_full_payload():
+    config = _from_pipeline_key("joyai_vl_interaction")
+    talker = config.stage_by_id(1)
+    code2wav = config.stage_by_id(2)
+
+    assert talker.custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
+    assert code2wav.custom_process_input_func.endswith("talker2code2wav_token_only")
+    assert code2wav.connector_config.async_chunk is False
+    assert code2wav.model_config.requires_full_payload_input is True
+
+
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert not hasattr(BaseVllmOmniStageConfig, "from_stage_config")
     assert not hasattr(BaseVllmOmniStageConfig, "to_legacy_stage_config")
@@ -558,6 +621,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
 
 def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "additional_config",
         "distributed_executor_backend",
         "worker_cls",
         "devices",
@@ -1252,6 +1316,70 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
+def test_diffusion_config_none_values_preserve_dataclass_defaults():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    normalized = OmniDiffusionConfig.normalize_init_kwargs(
+        {
+            "lora_scale": None,
+            "enable_sleep_mode": None,
+            "diffusers_load_kwargs": None,
+        }
+    )
+
+    assert "lora_scale" not in normalized
+    assert "enable_sleep_mode" not in normalized
+    assert normalized["diffusers_load_kwargs"] == {}
+
+    config = OmniDiffusionConfig.from_kwargs(
+        lora_scale=None,
+        enable_sleep_mode=None,
+    )
+    assert config.lora_scale == 1.0
+    assert config.enable_sleep_mode is False
+
+
+@pytest.mark.parametrize(
+    ("canonical_key", "alias_key", "canonical_value", "alias_value"),
+    [
+        ("lora_scale", "static_lora_scale", 0.75, 0.25),
+        (
+            "quantization_config",
+            "diffusion_quantization_config",
+            {"method": "canonical"},
+            {"method": "diffusion-alias"},
+        ),
+        (
+            "quantization_config",
+            "quantization",
+            {"method": "canonical"},
+            "legacy-alias",
+        ),
+        ("diffusion_kv_cache_dtype", "kv_cache_dtype", "fp8", "fp16"),
+        ("diffusion_kv_cache_skip_steps", "kv_cache_skip_steps", "0-1", "2-3"),
+        ("diffusion_kv_cache_skip_layers", "kv_cache_skip_layers", "1-2", "3-4"),
+        ("streaming_output", "diffusion_streaming_output", False, True),
+    ],
+)
+def test_diffusion_alias_conflicts_prefer_canonical_key(
+    canonical_key,
+    alias_key,
+    canonical_value,
+    alias_value,
+):
+    from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+
+    normalized = normalize_omni_diffusion_kwargs(
+        {
+            canonical_key: canonical_value,
+            alias_key: alias_value,
+        }
+    )
+
+    assert normalized[canonical_key] == canonical_value
+    assert alias_key not in normalized
+
+
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path, monkeypatch):
     from vllm_omni.platforms import current_omni_platform
 
@@ -1268,6 +1396,10 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "    fa_deterministic: true",
                 "    diffusion_kv_mode: paged_scheduler",
                 "    diffusion_kv_max_rows_per_request: 2",
+                "    kv_transfer_config:",
+                "      kv_connector: MooncakeConnector",
+                "      kv_role: kv_consumer",
+                "      engine_id: dit-engine-1",
             ]
         )
     )
@@ -1282,6 +1414,14 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     assert stage.diffusion_config.fa_deterministic is True
     assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert stage.diffusion_config.diffusion_kv_max_rows_per_request == 2
+    assert stage.diffusion_config.kv_transfer_config.engine_id == "dit-engine-1"
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+    assert od_config.kv_transfer_config.engine_id == "dit-engine-1"
 
 
 def test_from_pipeline_config_forwards_fastvideo_vsa_topk(tmp_path, monkeypatch):
@@ -1390,3 +1530,62 @@ def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
 
     assert cfg.quantization_config is not None
     assert cfg.quantization_config.get_name() == "int8"
+
+
+def test_compact_offload_config_reaches_terminal_config(monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+
+    compact_config = {
+        "mode": "layer",
+        "components": ["dit", "text_encoder"],
+        "layer_options": {
+            "dit": {"weight_transfer": "rank-local", "resident_layers": 12},
+            "text_encoder": {"weight_transfer": "allgather"},
+        },
+    }
+    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        diffusion_offload_config=compact_config,
+    )
+
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+    monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
+    cfg.enrich_config()
+
+    assert cfg.diffusion_offload_config == compact_config
+    assert cfg.extras == {}
+    assert resolve_offload_strategy(cfg) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+    restored = ForkingPickler.loads(ForkingPickler.dumps(cfg))
+    assert resolve_offload_strategy(restored) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+
+
+def test_global_diffusion_offload_config_targets_only_diffusion_stages():
+    compact_config = {"mode": "layer", "components": ["dit"]}
+
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={"diffusion_offload_config": compact_config},
+    )
+
+    assert not hasattr(config.stage_by_id(0), "diffusion_config")
+    assert config.stage_by_id(1).diffusion_config.diffusion_offload_config == compact_config
+
+
+def test_explicit_llm_stage_diffusion_offload_override_is_rejected():
+    with pytest.raises(ValueError, match="no structured config owner: diffusion_offload_config"):
+        _from_pipeline_key(
+            "minimax_h3_disaggregated",
+            cli_overrides={
+                "stage_0_diffusion_offload_config": {"mode": "layer", "components": ["dit"]},
+            },
+        )
+
+
+def test_compact_offload_config_is_validated_during_projection():
+    with pytest.raises(ValueError, match="Unknown diffusion offload mode"):
+        omni_config_module._DiffusionConfigProjection.from_kwargs(
+            diffusion_offload_config={
+                "mode": "layerwise",
+                "components": ["dit"],
+            }
+        )
