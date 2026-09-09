@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Custom model configs that cannot be expressed via HuggingFace Transformers alone,
 following the same pattern as vllm.transformers_utils.configs.
@@ -22,6 +22,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
     "DotsTTSConfig": "vllm_omni.transformers_utils.configs.dots_tts",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
+    "VibeVoiceConfig": "vllm_omni.transformers_utils.configs.vibevoice",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
     "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
@@ -47,6 +48,7 @@ __all__ = [
     "VoxCPM2Config",
     "DotsTTSConfig",
     "VoxtralTTSConfig",
+    "VibeVoiceConfig",
     "CosyVoice3Config",
     "MiniMaxMusic3Config",
     "OmniVoiceConfig",
@@ -85,5 +87,6 @@ from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

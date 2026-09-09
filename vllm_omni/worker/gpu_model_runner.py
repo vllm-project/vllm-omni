@@ -3,8 +3,8 @@
 
 import contextlib
 import inspect
-from collections.abc import Callable
-from dataclasses import replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -34,8 +34,16 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.model_runner_metadata import (
+    OMNI_INPUT_TOKEN_IDS_CPU_KEY,
+    OMNI_IS_PREFILL_KEY,
+    OMNI_NUM_COMPUTED_TOKENS_KEY,
+    OMNI_PROMPT_LEN_KEY,
+    OMNI_REQUEST_ID_KEY,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -51,6 +59,29 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _AsyncSampledTokenFeedback:
+    """Prior-step sampled tokens needed by CPU-side model preprocess hooks."""
+
+    sampled_token_ids_cpu: torch.Tensor
+    ready_event: Any
+    req_id_to_index: dict[str, int]
+    materialized_rows: list[list[int]] | None = None
+
+    def rows(self) -> list[list[int]]:
+        if self.materialized_rows is None:
+            if self.sampled_token_ids_cpu.ndim != 2:
+                raise RuntimeError(
+                    "Async sampled-token feedback must have rank 2, got "
+                    f"shape {tuple(self.sampled_token_ids_cpu.shape)}."
+                )
+            self.ready_event.synchronize()
+            self.materialized_rows = [
+                [int(token_id) for token_id in row] for row in self.sampled_token_ids_cpu.tolist()
+            ]
+        return self.materialized_rows
 
 
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -88,6 +119,65 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.omni_prefix_cache = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        self._omni_requires_input_token_ids_cpu = False
+        self._omni_async_sampled_token_feedback: _AsyncSampledTokenFeedback | None = None
+        self.named_kv_branches: dict[str, Any] = {}
+
+    def initialize_kv_cache(self, kv_cache_config, is_profiling: bool = False):
+        super().initialize_kv_cache(
+            kv_cache_config,
+            is_profiling=is_profiling,
+        )
+        if not is_profiling:
+            self._maybe_bind_named_kv_branch()
+
+    def _maybe_bind_named_kv_branch(self) -> None:
+        request = getattr(self.model, "named_kv_branch_request", None)
+        if request is None:
+            return
+
+        from vllm_omni.worker.named_kv_branch import (
+            NamedCausalKVBranch,
+            NamedKVBranchRequest,
+        )
+
+        if not isinstance(request, NamedKVBranchRequest):
+            raise TypeError(
+                f"model.named_kv_branch_request must be a NamedKVBranchRequest, got {type(request).__name__}."
+            )
+        if request.name in self.named_kv_branches:
+            raise RuntimeError(f"Named KV branch {request.name!r} was initialized twice.")
+        bind = getattr(self.model, "bind_named_kv_branch", None)
+        if not callable(bind):
+            raise TypeError("A model declaring named_kv_branch_request must implement bind_named_kv_branch(store).")
+
+        branch = NamedCausalKVBranch(runner=self, request=request)
+        try:
+            bind(branch)
+        except Exception:
+            try:
+                branch.close()
+            except Exception:
+                logger.exception("Failed to close unpublished named KV branch %r", branch.name)
+            raise
+        self.named_kv_branches[request.name] = branch
+
+    def shutdown(self) -> None:
+        self._omni_async_sampled_token_feedback = None
+        model = getattr(self, "model", None)
+        clear_runtime_state = getattr(model, "clear_runtime_state", None)
+        if callable(clear_runtime_state):
+            try:
+                clear_runtime_state()
+            except Exception:
+                logger.exception("Failed to clear model-owned runtime state")
+        for branch in self.named_kv_branches.values():
+            try:
+                branch.close()
+            except Exception:
+                logger.exception("Failed to close named KV branch %r", branch.name)
+        self.named_kv_branches.clear()
+        super().shutdown()
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -96,6 +186,106 @@ class OmniGPUModelRunner(GPUModelRunner):
             if sampled is not None:
                 return sampled
         return super()._to_list(sampled_token_ids)
+
+    def _remember_async_sampled_token_feedback(
+        self,
+        *,
+        sampled_token_ids_cpu: torch.Tensor,
+        ready_event: Any,
+        req_id_to_index: dict[str, int],
+    ) -> None:
+        """Retain prior sampled-token D2H state for opted-in model metadata."""
+        if not (
+            bool(getattr(self, "use_async_scheduling", False))
+            and bool(getattr(self, "_omni_requires_input_token_ids_cpu", False))
+            and req_id_to_index
+        ):
+            self._omni_async_sampled_token_feedback = None
+            return
+        self._omni_async_sampled_token_feedback = _AsyncSampledTokenFeedback(
+            sampled_token_ids_cpu=sampled_token_ids_cpu,
+            ready_event=ready_event,
+            req_id_to_index=dict(req_id_to_index),
+        )
+
+    def _resolve_async_sampled_token_ids_cpu(
+        self,
+        *,
+        req_id: str,
+        req_index: int,
+        start_token_index: int,
+        token_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        sentinel_indices = [index for index, token_id in enumerate(token_ids) if token_id == -1]
+        if not sentinel_indices:
+            return token_ids
+        if len(sentinel_indices) != 1:
+            raise RuntimeError(
+                "Omni runner cannot resolve multiple async sampled-token sentinels "
+                f"for request {req_id!r} at batch index {req_index}, token start "
+                f"{start_token_index}: {token_ids}."
+            )
+
+        feedback = getattr(self, "_omni_async_sampled_token_feedback", None)
+        if feedback is None:
+            raise RuntimeError(
+                "Omni runner is missing async sampled-token feedback for "
+                f"request {req_id!r} at batch index {req_index}, token start "
+                f"{start_token_index}."
+            )
+        previous_index = feedback.req_id_to_index.get(req_id)
+        if previous_index is None:
+            raise RuntimeError(
+                "Omni runner cannot map async sampled-token feedback for "
+                f"request {req_id!r} at batch index {req_index}."
+            )
+
+        rows = feedback.rows()
+        if previous_index < 0 or previous_index >= len(rows):
+            raise RuntimeError(
+                "Omni runner async sampled-token row index is out of range for "
+                f"request {req_id!r}: index {previous_index}, rows {len(rows)}."
+            )
+        sampled_row = rows[previous_index]
+        if len(sampled_row) != 1 or sampled_row[0] < 0:
+            raise RuntimeError(
+                f"Omni runner expected exactly one valid async sampled token for request {req_id!r}, got {sampled_row}."
+            )
+
+        resolved = list(token_ids)
+        resolved[sentinel_indices[0]] = sampled_row[0]
+        return tuple(resolved)
+
+    def _scheduled_input_token_ids_cpu(
+        self,
+        *,
+        req_id: str,
+        req_index: int,
+        start_token_index: int,
+        num_scheduled_tokens: int,
+    ) -> tuple[int, ...]:
+        """Read one scheduled token span from the persistent CPU input batch."""
+        if num_scheduled_tokens < 0:
+            raise ValueError("num_scheduled_tokens must be non-negative.")
+        end_token_index = start_token_index + num_scheduled_tokens
+        values = self.input_batch.token_ids_cpu[
+            req_index,
+            start_token_index:end_token_index,
+        ]
+        raw_values = values.tolist()
+        token_ids = tuple(int(value) for value in raw_values)
+        if len(token_ids) != num_scheduled_tokens:
+            raise RuntimeError(
+                "Omni runner expected "
+                f"{num_scheduled_tokens} CPU input token IDs, got {len(token_ids)} "
+                f"for request index {req_index}."
+            )
+        return self._resolve_async_sampled_token_ids_cpu(
+            req_id=req_id,
+            req_index=req_index,
+            start_token_index=start_token_index,
+            token_ids=token_ids,
+        )
 
     def _omni_routed_experts_d2h(self, scheduler_output) -> None:
         """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
@@ -182,6 +372,12 @@ class OmniGPUModelRunner(GPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         model = getattr(self, "model", None)
+        # Acknowledge runner support immediately after model loading, before
+        # EngineCore can issue profiling or dummy forwards. Binding still waits
+        # for the real KV cache configuration in initialize_kv_cache(). Models
+        # without a named-KV declaration receive no attribute or behavior.
+        if model is not None and getattr(model, "named_kv_branch_request", None) is not None:
+            model.named_kv_branch_capability_acknowledged = True
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
             candidate = getattr(model, "consume_sampled_token_ids_cpu_override", None)
@@ -189,6 +385,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
+        self._omni_requires_input_token_ids_cpu = bool(getattr(model, "requires_omni_input_token_ids_cpu", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
@@ -842,7 +1039,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             return None
 
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
+    def extract_multimodal_outputs(
+        self,
+        hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput,
+    ) -> tuple[torch.Tensor, OmniPayload | None]:
+        multimodal_outputs: OmniPayload | None
         if (
             hasattr(self.model, "have_multimodal_outputs")
             and self.model.have_multimodal_outputs
@@ -1117,10 +1318,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             else:
                 positions = self.positions[:num_tokens_padded]
 
+            intermediate_tensors: IntermediateTensors | None
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
-                if self.intermediate_tensors is None:
+                if getattr(self, "intermediate_tensors", None) is None:
                     self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                         batch_size=self.max_num_tokens,
                         dtype=self.model_config.dtype,
@@ -1411,10 +1613,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         scheduler_output: "SchedulerOutput",
         combined_hidden_states: dict[str, torch.Tensor] | None = None,
-        combined_multimodal_outputs: dict[str, object] | None = None,
+        combined_multimodal_outputs: dict[str, dict[str, object]] | None = None,
         req_ids_filter: set[str] | None = None,
         req_ids: list[str] | None = None,
-        query_start_loc_cpu: object | None = None,
+        query_start_loc_cpu: Sequence[int] | np.ndarray | torch.Tensor | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
         req_ids = req_ids if req_ids is not None else self.input_batch.req_ids
@@ -1446,6 +1648,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     else:
                         hidden_states_slice = hidden_states
 
+                    mm_out: object
                     if not postprocess_uses_multimodal_outputs:
                         mm_out = None
                     elif combined_multimodal_outputs:
@@ -1466,7 +1669,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                         multimodal_outputs=mm_out,
                         **postprocess_kwargs,
                     )
-                    self._update_intermediate_buffer(req_id, update_dict)
+                    if isinstance(update_dict, dict):
+                        self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
             logger.error(f"Error merging for requests:{req_ids} additional information update: {e}")
             import traceback
@@ -1476,9 +1680,8 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _collect_additional_information_for_prefill(
         self,
         num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
-        """Overlay per-request prompt_embeds for the prefill portion and collect
-        additional_information slices for this step. Returns a map req_id -> dict."""
+    ) -> None:
+        """Overlay per-request prompt embeddings for the prefill portion."""
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
@@ -1707,15 +1910,20 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
-            decode_req_ids = []
-            decode_start_offsets = []
-            decode_batch_items = []
-            batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
+            decode_req_ids: list[str] = []
+            decode_start_offsets: list[int] = []
+            decode_batch_items: list[tuple[str, int, dict[str, Any]]] = []
+            batch_decode_candidate = getattr(self.model, "preprocess_decode_batch", None)
+            batch_decode_preprocess: Callable[..., Any] | None = (
+                batch_decode_candidate if callable(batch_decode_candidate) else None
+            )
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
                 if not decode_batch_items:
                     return
+                if batch_decode_preprocess is None:
+                    raise RuntimeError("Decode batch items require a callable preprocess_decode_batch hook")
 
                 req_ids_b = [item[0] for item in decode_batch_items]
                 start_offsets_b = [item[1] for item in decode_batch_items]
@@ -1761,24 +1969,36 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # mimo-audio check
                 req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id) or {}
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
                 s, e = start_offset, start_offset + sched_tokens
                 span_len = int(e) - int(s)
 
-                # call the custom process function
+                if bool(getattr(self.model, "requires_omni_request_id", False)):
+                    # Reserved runner identity cannot be overridden by request metadata.
+                    req_infos[OMNI_REQUEST_ID_KEY] = req_id
+                # Backward compatibility for models that still consume the old key.
                 req_infos["request_id"] = req_id
                 req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
                 req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
                 prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
                 prompt_len = len(prompt_token_ids or ())
                 num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                if bool(getattr(self.model, "requires_omni_input_token_ids_cpu", False)):
+                    # Read the scheduler-maintained CPU mirror; never inspect
+                    # GPU input_ids with .item() in a model preprocess hook.
+                    req_infos[OMNI_INPUT_TOKEN_IDS_CPU_KEY] = self._scheduled_input_token_ids_cpu(
+                        req_id=req_id,
+                        req_index=req_index,
+                        start_token_index=num_computed_tokens,
+                        num_scheduled_tokens=sched_tokens,
+                    )
                 is_prefill = num_computed_tokens < prompt_len
-                req_infos["_omni_prompt_len"] = prompt_len
-                req_infos["_omni_num_computed_tokens"] = num_computed_tokens
-                req_infos["_omni_is_prefill"] = is_prefill
+                req_infos[OMNI_PROMPT_LEN_KEY] = prompt_len
+                req_infos[OMNI_NUM_COMPUTED_TOKENS_KEY] = num_computed_tokens
+                req_infos[OMNI_IS_PREFILL_KEY] = is_prefill
                 # Output-token cap, so a model that must ship a payload on the
                 # request's final step can tell which step that is. A finished
                 # request drops out of req_ids_output_copy, and downstream
@@ -1789,7 +2009,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # Seed, so a model that samples inside forward() can be
                 # reproducible: vLLM's own sampler seeding does not reach it.
                 req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
-                if callable(batch_decode_preprocess) and self.has_talker_mtp and span_len == 1 and not is_prefill:
+                if batch_decode_preprocess is not None and self.has_talker_mtp and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue
 
@@ -1831,6 +2051,25 @@ class OmniGPUModelRunner(GPUModelRunner):
                 input_ids = preprocess_input_ids
 
             flush_decode_batch()
+
+            # Phase C3: models that declare preprocess_finalize move their
+            # audio-token transition work out of forward() so forward() is a
+            # pure model call that vLLM can capture as a FULL decode graph.
+            finalize = getattr(self.model, "preprocess_finalize", None)
+            if callable(finalize):
+                extra_args_list: list[dict] | None = None
+                if getattr(self.model_config, "has_sampling_extra_args", False):
+                    extra_args_list = []
+                    for req_id in self.input_batch.req_ids:
+                        req = self.requests.get(req_id)
+                        sp = req.sampling_params if req else None
+                        extra_args_list.append(sp.extra_args if sp and sp.extra_args else {})
+                input_ids, inputs_embeds = finalize(
+                    input_ids=input_ids if input_ids is not None else preprocess_input_ids,
+                    inputs_embeds=inputs_embeds,
+                    req_ids=list(self.input_batch.req_ids),
+                    sampling_extra_args=extra_args_list,
+                )
 
             # run talker mtp decode
             if self.has_talker_mtp:

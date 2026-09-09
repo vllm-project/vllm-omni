@@ -28,6 +28,7 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
 )
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
@@ -44,8 +45,8 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     return runner
 
 
-def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, object]]:
-    received: dict[str, object] = {}
+def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, Any]]:
+    received: dict[str, Any] = {}
 
     def post_sample_talker_mtp(*, input_ids, hidden_states, req_ids, req_infos):
         received.update(
@@ -200,6 +201,7 @@ def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
 
 def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):
     requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17}
+    adapter_events: list[str] = []
     request = OpenAICreateSpeechRequest.model_validate(
         {"input": "Hello", "extra_params": requested},
     )
@@ -211,6 +213,10 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
         async def build(self, request, sampling_params_list, has_inline_ref_audio):
             return PreparedRequest(prompt={"prompt": request.input}, tts_params={}, model_type="higgs_audio_v3")
 
+        def finalize_prepared_request(self, prepared, request_id):
+            adapter_events.append(f"finalize:{request_id}")
+            return prepared
+
         def apply_sampling_overrides(
             self,
             sampling_params_list: list,
@@ -218,6 +224,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
             prompt: dict[str, Any] | None = None,
             request_id: str | None = None,
         ) -> list:
+            adapter_events.append("sampling-overrides")
             return sampling_params_list
 
     engine = SimpleNamespace(
@@ -234,6 +241,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
     stage0_params = stage_sampling_params[0]
+    assert adapter_events == ["finalize:speech-test", "sampling-overrides"]
 
     monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
     input_batch = InputBatch(
@@ -263,12 +271,17 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     input_batch.sampling_metadata = input_batch._make_sampling_metadata()
 
     received = []
+
+    def sample(_logits, metadata):
+        received.append(metadata)
+        return "model-sampler"
+
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = input_batch
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
-        sample=lambda logits, metadata: received.append(metadata) or "model-sampler",
+        sample=sample,
     )
     runner.sampler = SimpleNamespace()
     logits = torch.zeros((1, 4))
@@ -281,6 +294,124 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     torch.testing.assert_close(sampling_metadata.temperature, torch.tensor([requested["temperature"]]))
     torch.testing.assert_close(sampling_metadata.top_p, torch.tensor([requested["top_p"]]))
     assert sampling_metadata.top_k.tolist() == [requested["top_k"]]
+
+
+def _terminal_request_state(
+    *,
+    output_token_ids: list[int],
+    max_tokens: int,
+    prompt_token_ids: list[int] | None = None,
+) -> CachedRequestState:
+    return CachedRequestState(
+        req_id="request",
+        prompt_token_ids=prompt_token_ids or [1],
+        mm_features=[],
+        sampling_params=SamplingParams(max_tokens=max_tokens),
+        generator=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        output_token_ids=output_token_ids,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "declares_capability",
+        "token_ids",
+        "max_tokens",
+        "max_model_len",
+        "stop_token_ids",
+        "min_tokens",
+        "async_sample",
+        "expected",
+    ),
+    [
+        (False, [151654], 1, 8, [], 0, False, []),
+        (True, [151654], 1, 8, [], 0, False, ["request"]),
+        (True, [151654], 2, 8, [], 0, False, []),
+        (True, [151653], 1, 8, [], 0, False, []),
+        (True, [151654], 8, 2, [], 0, False, ["request"]),
+        (True, [151654], 1, 8, [151654], 0, False, []),
+        (True, [151654], 1, 8, [151654], 2, False, []),
+        (True, [-1], 1, 8, [], 0, True, ["request"]),
+    ],
+)
+def test_terminal_sample_drain_is_capability_gated_and_length_only(
+    declares_capability: bool,
+    token_ids: list[int],
+    max_tokens: int,
+    max_model_len: int,
+    stop_token_ids: list[int],
+    min_tokens: int,
+    async_sample: bool,
+    expected: list[str],
+) -> None:
+    model = SimpleNamespace()
+    if declares_capability:
+        model.terminal_sample_drain_token_ids = frozenset({151654})
+    state = _terminal_request_state(output_token_ids=token_ids, max_tokens=max_tokens)
+    state.sampling_params.stop_token_ids = stop_token_ids
+    state.sampling_params.min_tokens = min_tokens
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = model
+    runner.requests = {"request": state}
+    runner.max_model_len = max_model_len
+
+    actual = GPUARModelRunner._terminal_sample_drain_request_ids(
+        runner,
+        req_ids=["request"],
+        valid_sampled_token_ids=[] if async_sample else [token_ids[-1:]],
+        sampled_token_ids=(torch.tensor([[151654]], dtype=torch.int32) if async_sample else None),
+    )
+
+    assert actual == expected
+
+
+def test_terminal_sample_drain_runner_orders_postprocess_before_model_hook() -> None:
+    calls: list[Any] = []
+
+    class Model:
+        terminal_sample_drain_token_ids = frozenset({151654})
+        has_postprocess = True
+
+        def drain_terminal_sampled_tokens(self, **kwargs):
+            calls.append(("drain", kwargs))
+            return {"terminal": torch.tensor([1.0])}
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = Model()
+    runner.requests = {
+        "request": _terminal_request_state(
+            output_token_ids=[151654],
+            max_tokens=1,
+        )
+    }
+    runner.max_model_len = 8
+    runner._resolve_pooler_payload_req_ids = lambda _req_ids: (
+        "audio",
+        ["request"],
+    )
+    runner._process_additional_information_updates = lambda *_args, **_kwargs: calls.append("postprocess")
+
+    multimodal_outputs, postprocess_applied = GPUARModelRunner._maybe_run_terminal_sample_drain(
+        runner,
+        hidden_states=torch.zeros(1, 4),
+        multimodal_outputs={"existing": torch.tensor([2.0])},
+        num_scheduled_tokens_np=np.array([1], dtype=np.int32),
+        scheduler_output=SimpleNamespace(),
+        req_ids_output_copy=["request"],
+        valid_sampled_token_ids=[[151654]],
+        sampled_token_ids=torch.tensor([[151654]], dtype=torch.int32),
+        invalid_req_indices=[],
+        query_start_loc_cpu=torch.tensor([0, 1]),
+    )
+
+    assert postprocess_applied
+    assert calls[0] == "postprocess"
+    assert calls[1][0] == "drain"
+    assert calls[1][1]["request_ids"] == ["request"]
+    assert "existing" in calls[1][1]["multimodal_outputs"]
+    assert torch.equal(multimodal_outputs["terminal"], torch.tensor([1.0]))
 
 
 def test_resolve_pooler_payload_req_ids_audio_terminal_stage_keeps_payload():
@@ -318,6 +449,169 @@ def test_sparse_mm_req_ids_requires_sparse_audio_marker():
     assert sparse_audio.resolve_sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
     assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"req_id": ["r1"]}, "meta.sparse_audio": ["1"]}) == ["r1"]
     assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"sparse_audio": ["1"]}, "meta.req_id": ["r1"]}) == ["r1"]
+
+
+def test_sparse_audio_routes_delta_semantics_with_each_request() -> None:
+    payload = payload_build.build_omni_mm_payload(
+        combined_multimodal_outputs=None,
+        mm_cpu={
+            "audio": [torch.tensor([1.0]), torch.tensor([2.0])],
+            "sr": [torch.tensor(24_000), torch.tensor(24_000)],
+            "meta.req_id": ["r1", "r2"],
+            "meta.sparse_audio": ["1"],
+            "meta.audio_chunk_semantics": ["delta", "delta"],
+        },
+        rid="r2",
+        idx=1,
+        start=1,
+        end=2,
+        audio_sparse_output=True,
+        sparse_mm_index={"r1": 0, "r2": 1},
+        hidden_seq_len=2,
+        scheduled_seq_len=2,
+    )
+
+    assert torch.equal(payload["audio"], torch.tensor([2.0]))
+    assert payload["meta.audio_chunk_semantics"] == "delta"
+
+
+def test_model_side_graph_warmup_is_capability_gated() -> None:
+    calls: list[str] = []
+    runner = object.__new__(GPUARModelRunner)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=False))
+    runner.model = SimpleNamespace(warmup_side_graphs=lambda: calls.append("warmup"))
+
+    runner._maybe_warmup_model_side_graphs()
+
+    assert calls == ["warmup"]
+
+    runner.model = object()
+    runner._maybe_warmup_model_side_graphs()
+    assert calls == ["warmup"]
+
+
+def test_model_side_graph_warmup_skips_enforce_eager() -> None:
+    calls: list[str] = []
+    runner = object.__new__(GPUARModelRunner)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=True))
+    runner.model = SimpleNamespace(warmup_side_graphs=lambda: calls.append("warmup"))
+
+    runner._maybe_warmup_model_side_graphs()
+
+    assert calls == []
+
+
+def test_capture_model_orders_native_talker_and_model_side_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    runner = object.__new__(GPUARModelRunner)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=False))
+    runner.model = SimpleNamespace(warmup_side_graphs=lambda: calls.append("side"))
+
+    def capture_model(_self) -> int:
+        calls.append("native")
+        return 17
+
+    monkeypatch.setattr(
+        OmniGPUModelRunner,
+        "capture_model",
+        capture_model,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_capture_talker_mtp_graphs",
+        lambda: calls.append("talker"),
+    )
+
+    result = runner.capture_model()
+
+    assert result == 17
+    assert calls == ["native", "talker", "side"]
+
+
+def test_finished_request_hook_receives_executing_request_ids() -> None:
+    calls: list[tuple[set[str], set[str]]] = []
+
+    class Model:
+        def on_requests_finished(
+            self,
+            finished_req_ids: set[str],
+            *,
+            scheduled_req_ids: set[str],
+        ) -> None:
+            calls.append((set(finished_req_ids), set(scheduled_req_ids)))
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = Model()
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"finished", "scheduled", "negative"},
+        num_scheduled_tokens={
+            "scheduled": 1,
+            "negative": -1,
+        },
+    )
+
+    runner._notify_model_requests_finished(
+        scheduler_output,
+        total_num_scheduled_tokens=1,
+    )
+
+    assert calls == [
+        (
+            {"finished", "scheduled", "negative"},
+            {"scheduled"},
+        )
+    ]
+
+
+def test_finished_request_hook_has_no_scheduled_ids_on_early_return() -> None:
+    scheduled_ids: list[set[str]] = []
+
+    class Model:
+        def on_requests_finished(
+            self,
+            _finished_req_ids: set[str],
+            *,
+            scheduled_req_ids: set[str],
+        ) -> None:
+            scheduled_ids.append(set(scheduled_req_ids))
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = Model()
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"request-a"},
+        num_scheduled_tokens={"request-a": 1},
+    )
+
+    runner._notify_model_requests_finished(
+        scheduler_output,
+        total_num_scheduled_tokens=0,
+    )
+
+    assert scheduled_ids == [set()]
+
+
+def test_finished_request_hook_remains_compatible_with_legacy_model() -> None:
+    calls: list[set[str]] = []
+
+    class Model:
+        def on_requests_finished(self, finished_req_ids: set[str]) -> None:
+            calls.append(set(finished_req_ids))
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = Model()
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"request-a"},
+        num_scheduled_tokens={"request-a": 1},
+    )
+
+    runner._notify_model_requests_finished(
+        scheduler_output,
+        total_num_scheduled_tokens=1,
+    )
+
+    assert calls == [{"request-a"}]
 
 
 def test_runner_assisted_full_attention_metadata_request_is_opt_in():
@@ -501,10 +795,15 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
         "accumulate_full_payload_output",
         lambda self, rid, payload, request: events.append(f"accumulate:{rid}"),
     )
+
+    def get_omni_connector_output(_self):
+        events.append("connector")
+        return "connector-output"
+
     monkeypatch.setattr(
         GPUARModelRunner,
         "get_omni_connector_output",
-        lambda self: events.append("connector") or "connector-output",
+        get_omni_connector_output,
     )
 
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
@@ -631,6 +930,81 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
     assert len(seen) == 2
     assert torch.equal(seen[0], torch.tensor([[1.0]]))
     assert torch.equal(seen[1], torch.tensor([[2.0], [3.0]]))
+
+
+@pytest.mark.parametrize(
+    ("all_scheduled", "expected_request_ids"),
+    [
+        (False, ["r1"]),
+        (True, ["r1", "r2"]),
+    ],
+)
+def test_sparse_audio_postprocess_all_scheduled_is_capability_gated(
+    monkeypatch,
+    all_scheduled,
+    expected_request_ids,
+):
+    runner = _make_async_output_runner()
+    seen_request_ids = []
+
+    class PostprocessModel:
+        has_postprocess = True
+        omni_pooler_payload_include_hidden = False
+        postprocess_uses_multimodal_outputs = False
+
+        def postprocess(self, hidden_states, **kwargs):
+            assert hidden_states.shape == (1, 1)
+            seen_request_ids.append(kwargs["request_id"])
+            return {}
+
+    runner.model = PostprocessModel()
+    if all_scheduled:
+        setattr(runner.model, "postprocess_requires_all_scheduled_requests", True)
+    runner.model_intermediate_buffer = {
+        "r1": {"request_id": "r1"},
+        "r2": {"request_id": "r2"},
+    }
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("audio", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_update_intermediate_buffer", lambda *args, **kwargs: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            num_scheduled_tokens={"r1": 1, "r2": 1},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={
+            "audio": [torch.tensor([0.25])],
+            "sr": [torch.tensor(24_000, dtype=torch.int32)],
+            "meta": {"req_id": ["r1"], "sparse_audio": ["1"]},
+        },
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    assert seen_request_ids == expected_request_ids
+    assert output.multimodal_outputs is not None
+    assert output.multimodal_outputs[0]["audio"].tolist() == [0.25]
+    assert output.multimodal_outputs[1] is None
 
 
 def test_async_omni_output_guard_requires_safe_conditions():
@@ -1635,8 +2009,8 @@ class TestMergeModelKvTransferMetadata:
             def get_kv_transfer_metadata(self, req_id, num_computed_tokens):
                 return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
 
-        original_meta = {"a": 1}
-        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        original_meta: dict[str, Any] = {"a": 1}
+        original: dict[str, dict[str, Any]] = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
         runner = self._runner_with_model(_Model())
 
         merged = runner._merge_model_kv_transfer_metadata(original)
@@ -1690,7 +2064,7 @@ class TestDownstreamPayloadMemoization:
         return runner
 
     def test_missing_marker_defaults_true_without_memoizing(self):
-        stages = {"r1": None}
+        stages: dict[str, int | None] = {"r1": None}
         runner = self._runner(stages)
 
         assert runner._request_needs_downstream_stage_payload("r1") is True
