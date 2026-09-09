@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import concurrent.futures
 import queue
 import threading
 from types import SimpleNamespace
@@ -13,8 +14,10 @@ from vllm_omni.diffusion import diffusion_engine as diffusion_engine_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -33,10 +36,15 @@ def _make_engine() -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.scheduler = RequestScheduler()
     engine.scheduler.initialize(SimpleNamespace())
-    engine.executor = SimpleNamespace(shutdown=Mock())
+    engine.executor = SimpleNamespace(
+        drop_output=Mock(),
+        shutdown=Mock(),
+        wait_output_ready=Mock(),
+    )
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
+    engine._unclaimed_async_outputs = {}
     engine._closed = False
     engine._shutdown_complete = False
     engine.abort_queue = queue.Queue()
@@ -44,6 +52,15 @@ def _make_engine() -> DiffusionEngine:
     engine.stop_event = None
     engine.worker_thread = None
     return engine
+
+
+def _make_output_executor() -> MultiprocDiffusionExecutor:
+    executor = MultiprocDiffusionExecutor.__new__(MultiprocDiffusionExecutor)
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._closed = False
+    return executor
 
 
 def test_close_completes_pending_output_streams() -> None:
@@ -63,6 +80,120 @@ def test_close_completes_pending_output_streams() -> None:
         event_loop.close()
 
 
+def test_put_output_discards_async_output_when_stream_is_missing() -> None:
+    engine = _make_engine()
+
+    engine._put_output("abandoned", DiffusionOutput(async_output_id="aid-missing"))
+
+    engine.executor.drop_output.assert_called_once_with("aid-missing")
+
+
+@pytest.mark.asyncio
+async def test_unstarted_stream_does_not_admit_request() -> None:
+    engine = _make_engine()
+    request = _make_request("unstarted")
+
+    stream = engine.async_add_req_and_stream_response(request)
+    await stream.aclose()
+
+    assert engine.scheduler.get_request_state(request.request_id) is None
+    assert request.request_id not in engine._out_streams
+
+
+@pytest.mark.asyncio
+async def test_closing_stream_discards_unclaimed_async_output() -> None:
+    engine = _make_engine()
+    request_id = "abandoned"
+    engine._out_streams[request_id] = asyncio.Queue()
+    engine._unclaimed_async_outputs[request_id] = {"aid-queued"}
+    stream = engine.get_output_stream(request_id)
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+
+    next_output.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await next_output
+
+    engine.executor.drop_output.assert_called_once_with("aid-queued")
+    assert request_id not in engine._out_streams
+    assert request_id not in engine._unclaimed_async_outputs
+
+
+@pytest.mark.asyncio
+async def test_async_output_is_claimed_after_materialization() -> None:
+    engine = _make_engine()
+    request_id = "claimed"
+    pending_output = DiffusionOutput(async_output_id="aid-claimed")
+    materialized_output = DiffusionOutput(output="materialized")
+    ready: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+    ready.set_result(materialized_output)
+    engine.executor.wait_output_ready.return_value = ready
+    output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    output_queue.put_nowait(pending_output)
+    engine._out_streams[request_id] = output_queue
+    engine._unclaimed_async_outputs[request_id] = {"aid-claimed"}
+    stream = engine.get_output_stream(request_id)
+
+    assert await anext(stream) is materialized_output
+    assert request_id not in engine._unclaimed_async_outputs
+    engine.executor.wait_output_ready.assert_called_once_with("aid-claimed")
+
+    await stream.aclose()
+    engine.executor.drop_output.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exceptional_materialization_retires_async_output() -> None:
+    engine = _make_engine()
+    executor = _make_output_executor()
+    engine.executor = executor
+    request_id = "failed"
+    async_output_id = "aid-failed"
+    output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    output_queue.put_nowait(DiffusionOutput(async_output_id=async_output_id))
+    engine._out_streams[request_id] = output_queue
+    engine._unclaimed_async_outputs[request_id] = {async_output_id}
+    stream = engine.get_output_stream(request_id)
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+
+    with executor._futures_lock:
+        ready = executor._output_futures.pop(async_output_id)
+    ready.set_exception(RuntimeError("materialization failed"))
+
+    with pytest.raises(RuntimeError, match="materialization failed"):
+        await next_output
+
+    assert executor._output_futures == {}
+    assert executor._completed_outputs == {}
+    assert request_id not in engine._unclaimed_async_outputs
+
+
+@pytest.mark.asyncio
+async def test_cancelling_materialization_discards_async_output() -> None:
+    engine = _make_engine()
+    request_id = "cancelled"
+    pending_output = DiffusionOutput(async_output_id="aid-cancelled")
+    ready: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+    engine.executor.wait_output_ready.return_value = ready
+    output_queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    output_queue.put_nowait(pending_output)
+    engine._out_streams[request_id] = output_queue
+    engine._unclaimed_async_outputs[request_id] = {"aid-cancelled"}
+    stream = engine.get_output_stream(request_id)
+    next_output = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+
+    next_output.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await next_output
+
+    engine.executor.drop_output.assert_called_with("aid-cancelled")
+    assert ready.cancelled()
+    assert request_id not in engine._out_streams
+    assert request_id not in engine._unclaimed_async_outputs
+
+
 def test_emit_finished_outputs_finalizes_already_drained_waiter() -> None:
     class RacingOutQueue(dict):
         def get(self, key, default=None):
@@ -75,6 +206,22 @@ def test_emit_finished_outputs_finalizes_already_drained_waiter() -> None:
 
     engine._emit_finished_outputs({request_id})
 
+    assert engine.scheduler.get_request_state(request_id) is None
+
+
+def test_emit_finished_outputs_discards_async_output_without_stream() -> None:
+    engine = _make_engine()
+    request_id = engine.scheduler.add_request(_make_request("completed-async"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_COMPLETED)
+    runner_output = RunnerOutput(
+        request_id=request_id,
+        finished=True,
+        async_output_id="aid-completed",
+    )
+
+    engine._emit_finished_outputs({request_id}, runner_output)
+
+    engine.executor.drop_output.assert_called_once_with("aid-completed")
     assert engine.scheduler.get_request_state(request_id) is None
 
 
@@ -379,3 +526,36 @@ def test_close_defers_resource_shutdown_until_worker_thread_stops() -> None:
     engine.executor.shutdown.assert_called_once()
     assert engine._shutdown_complete is True
     assert engine._loop_started is False
+
+
+def test_finalize_aborted_request_drops_pending_async_output() -> None:
+    """An aborted request with a pending async output must be drained (#6413).
+
+    The aborted branch of _finalize_finished_request returns before the
+    async_output_id branch, so without draining, the worker's late OUTPUT_READY
+    is cached in the executor's _completed_outputs forever. The engine must tell
+    the executor to drop that output id.
+    """
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-async"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    runner_output = SimpleNamespace(result=None, async_output_id="aid-async-1")
+    output = engine._finalize_finished_request(request_id, runner_output)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_called_once_with("aid-async-1")
+
+
+def test_finalize_aborted_request_without_async_output_skips_drop() -> None:
+    """No async output pending -> nothing to drop; drop_output not called."""
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-plain"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    output = engine._finalize_finished_request(request_id)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_not_called()

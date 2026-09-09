@@ -890,6 +890,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._sync_result_buffer.put(msg)
                 continue
 
+            # If shutdown started while we were dequeuing, drop this delivery
+            # so it cannot repopulate _completed_outputs after shutdown()
+            # cleared it (issue #6413 / #6439 review). OUTPUT_READY must still
+            # flow through the dispatch below: unpack_diffusion_output_shm()
+            # is the only receive-side path that unlinks named SHM segments,
+            # and the closed-time re-checks under _futures_lock already
+            # prevent any cache write after unpack.
+            if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
+                continue
+
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
                 with self._futures_lock:
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
@@ -925,19 +935,27 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
                     if batch_id:
                         with self._futures_lock:
+                            if self._closed:
+                                # shutdown() cleared _completed_outputs while
+                                # we were unpacking; drop this delivery.
+                                continue
                             pending = self._output_futures.pop(batch_id, None)
-                            if pending is not None and not pending.done():
-                                if exc is not None:
-                                    try_set_exception(pending, exc)
-                                else:
-                                    try_set_result(pending, output_result)
-                            else:
+                            if pending is None:
+                                # No waiter registered yet: cache for a later
+                                # wait_output_ready().
                                 fut = concurrent.futures.Future()
                                 if exc is not None:
                                     fut.set_exception(exc)
                                 else:
                                     fut.set_result(output_result)
                                 self._completed_outputs[batch_id] = fut
+                            elif not pending.done():
+                                if exc is not None:
+                                    try_set_exception(pending, exc)
+                                else:
+                                    try_set_result(pending, output_result)
+                            # else: waiter registered but already cancelled/done
+                            # (e.g. aborted request) -> discard, do not re-cache.
 
     def _deliver_batch_split(
         self,
@@ -946,6 +964,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         error: str | None = None,
     ) -> None:
         """Resolve per-request futures from one batch-level output."""
+        if self._closed:
+            # shutdown() has taken over; do not touch _completed_outputs.
+            return
         for per_req_id, req_id in per_req_map.items():
             req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
             per_req_result: DiffusionOutput
@@ -956,13 +977,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             else:
                 per_req_result = DiffusionOutput(error="No output result for batch request")
             with self._futures_lock:
+                if self._closed:
+                    # Belt-and-braces: re-check under the lock so a shutdown
+                    # that started mid-loop cannot repopulate the cleared dict.
+                    return
                 pending = self._output_futures.pop(per_req_id, None)
-                if pending is not None and not pending.done():
-                    try_set_result(pending, per_req_result)
-                else:
+                if pending is None:
+                    # No waiter registered yet: cache for a later
+                    # wait_output_ready().
                     fut: concurrent.futures.Future = concurrent.futures.Future()
                     fut.set_result(per_req_result)
                     self._completed_outputs[per_req_id] = fut
+                elif not pending.done():
+                    try_set_result(pending, per_req_result)
+                # else: waiter registered but already cancelled/done -> discard,
+                # do not re-cache.
 
     def describe_pending_state(self, async_output_id: str | None = None) -> str:
         """Summarize async-output bookkeeping for diagnosing stuck waits."""
@@ -993,6 +1022,32 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             fut: concurrent.futures.Future = concurrent.futures.Future()
             self._output_futures[async_output_id] = fut
         return fut
+
+    def drop_output(self, async_output_id: str) -> None:
+        """Discard an async output that will never be waited on.
+
+        An aborted request never calls :meth:`wait_output_ready`, so a late
+        ``OUTPUT_READY`` would be unpacked and cached in ``_completed_outputs``
+        forever (issue #6413). Draining it here keeps engine-process memory
+        bounded under abort traffic. Handles both arrival orderings:
+
+        * result already arrived -> pop and drop the cached future;
+        * result not yet arrived -> register a placeholder waiter so the pump
+          resolves into it (and lets it be freed) instead of caching.
+
+        A genuine waiter that is already registered is left untouched so it can
+        drain through the normal path.
+        """
+        with self._futures_lock:
+            if self._closed:
+                # Executor is torn down; abort path must not repopulate the
+                # cleared state (issue #6413 / #6439 review).
+                return
+            if self._completed_outputs.pop(async_output_id, None) is not None:
+                return
+            if async_output_id in self._output_futures:
+                return
+            self._output_futures[async_output_id] = concurrent.futures.Future()
 
     def check_health(self) -> None:
         if self._is_failed:
@@ -1031,5 +1086,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
+                # Cached async outputs hold unpacked tensors; drop them so they
+                # do not survive shutdown (issue #6413).
+                self._completed_outputs.clear()
             self._shutdown_cleaner = None
             self._processes = []
