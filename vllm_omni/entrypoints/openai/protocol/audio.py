@@ -23,7 +23,7 @@ def _normalize_ref_audio_value(value):
         return None
     if isinstance(value, str):
         return value
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         items = []
         for item in value:
             if not isinstance(item, str):
@@ -38,16 +38,16 @@ def _normalize_ref_audio_value(value):
 def _normalize_speaker_embedding_value(value):
     if value is None:
         return None
-    if not isinstance(value, (list, tuple)):
+    if not isinstance(value, list | tuple):
         raise TypeError("'speaker_embedding' must be a list of numbers or list of embedding vectors")
     if not value:
         return []
 
     first = value[0]
-    if isinstance(first, (list, tuple)):
+    if isinstance(first, list | tuple):
         embeddings = []
         for item in value:
-            if not isinstance(item, (list, tuple)):
+            if not isinstance(item, list | tuple):
                 raise TypeError("'speaker_embedding' must not mix flat and nested values")
             embeddings.append([float(x) for x in item])
         return embeddings
@@ -410,9 +410,23 @@ class CreateAudio(BaseModel):
         arbitrary_types_allowed = True
 
 
+class AudioChunkMetadata(BaseModel):
+    """Waveform dimensions after transforms, before encoding.
+
+    Frames count samples per channel, not interleaved scalar samples or bytes.
+    For compressed formats this excludes any padding introduced by the codec.
+    """
+
+    format: str = Field(min_length=1, strict=True)
+    sample_rate_hz: int = Field(gt=0, strict=True)
+    frame_count: int = Field(ge=0, strict=True)
+    channels: int = Field(gt=0, strict=True)
+
+
 class AudioResponse(BaseModel):
     audio_data: bytes | str
     media_type: str
+    audio_metadata: AudioChunkMetadata | None = None
 
 
 # --- Batch Speech Models ---

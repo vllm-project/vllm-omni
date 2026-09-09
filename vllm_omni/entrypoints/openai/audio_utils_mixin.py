@@ -9,7 +9,12 @@ import torch
 import torchaudio
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.protocol.audio import DEFAULT_AUDIO_FORMAT, AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    DEFAULT_AUDIO_FORMAT,
+    AudioChunkMetadata,
+    AudioResponse,
+    CreateAudio,
+)
 
 try:
     import soundfile
@@ -224,7 +229,16 @@ class AudioMixin:
 
             audio_data = base64.b64encode(audio_data).decode("utf-8")
 
-        return AudioResponse(audio_data=audio_data, media_type=media_type)
+        return AudioResponse(
+            audio_data=audio_data,
+            media_type=media_type,
+            audio_metadata=AudioChunkMetadata(
+                format=response_format,
+                sample_rate_hz=int(sample_rate),
+                frame_count=int(audio_tensor.shape[0]),
+                channels=1 if audio_tensor.ndim == 1 else int(audio_tensor.shape[1]),
+            ),
+        )
 
     @staticmethod
     def _resample_audio(audio_tensor: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:

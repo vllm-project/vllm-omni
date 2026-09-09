@@ -171,7 +171,7 @@ class DuplexSessionRunnerMixin:
                     journal=projected.get("type") not in {"session.created", "session.resumed"},
                 )
 
-        async def emit_event(payload: dict[str, object]) -> None:
+        async def emit_event(payload: dict[str, object]) -> bool:
             deferred_precreate_response = False
             async with event_emit_lock:
                 accepted, deferred_overlap_payload = await self._apply_outbound_session_event(
@@ -182,7 +182,7 @@ class DuplexSessionRunnerMixin:
                     realtime_protocol=realtime_protocol,
                 )
                 if not accepted:
-                    return
+                    return False
                 await send_outbound(payload)
                 if deferred_overlap_payload is not None:
                     deferred_precreate_response = native.deferred_precreate_response
@@ -197,6 +197,8 @@ class DuplexSessionRunnerMixin:
                         deferred_overlap_payload if native.committed_audio_payload is deferred_overlap_payload else None
                     ),
                 )
+
+            return True
 
         writer_task = asyncio.create_task(actor.writer_loop(), name="duplex-session-writer")
         reader_task: asyncio.Task[None] | None = None
