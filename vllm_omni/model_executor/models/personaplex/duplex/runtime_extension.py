@@ -41,6 +41,9 @@ def _validated_frame_payload(payload: object) -> dict[str, object]:
 class PersonaPlexDuplexRuntimeExtension:
     """PersonaPlex policy for the engine-owned resumable duplex request."""
 
+    adapter_id = "personaplex"
+    runtime_extension_id = "personaplex"
+
     def configure_sampling_params(
         self,
         *,

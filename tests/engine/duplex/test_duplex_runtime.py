@@ -21,6 +21,9 @@ from vllm_omni.engine.duplex.runtime import (
     DuplexRuntimeCapabilities,
     DuplexSessionRuntimeManager,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.adapter import (
+    MiniCPMO45NativeDuplexServingAdapter,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
     build_duplex_data_plane_prompt,
@@ -156,6 +159,31 @@ def test_minicpmo_extension_owns_stage_sampling_overrides():
     assert configured[1].stop_token_ids == [151645]
     assert defaults[0].max_tokens == 4
     assert 151645 not in (defaults[1].stop_token_ids or [])
+
+
+def test_minicpmo_stage0_stop_tokens_allow_turn_eos_to_close_with_chunk_eos(monkeypatch):
+    token_ids = {
+        "<|chunk_eos|>": 8,
+        "<|chunk_tts_eos|>": 9,
+        "<|listen|>": 3,
+        "<|turn_eos|>": 10,
+    }
+    tokenizer = SimpleNamespace(
+        unk_token_id=-1,
+        convert_tokens_to_ids=lambda token: token_ids.get(token, -1),
+    )
+    monkeypatch.setattr(
+        MiniCPMO45NativeDuplexServingAdapter,
+        "_load_native_tokenizer",
+        staticmethod(lambda _model_config: tokenizer),
+    )
+
+    stop_token_ids = MiniCPMO45NativeDuplexServingAdapter._native_stage0_stop_token_ids(
+        SimpleNamespace(model="local-minicpmo")
+    )
+
+    assert stop_token_ids == [8, 9, 3]
+    assert token_ids["<|turn_eos|>"] not in stop_token_ids
 
 
 def test_minicpmo_output_decision_uses_raw_streaming_token_snapshot():
@@ -301,6 +329,34 @@ def test_duplex_prompt_expands_incarnation_metadata():
     assert prompt["model_intermediate_buffer"]["duplex"]["incarnation"] == 3
 
 
+def test_minicpmo_recovery_rebases_first_retained_unit_without_changing_logical_sequence():
+    extension = MiniCPMO45DuplexRuntimeExtension()
+    fence = DuplexFence("sid-rollover-rebase")
+    prompt = build_duplex_data_plane_prompt(
+        request_id="old-physical-request",
+        fence=fence,
+        session_config={},
+        runtime_config={"duplex_first_append_context_tokens": 48},
+        seq=7,
+        turn_seq=2,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload={"is_speech": True},
+        final=False,
+    )
+
+    rebased = extension.prepare_recovery_prompt(
+        prompt=prompt,
+        request_id="new-physical-request",
+        initial=True,
+    )
+    duplex = rebased["model_intermediate_buffer"]["duplex"]
+
+    assert duplex["seq"] == 7
+    assert duplex["turn_seq"] == 2
+    assert rebased["model_intermediate_buffer"]["request_id"] == "new-physical-request"
+    assert len(rebased["prompt_token_ids"]) == len(prompt["prompt_token_ids"]) + 48
+
+
 def test_duplex_runtime_tracks_turn_local_append_sequence():
     manager = DuplexSessionRuntimeManager()
     session = manager.open_session(
@@ -385,6 +441,28 @@ def test_duplex_scheduler_token_budget_estimates_pcm_slots():
         )
         == 16
     )
+
+
+@pytest.mark.parametrize("seq,expected_tokens", [(1, 59), (2, 13)])
+def test_final_append_does_not_reserve_a_phantom_audio_unit(seq, expected_tokens):
+    import base64
+
+    payload = {"audio": base64.b64encode(bytes(16000 * 4)).decode(), "format": "pcm_f32le"}
+    common = dict(
+        request_id="req",
+        fence=DuplexFence("sid-final-budget"),
+        session_config={},
+        runtime_config={"duplex_first_append_context_tokens": 48},
+        seq=seq,
+        turn_seq=seq,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload=payload,
+    )
+    regular = build_duplex_data_plane_prompt(**common, final=False)
+    final = build_duplex_data_plane_prompt(**common, final=True)
+    assert len(regular["prompt_token_ids"]) == expected_tokens
+    assert final["prompt_token_ids"] == regular["prompt_token_ids"]
+    assert final["model_intermediate_buffer"]["duplex"]["final"] is True
 
 
 def test_duplex_scheduler_token_budget_ignores_client_budget_fields():

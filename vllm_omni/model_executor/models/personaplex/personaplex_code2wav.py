@@ -4,26 +4,22 @@
 
 This is the ``LLM_GENERATION`` codec stage of the 2-stage PersonaPlex pipeline.
 It consumes the per-frame audio codebooks produced by the talker (stage 0) and
-the depformer (built by the lead), and turns them into 24 kHz PCM by calling the
-external Mimi neural codec from the ``moshi`` package.
+the depformer, and turns them into 24 kHz PCM using PersonaPlexMimiCodec.
 
 Layout contract (mirrors ``Qwen3TTSCode2Wav``):
 
-* Per request, ``input_ids`` holds a flat codebook-major codec sequence
-  ``[k * F]`` where ``k`` is the number of *active* codebooks Mimi decodes
-  (``num_codebooks``, i.e. the ``cb 0..7`` slice) and ``F`` is the number of
-  codec frames. The talker emits a 17-row token stack per frame; the input
-  processor (built by the lead) keeps only rows ``1:9`` (the 8 PCM-bearing audio
-  codebooks) and flattens them codebook-major before this stage.
+* Indexed streaming input carries ``codes.audio`` as ``[k, F]`` and an
+  explicit frame offset; scheduler token IDs are placeholders. Unindexed
+  offline input can still carry flat codebook-major ``input_ids``. ``k`` is
+  the number of active agent codebooks (8), and ``F`` the frame count.
 * ``forward(...)`` returns an :class:`OmniOutput` whose ``multimodal_outputs``
   carries ``{"model_outputs": [wav_per_request], "sr": [sr_per_request]}`` — the
   exact shape ``Qwen3TTSCode2Wav`` returns, so the downstream audio packer is
   unchanged.
 
-The Mimi decoder is the transformers ``MimiModel`` (kyutai/mimi weights), not
-in vLLM's safetensors loader, so they are loaded eagerly in ``load_weights``
-part of the vLLM weights iterator (the codec owns its own checkpoint; see the
-``duplex`` subpackage of this model folder for the same pattern).
+The codec builds a Transformers Mimi graph with native streaming wrappers
+and loads the bundled PersonaPlex checkpoint in ``load_weights``. It does
+not require the ``moshi`` package or a separate ``kyutai/mimi`` download.
 """
 
 from __future__ import annotations
@@ -102,6 +98,7 @@ class PersonaPlexCode2Wav(nn.Module):
         self._additional_mimi = nn.ModuleList()
         self._mimi_device: torch.device | None = None
         self._request_codes: dict[str, torch.Tensor] = {}
+        self._request_frame_cursors: dict[str, tuple[int, torch.Tensor]] = {}
         self._request_codec_slots: dict[str, int] = {}
 
     # ------------------------------------------------------------------
@@ -223,10 +220,21 @@ class PersonaPlexCode2Wav(nn.Module):
             frames = n // k
             codes_kf = flat.reshape(k, frames)
             state_id = state_ids[i]
-            delta_kf = self._new_code_suffix(state_id, codes_kf)
+            frame_offset = meta.get("codec_frame_offset") if isinstance(meta, Mapping) else None
+            if frame_offset is not None:
+                delta_kf = self._indexed_code_suffix(state_id, codes_kf, frame_offset)
+            else:
+                if state_id in self._request_frame_cursors:
+                    raise ValueError("PersonaPlex indexed codec stream lost its frame offset")
+                delta_kf = self._new_code_suffix(state_id, codes_kf)
             if delta_kf.shape[1] == 0:
                 continue
             wav = self._decode_streaming_frames(state_id, delta_kf.to(device=device))
+            if frame_offset is not None:
+                self._request_frame_cursors[state_id] = (
+                    frame_offset,
+                    codes_kf.detach().to(device="cpu", dtype=torch.long).clone(),
+                )
             if wav.numel() > 0:
                 audios[i] = wav.to(dtype=torch.float32).reshape(-1)
 
@@ -262,6 +270,22 @@ class PersonaPlexCode2Wav(nn.Module):
                         request_id = meta.get("request_id")
             resolved.append(str(request_id) if request_id is not None else None)
         return resolved
+
+    def _indexed_code_suffix(self, request_id: str | None, codes_kf: torch.Tensor, offset: int) -> torch.Tensor:
+        if request_id is None or not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError("PersonaPlex indexed codec chunk requires request identity and non-negative offset")
+        previous = self._request_frame_cursors.get(request_id)
+        if request_id in self._request_codes:
+            raise ValueError("PersonaPlex codec stream cannot switch from unindexed to indexed chunks")
+        expected = 0
+        if previous is not None:
+            start, chunk = previous
+            expected = start + chunk.shape[1]
+            if offset == start and torch.equal(codes_kf.cpu(), chunk):
+                return codes_kf[:, :0]
+        if offset != expected:
+            raise ValueError(f"PersonaPlex codec frame offset mismatch: expected={expected}, received={offset}")
+        return codes_kf
 
     def _new_code_suffix(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
         if request_id is None:
@@ -339,6 +363,7 @@ class PersonaPlexCode2Wav(nn.Module):
         for request_id in finished_req_ids:
             state_id = str(request_id)
             self._request_codes.pop(state_id, None)
+            self._request_frame_cursors.pop(state_id, None)
             slot = self._request_codec_slots.pop(state_id, None)
             codecs = self._mimi_codecs()
             if slot is not None and slot < len(codecs):
@@ -382,11 +407,11 @@ class PersonaPlexCode2Wav(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Construct and load the external Mimi decoder.
+        """Construct and load the bundled PersonaPlex Mimi decoder.
 
         The primary vLLM weights iterator carries no Code2Wav parameters (Mimi
         owns its own checkpoint format), so it is drained and the Mimi module is
-        built from the moshi package's loader.
+        built by PersonaPlexMimiCodec from its own checkpoint.
         """
         # Drain the primary iterator so callers don't hang on an unconsumed
         # generator; none of these weights belong to this stage.

@@ -52,6 +52,15 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
+@pytest.fixture(autouse=True)
+def keep_model_paths_local_to_stage_arg_tests(monkeypatch):
+    # Compare typed/legacy argument construction without downloading the
+    # registry's real checkpoints during vLLM 0.28 EngineArgs initialization.
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, *_args, **_kwargs: model)
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, *_args, **_kwargs: model)
+
+
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
 

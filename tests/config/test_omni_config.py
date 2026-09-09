@@ -245,6 +245,15 @@ def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_ove
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
 
 
+@pytest.mark.parametrize("model_type", ["minicpmo_4_5", "personaplex", "nemotron_voicechat", "qwen3_tts"])
+def test_served_model_alias_is_owned_by_frontend_not_stage_engine(model_type):
+    aliases = ["public-model", "alternate-name"]
+    config = _from_pipeline_key(model_type, cli_overrides={"served_model_name": aliases})
+    assert config.stage_by_id(0).stage_id == 0
+    assert aliases == ["public-model", "alternate-name"]
+    assert "served_model_name" not in omni_config_module._global_stage_cli_fields()
+
+
 @pytest.mark.parametrize(
     ("engine_extras", "unowned_field"),
     [
@@ -1383,6 +1392,8 @@ def test_diffusion_alias_conflicts_prefer_canonical_key(
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path, monkeypatch):
     from vllm_omni.platforms import current_omni_platform
 
+    # This is a config alias test; "test-model" is not a hub checkpoint.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, *_args, **_kwargs: model)
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
     deploy_path.write_text(

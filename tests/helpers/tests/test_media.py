@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import io
 import sys
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
@@ -63,6 +64,19 @@ def test_transcribe_defaults_to_auto_language(monkeypatch):
     media._whisper_transcribe_in_current_process("/tmp/does-not-matter.wav", "small")
 
     assert captured.get("language") is None
+
+
+def test_pyav_video_fallback_encodes_decodable_mp4():
+    av = pytest.importorskip("av")
+    frames = [np.full((32, 32, 3), fill_value=value, dtype=np.uint8) for value in (0, 64, 128)]
+
+    encoded = media._encode_video_frames_with_pyav(frames, fps=30)
+
+    with av.open(io.BytesIO(encoded)) as container:
+        decoded = list(container.decode(video=0))
+    assert len(decoded) == len(frames)
+    assert decoded[0].width == 32
+    assert decoded[0].height == 32
 
 
 class _FakeExecutor:

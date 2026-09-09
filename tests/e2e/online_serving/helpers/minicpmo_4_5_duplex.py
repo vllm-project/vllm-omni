@@ -8,8 +8,8 @@ from __future__ import annotations
 import hashlib
 import uuid
 import wave
+from argparse import Namespace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -64,6 +64,31 @@ CORE_SERVER_PARAMS = [
         ),
         id="three-stage-single-gpu",
     )
+]
+
+FOUR_SESSION_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        ),
+        id="four-session-async-off",
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=[
+                "--trust-remote-code",
+                "--stage-overrides",
+                '{"1": {"active_stream_window": 2}}',
+            ],
+        ),
+        id="four-session-two-slot-contention",
+    ),
 ]
 
 
@@ -142,8 +167,8 @@ def demo_args(
     input_wav: Path,
     ref_audio: Path,
     output_dir: Path,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> Namespace:
+    return Namespace(
         url=realtime_url(omni_server),
         model=omni_server.model,
         session_id=f"duplex-ci-single-{uuid.uuid4().hex}",
@@ -180,8 +205,8 @@ def multi_session_args(
     ref_audio: Path,
     output_dir: Path,
     response_required: bool,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> Namespace:
+    return Namespace(
         url=realtime_url(omni_server),
         model=omni_server.model,
         sessions=2,
@@ -204,6 +229,7 @@ def multi_session_args(
         expire_session_index=None,
         expire_after_s=40.0,
         verify_admission_limit=None,
+        emit_duplex_control_results=False,
         model_policy_settle_ms=2000,
         timeout_s=180.0,
     )

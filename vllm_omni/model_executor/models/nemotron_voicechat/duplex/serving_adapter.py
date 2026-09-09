@@ -195,8 +195,13 @@ class NemotronVoiceChatServingRuntimeAdapter:
 
     @staticmethod
     def capabilities(*, max_sessions: int) -> DuplexCapabilities:
+        from vllm_omni.engine.kv_append import scheduler_native_append_available
+
         supports_multi_session = max_sessions > 1
         return DuplexCapabilities(
+            # NVIDIA NIM 1.0.0 keeps one response open until graceful stream
+            # close; model EOS only terminates an utterance transcript.
+            response_lifecycle="continuous_stream",
             supports_model_native_turn_policy=True,
             supports_external_turn_signal=False,
             supports_client_commit=True,
@@ -211,7 +216,8 @@ class NemotronVoiceChatServingRuntimeAdapter:
             supports_core_kv_lease=False,
             supports_model_internal_state=True,
             supports_stage_resumption=True,
-            supports_scheduler_native_append=False,
+            supports_scheduler_native_append=scheduler_native_append_available(),
+            supports_prompt_replay=False,
             supports_core_resumable_request=True,
             supports_stage_connector_handoff=True,
             supports_independent_io_streams=True,
@@ -231,6 +237,9 @@ class NemotronVoiceChatServingRuntimeAdapter:
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=80,
             target_barge_in_latency_ms=None,
+            adapter_id="nemotron_voicechat",
+            runtime_extension_id="nemotron_voicechat",
+            stage_count=3,
         )
 
     @staticmethod

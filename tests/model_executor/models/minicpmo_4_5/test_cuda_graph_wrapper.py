@@ -60,7 +60,8 @@ def _small_hift() -> HiFTGenerator:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_hift_graph_replay_matches_eager_for_uncached_and_cached_shapes() -> None:
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4])
+def test_hift_graph_replay_matches_eager_for_uncached_and_cached_shapes(batch_size: int) -> None:
     torch.manual_seed(0)
     hift = _small_hift()
     token2wav = SimpleNamespace(
@@ -75,13 +76,13 @@ def test_hift_graph_replay_matches_eager_for_uncached_and_cached_shapes() -> Non
     wrapper = HiFTGraphWrapper(
         token2wav,
         connector_config={"codec_chunk_frames": 2, "codec_left_context_frames": 3},
-        capture_batch_sizes=[1],
+        capture_batch_sizes=[1, 2, 4],
     )
     wrapper.capture()
 
     cases = (
-        (torch.randn(1, 80, 4, device="cuda"), torch.zeros(1, 1, 0, device="cuda")),
-        (torch.randn(1, 80, 6, device="cuda"), torch.randn(1, 1, 960, device="cuda")),
+        (torch.randn(batch_size, 80, 4, device="cuda"), torch.zeros(batch_size, 1, 0, device="cuda")),
+        (torch.randn(batch_size, 80, 6, device="cuda"), torch.randn(batch_size, 1, 960, device="cuda")),
     )
     with torch.inference_mode():
         for speech_feat, cache_source in cases:
@@ -89,6 +90,10 @@ def test_hift_graph_replay_matches_eager_for_uncached_and_cached_shapes() -> Non
             actual_speech, actual_source = wrapper.replay(speech_feat, cache_source)
             torch.testing.assert_close(actual_speech, expected_speech, rtol=1e-4, atol=1e-5)
             torch.testing.assert_close(actual_source, expected_source, rtol=1e-4, atol=1e-5)
+            saved_speech, saved_source = actual_speech.clone(), actual_source.clone()
+            wrapper.replay(speech_feat.neg(), cache_source)
+            torch.testing.assert_close(actual_speech, saved_speech, rtol=0, atol=0)
+            torch.testing.assert_close(actual_source, saved_source, rtol=0, atol=0)
 
 
 class _FakeGraph:
@@ -192,6 +197,7 @@ class _MiniDiT(nn.Module):
                 x += att_b.sum(dim=(1, 2), keepdim=False).unsqueeze(1)
             x = self.blocks[b_idx](x)
             x = x + t
+            assert cnn_cache_buffer is not None and att_cache_buffer is not None
             cnn_cache_buffer[b_idx] = x[:, -2:, :].transpose(1, 2).contiguous()
             dt = x.shape[1]
             att_cache_buffer[b_idx][:, :, :dt, :] = x.unsqueeze(1)

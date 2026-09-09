@@ -18,10 +18,10 @@ import asyncio
 import os
 import shutil
 import time as _time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import janus
 import torch
@@ -55,7 +55,7 @@ from vllm_omni.engine.duplex.session import (
     DuplexSessionRuntimeManager,
     DuplexSessionRuntimeState,
 )
-from vllm_omni.engine.membership_controller import MembershipController
+from vllm_omni.engine.membership_controller import MembershipController, ReplicaLossCleanupResult
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -74,6 +74,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.stage_client import StagePoolLLMClient
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
@@ -84,6 +85,12 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 logger = init_logger(__name__)
+
+
+class _DuplexCleanupOptions(TypedDict, total=False):
+    abort: bool
+    cleanup_in_progress: bool
+    reason: str
 
 
 def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
@@ -147,6 +154,7 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
+    streaming_prompt_continuous: bool = False,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -196,6 +204,7 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        streaming_prompt_continuous=streaming_prompt_continuous,
     )
 
 
@@ -227,6 +236,7 @@ class OrchestratorRequestState:
     duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     duplex_config_generation: int = -1
     running_counter_registered: bool = False
+    duplex_recovery_replay: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
 
 
@@ -245,6 +255,10 @@ class StreamingSegmentState:
     # processed RequestOutput used by the routing layer.
     token_ids: list[int] = field(default_factory=list)
     output_metadata: dict[str, Any] = field(default_factory=dict)
+    # Scheduler-captured metadata for the exact input unit that produced this
+    # boundary.  Unlike bridge state, this cannot be overwritten by a later
+    # append before the boundary is processed.
+    input_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -274,7 +288,7 @@ class StreamingInputState:
 
         Fresh rather than shared: ``output_metadata`` is handed out by reference.
         """
-        segment = self.segments.get(stage_id)
+        segment = self.segments.get(stage_id) if stage_id is not None else None
         return segment if segment is not None else StreamingSegmentState()
 
 
@@ -306,7 +320,38 @@ class _OrchestratorDuplexStagePort:
         return len(self._stage_pools)
 
     def sampling_defaults(self) -> tuple[object, ...]:
-        return tuple(pool.stage_client.default_sampling_params for pool in self._stage_pools)
+        defaults: list[object] = []
+        for pool in self._stage_pools:
+            client = pool.stage_client
+            if client is None:
+                raise StageUnavailableError(f"stage {pool.stage_id} has no live replica for sampling defaults")
+            defaults.append(client.default_sampling_params)
+        return tuple(defaults)
+
+    def supports_scheduler_native_append(self, stage_id: int = 0) -> bool:
+        """Return whether every live replica can execute the native lifecycle."""
+        if stage_id < 0 or stage_id >= len(self._stage_pools):
+            return False
+        from vllm_omni.engine.kv_append import scheduler_native_append_available
+
+        pool = self._stage_pools[stage_id]
+        clients = [pool.clients[replica_id] for replica_id in pool.available_replica_ids()]
+        max_model_len = getattr(getattr(pool.stage_vllm_config, "model_config", None), "max_model_len", None)
+        required_client_methods = (
+            "admit_duplex_request_async",
+            "get_streaming_prompt_metrics_async",
+            "append_streaming_prompt_unit_async",
+        )
+        return (
+            pool.stage_type == "llm"
+            and bool(clients)
+            and isinstance(max_model_len, int)
+            and max_model_len > 0
+            and scheduler_native_append_available()
+            and all(
+                all(callable(getattr(client, method, None)) for method in required_client_methods) for client in clients
+            )
+        )
 
     @staticmethod
     def _sync_bridge_state(
@@ -360,6 +405,7 @@ class _OrchestratorDuplexStagePort:
             session_id=context.session_id,
             fence=context.fence,
         )
+        request_state.duplex_recovery_replay = context.recovery_replay
         self._sync_bridge_state(request_state, context)
 
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
@@ -367,19 +413,40 @@ class _OrchestratorDuplexStagePort:
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+        if not context.scheduler_native_append:
+            raise RuntimeError("native duplex Stage0 requires transactional append support")
+        request_state.duplex_recovery_replay = submission.recovery_replay
         request = build_engine_core_request_from_tokens(
             request_id=context.request_id,
             prompt=dict(submission.prompt),
             params=context.stage_sampling_params,
             model_config=self._stage_pools[context.stage_id].stage_vllm_config.model_config,
-            resumable=True,
+            # OutputProcessor owns one segment, not the retained scheduler
+            # request. The client sets resumable=True only after this segment
+            # is registered, so terminal output retires it before the next unit.
+            resumable=False,
+            streaming_prompt_continuous=True,
         )
         request.external_req_id = request.request_id
         pool = self._stage_pools[context.stage_id]
+        scheduler_metrics: dict[str, int | float | bool | str] = {}
         if submission.already_submitted:
-            replica_id = await pool.submit_update(context.request_id, request_state, request)
+            replica_id, scheduler_metrics = await pool.submit_streaming_prompt_update(
+                context.request_id,
+                request,
+                operation_id=submission.operation_id,
+                operation_fingerprint=submission.operation_fingerprint,
+                deadline_monotonic=submission.deadline_monotonic,
+            )
         else:
-            replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
+            replica_id, scheduler_metrics = await pool.submit_streaming_prompt_initial(
+                context.request_id,
+                request_state,
+                request,
+                operation_id=submission.operation_id,
+                operation_fingerprint=submission.operation_fingerprint,
+                deadline_monotonic=submission.deadline_monotonic,
+            )
             if self._async_chunk and context.stage_id == 0:
                 prewarmed = await self._prewarm_async_chunk_stages(
                     context.request_id,
@@ -407,10 +474,21 @@ class _OrchestratorDuplexStagePort:
             request_id=context.request_id,
             stage_id=context.stage_id,
             replica_id=replica_id,
+            metrics=scheduler_metrics,
         )
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)
+
+    async def wait_replay_safe(self, request_id: str, *, deadline_monotonic: float | None = None) -> None:
+        for pool in self._stage_pools:
+            if pool.get_bound_replica_id(request_id) is None:
+                continue
+            await pool.wait_streaming_prompt_append_ready(
+                request_id,
+                deadline_monotonic=deadline_monotonic,
+            )
+            return
 
 
 class Orchestrator:
@@ -507,7 +585,16 @@ class Orchestrator:
                     disconnect_grace_s=runtime_session_config.disconnect_grace_s,
                 ),
                 max_sessions=runtime_session_config.max_sessions,
+                max_pending_session_opens=runtime_session_config.max_pending_session_opens,
+                session_open_queue_timeout_s=runtime_session_config.session_open_queue_timeout_s,
+                session_open_aging_quantum_s=runtime_session_config.session_open_aging_quantum_s,
                 completed_append_limit=runtime_session_config.completed_append_cache_size,
+                max_pending_appends_per_session=runtime_session_config.max_pending_appends_per_session,
+                recovery_max_replay_tokens=runtime_session_config.kv_recovery_max_replay_tokens_per_session,
+                recovery_max_replay_bytes=runtime_session_config.kv_recovery_max_replay_bytes_per_session,
+                rollover_trigger_fraction=runtime_session_config.kv_rollover_trigger_fraction,
+                rollover_retain_tokens=runtime_session_config.kv_rollover_retain_tokens,
+                metrics=self._prom_metrics,
             )
 
         self._shutdown_event = asyncio.Event()
@@ -613,7 +700,7 @@ class Orchestrator:
         if self._membership is not None:
             self._membership.install_unregister_handlers(
                 output_queue=self.output_async_queue,
-                cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+                cleanup_callback=self._cleanup_membership_lost_requests,
                 replica_removed_callback=self._remove_stage_replica_waiting,
             )
             membership_watcher = self._membership.start()
@@ -708,7 +795,7 @@ class Orchestrator:
                 # process exit as EngineDeadError during teardown.
                 for pool in self.stage_pools:
                     for client in pool.clients:
-                        if hasattr(client, "_shutting_down"):
+                        if client is not None and hasattr(client, "_shutting_down"):
                             client._shutting_down = True
                 # Stage teardown runs once in run()'s finally after the
                 # orchestration loop observes _shutdown_event and exits.
@@ -1119,7 +1206,8 @@ class Orchestrator:
                     kv_params.get("connector_type") or "unknown",
                     float(kv_wait_s),
                 )
-            req_state = self.request_states.get(getattr(eco, "request_id", None))
+            output_request_id = getattr(eco, "request_id", None)
+            req_state = self.request_states.get(output_request_id) if isinstance(output_request_id, str) else None
             if req_state is None or not req_state.streaming.enabled:
                 continue
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
@@ -1128,6 +1216,15 @@ class Orchestrator:
                 finished=segment_finished,
                 token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
                 output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
+                input_metadata=(
+                    dict(segment_input_metadata)
+                    if segment_finished
+                    and isinstance(
+                        segment_input_metadata := getattr(eco, "streaming_segment_input_metadata", None),
+                        dict,
+                    )
+                    else {}
+                ),
             )
             req_state.streaming.new_prompt_len_snapshot = getattr(
                 eco,
@@ -1569,14 +1666,13 @@ class Orchestrator:
         self._prom_metrics.set_stage_waiting_requests(stage_id, total)
 
     async def _handle_dead_replica(self, stage_id: int, replica_id: int, error: EngineDeadError) -> None:
-        """Evict a dead stage replica and fail the requests stranded on it (#4285).
+        """Evict a dead replica and recover replay-safe native Stage-0 sessions.
 
         A dead replica must not tear down the whole server: evict it and keep the
         orchestrator loop alive so remaining live replicas / stages keep serving.
-        If the stage still has a live replica, fail only the requests bound to the
-        dead replica; requests bound to a surviving replica (or not yet bound)
-        keep running and can be (re)dispatched. If the stage has no live replica
-        left, every request routed through it must fail since none can be served.
+        Committed scheduler-native Stage-0 journals are rebound lazily on the
+        next append.  Uncertain appends, downstream-stage losses, and a fully
+        dead stage remain typed fail-closed boundaries.
         """
         pool = self.stage_pools[stage_id]
         logger.error(
@@ -1585,34 +1681,107 @@ class Orchestrator:
             replica_id,
             error,
         )
-        pool.evict_replica(replica_id)
-        self._remove_stage_replica_waiting(stage_id, replica_id)
-        stage_has_live = bool(pool.live_replica_ids())
-        failed_ids: list[str] = []
+        affected_ids: list[str] = []
         for req_id, req_state in list(self.request_states.items()):
             if stage_id not in req_state.stage_submit_ts:
                 continue
-            bound = pool.get_bound_replica_id(req_id)
-            if bound == replica_id or not stage_has_live:
-                await self.output_async_queue.put(
-                    ErrorMessage(
-                        error=str(error),
-                        fatal=True,
-                        request_id=req_id,
-                        stage_id=stage_id,
-                    )
-                )
-                failed_ids.append(req_id)
-        # Use the shared cleanup path so the running counter, PD/CFG state, and
-        # bindings across every stage pool are released (not just this pool).
-        # abort=True stops the failed requests' in-flight work on surviving
-        # stages (abort skips dead/evicted bindings), matching the
-        # distributed-membership eviction path.
-        for req_id in failed_ids:
-            await self._cleanup_request_ids(
-                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                abort=True,
+            if pool.get_bound_replica_id(req_id) == replica_id:
+                affected_ids.append(req_id)
+        pool.evict_replica(replica_id)
+        self._remove_stage_replica_waiting(stage_id, replica_id)
+        stage_has_live = bool(pool.live_replica_ids())
+        if not stage_has_live:
+            affected_ids.extend(
+                req_id
+                for req_id, req_state in list(self.request_states.items())
+                if stage_id in req_state.stage_submit_ts
             )
+        affected_ids = list(dict.fromkeys(affected_ids))
+        cleanup_result = await self._cleanup_replica_lost_requests(
+            stage_id,
+            affected_ids,
+            allow_recovery=stage_has_live,
+        )
+        terminal_ids = set(affected_ids) - set(cleanup_result.recoverable_request_ids)
+        for req_id in terminal_ids:
+            native_terminal = req_id in cleanup_result.terminal_native_request_ids
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=(
+                        f"native_kv_replica_lost: {error}; automatic replay was unsafe or unavailable; "
+                        "reopen the duplex session and replay input"
+                        if native_terminal
+                        else str(error)
+                    ),
+                    error_type="native_kv_replica_lost" if native_terminal else type(error).__name__,
+                    fatal=not stage_has_live,
+                    request_id=req_id,
+                    stage_id=stage_id,
+                )
+            )
+
+    async def _cleanup_replica_lost_requests(
+        self,
+        stage_id: int,
+        request_ids: list[str],
+        *,
+        allow_recovery: bool,
+    ) -> ReplicaLossCleanupResult:
+        """Release old physical state while preserving replay-safe sessions."""
+        if not request_ids:
+            return ReplicaLossCleanupResult()
+        native_request_ids = {
+            request_id
+            for request_id in request_ids
+            if (state := self.request_states.get(request_id)) is not None and self._is_duplex_session_request(state)
+        }
+        pool = self.stage_pools[stage_id]
+        uncertain_request_ids = {
+            request_id
+            for request_id in native_request_ids
+            if pool.native_append_operation_state(request_id) == "uncertain"
+        }
+        recoverable: set[str] = set()
+        terminal_native = set(native_request_ids)
+        if self.duplex_control_plane is not None and native_request_ids:
+            recoverable, explicitly_unsafe = self.duplex_control_plane.prepare_replica_recovery(
+                stage_id,
+                native_request_ids,
+                uncertain_request_ids=uncertain_request_ids,
+                allow_recovery=allow_recovery,
+            )
+            terminal_native = (native_request_ids - recoverable) | explicitly_unsafe
+        if recoverable:
+            await self._cleanup_request_ids(
+                list(recoverable),
+                abort=True,
+                close_duplex_sessions=False,
+            )
+        terminal_ids = [request_id for request_id in request_ids if request_id not in recoverable]
+        if terminal_ids:
+            await self._cleanup_request_ids(
+                terminal_ids,
+                abort=True,
+                close_duplex_sessions=bool(terminal_native),
+                close_duplex_reason="native_kv_replica_lost",
+            )
+        return ReplicaLossCleanupResult(
+            recoverable_request_ids=frozenset(recoverable),
+            terminal_native_request_ids=frozenset(terminal_native),
+        )
+
+    async def _cleanup_membership_lost_requests(
+        self,
+        stage_id: int,
+        request_ids: list[str],
+    ) -> ReplicaLossCleanupResult:
+        """Classify and clean requests affected by distributed replica loss."""
+        pool = self.stage_pools[stage_id]
+        return await self._cleanup_replica_lost_requests(
+            stage_id,
+            request_ids,
+            allow_recovery=bool(pool.live_replica_ids()),
+        )
 
     async def _fail_request_dead_stage(self, req_id: str, stage_id: int) -> None:
         """Fail one request whose target stage has no live replica (#4285).
@@ -1639,6 +1808,8 @@ class Orchestrator:
         await self._cleanup_request_ids(
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
+            close_duplex_sessions=True,
+            close_duplex_reason="native_kv_replica_lost",
         )
 
     async def _fail_request_client_error(
@@ -1765,6 +1936,7 @@ class Orchestrator:
         *,
         abort: bool = False,
         close_duplex_sessions: bool = False,
+        close_duplex_reason: str = "request_cleanup",
     ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
@@ -1807,10 +1979,15 @@ class Orchestrator:
                     cleanup_ids.append(cid)
         closing_session_ids: list[str] = []
         if close_duplex_sessions and self.duplex_control_plane is not None:
+            close_kwargs: _DuplexCleanupOptions = {
+                "abort": abort,
+                "cleanup_in_progress": True,
+            }
+            if close_duplex_reason != "request_cleanup":
+                close_kwargs["reason"] = close_duplex_reason
             closed_sessions = self.duplex_control_plane.close_sessions_for_request_ids(
                 cleanup_ids,
-                abort=abort,
-                cleanup_in_progress=True,
+                **close_kwargs,
             )
             closing_session_ids.extend(closed_sessions)
             for session_id, stale_request_ids in closed_sessions.items():
@@ -1831,7 +2008,7 @@ class Orchestrator:
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)
                 if req_state is not None:
-                    cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
+                    cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", []))
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
                     req_state.running_counter_registered = False
@@ -1973,6 +2150,13 @@ class Orchestrator:
         """Route a processed output: send to frontend and/or forward."""
         req_id = output.request_id
         finished = output.finished
+        if req_state.duplex_recovery_replay or self._output_is_duplex_recovery_replay(output):
+            # Recovery regenerates historical Stage0 decisions solely to rebuild
+            # model/scheduler state.  They must never be forwarded to Talker or
+            # emitted to the client a second time.  Check output metadata as well
+            # as request state so a delayed historical frame remains suppressed
+            # after the next live append has switched the request state back.
+            return
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         # CFG companion: stash output so parent can bundle [parent, *companions]
@@ -2094,6 +2278,34 @@ class Orchestrator:
 
         if request_finished and not self._is_duplex_session_request(req_state):
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+
+    @classmethod
+    def _output_is_duplex_recovery_replay(cls, output: Any) -> bool:
+        """Recognize replay on either wire dicts or structured completions.
+
+        Request-level transport metadata must not hide a completion marker.
+        """
+        completion = None
+        outputs = getattr(output, "outputs", None)
+        if isinstance(outputs, list) and outputs:
+            completion = outputs[0]
+        for candidate in (output, completion):
+            metadata = getattr(candidate, "multimodal_output", None)
+            if isinstance(metadata, Mapping) and cls._duplex_recovery_marker_is_true(
+                metadata.get("duplex_recovery_replay")
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _duplex_recovery_marker_is_true(cls, marker: object) -> bool:
+        if isinstance(marker, bool):
+            return marker
+        if isinstance(marker, torch.Tensor):
+            return marker.numel() > 0 and bool(marker.detach().bool().any().item())
+        if isinstance(marker, (list, tuple)):
+            return any(cls._duplex_recovery_marker_is_true(value) for value in marker)
+        return False
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
@@ -2498,6 +2710,9 @@ class Orchestrator:
             await self._fail_request_dead_stage(req_id, next_logical)
             return
         next_client = next_pool.stage_client
+        if next_client is None:
+            await self._fail_request_dead_stage(req_id, next_logical)
+            return
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
@@ -2733,7 +2948,7 @@ class Orchestrator:
             req_state.streaming.source_token_decoder = decode
 
         try:
-            next_inputs = next_client.process_engine_inputs(
+            next_inputs = cast(StagePoolLLMClient, next_client).process_engine_inputs(
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,
@@ -2774,6 +2989,22 @@ class Orchestrator:
             req_state.streaming.source_token_decoder = previous_decoder
 
         if not next_inputs:
+            if self._is_duplex_session_request(req_state):
+                # A model-owned duplex unit may legitimately produce no input
+                # for the next stage (for example MiniCPM-o's initial listen
+                # decision). The request remains appendable until the duplex
+                # control plane explicitly closes it. Synthesizing a terminal
+                # output here races the next append: ensure_request can observe
+                # the old state just before cleanup removes it, orphaning the
+                # newly appended unit.
+                logger.debug(
+                    "[Orchestrator] req=%s duplex stage-%s produced no inputs for stage-%s; "
+                    "waiting for the next appended unit",
+                    req_id,
+                    src_stage_id,
+                    next_logical,
+                )
+                return
             if not getattr(output, "finished", False):
                 logger.debug(
                     "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more outputs",
@@ -2959,7 +3190,12 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
+                # Duplex downstream stages consume multiple connector chunks,
+                # even when scheduler-native prompt append makes stage 0 itself
+                # non-resumable. Keep those receivers alive across turn
+                # boundaries for as long as the orchestrator request is in
+                # streaming mode.
+                downstream_resumable = bool(getattr(stage0_request, "resumable", False) or req_state.streaming.enabled)
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,

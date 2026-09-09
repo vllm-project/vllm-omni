@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -49,6 +50,7 @@ def normalize_duplex_input_event(event: dict[str, object]) -> dict[str, object]:
 
 MODEL_OUTPUT_EVENTS = frozenset(
     {
+        "response.transcript.done",
         "response.created",
         "response.listen",
         "response.speak",
@@ -133,6 +135,10 @@ class DuplexSessionTasks:
         return True
 
 
+class DuplexMailboxOverflowError(BufferError):
+    """The transport backlog exceeded a per-attachment admission limit."""
+
+
 @dataclass
 class DuplexWebSocketActor:
     """Own ordered WebSocket I/O queues, but no domain identity."""
@@ -141,13 +147,27 @@ class DuplexWebSocketActor:
     current_epoch: Callable[[], int | None] | None = None
     session_closed: Callable[[], bool] | None = None
     output_queue: asyncio.Queue[dict[str, object] | None] = field(default_factory=asyncio.Queue)
-    mailbox: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
+    mailbox: asyncio.Queue[tuple[dict[str, object], int]] = field(default_factory=asyncio.Queue)
+    max_output_events: int = 256
+    max_output_bytes: int = 16 * 1024 * 1024
+    _queued_output_bytes: int = 0
+    _output_closed: bool = False
+    max_mailbox_events: int = 256
+    max_mailbox_bytes: int = 16 * 1024 * 1024
     outbound_protocol: Any | None = None
     tasks: DuplexSessionTasks = field(default_factory=DuplexSessionTasks)
     closing: bool = False
     close_reason: str | None = None
     stale_output_dropped: int = 0
     _queued_input_events: int = 0
+    _queued_mailbox_bytes: int = 0
+    _terminal_enqueued: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_output_events <= 0 or self.max_output_bytes <= 0:
+            raise ValueError("duplex output limits must be positive")
+        if self.max_mailbox_events <= 0 or self.max_mailbox_bytes <= 0:
+            raise ValueError("duplex mailbox limits must be positive")
 
     @property
     def native_append_tasks(self) -> dict[asyncio.Task[bool], DuplexAppendTaskMeta]:
@@ -169,26 +189,76 @@ class DuplexWebSocketActor:
     def native_append_tail(self, task: asyncio.Task[bool] | None) -> None:
         self.tasks.native_append_tail = task
 
-    async def enqueue_event(self, event: dict[str, object]) -> None:
+    async def enqueue_event(self, event: dict[str, object], *, encoded_bytes: int | None = None) -> None:
+        if encoded_bytes is None:
+            encoded_bytes = len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
+        if encoded_bytes < 0:
+            raise ValueError("duplex mailbox byte count must be non-negative")
+        if (
+            self.mailbox.qsize() >= self.max_mailbox_events
+            or self._queued_mailbox_bytes + encoded_bytes > self.max_mailbox_bytes
+        ):
+            raise DuplexMailboxOverflowError("Duplex transport mailbox exceeds event or byte limit")
+        # Never wait on a full input queue: that would prevent the reader
+        # from observing cancel/close. The session owner handles overflow by
+        # explicit failure and cleanup, not by silently dropping audio.
+        try:
+            self.mailbox.put_nowait((event, encoded_bytes))
+        except asyncio.QueueFull as exc:
+            raise DuplexMailboxOverflowError("Duplex transport mailbox is full") from exc
+        self._queued_mailbox_bytes += encoded_bytes
         if is_input_event(event.get("type")):
             self._queued_input_events += 1
-        await self.mailbox.put(event)
 
     async def next_event(self) -> dict[str, object]:
-        event = await self.mailbox.get()
+        event, encoded_bytes = await self.mailbox.get()
+        self._queued_mailbox_bytes -= encoded_bytes
         if is_input_event(event.get("type")):
             self._queued_input_events = max(0, self._queued_input_events - 1)
         self.mailbox.task_done()
         return event
 
+    async def enqueue_terminal(self, event_type: str) -> None:
+        """Reserve one small EOF/error marker even when admission is full."""
+        if event_type not in {"__timeout__", "__disconnect__", "__mailbox_overflow__"}:
+            raise ValueError("invalid duplex reader terminal event")
+        if self._terminal_enqueued:
+            return
+        self._terminal_enqueued = True
+        await self.mailbox.put(({"type": event_type}, 0))
+
+    def discard_pending_events(self) -> None:
+        """Release an irrecoverably overloaded attachment's transport backlog."""
+        while True:
+            try:
+                self.mailbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self.mailbox.task_done()
+        self._queued_input_events = 0
+        self._queued_mailbox_bytes = 0
+
     def has_queued_input_events(self) -> bool:
         return self._queued_input_events > 0
 
     async def send_json(self, payload: dict[str, object]) -> None:
-        await self.output_queue.put(payload)
+        if self._output_closed:
+            raise RuntimeError("duplex output writer is closed")
+        # Freeze admitted payloads so later mutation cannot evade byte accounting.
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if (
+            self.output_queue.qsize() >= self.max_output_events
+            or self._queued_output_bytes + len(encoded) > self.max_output_bytes
+        ):
+            raise BufferError("Duplex output backlog exceeds event or byte limit")
+        self.output_queue.put_nowait(json.loads(encoded))
+        self._queued_output_bytes += len(encoded)
 
     async def close_writer(self) -> None:
-        await self.output_queue.put(None)
+        # Reserve a terminal marker even when the data budget is exhausted.
+        if not self._output_closed:
+            self._output_closed = True
+            self.output_queue.put_nowait(None)
 
     async def writer_loop(self) -> None:
         while True:
@@ -196,6 +266,7 @@ class DuplexWebSocketActor:
             try:
                 if payload is None:
                     return
+                self._queued_output_bytes -= len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
                 raw_realtime = payload.pop("_realtime_raw", False) is True
                 if not raw_realtime and self._is_stale_model_output(payload):
                     self.stale_output_dropped += 1

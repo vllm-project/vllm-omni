@@ -209,6 +209,22 @@ DIFFUSION_KV_LOAD_S = METRIC_PREFIX + "diffusion_kv_load_s"
 IMAGE_TTFP_S = METRIC_PREFIX + "image_ttfp_s"
 STAGE_IN_QUEUE_S = METRIC_PREFIX + "stage_in_queue_s"
 
+# Scheduler-native full-duplex control/session families. Labels are deliberately
+# bounded: never add session_id, request_id, or operation_id here.
+DUPLEX_SESSIONS = METRIC_PREFIX + "duplex_sessions"
+DUPLEX_APPEND_REQUESTS = METRIC_PREFIX + "duplex_append_requests"
+DUPLEX_APPEND_LATENCY_S = METRIC_PREFIX + "duplex_append_latency_s"
+DUPLEX_CONTROL_QUEUE_WAIT_S = METRIC_PREFIX + "duplex_control_queue_wait_s"
+DUPLEX_CONTEXT_TOKENS = METRIC_PREFIX + "duplex_context_tokens"
+DUPLEX_CONTEXT_LIMIT_TOKENS = METRIC_PREFIX + "duplex_context_limit_tokens"
+DUPLEX_CONTEXT_UTILIZATION = METRIC_PREFIX + "duplex_context_utilization"
+DUPLEX_APPEND_RECEIPTS = METRIC_PREFIX + "duplex_append_receipts"
+DUPLEX_REPLICA_AFFINITY_LOSS = METRIC_PREFIX + "duplex_replica_affinity_loss"
+DUPLEX_REPLAY_JOURNAL_TOKENS = METRIC_PREFIX + "duplex_replay_journal_tokens"
+DUPLEX_REPLAY_JOURNAL_BYTES = METRIC_PREFIX + "duplex_replay_journal_bytes"
+DUPLEX_RESOURCE_GENERATION = METRIC_PREFIX + "duplex_resource_generation"
+DUPLEX_KV_REBUILDS = METRIC_PREFIX + "duplex_kv_rebuilds"
+
 
 # ============================================================================
 # Label sets
@@ -225,6 +241,10 @@ STAGE_GEN_TIME_LABELS = ("model_name", "stage", "stage_type")
 DIFFUSION_LABELS = ("model_name", "stage")
 FAILED_LABELS = ("model_name", "reason")
 KV_WAIT_LABELS = ("model_name", "connector_type")
+DUPLEX_SESSION_LABELS = ("model_name", "state")
+DUPLEX_APPEND_LABELS = ("model_name", "outcome")
+DUPLEX_CONTROL_LABELS = ("model_name", "operation")
+DUPLEX_KV_REBUILD_LABELS = ("model_name", "reason", "outcome")
 
 # Audio continuity Counter carries an extra ``threshold_ms`` label so multiple
 # threshold buckets can be tracked simultaneously. The ``_ms`` suffix names a

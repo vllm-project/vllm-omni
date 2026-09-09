@@ -100,6 +100,73 @@ _kv_wait_s_family = Histogram(
     labelnames=list(defs.KV_WAIT_LABELS),
     buckets=defs.SECONDS_BUCKETS,
 )
+_duplex_sessions_family = Gauge(
+    defs.DUPLEX_SESSIONS,
+    "Current scheduler-native duplex sessions by bounded lifecycle state.",
+    labelnames=list(defs.DUPLEX_SESSION_LABELS),
+)
+_duplex_append_requests_family = Counter(
+    defs.DUPLEX_APPEND_REQUESTS,
+    "Scheduler-native duplex append attempts by bounded outcome.",
+    labelnames=list(defs.DUPLEX_APPEND_LABELS),
+)
+_duplex_append_latency_family = Histogram(
+    defs.DUPLEX_APPEND_LATENCY_S,
+    "Scheduler-native duplex append latency in seconds, excluding control-tail queue wait.",
+    labelnames=list(defs.DUPLEX_APPEND_LABELS),
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_duplex_control_queue_wait_family = Histogram(
+    defs.DUPLEX_CONTROL_QUEUE_WAIT_S,
+    "Duplex command wait in its per-session ordered control tail, in seconds.",
+    labelnames=list(defs.DUPLEX_CONTROL_LABELS),
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_duplex_context_tokens_family = Gauge(
+    defs.DUPLEX_CONTEXT_TOKENS,
+    "Largest current retained Stage-0 context among active native duplex sessions.",
+    labelnames=_labelnames,
+)
+_duplex_context_limit_tokens_family = Gauge(
+    defs.DUPLEX_CONTEXT_LIMIT_TOKENS,
+    "Largest configured Stage-0 context limit among active native duplex sessions.",
+    labelnames=_labelnames,
+)
+_duplex_context_utilization_family = Gauge(
+    defs.DUPLEX_CONTEXT_UTILIZATION,
+    "Largest current Stage-0 context-limit utilization among active native duplex sessions.",
+    labelnames=_labelnames,
+)
+_duplex_append_receipts_family = Gauge(
+    defs.DUPLEX_APPEND_RECEIPTS,
+    "Largest current bounded append-receipt cache among active native duplex sessions.",
+    labelnames=_labelnames,
+)
+_duplex_replica_affinity_loss_family = Counter(
+    defs.DUPLEX_REPLICA_AFFINITY_LOSS,
+    "Native duplex sessions whose resident-KV replica affinity was lost.",
+    labelnames=_labelnames,
+)
+_duplex_replay_journal_tokens_family = Gauge(
+    defs.DUPLEX_REPLAY_JOURNAL_TOKENS,
+    "Largest bounded committed replay journal among active native duplex sessions, in tokens.",
+    labelnames=_labelnames,
+)
+_duplex_replay_journal_bytes_family = Gauge(
+    defs.DUPLEX_REPLAY_JOURNAL_BYTES,
+    "Largest bounded committed replay journal among active native duplex sessions, in bytes.",
+    labelnames=_labelnames,
+)
+_duplex_resource_generation_family = Gauge(
+    defs.DUPLEX_RESOURCE_GENERATION,
+    "Largest physical scheduler-request generation among active native duplex sessions.",
+    labelnames=_labelnames,
+)
+_duplex_kv_rebuilds_family = Counter(
+    defs.DUPLEX_KV_REBUILDS,
+    "Scheduler-native duplex KV rebuild attempts by bounded reason and outcome.",
+    labelnames=list(defs.DUPLEX_KV_REBUILD_LABELS),
+)
 
 
 class OmniPrometheusMetrics:
@@ -121,6 +188,16 @@ class OmniPrometheusMetrics:
         self._num_inference_steps = _num_inference_steps_family.labels(model_name=model_name)
         self._image_count = _image_count_family.labels(model_name=model_name)
         self._image_pixels = _image_pixels_family.labels(model_name=model_name)
+        self._duplex_active_sessions = _duplex_sessions_family.labels(model_name=model_name, state="active")
+        self._duplex_closing_sessions = _duplex_sessions_family.labels(model_name=model_name, state="closing")
+        self._duplex_context_tokens = _duplex_context_tokens_family.labels(model_name=model_name)
+        self._duplex_context_limit_tokens = _duplex_context_limit_tokens_family.labels(model_name=model_name)
+        self._duplex_context_utilization = _duplex_context_utilization_family.labels(model_name=model_name)
+        self._duplex_append_receipts = _duplex_append_receipts_family.labels(model_name=model_name)
+        self._duplex_replica_affinity_loss = _duplex_replica_affinity_loss_family.labels(model_name=model_name)
+        self._duplex_replay_journal_tokens = _duplex_replay_journal_tokens_family.labels(model_name=model_name)
+        self._duplex_replay_journal_bytes = _duplex_replay_journal_bytes_family.labels(model_name=model_name)
+        self._duplex_resource_generation = _duplex_resource_generation_family.labels(model_name=model_name)
 
     def set_running(self, n: int) -> None:
         if not self._log_stats:
@@ -229,6 +306,101 @@ class OmniPrometheusMetrics:
             model_name=self._model_name,
             connector_type=connector_type or "unknown",
         ).observe(kv_wait_s)
+
+    def set_duplex_sessions(self, active: int, closing: int) -> None:
+        if not self._log_stats:
+            return
+        self._duplex_active_sessions.set(max(active, 0))
+        self._duplex_closing_sessions.set(max(closing, 0))
+
+    def observe_duplex_append(self, outcome: str, latency_s: float) -> None:
+        if not self._log_stats:
+            return
+        bounded_outcome = (
+            outcome
+            if outcome
+            in {
+                "success",
+                "deduplicated",
+                "timeout",
+                "resource_exhausted",
+                "admission_rejected",
+                "cancelled",
+                "replica_lost",
+                "kv_recovery_failed",
+                "error",
+            }
+            else "error"
+        )
+        labels = {
+            "model_name": self._model_name,
+            "outcome": bounded_outcome,
+        }
+        _duplex_append_requests_family.labels(**labels).inc()
+        _duplex_append_latency_family.labels(**labels).observe(max(latency_s, 0.0))
+
+    def observe_duplex_control_queue_wait(self, operation: str, queue_wait_s: float) -> None:
+        if not self._log_stats:
+            return
+        bounded_operation = (
+            operation
+            if operation
+            in {
+                "open",
+                "append",
+                "signal",
+                "close",
+                "touch",
+                "resume",
+            }
+            else "unknown"
+        )
+        _duplex_control_queue_wait_family.labels(
+            model_name=self._model_name,
+            operation=bounded_operation,
+        ).observe(max(queue_wait_s, 0.0))
+
+    def set_duplex_context(
+        self,
+        max_tokens: int,
+        max_limit_tokens: int,
+        max_utilization: float,
+        max_receipts: int,
+    ) -> None:
+        if not self._log_stats:
+            return
+        self._duplex_context_tokens.set(max(max_tokens, 0))
+        self._duplex_context_limit_tokens.set(max(max_limit_tokens, 0))
+        self._duplex_context_utilization.set(max(max_utilization, 0.0))
+        self._duplex_append_receipts.set(max(max_receipts, 0))
+
+    def inc_duplex_replica_affinity_loss(self, count: int = 1) -> None:
+        if not self._log_stats or count <= 0:
+            return
+        self._duplex_replica_affinity_loss.inc(count)
+
+    def set_duplex_recovery_state(
+        self,
+        max_journal_tokens: int,
+        max_journal_bytes: int,
+        max_resource_generation: int,
+    ) -> None:
+        if not self._log_stats:
+            return
+        self._duplex_replay_journal_tokens.set(max(max_journal_tokens, 0))
+        self._duplex_replay_journal_bytes.set(max(max_journal_bytes, 0))
+        self._duplex_resource_generation.set(max(max_resource_generation, 0))
+
+    def inc_duplex_kv_recovery(self, reason: str, outcome: str, count: int = 1) -> None:
+        if not self._log_stats or count <= 0:
+            return
+        bounded_reason = reason if reason in {"replica_loss", "context_rollover"} else "other"
+        bounded_outcome = outcome if outcome in {"success", "failure"} else "failure"
+        _duplex_kv_rebuilds_family.labels(
+            model_name=self._model_name,
+            reason=bounded_reason,
+            outcome=bounded_outcome,
+        ).inc(count)
 
 
 class OmniRequestCounter:

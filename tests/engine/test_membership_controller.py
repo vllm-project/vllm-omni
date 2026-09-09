@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
-from vllm_omni.engine.membership_controller import MembershipController
+from vllm_omni.engine.membership_controller import MembershipController, ReplicaLossCleanupResult
+from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.engine.stage_pool import StagePool
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -41,13 +42,13 @@ async def _wait_until(predicate, timeout=1):
 class FakePool:
     def __init__(self, stage_id: int):
         self.stage_id = stage_id
-        self.clients = []
-        self.added = []
-        self.removed = []
-        self.invalidated = []
+        self.clients: list[SimpleNamespace] = []
+        self.added: list[tuple[str, SimpleNamespace, int | None]] = []
+        self.removed: list[str] = []
+        self.invalidated: list[str] = []
         self.hub = None
         self.lb = None
-        self.replica_ids = {}
+        self.replica_ids: dict[str, int] = {}
 
     def attach_hub(self, hub):
         self.hub = hub
@@ -220,7 +221,7 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
     controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=factory)
     removed_replicas = []
 
-    async def cleanup(_request_ids):
+    async def cleanup(_stage_id, _request_ids):
         return None
 
     controller.install_unregister_handlers(
@@ -239,6 +240,62 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
     assert pool.get_replica_id_by_addr("tcp://old-1") is None
     assert pool.available_replica_ids() == [1]
     assert removed_replicas == [(0, 0), (0, 1)]
+
+
+@pytest.mark.asyncio
+async def test_unregister_reports_typed_terminal_error_for_native_kv_request(monkeypatch):
+    pool = FakePool(stage_id=0)
+    pool.replica_ids["tcp://lost-native"] = 0
+    controller = _controller(monkeypatch, pool, FakeHub())
+    output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
+    cleanup_calls = []
+
+    async def cleanup(stage_id, request_ids):
+        cleanup_calls.append((stage_id, request_ids))
+        return ReplicaLossCleanupResult(terminal_native_request_ids=frozenset({"req-2"}))
+
+    await controller.handle_unregister(
+        0,
+        "tcp://lost-native",
+        output_queue=output_queue,
+        cleanup_callback=cleanup,
+    )
+
+    errors = [output_queue.get_nowait(), output_queue.get_nowait()]
+    assert all(isinstance(error, ErrorMessage) for error in errors)
+    assert cleanup_calls == [(0, ["req-1", "req-2"])]
+    by_request = {error.request_id: error for error in errors}
+    assert by_request["req-1"].error_type is None
+    assert by_request["req-1"].error == "stage replica disappeared"
+    assert by_request["req-2"].error_type == "native_kv_replica_lost"
+    assert "reopen the duplex session and replay input" in by_request["req-2"].error
+
+
+@pytest.mark.asyncio
+async def test_unregister_suppresses_terminal_error_for_replay_safe_native_request(monkeypatch):
+    pool = FakePool(stage_id=0)
+    pool.replica_ids["tcp://lost-native"] = 0
+    controller = _controller(monkeypatch, pool, FakeHub())
+    output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
+
+    async def cleanup(stage_id, request_ids):
+        assert stage_id == 0
+        assert request_ids == ["req-1", "req-2"]
+        return ReplicaLossCleanupResult(
+            recoverable_request_ids=frozenset({"req-2"}),
+        )
+
+    await controller.handle_unregister(
+        0,
+        "tcp://lost-native",
+        output_queue=output_queue,
+        cleanup_callback=cleanup,
+    )
+
+    error = output_queue.get_nowait()
+    assert error.request_id == "req-1"
+    assert error.error == "stage replica disappeared"
+    assert output_queue.empty()
 
 
 @pytest.mark.asyncio
@@ -502,7 +559,7 @@ async def test_up_observed_before_attach_does_not_qualify_attachment(monkeypatch
         ]
     )
     shutdown_calls = []
-    sleep_gates = asyncio.Queue()
+    sleep_gates: asyncio.Queue[asyncio.Event] = asyncio.Queue()
 
     async def _controlled_sleep(_delay):
         gate = asyncio.Event()

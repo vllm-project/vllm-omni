@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass, field, fields
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
@@ -88,6 +92,7 @@ class OmniCachedRequestData(CachedRequestData):
 
     prompt_token_ids: dict[str, list[int]]
     additional_information: dict[str, dict | None]
+    sampling_params: dict[str, SamplingParams] = field(default_factory=dict)
 
 
 @dataclass
@@ -113,3 +118,5 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    # Filled by the runner before forward; snapshotted with this scheduler step.
+    model_input_errors: dict[str, str] = field(default_factory=dict)

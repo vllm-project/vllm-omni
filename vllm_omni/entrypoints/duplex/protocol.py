@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -112,6 +112,9 @@ class DuplexCapabilities:
     supports_model_internal_state: bool = False
     supports_stage_resumption: bool = False
     supports_scheduler_native_append: bool = False
+    # Rebuilding model state from input prompts is a separate model contract;
+    # accepting an atomic scheduler append does not imply replay is safe.
+    supports_prompt_replay: bool = False
     supports_core_resumable_request: bool = False
     supports_stage_connector_handoff: bool = False
     supports_independent_io_streams: bool = False
@@ -125,12 +128,23 @@ class DuplexCapabilities:
     requires_model_runner_kv: bool = False
     requires_native_stage_role: bool = False
     implementation_level: str = "serving_session_adapter"
+    response_lifecycle: str = "model_turn"
     adapter_patterns: list[str] = field(default_factory=lambda: ["chunk_group_append"])
     input_modes: list[str] = field(default_factory=lambda: ["turn_commit_only", "reencode_context"])
     signal_sources: list[str] = field(default_factory=lambda: ["client_event", "server_policy", "model_native"])
     stage_handoff_transport: str | None = None
     chunk_period_ms: int | None = 1000
     target_barge_in_latency_ms: int | None = 1000
+    contract_version: str = "duplex.capabilities.v1"
+    adapter_id: str = ""
+    runtime_extension_id: str = ""
+    stage_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.response_lifecycle not in {"model_turn", "continuous_stream"}:
+            raise ValueError("unsupported duplex response lifecycle")
+        if self.supports_prompt_replay and not self.supports_scheduler_native_append:
+            raise ValueError("duplex prompt replay requires scheduler-native append")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -150,6 +164,7 @@ class DuplexCapabilities:
             "supports_model_internal_state": self.supports_model_internal_state,
             "supports_stage_resumption": self.supports_stage_resumption,
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
+            "supports_prompt_replay": self.supports_prompt_replay,
             "supports_core_resumable_request": self.supports_core_resumable_request,
             "supports_stage_connector_handoff": self.supports_stage_connector_handoff,
             "supports_independent_io_streams": self.supports_independent_io_streams,
@@ -163,12 +178,17 @@ class DuplexCapabilities:
             "requires_model_runner_kv": self.requires_model_runner_kv,
             "requires_native_stage_role": self.requires_native_stage_role,
             "implementation_level": self.implementation_level,
+            "response_lifecycle": self.response_lifecycle,
             "adapter_patterns": self.adapter_patterns,
             "input_modes": self.input_modes,
             "signal_sources": self.signal_sources,
             "stage_handoff_transport": self.stage_handoff_transport,
             "chunk_period_ms": self.chunk_period_ms,
             "target_barge_in_latency_ms": self.target_barge_in_latency_ms,
+            "contract_version": self.contract_version,
+            "adapter_id": self.adapter_id,
+            "runtime_extension_id": self.runtime_extension_id,
+            "stage_count": self.stage_count,
         }
 
 
@@ -278,55 +298,55 @@ class DuplexSessionConfig:
             source = event
 
         config = cls()
-        if isinstance(source.get("model"), str):
-            config.model = source["model"]
-        if isinstance(source.get("instructions"), str):
-            config.instructions = source["instructions"]
-        if isinstance(source.get("voice"), str):
-            config.voice = source["voice"]
-        if isinstance(source.get("ref_audio"), str):
-            config.ref_audio = source["ref_audio"]
-        if isinstance(source.get("response_format"), str):
-            config.response_format = source["response_format"]
-        if isinstance(source.get("use_tts_template"), bool):
-            config.use_tts_template = bool(source["use_tts_template"])
-        if isinstance(source.get("temperature"), int | float):
-            config.temperature = float(source["temperature"])
-        if isinstance(source.get("max_tokens"), int):
-            config.max_tokens = int(source["max_tokens"])
-        if isinstance(source.get("speed"), int | float):
-            config.speed = float(source["speed"])
-        if isinstance(source.get("idle_timeout_s"), int | float):
-            config.idle_timeout_s = float(source["idle_timeout_s"])
-        if isinstance(source.get("overlap_policy"), str):
-            config.overlap_policy = cls._normalize_overlap_policy(source["overlap_policy"])
-        if isinstance(source.get("overlap_short_ack_ms"), int | float):
-            config.overlap_short_ack_ms = max(0, int(source["overlap_short_ack_ms"]))
-        if isinstance(source.get("overlap_barge_in_ms"), int | float):
-            config.overlap_barge_in_ms = max(0, int(source["overlap_barge_in_ms"]))
-        if isinstance(source.get("overlap_silence_rms"), int | float):
-            config.overlap_silence_rms = max(0.0, float(source["overlap_silence_rms"]))
-        if isinstance(source.get("playback_commit_policy"), str):
-            config.playback_commit_policy = cls._normalize_playback_commit_policy(source["playback_commit_policy"])
+        if isinstance((checked_model := source.get("model")), str):
+            config.model = checked_model
+        if isinstance((checked_instructions := source.get("instructions")), str):
+            config.instructions = checked_instructions
+        if isinstance((checked_voice := source.get("voice")), str):
+            config.voice = checked_voice
+        if isinstance((checked_ref_audio := source.get("ref_audio")), str):
+            config.ref_audio = checked_ref_audio
+        if isinstance((checked_response_format := source.get("response_format")), str):
+            config.response_format = checked_response_format
+        if isinstance((checked_use_tts_template := source.get("use_tts_template")), bool):
+            config.use_tts_template = bool(checked_use_tts_template)
+        if isinstance((checked_temperature := source.get("temperature")), int | float):
+            config.temperature = float(checked_temperature)
+        if isinstance((checked_max_tokens := source.get("max_tokens")), int):
+            config.max_tokens = int(checked_max_tokens)
+        if isinstance((checked_speed := source.get("speed")), int | float):
+            config.speed = float(checked_speed)
+        if isinstance((checked_idle_timeout_s := source.get("idle_timeout_s")), int | float):
+            config.idle_timeout_s = float(checked_idle_timeout_s)
+        if isinstance((checked_overlap_policy := source.get("overlap_policy")), str):
+            config.overlap_policy = cls._normalize_overlap_policy(checked_overlap_policy)
+        if isinstance((checked_overlap_short_ack_ms := source.get("overlap_short_ack_ms")), int | float):
+            config.overlap_short_ack_ms = max(0, int(checked_overlap_short_ack_ms))
+        if isinstance((checked_overlap_barge_in_ms := source.get("overlap_barge_in_ms")), int | float):
+            config.overlap_barge_in_ms = max(0, int(checked_overlap_barge_in_ms))
+        if isinstance((checked_overlap_silence_rms := source.get("overlap_silence_rms")), int | float):
+            config.overlap_silence_rms = max(0.0, float(checked_overlap_silence_rms))
+        if isinstance((checked_playback_commit_policy := source.get("playback_commit_policy")), str):
+            config.playback_commit_policy = cls._normalize_playback_commit_policy(checked_playback_commit_policy)
         if isinstance(source.get("modalities"), list) and all(isinstance(x, str) for x in source["modalities"]):
             config.modalities = list(source["modalities"])
         turn_detection_configured, server_vad = parse_session_turn_detection(source)
-        if isinstance(source.get("extra_body"), dict):
-            config.extra_body = normalize_native_duplex_key(dict(source["extra_body"]))
+        if isinstance((checked_extra_body := source.get("extra_body")), dict):
+            config.extra_body = normalize_native_duplex_key(dict(checked_extra_body))
             extra = config.extra_body
             raw_realtime_session = extra.get("realtime_session_payload")
             if not turn_detection_configured and isinstance(raw_realtime_session, dict):
                 turn_detection_configured, server_vad = parse_session_turn_detection(raw_realtime_session)
-            if isinstance(extra.get("overlap_policy"), str):
-                config.overlap_policy = cls._normalize_overlap_policy(extra["overlap_policy"])
-            if isinstance(extra.get("overlap_short_ack_ms"), int | float):
-                config.overlap_short_ack_ms = max(0, int(extra["overlap_short_ack_ms"]))
-            if isinstance(extra.get("overlap_barge_in_ms"), int | float):
-                config.overlap_barge_in_ms = max(0, int(extra["overlap_barge_in_ms"]))
-            if isinstance(extra.get("overlap_silence_rms"), int | float):
-                config.overlap_silence_rms = max(0.0, float(extra["overlap_silence_rms"]))
-            if isinstance(extra.get("playback_commit_policy"), str):
-                config.playback_commit_policy = cls._normalize_playback_commit_policy(extra["playback_commit_policy"])
+            if isinstance((checked_overlap_policy := extra.get("overlap_policy")), str):
+                config.overlap_policy = cls._normalize_overlap_policy(checked_overlap_policy)
+            if isinstance((checked_overlap_short_ack_ms := extra.get("overlap_short_ack_ms")), int | float):
+                config.overlap_short_ack_ms = max(0, int(checked_overlap_short_ack_ms))
+            if isinstance((checked_overlap_barge_in_ms := extra.get("overlap_barge_in_ms")), int | float):
+                config.overlap_barge_in_ms = max(0, int(checked_overlap_barge_in_ms))
+            if isinstance((checked_overlap_silence_rms := extra.get("overlap_silence_rms")), int | float):
+                config.overlap_silence_rms = max(0.0, float(checked_overlap_silence_rms))
+            if isinstance((checked_playback_commit_policy := extra.get("playback_commit_policy")), str):
+                config.playback_commit_policy = cls._normalize_playback_commit_policy(checked_playback_commit_policy)
         if turn_detection_configured:
             config.turn_detection_configured = True
             config.server_vad = server_vad
@@ -859,7 +879,7 @@ class DuplexSession:
 
         self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
-        message = {"role": "user", "content": content}
+        message: dict[str, object] = {"role": "user", "content": content}
         if append_history:
             self._conversation.messages.append(message)
         self._input.pending_text.clear()
@@ -921,7 +941,7 @@ class DuplexSession:
             input_audio_part["transcript"] = transcript
         self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
-        message = {"role": "user", "content": [input_audio_part]}
+        message: dict[str, object] = {"role": "user", "content": [input_audio_part]}
         if transcript:
             message["transcript"] = transcript
         self._conversation.messages.append(message)
@@ -1032,7 +1052,8 @@ class DuplexSession:
             for name in additive_fields:
                 value = raw_values.get(name)
                 if isinstance(value, int | float) and not isinstance(value, bool):
-                    current[name] = current.get(name, 0) + value
+                    previous = current.get(name, 0)
+                    current[name] = (previous if isinstance(previous, int | float) else 0) + value
             for name in first_positive_fields:
                 value = raw_values.get(name)
                 current_value = current.get(name)
@@ -1046,7 +1067,8 @@ class DuplexSession:
             for list_name, mean_name in interval_fields:
                 values = raw_values.get(list_name)
                 if isinstance(values, list):
-                    combined = list(current.get(list_name, []))
+                    previous_values = current.get(list_name, [])
+                    combined = list(previous_values) if isinstance(previous_values, list) else []
                     combined.extend(
                         value for value in values if isinstance(value, int | float) and not isinstance(value, bool)
                     )
@@ -1108,7 +1130,7 @@ class DuplexSession:
         duration_ms: int | None = None,
         *,
         text_chars: int | None = None,
-        audio_text_marks: list[dict[str, object]] | None = None,
+        audio_text_marks: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         playback = self._playback.current
         if duration_ms is not None:
@@ -1202,7 +1224,7 @@ class DuplexSession:
             self.input_commit_seq > response_input_commit_seq and not response_history_is_reserved
         )
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
-        message = None
+        message: dict[str, object] | None = None
         if assistant_text:
             self._conversation.last_assistant_full_message = {"role": "assistant", "content": assistant_text}
             self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
@@ -1324,6 +1346,7 @@ class DuplexSession:
         playback: DuplexPlaybackCursor | DuplexPlaybackView | None = None,
         hard: bool = False,
     ) -> bool:
+        message: dict[str, object] | None
         playback = playback or self._playback_cursor_for_item_id(item_id)
         audio_end_ms = max(0, int(audio_end_ms))
         if hard:
@@ -1608,26 +1631,38 @@ class DuplexSession:
         }
         if self.config.turn_detection_configured:
             payload["turn_detection"] = self.config.server_vad.as_dict() if self.config.server_vad is not None else None
-        if isinstance(self.config.extra_body.get("realtime_tools"), list):
-            payload["tools"] = self.config.extra_body["realtime_tools"]
-        if isinstance(self.config.extra_body.get("realtime_tool_choice"), str | dict):
-            payload["tool_choice"] = self.config.extra_body["realtime_tool_choice"]
-        if isinstance(self.config.extra_body.get("realtime_metadata"), dict):
-            payload["metadata"] = dict(self.config.extra_body["realtime_metadata"])
-        if isinstance(self.config.extra_body.get("realtime_include"), list):
-            payload["include"] = list(self.config.extra_body["realtime_include"])
-        if isinstance(self.config.extra_body.get("realtime_prompt"), dict):
-            payload["prompt"] = dict(self.config.extra_body["realtime_prompt"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_transcription"), dict):
-            payload["input_audio_transcription"] = dict(self.config.extra_body["realtime_input_audio_transcription"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_noise_reduction"), dict):
-            payload["input_audio_noise_reduction"] = dict(
-                self.config.extra_body["realtime_input_audio_noise_reduction"]
-            )
-        if isinstance(self.config.extra_body.get("realtime_audio"), dict):
-            payload["audio"] = dict(self.config.extra_body["realtime_audio"])
-        if isinstance(self.config.extra_body.get("realtime_tracing"), str | dict):
-            payload["tracing"] = self.config.extra_body["realtime_tracing"]
+        if isinstance((checked_realtime_tools := self.config.extra_body.get("realtime_tools")), list):
+            payload["tools"] = checked_realtime_tools
+        if isinstance((checked_realtime_tool_choice := self.config.extra_body.get("realtime_tool_choice")), str | dict):
+            payload["tool_choice"] = checked_realtime_tool_choice
+        if isinstance((checked_realtime_metadata := self.config.extra_body.get("realtime_metadata")), dict):
+            payload["metadata"] = dict(checked_realtime_metadata)
+        if isinstance((checked_realtime_include := self.config.extra_body.get("realtime_include")), list):
+            payload["include"] = list(checked_realtime_include)
+        if isinstance((checked_realtime_prompt := self.config.extra_body.get("realtime_prompt")), dict):
+            payload["prompt"] = dict(checked_realtime_prompt)
+        if isinstance(
+            (
+                checked_realtime_input_audio_transcription := self.config.extra_body.get(
+                    "realtime_input_audio_transcription"
+                )
+            ),
+            dict,
+        ):
+            payload["input_audio_transcription"] = dict(checked_realtime_input_audio_transcription)
+        if isinstance(
+            (
+                checked_realtime_input_audio_noise_reduction := self.config.extra_body.get(
+                    "realtime_input_audio_noise_reduction"
+                )
+            ),
+            dict,
+        ):
+            payload["input_audio_noise_reduction"] = dict(checked_realtime_input_audio_noise_reduction)
+        if isinstance((checked_realtime_audio := self.config.extra_body.get("realtime_audio")), dict):
+            payload["audio"] = dict(checked_realtime_audio)
+        if isinstance((checked_realtime_tracing := self.config.extra_body.get("realtime_tracing")), str | dict):
+            payload["tracing"] = checked_realtime_tracing
         raw_realtime_session = self.config.extra_body.get("realtime_session_payload")
         if isinstance(raw_realtime_session, dict):
             for key, value in raw_realtime_session.items():
@@ -1655,7 +1690,10 @@ class DuplexTurnController:
         elif event_type == DuplexTurnEventType.ASSISTANT_DONE.value:
             session.transition_turn(DuplexTurnState.IDLE)
         elif event_type == DuplexTurnEventType.PLAYBACK_ACK.value:
-            played_ms = int(payload.get("played_ms", 0) or 0)
+            raw_played_ms = payload.get("played_ms", 0) or 0
+            if not isinstance(raw_played_ms, str | int | float):
+                raise ValueError("playback acknowledgement requires a numeric played_ms")
+            played_ms = int(raw_played_ms)
             committed_ms = payload.get("committed_ms")
             session.acknowledge_playback(
                 played_ms,

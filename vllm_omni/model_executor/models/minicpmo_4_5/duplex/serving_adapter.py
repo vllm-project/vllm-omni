@@ -28,6 +28,9 @@ class MiniCPMO45ServingRuntimeAdapter:
     """MiniCPM-owned serving state, input packing, and output projection."""
 
     adapter_id = "minicpmo45"
+    # MiniCPM may need silent decision units after the user's final chunk.
+    # Frame-clocked adapters must not inherit this model-turn policy.
+    supports_silence_continuation = True
     clean_response_done_prefix = ""
     interrupted_tts_prefix = ""
     private_runtime_config_keys = MiniCPMO45NativeDuplexServingAdapter.PRIVATE_RUNTIME_CONFIG_KEYS

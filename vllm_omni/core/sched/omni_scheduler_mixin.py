@@ -6,14 +6,17 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator
-from typing import Any
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.utils import remove_all
@@ -44,7 +47,17 @@ from vllm_omni.engine import OmniEngineCoreOutput
 
 logger = init_logger(__name__)
 
+# Both concrete schedulers compose this mixin before vLLM's Scheduler. Expose
+# that required host to the type checker without changing cooperative MRO or
+# making optional scheduler methods appear on standalone test doubles.
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler as _SchedulerHost
+else:
+    _SchedulerHost = object
+
 _STATS_INTERVAL_S = 1.0
+_NATIVE_APPEND_RECEIPT_LIMIT = 256
+_NATIVE_APPEND_TOMBSTONE_LIMIT = 65536
 
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
@@ -98,8 +111,364 @@ elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
     )
 
 
-class OmniSchedulerMixin:
+class OmniSchedulerMixin(_SchedulerHost):
     """Shared scheduler helpers for omni-specific request handling."""
+
+    running: list[Request]
+
+    @staticmethod
+    def _streaming_segment_input_metadata(request: Request) -> dict[str, Any] | None:
+        """Snapshot the control identity of the unit that just stopped.
+
+        ``Request.model_intermediate_buffer`` is replaced on every native
+        append.  Taking the snapshot on the scheduler thread at the segment
+        boundary associates ``final`` with the exact output segment; reading a
+        later request/bridge state would race the next append.
+        """
+        model_buffer = getattr(request, "model_intermediate_buffer", None)
+        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return None
+        scalar_fields = (
+            "session_id",
+            "incarnation",
+            "epoch",
+            "seq",
+            "turn_id",
+            "response_seq",
+            "turn_seq",
+            "mode",
+            "final",
+            "data_plane",
+            "recovery_replay",
+        )
+        snapshot = {
+            key: duplex[key]
+            for key in scalar_fields
+            if key in duplex and isinstance(duplex[key], str | int | float | bool | type(None))
+        }
+        return {"duplex": snapshot}
+
+    def _scheduler_native_context_limit(self) -> int | None:
+        candidates = (
+            getattr(self, "max_model_len", None),
+            getattr(getattr(getattr(self, "vllm_config", None), "model_config", None), "max_model_len", None),
+            getattr(
+                getattr(getattr(self, "vllm_config", None), "scheduler_config", None),
+                "max_model_len",
+                None,
+            ),
+        )
+        return next((int(value) for value in candidates if isinstance(value, int) and value > 0), None)
+
+    def _record_native_model_input_error(self, request_id: str, error: str) -> None:
+        errors = getattr(self, "_omni_native_model_input_errors", None)
+        if errors is None:
+            errors = self._omni_native_model_input_errors = OrderedDict[str, str]()
+        errors[request_id] = str(error)[:1024]
+        errors.move_to_end(request_id)
+        while len(errors) > 256:
+            errors.popitem(last=False)
+
+    def get_streaming_prompt_metrics(self, request_id: str) -> dict[str, int | bool | str | float]:
+        """Read retained-request progress on the EngineCore scheduler thread."""
+        request = self.requests.get(request_id)
+        if request is None:
+            input_error = getattr(self, "_omni_native_model_input_errors", {}).get(request_id)
+            if input_error:
+                # Readiness/prefill RPCs can race terminal output processing.
+                # Preserve the actual failure after Request/KV cleanup instead
+                # of misleading the caller with a generic NOT_FOUND response.
+                return {
+                    "status": "FINISHED_ERROR",
+                    "num_prompt_tokens": 0,
+                    "num_computed_tokens": 0,
+                    "is_finished": True,
+                    "omni_request_found": False,
+                    "omni_model_input_error": input_error,
+                }
+            # Utility RPCs already queued in EngineCore are not synchronously
+            # withdrawn when a pending append task is cancelled.  A terminal
+            # close can therefore free the request just before this read.  A
+            # typed sentinel lets the caller preserve not-found semantics
+            # without turning an expected teardown race into an EngineCore
+            # utility-method exception/error log.
+            return {
+                "status": "NOT_FOUND",
+                "num_prompt_tokens": 0,
+                "num_computed_tokens": 0,
+                "is_finished": True,
+                "omni_request_found": False,
+            }
+        result: dict[str, int | bool | str | float] = {
+            "status": request.status.name,
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "num_computed_tokens": request.num_computed_tokens,
+            "is_finished": request.is_finished(),
+        }
+        receipts = getattr(request, "_omni_native_append_receipts", {})
+        result["omni_append_receipt_count"] = len(receipts)
+        result["omni_context_tokens"] = len(request._all_token_ids)
+        # Keep scheduler diagnostics request-scoped and low-cardinality.  These
+        # fields are returned over the existing control RPC (not exported as
+        # Prometheus labels), so operators can distinguish a capacity gate,
+        # stale-output fence, and queue-ownership bug without enabling verbose
+        # scheduler logs on a production worker.
+        queue_snapshots: dict[str, tuple[Any, ...]] = {}
+        for queue_name in ("running", "waiting", "skipped_waiting"):
+            queue = getattr(self, queue_name, ())
+            queue_items = getattr(queue, "requests", queue)
+            try:
+                queue_snapshots[queue_name] = tuple(queue_items)
+            except TypeError:
+                queue_snapshots[queue_name] = ()
+        result.update(
+            omni_scheduler_running_requests=len(queue_snapshots["running"]),
+            omni_scheduler_waiting_requests=len(queue_snapshots["waiting"]),
+            omni_scheduler_skipped_waiting_requests=len(queue_snapshots["skipped_waiting"]),
+            omni_scheduler_waiting_for_streaming_input=int(getattr(self, "num_waiting_for_streaming_input", 0) or 0),
+            omni_request_in_running=request in queue_snapshots["running"],
+            omni_request_in_waiting=request in queue_snapshots["waiting"],
+            omni_request_in_skipped_waiting=request in queue_snapshots["skipped_waiting"],
+            omni_num_stale_output_tokens=int(getattr(request, "num_stale_output_tokens", 0) or 0),
+            omni_num_in_flight_tokens=int(getattr(request, "num_in_flight_tokens", 0) or 0),
+            omni_num_output_placeholders=int(getattr(request, "num_output_placeholders", 0) or 0),
+            omni_num_preemptions=int(getattr(request, "num_preemptions", 0) or 0),
+            omni_drop_stale_output=bool(getattr(request, "drop_stale_output", False)),
+        )
+        context_limit = self._scheduler_native_context_limit()
+        if context_limit is not None:
+            result["omni_context_limit"] = context_limit
+            result["omni_context_utilization"] = len(request._all_token_ids) / context_limit
+        return result
+
+    @staticmethod
+    def _fence_streaming_prompt_async_lookahead(request: Request) -> None:
+        """Discard optimistic old-unit state before a native append.
+
+        Async scheduling can have already scheduled an extra decode frame when
+        the model unit parks.  Usually ``update_from_output`` fences it at the
+        stop boundary; doing the same here makes the EngineCore append utility
+        safe even when it arrives before that bookkeeping has fully settled.
+        Late output is drained as stale and cannot enter the new prompt unit.
+        """
+        outstanding = int(getattr(request, "num_output_placeholders", 0) or 0)
+        if outstanding <= 0:
+            return
+        if outstanding > request.num_computed_tokens:
+            raise RuntimeError(
+                "streaming prompt async placeholder state is inconsistent: "
+                f"request={request.request_id}, placeholders={outstanding}, "
+                f"computed={request.num_computed_tokens}"
+            )
+        in_flight = int(getattr(request, "num_in_flight_tokens", 0) or 0)
+        if in_flight > 0:
+            request.num_stale_output_tokens = in_flight
+            # ``is_stale`` alone only protects async scheduler counters; the
+            # base output update would still append the old token IDs. Drop
+            # the fenced frame so it cannot become output of the new unit.
+            request.drop_stale_output = True
+        request.num_computed_tokens -= outstanding
+        request.num_output_placeholders = 0
+        request.spec_token_ids = []
+
+    def append_streaming_prompt_unit(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        model_intermediate_buffer: dict[str, Any] | None = None,
+        *,
+        operation_id: str | None = None,
+        operation_fingerprint: bytes | None = None,
+        sampling_params: SamplingParams | None = None,
+    ) -> dict[str, int | bool | str | float]:
+        """Apply and commit one duplex unit in a single scheduler utility.
+
+        vLLM 0.28 updates and releases the retained request in one transition.
+        Commit bookkeeping and the bounded receipt live on the same thread;
+        a lost utility reply can be retried without appending the tokens again.
+        """
+        if not operation_id:
+            raise ValueError("scheduler-native streaming prompt append requires a non-empty operation_id")
+        if not isinstance(operation_fingerprint, bytes) or not operation_fingerprint:
+            raise ValueError("scheduler-native streaming prompt append requires a full operation_fingerprint")
+        request = self.requests[request_id]
+        token_signature = tuple(int(token_id) for token_id in token_ids)
+        if not token_signature:
+            raise ValueError("scheduler-native streaming prompt append requires at least one token")
+        token_digest = sha256(",".join(str(token_id) for token_id in token_signature).encode()).digest()
+        receipt_digest = sha256(operation_fingerprint + token_digest).digest()
+        receipts = getattr(request, "_omni_native_append_receipts", None)
+        if receipts is None:
+            receipts = OrderedDict[str, tuple[bytes, dict[str, int | bool | str | float]]]()
+        if not isinstance(receipts, OrderedDict):
+            raise TypeError("native append receipts must preserve LRU ordering")
+        operation_digest = sha256(operation_id.encode()).digest()
+        evicted_receipts: set[bytes] = getattr(request, "_omni_native_append_evicted_receipts", set())
+
+        def complete_operation(*, deduplicated: bool) -> dict[str, int | bool | str | float]:
+            metrics = getattr(self, "get_streaming_prompt_metrics", None)
+            result: dict[str, int | bool | str | float] = {}
+            if callable(metrics):
+                try:
+                    result.update(metrics(request_id))
+                except Exception:
+                    # Metrics are diagnostic and occur after the append commit.
+                    # Never turn their failure into an ambiguous append result
+                    # that a caller could retry without a stored receipt.
+                    logger.warning(
+                        "Failed to collect post-append streaming metrics for request %s",
+                        request_id,
+                        exc_info=True,
+                    )
+            result["deduplicated"] = deduplicated
+
+            result["omni_append_receipt_count"] = min(
+                len(receipts) + 1,
+                _NATIVE_APPEND_RECEIPT_LIMIT,
+            )
+            # Retain a fixed-size signature rather than every prompt token
+            # for each receipt; long audio sessions otherwise duplicate
+            # substantial token storage solely for retry detection.
+            receipts[operation_id] = (receipt_digest, dict(result))
+            receipts.move_to_end(operation_id)
+            while len(receipts) > _NATIVE_APPEND_RECEIPT_LIMIT:
+                evicted_operation_id, _ = receipts.popitem(last=False)
+                evicted_receipts.add(sha256(evicted_operation_id.encode()).digest())
+            request._omni_native_append_receipts = receipts
+            request._omni_native_append_evicted_receipts = evicted_receipts
+            pending_operations.pop(operation_id, None)
+            request._omni_native_append_pending = pending_operations
+            return result
+
+        pending_operations: dict[str, bytes] = getattr(request, "_omni_native_append_pending", {})
+        completed = receipts.get(operation_id)
+        if completed is not None:
+            completed_digest, completed_result = completed
+            if completed_digest != receipt_digest:
+                raise ValueError(f"streaming prompt operation {operation_id!r} was reused with different input")
+            receipts.move_to_end(operation_id)
+            return {**completed_result, "deduplicated": True}
+        if operation_digest in evicted_receipts:
+            raise RuntimeError(
+                f"streaming_prompt_idempotency_window_expired: operation={operation_id!r}; "
+                "the append was previously committed but its replay result was evicted"
+            )
+        if len(receipts) >= _NATIVE_APPEND_RECEIPT_LIMIT and len(evicted_receipts) >= (_NATIVE_APPEND_TOMBSTONE_LIMIT):
+            raise RuntimeError("streaming_prompt_idempotency_capacity_exhausted: reopen the session before appending")
+
+        if pending_operations:
+            pending_operation_id, pending_digest = next(iter(pending_operations.items()))
+            if operation_id != pending_operation_id:
+                raise RuntimeError(
+                    "streaming_prompt_uncertain_operation_requires_retry: "
+                    f"request={request_id}, operation={pending_operation_id!r}"
+                )
+            if pending_digest != receipt_digest:
+                raise ValueError(f"streaming prompt operation {operation_id!r} was reused with different input")
+            try:
+                if not bool(getattr(request, "_omni_native_append_committed", False)):
+                    self._commit_native_append(request_id)
+            except Exception as exc:
+                raise RuntimeError(
+                    "streaming_prompt_uncertain_operation_requires_retry: "
+                    f"request={request_id}, operation={operation_id!r}"
+                ) from exc
+            return complete_operation(deduplicated=True)
+
+        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            raise RuntimeError(
+                f"streaming prompt request {request_id} is not ready for append: status={request.status}"
+            )
+
+        if not callable(getattr(self, "_update_request_as_session", None)):
+            raise RuntimeError("vLLM does not provide scheduler-native streaming prompt append")
+
+        self._fence_streaming_prompt_async_lookahead(request)
+        context_limit = self._scheduler_native_context_limit()
+        projected_context_tokens = request.num_computed_tokens + len(token_signature)
+        if context_limit is not None and projected_context_tokens > context_limit:
+            raise RuntimeError(
+                "streaming_prompt_context_limit_exceeded: "
+                f"request={request_id}, projected={projected_context_tokens}, limit={context_limit}"
+            )
+
+        self._append_duplex_tokens(
+            request_id,
+            list(token_signature),
+            model_intermediate_buffer,
+            sampling_params=sampling_params,
+        )
+        pending_operations[operation_id] = receipt_digest
+        request._omni_native_append_pending = pending_operations
+        try:
+            self._commit_native_append(request_id)
+        except Exception as exc:
+            # Token append already committed on this scheduler thread.  Keep a
+            # bounded per-request journal so only this exact operation may
+            # retry; its retry completes bookkeeping without appending twice.
+            raise RuntimeError(
+                f"streaming_prompt_uncertain_operation_requires_retry: request={request_id}, operation={operation_id!r}"
+            ) from exc
+        return complete_operation(deduplicated=False)
+
+    def _append_duplex_tokens(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        model_intermediate_buffer: dict[str, Any] | None = None,
+        *,
+        sampling_params: SamplingParams | None = None,
+    ) -> None:
+        """Apply the single supported StreamingUpdate contract through Omni's override."""
+        request = self.requests[request_id]
+        if not getattr(request, "streaming_prompt_continuous", False):
+            raise RuntimeError("request is not an Omni continuous streaming-prompt request")
+        duplex = model_intermediate_buffer.get("duplex") if isinstance(model_intermediate_buffer, dict) else None
+        if model_intermediate_buffer is not None and isinstance(duplex, dict) and duplex.get("data_plane") is True:
+            # Engine-owned immutable unit boundary, also valid after preemption
+            # resets the worker's current computed offset. Do not mutate the
+            # caller's fingerprinted/replay-journal payload.
+            model_intermediate_buffer = {
+                **model_intermediate_buffer,
+                "duplex": {**duplex, "kv_append_start": request.num_computed_tokens},
+            }
+
+        update = StreamingUpdate(
+            mm_features=None,
+            prompt_token_ids=token_ids,
+            max_tokens=sampling_params.max_tokens if sampling_params is not None else request.max_tokens,
+            arrival_time=time.time(),
+            sampling_params=sampling_params if sampling_params is not None else request.sampling_params,
+        )
+        if model_intermediate_buffer is not None:
+            update.model_intermediate_buffer = model_intermediate_buffer
+        request._omni_native_append_committed = False
+        # The Omni override preserves segment identity, model metadata and
+        # async lookahead fences before calling the upstream session update.
+        self._update_request_as_session(request, update)
+        if sampling_params is not None:
+            request.sampling_params = sampling_params
+            # Upstream's update does not refresh this separate stop budget.
+            request.max_tokens = sampling_params.max_tokens
+            request._omni_native_append_sampling_pending = True
+        if model_intermediate_buffer is not None:
+            request.model_intermediate_buffer = model_intermediate_buffer
+            request._omni_native_append_metadata_pending = True
+
+    def _commit_native_append(self, request_id: str) -> None:
+        """Mark an applied update before publishing its idempotent receipt.
+
+        This is local transaction bookkeeping, not an upstream finalize call
+        or another schedulable/RPC phase. A pending retry never reapplies tokens.
+        """
+        request = self.requests.get(request_id)
+        if request is None:
+            input_error = getattr(self, "_omni_native_model_input_errors", {}).get(request_id)
+            if input_error:
+                raise RuntimeError(input_error)
+            raise KeyError(request_id)
+        request._omni_native_append_committed = True
 
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
@@ -481,6 +850,46 @@ class OmniSchedulerMixin:
     ) -> None:
         """Enrich new requests and apply async-chunk output bookkeeping."""
         self._rewrap_scheduled_new_reqs(scheduler_output)
+        for data in scheduler_output.scheduled_new_reqs:
+            if (request := self.requests.get(data.req_id)) is not None:
+                # NewRequestData already carries the current sampling snapshot.
+                request._omni_native_append_sampling_pending = False
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached_reqs is not None:
+            pending_ids = tuple(
+                req_id
+                for req_id in getattr(cached_reqs, "req_ids", ())
+                if (request := self.requests.get(req_id)) is not None
+                and (
+                    getattr(request, "_omni_native_append_metadata_pending", False)
+                    or getattr(request, "_omni_native_append_sampling_pending", False)
+                )
+            )
+            if pending_ids:
+                pending_payloads = getattr(cached_reqs, "additional_information", None)
+                if not isinstance(pending_payloads, dict):
+                    pending_payloads = {}
+                pending_sampling = dict(getattr(cached_reqs, "sampling_params", {}) or {})
+                for req_id in pending_ids:
+                    request = self.requests[req_id]
+                    model_buffer = getattr(request, "model_intermediate_buffer", None)
+                    if isinstance(model_buffer, dict) and model_buffer:
+                        pending_payloads[req_id] = model_buffer
+                    request._omni_native_append_metadata_pending = False
+                    if getattr(request, "_omni_native_append_sampling_pending", False):
+                        pending_sampling[req_id] = request.sampling_params
+                        request._omni_native_append_sampling_pending = False
+                from vllm.v1.core.sched.output import CachedRequestData
+
+                from vllm_omni.core.sched.output import OmniCachedRequestData
+
+                cached_data = {name: getattr(cached_reqs, name) for name in CachedRequestData.__dataclass_fields__}
+                cached_data.update(
+                    prompt_token_ids={},
+                    additional_information=pending_payloads,
+                    sampling_params=pending_sampling,
+                )
+                scheduler_output.scheduled_cached_reqs = OmniCachedRequestData(**cached_data)
         if not self.chunk_transfer_adapter:
             return
         if include_cached_payloads:
@@ -511,6 +920,9 @@ class OmniSchedulerMixin:
         new_prompt_len_snapshot: int | None = None,
     ) -> OmniEngineCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
+        segment_input_metadata = (
+            OmniSchedulerMixin._streaming_segment_input_metadata(request) if is_segment_finished else None
+        )
         return OmniEngineCoreOutput(
             request_id=request.request_id,
             new_token_ids=new_token_ids,
@@ -529,6 +941,7 @@ class OmniSchedulerMixin:
             num_nans_in_logits=num_nans_in_logits,
             is_segment_finished=is_segment_finished,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
+            streaming_segment_input_metadata=segment_input_metadata,
         )
 
     def _append_request_output(
@@ -622,6 +1035,22 @@ class OmniSchedulerMixin:
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
         """Resume duplex connector polling without an external update."""
         adapter = self.chunk_transfer_adapter
+        # A bounded active window is a concurrency limit, not a permanent
+        # ownership assignment.  Yield at the downstream segment boundary so
+        # long-lived duplex sessions behind the first K streams can make
+        # progress; the request retains all prompt/KV state and competes FIFO
+        # for a slot again when its next connector chunk is ready.
+        yield_active_stream = getattr(adapter, "yield_active_stream", None)
+        if callable(yield_active_stream):
+            yield_active_stream(request.request_id)
+        # A batched async runner output can reach this boundary before the
+        # post-schedule path retires the ready marker for the chunk that
+        # produced it.  This segment is fully consumed now; retaining that
+        # marker makes _process_chunk_queue skip load_async() forever.
+        ready_chunks = getattr(adapter, "requests_with_ready_chunks", None)
+        if ready_chunks is not None:
+            ready_chunks.discard(request.request_id)
+        assert adapter is not None
         adapter.segment_finished_requests.discard(request.request_id)
         if (
             not adapter.receives_chunks
@@ -868,6 +1297,7 @@ class OmniSchedulerMixin:
         target_request_ids = target_request_ids or set()
 
         def keep_running(req: Request) -> bool:
+            assert target_request_ids is not None
             if req.request_id not in self.requests:
                 return False
             if not req.is_finished():

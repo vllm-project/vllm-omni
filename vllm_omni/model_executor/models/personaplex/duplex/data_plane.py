@@ -30,6 +30,8 @@ class PersonaPlexDataPlaneContext:
 @dataclass(slots=True)
 class _RequestCursor:
     audio_samples: int = 0
+    accepted_frames: int = 0
+    delivered_audio_samples: int = 0
     text: str = ""
     terminal: bool = False
 
@@ -43,6 +45,34 @@ class PersonaPlexDataPlaneSession:
 
     def begin_request(self, request_id: str) -> None:
         self._requests.setdefault(request_id, _RequestCursor()).terminal = False
+
+    def note_accepted_input(self, request_id: str, sequence: int) -> None:
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise ValueError("PersonaPlex append requires a positive engine sequence")
+        state = self._requests.setdefault(request_id, _RequestCursor())
+        state.accepted_frames = max(state.accepted_frames, sequence)
+
+    def mark_outputs_delivered(self, request_id: str) -> None:
+        state = self._requests[request_id]
+        state.delivered_audio_samples = state.audio_samples
+
+    def drain_status(self, request_id: str) -> dict[str, int | bool]:
+        state = self._requests[request_id]
+        # Agent cb1..7 for acoustic frame t arrive at t+1. EOF cannot invent
+        # that successor. Drain every fully generated frame and expose the
+        # model delay separately from missing/undelivered audio.
+        delay = min(state.accepted_frames, 1)
+        expected = state.accepted_frames - delay
+        samples = state.delivered_audio_samples
+        if samples % 1920 or samples > expected * 1920:
+            raise RuntimeError("PersonaPlex stream produced invalid acoustic frame accounting")
+        return {
+            "accepted_frames": state.accepted_frames,
+            "expected_audio_frames": expected,
+            "model_delay_frames": delay,
+            "audio_frames": samples // 1920,
+            "drained": samples == expected * 1920,
+        }
 
     def is_terminal(self, request_id: str | None) -> bool:
         if request_id is None:
@@ -105,9 +135,11 @@ class PersonaPlexDataPlaneSession:
 
         sample_rate_hz = _sample_rate(multimodal)
         encoded = self._encode_audio(audio_delta, sample_rate_hz, context.response_format, context.speed)
+        delta_samples = _num_samples(audio_delta) or 0
+        if delta_samples and not encoded:
+            raise RuntimeError("PersonaPlex audio encoding failed before delivery")
         if not encoded and not text_delta:
             return None
-        delta_samples = _num_samples(audio_delta) or 0
         return {
             "supported": True,
             "stage_role": "tts",

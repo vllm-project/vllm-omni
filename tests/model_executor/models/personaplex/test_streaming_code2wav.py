@@ -271,6 +271,20 @@ def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
     ]
 
 
+def test_batched_mimi_transformer_preserves_frame_clock_across_ring_wrap():
+    generator = torch.Generator().manual_seed(42)
+    model = personaplex_mimi._MimiStreamingTransformer(num_layers=2, dim=8, num_heads=2, context=8)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(torch.rand(parameter.shape, generator=generator) * 0.5)
+        inputs = torch.rand(1, 30, 8, generator=generator)
+        model.streaming_init(1)
+        reference = torch.cat([model.step(part) for part in inputs.split(2, dim=1)], dim=1)
+        model.streaming_init(1)
+        actual = torch.cat([model.step(part) for part in inputs.split(6, dim=1)], dim=1)
+    torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-6)
+
+
 def test_request_id_falls_back_to_runtime_information() -> None:
     model, _ = _model()
     info = [{"request_id": "runtime-req"}]
@@ -279,6 +293,43 @@ def test_request_id_falls_back_to_runtime_information() -> None:
     second = model(input_ids=_codes(3), runtime_additional_information=info)
 
     assert _audio(second).numel() == 4
+
+
+def test_indexed_chunks_do_not_confuse_identical_frames_with_replays():
+    model, mimi = _model()
+    codes = _codes(1)
+    for offset in range(100):
+        info = [{"meta": {"codec_frame_offset": offset}}]
+        output = model(input_ids=codes, request_ids=["r"], runtime_additional_information=info)
+        assert _audio(output).numel() == 4
+        replay = model(input_ids=codes, request_ids=["r"], runtime_additional_information=info)
+        assert _audio(replay).numel() == 0
+    assert mimi.decode_frame_calls == 100
+    assert not model._request_codes
+    assert model._request_frame_cursors["r"][1].shape == (2, 1)
+    model.on_requests_finished(["r"])
+    assert not model._request_frame_cursors
+
+
+@pytest.mark.parametrize("offset", [True, -1, 1, 1.5, "0"])
+def test_indexed_chunks_reject_invalid_or_gapped_offsets(offset):
+    model, mimi = _model()
+    with pytest.raises(ValueError, match="offset"):
+        model(
+            input_ids=_codes(1),
+            request_ids=["r"],
+            runtime_additional_information=[{"meta": {"codec_frame_offset": offset}}],
+        )
+    assert mimi.decode_frame_calls == 0
+
+
+def test_indexed_replay_conflict_fails_before_codec_mutation():
+    model, mimi = _model()
+    info = [{"meta": {"codec_frame_offset": 0}}]
+    model(input_ids=_codes(1), request_ids=["r"], runtime_additional_information=info)
+    with pytest.raises(ValueError, match="offset mismatch"):
+        model(input_ids=_codes(1, start=2), request_ids=["r"], runtime_additional_information=info)
+    assert mimi.decode_frame_calls == 1
 
 
 def test_decoder_slot_lifecycle_isolated_capacity_and_reuse() -> None:

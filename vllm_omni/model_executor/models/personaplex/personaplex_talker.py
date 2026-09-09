@@ -42,7 +42,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import ModelInputError, OmniOutput
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
     PersonaPlexConfig,
 )
@@ -318,6 +318,14 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
 
         duplex = info_dict.get("duplex")
         if isinstance(duplex, dict) and duplex.get("data_plane") is True and is_prefill:
+            append_start = duplex.get("kv_append_start")
+            computed = info_dict.get("_omni_num_computed_tokens")
+            if isinstance(append_start, int) and isinstance(computed, int) and computed < append_start:
+                # Reject before advancing the session's streaming Mimi
+                # encoder; the current frame cannot rebuild earlier inputs.
+                raise ModelInputError(
+                    "native_duplex_recompute_unsupported: PersonaPlex cannot replay historical frame state"
+                )
             prompt_len_raw = info_dict.get("duplex_prompt_len", span)
             try:
                 prompt_len = int(prompt_len_raw)
@@ -335,8 +343,8 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 offset = 0
             local_offset = offset - prepared.prompt_offset
             if local_offset < 0:
-                raise ValueError(
-                    "PersonaPlex scheduled span precedes the current append: "
+                raise ModelInputError(
+                    "native_duplex_recompute_unsupported: PersonaPlex scheduled span precedes the current append: "
                     f"offset={offset}, append_offset={prepared.prompt_offset}, "
                     f"span={span}, prompt={prompt_len}"
                 )

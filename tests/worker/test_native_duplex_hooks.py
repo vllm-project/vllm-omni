@@ -483,7 +483,8 @@ def test_minicpmo_model_cleans_incarnation_state_when_request_finishes():
     }
 
 
-def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
+@pytest.mark.parametrize("replay", [True, False])
+def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request(replay):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -511,6 +512,7 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                 "duplex": {
                     "duplex_prompt_token_ids": [101, 102],
                     "special_token_ids": {"listen_token_id": 701},
+                    "recovery_replay": replay,
                 },
             },
             {
@@ -529,6 +531,9 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     assert to_payload_element(prompt_rows, 1, 2, 4) == [201, 202, 203]
     assert int(to_payload_element(listen_rows, 0, 0, 2).reshape(-1)[0]) == 701
     assert int(to_payload_element(listen_rows, 1, 2, 4).reshape(-1)[0]) == 702
+    recovery_rows = output.multimodal_outputs["duplex_recovery_replay"]
+    assert to_payload_element(recovery_rows, 0, 0, 2) is replay
+    assert to_payload_element(recovery_rows, 1, 2, 4) is False
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
@@ -905,6 +910,121 @@ def _stage0_vision_runtime():
     return runtime
 
 
+def test_minicpmo_stage0_successful_final_append_arms_turn_fence_once():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-final-turn-fence")
+
+    first = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=3,
+        turn_id=7,
+        seq=9,
+        final=True,
+    )
+
+    assert first["success"] is True
+    assert state.pending_turn_end_identity == (3, 7)
+    assert state.last_final_append_identity == (3, 9)
+
+    # Simulate the sampler consuming the fence, then a repeated preprocess of
+    # the same physical append.  The cached retry must not re-arm it.
+    state.pending_turn_end_identity = None
+    cached = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=3,
+        turn_id=7,
+        seq=9,
+        final=True,
+    )
+
+    assert cached["success"] is True
+    assert state.pending_turn_end_identity is None
+    assert state.last_final_append_identity == (3, 9)
+
+
+def test_minicpmo_stage0_cached_non_final_prefill_can_be_committed_once():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-cached-final-transition")
+    prepared = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=2,
+        turn_id=5,
+        seq=8,
+        final=False,
+    )
+    assert prepared["success"] is True
+    assert state.pending_turn_end_identity is None
+
+    committed = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=2,
+        turn_id=5,
+        seq=8,
+        final=True,
+    )
+
+    assert committed["success"] is True
+    assert state.pending_turn_end_identity == (2, 5)
+    assert state.last_final_append_identity == (2, 8)
+
+    state.pending_turn_end_identity = None
+    repeated = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=2,
+        turn_id=5,
+        seq=8,
+        final=True,
+    )
+    assert repeated["success"] is True
+    assert state.pending_turn_end_identity is None
+
+
+@pytest.mark.parametrize("next_identity", [(0, 1), (1, 0)])
+def test_minicpmo_stage0_new_turn_or_epoch_discards_stale_turn_fence(next_identity):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stale-turn-fence")
+    armed = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=0,
+        turn_id=0,
+        seq=1,
+        final=True,
+    )
+    assert armed["success"] is True
+    assert state.pending_turn_end_identity == (0, 0)
+
+    epoch, turn_id = next_identity
+    advanced = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=epoch,
+        turn_id=turn_id,
+        seq=2,
+        final=False,
+    )
+
+    assert advanced["success"] is True
+    assert state.pending_turn_end_identity is None
+
+
 def test_minicpmo_stage0_puts_every_frame_of_an_append_in_one_unit():
     """Official streaming_prefill feeds the whole frame_list into one unit.
 
@@ -1163,13 +1283,16 @@ def test_minicpmo_stage0_failed_append_does_not_set_pending_speech_context():
         state,
         np.zeros(0, dtype=np.float32),
         epoch=0,
+        turn_id=0,
         seq=1,
         is_speech=True,
+        final=True,
     )
 
     assert result["success"] is False
     assert state.pending_speech_context is False
     assert state.pending_speech_append_identity is None
+    assert state.pending_turn_end_identity is None
 
 
 def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
@@ -2094,6 +2217,177 @@ def test_minicpmo_stage0_native_sampler_preserves_model_chunk_eos_decision():
 
     assert sampled is not None
     assert sampled.sampled_token_ids.tolist() == [[151718]]
+
+
+def _minicpmo_stage0_turn_fence_sampler(
+    recent_tokens,
+    *,
+    prepared_append_identity=(0, 4),
+    last_final_append_identity=(0, 4),
+):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    token_ids = {
+        "unit_token_id": 1,
+        "unit_end_token_id": 2,
+        "listen_token_id": 3,
+        "speak_token_id": 4,
+        "tts_bos_token_id": 5,
+        "tts_eos_token_id": 6,
+        "tts_pad_token_id": 7,
+        "chunk_eos_token_id": 8,
+        "chunk_tts_eos_token_id": 9,
+        "turn_eos_token_id": 10,
+    }
+    session_key = ("sid-turn-fence-sampler", 0)
+    state = _MiniCPMO45Stage0SessionState(
+        session_id=session_key[0],
+        current_turn_ended=False,
+        prepared_append_identity=prepared_append_identity,
+        pending_turn_end_identity=(0, 4),
+        last_final_append_identity=last_final_append_identity,
+    )
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model._minicpmo45_native_duplex_token_ids_cache = token_ids
+    model._minicpmo45_active_duplex_rows = [0]
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+    logits = torch.full((1, 16), -100.0)
+    logits[0, token_ids["chunk_eos_token_id"]] = 30.0
+    sampling_metadata = SimpleNamespace(
+        all_greedy=True,
+        all_random=False,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[token_ids["unit_token_id"]]]),
+        output_token_ids=[recent_tokens],
+    )
+    return model, state, logits, sampling_metadata, token_ids
+
+
+def test_minicpmo_stage0_final_speech_segment_keeps_model_chunk_eos():
+    model, state, logits, sampling_metadata, token_ids = _minicpmo_stage0_turn_fence_sampler([4, 12])
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[token_ids["chunk_eos_token_id"]]]
+    assert state.pending_turn_end_identity == (0, 4)
+    assert state.pending_post_turn_eos_chunk is False
+    assert state.current_turn_ended is False
+
+
+def test_minicpmo_stage0_empty_boundary_promotes_chunk_eos_to_real_turn_eos():
+    model, state, logits, sampling_metadata, token_ids = _minicpmo_stage0_turn_fence_sampler([])
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[token_ids["turn_eos_token_id"]]]
+    assert state.pending_terminator_token == token_ids["turn_eos_token_id"]
+    assert state.last_terminator_token == token_ids["turn_eos_token_id"]
+    assert state.pending_turn_end_identity is None
+    assert state.pending_post_turn_eos_chunk is True
+    assert state.current_turn_ended is True
+
+
+def test_minicpmo_stage0_post_final_continuation_promotes_chunk_eos_with_filler_tokens():
+    model, state, logits, sampling_metadata, token_ids = _minicpmo_stage0_turn_fence_sampler(
+        [4, 12],
+        prepared_append_identity=(0, 5),
+        last_final_append_identity=(0, 4),
+    )
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[token_ids["turn_eos_token_id"]]]
+    assert state.pending_turn_end_identity is None
+    assert state.pending_post_turn_eos_chunk is True
+    assert state.current_turn_ended is True
+
+    sampling_metadata.output_token_ids = [[token_ids["turn_eos_token_id"]]]
+    logits.fill_(-100.0)
+    logits[0, 12] = 30.0
+
+    closed = model.sample(logits, sampling_metadata)
+
+    assert closed is not None
+    assert closed.sampled_token_ids.tolist() == [[token_ids["chunk_eos_token_id"]]]
+    assert state.pending_post_turn_eos_chunk is False
+    assert state.current_turn_ended is True
+
+
+def test_minicpmo_stage0_post_final_continuation_promotes_length_guard_boundary():
+    model, state, logits, sampling_metadata, token_ids = _minicpmo_stage0_turn_fence_sampler(
+        [4, 12, 13],
+        prepared_append_identity=(0, 5),
+        last_final_append_identity=(0, 4),
+    )
+    model.max_new_speak_tokens_per_chunk = 4
+    logits.fill_(-100.0)
+    logits[0, 14] = 30.0
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[token_ids["turn_eos_token_id"]]]
+    assert state.pending_turn_end_identity is None
+    assert state.pending_post_turn_eos_chunk is True
+    assert state.current_turn_ended is True
+
+
+def test_minicpmo_stage0_post_final_continuation_promotes_text_guard_boundary():
+    model, state, logits, sampling_metadata, token_ids = _minicpmo_stage0_turn_fence_sampler(
+        [4, 12],
+        prepared_append_identity=(0, 5),
+        last_final_append_identity=(0, 4),
+    )
+    model.max_speak_chars_per_chunk = 1
+    model._minicpmo45_tokenizer_cache = SimpleNamespace(decode=lambda *_args, **_kwargs: "x")
+    logits.fill_(-100.0)
+    logits[0, 14] = 30.0
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[token_ids["turn_eos_token_id"]]]
+    assert state.pending_turn_end_identity is None
+    assert state.pending_post_turn_eos_chunk is True
+    assert state.current_turn_ended is True
+
+
+def test_minicpmo_stage0_natural_turn_eos_uses_same_deterministic_close_sequence():
+    model, state, logits, sampling_metadata, token_ids = _minicpmo_stage0_turn_fence_sampler([4, 12])
+    logits.fill_(-100.0)
+    logits[0, token_ids["turn_eos_token_id"]] = 30.0
+
+    turn_end = model.sample(logits, sampling_metadata)
+
+    assert turn_end is not None
+    assert turn_end.sampled_token_ids.tolist() == [[token_ids["turn_eos_token_id"]]]
+    assert state.pending_turn_end_identity is None
+    assert state.pending_post_turn_eos_chunk is True
+    assert state.current_turn_ended is True
+
+    sampling_metadata.output_token_ids = [[4, 12, token_ids["turn_eos_token_id"]]]
+    logits.fill_(-100.0)
+    logits[0, 13] = 30.0
+
+    closed = model.sample(logits, sampling_metadata)
+
+    assert closed is not None
+    assert closed.sampled_token_ids.tolist() == [[token_ids["chunk_eos_token_id"]]]
+    assert state.pending_post_turn_eos_chunk is False
+    assert state.current_turn_ended is True
 
 
 def test_minicpmo_stage0_native_sampler_preserves_early_model_turn_eos_decision():

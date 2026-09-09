@@ -15,6 +15,34 @@ from tests.helpers.assertions import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_native_duplex_error_assertion_requires_the_original_failure():
+    with pytest.raises(AssertionError):
+        assertions.assert_realtime_duplex_audio_result(
+            {"audio_bytes": 0, "events": [{"type": "error", "error": {"code": "not_found"}}]},
+            expected_error="native_duplex_prefill_failed",
+        )
+    assertions.assert_realtime_duplex_audio_result(
+        {
+            "audio_bytes": 0,
+            "events": [
+                {
+                    "type": "error",
+                    "error": {"code": "model_input_error", "message": "native_duplex_prefill_failed: empty encoder"},
+                }
+            ],
+        },
+        expected_error="native_duplex_prefill_failed",
+    )
+
+
+def test_native_duplex_success_assertion_requires_real_audio_and_terminal():
+    with pytest.raises(AssertionError):
+        assertions.assert_realtime_duplex_audio_result({"audio_bytes": 0, "events": [{"type": "response.done"}]})
+    with pytest.raises(AssertionError):
+        assertions.assert_realtime_duplex_audio_result({"audio_bytes": 8, "events": []})
+    assertions.assert_realtime_duplex_audio_result({"audio_bytes": 8, "events": [{"type": "response.done"}]})
+
+
 def test_short_transcript_repeat_passes_containment_fallback():
     _assert_transcript_matches(
         " How... how are you?",

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.contracts import DuplexInputMode
@@ -22,6 +23,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.duplex.serving_adapter i
 from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_thinker import (
     NemotronVoiceChatThinkerForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.output_templates import ModelInputError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -77,11 +79,82 @@ def test_append_rejects_stage0_context_overflow() -> None:
         _plan(NemotronVoiceChatDuplexRuntimeExtension(), input_seq=8190)
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_nemotron_native_append_capability_does_not_enable_model_replay(monkeypatch, available) -> None:
+    monkeypatch.setattr("vllm_omni.engine.kv_append.scheduler_native_append_available", lambda: available)
+    capabilities = NemotronVoiceChatServingRuntimeAdapter.capabilities(max_sessions=1)
+    assert capabilities.supports_scheduler_native_append is available
+    assert capabilities.supports_prompt_replay is False
+    assert not hasattr(NemotronVoiceChatDuplexRuntimeExtension(), "prepare_recovery_prompt")
+
+
+@pytest.mark.parametrize("computed", [0, 3])
+def test_nemotron_rejects_historical_recompute_before_advancing_perception(computed) -> None:
+    model = SimpleNamespace(_sessions={"req": {}})
+    with pytest.raises(ModelInputError, match="native_duplex_recompute_unsupported"):
+        NemotronVoiceChatThinkerForConditionalGeneration._preprocess_duplex(
+            model,
+            request_id="req",
+            input_ids=torch.zeros(1, dtype=torch.long),
+            info={"_omni_num_computed_tokens": computed},
+            duplex={
+                "source_input_seq": 2,
+                "kv_append_start": 4,
+                "runtime_config": {"nvc_text_pad_id": 12},
+            },
+        )
+    assert model._sessions == {"req": {}}
+
+
+def test_nemotron_missing_continuation_state_fails_request_locally() -> None:
+    model = SimpleNamespace(_sessions={})
+    with pytest.raises(ModelInputError, match="no retained model state"):
+        NemotronVoiceChatThinkerForConditionalGeneration._preprocess_duplex(
+            model,
+            request_id="req",
+            input_ids=torch.zeros(1, dtype=torch.long),
+            info={"_omni_num_computed_tokens": 4},
+            duplex={
+                "source_input_seq": 2,
+                "kv_append_start": 4,
+                "runtime_config": {"nvc_text_pad_id": 12},
+            },
+        )
+    assert not model._sessions
+
+
+def test_nemotron_retained_continuation_uses_current_frame_and_previous_sample() -> None:
+    model = SimpleNamespace(
+        _sessions={"req": {"func_token": 5, "prefill_embeds": torch.zeros(4, 4)}},
+        _duplex_previous_text_tokens={"req": 6},
+        _duplex_stable_frame=lambda *args: torch.ones(1, 4),
+        _sync_forced_function_response=lambda *args: None,
+        _fuse=lambda text, frame, function: frame + text.reshape(1, 1) + function.reshape(1, 1),
+    )
+    _, embeddings, _ = NemotronVoiceChatThinkerForConditionalGeneration._preprocess_duplex(
+        model,
+        request_id="req",
+        input_ids=torch.zeros(1, dtype=torch.long),
+        info={"_omni_num_computed_tokens": 4},
+        duplex={
+            "source_input_seq": 2,
+            "kv_append_start": 4,
+            "runtime_config": {"nvc_text_pad_id": 12},
+        },
+    )
+    assert torch.equal(embeddings, torch.full((1, 4), 12.0))
+
+
 def test_function_output_becomes_versioned_nvidia_channel_tokens() -> None:
     encoded: list[str] = []
+
+    def encode(text: str, **_kwargs) -> list[int]:
+        encoded.append(text)
+        return [31, 32, 33]
+
     adapter = NemotronVoiceChatServingRuntimeAdapter(lambda *_: None)
     adapter._tokenizer = SimpleNamespace(
-        encode=lambda text, **_kwargs: encoded.append(text) or [31, 32, 33],
+        encode=encode,
     )
 
     first = adapter.runtime_config_for_function_output(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -79,8 +79,26 @@ def test_async_chunk_keeps_delay_tail_across_resumable_segments() -> None:
     assert first.meta.finished.item() is False
     assert first.meta.is_segment_finished.item() is False
     expected = torch.cat([first_frame[:, :1], second_frame[:, 1:]], dim=1).reshape(-1)
-    assert torch.equal(second.codes.audio, expected)
+    assert torch.equal(second.codes.audio.reshape(-1), expected)
+    assert second.meta.codec_frame_offset == 0
     assert manager.request_payload["req"]["personaplex_frames"][0].equal(second_frame.reshape(-1))
+
+
+@pytest.mark.parametrize("frame_count", [1, 2, 3, 5, 6, 7, 11])
+def test_duplex_segments_publish_every_complete_acoustic_frame(frame_count):
+    manager = SimpleNamespace(connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 5}}))
+    request = SimpleNamespace(request_id="tail", resumable=True)
+    rows = torch.arange(frame_count * 8).reshape(frame_count, 8)
+    emitted = []
+    for row in rows:
+        request.additional_information = {"codes": {"audio": row.reshape(1, 8)}}
+        payload = talker2code2wav_async_chunk(manager, None, request, is_finished=True)
+        if payload.codes is not None:
+            emitted.append(payload.codes.audio.reshape(8, -1).T)
+    expected = torch.cat([rows[:-1, :1], rows[1:, 1:]], dim=1)
+    actual = torch.cat(emitted) if emitted else rows[:0]
+    assert torch.equal(actual, expected)
+    assert len(manager.request_payload["tail"]["personaplex_frames"]) == 1
 
 
 def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:

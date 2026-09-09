@@ -39,6 +39,9 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
+    pending_turn_end_identity: tuple[int | None, int | None] | None = None
+    pending_post_turn_eos_chunk: bool = False
+    last_final_append_identity: tuple[int | None, int] | None = None
     generated_tokens: list[int] = field(default_factory=list)
 
 
@@ -167,6 +170,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         *,
         video_frames: list[Any] | None = None,
         epoch: int | None = None,
+        turn_id: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
         final: bool = False,
@@ -185,6 +189,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             and state.prepared_append_identity == append_identity
             and state.prepared_inputs_embeds is not None
         ):
+            self._update_turn_end_fence(
+                state,
+                epoch=epoch,
+                turn_id=turn_id,
+                append_identity=append_identity,
+                final=final,
+            )
             result = dict(state.prepared_result)
             result["inputs_embeds"] = state.prepared_inputs_embeds
             result["input_token_ids"] = list(state.prepared_input_token_ids)
@@ -308,6 +319,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
+        if units_built == 0:
+            return self._stage_prefill_result(False, start_time, "no model unit built for this append")
 
         import torch
 
@@ -328,12 +341,43 @@ class MiniCPMO45Stage0DuplexRuntime:
         if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
+        self._update_turn_end_fence(
+            state,
+            epoch=epoch,
+            turn_id=turn_id,
+            append_identity=append_identity,
+            final=final,
+        )
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
             state.prepared_input_token_ids = list(token_ids)
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
+
+    @staticmethod
+    def _update_turn_end_fence(
+        state: _MiniCPMO45Stage0SessionState,
+        *,
+        epoch: int | None,
+        turn_id: int | None,
+        append_identity: tuple[int | None, int] | None,
+        final: bool,
+    ) -> None:
+        turn_identity = (epoch, turn_id)
+        if state.pending_turn_end_identity is not None and state.pending_turn_end_identity != turn_identity:
+            # A late/stale final marker must never terminate a later model
+            # turn.  Normal silence continuations retain the same identity, so
+            # they keep the pending fence until the model reaches an empty
+            # chunk boundary.
+            state.pending_turn_end_identity = None
+        if final and (append_identity is None or state.last_final_append_identity != append_identity):
+            # Commit the user turn only after this append produced a real
+            # scheduler prefill.  Buffering/failed appends must not arm a turn
+            # boundary, and an identical prefill retry must not re-arm one
+            # after the sampler has consumed it.
+            state.pending_turn_end_identity = turn_identity
+            state.last_final_append_identity = append_identity
 
     @staticmethod
     def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, Any]:

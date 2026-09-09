@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import base64
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,7 +57,7 @@ def _audio_client(
     frame_count: int = 10,
     *,
     voiced_frames: int = 0,
-) -> SimpleNamespace:
+) -> e2e_driver.RawRealtimeProbe:
     frames = np.full((frame_count, e2e_driver.FRAME_SAMPLES), 7, dtype="<i2")
     frames[:voiced_frames] = 1000
     raw = frames.tobytes()
@@ -72,12 +73,10 @@ def _audio_client(
             }
         },
     }
-    events = SimpleNamespace(
-        events=[event],
-        response_audio={"response-1": [raw]},
-        audio_bytes=lambda: raw,
-    )
-    return SimpleNamespace(events=events)
+    client = e2e_driver.RawRealtimeProbe("ws://unused")
+    client.events.add({"type": "response.created", "response": {"id": "response-1"}})
+    client.events.add({**event, "delta": base64.b64encode(raw).decode("ascii")})
+    return client
 
 
 def test_realtime_audio_frame_stats_separate_voiced_and_silent_frames() -> None:
@@ -112,7 +111,7 @@ def test_realtime_audio_frame_stats_reject_partial_codec_frame() -> None:
 
 @pytest.mark.parametrize("frame_count", [10, 40])
 def test_e2e_driver_rejects_inaudible_sessions(frame_count: int) -> None:
-    args = SimpleNamespace(
+    args = Namespace(
         max_frame_deficit=4,
         voiced_frame_rms_threshold=1e-3,
         min_voiced_frames=5,
@@ -128,7 +127,7 @@ def test_e2e_driver_rejects_inaudible_sessions(frame_count: int) -> None:
 
 
 def test_e2e_driver_uses_absolute_audible_floor() -> None:
-    args = SimpleNamespace(
+    args = Namespace(
         max_frame_deficit=4,
         voiced_frame_rms_threshold=1e-3,
         min_voiced_frames=5,
@@ -244,6 +243,107 @@ def test_personaplex_capabilities_are_honest() -> None:
     assert multi.supports_multi_session is True
     assert multi.supports_multi_session_same_replica is True
     assert multi.supports_barge_in is False
+    assert multi.supports_prompt_replay is False
+    assert multi.response_lifecycle == "continuous_stream"
+
+
+@pytest.mark.parametrize("accepted", [1, 2, 6, 10])
+def test_personaplex_drain_waits_for_delivery_and_reports_model_delay(accepted):
+    projector = PersonaPlexDataPlaneSession(lambda *_: "encoded")
+    projector.begin_request("req")
+    projector.note_accepted_input("req", accepted)
+    projector.note_accepted_input("req", 1)
+    if accepted > 1:
+        assert not projector.drain_status("req")["drained"]
+        output = SimpleNamespace(
+            request_id="req", multimodal_output={"audio": np.ones((accepted - 1) * 1920), "sr": 24000}
+        )
+        list(projector.project({"data_plane_outputs": [output]}))
+        assert not projector.drain_status("req")["drained"]
+        projector.mark_outputs_delivered("req")
+    status = projector.drain_status("req")
+    assert status == {
+        "accepted_frames": accepted,
+        "expected_audio_frames": accepted - 1,
+        "model_delay_frames": 1,
+        "audio_frames": accepted - 1,
+        "drained": True,
+    }
+
+
+@pytest.mark.parametrize("samples", [1921, 3840])
+def test_personaplex_drain_rejects_partial_or_excess_output(samples):
+    projector = PersonaPlexDataPlaneSession(lambda *_: "encoded")
+    projector.note_accepted_input("req", 2)
+    output = SimpleNamespace(request_id="req", multimodal_output={"audio": np.ones(samples), "sr": 24000})
+    list(projector.project({"data_plane_outputs": [output]}))
+    projector.mark_outputs_delivered("req")
+    with pytest.raises(RuntimeError, match="accounting"):
+        projector.drain_status("req")
+
+
+def test_personaplex_drain_does_not_count_unencoded_audio():
+    projector = PersonaPlexDataPlaneSession(lambda *_: None)
+    projector.note_accepted_input("req", 2)
+    output = SimpleNamespace(request_id="req", multimodal_output={"audio": np.ones(1920), "sr": 24000})
+    with pytest.raises(RuntimeError, match="encoding failed"):
+        list(projector.project({"data_plane_outputs": [output]}))
+    assert not projector.drain_status("req")["drained"]
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_personaplex_native_append_capability_does_not_enable_model_replay(monkeypatch, available) -> None:
+    monkeypatch.setattr("vllm_omni.engine.kv_append.scheduler_native_append_available", lambda: available)
+    capabilities = PersonaPlexServingRuntimeAdapter.capabilities(max_sessions=2)
+    assert capabilities.supports_scheduler_native_append is available
+    assert capabilities.supports_prompt_replay is False
+    assert not hasattr(PersonaPlexDuplexRuntimeExtension(), "prepare_recovery_prompt")
+
+
+@pytest.mark.parametrize("computed", [0, 3])
+def test_personaplex_rejects_historical_recompute_before_advancing_codec(computed) -> None:
+    import torch
+
+    from vllm_omni.model_executor.models.output_templates import ModelInputError
+    from vllm_omni.model_executor.models.personaplex.personaplex_talker import PersonaPlexTalkerForConditionalGeneration
+
+    # No runtime is installed: rejection must precede codec lookup/mutation.
+    with pytest.raises(ModelInputError, match="native_duplex_recompute_unsupported"):
+        PersonaPlexTalkerForConditionalGeneration.preprocess(
+            SimpleNamespace(),
+            input_ids=torch.zeros(1, dtype=torch.long),
+            input_embeds=None,
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=computed,
+            duplex={"data_plane": True, "kv_append_start": 4},
+        )
+
+
+def test_personaplex_retained_continuation_preserves_single_frame_prefill() -> None:
+    import torch
+
+    from vllm_omni.model_executor.models.personaplex.personaplex_talker import PersonaPlexTalkerForConditionalGeneration
+
+    prepared = SimpleNamespace(
+        prompt_offset=4,
+        inputs_embeds=torch.ones(1, 4),
+        input_ids=torch.zeros(1, dtype=torch.long),
+        info_update={"pplex_user_codes": "current-frame"},
+    )
+    runtime = SimpleNamespace(prepare_append=lambda *args, **kwargs: prepared)
+    model = SimpleNamespace(_duplex_stage0_runtime=lambda: runtime, _dtype=torch.float32)
+    _, embeddings, info = PersonaPlexTalkerForConditionalGeneration.preprocess(
+        model,
+        input_ids=torch.zeros(1, dtype=torch.long),
+        input_embeds=None,
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=4,
+        duplex_prompt_len=5,
+        duplex_token_offset=4,
+        duplex={"data_plane": True, "kv_append_start": 4},
+    )
+    assert torch.equal(embeddings, torch.ones(1, 4))
+    assert info == prepared.info_update
 
 
 def test_personaplex_runtime_config_update_rejects_changed_persona() -> None:

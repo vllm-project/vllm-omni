@@ -12,7 +12,8 @@ clients via an injected factory and mutating StagePool membership.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.logger import init_logger
@@ -28,6 +29,14 @@ from vllm_omni.engine.stage_pool import StagePool
 logger = init_logger(__name__)
 
 RemoteReplicaFactory = Callable[[int, int], Any]
+
+
+@dataclass(frozen=True)
+class ReplicaLossCleanupResult:
+    """Request classification returned by the orchestrator cleanup owner."""
+
+    recoverable_request_ids: frozenset[str] = frozenset()
+    terminal_native_request_ids: frozenset[str] = frozenset()
 
 
 class MembershipController:
@@ -59,10 +68,10 @@ class MembershipController:
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
         self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
-        self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
+        self._cleanup_callback: Callable[[int, list[str]], Awaitable[ReplicaLossCleanupResult | None]] | None = None
         self._replica_removed_callback: Callable[[int, int], None] | None = None
 
-        self._hub = OmniCoordClientForHub(coordinator_pub_address)
+        self._hub: OmniCoordClientForHub | None = OmniCoordClientForHub(coordinator_pub_address)
         factory = load_balancer_factory
         for pool in self._stage_pools:
             pool.attach_hub(self._hub)
@@ -111,7 +120,7 @@ class MembershipController:
         stage_id: int,
         input_addr: str,
         output_queue: asyncio.Queue[EngineQueueMessage] | None = None,
-        cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None,
+        cleanup_callback: (Callable[[int, list[str]], Awaitable[ReplicaLossCleanupResult | None]] | None) = None,
     ) -> None:
         """Handle an unregister_remote_replica message."""
         pool = self._pool_for_stage_id(stage_id)
@@ -125,12 +134,26 @@ class MembershipController:
         self._detach_replica(stage_id, input_addr)
         if client is not None and replica_id is not None and self._replica_removed_callback is not None:
             self._replica_removed_callback(stage_id, replica_id)
+        cleanup_result = ReplicaLossCleanupResult()
         if affected and effective_cleanup_callback is not None:
-            await effective_cleanup_callback(affected)
+            cleanup_result = await effective_cleanup_callback(stage_id, affected) or ReplicaLossCleanupResult()
         if affected and effective_output_queue is not None:
             for req_id in affected:
+                if req_id in cleanup_result.recoverable_request_ids:
+                    continue
+                native_terminal = req_id in cleanup_result.terminal_native_request_ids
                 await effective_output_queue.put(
-                    ErrorMessage(error="stage replica disappeared", request_id=req_id, stage_id=stage_id)
+                    ErrorMessage(
+                        error=(
+                            "native_kv_replica_lost: stage replica disappeared; "
+                            "automatic replay was unsafe or unavailable; reopen the duplex session and replay input"
+                            if native_terminal
+                            else "stage replica disappeared"
+                        ),
+                        error_type=("native_kv_replica_lost" if native_terminal else None),
+                        request_id=req_id,
+                        stage_id=stage_id,
+                    )
                 )
 
     def shutdown(self) -> None:
@@ -149,7 +172,7 @@ class MembershipController:
 
     # ---- Internal ----
 
-    def _spawn_task(self, coro: Awaitable[None], *, label: str) -> None:
+    def _spawn_task(self, coro: Coroutine[object, object, None], *, label: str) -> None:
         task = asyncio.create_task(coro, name=f"membership-{label}")
         self._membership_tasks.add(task)
 
@@ -168,6 +191,8 @@ class MembershipController:
         last_up: set[tuple[int, str]] = set()
         while not self._shutdown_event.is_set():
             try:
+                if self._hub is None:
+                    return
                 snap = self._hub.get_replica_list()
                 self._watch_generation += 1
                 current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
@@ -287,7 +312,10 @@ class MembershipController:
         self,
         *,
         output_queue: asyncio.Queue[EngineQueueMessage],
-        cleanup_callback: Callable[[list[str]], Awaitable[None]],
+        cleanup_callback: Callable[
+            [int, list[str]],
+            Awaitable[ReplicaLossCleanupResult | None],
+        ],
         replica_removed_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         """Install shared cleanup sinks for watcher-driven unregister events."""

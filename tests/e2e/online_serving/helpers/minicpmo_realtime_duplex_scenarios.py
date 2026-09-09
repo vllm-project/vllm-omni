@@ -191,6 +191,7 @@ class DemoState:
     model_speak_delta_count: int = 0
     playback_ack_count: int = 0
     playback_history_committed_count: int = 0
+    playback_reservation_sent_ids: set[str] = field(default_factory=set)
     truncate_count: int = 0
     input_transcription_count: int = 0
     audio_marks_seen: bool = False
@@ -585,6 +586,46 @@ class DemoState:
                 response_ids.append(response_id)
         return response_ids
 
+    def model_turn_end_response_ids(self) -> list[str]:
+        """Responses completed by a genuine scheduler-native model turn EOS.
+
+        The Realtime projector preserves the terminal internal audio delta in
+        ``response.metadata``.  Requiring that envelope, rather than merely a
+        ``response.done`` event, prevents close/cancel/failure bookkeeping from
+        being mistaken for a model-produced end of turn.
+        """
+        response_ids: list[str] = []
+        for event in self.events:
+            if event.get("type") != "response.done":
+                continue
+            response = event.get("response")
+            if not isinstance(response, dict) or response.get("status") != "completed":
+                continue
+            metadata = response.get("metadata")
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("type") != "response.output_audio.delta"
+                or metadata.get("end_of_turn") is not True
+            ):
+                continue
+            runtime = metadata.get("vllm_omni")
+            if not isinstance(runtime, dict):
+                continue
+            model_turn_id = runtime.get("model_turn_id")
+            if (
+                runtime.get("runtime_impl") != "scheduler_data_plane"
+                or runtime.get("uses_model_runner_scheduler") is not True
+                or runtime.get("runner_kv_backed") is not True
+                or isinstance(model_turn_id, bool)
+                or not isinstance(model_turn_id, int)
+                or model_turn_id < 0
+            ):
+                continue
+            response_id = self._event_response_id(event)
+            if isinstance(response_id, str):
+                response_ids.append(response_id)
+        return response_ids
+
     def stale_audio_delta_count(self) -> int:
         cancelled_epochs_by_index: list[tuple[int, int]] = []
         for index, event in enumerate(self.events):
@@ -630,6 +671,7 @@ def _session_update_event(args: DemoArgs) -> dict[str, object]:
             "auto_response": True,
             "native_duplex": True,
             "force_listen_count": 0,
+            "emit_duplex_control_results": bool(getattr(args, "emit_duplex_control_results", False)),
         },
     }
     temperature = getattr(args, "temperature", None)
@@ -833,6 +875,41 @@ def _unexpected_error_events(state: DemoState) -> list[dict[str, object]]:
     return [event for event in state.events if event.get("type") == "error"]
 
 
+def _native_append_observations(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    observations: list[dict[str, object]] = []
+    for wire_event in events:
+        event = wire_event
+        if wire_event.get("type") == "duplex.runtime.control":
+            nested_event = wire_event.get("event")
+            if not isinstance(nested_event, dict):
+                continue
+            event = nested_event
+        if event.get("type") != "runtime.control":
+            continue
+        control_result = event.get("result")
+        if not isinstance(control_result, dict) or control_result.get("operation") != "append":
+            continue
+        stage_results = control_result.get("stage_results")
+        if not isinstance(stage_results, list):
+            continue
+        for stage_result in stage_results:
+            if not isinstance(stage_result, dict):
+                continue
+            result_payload = stage_result.get("result")
+            if not isinstance(result_payload, dict):
+                continue
+            append_metrics = result_payload.get("append_metrics")
+            if isinstance(append_metrics, dict):
+                observations.append(
+                    {
+                        "request_id": result_payload.get("request_id"),
+                        "replica_id": stage_result.get("replica_id"),
+                        **append_metrics,
+                    }
+                )
+    return observations
+
+
 def _evaluate_response_speak_contract(state: DemoState) -> dict[str, object]:
     speak_counts: dict[str, int] = {}
     invalid_response_speak_count = 0
@@ -930,6 +1007,31 @@ def _evaluate_transcript_integrity(
     }
 
 
+async def _reserve_response_playback(ws, state: DemoState, event: dict[str, object]) -> bool:
+    if event.get("type") != "response.created":
+        return False
+    response_id = state._event_response_id(event)
+    if not isinstance(response_id, str) or response_id in state.playback_reservation_sent_ids:
+        return False
+    state.playback_reservation_sent_ids.add(response_id)
+    try:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "playback.ack",
+                    "response_id": response_id,
+                    "item_id": f"item_{response_id}",
+                    "played_ms": 0,
+                    "committed_ms": 0,
+                }
+            )
+        )
+    except BaseException:
+        state.playback_reservation_sent_ids.discard(response_id)
+        raise
+    return True
+
+
 async def _reader(ws, state: DemoState, stop: asyncio.Event) -> None:
     try:
         while not stop.is_set():
@@ -939,6 +1041,7 @@ async def _reader(ws, state: DemoState, stop: asyncio.Event) -> None:
             event = json.loads(raw)
             if isinstance(event, dict):
                 state.add(event)
+                await _reserve_response_playback(ws, state, event)
     except ConnectionClosed:
         return
 
@@ -1602,6 +1705,8 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
     model_speak_event_ok = state.model_speak_before_audio_ok()
     realtime_audio_lifecycle_ok = state.count("response.audio.delta") > 0 and state.count("response.audio.done") > 0
     completed_response_ids = state.completed_response_ids()
+    model_turn_end_response_ids = state.model_turn_end_response_ids()
+    native_model_turn_end_ok = model_turn_end_response_ids == completed_response_ids
     observed_turn_response_ids = [response_id for response_id in turn_response_ids if isinstance(response_id, str)]
     expected_empty_response_ids = {
         response_id
@@ -1669,6 +1774,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         )
     )
     unexpected_error_events = _unexpected_error_events(state)
+    native_append_observations = _native_append_observations(state.events)
     continuous_input_ok = not continuous_input or state.count("input_audio_buffer.committed") == 0
     result = {
         "ok": terminal_activity_ok
@@ -1706,6 +1812,9 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         "terminal_activity_ok": terminal_activity_ok,
         "input_transcription_ok": input_transcription_ok,
         "completed_response_ids": completed_response_ids,
+        "model_turn_end_response_ids": model_turn_end_response_ids,
+        "model_turn_end_count": len(model_turn_end_response_ids),
+        "native_model_turn_end_ok": native_model_turn_end_ok,
         "response_timings": state.response_timing_summaries(),
         "request_metrics": state.session_request_metrics(session_id=args.session_id),
         "session_metrics": state.session_metric_summary(session_id=args.session_id),
@@ -1732,6 +1841,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         "distinct_turn_inputs": distinct_turn_inputs,
         "error_count": len(unexpected_error_events),
         "errors": unexpected_error_events,
+        "native_append_observations": native_append_observations,
         **response_speak_contract,
         **transcript_integrity,
         "turn_inputs": [

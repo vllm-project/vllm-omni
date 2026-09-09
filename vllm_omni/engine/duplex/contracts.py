@@ -15,10 +15,15 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.session import DuplexSessionRuntimeManager, DuplexSessionRuntimeState
 
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.messages import EngineQueueMessage
+
+DUPLEX_CONTRACT_VERSION = "duplex.capabilities.v1"
 
 
 class SessionMode(str, Enum):
@@ -43,6 +48,75 @@ class DuplexOutputAction(str, Enum):
 class DuplexRuntimeCapabilities:
     input_modes: set[DuplexInputMode] = field(default_factory=lambda: {DuplexInputMode.TURN_COMMIT_ONLY})
     implementation_level: str = "serving_session_adapter"
+    scheduler_native_append: bool = False
+    prompt_replay: bool = False
+    contract_version: str = DUPLEX_CONTRACT_VERSION
+    adapter_id: str = ""
+    runtime_extension_id: str = ""
+    stage_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.prompt_replay and not self.scheduler_native_append:
+            raise ValueError("duplex prompt replay requires scheduler-native append")
+
+    def plugin_descriptor(self) -> DuplexPluginDescriptor | None:
+        if self.contract_version != DUPLEX_CONTRACT_VERSION:
+            raise ValueError(
+                f"unsupported duplex contract version: {self.contract_version!r}; expected {DUPLEX_CONTRACT_VERSION!r}"
+            )
+        values = (self.adapter_id, self.runtime_extension_id, self.stage_count)
+        if not any(value not in ("", None) for value in values):
+            return None
+        if not self.adapter_id or not self.runtime_extension_id or self.stage_count is None:
+            raise ValueError("duplex plugin descriptor must declare adapter_id, runtime_extension_id, and stage_count")
+        return DuplexPluginDescriptor(
+            contract_version=self.contract_version,
+            adapter_id=self.adapter_id,
+            runtime_extension_id=self.runtime_extension_id,
+            stage_count=self.stage_count,
+        )
+
+
+@dataclass(frozen=True)
+class DuplexPluginDescriptor:
+    """Versioned binding between serving, engine extension, and stage topology."""
+
+    contract_version: str
+    adapter_id: str
+    runtime_extension_id: str
+    stage_count: int
+
+    def __post_init__(self) -> None:
+        if self.contract_version != DUPLEX_CONTRACT_VERSION:
+            raise ValueError(
+                f"unsupported duplex contract version: {self.contract_version!r}; expected {DUPLEX_CONTRACT_VERSION!r}"
+            )
+        if not self.adapter_id or not self.runtime_extension_id:
+            raise ValueError("duplex plugin descriptor requires adapter_id and runtime_extension_id")
+        if self.stage_count <= 0:
+            raise ValueError("duplex plugin descriptor stage_count must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexTraceEnvelope:
+    """Bounded causal IDs propagated across the duplex engine boundary."""
+
+    session_id: str
+    fence: DuplexFence
+    event: str
+    control_id: str | None = None
+    operation_id: str | None = None
+    request_id: str | None = None
+    sequence: int | None = None
+    clock_origin: str = "engine_monotonic"
+
+    def __post_init__(self) -> None:
+        if not self.session_id or self.session_id != self.fence.session_id:
+            raise ValueError("duplex trace session_id must match fence.session_id")
+        if not self.event:
+            raise ValueError("duplex trace event must be non-empty")
+        if self.sequence is not None and self.sequence < 0:
+            raise ValueError("duplex trace sequence must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -112,8 +186,11 @@ class DuplexStageRequestContext:
     final_stage_id: int
     config_generation: int
     sampling_params: tuple[object, ...]
+    scheduler_native_append: bool = False
+    recovery_replay: bool = False
     session_config: Mapping[str, Any] = field(default_factory=dict)
     runtime_config: Mapping[str, Any] = field(default_factory=dict)
+    trace: DuplexTraceEnvelope | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sampling_params", tuple(self.sampling_params))
@@ -130,6 +207,10 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, Any]
     already_submitted: bool
+    operation_id: str | None = None
+    operation_fingerprint: bytes | None = None
+    deadline_monotonic: float | None = None
+    recovery_replay: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -140,6 +221,10 @@ class DuplexStageSubmissionResult:
     request_id: str
     stage_id: int
     replica_id: int
+    metrics: Mapping[str, int | float | bool | str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
 
 
 @dataclass(frozen=True)
@@ -165,6 +250,8 @@ class DuplexStagePort(Protocol):
 
     def sampling_defaults(self) -> tuple[object, ...]: ...
 
+    def supports_scheduler_native_append(self, stage_id: int = 0) -> bool: ...
+
     def ensure_request(self, context: DuplexStageRequestContext) -> None: ...
 
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult: ...
@@ -174,7 +261,7 @@ class DuplexStagePort(Protocol):
 
 class DuplexControlPlanePort(Protocol):
     @property
-    def sessions(self) -> object: ...
+    def sessions(self) -> DuplexSessionRuntimeManager: ...
 
     def accepts(self, message: object) -> bool: ...
 
@@ -182,11 +269,31 @@ class DuplexControlPlanePort(Protocol):
 
     async def shutdown(self) -> None: ...
 
-    def close_sessions_for_request_ids(self, request_ids: list[str]) -> dict[str, list[str]]: ...
+    async def reap_expired(self, now: float | None = None) -> int: ...
+
+    def defer_request_cleanups(self, session_ids: Iterable[str]) -> None: ...
+
+    def prepare_replica_recovery(
+        self,
+        stage_id: int,
+        request_ids: Iterable[str],
+        *,
+        uncertain_request_ids: Iterable[str] = (),
+        allow_recovery: bool = True,
+    ) -> tuple[set[str], set[str]]: ...
+
+    def close_sessions_for_request_ids(
+        self,
+        request_ids: list[str],
+        *,
+        abort: bool = False,
+        cleanup_in_progress: bool = False,
+        reason: str = "request_cleanup",
+    ) -> dict[str, list[str]]: ...
 
     def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None: ...
 
-    def session_for_identity(self, identity: DuplexRequestIdentity | None) -> object | None: ...
+    def session_for_identity(self, identity: DuplexRequestIdentity | None) -> DuplexSessionRuntimeState | None: ...
 
     def decide_output(
         self,
@@ -235,6 +342,33 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     return f"duplex-s.{encoded_session_id}.i.{fence.incarnation}.e.{fence.epoch}.r.{role}"
 
 
+def duplex_resource_request_generation(
+    request_id: str,
+    fence: DuplexFence,
+    role: str,
+) -> int | None:
+    """Parse one exact logical resource's physical request generation.
+
+    Generation zero uses the canonical ``role`` request id.  Later physical
+    requests append ``g<N>`` to that role.  Comparing against the canonical
+    prefix first makes the parser reject a valid-looking request belonging to
+    another session, incarnation, epoch, or resource role.
+    """
+    canonical = duplex_resource_request_id(fence, role)
+    if request_id == canonical:
+        return 0
+    generation_prefix = f"{canonical}g"
+    if not request_id.startswith(generation_prefix):
+        return None
+    raw_generation = request_id[len(generation_prefix) :]
+    if not raw_generation.isascii() or not raw_generation.isdecimal():
+        return None
+    generation = int(raw_generation)
+    if generation <= 0 or raw_generation != str(generation):
+        return None
+    return generation
+
+
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
@@ -256,12 +390,14 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 
 __all__ = [
     "CorrelatedRpcTransport",
+    "DUPLEX_CONTRACT_VERSION",
     "DuplexAppendPlan",
     "DuplexControlPlanePort",
     "DuplexInputMode",
     "DuplexOutputAction",
     "DuplexOutputContext",
     "DuplexOutputDecision",
+    "DuplexPluginDescriptor",
     "DuplexRequestIdentity",
     "DuplexRuntimeCapabilities",
     "DuplexRuntimeExtension",
@@ -269,8 +405,10 @@ __all__ = [
     "DuplexStageRequestContext",
     "DuplexStageSubmission",
     "DuplexStageSubmissionResult",
+    "DuplexTraceEnvelope",
     "SessionMode",
     "duplex_data_plane_request_info",
     "duplex_resource_request_belongs_to_session",
+    "duplex_resource_request_generation",
     "duplex_resource_request_id",
 ]

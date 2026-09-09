@@ -10,6 +10,7 @@ from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.runtime import (
     DuplexOutputAction,
     DuplexOutputDecision,
+    duplex_resource_request_generation,
     duplex_resource_request_id,
 )
 from vllm_omni.engine.messages import OutputMessage
@@ -143,6 +144,8 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
         timeout=16.5,
     )
 
+    append_timeout = calls[0][2]["timeout"]
+    assert 0 < append_timeout <= 12.5
     assert calls == [
         (
             "append",
@@ -153,7 +156,7 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
                 "final": False,
                 "expected_epoch": None,
                 "fence": cancelled_fence,
-                "timeout": 12.5,
+                "timeout": append_timeout,
             },
         ),
         (
@@ -599,3 +602,240 @@ async def test_duplex_request_client_retains_output_route_when_close_fails():
         await client.close(fence.session_id, reason="test", fence=fence, timeout=1.0)
 
     assert request_id in request_states
+
+
+def _data_plane_result(request_id: str, *, response_stage_id: int = 0) -> dict[str, object]:
+    return {
+        "stage_results": [
+            {
+                "result": {
+                    "data_plane_append": True,
+                    "request_id": request_id,
+                    "response_stage_id": response_stage_id,
+                }
+            }
+        ]
+    }
+
+
+def _duplex_output_port(request_states: dict[str, ClientRequestState]):
+    return SimpleNamespace(
+        request_states=request_states,
+        num_stages=1,
+        log_stats=False,
+        start_output_handler=lambda: None,
+    )
+
+
+def test_duplex_physical_generation_parser_is_fence_and_role_strict():
+    fence = DuplexFence("sid.with/slash", incarnation=3, epoch=7)
+    base = duplex_resource_request_id(fence, "stage0")
+
+    assert duplex_resource_request_generation(base, fence, "stage0") == 0
+    assert duplex_resource_request_generation(f"{base}g1", fence, "stage0") == 1
+    assert duplex_resource_request_generation(f"{base}g27", fence, "stage0") == 27
+    for invalid in (
+        f"{base}g0",
+        f"{base}g01",
+        f"{base}g-1",
+        f"{base}g1x",
+        duplex_resource_request_id(DuplexFence(fence.session_id, incarnation=4, epoch=7), "stage0g1"),
+        duplex_resource_request_id(DuplexFence("other", incarnation=3, epoch=7), "stage0g1"),
+        duplex_resource_request_id(fence, "stage1g1"),
+    ):
+        assert duplex_resource_request_generation(invalid, fence, "stage0") is None
+
+
+@pytest.mark.asyncio
+async def test_duplex_request_client_switches_from_base_to_next_physical_generation():
+    fence = DuplexFence("sid-rollover")
+    base = duplex_resource_request_id(fence, "stage0")
+    next_request_id = duplex_resource_request_id(fence, "stage0g1")
+    results = iter((_data_plane_result(base), _data_plane_result(next_request_id)))
+
+    async def append_duplex_input_async(session_id, **kwargs):
+        del session_id, kwargs
+        return next(results)
+
+    request_states: dict[str, ClientRequestState] = {}
+    client = DuplexRequestClient(
+        SimpleNamespace(append_duplex_input_async=append_duplex_input_async),
+        _duplex_output_port(request_states),
+    )
+
+    for operation_id in ("append-0", "append-1"):
+        await client.append(
+            fence.session_id,
+            mode="append_tokens",
+            payload={},
+            operation_id=operation_id,
+            final=False,
+            expected_epoch=0,
+            fence=fence,
+            timeout=1.0,
+            collect_outputs=False,
+        )
+
+    assert base not in request_states
+    assert next_request_id in request_states
+
+
+@pytest.mark.asyncio
+async def test_duplex_request_client_routes_next_generation_output_before_append_reply():
+    fence = DuplexFence("sid-rollover-output-race")
+    next_request_id = duplex_resource_request_id(fence, "stage0g1")
+    request_states: dict[str, ClientRequestState] = {}
+    output = OmniRequestOutput(request_id=next_request_id, stage_id=0, finished=True)
+
+    async def append_duplex_input_async(session_id, **kwargs):
+        del session_id, kwargs
+        request_state = request_states[next_request_id]
+        await request_state.queue.put(
+            OutputMessage(
+                request_id=next_request_id,
+                stage_id=0,
+                engine_outputs=output,
+                finished=True,
+            )
+        )
+        return _data_plane_result(next_request_id)
+
+    client = DuplexRequestClient(
+        SimpleNamespace(append_duplex_input_async=append_duplex_input_async),
+        _duplex_output_port(request_states),
+    )
+
+    result = await client.append(
+        fence.session_id,
+        mode="append_tokens",
+        payload={},
+        operation_id="rollover",
+        final=False,
+        expected_epoch=0,
+        fence=fence,
+        timeout=1.0,
+        collect_outputs=True,
+    )
+
+    assert result["data_plane_outputs"] == [output]
+
+
+@pytest.mark.asyncio
+async def test_duplex_request_client_rejects_request_from_another_fence():
+    fence = DuplexFence("sid-route-owner", incarnation=2, epoch=4)
+    foreign_request_id = duplex_resource_request_id(
+        DuplexFence("sid-route-owner", incarnation=3, epoch=4),
+        "stage0g1",
+    )
+
+    async def append_duplex_input_async(session_id, **kwargs):
+        del session_id, kwargs
+        return _data_plane_result(foreign_request_id)
+
+    client = DuplexRequestClient(
+        SimpleNamespace(append_duplex_input_async=append_duplex_input_async),
+        _duplex_output_port({}),
+    )
+
+    with pytest.raises(RuntimeError, match="data-plane request id mismatch"):
+        await client.append(
+            fence.session_id,
+            mode="append_tokens",
+            payload={},
+            operation_id="foreign",
+            final=False,
+            expected_epoch=4,
+            fence=fence,
+            timeout=1.0,
+            collect_outputs=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_duplex_request_client_rejects_stale_physical_generation():
+    fence = DuplexFence("sid-stale-generation")
+    base = duplex_resource_request_id(fence, "stage0")
+    next_request_id = duplex_resource_request_id(fence, "stage0g1")
+    results = iter((_data_plane_result(next_request_id), _data_plane_result(base)))
+
+    async def append_duplex_input_async(session_id, **kwargs):
+        del session_id, kwargs
+        return next(results)
+
+    client = DuplexRequestClient(
+        SimpleNamespace(append_duplex_input_async=append_duplex_input_async),
+        _duplex_output_port({}),
+    )
+    append_kwargs = {
+        "mode": "append_tokens",
+        "payload": {},
+        "final": False,
+        "expected_epoch": 0,
+        "fence": fence,
+        "timeout": 1.0,
+        "collect_outputs": False,
+    }
+
+    await client.append(fence.session_id, operation_id="new", **append_kwargs)
+    with pytest.raises(RuntimeError, match="data-plane request id mismatch"):
+        await client.append(fence.session_id, operation_id="stale", **append_kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cancel", "close"])
+async def test_duplex_request_client_cancel_and_close_clear_all_generation_aliases(operation: str):
+    fence = DuplexFence("sid-clear-aliases", incarnation=2, epoch=5)
+    next_fence = DuplexFence("sid-clear-aliases", incarnation=2, epoch=6)
+    base = duplex_resource_request_id(fence, "stage0")
+    next_request_id = duplex_resource_request_id(fence, "stage0g1")
+    request_states: dict[str, ClientRequestState] = {}
+
+    async def append_duplex_input_async(session_id, **kwargs):
+        del session_id, kwargs
+        raise TimeoutError("uncertain append")
+
+    async def signal_duplex_turn_async(session_id, **kwargs):
+        del session_id, kwargs
+        return {"ok": True}
+
+    async def close_duplex_session_async(session_id, **kwargs):
+        del session_id, kwargs
+        return {"ok": True}
+
+    client = DuplexRequestClient(
+        SimpleNamespace(
+            append_duplex_input_async=append_duplex_input_async,
+            signal_duplex_turn_async=signal_duplex_turn_async,
+            close_duplex_session_async=close_duplex_session_async,
+        ),
+        _duplex_output_port(request_states),
+    )
+    with pytest.raises(TimeoutError, match="uncertain append"):
+        await client.append(
+            fence.session_id,
+            mode="append_tokens",
+            payload={},
+            operation_id="uncertain",
+            final=False,
+            expected_epoch=5,
+            fence=fence,
+            timeout=1.0,
+            collect_outputs=False,
+        )
+    assert {base, next_request_id}.issubset(request_states)
+
+    if operation == "cancel":
+        await client.signal(
+            fence.session_id,
+            event="input.cancel",
+            fence=fence,
+            next_fence=next_fence,
+            session_config=None,
+            runtime_config=None,
+            timeout=1.0,
+        )
+    else:
+        await client.close(fence.session_id, reason="done", fence=fence, timeout=1.0)
+
+    assert base not in request_states
+    assert next_request_id not in request_states

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Talker -> Code2Wav input processors for PersonaPlex.
 
 The talker (stage 0) emits, per frame, the ``dep_q`` depformer audio codes under
@@ -202,6 +202,12 @@ def talker2code2wav_async_chunk(
             f"codec_chunk_frames={chunk}, initial_codec_chunk_frames={initial_chunk}"
         )
     target_frames = initial_chunk if not state.get("personaplex_emitted") and initial_chunk > 0 else chunk
+    # A retained duplex request may stop receiving input after any segment.
+    # Publish each available acoustic frame at that boundary; waiting for the
+    # next five-frame chunk strands already-generated audio at session.close.
+    # Non-resumable offline requests retain their configured chunk batching.
+    if is_finished and getattr(request, "resumable", False):
+        target_frames = 1
 
     # De-delay needs one successor raw frame: N output acoustic frames require
     # N + 1 raw depformer rows.
@@ -228,6 +234,8 @@ def talker2code2wav_async_chunk(
 
     stacked = torch.stack(frames[: emit_frames + 1], dim=0)  # [F+1, dep_q]
     flat = _agent_codes_to_codebook_major(stacked)
+    frame_offset = state.get("personaplex_frame_offset", 0)
+    state["personaplex_frame_offset"] = frame_offset + emit_frames
     if finished:
         request_payload.pop(request_id, None)
     else:
@@ -236,8 +244,12 @@ def talker2code2wav_async_chunk(
         state["personaplex_frames"] = frames[emit_frames:]
         state["personaplex_emitted"] = True
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=flat),
-        meta=MetaStruct(finished=torch.tensor(bool(finished), dtype=torch.bool)),
+        codes=CodesStruct(audio=flat.reshape(_NUM_ACTIVE_CODEBOOKS, -1)),
+        meta=MetaStruct(
+            finished=torch.tensor(bool(finished), dtype=torch.bool),
+            codec_frame_offset=frame_offset,
+            codec_coalesce=True,
+        ),
     )
 
 

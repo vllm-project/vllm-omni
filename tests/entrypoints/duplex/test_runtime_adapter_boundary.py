@@ -11,10 +11,27 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.entrypoints.duplex.runtime_adapter import (
+    require_continuous_data_plane,
     validate_serving_runtime_adapter,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+_CONTINUOUS_ACCOUNTING_HOOKS = ("note_accepted_input", "mark_outputs_delivered", "drain_status")
+
+
+@pytest.mark.parametrize("missing_hook", _CONTINUOUS_ACCOUNTING_HOOKS)
+def test_continuous_data_plane_requires_each_accounting_hook(mocker, missing_hook):
+    data_plane = mocker.Mock(spec=list(_CONTINUOUS_ACCOUNTING_HOOKS))
+    delattr(data_plane, missing_hook)
+    with pytest.raises(RuntimeError, match="input and delivery accounting"):
+        require_continuous_data_plane(data_plane)
+
+
+def test_continuous_data_plane_preserves_complete_plugin(mocker):
+    data_plane = mocker.Mock(spec=list(_CONTINUOUS_ACCOUNTING_HOOKS))
+    assert require_continuous_data_plane(data_plane) is data_plane
 
 
 @pytest.mark.parametrize(

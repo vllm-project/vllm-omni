@@ -147,6 +147,42 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
+    deploy_config_overrides: dict[str, Any] | None = None
+
+
+def _deep_merge_mapping(target: dict[str, Any], overrides: dict[str, Any]) -> None:
+    for key, value in overrides.items():
+        existing = target.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            _deep_merge_mapping(existing, value)
+        else:
+            target[key] = value
+
+
+@contextmanager
+def _temporary_deploy_config_override(
+    stage_config_path: str | None,
+    overrides: dict[str, Any] | None,
+) -> Generator[str | None, None, None]:
+    """Materialize test-only top-level deploy overrides for one server."""
+    if not overrides:
+        yield stage_config_path
+        return
+    if stage_config_path is None:
+        raise ValueError("deploy_config_overrides requires stage_config_path")
+    resolved = resolve_deploy_yaml(stage_config_path)
+    if not isinstance(resolved, dict):
+        raise TypeError(f"resolved deploy config must be a mapping: {stage_config_path}")
+    _deep_merge_mapping(resolved, overrides)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", encoding="utf-8", delete=False) as temporary:
+            yaml.safe_dump(resolved, temporary, sort_keys=False, default_flow_style=False)
+            temporary_path = Path(temporary.name)
+        yield str(temporary_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 class OmniServer:
@@ -946,69 +982,90 @@ def iter_omni_server(
         model = original_model
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
-        port = params.port
         stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
 
-        server_args = params.server_args or []
-        if model != original_model:
-            server_args = [*server_args, "--served-model-name", original_model]
-        if params.use_omni and params.stage_init_timeout is not None:
-            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
-        else:
-            server_args = [*server_args, "--stage-init-timeout", "600"]
-        if params.init_timeout is not None:
-            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
-        else:
-            server_args = [*server_args, "--init-timeout", "900"]
-        # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
-        if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
-            server_args = [*server_args, "--log-stats"]
-        if params.use_stage_cli:
-            if not params.use_omni:
-                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
-            if stage_config_path is None:
-                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--deploy-config", stage_config_path]
-
-            with OmniServerStageCli(
-                model,
-                stage_config_path,
-                server_args,
-                port=port,
-                env_dict=params.env_dict,
-            ) as server:
-                if model != original_model:
-                    server.model = original_model
-                print("OmniServer started successfully")
-                yield server
-                print("OmniServer stopping...")
-        else:
-            if stage_config_path is not None:
-                server_args += ["--deploy-config", stage_config_path]
-
-            with (
-                OmniServer(
-                    model,
-                    server_args,
-                    port=port,
-                    env_dict=params.env_dict,
-                    use_omni=params.use_omni,
-                )
-                if port
-                else OmniServer(
-                    model,
-                    server_args,
-                    env_dict=params.env_dict,
-                    use_omni=params.use_omni,
-                )
-            ) as server:
-                if model != original_model:
-                    server.model = original_model
-                print("OmniServer started successfully")
-                yield server
-                print("OmniServer stopping...")
+        with _temporary_deploy_config_override(
+            stage_config_path,
+            params.deploy_config_overrides,
+        ) as stage_config_path:
+            yield from _iter_omni_server_with_resolved_config(
+                params=params,
+                model=model,
+                original_model=original_model,
+                stage_config_path=stage_config_path,
+            )
 
         print("OmniServer stopped")
+
+
+def _iter_omni_server_with_resolved_config(
+    *,
+    params: OmniServerParams,
+    model: str,
+    original_model: str,
+    stage_config_path: str | None,
+) -> Generator[Any, Any, None]:
+    """Launch one fixture server after any test-only config merge."""
+
+    port = params.port
+    server_args = list(params.server_args or [])
+    if model != original_model:
+        server_args = [*server_args, "--served-model-name", original_model]
+    if params.use_omni and params.stage_init_timeout is not None:
+        server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+    else:
+        server_args = [*server_args, "--stage-init-timeout", "600"]
+    if params.init_timeout is not None:
+        server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+    else:
+        server_args = [*server_args, "--init-timeout", "900"]
+    # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
+    if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
+        server_args = [*server_args, "--log-stats"]
+    if params.use_stage_cli:
+        if not params.use_omni:
+            raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
+        if stage_config_path is None:
+            raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
+        server_args += ["--deploy-config", stage_config_path]
+
+        with OmniServerStageCli(
+            model,
+            stage_config_path,
+            server_args,
+            port=port,
+            env_dict=params.env_dict,
+        ) as server:
+            if model != original_model:
+                server.model = original_model
+            print("OmniServer started successfully")
+            yield server
+            print("OmniServer stopping...")
+        return
+
+    if stage_config_path is not None:
+        server_args += ["--deploy-config", stage_config_path]
+    with (
+        OmniServer(
+            model,
+            server_args,
+            port=port,
+            env_dict=params.env_dict,
+            use_omni=params.use_omni,
+        )
+        if port
+        else OmniServer(
+            model,
+            server_args,
+            env_dict=params.env_dict,
+            use_omni=params.use_omni,
+        )
+    ) as server:
+        if model != original_model:
+            server.model = original_model
+        print("OmniServer started successfully")
+        yield server
+        print("OmniServer stopping...")
 
 
 def iter_omni_runner(

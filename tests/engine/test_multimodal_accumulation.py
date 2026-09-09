@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -12,6 +12,26 @@ from vllm_omni.outputs.multimodal_accumulation import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("tensor_marker", [False, True])
+def test_replay_marker_is_replaced_by_live_output_not_accumulated(tensor_marker):
+    """A replay marker is a step snapshot, never generated content/history."""
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.orchestrator import Orchestrator
+    from vllm_omni.outputs.output_modality import TensorAccumulationStrategy
+    from vllm_omni.outputs.output_processor import OmniRequestState
+
+    state = OmniRequestState.__new__(OmniRequestState)
+    state.mm_accumulated = MultimodalPayload()
+    state.mm_type = None
+    for replay in (True, False, True, False):
+        marker = torch.tensor([replay]) if tensor_marker else replay
+        state.add_multimodal_tensor({"duplex_recovery_replay": marker}, "latent")
+        state.mm_accumulated.consolidate_tensors(TensorAccumulationStrategy.CONCAT_DIM0)
+        output = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output=dict(state.mm_accumulated))])
+        assert Orchestrator._output_is_duplex_recovery_replay(output) is replay
 
 
 def test_chunk_accumulation_policy_replaces_snapshots_and_drains_delta_state():

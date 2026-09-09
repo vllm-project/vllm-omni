@@ -136,6 +136,43 @@ def test_realtime_duplex_demo_pair_requires_distinct_inputs_and_outputs(tmp_path
         demo._validate_pair_args(args)
 
 
+def test_realtime_duplex_demo_extracts_native_append_metrics_from_wire_envelope():
+    demo = _load_demo_module()
+    wire_event = {
+        "type": "duplex.runtime.control",
+        "event": {
+            "type": "runtime.control",
+            "result": {
+                "operation": "append",
+                "stage_results": [
+                    {
+                        "stage_id": 0,
+                        "replica_id": 2,
+                        "result": {
+                            "request_id": "request-stage0",
+                            "append_metrics": {
+                                "appended_tokens": 17,
+                                "omni_context_tokens": 139,
+                                "omni_context_limit": 40960,
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+    }
+
+    assert demo._native_append_observations([wire_event]) == [
+        {
+            "request_id": "request-stage0",
+            "replica_id": 2,
+            "appended_tokens": 17,
+            "omni_context_tokens": 139,
+            "omni_context_limit": 40960,
+        }
+    ]
+
+
 def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path, monkeypatch):
     demo = _load_pair_demo_module()
     fake_demo = tmp_path / "fake_realtime_duplex_demo.py"
@@ -1109,6 +1146,37 @@ def test_realtime_duplex_demo_reads_response_playback_cursor():
     assert state.response_playback_sent_ms("resp-1") == 27920
 
 
+def test_realtime_duplex_demo_reserves_each_created_response_once():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, payload):
+            self.messages.append(demo.json.loads(payload))
+
+    ws = FakeWebSocket()
+    created = {"type": "response.created", "response": {"id": "resp-1"}}
+
+    async def reserve_twice():
+        assert await demo._reserve_response_playback(ws, state, created) is True
+        assert await demo._reserve_response_playback(ws, state, created) is False
+
+    asyncio.run(reserve_twice())
+
+    assert ws.messages == [
+        {
+            "type": "playback.ack",
+            "response_id": "resp-1",
+            "item_id": "item_resp-1",
+            "played_ms": 0,
+            "committed_ms": 0,
+        }
+    ]
+
+
 def test_realtime_duplex_demo_partitions_timing_by_response_identity():
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -1292,6 +1360,96 @@ def test_realtime_duplex_demo_accepts_overlap_unit_terminating_continuous_respon
         before_created=1,
         before_model_listen=0,
     )
+
+
+def test_realtime_duplex_demo_identifies_genuine_native_model_turn_end():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    native_terminal_metadata = {
+        "type": "response.output_audio.delta",
+        "end_of_turn": True,
+        "vllm_omni": {
+            "runtime_impl": "scheduler_data_plane",
+            "model_turn_id": 0,
+            "uses_model_runner_scheduler": True,
+            "runner_kv_backed": True,
+        },
+    }
+    state.add(
+        {
+            "type": "response.done",
+            "response_id": "resp-native-eos",
+            "response": {
+                "id": "resp-native-eos",
+                "status": "completed",
+                "metadata": native_terminal_metadata,
+            },
+        }
+    )
+
+    assert state.model_turn_end_response_ids() == ["resp-native-eos"]
+
+
+@pytest.mark.parametrize("status", ["cancelled", "failed"])
+def test_realtime_duplex_demo_does_not_count_noncompleted_response_as_model_turn_end(status):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add(
+        {
+            "type": "response.done",
+            "response_id": f"resp-{status}",
+            "response": {
+                "id": f"resp-{status}",
+                "status": status,
+                "metadata": {
+                    "type": "response.output_audio.delta",
+                    "end_of_turn": True,
+                    "vllm_omni": {
+                        "runtime_impl": "scheduler_data_plane",
+                        "model_turn_id": 1,
+                        "uses_model_runner_scheduler": True,
+                        "runner_kv_backed": True,
+                    },
+                },
+            },
+        }
+    )
+
+    assert state.model_turn_end_response_ids() == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"type": "response.output_audio.delta", "end_of_turn": False},
+        {
+            "type": "response.output_audio.delta",
+            "end_of_turn": True,
+            "vllm_omni": {
+                "runtime_impl": "scheduler_data_plane",
+                "model_turn_id": True,
+                "uses_model_runner_scheduler": True,
+                "runner_kv_backed": True,
+            },
+        },
+    ],
+)
+def test_realtime_duplex_demo_rejects_incomplete_model_turn_end_metadata(metadata):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-incomplete",
+                "status": "completed",
+                "metadata": metadata,
+            },
+        }
+    )
+
+    assert state.model_turn_end_response_ids() == []
 
 
 def test_realtime_duplex_demo_full_turn_duration_does_not_slice_audio():

@@ -28,6 +28,7 @@ steps:
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"
         timeout_in_minutes: 50
         commands:
+          - export VLLM_USE_V2_MODEL_RUNNER=0
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py -m "full_model and cuda and H100 and omni and cards_1" --run-level "full_model"
         mirror_hardwares: h100_1
 
@@ -109,7 +110,7 @@ steps:
             exit $$EXIT
         mirror_hardwares: h100_1
 
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Realtime Chat Fallback Seed-TTS Perf Test"
         key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts
         timeout_in_minutes: 180
         commands:
@@ -119,6 +120,21 @@ steps:
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_duplex_seed_tts.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_1
+
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Native KV Append Perf Test"
+        key: nightly-omni-performance-minicpmo-4-5-native-kv-append
+        timeout_in_minutes: 60
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results/native-kv-append
+          - export VLLM_USE_V2_MODEL_RUNNER=0
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_native_duplex_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_native_duplex.json --junitxml=tests/dfx/perf/results/native-kv-append.xml
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/native-kv-append/**/*"
+            buildkite-agent artifact upload "tests/dfx/perf/results/native-kv-append.xml"
             exit $$EXIT
         mirror_hardwares: h100_1
 

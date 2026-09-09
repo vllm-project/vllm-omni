@@ -3,7 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -224,8 +224,9 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
         else:
             request_payload.pop(request_id, None)
     code_accumulators = getattr(transfer_manager, "code_prompt_token_ids", None)
-    if hasattr(code_accumulators, "pop"):
-        code_accumulators.pop(request_id, None)
+    pop_code_state = getattr(code_accumulators, "pop", None)
+    if callable(pop_code_state):
+        pop_code_state(request_id, None)
 
 
 def _is_aborted(request: Any) -> bool:
@@ -542,6 +543,33 @@ def _has_native_duplex_prompt_metadata(mm_output):
     return mm_output.get("duplex_prompt_token_ids") is not None or mm_output.get("ids.prompt") is not None
 
 
+def _merge_multimodal_outputs(
+    request_output: object,
+    completion_output: object,
+) -> dict[str, object]:
+    """Merge vLLM request/completion payloads without dropping model data.
+
+    Different vLLM releases place custom model output on different levels of
+    ``RequestOutput``.  Some releases populate both: request-level transport
+    metadata plus completion-level latent/TTS metadata.  Preserve the historic
+    request-level precedence for conflicting leaves while retaining disjoint
+    and nested completion fields.
+    """
+
+    request_values = request_output if isinstance(request_output, Mapping) else {}
+    completion_values = completion_output if isinstance(completion_output, Mapping) else {}
+    merged: dict[str, object] = dict(completion_values)
+    for key, value in request_values.items():
+        fallback = merged.get(key)
+        if isinstance(value, Mapping) and isinstance(fallback, Mapping):
+            nested = dict(fallback)
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
+
+
 def _require_native_tts_boundary_metadata(special_token_ids):
     if special_token_ids.get("tts_bos_token_id") is None:
         raise ValueError(
@@ -599,7 +627,7 @@ def _decode_native_duplex_token_ids(
     request_id: str,
 ) -> str | None:
     decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
-    if not isinstance(decode_token_ids, Callable):
+    if not callable(decode_token_ids):
         return None
     decode_ids = [int(token_id) for token_id in token_ids]
     try:
@@ -708,6 +736,144 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     return metadata
 
 
+def _native_duplex_raw_stage0_segment(streaming_context) -> tuple[list[int], dict[str, object]]:
+    """Return the raw Stage-0 boundary captured before output processing.
+
+    Some vLLM output processors omit the final segment's token ids or custom
+    multimodal metadata from ``RequestOutput``.  The orchestrator records both
+    directly from ``EngineCoreOutput`` so control-only boundaries such as
+    ``<|turn_eos|>`` can still cross the model-stage bridge.
+    """
+    segment_fn = getattr(streaming_context, "segment", None)
+    if callable(segment_fn):
+        segment = segment_fn(0)
+    else:
+        segments = getattr(streaming_context, "segments", None)
+        segment = segments.get(0) if isinstance(segments, Mapping) else None
+    token_ids = _coerce_token_id_list(getattr(segment, "token_ids", None)) or []
+    output_metadata = getattr(segment, "output_metadata", None)
+    return token_ids, dict(output_metadata) if isinstance(output_metadata, Mapping) else {}
+
+
+def _native_duplex_stage0_input_metadata(streaming_context) -> dict[str, object]:
+    """Return scheduler-captured metadata for the exact Stage-0 segment."""
+    segment_fn = getattr(streaming_context, "segment", None)
+    if callable(segment_fn):
+        segment = segment_fn(0)
+    else:
+        segments = getattr(streaming_context, "segments", None)
+        segment = segments.get(0) if isinstance(segments, Mapping) else None
+    input_metadata = getattr(segment, "input_metadata", None)
+    return dict(input_metadata) if isinstance(input_metadata, Mapping) else {}
+
+
+def _native_duplex_turn_end_fence_pending(streaming_context) -> bool:
+    """Arm or retain the input-commit fence until Stage 0 goes idle.
+
+    MiniCPM-o can emit a speech condition for the input unit marked ``final``
+    and only reach its control-only boundary after one or more engine-generated
+    silence continuations.  Those continuations are separate scheduler units
+    with ``final=False``.  Persist the exact turn identity in bridge state so
+    the eventual control boundary can consume the commit once, without
+    treating an unrelated non-final listen unit as terminal.
+    """
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
+        return False
+    metadata = _native_duplex_stage0_input_metadata(streaming_context)
+    duplex = metadata.get("duplex")
+    if not isinstance(duplex, Mapping) or duplex.get("data_plane") is not True:
+        return False
+    identity = tuple(duplex.get(key) for key in ("session_id", "incarnation", "epoch", "turn_id"))
+    if not isinstance(identity[0], str) or not identity[0]:
+        return False
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in identity[1:]):
+        return False
+
+    state = bridge_states.setdefault("minicpmo45_turn_end_fence", {})
+    if not isinstance(state, dict):
+        state = {}
+        bridge_states["minicpmo45_turn_end_fence"] = state
+    pending_identity = state.get("identity")
+    if duplex.get("final") is True:
+        state.clear()
+        state.update(
+            {
+                "identity": identity,
+                "seq": duplex.get("seq"),
+            }
+        )
+        pending_identity = identity
+    elif pending_identity is not None and pending_identity != identity:
+        # Barge-in/reopen/new turn invalidates an unconsumed old fence.
+        state.clear()
+        return False
+    return pending_identity == identity
+
+
+def _consume_native_duplex_turn_end_fence(streaming_context) -> None:
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    state = bridge_states.get("minicpmo45_turn_end_fence") if isinstance(bridge_states, dict) else None
+    if isinstance(state, dict):
+        state.clear()
+
+
+def _advance_native_duplex_model_turn(streaming_context) -> None:
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    duplex_state = bridge_states.get("duplex") if isinstance(bridge_states, dict) else None
+    if not isinstance(duplex_state, dict):
+        return
+    current_turn_id = duplex_state.get("model_turn_id", duplex_state.get("turn_id", 0))
+    if isinstance(current_turn_id, int) and not isinstance(current_turn_id, bool):
+        duplex_state["model_turn_id"] = current_turn_id + 1
+
+
+def _build_native_duplex_turn_end_input(
+    *,
+    request_id: str,
+    prompt_token_ids: list[int],
+    output_token_ids: list[int],
+    turn_eos_token_id: int,
+    streaming_context,
+    multi_modal_data: object | None,
+) -> OmniTokensPrompt:
+    """Build a zero-speech Talker request that transports a turn boundary."""
+    model_intermediate_buffer = build_duplex_intermediate_buffer(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        output_token_ids=output_token_ids,
+        output_text="",
+        stream_output=True,
+        native_duplex=True,
+    )
+    data_plane_metadata = _native_duplex_data_plane_metadata(streaming_context)
+    if data_plane_metadata is not None:
+        model_intermediate_buffer["duplex"] = data_plane_metadata
+    set_tts_handoff(model_intermediate_buffer, [], [])
+    meta = model_intermediate_buffer.setdefault("meta", {})
+    meta.update(
+        {
+            "native_duplex_segment_text": "",
+            "turn_end": True,
+            "turn_eos_token_id": turn_eos_token_id,
+            "segment_end": True,
+            "replace_streaming_prompt": True,
+            "next_stage_prompt_len": 1,
+            "next_stage_generation_tokens": MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
+            "override_keys": [
+                "llm_output_text",
+                ["meta", "native_duplex_segment_text"],
+            ],
+        }
+    )
+    return OmniTokensPrompt(
+        prompt_token_ids=[0],
+        model_intermediate_buffer=model_intermediate_buffer,
+        multi_modal_data=multi_modal_data,
+        mm_processor_kwargs=None,
+    )
+
+
 def _build_tts_scheduler_prompt_token_ids(
     tts_token_ids: torch.Tensor | None,
     llm_output_ids: list[int],
@@ -753,12 +919,11 @@ def llm2tts(
         output = llm_output.outputs[0]
         request_mm_output = getattr(llm_output, "multimodal_output", None)
         completion_mm_output = getattr(output, "multimodal_output", None)
-        if isinstance(request_mm_output, Mapping):
-            mm_output = request_mm_output
-        elif isinstance(completion_mm_output, Mapping):
-            mm_output = completion_mm_output
-        else:
-            mm_output = {}
+        mm_output = _merge_multimodal_outputs(request_mm_output, completion_mm_output)
+        raw_segment_ids, raw_segment_metadata = _native_duplex_raw_stage0_segment(_streaming_context)
+        # Processed request/completion values remain authoritative; raw model
+        # metadata only fills leaves lost by the output processor.
+        mm_output = _merge_multimodal_outputs(mm_output, raw_segment_metadata)
         special_token_ids = _special_token_ids_from_mm_output(mm_output)
         prompt_token_ids = (
             _coerce_token_id_list(mm_output.get("duplex_prompt_token_ids"))
@@ -803,6 +968,53 @@ def llm2tts(
         prompt_token_ids_len = len(prompt_token_ids)
 
         is_native_duplex_handoff = _has_native_duplex_prompt_metadata(mm_output)
+        is_native_duplex_session = _native_duplex_data_plane_metadata(_streaming_context) is not None
+        turn_end_fence_pending = (
+            _native_duplex_turn_end_fence_pending(_streaming_context) if is_native_duplex_session else False
+        )
+        turn_eos_id = special_token_ids.get("turn_eos_token_id")
+        raw_control_turn_end = (
+            is_native_duplex_session
+            and turn_eos_id is not None
+            and turn_eos_id in raw_segment_ids
+            and _native_duplex_output_is_control_only(raw_segment_ids, special_token_ids)
+        )
+        final_append_control_turn_end = (
+            is_native_duplex_session
+            and turn_eos_id is not None
+            and turn_end_fence_pending
+            and not llm_output_ids
+            and bool(raw_segment_ids)
+            and _native_duplex_output_is_control_only(raw_segment_ids, special_token_ids)
+        )
+
+        if raw_control_turn_end or final_append_control_turn_end:
+            tts_inputs.append(
+                _build_native_duplex_turn_end_input(
+                    request_id=str(llm_output.request_id),
+                    prompt_token_ids=prompt_token_ids,
+                    output_token_ids=raw_segment_ids,
+                    turn_eos_token_id=turn_eos_id,
+                    streaming_context=_streaming_context,
+                    multi_modal_data=(
+                        multi_modal_data[llm_output.request_id]
+                        if requires_multimodal_data and multi_modal_data.get(llm_output.request_id) is not None
+                        else None
+                    ),
+                )
+            )
+            _consume_native_duplex_turn_end_fence(_streaming_context)
+            _advance_native_duplex_model_turn(_streaming_context)
+            continue
+
+        if is_native_duplex_session and not is_native_duplex_handoff:
+            # A scheduler-native unit can finish with only request-level text
+            # bookkeeping (for example an initial/forced listen decision).
+            # It is not a Talker prompt.  Waiting for the next append keeps the
+            # Stage-0 KV session alive and prevents a malformed Stage-1 request
+            # from turning this expected control-only unit into an engine-fatal
+            # missing-conditioning error.
+            continue
 
         latent = mm_output.get("latent", None)
         if latent is None:
@@ -811,9 +1023,29 @@ def llm2tts(
                 if is_native_duplex_handoff and _native_duplex_output_is_control_only(
                     llm_output_ids, special_token_ids
                 ):
+                    if turn_eos_id is not None and turn_eos_id in llm_output_ids:
+                        tts_inputs.append(
+                            _build_native_duplex_turn_end_input(
+                                request_id=str(llm_output.request_id),
+                                prompt_token_ids=prompt_token_ids,
+                                output_token_ids=llm_output_ids,
+                                turn_eos_token_id=turn_eos_id,
+                                streaming_context=_streaming_context,
+                                multi_modal_data=(
+                                    multi_modal_data[llm_output.request_id]
+                                    if requires_multimodal_data
+                                    and multi_modal_data.get(llm_output.request_id) is not None
+                                    else None
+                                ),
+                            )
+                        )
+                        _consume_native_duplex_turn_end_fence(_streaming_context)
+                        _advance_native_duplex_model_turn(_streaming_context)
                     continue
                 raise ValueError("No latent or hidden_states found in thinker output")
 
+        if not isinstance(latent, torch.Tensor):
+            raise ValueError("MiniCPM-o thinker latent must be a tensor")
         thinker_hidden_states = latent.detach()
         if thinker_hidden_states.ndim == 3 and thinker_hidden_states.shape[0] == 1:
             thinker_hidden_states = thinker_hidden_states.squeeze(0)
@@ -969,7 +1201,10 @@ def llm2tts(
             if data_plane_metadata is not None:
                 model_intermediate_buffer["duplex"] = data_plane_metadata
             meta["native_duplex_segment_text"] = thinker_text
-            meta.setdefault("override_keys", []).extend(
+            override_keys = meta.setdefault("override_keys", [])
+            if not isinstance(override_keys, list):
+                raise ValueError("MiniCPM-o override_keys must be a list")
+            override_keys.extend(
                 [
                     "llm_output_text",
                     ["meta", "native_duplex_segment_text"],
@@ -980,8 +1215,9 @@ def llm2tts(
                 # handed condition (official conditions on its embedding).
                 meta["turn_eos_token_id"] = int(turn_eos_id)
             meta["turn_start"] = native_turn_start
-            if native_segment_end:
-                meta["segment_end"] = True
+            # Resumable Talker input merges metadata across chunks. These are
+            # per-handoff flags, so false must overwrite an earlier boundary.
+            meta["segment_end"] = native_segment_end
         ref_audio = reference_audio_by_request_id.get(llm_output.request_id)
         if ref_audio is None:
             ref_audio = _extract_native_runtime_ref_audio(
@@ -995,11 +1231,17 @@ def llm2tts(
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
-            if not handoff_ids:
-                continue
+            if not handoff_ids or not handoff_hidden:
+                # Talker conditioning is an atomic pair.  A listen/control
+                # unit, or a partially transported handoff, must not create a
+                # non-empty EngineCore request that can only fail in preprocess.
+                if not native_turn_end_handoff:
+                    continue
+                handoff_ids = []
+                handoff_hidden = []
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
-        if native_turn_end_handoff:
-            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
+        if is_native_duplex_handoff:
+            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = native_turn_end_handoff
 
         condition_sequence_state = None
         condition_sequence_value = None
@@ -1030,8 +1272,9 @@ def llm2tts(
                 handoff_meta["streaming_condition_seq"] = condition_sequence_value
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
-            if not is_native_duplex_handoff or native_turn_start:
-                handoff_meta["replace_streaming_prompt"] = True
+            handoff_meta["replace_streaming_prompt"] = (
+                not is_native_duplex_handoff or native_turn_start or native_turn_end_handoff
+            )
         else:
             scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(
                 tts_token_ids_slice,
@@ -1053,11 +1296,7 @@ def llm2tts(
         if condition_sequence_state is not None:
             condition_sequence_state["condition_seq"] = condition_sequence_value
         if native_turn_end_handoff:
-            bridge_states = getattr(_streaming_context, "bridge_states", None)
-            duplex_state = bridge_states.get("duplex") if isinstance(bridge_states, dict) else None
-            if isinstance(duplex_state, dict):
-                current_model_turn_id = duplex_state.get("model_turn_id", duplex_state.get("turn_id", 0))
-                if isinstance(current_model_turn_id, int):
-                    duplex_state["model_turn_id"] = current_model_turn_id + 1
+            _consume_native_duplex_turn_end_fence(_streaming_context)
+            _advance_native_duplex_model_turn(_streaming_context)
 
     return tts_inputs

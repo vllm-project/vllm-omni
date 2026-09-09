@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import pytest
 
+from vllm_omni.engine.duplex import control_client as duplex_control_client
 from vllm_omni.engine.duplex.control_client import (
     DuplexControlClient,
     DuplexControlRequestError,
 )
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.messages import (
+    AppendDuplexInputMessage,
     DuplexControlError,
     DuplexControlResultMessage,
     DuplexFence,
@@ -23,7 +25,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _Transport:
     def __init__(self) -> None:
-        self.calls = []
+        self.calls: list[tuple[object, object, dict[str, object]]] = []
 
     def execute(self, key, message, **kwargs):
         self.calls.append((key, message, kwargs))
@@ -90,6 +92,68 @@ def test_control_client_routes_touch_and_resume_by_control_id() -> None:
     assert isinstance(resume_message, ResumeDuplexSessionMessage)
     assert resume_message.expected_lease_generation == 7
     assert resume_kwargs["timeout"] == 3.0
+
+
+def test_control_client_stamps_append_with_caller_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(duplex_control_client.time, "monotonic", lambda: 100.0)
+    transport = _Transport()
+    client = DuplexControlClient(transport, control_id_factory=lambda: "append-id")
+    fence = DuplexFence("sid-append")
+
+    client.append(
+        fence.session_id,
+        mode="append_audio_chunk",
+        payload={"audio": b"pcm"},
+        operation_id="append-operation",
+        final=False,
+        expected_epoch=0,
+        fence=fence,
+        timeout=2.5,
+    )
+
+    key, message, kwargs = transport.calls[0]
+    assert key == ("duplex", "append-id")
+    assert isinstance(message, AppendDuplexInputMessage)
+    assert message.operation_id == "append-operation"
+    assert message.deadline_monotonic == 102.5
+    assert kwargs["timeout"] == 2.5
+
+
+def test_control_client_preserves_trace_and_admission_metadata() -> None:
+    class _TraceTransport(_Transport):
+        def execute(self, key, message, **kwargs):
+            self.calls.append((key, message, kwargs))
+            return DuplexControlResultMessage(
+                control_id=message.control_id,
+                fence=message.fence,
+                operation="append",
+                session_id=message.session_id,
+                ok=True,
+                stage_results=[],
+                admission={"mode": "queued", "reason": "capacity_released"},
+                trace={
+                    "session_id": message.session_id,
+                    "event": "append",
+                    "control_id": message.control_id,
+                    "operation_id": message.operation_id,
+                },
+            )
+
+    transport = _TraceTransport()
+    client = DuplexControlClient(transport, control_id_factory=lambda: "control-1")
+    result = client.append(
+        "sid-trace",
+        mode="append_audio_chunk",
+        payload={"audio": b"pcm"},
+        operation_id="operation-1",
+        final=False,
+        expected_epoch=0,
+        fence=DuplexFence("sid-trace"),
+        timeout=1.0,
+    )
+    assert result["admission"]["mode"] == "queued"
+    assert result["trace"]["control_id"] == "control-1"
+    assert result["trace"]["operation_id"] == "operation-1"
 
 
 def test_control_client_treats_ok_false_as_authoritative_failure() -> None:

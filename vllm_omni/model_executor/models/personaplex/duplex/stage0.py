@@ -29,9 +29,7 @@ _FRAME_SAMPLES = 1920
 class PersonaPlexStage0PreparedAppend:
     input_ids: Any
     inputs_embeds: Any
-    user_codes: Any
     info_update: dict[str, Any]
-    prefill_applied: bool
     prompt_offset: int
 
 
@@ -40,6 +38,7 @@ class PersonaPlexStage0SessionState:
     session_id: str
     incarnation: int
     user_codes: Any | None = None
+    user_frame_count: int = 0
     last_text_token: Any | None = None
     last_agent_codes: Any | None = None
     prefill_slots: int = 0
@@ -182,7 +181,12 @@ class PersonaPlexStage0DuplexRuntime:
                 f"PersonaPlex Mimi encoder returned {user_frame.shape[1]} codebooks, expected at least 8"
             )
         user_frame = user_frame[:, :8].contiguous()
-        state.user_codes = user_frame if state.user_codes is None else torch.cat([state.user_codes, user_frame], dim=0)
+        # Only the current and two preceding frames participate in the Moshi
+        # delay pattern. Keep independent bounded snapshots for queued work.
+        state.user_codes = (
+            user_frame if state.user_codes is None else torch.cat([state.user_codes[-2:], user_frame], dim=0)
+        )
+        state.user_frame_count += 1
 
         runtime_config = duplex.get("runtime_config")
         runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
@@ -284,7 +288,7 @@ class PersonaPlexStage0DuplexRuntime:
             "pplex_depformer_audio_tokens": depformer_audio_tokens.detach().cpu(),
             "pplex_depformer_audio_provided": depformer_audio_provided.detach().cpu(),
             "meta": {
-                "pplex_frame": state.prefill_slots + int(state.user_codes.shape[0]),
+                "pplex_frame": state.prefill_slots + state.user_frame_count,
                 "pplex_prefill_len": state.prefill_slots,
             },
             "duplex": {
@@ -299,9 +303,7 @@ class PersonaPlexStage0DuplexRuntime:
         prepared = PersonaPlexStage0PreparedAppend(
             input_ids=input_ids,
             inputs_embeds=full_embeds,
-            user_codes=state.user_codes,
             info_update=info_update,
-            prefill_applied=first_append,
             prompt_offset=prompt_offset,
         )
         state.prepared_identity = identity

@@ -4,12 +4,15 @@ async_chunk: true
 # Native full-duplex shares this profile with /v1/chat/completions. Every other
 # duplex_session knob keeps its runtime default.
 session_mode: duplex
-# Keep the active window aligned with the session and stage capacities below.
-# A smaller window serializes first-packet generation for concurrent chat turns.
+# Keep the active window aligned with the validated duplex admission envelope.
+# The default single-H200 profile completed two independent synchronized
+# four-session/two-turn gates with Stage0 async scheduling disabled.
 active_stream_window: 4
 duplex_session:
-  # Matches Stage 0/1 max_num_seqs below.
   max_sessions: 4
+  # Bounds engine-owned same-session append work; cancel/close bypass and
+  # preempt this queue so overload cannot prevent resource reclamation.
+  max_pending_appends_per_session: 4
 
 trust_remote_code: true
 enable_prefix_caching: false
@@ -34,10 +37,18 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 4
+    # Async-on is opt-in: aligned V1 runner/scheduler and unit fences pass the
+    # H200 four-session correctness gate. Native performance needs its own
+    # benchmark; Seed-TTS chat-fallback timings do not measure KV append.
+    async_scheduling: false
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
     tensor_parallel_size: 1
+    # Explicit hard ceiling for retained Stage0 prompt/KV growth. This matches
+    # the checkpoint's advertised context and makes long-session exhaustion a
+    # typed append failure instead of an implicit worker OOM boundary.
+    max_model_len: 40960
     max_num_batched_tokens: 16384
     devices: "0"
     # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
@@ -94,6 +105,12 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 4
+    # Stage 1 is the sole bounded-stream admission owner. If Stage 2 also
+    # maintains an independent active window, segment-boundary rotation can pick
+    # a disjoint pair and deadlock the pipeline (Talker waits for Code2Wav
+    # while Code2Wav waits for Talker-selected streams). Poll all Stage 2
+    # sessions; only streams admitted by Stage 1 can deliver runnable chunks.
+    active_stream_window: 0
     gpu_memory_utilization: 0.18
     enforce_eager: true
     enable_chunked_prefill: false

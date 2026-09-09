@@ -172,9 +172,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_status: RequestStatus,
     ) -> list[Request]:
         """Finish requests and discard any incomplete KV-wait timing."""
+        cleanup_ids: tuple[str, ...]
+        finish_request_ids: str | Iterable[str] | None
         if isinstance(request_ids, str):
             cleanup_ids = (request_ids,)
-            finish_request_ids: str | tuple[str, ...] | None = request_ids
+            finish_request_ids = request_ids
         elif request_ids is None:
             cleanup_ids = ()
             finish_request_ids = None
@@ -188,6 +190,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         return self._get_omni_kv_config_value("kv_transfer_criteria")
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        if getattr(request, "streaming_prompt_continuous", False):
+            request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+            self.num_waiting_for_streaming_input += 1
+            self._enqueue_waiting_request(request)
+            return False
+        return super()._handle_stopped_request(request)
 
     def _get_omni_kv_config_value(self, key: str, default: Any = None) -> Any:
         config = getattr(self, "_omni_kv_config", None)
@@ -461,6 +471,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             status_before_stop = request.status
             new_logprobs = None
             logprob_validation_failed = False
+            input_error = (getattr(model_runner_output, "model_input_errors", {}) or {}).get(req_id)
+            if input_error:
+                if getattr(request, "streaming_prompt_continuous", False):
+                    OmniSchedulerMixin._record_native_model_input_error(self, req_id, input_error)
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = input_error
+                request.resumable = False
+                request.streaming_prompt_continuous = False
+                generated_token_ids = []
 
             # Validate before mutating request token state. A bad runner output
             # is request-local: terminate only this request and keep processing
@@ -508,13 +527,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = logprob_validation_failed
+            stopped = logprob_validation_failed or bool(input_error)
             is_segment_finished = False
             finished = False
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
+            if input_error:
+                pooler_output = mm_output = inter_stage_output = None
             kv_transfer_params = None
             ec_transfer_params = None
             finish_reason = None
@@ -850,6 +871,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
+                assert self.chunk_transfer_adapter is not None
                 self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
                 return
             if replaced is not None:

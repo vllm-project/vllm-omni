@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
 import os
@@ -64,17 +64,21 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
-    def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
+    def _get_data_with_lock(
+        self, lock_file: str, shm_handle: dict[str, Any], *, nonblocking: bool = False
+    ) -> tuple[Any, int] | None:
         deserialized = False
         try:
             with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
+                fcntl.flock(lockf, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
             result = (obj, int(shm_handle.get("size", 0)))
             deserialized = True
             return result
+        except BlockingIOError:
+            return None
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
@@ -85,7 +89,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 except FileNotFoundError:
                     pass
 
-    def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
+    def _get_by_key(self, get_key: str, *, nonblocking: bool = False) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
         shm = None
         try:
@@ -94,7 +98,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 return None
             lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
             shm_handle = {"name": get_key, "size": shm.size}
-            result = self._get_data_with_lock(lock_file, shm_handle)
+            result = self._get_data_with_lock(lock_file, shm_handle, nonblocking=nonblocking)
             if result is not None:
                 self._pending_keys.discard(get_key)
             return result
@@ -114,6 +118,12 @@ class SharedMemoryConnector(OmniConnectorBase):
         finally:
             if shm:
                 shm.close()
+
+    def get_nowait(self, from_stage: str, to_stage: str, get_key: str) -> tuple[Any, int] | None:
+        result = self._get_by_key(get_key, nonblocking=True)
+        if result is not None:
+            self._metrics["gets"] += 1
+        return result
 
     def get(
         self,

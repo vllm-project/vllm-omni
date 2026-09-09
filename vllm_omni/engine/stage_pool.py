@@ -137,6 +137,14 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        # One bounded retry guard per resident native request. ``uncertain``
+        # means the utility reply was lost and only the same logical append
+        # may proceed; ``completed`` keeps a duplicate retry from creating a
+        # fresh output-processor registration for a scheduler-deduped unit.
+        self._native_append_operations: dict[
+            str,
+            tuple[str, bytes | None, tuple[int, ...], str],
+        ] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -520,11 +528,23 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        self._native_append_operations.pop(request_id, None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
         for request_id in request_ids:
             self.release_binding(request_id)
+
+    def native_append_operation_state(self, request_id: str) -> str | None:
+        """Return the bounded scheduler-append commit state for fault fencing.
+
+        Replica recovery may replay only a fully committed journal.  A lost
+        utility reply leaves an ``uncertain`` operation in this stage-local
+        guard even after the control RPC has timed out, so the orchestrator
+        must inspect it before releasing the dead replica's bindings.
+        """
+        operation = self._native_append_operations.get(request_id)
+        return operation[3] if operation is not None else None
 
     def release_replica_bindings(self, replica_id: int) -> list[str]:
         """Drop all route/session bindings owned by one physical replica."""
@@ -823,7 +843,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -1000,8 +1020,8 @@ class StagePool:
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
-            client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            diffusion_client = self._diffusion_client(replica_id)
+            await diffusion_client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
         replica_id = await self._pick_or_select(
@@ -1095,6 +1115,301 @@ class StagePool:
                         )
                 raise
         return replica_id
+
+    async def submit_streaming_prompt_initial(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        request: Any,
+        *,
+        prompt_text: Any = None,
+        operation_id: str | None,
+        operation_fingerprint: bytes | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> tuple[int, dict[str, int | float | bool | str]]:
+        """Admit a scheduler-native streaming-prompt request."""
+        del req_state
+        if self.stage_type == "diffusion":
+            raise ValueError("scheduler-native streaming prompt requires an LLM stage")
+        if not operation_id:
+            raise ValueError("scheduler-native streaming prompt admission requires a non-empty operation_id")
+        if not isinstance(operation_fingerprint, bytes) or not operation_fingerprint:
+            raise ValueError("scheduler-native streaming prompt admission requires a full operation_fingerprint")
+        replica_id = await self._pick_or_select(request_id)
+        client = self.clients[replica_id]
+        if client is None:
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        try:
+            self.output_processor.add_request(
+                request=request,
+                prompt=prompt_text,
+                parent_req=None,
+                request_index=0,
+                queue=None,
+            )
+            add_streaming_prompt = getattr(client, "admit_duplex_request_async", None)
+            if not callable(add_streaming_prompt):
+                raise RuntimeError("Omni client does not provide admit_duplex_request_async")
+            await self._await_with_deadline(
+                add_streaming_prompt(request),
+                deadline_monotonic,
+                f"streaming prompt admission timed out for {request_id}",
+            )
+            metrics = await self._wait_for_streaming_prompt_prefill(
+                client,
+                request_id,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except Exception:
+            # Preserve the binding so orchestrator compensation can route an
+            # abort if admission reached EngineCore before the await failed.
+            rollback = getattr(self.output_processor, "remove_request", None)
+            if callable(rollback):
+                rollback(request_id)
+            raise
+        return replica_id, metrics
+
+    async def submit_streaming_prompt_update(
+        self,
+        request_id: str,
+        request: Any,
+        *,
+        operation_id: str | None,
+        operation_fingerprint: bytes | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> tuple[int, dict[str, int | float | bool | str]]:
+        """Append prompt tokens and runtime metadata atomically in the core."""
+        if self.stage_type == "diffusion":
+            raise ValueError("scheduler-native streaming prompt requires an LLM stage")
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None:
+            raise StageUnavailableError(
+                f"scheduler-native request {request_id} lost its stage {self.stage_id} replica binding; "
+                "resident KV cannot be reassigned"
+            )
+        if replica_id >= len(self.clients) or self.clients[replica_id] is None:
+            raise StageUnavailableError(
+                f"scheduler-native request {request_id} replica {replica_id} is unavailable; "
+                "resident KV cannot be reassigned"
+            )
+        client = self.clients[replica_id]
+        if client is None:
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if not isinstance(token_ids, list):
+            raise TypeError("scheduler-native streaming prompt append requires prompt_token_ids")
+        if not operation_id:
+            raise ValueError("scheduler-native streaming prompt append requires a non-empty operation_id")
+        if not isinstance(operation_fingerprint, bytes) or not operation_fingerprint:
+            raise ValueError("scheduler-native streaming prompt append requires a full operation_fingerprint")
+        operation_signature = (
+            operation_id,
+            operation_fingerprint,
+            tuple(int(token_id) for token_id in token_ids),
+        )
+        previous_operation = self._native_append_operations.get(request_id)
+        reuse_output_registration = False
+        if previous_operation is not None:
+            previous_signature = previous_operation[:3]
+            previous_state = previous_operation[3]
+            if previous_state == "uncertain" and previous_signature != operation_signature:
+                raise RuntimeError(
+                    "streaming_prompt_uncertain_operation_requires_retry: "
+                    f"request={request_id}, operation={previous_operation[0]!r}"
+                )
+            reuse_output_registration = previous_signature == operation_signature
+        await self._wait_for_streaming_prompt_append_ready(
+            client,
+            request_id,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if not reuse_output_registration:
+            await self._wait_for_streaming_prompt_output_retirement(
+                request_id,
+                deadline_monotonic=deadline_monotonic,
+            )
+        append_streaming_prompt = getattr(client, "append_streaming_prompt_unit_async", None)
+        if not callable(append_streaming_prompt):
+            raise RuntimeError("vLLM does not provide scheduler-native streaming prompt append")
+        try:
+            # A completed segment is removed from the output processor even
+            # though the scheduler-owned streaming-prompt request remains
+            # alive. Re-register it before the append can produce the next
+            # segment, matching the legacy ``submit_update`` lifecycle.
+            if not reuse_output_registration:
+                self.output_processor.add_request(
+                    request=request,
+                    prompt=None,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+            self._native_append_operations[request_id] = (*operation_signature, "uncertain")
+            append_result = await self._await_with_deadline(
+                append_streaming_prompt(
+                    request_id,
+                    token_ids,
+                    model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+                    operation_id=operation_id,
+                    operation_fingerprint=operation_fingerprint,
+                    sampling_params=getattr(request, "sampling_params", None),
+                ),
+                deadline_monotonic,
+                f"streaming prompt append timed out for {request_id}",
+            )
+            if append_result is None:
+                metrics: dict[str, int | float | bool | str] = {}
+            elif isinstance(append_result, dict):
+                metrics = {
+                    str(key): value
+                    for key, value in append_result.items()
+                    if isinstance(value, int | float | bool | str)
+                }
+            else:
+                raise RuntimeError(f"invalid streaming prompt append result for {request_id}: {append_result!r}")
+            self._native_append_operations[request_id] = (*operation_signature, "completed")
+        except TimeoutError:
+            # The core utility may have committed just before its reply was
+            # lost. Keep output processing registered while that unit runs;
+            # the same operation_id can be retried once it parks again.
+            raise
+        except Exception as exc:
+            if "streaming_prompt_uncertain_operation_requires_retry" not in str(exc):
+                self._native_append_operations.pop(request_id, None)
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    rollback(request_id)
+            # The scheduler journal owns a partially committed append. Keep
+            # both the exact-operation guard and output registration intact so
+            # a same-ID retry can finish receipt bookkeeping without duplicating input.
+            raise
+        return replica_id, metrics
+
+    async def wait_streaming_prompt_append_ready(
+        self,
+        request_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        """Fence a planned replay/rollover at a parked segment boundary."""
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or replica_id >= len(self.clients):
+            raise StageUnavailableError(f"scheduler-native request {request_id} lost its replica binding")
+        client = self.clients[replica_id]
+        if client is None:
+            raise StageUnavailableError(f"scheduler-native request {request_id} replica is unavailable")
+        await self._wait_for_streaming_prompt_append_ready(
+            client,
+            request_id,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    @staticmethod
+    async def _wait_for_streaming_prompt_append_ready(
+        client: Any,
+        request_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        """Wait until the previous native-duplex segment has stopped decoding."""
+        get_metrics = getattr(client, "get_streaming_prompt_metrics_async", None)
+        if not callable(get_metrics):
+            raise RuntimeError("vLLM does not provide get_streaming_prompt_metrics_async")
+        deadline = deadline_monotonic if deadline_monotonic is not None else _time.monotonic() + 120.0
+        while True:
+            metrics = await StagePool._await_with_deadline(
+                get_metrics(request_id),
+                deadline,
+                f"streaming prompt append readiness timed out for {request_id}",
+            )
+            if not isinstance(metrics, dict):
+                raise RuntimeError(f"invalid streaming prompt metrics for {request_id}: {metrics!r}")
+            if metrics.get("omni_model_input_error"):
+                raise RuntimeError(str(metrics["omni_model_input_error"]))
+            status = str(metrics.get("status", ""))
+            if status == "WAITING_FOR_STREAMING_REQ":
+                return
+            if bool(metrics.get("is_finished", False)):
+                raise RuntimeError(f"streaming prompt request finished before append: {request_id}")
+            if _time.monotonic() >= deadline:
+                raise TimeoutError(f"streaming prompt append waited too long for {request_id}; status={status!r}")
+            await asyncio.sleep(min(0.01, max(deadline - _time.monotonic(), 0.0)))
+
+    async def _wait_for_streaming_prompt_output_retirement(
+        self,
+        request_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        """Fence re-registration on consumption of the prior terminal output.
+
+        The scheduler parks a streaming-prompt request before the output
+        poller necessarily consumes that segment's terminal output. Registering
+        the next non-resumable segment while the old OutputProcessor state is
+        still present makes vLLM retire the registration as an invalid
+        streaming update, after which the next segment's outputs are dropped.
+        """
+        request_states = getattr(self.output_processor, "request_states", None)
+        if not isinstance(request_states, Mapping):
+            # Compatibility with older vLLM versions and lightweight tests
+            # whose output processors do not expose registration state.
+            return
+        deadline = deadline_monotonic if deadline_monotonic is not None else _time.monotonic() + 120.0
+        while request_id in request_states:
+            if _time.monotonic() >= deadline:
+                raise TimeoutError(f"streaming prompt output retirement timed out for {request_id}")
+            await asyncio.sleep(min(0.01, max(deadline - _time.monotonic(), 0.0)))
+
+    @staticmethod
+    async def _wait_for_streaming_prompt_prefill(
+        client: Any,
+        request_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, int | float | bool | str]:
+        """Confirm initial prefill; vLLM 0.28 has no separate finalize RPC."""
+        get_metrics = getattr(client, "get_streaming_prompt_metrics_async", None)
+        if not callable(get_metrics):
+            raise RuntimeError("vLLM does not provide streaming prompt lifecycle utilities")
+        deadline = deadline_monotonic if deadline_monotonic is not None else _time.monotonic() + 120.0
+        while True:
+            metrics = await StagePool._await_with_deadline(
+                get_metrics(request_id),
+                deadline,
+                f"streaming prompt prefill metrics timed out for {request_id}",
+            )
+            if not isinstance(metrics, dict):
+                raise RuntimeError(f"invalid streaming prompt metrics for {request_id}: {metrics!r}")
+            if metrics.get("omni_request_found") is False or metrics.get("status") == "NOT_FOUND":
+                if metrics.get("omni_model_input_error"):
+                    raise RuntimeError(str(metrics["omni_model_input_error"]))
+                raise KeyError(f"streaming prompt request not found: {request_id}")
+            prompt_tokens = int(metrics.get("num_prompt_tokens", 0))
+            computed_tokens = int(metrics.get("num_computed_tokens", 0))
+            if computed_tokens >= prompt_tokens:
+                return {
+                    str(key): value for key, value in metrics.items() if isinstance(value, int | float | bool | str)
+                }
+            if _time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"streaming prompt prefill timed out for {request_id}: "
+                    f"computed={computed_tokens}, prompt={prompt_tokens}"
+                )
+            await asyncio.sleep(min(0.01, max(deadline - _time.monotonic(), 0.0)))
+
+    @staticmethod
+    async def _await_with_deadline(awaitable: Any, deadline_monotonic: float | None, message: str) -> Any:
+        if deadline_monotonic is None:
+            return await awaitable
+        remaining = deadline_monotonic - _time.monotonic()
+        if remaining <= 0:
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise TimeoutError(message)
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except TimeoutError as exc:
+            raise TimeoutError(message) from exc
 
     async def submit_interaction(
         self,

@@ -34,6 +34,13 @@ steps:
           - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
         mirror_hardwares: h100_2
 
+      - label: "Reliability Test · MiniCPM-o 4.5 · Duplex KV Lifecycle"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_USE_V2_MODEL_RUNNER=0
+          - pytest -s -v tests/dfx/reliability/test_reliability_minicpmo_4_5_duplex.py -m "slow and H100 and cards_1" --run-level "full_model"
+        mirror_hardwares: h100_1
+
       - label: "Reliability Test · wan22"
         timeout_in_minutes: 180
         commands:

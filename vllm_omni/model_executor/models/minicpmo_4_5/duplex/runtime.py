@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from base64 import b64decode
 from binascii import Error as BinasciiError
+from copy import deepcopy
 from typing import Any, cast
 
 from vllm.sampling_params import SamplingParams
@@ -136,8 +137,9 @@ def build_duplex_data_plane_prompt(
             token_budget = context_reserve + first_units * 12 - 1 + _duplex_vision_tokens(payload)
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
-    if final and duplex_payload_is_exact_chunks(payload):
-        token_budget += 12
+    # final arms the model's turn-end fence; it does not build another audio
+    # unit. Reserving an extra 12 slots here used to execute phantom padding
+    # before every committed tail (25 scheduled tokens for 13 real embeddings).
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
@@ -262,6 +264,9 @@ def _stage_config_value(runtime_config: dict[str, Any], key: str, stage_id: int)
 
 
 class MiniCPMO45DuplexRuntimeExtension:
+    adapter_id = "minicpmo45"
+    runtime_extension_id = "minicpmo45"
+
     def configure_sampling_params(
         self,
         *,
@@ -318,6 +323,55 @@ class MiniCPMO45DuplexRuntimeExtension:
                 final=final,
             )
         )
+
+    def prepare_recovery_prompt(
+        self,
+        *,
+        prompt: dict[str, Any],
+        request_id: str,
+        initial: bool,
+    ) -> dict[str, Any]:
+        """Rebase a journal unit onto a new physical scheduler request.
+
+        A rollover may discard the original first append.  The first retained
+        unit must therefore reserve the model's session-prefix embeddings even
+        though its logical ``seq`` remains unchanged for fencing/idempotency.
+        """
+        copied = deepcopy(prompt)
+        model_buffer = copied.get("model_intermediate_buffer")
+        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+        if not isinstance(duplex, dict):
+            raise ValueError("MiniCPM-o recovery journal entry has no duplex metadata")
+        fence = duplex.get("fence")
+        if not isinstance(fence, DuplexFence):
+            raise ValueError("MiniCPM-o recovery journal entry has no typed fence")
+        try:
+            mode = DuplexInputMode(duplex["mode"])
+            seq = int(duplex["seq"])
+            turn_seq = int(duplex["turn_seq"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("MiniCPM-o recovery journal entry has invalid sequence metadata") from exc
+        session_config = duplex.get("session_config")
+        runtime_config = duplex.get("runtime_config")
+        payload = duplex.get("payload")
+        if not isinstance(session_config, dict) or not isinstance(runtime_config, dict):
+            raise ValueError("MiniCPM-o recovery journal entry has invalid runtime configuration")
+        rebuilt = build_duplex_data_plane_prompt(
+            request_id=request_id,
+            fence=fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            seq=(1 if initial else seq),
+            turn_seq=turn_seq,
+            mode=mode,
+            payload=payload,
+            final=bool(duplex.get("final")),
+        )
+        rebuilt_duplex = rebuilt["model_intermediate_buffer"]["duplex"]
+        # Preserve logical ordering even when the physical first unit is
+        # materialized with first-append token budgeting.
+        rebuilt_duplex["seq"] = seq
+        return rebuilt
 
     def decide_output(
         self,

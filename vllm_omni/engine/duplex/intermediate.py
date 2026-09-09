@@ -62,12 +62,12 @@ def build_duplex_intermediate_buffer(
     return buffer
 
 
-def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: int) -> None:
+def set_ref_audio(buffer: DuplexIntermediateBuffer, waveform: object, sample_rate_hz: int) -> None:
     buffer.setdefault("codes", {})["ref"] = waveform
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
-def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
+def set_tts_handoff(buffer: DuplexIntermediateBuffer, token_ids: object | None, hidden_states: object | None) -> None:
     """Store the AR-to-TTS handoff used by the full-duplex stage bridge."""
     if token_ids is not None:
         buffer.setdefault("ids", {})["tts"] = token_ids

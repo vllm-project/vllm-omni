@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Engine Core Client for vLLM-Omni multi-stage runtime.
 
@@ -59,7 +62,15 @@ def _default_process_engine_inputs(
     ]
 
 
-class StageEngineCoreClientBase(StageClientBase):
+if TYPE_CHECKING:
+
+    class _StageEngineClientHost(StageClientBase, AsyncMPClient):
+        """Required async transport supplied by both concrete client MROs."""
+else:
+    _StageEngineClientHost = StageClientBase
+
+
+class StageEngineCoreClientBase(_StageEngineClientHost):
     """Shared stage-aware behavior for async EngineCore clients.
 
     The concrete transport/load-balancing behavior is supplied by the
@@ -240,6 +251,36 @@ class StageEngineCoreClientBase(StageClientBase):
             request.request_id,
         )
         await super().add_request_async(request)
+
+    async def admit_duplex_request_async(self, request: EngineCoreRequest) -> None:
+        """Admit an Omni-owned stream using vLLM 0.28's retained request."""
+        request.resumable = True
+        await super().add_request_async(request)
+
+    async def get_streaming_prompt_metrics_async(self, request_id: str) -> Any:
+        """Return scheduler progress for a streaming-prompt request."""
+        return await self.call_utility_async("get_streaming_prompt_metrics", request_id)
+
+    async def append_streaming_prompt_unit_async(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        *,
+        model_intermediate_buffer: dict[str, Any] | None,
+        operation_id: str | None,
+        operation_fingerprint: bytes | None,
+        sampling_params: Any = None,
+    ) -> Any:
+        """Append and finalize one idempotent duplex unit in EngineCore."""
+        return await self.call_utility_async(
+            "append_streaming_prompt_unit",
+            request_id,
+            token_ids,
+            model_intermediate_buffer,
+            operation_id,
+            operation_fingerprint,
+            sampling_params,
+        )
 
     # ==================== Stage Methods ====================
 

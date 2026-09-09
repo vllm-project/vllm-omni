@@ -38,7 +38,6 @@ from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
     _RingKV,
 )
 
-DEFAULT_HF_REPO = "kyutai/mimi"
 FRAME_SIZE = 1920
 CODEBOOKS = 8
 
@@ -231,6 +230,12 @@ class _MimiStreamingTransformer(nn.Module):
 
     def step(self, x: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
+        # Mimi has two transformer positions per 80ms acoustic frame. Writing
+        # a whole multi-frame batch into a full ring would evict history needed
+        # by its earliest queries. Preserve the reference per-frame ring clock
+        # while convolutions/quantizer still benefit from multi-frame calls.
+        if x.shape[1] > 2:
+            return torch.cat([self.step(part) for part in x.split(2, dim=1)], dim=1)
         for layer, kv in zip(self.layers, self._kv):
             x = layer(x, kv, self._offset, self.context)
         self._offset.add_(x.shape[1])
@@ -286,7 +291,7 @@ def _walk_seanet(layers) -> list[tuple[str, object]]:
 class PersonaPlexMimiCodec(nn.Module):
     """Streaming Mimi encode/decode at one 80 ms frame per call (moshi-free)."""
 
-    def __init__(self, hf_repo: str = DEFAULT_HF_REPO, checkpoint: str | None = None, device: str = "cuda") -> None:
+    def __init__(self, *, checkpoint: str | None = None, device: str = "cuda") -> None:
         super().__init__()
         from safetensors.torch import load_file
         from transformers import MimiConfig, MimiModel

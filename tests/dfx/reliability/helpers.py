@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared reliability fault-injection helpers.
 
 This module keeps fault injection callable from tests directly:
@@ -26,7 +29,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import psutil
 import pytest
@@ -743,6 +746,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     snapshot = getattr(server, "reliability_fault_snapshot", None)
     if not isinstance(snapshot, dict):
         pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+    assert isinstance(snapshot, dict)
     tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
     if not tree_pids:
         pytest.skip(f"[{scenario}] no server process tree PIDs captured for this run")
@@ -756,6 +760,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
         gpu_map = query_gpu_compute_pid_used_memory_mb()
         if gpu_map is None:
             pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
+        assert gpu_map is not None
         last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
         if not last_alive and not last_gpu_leaks:
             return
@@ -781,11 +786,18 @@ def assert_no_worker_residual_and_gpu_release(
     )
 
 
+class _FaultSnapshot(TypedDict):
+    root_pids: list[int]
+    tree_pids: list[int]
+    worker_pids: list[int]
+    worker_markers: list[str]
+
+
 def _capture_server_fault_snapshot(
     server: Any,
     *,
     worker_markers_extra: Sequence[str] | None = None,
-) -> dict[str, list[int]]:
+) -> _FaultSnapshot:
     """Capture current server process snapshot for post-fault assertions.
 
     ``tree_pids`` is ``[root, ...descendants]`` and is used by
@@ -801,7 +813,7 @@ def _capture_server_fault_snapshot(
             continue
         if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
-    snapshot = {
+    snapshot: _FaultSnapshot = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,
@@ -904,7 +916,7 @@ def make_process_kill_fault_injector(
        ``Process.name()`` plus argv text. This matches how :func:`_safe_proc_info`
        logs processes and catches vLLM-style titles (``VLLM::...``) that often do not
        appear in ``pgrep -f``\'s command-line view.
-    2. **``pgrep -f``** (legacy): scoped to the server PID tree when it is known;
+    2. **``pgrep -f``** (legacy): always scoped to the known server PID tree;
        uses procps regular-expression rules for the pattern.
 
     If neither phase finds a target, the returned callable issues ``pytest.skip``.
@@ -921,9 +933,7 @@ def make_process_kill_fault_injector(
         _log_server_process_tree(server)
         server_tree = set(_list_server_process_tree(server))
         if not server_tree:
-            logger.warning(
-                "[reliability][process-kill] no server process tree found; fallback to global pgrep matching"
-            )
+            raise ValueError("Fault injection requires a known test server process tree; global matching is unsafe")
 
         def _kill_and_wait(filtered: list[int], pattern: str, *, source: str) -> None:
             sig = getattr(signal, signal_name, None)
@@ -972,7 +982,7 @@ def make_process_kill_fault_injector(
                 allow_zero_match=True,
                 execute_kill=False,
             )
-            filtered = [pid for pid in pids if not server_tree or pid in server_tree]
+            filtered = [pid for pid in pids if pid in server_tree]
             if pids and not filtered:
                 logger.warning(
                     "[reliability][process-kill] pattern=%s matched non-server pids=%s, skip them",

@@ -184,6 +184,90 @@ async def test_realtime_client_close_waits_for_a_new_session_closed_event():
 
 
 @pytest.mark.asyncio
+async def test_realtime_client_reserves_response_history_once_when_created():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+
+    client = Client()
+    created = {"type": "response.created", "response": {"id": "resp-a"}}
+
+    await client._handle_server_event(dict(created))
+    await client._handle_server_event(dict(created))
+
+    assert client.sent == [
+        {
+            "type": "playback.ack",
+            "response_id": "resp-a",
+            "item_id": "item_resp-a",
+            "played_ms": 0,
+            "committed_ms": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_final_playback_ack_advances_reserved_cursor_once():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+
+    client = Client()
+    await client._handle_server_event({"type": "response.created", "response": {"id": "resp-a"}})
+    await client._handle_server_event(
+        {
+            "type": "response.audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(b"\x01\x00" * 24_000).decode("ascii"),
+            "sample_rate_hz": 24_000,
+        }
+    )
+    await client._handle_server_event({"type": "response.done", "response": {"id": "resp-a"}})
+
+    await client.acknowledge_playback()
+    await client.acknowledge_playback()
+
+    assert [(event["played_ms"], event["committed_ms"]) for event in client.sent] == [(0, 0), (1000, 1000)]
+
+
+def test_realtime_event_collector_distinguishes_reservation_and_history_commit():
+    collector = RealtimeEventCollector()
+    collector.add(
+        {
+            "type": "playback.acknowledged",
+            "event": {
+                "item_id": "item_resp-a",
+                "played_ms": 0,
+                "committed_ms": 0,
+                "history_committed": False,
+            },
+        }
+    )
+    collector.add(
+        {
+            "type": "playback.acknowledged",
+            "event": {
+                "item_id": "item_resp-a",
+                "played_ms": 1000,
+                "committed_ms": 1000,
+                "history_committed": True,
+            },
+        }
+    )
+
+    assert collector.response_playback_reserved("resp-a") is True
+    assert collector.response_playback_history_committed("resp-a") is True
+
+
+@pytest.mark.asyncio
 async def test_realtime_client_configure_sends_seed_tts_text_condition():
     class Client(RealtimeDuplexClient):
         def __init__(self):
