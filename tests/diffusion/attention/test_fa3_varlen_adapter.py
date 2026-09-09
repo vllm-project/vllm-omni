@@ -5,6 +5,7 @@ import inspect
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -116,6 +117,30 @@ def test_optional_features_forwarded_only_when_supported(monkeypatch):
     set_provider(monkeypatch, provider)
     fa.flash_attn_3_varlen(q, k, v, **kwargs, sinks=sink, softcap=2.0, deterministic=True)
     assert seen == dict(sinks=sink, softcap=2.0, deterministic=True)
+
+
+@pytest.mark.cpu
+def test_optional_backend_is_forwarded_only_when_supported(monkeypatch):
+    q, k, v, kwargs = inputs()
+    seen: dict[str, Any] = {}
+
+    def provider(*, backend="auto", **kw):
+        seen["backend"] = backend
+        return q
+
+    monkeypatch.setattr(fa, "_external_fa3_varlen", lambda: (provider, frozenset(("backend",))))
+    fa.flash_attn_3_varlen(q, k, v, **kwargs, backend="mutlass")
+    assert seen == {"backend": "mutlass"}
+
+
+@pytest.mark.cpu
+def test_backend_is_rejected_when_provider_does_not_advertise_it(monkeypatch):
+    q, k, v, kwargs = inputs()
+    provider = Mock(return_value=q)
+    monkeypatch.setattr(fa, "_external_fa3_varlen", lambda: (provider, frozenset()))
+    with pytest.raises(NotImplementedError, match="backend"):
+        fa.flash_attn_3_varlen(q, k, v, **kwargs, backend="mutlass")
+    provider.assert_not_called()
 
 
 @pytest.mark.cpu
