@@ -12,6 +12,7 @@
 #     MIOpen conv_transpose1d is not capture-safe in the Code2Wav graph path.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
+# model_runner: v2  # Opt in via qwen3_omni_moe_mrv2.yaml.
 async_chunk: true
 
 connectors:

@@ -123,6 +123,10 @@ def _make_fast_path_sched(*, defer_block_free: bool) -> tuple[MagicMock, Request
 
     sched = MagicMock()
     sched.max_num_scheduled_tokens = 8
+    sched.max_num_running_reqs = 8
+    sched._native_data_plane = False
+    sched._retains_state_across_chunks = False
+    sched._execution_batch_limit = OmniGenerationScheduler._execution_batch_limit.__get__(sched)
     sched._pause_state = PauseState.UNPAUSED
     sched.requests = {request.request_id: request}
     sched.running = [request]

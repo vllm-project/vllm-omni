@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for multi-modal streaming finish_reason behavior (commit 44c799bc).
 
 Verifies that the /v1/chat/completions streaming endpoint emits exactly one
@@ -17,6 +18,7 @@ Key invariants tested:
 """
 
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -80,6 +82,33 @@ def _make_audio_omni_output(
         final_output_type="audio",
         finished=True,
     )
+
+
+def test_streaming_audio_choice_emits_empty_delta_for_metadata_only_chunk() -> None:
+    serving_chat = object.__new__(OmniOpenAIServingChat)
+    omni_output = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                finish_reason="stop",
+                stop_reason=None,
+                token_ids=[],
+                multimodal_output={},
+            )
+        ]
+    )
+
+    choices = serving_chat._create_audio_choice(
+        omni_output,
+        role="assistant",
+        request=SimpleNamespace(return_token_ids=False),
+        stream=True,
+    )
+
+    assert len(choices) == 1
+    assert choices[0].index == 0
+    assert choices[0].delta.content == ""
+    assert choices[0].finish_reason == "stop"
 
 
 # ---------------------------------------------------------------------------

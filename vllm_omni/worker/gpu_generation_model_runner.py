@@ -295,7 +295,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 pad_attn=pad_attn,
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
             )
-
             (
                 input_ids,
                 inputs_embeds,

@@ -1,12 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Online serving tests: Qwen2.5-Omni-7B.
 See examples/online_serving/qwen2_5_omni/README.md
 """
 
 import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
 from pathlib import Path
 
 import pytest
@@ -115,13 +115,16 @@ def test_send_multimodal_request_002(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_003(omni_server) -> None:
+    env = os.environ.copy()
+    env["MODEL"] = omni_server.model
+
     command = [
         "bash",
         os.path.join(example_dir, "qwen2_5_omni/run_curl_multimodal_generation.sh"),
         "mixed_modalities",
     ]
 
-    result = run_cmd(command)
+    result = run_cmd(command, env=env)
 
     text_content = extract_content_after_keyword("Output of request:", result)
 

@@ -8,6 +8,7 @@ import sys
 import types
 from dataclasses import fields, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic.fields import FieldInfo
@@ -60,9 +61,14 @@ _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, object]:
     backend_fields = fields(config_cls)
     backend_field_names = {backend_field.name for backend_field in backend_fields}
-    backend_config = config_cls(
-        **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
-    )
+    # This is a schema/normalization comparison, not a Hub download test.
+    with (
+        patch("vllm.engine.arg_utils.get_model_path", side_effect=lambda model, *_: model),
+        patch("vllm_omni.diffusion.data.get_model_path", side_effect=lambda model, *_: model),
+    ):
+        backend_config = config_cls(
+            **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
+        )
     effective_values: dict[str, object] = {}
     for backend_field in backend_fields:
         value = getattr(backend_config, backend_field.name)
@@ -77,6 +83,9 @@ _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusi
 _TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
+        "final_output",
+        "use_v2_model_runner",
+        "supports_native_mrv2_data_plane",
         "active_stream_window",
         "codec_frame_rate_hz",
         "custom_voice_dir",

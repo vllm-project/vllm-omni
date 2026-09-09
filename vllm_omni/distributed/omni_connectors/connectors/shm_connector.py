@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
+import hashlib
 import os
+from contextlib import contextmanager
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
+
+import regex as re
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
@@ -28,11 +32,49 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
         self._pending_keys: set[str] = set()
+        self._cohort_namespace = os.getenv("VLLM_OMNI_SHM_COHORT_NAMESPACE", "")
+        if self._cohort_namespace and not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", self._cohort_namespace):
+            raise ValueError("SHM cohort namespace must be 1-64 alphanumeric, dash or underscore characters")
+        self._cohort_directory = "/dev/shm"
         self._metrics = {
             "puts": 0,
             "gets": 0,
             "bytes_transferred": 0,
         }
+
+    def _cohort_path(self, from_stage: str, to_stage: str) -> str:
+        edge = hashlib.sha256(f"{from_stage}:{to_stage}".encode()).hexdigest()[:16]
+        return f"{self._cohort_directory}/omni_cohort_{self._cohort_namespace}_{edge}.lock"
+
+    def cohort_notification_name(self, from_stage: str, to_stage: str) -> str | None:
+        """Return the publication notification for this exact input edge."""
+        if not self._cohort_namespace:
+            return None
+        return os.path.basename(self._cohort_path(from_stage, to_stage))
+
+    @contextmanager
+    def publication_cohort(self, from_stage: str, to_stage: str):
+        """Keep a model step's keys invisible until all its puts complete.
+
+        The output worker owns this lock while the independent save thread
+        performs puts. Readers use a nonblocking shared lock, so there is no
+        send/receive acknowledgement cycle. Callers skip empty model steps.
+        """
+        if not self._cohort_namespace:
+            yield
+            return
+        path = self._cohort_path(from_stage, to_stage)
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            # Also notify when all puts failed: a receiver may have deferred
+            # reading an older, already-published key while this lock was held.
+            with open(path, "wb"):
+                pass
 
     def put(
         self,
@@ -122,6 +164,23 @@ class SharedMemoryConnector(OmniConnectorBase):
         get_key: str,
         metadata=None,
     ) -> tuple[Any, int] | None:
+        if not self._cohort_namespace:
+            return self._get_published(from_stage, to_stage, get_key, metadata)
+        try:
+            lock = open(self._cohort_path(from_stage, to_stage), "rb")
+        except FileNotFoundError:
+            return self._get_published(from_stage, to_stage, get_key, metadata)
+        with lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None
+            try:
+                return self._get_published(from_stage, to_stage, get_key, metadata)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _get_published(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
         if metadata is not None:
             if isinstance(metadata, dict) and get_key in metadata:
                 metadata = metadata.get(get_key)

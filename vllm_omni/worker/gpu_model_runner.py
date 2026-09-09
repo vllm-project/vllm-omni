@@ -38,6 +38,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1880,11 +1881,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         def _explicit_talker_seed(req_id: str) -> int | None:
             sampling_params = getattr(self.requests[req_id], "sampling_params", None)
-            extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
-            seed = None
-            if isinstance(extra_args, dict):
-                seed = extra_args.get("tts_local_seed")
-            return int(seed) if seed is not None else None
+            return get_tts_local_seed(sampling_params)
 
         def _row_generator(req_id: str) -> torch.Generator | None:
             seed = _explicit_talker_seed(req_id)
@@ -1902,6 +1899,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             return generator
 
         row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
+        has_explicit_generator = any(generator is not None for generator in row_generators)
+        talker_mtp_runner = self.talker_mtp
+        if has_explicit_generator:
+            # The outer whole-MTP graph owns one captured RNG stream and cannot
+            # represent independent request generators. Bypass only that wrapper;
+            # the raw code predictor still uses its compiled/device-graph body.
+            _cudagraph_mode = CUDAGraphMode.NONE
+            num_tokens_padded = decode_batch_size
+            req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+            req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+            last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+            text_step = self.text_step.gpu[:num_tokens_padded]
+            talker_mtp_runner = self.model.talker_mtp
         cache = getattr(self, "_talker_mtp_generators", None)
         if cache:
             # Generators live as long as their request; drop finished ones.
@@ -1954,7 +1964,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
+            req_embeds, code_predictor_codes = talker_mtp_runner(
                 req_input_ids,
                 req_embeds,
                 last_talker_hidden,

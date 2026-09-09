@@ -7,6 +7,8 @@ from __future__ import annotations
 import importlib
 import inspect
 from collections import deque
+from collections.abc import Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -63,6 +65,16 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         extracted: dict[str, Any] = {}
         meta = payload.get("meta") if isinstance(payload, dict) else None
         meta = meta if isinstance(meta, dict) else {}
+        embed = payload.get("embed") if isinstance(payload, dict) else None
+        embed = embed if isinstance(embed, dict) else {}
+
+        decode_token_end = embed.get("decode_token_end")
+        if isinstance(decode_token_end, torch.Tensor):
+            if decode_token_end.numel() != 1:
+                raise ValueError("embed.decode_token_end must be a scalar")
+            decode_token_end = decode_token_end.item()
+        if decode_token_end is not None:
+            extracted["decode_token_end"] = int(decode_token_end)
 
         if "next_stage_prompt_len" in meta:
             extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
@@ -72,6 +84,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             )
             extracted["next_stage_prompt_len"] = payload["next_stage_prompt_len"]
 
+        if "next_stage_prompt_ids" in meta:
+            prompt_ids = meta["next_stage_prompt_ids"]
+            if isinstance(prompt_ids, (list, tuple)):
+                extracted["next_stage_prompt_ids"] = [int(token_id) for token_id in prompt_ids]
+
         audio_codes = cls._payload_audio_codes(payload)
         if audio_codes is not None:
             extracted["code_predictor_codes"] = audio_codes
@@ -80,6 +97,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             extracted["left_context_size"] = meta["left_context_size"]
         elif "left_context_size" in payload:
             logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
+
+        if cls._payload_finished(payload):
+            extracted["input_terminal"] = True
 
         return extracted
 
@@ -318,67 +338,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """
         if not hasattr(self, "_lock"):
             return OmniConnectorOutput()
-
-        tp_group = self._get_local_tp_group()
-        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
-            if self.is_data_transfer_rank():
-                with self._lock:
-                    fanout_packet = self._collect_async_chunk_fanout_packet_locked()
-            else:
-                fanout_packet = None
-            fanout_packet = self._broadcast_tp_payload_packet(fanout_packet)
-            if fanout_packet is None:
-                newly_finished = set()
-                chunk_finished = set()
-                request_metadata = {}
-            else:
-                if not self.is_data_transfer_rank():
-                    self._apply_async_chunk_fanout_packet(fanout_packet)
-                newly_finished = set(fanout_packet["newly_finished"])
-                chunk_finished = set(fanout_packet["chunk_finished"])
-                request_metadata = dict(fanout_packet["request_metadata"])
-        else:
-            with self._lock:
-                newly_finished = set(self._finished_load_reqs)
-                self._finished_load_reqs.clear()
-                chunk_finished = set(self._chunk_finished_req_ids)
-                self._chunk_finished_req_ids.clear()
-                request_metadata = dict(self._local_request_metadata)
-                self._local_request_metadata.clear()
-                # _send_side_request_payload is the async accumulation buffer for
-                # future recv chunks. Clearing it on every consumable wake-up drops
-                # intermediate
-                # thinker decode spans before the model side can consume them.
-                # Only terminal chunk_finished requests may release that buffer.
-                for req_id in chunk_finished:
-                    if req_id not in self._local_stage_payload_cache:
-                        continue
-                    ext_req_id = self._request_ids_mapping.get(req_id, req_id)
-                    self._send_side_request_payload.pop(ext_req_id, None)
-                    if ext_req_id != req_id:
-                        self._send_side_request_payload.pop(req_id, None)
-        self._chunk_ready_req_ids.update(newly_finished)
-
-        output = OmniConnectorOutput(
-            chunk_ready_req_ids=set(self._chunk_ready_req_ids),
-            chunk_finished_req_ids=chunk_finished,
-            request_metadata=request_metadata,
-            kv_sent_req_ids=list(self._kv_sent_req_ids),
-            stage_recv_req_ids=set(self._stage_recv_req_ids),
-            has_pending_kv_work=self.has_pending_kv_work(),
-        )
-        if output.stage_recv_req_ids or chunk_finished or newly_finished:
-            logger.debug(
-                "[Stage-%s] get_omni_connector_output: stage_recv=%s, chunk_finished=%s, chunk_ready=%s",
-                self._stage_id,
-                output.stage_recv_req_ids,
-                chunk_finished,
-                output.chunk_ready_req_ids,
-            )
-        self._chunk_ready_req_ids.clear()
-        self._kv_sent_req_ids.clear()
-        self._stage_recv_req_ids.clear()
-        return output
+        drain_lock = getattr(self, "_omni_connector_output_drain_lock", None)
+        if drain_lock is None:
+            return self._drain_omni_connector_output()
+        with drain_lock:
+            return self._drain_omni_connector_output()
 
     @staticmethod
     def _connector_output_has_signals(output: OmniConnectorOutput) -> bool:
@@ -840,6 +804,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self,
         request: Any,
         pooling_output: Any | None = None,
+        *,
+        propagate_errors: bool = False,
+        wait_for_delivery: bool = False,
     ) -> bool:
         """Derive and enqueue one chunk for async sending.
 
@@ -865,10 +832,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             request_id=request_id,
             request=request,
             pooling_output=pooling_output,
+            propagate_errors=propagate_errors,
         )
         if payload_data is None:
             if chunk_id == 0:
-                logger.warning(
+                logger.debug(
                     "[Stage-%s] send_chunk: payload is None for req=%s chunk=%s (process_func=%s)",
                     self._stage_id,
                     request_id,
@@ -877,31 +845,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 )
             return False
 
-        self._put_req_chunk[request_id] += 1
-        self._ramp_chunk_count[request_id] += 1
-        next_stage_id = self._next_stage_id
-        connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
-
-        if chunk_id == 0:
-            logger.debug(
-                "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
-                self._stage_id,
-                request_id,
-                connector_put_key,
-            )
-
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
-        }
-        with self._lock:
-            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-            self._pending_save_counts[request_id] += 1
-        self._work_available.set()
-        return True
+        enqueued, completion = self._enqueue_chunk_payload(
+            request,
+            payload_data,
+            wait_for_delivery=wait_for_delivery,
+        )
+        if enqueued and completion is not None:
+            completion.wait()
+        return enqueued
 
     # ------------------------------------------------------------------ #
     #  Background I/O threads
@@ -929,14 +880,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     _recv_poll_count,
                 )
 
-            made_progress = False
-            for req_id in pending_ids:
-                if self._stop_event.is_set():
-                    break
-                try:
-                    made_progress = self._poll_single_request(req_id) or made_progress
-                except Exception:
-                    logger.warning("Error receiving data for %s", req_id, exc_info=True)
+            made_progress = self._poll_pending_requests_once(pending_ids)
 
             if not made_progress and not self._stop_event.is_set():
                 self._work_available.wait(timeout=0.005)
@@ -960,25 +904,34 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
             if task is not None:
                 success = False
+                send_error: BaseException | None = None
                 try:
                     success = self._send_single_request(task)
-                except Exception:
+                except Exception as error:
+                    send_error = error
                     logger.error(
                         "Error saving data for %s",
                         task.get("request_id"),
                         exc_info=True,
                     )
                 if not success:
-                    self._requeue_or_drop_failed_send(task)
+                    self._requeue_or_drop_failed_send(task, error=send_error)
                 continue
 
             self._work_available.wait(timeout=0.01)
             self._work_available.clear()
 
-    def _requeue_or_drop_failed_send(self, task: dict) -> None:
+    def _requeue_or_drop_failed_send(
+        self,
+        task: dict,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
         """Re-enqueue a failed send task or drop it after max retries."""
         retry_count = task.get("_retry_count", 0) + 1
         req_id = task.get("request_id")
+        if error is not None:
+            task["_last_send_error"] = error
         if retry_count <= self._MAX_SEND_RETRIES:
             task["_retry_count"] = retry_count
             logger.warning(
@@ -992,19 +945,36 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 dq = self._pending_save_reqs.setdefault(req_id, deque())
                 dq.appendleft(task)
         else:
+            cause = error or task.get("_last_send_error")
+            failure = RuntimeError(
+                "connector send failed permanently for "
+                f"request {req_id!r}, key {task.get('put_key')!r} "
+                f"after {self._MAX_SEND_RETRIES + 1} attempts"
+            )
+            if cause is not None:
+                failure.__cause__ = cause
             logger.error(
                 "[Stage-%s] Giving up on send for %s after %d retries",
                 getattr(self, "_stage_id", "?"),
                 req_id,
                 self._MAX_SEND_RETRIES,
             )
+            sink = getattr(self, "_connector_send_error_sink", None)
+            if sink is not None:
+                try:
+                    sink(failure)
+                except Exception:
+                    logger.exception("Connector send error sink failed for %s", req_id)
+            completion = task.get("completion")
+            if completion is not None:
+                completion.set_error(failure)
             self._decrement_pending_save_count(req_id)
 
     # ------------------------------------------------------------------ #
     #  Chunk-level poll / send  (ported from OmniChunkTransferAdapter)
     # ------------------------------------------------------------------ #
 
-    def _poll_single_request(self, req_id: str) -> bool:
+    def _poll_single_request(self, req_id: str, *, publish_ready: bool = True) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
         connector = self._omni_connector
         if connector is None:
@@ -1066,16 +1036,20 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             is_finished = self._payload_finished(payload_data)
             incoming_payload_consumable = self._payload_is_consumable(payload_data)
 
-            if self._model_mode == "ar":
-                payload_data = self._accumulate_payload(external_req_id, payload_data)
-                payload_consumable = incoming_payload_consumable
-            else:
-                new_ids = self._payload_audio_codes(payload_data) or []
-                if not new_ids and not is_finished:
+            if self._model_mode != "ar":
+                new_ids = self._payload_audio_codes(payload_data)
+                if not self._payload_value_has_content(new_ids) and not is_finished:
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
 
             with self._lock:
+                if self._model_mode == "ar":
+                    # Accumulation, staging, and model-side consume/ack share
+                    # this lock. Keeping the transition atomic prevents the
+                    # model thread from clearing a just-merged decode span
+                    # before the recv thread publishes it to the local cache.
+                    payload_data = self._accumulate_payload(external_req_id, payload_data)
+                    payload_consumable = incoming_payload_consumable
                 if is_finished:
                     self._chunk_finished_req_ids.add(req_id)
                     self._chunk_stream_completed.add(req_id)
@@ -1134,6 +1108,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 type(engine_inputs).__name__,
             )
 
+        if publish_ready and self._async_chunk and (payload_consumable or is_finished):
+            self.publish_omni_connector_output_to_sink()
         logger.debug("[Stage-%s] Received data for key %s", self._stage_id, connector_get_key)
         return True
 
@@ -1142,14 +1118,27 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         request_id: str | None,
         request: Any | None,
         pooling_output: Any | None,
+        *,
+        propagate_errors: bool = False,
     ) -> Any | None:
         """Run the custom process hook with a best-effort finished kwarg."""
         if self._custom_process_func is None:
             return None
 
+        payload_kwarg = getattr(self, "_custom_process_payload_kwarg", None)
+        if payload_kwarg is None:
+            payload_kwarg = self._connector_payload_kwarg(self._custom_process_func)
+            self._custom_process_payload_kwarg = payload_kwarg
+        if payload_kwarg is None:
+            message = f"custom process hook {self._custom_process_func} has no connector payload argument"
+            logger.error(message)
+            if propagate_errors:
+                raise RuntimeError(message)
+            return None
+
         kwargs = {
             "transfer_manager": self,
-            "pooling_output": pooling_output,
+            payload_kwarg: pooling_output,
             "request": request,
         }
         supports_is_finished = getattr(
@@ -1164,21 +1153,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     kwargs["is_finished"] = bool(is_finished_fn())
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
+                if propagate_errors:
+                    raise
 
         try:
             return self._custom_process_func(**kwargs)
         except TypeError as exc:
             if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
                 logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                if propagate_errors:
+                    raise
                 return None
             kwargs.pop("is_finished", None)
             try:
                 return self._custom_process_func(**kwargs)
             except Exception:
                 logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                if propagate_errors:
+                    raise
                 return None
         except Exception:
             logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+            if propagate_errors:
+                raise
             return None
 
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
@@ -1214,9 +1211,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     def _send_single_request(self, task: dict) -> bool:
         """Send one queued task via connector.put().
 
-        Returns True on success.  On failure (put() raises or returns
-        ``success=False``), returns False **without** decrementing
-        ``_pending_save_counts`` so the caller can retry or clean up.
+        Returns True when the task is consumed, either by a successful send or
+        because its delivery completion was already terminal.  On transport
+        failure (put() raises or returns ``success=False``), returns False
+        **without** decrementing ``_pending_save_counts`` so the caller can
+        retry or clean up.
         """
         connector = self._omni_connector
         if connector is None:
@@ -1231,6 +1230,15 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 pooling_output=task.get("pooling_output"),
             )
         put_key = task.get("put_key")
+        completion = task.get("completion")
+        if completion is not None and not completion.mark_in_flight():
+            logger.debug(
+                "[Stage-%s] Skipping terminal connector delivery: put_key=%s",
+                task["stage_id"],
+                put_key,
+            )
+            self._decrement_pending_save_count(request_id)
+            return True
 
         success, _size, _metadata = connector.put(
             from_stage=str(task["stage_id"]),
@@ -1250,6 +1258,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return False
 
         self._decrement_pending_save_count(request_id)
+        if completion is not None:
+            completion.set_result()
         return True
 
     def _decrement_pending_save_count(self, request_id: str) -> None:
@@ -1268,6 +1278,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._put_req_chunk.pop(cleanup_req_id, None)
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
+                getattr(self, "_qwen3_tts_emitted_frames", {}).pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
                 self._ramp_chunk_count.pop(cleanup_req_id, None)
                 self._adaptive_states.pop(cleanup_req_id, None)
@@ -1320,3 +1331,249 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         self._send_side_request_payload[req_id] = merged
         return dict(merged)
+
+    def _drain_omni_connector_output(self) -> OmniConnectorOutput:
+        tp_group = self._get_local_tp_group()
+        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+            if self.is_data_transfer_rank():
+                with self._lock:
+                    fanout_packet = self._collect_async_chunk_fanout_packet_locked()
+            else:
+                fanout_packet = None
+            fanout_packet = self._broadcast_tp_payload_packet(fanout_packet)
+            if fanout_packet is None:
+                newly_finished = set()
+                chunk_finished = set()
+                request_metadata = {}
+            else:
+                if not self.is_data_transfer_rank():
+                    self._apply_async_chunk_fanout_packet(fanout_packet)
+                newly_finished = set(fanout_packet["newly_finished"])
+                chunk_finished = set(fanout_packet["chunk_finished"])
+                request_metadata = dict(fanout_packet["request_metadata"])
+        else:
+            with self._lock:
+                newly_finished = set(self._finished_load_reqs)
+                self._finished_load_reqs.clear()
+                chunk_finished = set(self._chunk_finished_req_ids)
+                self._chunk_finished_req_ids.clear()
+                request_metadata = dict(self._local_request_metadata)
+                self._local_request_metadata.clear()
+                # _send_side_request_payload is the async accumulation buffer for
+                # future recv chunks. Clearing it on every consumable wake-up drops
+                # intermediate
+                # thinker decode spans before the model side can consume them.
+                # Only terminal chunk_finished requests may release that buffer.
+                for req_id in chunk_finished:
+                    if req_id not in self._local_stage_payload_cache:
+                        continue
+                    ext_req_id = self._request_ids_mapping.get(req_id, req_id)
+                    self._send_side_request_payload.pop(ext_req_id, None)
+                    if ext_req_id != req_id:
+                        self._send_side_request_payload.pop(req_id, None)
+        self._chunk_ready_req_ids.update(newly_finished)
+
+        output = OmniConnectorOutput(
+            chunk_ready_req_ids=set(self._chunk_ready_req_ids),
+            chunk_finished_req_ids=chunk_finished,
+            request_metadata=request_metadata,
+            kv_sent_req_ids=list(self._kv_sent_req_ids),
+            stage_recv_req_ids=set(self._stage_recv_req_ids),
+            has_pending_kv_work=self.has_pending_kv_work(),
+        )
+        if output.stage_recv_req_ids or chunk_finished or newly_finished:
+            logger.debug(
+                "[Stage-%s] get_omni_connector_output: stage_recv=%s, chunk_finished=%s, chunk_ready=%s",
+                self._stage_id,
+                output.stage_recv_req_ids,
+                chunk_finished,
+                output.chunk_ready_req_ids,
+            )
+        self._chunk_ready_req_ids.clear()
+        self._kv_sent_req_ids.clear()
+        self._stage_recv_req_ids.clear()
+        return output
+
+    def _enqueue_chunk_payload(
+        self,
+        request: Any,
+        payload_data: Any,
+        *,
+        wait_for_delivery: bool = False,
+    ) -> tuple[bool, Any | None]:
+        """Enqueue an already-built payload under its per-request chunk key."""
+        raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
+        request_id = self._resolve_external_req_id(request, raw_req_id)
+        if raw_req_id and raw_req_id != request_id:
+            self._request_ids_mapping.setdefault(raw_req_id, request_id)
+        chunk_id = self._put_req_chunk[request_id]
+        self._put_req_chunk[request_id] += 1
+        self._ramp_chunk_count[request_id] += 1
+        next_stage_id = self._next_stage_id
+        connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
+        completion = (
+            self._create_send_completion(
+                request_id=request_id,
+                put_key=connector_put_key,
+            )
+            if wait_for_delivery
+            else None
+        )
+
+        if chunk_id == 0:
+            logger.debug(
+                "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
+                self._stage_id,
+                request_id,
+                connector_put_key,
+            )
+
+        task = {
+            "stage_id": self._stage_id,
+            "next_stage_id": next_stage_id,
+            "put_key": connector_put_key,
+            "data": payload_data,
+            "request_id": request_id,
+            "completion": completion,
+        }
+        with self._lock:
+            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
+            self._pending_save_counts[request_id] += 1
+        self._work_available.set()
+        return True, completion
+
+    def _poll_pending_requests_once(self, pending_ids: list[str]) -> bool:
+        """Poll one receiver pass and publish its ready requests as a cohort."""
+        made_progress = False
+        for req_id in pending_ids:
+            if self._stop_event.is_set():
+                break
+            try:
+                made_progress = self._poll_single_request(req_id, publish_ready=False) or made_progress
+            except Exception:
+                logger.warning("Error receiving data for %s", req_id, exc_info=True)
+        if made_progress and self._async_chunk:
+            self.publish_omni_connector_output_to_sink()
+        return made_progress
+
+    def _publish_chunk_cohort(self, entries: list[tuple[Any, Any]], *, wait_for_delivery: bool) -> int:
+        entries = [(request, payload) for request, payload in entries if payload is not None]
+        if not entries:
+            return 0
+        # Only hold publication while there are actual puts. A zero-payload
+        # model step must not hide previously published keys from a receiver.
+        cohort = getattr(self._omni_connector, "publication_cohort", None)
+        context = (
+            cohort(str(self._stage_id), str(self._next_stage_id))
+            if wait_for_delivery and callable(cohort)
+            else nullcontext()
+        )
+        with context:
+            emitted = 0
+            completions: list[Any] = []
+            for request, payload in entries:
+                enqueued, completion = self._enqueue_chunk_payload(
+                    request, payload, wait_for_delivery=wait_for_delivery
+                )
+                if enqueued:
+                    emitted += 1
+                    if completion is not None:
+                        completions.append(completion)
+            for completion in completions:
+                completion.wait()
+            return emitted
+
+    def publish_omni_connector_output_to_sink(self) -> bool:
+        """Drain pending readiness into the same-process scheduler inbox."""
+        sink = getattr(self, "_omni_connector_output_sink", None)
+        if sink is None:
+            return False
+        output = self.get_omni_connector_output()
+        if not self._connector_output_has_signals(output):
+            return False
+        sink(output)
+        return True
+
+    def send_chunks(
+        self,
+        entries: list[tuple[Any, Any | None]],
+        *,
+        propagate_errors: bool = False,
+        wait_for_delivery: bool = False,
+    ) -> int:
+        """Build and enqueue all request payloads from one model step.
+
+        A model-specific batch builder may coalesce GPU post-processing and
+        D2H copies across requests. Models without one retain the scalar
+        builder contract.
+        """
+        if not entries or self._omni_connector is None:
+            return 0
+        if not self.is_data_transfer_rank():
+            return len(entries)
+
+        batch_func = getattr(self, "_custom_process_batch_func", None)
+        if batch_func is None:
+            payloads = []
+            for request, pooling_output in entries:
+                raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
+                request_id = self._resolve_external_req_id(request, raw_req_id)
+                payloads.append(
+                    self._build_custom_process_payload(
+                        request_id=request_id,
+                        request=request,
+                        pooling_output=pooling_output,
+                        propagate_errors=propagate_errors,
+                    )
+                )
+            return self._publish_chunk_cohort(
+                [(request, payload) for (request, _), payload in zip(entries, payloads, strict=True)],
+                wait_for_delivery=wait_for_delivery,
+            )
+
+        requests = [request for request, _ in entries]
+        pooling_outputs = [pooling_output for _, pooling_output in entries]
+        is_finished: list[bool] = []
+        for request in requests:
+            finished_fn = getattr(request, "is_finished", None)
+            is_finished.append(bool(finished_fn()) if callable(finished_fn) else False)
+
+        try:
+            payloads = batch_func(
+                transfer_manager=self,
+                pooling_outputs=pooling_outputs,
+                requests=requests,
+                is_finished=is_finished,
+            )
+        except Exception:
+            logger.exception(
+                "batch custom_process_stage_input_func failed for %s requests",
+                len(entries),
+            )
+            if propagate_errors:
+                raise
+            return 0
+        if not isinstance(payloads, list) or len(payloads) != len(entries):
+            message = (
+                "batch custom process hook "
+                f"{batch_func} returned "
+                f"{len(payloads) if isinstance(payloads, list) else type(payloads).__name__} "
+                f"payloads for {len(entries)} requests"
+            )
+            logger.error(
+                "batch custom process hook %s returned %s payloads for %s requests",
+                batch_func,
+                len(payloads) if isinstance(payloads, list) else type(payloads).__name__,
+                len(entries),
+            )
+            if propagate_errors:
+                raise RuntimeError(message)
+            return 0
+
+        return self._publish_chunk_cohort(list(zip(requests, payloads)), wait_for_delivery=wait_for_delivery)
+
+    def set_omni_connector_output_sink(
+        self,
+        sink: Callable[[OmniConnectorOutput], None] | None,
+    ) -> None:
+        self._omni_connector_output_sink = sink

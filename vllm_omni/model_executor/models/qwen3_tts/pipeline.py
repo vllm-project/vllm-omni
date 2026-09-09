@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS pipeline: Talker (text → RVQ codec) → Code2Wav (codec → audio).
 
 Chunked vs end-to-end mode is dispatched from ``deploy.async_chunk``.
@@ -27,6 +27,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
+            supports_native_mrv2_data_plane=True,
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": False,
@@ -42,6 +43,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="Qwen3TTSCode2Wav",
+            supports_native_mrv2_data_plane=True,
             # ``sync_process_input_func`` is the only input-proc override for
             # this stage in sync (non-async-chunk) mode: a length-only
             # ``_token_only`` placeholder.  The bulk codec payload itself

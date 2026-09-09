@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM for running offline inference
 with the correct prompt format on Qwen3-Omni (thinker only).
@@ -465,6 +465,11 @@ def parse_args():
         type=int,
         default=65536,
         help="Threshold for using shared memory in bytes (default: 65536)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for generated text and audio outputs.",
     )
     parser.add_argument(
         "--output-wav",

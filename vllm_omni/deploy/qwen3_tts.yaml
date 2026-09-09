@@ -11,6 +11,7 @@
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
+# model_runner: v2  # Opt in via qwen3_tts_mrv2.yaml.
 async_chunk: true
 
 connectors:
@@ -63,11 +64,6 @@ stages:
     max_num_seqs: 64
     gpu_memory_utilization: 0.3
     trust_remote_code: true
-    # Prefix caching on by default. The HS opt-out (talker only consumes the
-    # last token's hidden state) and deferred mm-output writes added in this
-    # PR make per-step bookkeeping negligible, and any text repetition across
-    # requests (same voice or shared ref_audio) is a net throughput win.
-    # Disable explicitly if memory headroom is tight on a single-GPU deploy.
     enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 32768

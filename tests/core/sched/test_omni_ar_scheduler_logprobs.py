@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the AR sampled-token logprob contract."""
 
 from __future__ import annotations
@@ -93,6 +96,7 @@ class _Request:
         self.num_computed_tokens = 0
         self.num_in_flight_tokens = 0
         self.num_output_placeholders = 0
+        self.output_token_ids: list[int] = []
         # vLLM 0.27 (a0c092ee72): Request gained num_stale_output_tokens to
         # track in-flight outputs discarded at preemption/streaming-stop.
         self.num_stale_output_tokens = 0
@@ -145,6 +149,14 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
         recompute_kv_load_failures=False,
+        _native_data_plane=False,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                use_v2_model_runner=False,
+                async_chunk=False,
+                final_output=True,
+            )
+        ),
     )
     for name in _MIXIN_UPDATE_HELPERS:
         setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
@@ -164,10 +176,15 @@ def _bind_request_lifecycle(
         scheduler.requests.pop(request.request_id, None)
         scheduler.finished_req_ids.add(request.request_id)
         scheduler.finished_req_ids_dict[request.client_index].add(request.request_id)
-        # vLLM 0.26 contract: (kv_xfer_params, ec_xfer_params)
+        # Current vLLM contract: (kv_xfer_params, ec_xfer_params)
         return None, None
 
-    scheduler._update_request_with_output = update_request
+    def update_with_history(request, token_ids):
+        accepted, stopped = update_request(request, token_ids)
+        request.output_token_ids.extend(accepted)
+        return accepted, stopped
+
+    scheduler._update_request_with_output = update_with_history
     scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
     scheduler._handle_stopped_request = handle_stopped or (lambda _request: True)
     scheduler._free_request = free_request
@@ -216,6 +233,7 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     (output,) = outputs[0].outputs
 
     assert output.new_token_ids == [7]
+    assert output.num_generation_tokens == 1
     assert output.finish_reason is FinishReason.STOP
     token_rows = np.asarray(output.new_logprobs.logprob_token_ids)
     value_rows = np.asarray(output.new_logprobs.logprobs)

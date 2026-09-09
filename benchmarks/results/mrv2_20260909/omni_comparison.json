@@ -1,0 +1,298 @@
+{
+  "publish_omni_pcm_v1": {
+    "warm": {
+      "summary": {
+        "completed": 0,
+        "failed": 32,
+        "duration_s": 2.7740251501090825,
+        "audio_s_s": 0.0,
+        "started_unix": 1788967014.7097135,
+        "finished_unix": 1788967017.4842322,
+        "capped": 0,
+        "request_throughput": 0.0,
+        "concurrency": 8,
+        "mixed": false
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 1,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 1,
+          "foreign": 0
+        }
+      }
+    }
+  },
+  "publish_omni_v2": {
+    "c8": {
+      "summary": {
+        "completed": 64,
+        "failed": 0,
+        "duration_s": 5.460978750139475,
+        "audio_s_s": 46.752951564493664,
+        "started_unix": 1788966578.7542706,
+        "finished_unix": 1788966584.2165368,
+        "capped": 0,
+        "request_throughput": 11.719510902393719,
+        "concurrency": 8,
+        "mixed": false,
+        "first_text_s": 0.029883181843615603,
+        "first_text_s_p95": 0.05258032402489335,
+        "first_audio_s": 0.18903169679106213,
+        "first_audio_s_p95": 0.3071149978088212,
+        "e2e_s": 0.6426844604866346,
+        "e2e_s_p95": 0.8426701148040593
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 4,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 4,
+          "foreign": 0
+        }
+      }
+    },
+    "mixed_smoke": {
+      "summary": {
+        "completed": 6,
+        "failed": 0,
+        "duration_s": 1.9628628301434219,
+        "audio_s_s": 14.642515798161986,
+        "started_unix": 1788966576.4834688,
+        "finished_unix": 1788966578.446847,
+        "capped": 0,
+        "request_throughput": 3.056759702134455,
+        "concurrency": 2,
+        "mixed": true,
+        "first_text_s": 0.15889395959675312,
+        "first_text_s_p95": 0.3617879725061357,
+        "first_audio_s": 0.25373032471785945,
+        "first_audio_s_p95": 0.47417947149369866,
+        "e2e_s": 0.6314539546923091,
+        "e2e_s_p95": 0.9379988166037947
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 1,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 1,
+          "foreign": 0
+        }
+      }
+    },
+    "warm": {
+      "summary": {
+        "completed": 32,
+        "failed": 0,
+        "duration_s": 2.789048780221492,
+        "audio_s_s": 44.23640808111,
+        "started_unix": 1788966573.4165754,
+        "finished_unix": 1788966576.206175,
+        "capped": 0,
+        "request_throughput": 11.47344579518567,
+        "concurrency": 8,
+        "mixed": false,
+        "first_text_s": 0.03998701793898363,
+        "first_text_s_p95": 0.07506277253851294,
+        "first_audio_s": 0.23215624161821324,
+        "first_audio_s_p95": 0.4105592289706692,
+        "e2e_s": 0.6408507602027385,
+        "e2e_s_p95": 0.8353862619027494
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 2,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 2,
+          "foreign": 0
+        }
+      }
+    },
+    "c16": {
+      "summary": {
+        "completed": 64,
+        "failed": 0,
+        "duration_s": 4.915263446979225,
+        "audio_s_s": 50.036483833058625,
+        "started_unix": 1788966584.5258963,
+        "finished_unix": 1788966589.4419558,
+        "capped": 0,
+        "request_throughput": 13.020665258406954,
+        "concurrency": 16,
+        "mixed": false,
+        "first_text_s": 0.35532573622185737,
+        "first_text_s_p95": 1.2203542354051025,
+        "first_audio_s": 0.6102763648450491,
+        "first_audio_s_p95": 1.52867726306431,
+        "e2e_s": 1.1692317472479772,
+        "e2e_s_p95": 2.1695365750230846
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 3,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 3,
+          "foreign": 0
+        }
+      }
+    }
+  },
+  "publish_omni_pcm_v2": {
+    "c8": {
+      "summary": {
+        "completed": 64,
+        "failed": 0,
+        "duration_s": 5.441984327044338,
+        "audio_s_s": 46.139305060507624,
+        "started_unix": 1788967282.9108756,
+        "finished_unix": 1788967288.353278,
+        "capped": 0,
+        "request_throughput": 11.760416082410847,
+        "concurrency": 8,
+        "mixed": false,
+        "first_text_s": 0.031194622461043764,
+        "first_text_s_p95": 0.056255339016206565,
+        "first_audio_s": 0.1907599542319076,
+        "first_audio_s_p95": 0.2504040592815727,
+        "e2e_s": 0.6494716386005166,
+        "e2e_s_p95": 0.8210602869512513
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 4,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 4,
+          "foreign": 0
+        }
+      }
+    },
+    "mixed_smoke": {
+      "summary": {
+        "completed": 6,
+        "failed": 0,
+        "duration_s": 1.9604469779878855,
+        "audio_s_s": 14.63154847954131,
+        "started_unix": 1788967280.6427572,
+        "finished_unix": 1788967282.6038792,
+        "capped": 0,
+        "request_throughput": 3.060526536738132,
+        "concurrency": 2,
+        "mixed": true,
+        "first_text_s": 0.0881139428820461,
+        "first_text_s_p95": 0.20210386195685714,
+        "first_audio_s": 0.18918457945498326,
+        "first_audio_s_p95": 0.2879998544231057,
+        "e2e_s": 0.5994715260652205,
+        "e2e_s_p95": 0.7549792479258031
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 2,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 2,
+          "foreign": 0
+        }
+      }
+    },
+    "warm": {
+      "summary": {
+        "completed": 32,
+        "failed": 0,
+        "duration_s": 3.5410766610875726,
+        "audio_s_s": 35.42972576071471,
+        "started_unix": 1788967276.823503,
+        "finished_unix": 1788967280.365745,
+        "capped": 0,
+        "request_throughput": 9.036799556373294,
+        "concurrency": 8,
+        "mixed": false,
+        "first_text_s": 0.042869923694524914,
+        "first_text_s_p95": 0.07790881521068513,
+        "first_audio_s": 0.4463742805819493,
+        "first_audio_s_p95": 1.1431365785421805,
+        "e2e_s": 0.825010678221588,
+        "e2e_s_p95": 1.330511717009358
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 3,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 3,
+          "foreign": 0
+        }
+      }
+    },
+    "c16": {
+      "summary": {
+        "completed": 64,
+        "failed": 0,
+        "duration_s": 3.700835866853595,
+        "audio_s_s": 65.68735651783419,
+        "started_unix": 1788967288.634398,
+        "finished_unix": 1788967292.336175,
+        "capped": 0,
+        "request_throughput": 17.293390548122854,
+        "concurrency": 16,
+        "mixed": false,
+        "first_text_s": 0.06102789570286404,
+        "first_text_s_p95": 0.14354911588598043,
+        "first_audio_s": 0.2900520928524202,
+        "first_audio_s_p95": 0.5080928459763526,
+        "e2e_s": 0.8573723387671635,
+        "e2e_s_p95": 1.1249415951315314
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 3,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 3,
+          "foreign": 0
+        }
+      }
+    }
+  },
+  "publish_omni_v1": {
+    "warm": {
+      "summary": {
+        "completed": 0,
+        "failed": 32,
+        "duration_s": 2.063708243891597,
+        "audio_s_s": 0.0,
+        "started_unix": 1788966354.287581,
+        "finished_unix": 1788966356.3522077,
+        "capped": 0,
+        "request_throughput": 0.0,
+        "concurrency": 8,
+        "mixed": false
+      },
+      "ownership": {
+        "ownership_gpu2": {
+          "samples": 1,
+          "foreign": 0
+        },
+        "ownership_gpu3": {
+          "samples": 1,
+          "foreign": 0
+        }
+      }
+    }
+  }
+}
