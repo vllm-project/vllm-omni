@@ -20,7 +20,24 @@ from vllm.logger import init_logger
 from vllm_omni.platforms import current_omni_platform
 
 if current_omni_platform.is_npu():
-    from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding as _BaseMRotaryEmbedding
+    import os
+    from importlib.util import find_spec
+
+    # Key off the same per-stage backend selection the NPU platform plugin
+    # uses (VLLM_OMNI_DISABLE_VLLM_ASCEND) instead of package presence, so a
+    # standalone (DiT) stage never imports vllm_ascend even when the package
+    # is installed. The find_spec fallback only guards the misconfigured
+    # "AR selected but vllm-ascend missing" case; the AR constructor then
+    # raises a clear install-guiding error.
+    disable_ascend = os.environ.get("VLLM_OMNI_DISABLE_VLLM_ASCEND", "false").strip().lower() == "true"
+    if disable_ascend or find_spec("vllm_ascend") is None:
+        # Standalone NPU (DiT backend): fall back to the upstream vLLM
+        # MRotaryEmbedding. OmniMRotaryEmbedding is only exercised on the
+        # AR/multimodal-LLM path, which requires vllm-ascend anyway; the
+        # upstream base keeps module imports alive for pure diffusion stages.
+        from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding as _BaseMRotaryEmbedding
+    else:
+        from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding as _BaseMRotaryEmbedding
 else:
     from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding as _BaseMRotaryEmbedding
 

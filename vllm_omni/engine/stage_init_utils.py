@@ -587,6 +587,25 @@ def _apply_rocm_attention_backend(
     engine_args["attention_backend"] = "TRITON_ATTN"
 
 
+def _check_npu_ar_stage_requires_ascend(stage_id: int, stage_type: str | StageType) -> None:
+    """NPU backend scope pre-check for a single stage.
+
+    AR/generation (llm) stages require vllm-ascend on NPU; pure diffusion
+    stages do not. Fail early with a clear message instead of waiting for
+    worker instantiation.
+    """
+    if stage_type != "diffusion" and current_omni_platform.is_npu():
+        from importlib.util import find_spec
+
+        if find_spec("vllm_ascend") is None:
+            raise RuntimeError(
+                f"Stage {stage_id} is an llm (AR/generation) stage, which "
+                "requires vllm-ascend on NPU. Pure diffusion stages do NOT "
+                "need it. Install vllm-ascend, or declare this stage as a "
+                "diffusion stage."
+            )
+
+
 def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     """Extract metadata through the active production legacy path.
 
@@ -598,6 +617,8 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     engine_args = stage_config.engine_args
 
     _apply_rocm_attention_backend(engine_args, stage_type)
+
+    _check_npu_ar_stage_requires_ascend(stage_id, stage_type)
 
     runtime_cfg = stage_config.runtime
     engine_input_source: list[int] = _get_attr_or_item(stage_config, "engine_input_source", [])
