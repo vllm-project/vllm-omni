@@ -43,7 +43,7 @@
         "extra_body": {
           "save_duplex_request_metrics": true
         },
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "H100": {
             "request_throughput": [

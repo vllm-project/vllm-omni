@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for AR EngineCore vs diffusion worker pause/sleep routing."""
 
 from __future__ import annotations
@@ -7,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
+from vllm.renderers import BaseRenderer
+from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -18,11 +23,14 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
     omni._pause_cond = asyncio.Condition()
     omni._paused = False
+    omni._admitting = 0
     omni._hold_admission_until_resume = False
     omni._sleeping_tags = set()
+    omni._stage_sleeping_tags = {}
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
     omni._final_output_handler = lambda: None
+    omni.reset_mm_cache = AsyncMock()
 
     stage_clients = [SimpleNamespace(stage_type=stage_type) for stage_type in stage_types]
     omni.engine = SimpleNamespace(
@@ -32,6 +40,22 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     )
     omni.collective_rpc = AsyncMock(return_value=[True])
     return omni
+
+
+@pytest.mark.cpu
+def test_reset_mm_cache_routes_through_renderer(mocker):
+    async def run() -> None:
+        omni = object.__new__(AsyncOmni)
+        renderer = mocker.create_autospec(BaseRenderer, instance=True)
+        input_processor = mocker.create_autospec(InputProcessor, instance=True)
+        input_processor.renderer = renderer
+        omni.input_processor = input_processor
+
+        await omni.reset_mm_cache()
+
+        renderer.clear_mm_cache_async.assert_awaited_once_with()
+
+    asyncio.run(run())
 
 
 @pytest.mark.cpu
@@ -172,6 +196,33 @@ def test_sleep_blocks_admission_before_engine_core_rpc():
 
 
 @pytest.mark.cpu
+def test_sleep_waits_for_in_flight_generate_admission():
+    """Sleep must not offload while generate() is still in add_request."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._admitting = 1
+        rpc_started = asyncio.Event()
+
+        async def rpc_side_effect(**kwargs):
+            if kwargs.get("method") == "sleep":
+                rpc_started.set()
+            return [True]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
+        await asyncio.sleep(0.05)
+        assert not sleep_task.done()
+        assert not rpc_started.is_set()
+        await omni._release_generate_admission()
+        await asyncio.wait_for(sleep_task, timeout=1)
+        assert rpc_started.is_set()
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
@@ -261,6 +312,80 @@ def test_sleep_diffusion_only_skips_engine_core_collective_rpc():
 
 
 @pytest.mark.cpu
+def test_streaming_wait_for_first_chunk_does_not_block_sleep():
+    """Waiting for the next client chunk must not hold an admission slot."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        rpc_started = asyncio.Event()
+        first_chunk = asyncio.Event()
+
+        async def rpc_side_effect(**kwargs):
+            if kwargs.get("method") == "sleep":
+                rpc_started.set()
+            return [True]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
+
+        async def wait_then_submit() -> None:
+            await first_chunk.wait()
+            await omni._submit_with_admission(asyncio.sleep(0))
+
+        wait_task = asyncio.create_task(wait_then_submit())
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
+        await asyncio.sleep(0.05)
+        assert not wait_task.done()
+        assert omni._admitting == 0
+        await asyncio.wait_for(sleep_task, timeout=1)
+        assert rpc_started.is_set()
+
+        wait_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait_task
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_streaming_in_flight_add_blocks_sleep():
+    """Sleep must wait while a streaming ADD/update holds an admission slot."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        add_started = asyncio.Event()
+        add_release = asyncio.Event()
+        rpc_started = asyncio.Event()
+
+        async def rpc_side_effect(**kwargs):
+            if kwargs.get("method") == "sleep":
+                rpc_started.set()
+            return [True]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
+
+        async def slow_add() -> None:
+            add_started.set()
+            await add_release.wait()
+
+        add_task = asyncio.create_task(omni._submit_with_admission(slow_add()))
+        await add_started.wait()
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
+        await asyncio.sleep(0.05)
+        assert not sleep_task.done()
+        assert not rpc_started.is_set()
+        assert omni._admitting == 1
+
+        add_release.set()
+        await asyncio.wait_for(add_task, timeout=1)
+        await asyncio.wait_for(sleep_task, timeout=1)
+        assert rpc_started.is_set()
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_wake_up_restores_admission_for_diffusion_only():
     """Pure diffusion must keep sleep → wake → generate (no resume)."""
 
@@ -306,5 +431,32 @@ def test_pause_then_sleep_wake_keeps_admission_paused_for_diffusion():
         assert omni._hold_admission_until_resume is True
         await omni.resume_generation()
         assert omni._paused is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_partial_wake_does_not_skip_remaining_sleeping_stage():
+    """sleep(stage_ids=[0]) then wake([0]) must not skip a later wake([1])."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        await omni.sleep(stage_ids=[0, 1], level=1, mode="abort")
+        assert omni._stage_sleeping_tags.keys() == {0, 1}
+
+        await omni.wake_up(stage_ids=[0])
+        assert 0 not in omni._stage_sleeping_tags
+        assert 1 in omni._stage_sleeping_tags
+        assert CuMemTag.WEIGHTS.value in omni._sleeping_tags
+
+        omni.collective_rpc.reset_mock()
+        acks = await omni.wake_up(stage_ids=[1])
+        assert acks
+        omni.collective_rpc.assert_awaited_once()
+        wake_kwargs = omni.collective_rpc.await_args.kwargs
+        assert wake_kwargs["method"] == "wake_up"
+        assert wake_kwargs["stage_ids"] == [1]
+        assert not omni._sleeping_tags
+        assert not omni._stage_sleeping_tags
 
     asyncio.run(run())

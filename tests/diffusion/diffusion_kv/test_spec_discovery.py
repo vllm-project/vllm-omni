@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -42,9 +42,10 @@ class _RunnerKVBackend:
         self.kv_cache_config = config
 
 
-def _attention(*, enabled: bool) -> Attention:
+def _attention(*, enabled: bool, prefix: str = "image_attention") -> Attention:
     attention = Attention.__new__(Attention)
     nn.Module.__init__(attention)
+    attention.prefix = prefix
     attention.paged_kv_cache_role = "primary" if enabled else None
     attention.paged_kv_cache_dtype = torch.bfloat16
     attention.num_kv_heads = 2
@@ -82,6 +83,23 @@ def test_runner_discovers_native_spec_from_loaded_attention() -> None:
     assert spec.non_causal is True
 
 
+def test_runner_uses_attention_prefix_as_canonical_layer_name() -> None:
+    runner = _runner(_attention(enabled=True, prefix="layers.0.self_attn.image_attn.attn"))
+
+    specs = runner.get_kv_cache_spec()
+
+    assert set(specs) == {"layers.0.self_attn.image_attn.attn"}
+
+
+def test_runner_rejects_duplicate_attention_prefixes() -> None:
+    runner = _runner(_attention(enabled=True, prefix="shared"))
+    second_attention = _attention(enabled=True, prefix="shared")
+    runner.pipeline.second_image_attention = second_attention
+
+    with pytest.raises(RuntimeError, match="Duplicate canonical paged Diffusion Attention prefix 'shared'"):
+        runner.get_kv_cache_spec()
+
+
 def test_runner_rejects_paged_mode_without_cache_enabled_attention() -> None:
     runner = _runner(_attention(enabled=False))
 
@@ -116,21 +134,28 @@ def test_runner_rejects_rank_local_config_for_different_layers() -> None:
         runner.set_kv_cache_config(config)
 
 
-def test_worker_selects_its_rank_local_config() -> None:
+def test_worker_selects_its_rank_local_config(monkeypatch) -> None:
     worker = object.__new__(DiffusionWorker)
     worker.rank = 1
     worker.od_config = SimpleNamespace(num_gpus=2)
     worker.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=None),
         cache_config=SimpleNamespace(num_gpu_blocks=None),
+        kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector", engine_id="dit-engine-1"),
     )
     worker._maybe_get_memory_pool_context = lambda _tag: nullcontext()
     worker.model_runner = SimpleNamespace(set_kv_cache_config=lambda config: setattr(worker, "installed", config))
     configs = [SimpleNamespace(num_blocks=4), SimpleNamespace(num_blocks=8)]
+    ensure_initialized = Mock()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_kv.kv_connector.ensure_kv_transfer_initialized",
+        ensure_initialized,
+    )
 
     worker.set_kv_cache_configs(configs, 64)
 
     assert worker.installed is configs[1]
+    ensure_initialized.assert_called_once_with(worker.vllm_config, configs[1])
     assert worker.vllm_config.model_config.max_model_len == 64
     assert worker.vllm_config.cache_config.num_gpu_blocks == 8
     with pytest.raises(ValueError, match="rank count mismatch"):

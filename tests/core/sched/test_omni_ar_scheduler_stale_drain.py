@@ -142,13 +142,16 @@ def test_exact_drain_delivers_new_segment_frame() -> None:
     session.num_computed_tokens = 6
     session.num_output_placeholders = 1
     session.num_in_flight_tokens = 1
+    session.async_tokens_to_discard = 1
 
     _replace_streaming_session(session)
     assert session.num_stale_output_tokens == 1
+    assert session.async_tokens_to_discard == 1
 
     sched = _make_drain_sched(session)
     assert _run_step(sched, session, num_scheduled=1, token=42) is False  # late frame dropped
     assert session.num_stale_output_tokens == 0
+    assert session.async_tokens_to_discard == 0
     assert _run_step(sched, session, num_scheduled=1, token=43) is True  # new segment survives
 
 
