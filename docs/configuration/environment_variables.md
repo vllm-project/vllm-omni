@@ -90,6 +90,22 @@ depends on the installed kernels and model path.
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on` or `off`; default `on` | Streaming video output; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `on`. | Experimental |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast` or `slow`; default `fast` | Streaming video audio deltas; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `fast`. | Experimental |
 
+### NIXL connector
+
+These overrides are read when each `NixlConnector` is constructed. They control
+full-payload transport, not the native vLLM paged KV connector.
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; connector default `3600` | Producer payload registration lease; connector construction | A non-empty value overrides connector `lease_seconds`; unset or empty uses the connector setting/default. Non-float values raise `ValueError`; range and finiteness are not validated. | Experimental operational control |
+| `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; connector default `300` | Receiver transfer-completion wait; connector construction | A non-empty value overrides connector `transfer_timeout_s`; unset or empty uses the connector setting/default. Non-float values raise `ValueError`; range and finiteness are not validated. | Experimental operational control |
+
+Set a positive, finite lease longer than the maximum consumer queueing delay
+plus transfer time. Lease expiry can deregister an unread producer payload;
+it is not a safe cancellation mechanism for an active transfer. See the
+[NIXL connector](../design/feature/omni_connectors/nixl_connector.md) for ownership
+and timeout behavior.
+
 ### Server storage
 
 Storage names use Pydantic's nested-settings delimiter (`__`). They are read

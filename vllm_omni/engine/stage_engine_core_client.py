@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Engine Core Client for vLLM-Omni multi-stage runtime.
 
@@ -149,11 +152,13 @@ class StageEngineCoreClientBase(StageClientBase):
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
+        self.vllm_config = vllm_config
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._stage_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
+        self._payload_sender_info: dict[str, Any] | None = None
 
         client_name = self.__class__.__name__
         logger.info(
@@ -211,6 +216,7 @@ class StageEngineCoreClientBase(StageClientBase):
             raise
 
         self._initialize_kv_sender_endpoint()
+        self._payload_sender_info = self._build_payload_sender_info()
 
         logger.info(
             "[%s] stage-%s [rep-%s] EngineCore running",
@@ -290,6 +296,50 @@ class StageEngineCoreClientBase(StageClientBase):
         if not isinstance(connector_config, dict):
             return None
         return connector_config
+
+    def _build_payload_sender_info(self) -> dict[str, Any] | None:
+        sender_info = getattr(self, "_kv_sender_info", None)
+        if isinstance(sender_info, dict):
+            sender_host = sender_info.get("host")
+            sender_port = sender_info.get("zmq_port")
+            if sender_host is not None and sender_port is not None:
+                return {
+                    "host": str(sender_host),
+                    "zmq_port": int(sender_port) - KV_TRANSFER_PORT_OFFSET,
+                }
+
+        model_config = getattr(self.vllm_config, "model_config", None)
+        kv_connector_config = self._get_kv_connector_config()
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        extra = connector_config.get("extra") if isinstance(connector_config, dict) else None
+        if not isinstance(extra, dict) or extra.get("role") != "sender":
+            extra = kv_connector_config
+        if not isinstance(extra, dict) or extra.get("role") != "sender":
+            return None
+
+        base_port = extra.get("zmq_port")
+        kv_port = kv_connector_config.get("zmq_port") if isinstance(kv_connector_config, dict) else None
+        if kv_port is not None:
+            base_port = int(os.path.expandvars(str(kv_port))) - KV_TRANSFER_PORT_OFFSET
+        if base_port is None:
+            return None
+        sender_host = self._resolve_sender_host_from_config(extra)
+        if sender_host is None:
+            return None
+        from vllm_omni.distributed.omni_connectors.utils.initialization import connector_zmq_port
+
+        return {
+            "host": sender_host,
+            "zmq_port": connector_zmq_port(
+                int(os.path.expandvars(str(base_port))),
+                purpose="request_forwarding",
+                from_stage=int(extra.get("from_stage", self.stage_id)),
+                replica_id=self.replica_id,
+            ),
+        }
+
+    def get_payload_sender_info(self) -> dict[str, Any] | None:
+        return dict(self._payload_sender_info) if self._payload_sender_info is not None else None
 
     def _resolve_sender_host_from_config(self, connector_config: dict[str, Any]) -> str | None:
         host = connector_config.get("sender_host") or connector_config.get("host")

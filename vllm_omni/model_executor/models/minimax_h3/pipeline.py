@@ -28,6 +28,7 @@ MINIMAX_H3_PIPELINE = PipelineConfig(
             model_arch="MiniMaxH3TextEncoder",
             engine_output_type="latent",
             prompt_transform_func=f"{_PROCESSOR}.prepare_text_encoder_prompt",
+            custom_process_next_stage_input_func=f"{_PROCESSOR}.text_encoder2diffusion_full_payload",
             sampling_constraints={
                 "max_tokens": 1,
                 "temperature": 0.0,
@@ -45,6 +46,7 @@ MINIMAX_H3_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             model_arch="MiniMaxH3Pipeline",
             custom_process_input_func=f"{_PROCESSOR}.text_encoder2diffusion",
+            stage_input_payload_keys=("text_encoder_output",),
             omni_kv_config={"need_recv_cache": False},
             model_path_resolver=f"{_DIFFUSION_PIPELINE}.resolve_minimax_h3_diffusion_model_path",
             inline_diffusion=True,

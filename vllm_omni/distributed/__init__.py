@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from .omni_connectors import (
     ConnectorSpec,
@@ -7,6 +7,7 @@ from .omni_connectors import (
     MooncakeStoreConnector,
     MooncakeTransferEngineConnector,
     MoriTransferEngineConnector,
+    NixlConnector,
     OmniConnectorBase,
     OmniConnectorFactory,
     OmniTransferConfig,
@@ -27,6 +28,7 @@ __all__ = [
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",
     "MoriTransferEngineConnector",
+    "NixlConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
     "YuanrongTransferEngineConnector",
