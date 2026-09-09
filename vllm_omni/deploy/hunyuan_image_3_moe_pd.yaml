@@ -23,6 +23,7 @@ connectors:
 
 stages:
   - stage_id: 0
+    async_scheduling: false
     devices: "0,1"
     env:
       VLLM_HOST_IP: "127.0.0.1"
@@ -83,6 +84,8 @@ stages:
       top_p: 1
       top_k: -1
       max_tokens: 8192
+      extra_args:
+        pd_resume_from_prefill: true
       detokenize: true
       skip_special_tokens: false
       include_stop_str_in_output: true

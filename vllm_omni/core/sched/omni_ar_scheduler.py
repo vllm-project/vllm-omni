@@ -16,7 +16,8 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.core.sched.utils import check_stop
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -25,6 +26,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.pd_continuation import PD_PREFILL_KEY, prepend_initial_output
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     request_needs_downstream_stage,
@@ -127,6 +129,121 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._pd_completed_outputs: list[tuple[int, OmniEngineCoreOutput]] = []
+
+    def add_request(self, request: Request) -> None:
+        params = request.sampling_params
+        is_pd_resume = getattr(request, "pd_continuation", None) is not None
+        is_pd_prefill = params is not None and (params.extra_args or {}).get(PD_PREFILL_KEY)
+        if is_pd_resume or is_pd_prefill:
+            parallel = self.vllm_config.parallel_config
+            # P's one-sample budget is enforced when its output arrives, so
+            # it cannot submit another step before that output is processed.
+            # D uses the normal AsyncScheduler placeholder accounting; y1 is
+            # already confirmed history and must not create a placeholder.
+            if is_pd_prefill and self.scheduler_config.async_scheduling:
+                raise ValueError("PD first-token producer requires synchronous scheduling")
+            if (
+                self.vllm_config.speculative_config is not None
+                or parallel.pipeline_parallel_size != 1
+                or getattr(parallel, "decode_context_parallel_size", 1) != 1
+                or getattr(parallel, "prefill_context_parallel_size", 1) != 1
+                or request.resumable
+            ):
+                raise ValueError("PD first-token continuation requires PP/CP=1, no speculation, no resumable input")
+        return super().add_request(request)
+
+    def _update_request_with_output(self, request: Request, new_token_ids: list[int], *args, **kwargs):
+        token_ids, stopped = super()._update_request_with_output(request, new_token_ids, *args, **kwargs)
+        params = request.sampling_params
+        if params is not None and (params.extra_args or {}).get(PD_PREFILL_KEY) and token_ids:
+            # This is an execution boundary, not the user's logical stop rule.
+            # Keep the actual first-token sampler masks, but satisfy Mooncake's
+            # length-finished contract so it retains the prompt blocks for D.
+            if request.num_output_tokens != 1:
+                raise RuntimeError("PD producer must execute exactly one sample")
+            request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            request.stop_reason = None
+            return token_ids, True
+        return token_ids, stopped
+
+    def _finish_pd_terminal_receives(self) -> None:
+        """Complete a terminal y1 after its prompt KV arrives, without forward.
+
+        The regular _free_request path retains blocks for downstream extraction.
+        Its result is emitted in update_from_output, after the transfer-only
+        worker execution, rather than being mistaken for an abort.
+        """
+        if not any(getattr(req, "pd_continuation", None) is not None for req in self.requests.values()):
+            return
+        queues = (self.waiting, self.skipped_waiting)
+        seen = set()
+        for queue in queues:
+            for request in list(queue):
+                req_id = request.request_id
+                continuation = getattr(request, "pd_continuation", None)
+                if (
+                    continuation is None
+                    or req_id in seen
+                    or request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                    or req_id not in self.finished_recving_kv_req_ids
+                ):
+                    continue
+                seen.add(req_id)
+                old_status, old_reason = request.status, request.stop_reason
+                stopped = check_stop(request, self.max_model_len)
+                if continuation.stop_string is not None:
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    request.stop_reason = continuation.stop_string
+                    stopped = True
+                terminal_status, terminal_reason = request.status, request.stop_reason
+                request.status, request.stop_reason = old_status, old_reason
+                if not stopped:
+                    continue
+                self._update_waiting_for_remote_kv(request)
+                if request.num_computed_tokens != continuation.prompt_len:
+                    raise RuntimeError("PD terminal continuation requires all prompt KV to be received")
+                for pending in queues:
+                    pending.remove_requests([request])
+                request.status, request.stop_reason = terminal_status, terminal_reason
+                finish_reason = request.get_finished_reason()
+                prefill_stats = request.take_prefill_stats()
+                if prefill_stats is not None:
+                    prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
+                kv_params, ec_params = self._free_request(request)
+                request.pd_output_prefix_pending = False
+                self._pd_completed_outputs.append(
+                    (
+                        request.client_index,
+                        OmniEngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=list(continuation.token_ids),
+                            # STOP would drop the entire last token in detokenization,
+                            # including text before a stop string within y1. Flush y1
+                            # normally; the output processor then applies the text stop
+                            # and replaces LENGTH with STOP, just as in ordinary AR.
+                            finish_reason=FinishReason.LENGTH
+                            if continuation.stop_string is not None
+                            else finish_reason,
+                            stop_reason=None if continuation.stop_string is not None else terminal_reason,
+                            kv_transfer_params=kv_params,
+                            ec_transfer_params=ec_params,
+                            events=request.take_events(),
+                            prefill_stats=prefill_stats,
+                            trace_headers=request.trace_headers,
+                            is_segment_finished=True,
+                        ),
+                    )
+                )
+
+    def _update_waiting_for_remote_kv(self, request: Request):
+        continuation = getattr(request, "pd_continuation", None)
+        if continuation is not None and request.request_id in self.failed_recving_kv_req_ids:
+            raise RuntimeError("PD continuation prompt KV load failed; cannot resume with incomplete KV")
+        result = super()._update_waiting_for_remote_kv(request)
+        if continuation is not None and request.num_computed_tokens != continuation.prompt_len:
+            raise RuntimeError("PD continuation expected complete prompt KV, without tail recomputation")
+        return result
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -307,6 +424,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.pending_stop_after_extraction.add(req_id)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._finish_pd_terminal_receives()
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -382,6 +500,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        for client_index, output in getattr(self, "_pd_completed_outputs", []):
+            outputs[client_index].append(output)
+        self._pd_completed_outputs = []
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -671,6 +792,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                # Model history already contains y1; prepend it only to the emitted delta.
+                new_token_ids = prepend_initial_output(request, new_token_ids, stopped)
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,
