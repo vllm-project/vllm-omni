@@ -18,16 +18,22 @@ Ulysses keeps using SP while native column/row tensor parallelism and the MoE
 heads use TP.  This gives TP4 and TP2SP2 independent weight/head and token
 axes while preserving the released equations and checkpoint hierarchy.
 
-These helpers intentionally do not create or own process groups.
+The normal path reuses vLLM-owned groups.  The opt-in ``MAGI2_EP_SIZE`` path
+creates deterministic contiguous EP subgroups for MAGI-2 experiments when the
+pipeline does not expose an expert-parallel group yet.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,13 @@ class Magi2ParallelGroup:
     world_size: int
     rank: int
     replicated_sequence: bool = False
+    # Global ranks in an experimental MAGI MoE group. ``None`` denotes a
+    # vLLM-owned group whose rank order is already local to its coordinator.
+    global_ranks: tuple[int, ...] | None = None
+    global_rank: int | None = None
+
+
+_CUSTOM_EP_GROUPS: dict[tuple[int, int, str], Magi2ParallelGroup] = {}
 
 
 def _dist_group_info(group: dist.ProcessGroup | None) -> Magi2ParallelGroup:
@@ -76,13 +89,52 @@ def get_magi2_ep_group() -> Magi2ParallelGroup:
     """Return the process group used for MAGI's MoE-head parallelism.
 
     TP is the explicit MoE-head axis when it is larger than one.  Otherwise
-    the released SP-only layout overlaps head parallelism with Ulysses.  Both
-    groups are initialized and owned by vLLM-Omni; MAGI creates no ad-hoc
-    process groups.
+    the released SP-only layout overlaps head parallelism with Ulysses.  The
+    normal path reuses vLLM-owned groups; ``MAGI2_EP_SIZE`` is an explicit
+    experimental escape hatch that creates deterministic contiguous subgroups.
     """
 
     if not dist.is_available() or not dist.is_initialized():
         return Magi2ParallelGroup(None, 1, 0)
+    ep_size_text = os.environ.get("MAGI2_EP_SIZE")
+    if ep_size_text:
+        try:
+            ep_size = int(ep_size_text)
+        except ValueError as exc:
+            raise ValueError("MAGI2_EP_SIZE must be an integer") from exc
+        world = dist.get_world_size()
+        global_rank = dist.get_rank()
+        if ep_size < 1 or world % ep_size != 0:
+            raise ValueError(f"MAGI2_EP_SIZE={ep_size} must divide diffusion world size {world}")
+        if ep_size > 1:
+            backend = str(dist.get_backend())
+            cache_key = (world, ep_size, backend)
+            cached = _CUSTOM_EP_GROUPS.get(cache_key)
+            if cached is not None:
+                return cached
+            selected = None
+            # Every rank creates every subgroup in identical order, as
+            # required by torch.distributed.new_group.
+            for start in range(0, world, ep_size):
+                ranks = tuple(range(start, start + ep_size))
+                group = dist.new_group(ranks=list(ranks), backend=backend)
+                if global_rank in ranks:
+                    selected = Magi2ParallelGroup(
+                        group=group,
+                        world_size=ep_size,
+                        rank=ranks.index(global_rank),
+                        replicated_sequence=False,
+                        global_ranks=ranks,
+                        global_rank=global_rank,
+                    )
+            assert selected is not None
+            _CUSTOM_EP_GROUPS[cache_key] = selected
+            logger.info(
+                "MAGI2 experimental EP group: global_rank=%d ranks=%s",
+                global_rank,
+                selected.global_ranks,
+            )
+            return selected
     try:
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -124,10 +176,7 @@ def get_magi2_replica_group(data_parallel_size: int) -> Magi2ParallelGroup:
     The pipeline uses this group for conditioning broadcasts and output-rank
     ownership.  With DP=1 the diffusion world is exactly one TP x SP replica.
     With DP>1, MAGI currently requires TP=1, so the existing SP group is the
-    complete per-replica group. CFG x DP is deliberately rejected by
-    ``_validate_native_topology``; if that combination is enabled in the
-    future, this helper must select a group fixed to one DP replica and include
-    its CFG ranks rather than returning the SP group alone.
+    complete per-replica group.  Topology validation enforces those premises.
     """
 
     if not dist.is_available() or not dist.is_initialized():

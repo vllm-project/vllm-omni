@@ -118,15 +118,24 @@ DEFAULT_NEGATIVE_PROMPT += (
 class _PeakReservedMonitor:
     def __init__(self, device: int) -> None:
         self.device = device
-        self.peak_bytes = torch.accelerator.memory_reserved(device)
+        self.peak_bytes = self._memory_reserved()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _memory_reserved(self) -> int:
+        try:
+            return int(torch.accelerator.memory_reserved(self.device))
+        except (AttributeError, RuntimeError, NotImplementedError):
+            # Some accelerator builds expose synchronization but not a
+            # reserved-memory counter. Monitoring is diagnostic only and must
+            # not block a correctness run on those platforms.
+            return 0
 
     def _run(self) -> None:
         while not self._stop.is_set():
             self.peak_bytes = max(
                 self.peak_bytes,
-                torch.accelerator.memory_reserved(self.device),
+                self._memory_reserved(),
             )
             self._stop.wait(0.05)
 
@@ -138,7 +147,7 @@ class _PeakReservedMonitor:
         self._thread.join()
         self.peak_bytes = max(
             self.peak_bytes,
-            torch.accelerator.memory_reserved(self.device),
+            self._memory_reserved(),
         )
 
 
@@ -370,6 +379,12 @@ def _seed_request(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
+    if current_omni_platform.is_musa():
+        # torch.cuda intentionally reports false on MUSA; use the platform
+        # hook when available so each worker's accelerator RNG is seeded.
+        manual_seed_all = getattr(current_omni_platform, "manual_seed_all", None)
+        if manual_seed_all is not None:
+            manual_seed_all(seed)
 
 
 def _resolve_request_seed(sampling: object) -> int:
@@ -496,6 +511,16 @@ class Magi2Pipeline(
     SupportImageInput,
     SupportAudioOutput,
 ):
+    _PROFILER_TARGETS = (
+        "_encode_prompts",
+        "_encode_reference_image",
+        "_pool_figure_token",
+        "sampler.sample",
+        "sampler.denoise_step",
+        "_decode_video",
+        "_decode_audio",
+    )
+
     """Native MAGI-2 Preview text/image-to-video-and-audio pipeline.
 
     One pipeline instance is supported per worker process. Initialization sets
@@ -527,11 +552,7 @@ class Magi2Pipeline(
 
     @staticmethod
     def _remap_ckpt_key(checkpoint_key: str) -> str | None:
-        """Map released Preview keys to the native pipeline namespace.
-
-        The DLO host-weight planner looks this hook up by name when it builds
-        a direct mmap plan; the ordinary loader uses ``load_weights`` below.
-        """
+        """Map released Preview keys to the native pipeline namespace."""
 
         checkpoint_key = checkpoint_key.removeprefix("transformer.")
         if checkpoint_key.startswith(("block.", "pre_adapter.", "post_adapter.")):
@@ -546,12 +567,15 @@ class Magi2Pipeline(
         if not od_config.model:
             raise ValueError("MAGI-2 requires od_config.model")
         _validate_native_topology(od_config)
-        if not current_omni_platform.is_cuda() or not current_omni_platform.is_available():
-            raise RuntimeError("MAGI-2 Preview requires CUDA GPUs")
+        if not (
+            (current_omni_platform.is_cuda() or current_omni_platform.is_musa())
+            and current_omni_platform.is_available()
+        ):
+            raise RuntimeError("MAGI-2 Preview requires a CUDA or MUSA accelerator")
 
         self.od_config = od_config
         self.dtype = od_config.dtype or torch.bfloat16
-        self.device_str = f"cuda:{torch.accelerator.current_device_index()}"
+        self.device_str = f"{current_omni_platform.device_type}:{torch.accelerator.current_device_index()}"
         self.checkpoint_root = _resolve_checkpoint_root(
             str(od_config.model),
             od_config.revision,
@@ -678,14 +702,7 @@ class Magi2Pipeline(
             )
         ]
         self.setup_diffusion_pipeline_profiler(
-            profiler_targets=[
-                "_encode_prompts",
-                "_encode_reference_image",
-                "_pool_figure_token",
-                "sampler.sample",
-                "_decode_video",
-                "_decode_audio",
-            ],
+            profiler_targets=list(self._PROFILER_TARGETS),
             enable_diffusion_pipeline_profiler=bool(getattr(od_config, "enable_diffusion_pipeline_profiler", False)),
         )
 
@@ -841,10 +858,6 @@ class Magi2Pipeline(
     ) -> torch.Tensor:
         special: torch.Tensor | None = None
         if self._is_output_rank:
-            # This helper only tokenizes the prompt and pools rows that are
-            # already present in ``context``; it does not read encoder weights.
-            # Keep it outside the staged encoder window so CPU-only pooling
-            # cannot trigger an unnecessary device transfer.
             special = self.text_encoder.module.pool_figure_tokens(
                 prompt,
                 ["<Figure 1>"],
@@ -911,15 +924,7 @@ class Magi2Pipeline(
 
         latent_height = height // MAGI2_GENERATION_CONFIG.video_vae_stride[1]
         latent_width = width // MAGI2_GENERATION_CONFIG.video_vae_stride[2]
-        public_frame_length = int(round(MAGI2_GENERATION_CONFIG.duration_seconds * MAGI2_GENERATION_CONFIG.fps))
-        if public_frame_length != MAGI2_GENERATION_CONFIG.output_frames:
-            raise RuntimeError(
-                "MAGI-2 generation config is inconsistent: duration_seconds * fps must equal output_frames"
-            )
-        # The Preview DiT/decoder operates on the internal 25-FPS timeline,
-        # while the public output contract is 12.5 FPS. The internal timeline
-        # is therefore twice as long; the decoded result is muxed at 12.5 FPS.
-        video_frame_length = public_frame_length * 2
+        video_frame_length = int(round(MAGI2_GENERATION_CONFIG.duration_seconds * MAGI2_GENERATION_CONFIG.fps * 2))
         latent_length = (video_frame_length - 1) // MAGI2_GENERATION_CONFIG.video_vae_stride[0] + 1
         audio_length = int(round(MAGI2_GENERATION_CONFIG.duration_seconds * MAGI2_GENERATION_CONFIG.audio_latent_fps))
         # Draw order is parity-critical: video noise precedes audio noise.
@@ -1062,18 +1067,12 @@ class Magi2Pipeline(
         seed = _resolve_request_seed(sampling)
         _seed_request(seed)
 
-        has_cuda = current_omni_platform.is_cuda() and current_omni_platform.is_available()
-        device_index = torch.accelerator.current_device_index() if has_cuda else None
-        # Sampling reserved memory is qualification instrumentation, not part
-        # of ordinary serving. It starts only when the pipeline profiler is
-        # explicitly enabled, so every CUDA request avoids a 20 Hz thread.
-        monitor = (
-            _PeakReservedMonitor(device_index)
-            if device_index is not None and getattr(self, "enable_diffusion_pipeline_profiler", False)
-            else None
-        )
+        has_accelerator = (
+            current_omni_platform.is_cuda() or current_omni_platform.is_musa()
+        ) and current_omni_platform.is_available()
+        device_index = torch.accelerator.current_device_index() if has_accelerator else None
+        monitor = _PeakReservedMonitor(device_index) if device_index is not None else None
         monitor_started = False
-        started = time.perf_counter()
         try:
             if monitor is not None:
                 monitor.start()
@@ -1087,7 +1086,7 @@ class Magi2Pipeline(
                 height=height,
                 num_inference_steps=steps,
             )
-            if has_cuda:
+            if has_accelerator:
                 torch.accelerator.synchronize()
         finally:
             if monitor_started:
@@ -1098,7 +1097,7 @@ class Magi2Pipeline(
             video = _resize_video(video, output_width, output_height)
 
         peak_memory_mb = monitor.peak_bytes / 1024**2 if monitor is not None else 0.0
-        if has_cuda and dist.is_available() and dist.is_initialized() and self._parallel_group.world_size > 1:
+        if has_accelerator and dist.is_available() and dist.is_initialized() and self._parallel_group.world_size > 1:
             peak = torch.tensor(peak_memory_mb, device=self.device_str)
             dist.all_reduce(
                 peak,

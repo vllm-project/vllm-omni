@@ -249,6 +249,55 @@ def vllm_flash_attn_varlen_with_lse(
     return out, lse
 
 
+def flash_attn_3_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    deterministic: bool = False,
+) -> torch.Tensor | None:
+    """Run an optional FlashAttention-3 varlen backend without LSE.
+
+    This adapter is backend-neutral: MATE/FlashAttention-3 builds on MUSA or
+    CUDA may provide either ``flash_attn_3.interface`` or the compatibility
+    ``flash_attn_interface`` module.  Callers needing log-sum-exp should keep
+    using :func:`vllm_flash_attn_varlen_with_lse`, whose return contract is
+    intentionally different.
+    """
+    try:
+        from flash_attn_3.interface import flash_attn_varlen_func
+    except (ImportError, ModuleNotFoundError):
+        try:
+            from flash_attn_interface import flash_attn_varlen_func
+        except (ImportError, ModuleNotFoundError):
+            return None
+    result = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=q.shape[-1] ** -0.5,
+        causal=False,
+        softcap=max(0.0, softcap),
+        deterministic=deterministic,
+        return_softmax_lse=False,
+        sinks=sinks,
+    )
+    out = result[0] if isinstance(result, tuple) else result
+    if not isinstance(out, torch.Tensor):
+        raise TypeError(f"FlashAttention-3 returned unsupported type {type(out)!r}")
+    return out
+
+
 @lru_cache(maxsize=1)
 def is_flash_attn_installed() -> bool:
     """Return whether a Flash Attention backend package is importable.

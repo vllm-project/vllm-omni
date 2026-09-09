@@ -11,7 +11,9 @@ MagiCompiler and external Triton runtime dependencies.
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 from collections.abc import Callable
 
 import torch
@@ -20,6 +22,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
+
+logger = logging.getLogger(__name__)
+_SWIGLU7_FUSED_DISABLED = False
 
 
 def swiglu7(
@@ -30,7 +35,31 @@ def swiglu7(
 ) -> torch.Tensor:
     """Released GPT-OSS-style clamped SwiGLU activation."""
 
+    global _SWIGLU7_FUSED_DISABLED
     out_dtype = x.dtype if out_dtype is None else out_dtype
+    use_fused = (
+        not _SWIGLU7_FUSED_DISABLED
+        and os.environ.get("MAGI2_USE_FUSED_SWIGLU7", "1") == "1"
+        and os.environ.get("MAGI2_DETERMINISTIC", "0") != "1"
+        and x.device.type in {"musa", "privateuseone"}
+        and x.dtype == torch.bfloat16
+        and out_dtype == x.dtype
+        and x.is_contiguous()
+        and x.shape[-1] % 2 == 0
+        and alpha == 1.702
+        and limit == 7.0
+    )
+    if use_fused:
+        try:
+            from .swiglu_kernel import magi2_swiglu7
+
+            return magi2_swiglu7(x)
+        except Exception as exc:
+            _SWIGLU7_FUSED_DISABLED = True
+            logger.warning(
+                "MUSA fused MAGI-2 SwiGLU7 failed; using eager fallback: %s",
+                exc,
+            )
     x = x.to(torch.float32)
     gate, linear = x[..., ::2], x[..., 1::2]
     gate = gate.clamp(max=limit)
@@ -256,8 +285,47 @@ class MultiModalityRMSNorm(nn.Module):
         self,
         tensor: torch.Tensor,
         modality_dispatcher: ModalityDispatcher | None = None,
+        *,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         original_dtype = tensor.dtype
+        target_dtype = out_dtype or self.out_dtype or original_dtype
+
+        # ``tensor.float(); square(); mean(); rsqrt()`` is a surprisingly large
+        # part of a MAGI-2 step on MUSA.  The MUSA implementation of
+        # ``aten.rms_norm`` performs the reduction and scale in one kernel.  Keep
+        # this guarded by an environment rollback switch; callers can set the
+        # variable to ``0`` to retain the checkpoint/reference path below.
+        fast_rms = (
+            os.environ.get("MAGI2_FAST_RMS_NORM", "1") == "1"
+            and os.environ.get("MAGI2_DETERMINISTIC", "0") != "1"
+            and tensor.device.type in {"musa", "privateuseone"}
+        )
+        if fast_rms:
+            compute_dtype = torch.float32 if target_dtype == torch.float32 else tensor.dtype
+            normalized_input = tensor.to(compute_dtype)
+            if self.num_modality == 1:
+                normalized = F.rms_norm(
+                    normalized_input,
+                    (self.dim,),
+                    None,
+                    self.eps,
+                )
+                weight = (self.weight.view(self.num_patterns, self.dim) + 1.0).to(compute_dtype)
+                return (normalized * weight).to(target_dtype)
+            if modality_dispatcher is None:
+                raise ValueError("modality_dispatcher is required for multimodal RMSNorm")
+            normalized = F.rms_norm(
+                normalized_input,
+                (self.dim,),
+                None,
+                self.eps,
+            )
+            weights = (self.weight.view(self.num_modality, self.num_patterns, self.dim) + 1.0).to(compute_dtype)
+            inputs = modality_dispatcher.dispatch(normalized)
+            result = modality_dispatcher.undispatch(*(part * weights[index] for index, part in enumerate(inputs)))
+            return result.to(target_dtype)
+
         normalized = tensor.float()
         normalized = normalized * torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + self.eps)
         if self.num_modality == 1:
@@ -271,7 +339,7 @@ class MultiModalityRMSNorm(nn.Module):
             result = modality_dispatcher.undispatch(
                 *(part * (weights[index] + 1.0) for index, part in enumerate(inputs))
             )
-        return result.to(self.out_dtype or original_dtype)
+        return result.to(target_dtype)
 
 
 def _frequency_bands(
@@ -329,7 +397,27 @@ class ElementWiseFourierEmbed(nn.Module):
 MHCTensorTuple = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
+_MHC_FUSED_DISABLED = False
+
+
 def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float) -> torch.Tensor:
+    global _MHC_FUSED_DISABLED
+    fused_setting = os.environ.get("MAGI2_USE_MHC_FUSED")
+    use_fused = (
+        not _MHC_FUSED_DISABLED
+        and fused_setting != "0"
+        and matrix_logits.device.type in ("musa", "privateuseone")
+        and matrix_logits.ndim == 3
+        and matrix_logits.shape[-2:] == (4, 4)
+    )
+    if use_fused:
+        try:
+            from .mhc_kernel import mhc_sinkhorn
+
+            return mhc_sinkhorn(matrix_logits, num_iters=iterations, eps=epsilon)
+        except Exception as exc:
+            logger.warning("MAGI-2 fused mHC Sinkhorn failed; using reference path: %s", exc)
+            _MHC_FUSED_DISABLED = True
     matrix = torch.exp(matrix_logits - matrix_logits.amax(dim=(-2, -1), keepdim=True))
     for _ in range(iterations):
         matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon)
@@ -355,6 +443,31 @@ class MHCHandler:
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.dtype = dtype
         self.matmul_scale = 1.0 / math.sqrt(float(num_streams * hidden_size))
+        self._phi_fused_bf16: dict[int, tuple[tuple[int, int], torch.Tensor]] = {}
+
+    @staticmethod
+    def _parameter_source(parameter: torch.Tensor) -> tuple[int, int]:
+        try:
+            version = parameter._version
+        except RuntimeError:
+            version = -1
+        return parameter.data_ptr(), version
+
+    def _bf16_phi(self, phi_fused: torch.Tensor) -> torch.Tensor:
+        """Cache the tiny BF16 projection matrix without changing state dicts."""
+        key = id(phi_fused)
+        source = self._parameter_source(phi_fused)
+        cached = self._phi_fused_bf16.get(key)
+        if (
+            cached is None
+            or cached[0] != source
+            or cached[1].device != phi_fused.device
+            or cached[1].shape != phi_fused.shape
+        ):
+            value = phi_fused.detach().to(dtype=torch.bfloat16).contiguous()
+            self._phi_fused_bf16[key] = (source, value)
+            return value
+        return cached[1]
 
     def flatten(self, tensor: torch.Tensor) -> torch.Tensor:
         self._check_multi(tensor)
@@ -368,7 +481,20 @@ class MHCHandler:
     ) -> MHCTensorTuple:
         if flattened.ndim != 2 or flattened.shape[-1] != self.num_streams * self.hidden_size:
             raise ValueError("invalid flattened mHC shape")
-        fused = norm(flattened).to(self.dtype) @ phi_fused
+        normalized = norm(flattened)
+        use_bf16 = (
+            os.environ.get("MAGI2_MHC_BF16_PROJECT", "1") == "1"
+            and os.environ.get("MAGI2_DETERMINISTIC", "0") != "1"
+            and flattened.device.type in {"musa", "privateuseone"}
+            and self.num_streams == 4
+            and flattened.ndim == 2
+            and flattened.shape[-1] == self.num_streams * self.hidden_size
+            and phi_fused.dtype == torch.float32
+        )
+        if use_bf16:
+            fused = (normalized.to(dtype=torch.bfloat16) @ self._bf16_phi(phi_fused)).float()
+        else:
+            fused = normalized.to(self.dtype) @ phi_fused
         pre, post, residual = torch.split(
             fused,
             (self.num_streams, self.num_streams, self.num_streams**2),
@@ -386,6 +512,14 @@ class MHCHandler:
         self._check_multi(streams)
         alpha, bias, logits = alpha_bias_logits
         coefficients = torch.sigmoid(alpha * self.matmul_scale * logits + bias.unsqueeze(0))
+        if (
+            os.environ.get("MAGI2_MHC_FAST_MIX", "1") == "1"
+            and os.environ.get("MAGI2_DETERMINISTIC", "0") != "1"
+            and streams.device.type in {"musa", "privateuseone"}
+            and streams.dtype == torch.bfloat16
+            and streams.shape[1] == 4
+        ):
+            return (coefficients.to(streams.dtype).unsqueeze(-1) * streams).sum(dim=1)
         return torch.einsum("tn,tnc->tc", coefficients.to(out_dtype or streams.dtype), streams)
 
     def compute_post_residual(
@@ -397,6 +531,47 @@ class MHCHandler:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         alpha_post, bias_post, post_logits = post
         alpha_residual, bias_residual, residual_logits = residual
+        use_fused_coefficients = (
+            # Validated on S5000; set MAGI2_FUSED_MHC_COEFFICIENTS=0 to roll
+            # back if an older MUSA runtime lacks this custom op.
+            os.environ.get("MAGI2_FUSED_MHC_COEFFICIENTS", "1") == "1"
+            and os.environ.get("MAGI2_DETERMINISTIC", "0") != "1"
+            and residual_logits.device.type in {"musa", "privateuseone"}
+            and residual_logits.dtype == torch.float32
+            and post_logits.dtype == torch.float32
+            and out_dtype == torch.bfloat16
+            and alpha_post.dtype == torch.float32
+            and bias_post.dtype == torch.float32
+            and alpha_residual.dtype == torch.float32
+            and bias_residual.dtype == torch.float32
+            and self.num_streams == 4
+            and post_logits.ndim == 2
+            and post_logits.shape[-1] == 4
+            and residual_logits.ndim == 3
+            and residual_logits.shape[-2:] == (4, 4)
+            and post_logits.stride(-1) == 1
+            and residual_logits.stride()[-2:] == (4, 1)
+        )
+        if use_fused_coefficients:
+            try:
+                from .mhc_kernel import mhc_coefficients
+
+                return mhc_coefficients(
+                    post_logits,
+                    residual_logits,
+                    alpha_post,
+                    bias_post,
+                    alpha_residual,
+                    bias_residual,
+                    scale=self.matmul_scale,
+                    num_iters=self.sinkhorn_iterations,
+                    eps=self.sinkhorn_epsilon,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MAGI-2 fused mHC coefficient kernel failed; using reference path: %s",
+                    exc,
+                )
         post_coefficients = 2.0 * torch.sigmoid(alpha_post * self.matmul_scale * post_logits + bias_post.unsqueeze(0))
         residual_matrix = sinkhorn_knopp(
             alpha_residual * self.matmul_scale * residual_logits.float() + bias_residual.unsqueeze(0).float(),
@@ -415,6 +590,26 @@ class MHCHandler:
         self._check_multi(residual_streams)
         if branch_output.ndim != 2 or branch_output.shape[-1] != self.hidden_size:
             raise ValueError("invalid mHC branch-output shape")
+        fused_setting = os.environ.get("MAGI2_USE_MHC_FUSED")
+        if fused_setting != "0" and residual_streams.device.type in ("musa", "privateuseone") and self.num_streams == 4:
+            try:
+                from .mhc_kernel import mhc_mix_output
+
+                if not (
+                    residual_streams.is_contiguous()
+                    and branch_output.is_contiguous()
+                    and post_coefficients.is_contiguous()
+                    and residual_matrix.is_contiguous()
+                ):
+                    raise ValueError("mHC fused inputs must be contiguous")
+                return mhc_mix_output(
+                    residual_streams,
+                    branch_output,
+                    post_coefficients,
+                    residual_matrix,
+                )
+            except Exception as exc:
+                logger.warning("MAGI-2 fused mHC mix failed; using reference path: %s", exc)
         branch = torch.einsum("tn,tc->tnc", post_coefficients, branch_output)
         mixed = torch.einsum("tij,tjc->tic", residual_matrix, residual_streams)
         return mixed + branch

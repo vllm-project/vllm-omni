@@ -539,13 +539,7 @@ class PackedModelInput:
 
 
 class Magi2DataProxy:
-    """Convert dense modality tensors to/from the transformer's packed ABI.
-
-    The proxy is request-stateless: all packing state needed by
-    ``process_output`` is returned as ``PackedModelInput.output_layout`` rather
-    than stored on this shared instance, so concurrent requests cannot
-    overwrite one another.
-    """
+    """Convert dense modality tensors to/from the transformer's packed ABI."""
 
     def __init__(self, config: Magi2PreviewDataProxyConfig | None = None) -> None:
         self.config = config or Magi2PreviewDataProxyConfig()
