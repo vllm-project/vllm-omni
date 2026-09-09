@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
-from safetensors.torch import save_file
 
 from vllm_omni.data_entry_keys import OmniPayload, deserialize_payload, serialize_payload
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
@@ -492,7 +491,7 @@ def test_diffusion_resolver_skips_native_transformer_for_override(monkeypatch, t
     assert transformer_patterns == ["FL2VA/transformer/config.json"]
 
 
-def test_diffusion_resolver_rejects_incompatible_convrot_modes_before_download(monkeypatch, tmp_path):
+def test_diffusion_resolver_rejects_convrot_hsdp_before_download(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
 
     calls = []
@@ -510,25 +509,6 @@ def test_diffusion_resolver_rejects_incompatible_convrot_modes_before_download(m
             "fl2va",
             model_paths=model_paths,
             use_hsdp=True,
-        )
-
-    adapter = tmp_path / "fasth3.safetensors"
-    save_file(
-        {"dummy": torch.zeros(1)},
-        adapter,
-        metadata={
-            "format": "fastvideo-lora-v2",
-            "finetuned_model": "FastVideo/FastVideo-FastH3-Dense-4-step-v1",
-            "base_model": "MiniMaxAI/MiniMax-H3",
-        },
-    )
-    with pytest.raises(ValueError, match="cannot be combined with FastH3"):
-        resolve_minimax_h3_diffusion_model_path(
-            "MiniMaxAI/MiniMax-H3",
-            None,
-            "fl2va",
-            model_paths=model_paths,
-            lora_path=[str(tmp_path / "ordinary.safetensors"), str(adapter)],
         )
 
     assert calls == []

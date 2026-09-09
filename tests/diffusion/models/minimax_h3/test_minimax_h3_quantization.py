@@ -677,6 +677,41 @@ def test_comfy_checkpoint_rejects_unmarked_int8_weights(tmp_path):
         inspect_comfy_checkpoint(checkpoint)
 
 
+def test_convrot_rejects_resolved_fasth3_fusion(monkeypatch, mocker, tmp_path):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline
+    from vllm_omni.diffusion.models.minimax_h3.comfy_checkpoint import MiniMaxH3ComfyCheckpoint
+    from vllm_omni.quantization.int8_convrot_config import DiffusionInt8ConvRotConfig
+
+    partition = tmp_path / "FL2VA"
+    partition.mkdir()
+    (partition / "model_index.json").write_text(json.dumps({"_minimax_h3": {"partition": "fl2va"}}))
+    checkpoint = tmp_path / "convrot.safetensors"
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        revision=None,
+        task_type="fl2va",
+        model_loaded={"text_encoder": False},
+        model_paths={"transformer": str(checkpoint)},
+        quantization_config=DiffusionInt8ConvRotConfig(),
+    )
+    transformer = nn.Module()
+    monkeypatch.setattr(pipeline, "get_local_device", lambda: torch.device("cpu"))
+    mocker.patch.object(pipeline, "resolve_comfy_checkpoint_path", return_value=checkpoint)
+    mocker.patch.object(
+        pipeline,
+        "inspect_comfy_checkpoint",
+        return_value=MiniMaxH3ComfyCheckpoint(checkpoint, "fl2va", {}, None, None),
+    )
+    mocker.patch.object(pipeline, "MiniMaxH3DiTModel", return_value=transformer)
+    resolve_fusion = mocker.patch.object(pipeline, "resolve_fasth3_fusion", return_value=object())
+
+    with pytest.raises(ValueError, match="FastH3 weight deltas cannot be fused"):
+        pipeline.MiniMaxH3Pipeline(od_config=od_config)
+
+    resolve_fusion.assert_called_once_with(od_config, transformer)
+
+
 def test_adaln_curve_model_interpolates_without_dense_time_embedder(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 
@@ -691,17 +726,17 @@ def test_adaln_curve_model_interpolates_without_dense_time_embedder(monkeypatch)
         _small_od_config(),
         arch_overrides={"adaln_curve_grid": 3, "adaln_curve_dim": 2},
     )
-    model.adaln_t_table.copy_(
-        torch.tensor(
-            [
-                [0.0, 10.0],
-                [2.0, 12.0],
-                [4.0, 14.0],
-            ]
-        )
+    table = torch.tensor(
+        [[0.0, 10.0], [2.0, 12.0], [4.0, 14.0]],
+        dtype=torch.float32,
     )
+    assert model.load_weights([("adaln_t_table", table)]) == {"adaln_t_table"}
+    model.post_load_weights()
+    model.validate_restored_host_weights()
 
     assert model.time_embedder is None
+    assert model.adaln_t_table.dtype == torch.float32
+    torch.testing.assert_close(model.adaln_t_table, table, rtol=0, atol=0)
     assert model.blocks[0].adaln_proj.linear.weight.dtype == torch.float32
     torch.testing.assert_close(
         model._embed_timesteps(torch.tensor([0.0, 0.25, 1.0])),

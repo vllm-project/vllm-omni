@@ -1503,18 +1503,21 @@ stages:
         assert "text_encoder_tp_size" not in stages[1].runtime_overrides
         assert stages[1].yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 1
 
-    def test_minimax_h3_model_path_override_reaches_only_diffusion_stage(self):
+    def test_minimax_h3_convrot_overrides_reach_only_diffusion_stage(self):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
         model_paths = {"transformer": "/models/minimax_h3_fl2va_int8_convrot.safetensors"}
+        quantization_config = {"transformer": {"method": "int8_convrot"}}
         stages, _ = StageConfigFactory._create_legacy_from_registry(
             pipeline,
-            {"stage_1_model_paths": model_paths},
+            {"stage_1_model_paths": model_paths, "stage_1_quantization_config": quantization_config},
         )
 
         stage_zero_args = stages[0].to_omegaconf()["engine_args"]
         stage_one_args = stages[1].to_omegaconf()["engine_args"]
         assert "model_paths" not in stage_zero_args
+        assert stage_zero_args.get("quantization_config") is None
         assert stage_one_args["model_paths"] == model_paths
+        assert stage_one_args["quantization_config"] == quantization_config
 
     def test_minimax_h3_disaggregated_defaults_match_validated_topology(self):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]

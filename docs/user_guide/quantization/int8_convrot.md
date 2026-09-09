@@ -46,7 +46,7 @@ omni = Omni(
     model="MiniMaxAI/MiniMax-H3",
     task_type="fl2va",
     model_paths={"transformer": checkpoint},
-    diffusion_quantization_config={
+    quantization_config={
         "transformer": {"method": "int8_convrot"},
     },
     trust_remote_code=True,
@@ -64,9 +64,7 @@ vllm-omni serve MiniMaxAI/MiniMax-H3 \
   --task-type fl2va \
   --deploy-config vllm_omni/deploy/minimax_h3_disaggregated.yaml \
   --stage-overrides \
-  "{\"1\":{\"model_paths\":{\"transformer\":\"${CHECKPOINT}\"}}}" \
-  --diffusion-quantization-config \
-  '{"transformer":{"method":"int8_convrot"}}'
+  "{\"1\":{\"model_paths\":{\"transformer\":\"${CHECKPOINT}\"},\"quantization_config\":{\"transformer\":{\"method\":\"int8_convrot\"}}}}"
 ```
 
 Adjust the disaggregated deploy's stage devices and parallel sizes for your
@@ -85,6 +83,12 @@ marked linears. Unmarked token-refiner and input/output layers keep their
 checkpoint dtype. The pruned checkpoint's `adaln_t_table` is also detected
 automatically, so the model uses the matching low-rank AdaLN curve path instead
 of constructing the dense time embedder.
+
+The curve table and its AdaLN projections stay FP32 to preserve interpolation
+and modulation precision.
+
+FastH3 fusion is unsupported: its dense-weight deltas cannot be added directly
+to rotated INT8 weights.
 
 ## Tensor Parallelism
 

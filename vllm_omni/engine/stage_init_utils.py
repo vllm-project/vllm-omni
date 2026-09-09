@@ -321,7 +321,7 @@ def _resolve_model_path(model: str, engine_args: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         parameters = {}
     accepts_var_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    for field in ("model_paths", "use_hsdp", "lora_path"):
+    for field in ("model_paths", "use_hsdp"):
         if field in parameters or accepts_var_kwargs:
             value = engine_args.get(field)
             if field == "use_hsdp" and value is None:

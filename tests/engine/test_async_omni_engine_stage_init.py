@@ -1599,8 +1599,8 @@ def test_model_path_resolver_forwards_component_overrides(monkeypatch):
 
     calls = []
 
-    def resolver(model, revision, task_type, *, model_paths=None, use_hsdp=None, lora_path=None):
-        calls.append((model, revision, task_type, model_paths, use_hsdp, lora_path))
+    def resolver(model, revision, task_type, *, model_paths=None, use_hsdp=None):
+        calls.append((model, revision, task_type, model_paths, use_hsdp))
         return "/resolved/FL2VA"
 
     monkeypatch.setattr(pipeline_minimax_h3, "resolve_minimax_h3_diffusion_model_path", resolver)
@@ -1613,7 +1613,6 @@ def test_model_path_resolver_forwards_component_overrides(monkeypatch):
         "task_type": "fl2va",
         "model_paths": model_paths,
         "parallel_config": {"use_hsdp": True},
-        "lora_path": "/models/adapter.safetensors",
     }
 
     assert _resolve_model_path("MiniMaxAI/MiniMax-H3", engine_args) == "/resolved/FL2VA"
@@ -1624,7 +1623,6 @@ def test_model_path_resolver_forwards_component_overrides(monkeypatch):
             "fl2va",
             model_paths,
             True,
-            "/models/adapter.safetensors",
         )
     ]
 
