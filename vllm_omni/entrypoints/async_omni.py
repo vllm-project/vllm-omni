@@ -1416,19 +1416,9 @@ class AsyncOmni(EngineClient, OmniBase):
         ``EngineCore.sleep(level>=1)`` already clears the P1 receiver cache.
         Clearing P0 avoids hash-only follow-up requests after that reset.
         """
-        processor = getattr(self, "input_processor", None)
-        if processor is None:
-            processor = getattr(self.engine, "input_processor", None)
-        cache = getattr(processor, "mm_processor_cache", None)
-        if cache is None:
-            logger.debug("[AsyncOmni] reset_mm_cache: no frontend mm_processor_cache")
-            return
-        for name in ("clear", "reset", "clear_cache"):
-            fn = getattr(cache, name, None)
-            if callable(fn):
-                fn()
-                return
-        logger.debug("[AsyncOmni] reset_mm_cache: cache has no clear/reset method")
+        renderer = self.renderer
+        if renderer is not None:
+            await renderer.clear_mm_cache_async()
 
     async def reset_encoder_cache(self) -> None:
         """Reset the encoder cache for all stages.

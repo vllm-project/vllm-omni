@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts talker — vLLM-native AR base LM + audio side path.
 
 Mirrors upstream rednote-hilab/dots.tts (pinned @ a393d2e):
@@ -516,9 +516,9 @@ class DotsTTSForConditionalGeneration(nn.Module):
         if os.path.exists(local):
             return local
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            return hf_hub_download(
+            return hf_api().hf_hub_download(
                 repo_id=model_arg,
                 filename="latent_stats.pt",
                 local_files_only=True,

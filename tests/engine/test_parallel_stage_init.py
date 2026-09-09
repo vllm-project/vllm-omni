@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for parallel stage initialization (CPU-only).
 
 Covers the pure/lock logic added for ``parallel_stage_init``:
-  * init-group device keying (resolved physical set; parallel unique keys),
+  * init-group device keying (overlap components; parallel unique keys),
   * admission control arithmetic + graph reserve,
   * SH/EX device phase locks (real flock on a temp dir),
   * the phase-locked executor wrapper ordering,
@@ -18,6 +21,7 @@ import inspect
 import os
 import subprocess
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -37,7 +41,9 @@ from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
     device_init_lock_path,
+    device_overlap_group_keys,
     open_device_lock_file,
+    parse_physical_device_ids,
 )
 from vllm_omni.engine.stage_phase_lock import (
     DeviceLockTimeoutError,
@@ -46,6 +52,7 @@ from vllm_omni.engine.stage_phase_lock import (
     wrap_executor_with_phase_locks,
 )
 from vllm_omni.engine.stage_runtime import StageRuntime
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -104,49 +111,114 @@ def _fake_vllm_config(util: float, *, model="m", dtype="bf16", cudagraph_mode="F
 # --------------------------------------------------------------------------- #
 # A1: init-group device key
 # --------------------------------------------------------------------------- #
-def test_init_group_key_resolves_physical_devices_serial():
+@pytest.mark.parametrize(
+    ("devices", "expected"),
+    [
+        ("0", {0}),
+        ("1,0,1", {0, 1}),
+        (" 2, 3 ", {2, 3}),
+        (None, None),
+        ("", None),
+        ("GPU-uuid", None),
+    ],
+)
+def test_parse_physical_device_ids(devices, expected):
+    assert parse_physical_device_ids(devices) == expected
+
+
+@pytest.mark.parametrize(
+    ("device_sets", "expected"),
+    [
+        # equal / disjoint
+        ([{0}, {1}, {0}], ["device-group:0", "device-group:1", "device-group:0"]),
+        # unequal overlap, canonical order
+        ([{0, 1}, {0}, {2}], ["device-group:0,1", "device-group:0,1", "device-group:2"]),
+        # transitive: {0,1} ~ {1,2} ~ {2}
+        ([{0, 1}, {1, 2}, {2}], ["device-group:0,1,2"] * 3),
+        # unresolved may touch any GPU -> everything serial
+        ([{0}, None, {1}], ["device-group:*"] * 3),
+        ([], []),
+    ],
+)
+def test_device_overlap_group_keys(device_sets, expected):
+    sets = [None if s is None else frozenset(s) for s in device_sets]
+    assert device_overlap_group_keys(sets) == expected
+
+
+def test_init_group_keys_serial_groups_by_device_overlap():
     runtime = _runtime(parallel_stage_init=False)
-    runtime._init_visible_devices_baseline = None  # no CUDA_VISIBLE_DEVICES mapping
-    r0 = _llm_replica(0, 0, "0")
-    r1 = _llm_replica(1, 0, "1")
-    r0b = _llm_replica(2, 0, "0")
 
-    k0 = runtime._replica_init_group_key(r0)
-    k1 = runtime._replica_init_group_key(r1)
-    k0b = runtime._replica_init_group_key(r0b)
+    keys = runtime._init_group_keys(
+        [_llm_replica(0, 0, "0,1"), _llm_replica(1, 0, "0"), _llm_replica(2, 0, "2"), _llm_replica(3, 0, "1,0")]
+    )
 
-    assert k0 == "device:0"
-    assert k1 == "device:1"
-    # Different physical devices -> different groups (parallel).
-    assert k0 != k1
-    # Same physical device -> same group (serialized under LOCK_EX).
-    assert k0 == k0b
+    assert keys == ["device-group:0,1", "device-group:0,1", "device-group:2", "device-group:0,1"]
 
 
-def test_init_group_key_parallel_is_unique_per_replica():
-    runtime = _runtime(parallel_stage_init=True)
-    runtime._init_visible_devices_baseline = None
-    # Both on the SAME device, but parallel mode must give distinct keys so they
-    # run concurrently, coordinated by the child SH/EX locks + admission.
-    keys = [
-        runtime._replica_init_group_key(_llm_replica(0, 0, "0")),
-        runtime._replica_init_group_key(_llm_replica(0, 1, "0")),
-        runtime._replica_init_group_key(_llm_replica(1, 0, "0")),
-    ]
-    assert keys == ["parallel:0:0", "parallel:0:1", "parallel:1:0"]
-    assert len(set(keys)) == 3
-
-
-def test_init_group_key_remote_and_diffusion_unchanged():
+def test_init_group_keys_fixed_for_parallel_remote_and_diffusion():
     runtime = _runtime(parallel_stage_init=True)
     remote = _llm_replica(1, 0, "0")
     remote.launch_mode = "remote"
     remote.metadata.runtime_cfg = None
-    assert runtime._replica_init_group_key(remote) == "remote:1:0"
-
     diffusion = _llm_replica(2, 0, "0")
     diffusion.metadata.stage_type = "diffusion"
-    assert runtime._replica_init_group_key(diffusion) == "inline:diffusion"
+
+    # Same device everywhere; parallel mode still keys per replica (child SH/EX locks coordinate).
+    keys = runtime._init_group_keys([_llm_replica(0, 0, "0"), _llm_replica(0, 1, "0"), remote, diffusion])
+
+    assert keys == ["parallel:0:0", "parallel:0:1", "remote:1:0", "inline:diffusion"]
+
+
+def test_unresolved_devices_collapse_serial_groups_and_warn(caplog):
+    runtime = _runtime(parallel_stage_init=False)
+    with caplog.at_level("WARNING"):
+        keys = runtime._init_group_keys([_llm_replica(0, 0, "0"), _llm_replica(1, 0, "GPU-uuid")])
+
+    assert keys == ["device-group:*", "device-group:*"]
+    assert "Stage-1 replica 0" in caplog.text
+    assert "GPU-uuid" in caplog.text
+
+
+def _stage_plans(*devices: str) -> list[LogicalStageInitPlan]:
+    return [
+        LogicalStageInitPlan(stage_idx=i, stage_id=i, replicas=[_llm_replica(i, 0, dev)])
+        for i, dev in enumerate(devices)
+    ]
+
+
+def test_overlapping_device_stages_initialize_sequentially(monkeypatch):
+    monkeypatch.delenv(current_omni_platform.device_control_env_var, raising=False)
+    runtime = _runtime(parallel_stage_init=False)
+    in_flight, peak = 0, 0
+    guard = threading.Lock()
+
+    def _initialize_replica(plan, _timeout):
+        nonlocal in_flight, peak
+        with guard:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        time.sleep(0.05)
+        with guard:
+            in_flight -= 1
+        return object()
+
+    monkeypatch.setattr(runtime, "_initialize_replica", _initialize_replica)
+    runtime._initialize_stage_replicas(_stage_plans("0,1", "0"), stage_init_timeout=5)
+
+    assert peak == 1
+
+
+def test_disjoint_device_stages_initialize_in_parallel(monkeypatch):
+    monkeypatch.delenv(current_omni_platform.device_control_env_var, raising=False)
+    runtime = _runtime(parallel_stage_init=False)
+    barrier = threading.Barrier(2, timeout=2)  # breaks unless both inits are in flight together
+
+    def _initialize_replica(_plan, _timeout):
+        barrier.wait()
+        return object()
+
+    monkeypatch.setattr(runtime, "_initialize_replica", _initialize_replica)
+    runtime._initialize_stage_replicas(_stage_plans("0", "1"), stage_init_timeout=5)
 
 
 # --------------------------------------------------------------------------- #

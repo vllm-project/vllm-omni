@@ -263,6 +263,94 @@ curl -X POST http://localhost:8091/v1/audio/speech \
       gpu_memory_utilization: 0.15
   ```
 
+### 1x A100 40GB (0.6B CustomVoice)
+
+#### Environment
+
+- OS: Linux 4.18.0-553 (RHEL 8.10), x86_64
+- Python: 3.12.14
+- PyTorch: 2.13.0+cu129
+- Driver / runtime: NVIDIA 570.124.06 / CUDA 12.8 (`nvidia-smi`); PyTorch CUDA 12.9
+- GPU: NVIDIA A100-SXM4-40GB, 40960 MiB
+- vLLM version: 0.28.0+cu129
+- vLLM-Omni version or commit: `3204a0b2ade0f05424b7f11e3bcc03cb3542e0c6`
+
+#### Command
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --omni --port 8091
+```
+
+The default deploy config (`qwen3_tts.yaml`) works without modification on this
+A100 40GB. Both stages (talker + code2wav) share GPU 0 with
+`gpu_memory_utilization: 0.3` each.
+
+#### Verification
+
+**English synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Qwen3-TTS running on A100 40GB.",
+        "voice": "vivian",
+        "language": "English"
+    }' --output test_english.wav
+```
+
+**Chinese synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "你好，这是在A100 40GB上运行的语音合成测试。",
+        "voice": "vivian",
+        "language": "Chinese"
+    }' --output test_chinese.wav
+```
+
+**With emotion instruction:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "I am so excited about this!",
+        "voice": "vivian",
+        "language": "English",
+        "instructions": "Speak with great enthusiasm"
+    }' --output test_emotion.wav
+```
+
+#### Notes
+
+- Memory usage: **16283 MiB / 40960 MiB** peak (`nvidia-smi`) during the three
+  verification requests with the default deploy config
+  (`gpu_memory_utilization: 0.3` per stage). Stage 0 used 12404 MiB and stage 1
+  used 3862 MiB. The 0.6B weights occupy only ~2.4 GiB (Stage 0: 1.91 GiB,
+  Stage 1: 0.45 GiB); the rest is KV cache reserved as a fraction of device
+  memory, so the same `0.3` setting reads higher in GiB on 40GB than the
+  ~13.5 GiB idle figure on the 24GB 4090 profile above. To shrink the
+  reservation, use the `gpu_memory_utilization: 0.15` override documented in
+  that 4090 section.
+- vLLM 0.28.0's default wheel targets CUDA 13.0. Driver 570 cannot load that
+  variant. This qualification used the official CUDA 12.9 wheel (same pin as
+  the A100 Wan2.2 recipe):
+
+  ```bash
+  uv pip install \
+    'https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl' \
+    --torch-backend=cu129
+  ```
+
+  Confirm `torch.__version__` contains `cu129`. If a CPU build is already
+  installed, `uv pip install --torch-backend=cu129` is a no-op; use
+  `--reinstall`.
+
 ### 1x AMD MI300X, 1.7B checkpoints
 
 #### Environment

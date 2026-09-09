@@ -52,11 +52,13 @@ from vllm_omni.engine.stage_init_utils import (
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
+    device_overlap_group_keys,
     extract_legacy_stage_metadata,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
+    parse_physical_device_ids,
     prepare_engine_environment,
     release_device_locks,
     stage_runtime_env,
@@ -443,9 +445,10 @@ class StageRuntime:
     ) -> dict[int, list[StagePoolClient | None]]:
         """Initialize all stage replicas.
 
-        Stages sharing the same GPU are initialized sequentially to avoid
-        memory profiling interference. Stages on different GPUs are
-        initialized in parallel.
+        Stages that share any physical GPU — including overlapping-but-unequal
+        sets such as ``{0,1}`` and ``{0}`` — initialize sequentially to avoid
+        memory profiling interference and same-process ``flock`` self-contention.
+        Stages on disjoint GPUs initialize in parallel.
         """
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
@@ -461,10 +464,7 @@ class StageRuntime:
             self._reject_unguardable_executors(stage_plans)
             self._run_stage_admission(stage_plans)
 
-        init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
-        for plan in stage_plans:
-            for replica in plan.replicas:
-                init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
+        init_groups = self._build_init_groups(stage_plans)
 
         def _init_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
             """Initialize replicas in one scheduling group sequentially."""
@@ -586,19 +586,8 @@ class StageRuntime:
                 # fails admission (fail-closed in check_admission).
                 return ADMISSION_EXEMPT
             resolved = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
-            if not resolved:
-                return None
-            ids: list[int] = []
-            for tok in str(resolved).split(","):
-                tok = tok.strip()
-                if not tok:
-                    continue
-                try:
-                    ids.append(int(tok))
-                except ValueError:
-                    # Non-integer visibility (UUID / MIG) can't be reasoned about.
-                    return None
-            return ids or None
+            parsed = parse_physical_device_ids(resolved)
+            return sorted(parsed) if parsed else None
 
         def _visible_ordinal(physical_id: int) -> int:
             """Translate a physical device id to this process's visible ordinal.
@@ -653,47 +642,58 @@ class StageRuntime:
             device_total_memory=_total_memory,
         )
 
-    def _replica_init_group_key(self, replica: ReplicaInitPlan) -> str:
-        """Return the scheduling group used during replica initialization.
+    def _build_init_groups(
+        self,
+        stage_plans: Sequence[LogicalStageInitPlan],
+    ) -> dict[str, list[tuple[int, ReplicaInitPlan]]]:
+        items = [(plan.stage_idx, replica) for plan in stage_plans for replica in plan.replicas]
+        groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
+        for key, item in zip(self._init_group_keys([replica for _, replica in items]), items, strict=True):
+            groups.setdefault(key, []).append(item)
+        return groups
 
-        Replicas sharing a group initialize sequentially; different groups
-        initialize in parallel threads. Local LLM replicas are keyed by their
-        **resolved canonical physical device set** so stages on different
-        physical GPUs land in different groups (parallel) while stages sharing a
-        device stay in one group (serialized, then further guarded by the
-        per-device ``LOCK_EX`` file lock). Keying on the raw ``runtime.devices``
-        config value instead would fail to parallelize logically-distinct stages
-        that map to different physical GPUs.
+    def _init_group_keys(self, replicas: Sequence[ReplicaInitPlan]) -> list[str]:
+        """One init-group key per replica: same key -> sequential, distinct -> parallel.
+
+        Diffusion, remote and parallel-stage-init replicas keep fixed per-replica
+        keys. Serial local LLM replicas are grouped by connected components of
+        their resolved physical-device overlap, so ``{0,1}`` and ``{0}`` share a
+        group and never re-``flock`` a device this process already holds.
         """
+        keys = [self._init_group_key_override(replica) for replica in replicas]
+        pending = [i for i, key in enumerate(keys) if key is None]
+        device_sets: list[frozenset[int] | None] = []
+        for i in pending:
+            replica = replicas[i]
+            physical = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
+            parsed = parse_physical_device_ids(physical)
+            if parsed is None:
+                logger.warning(
+                    "[stage_init] Stage-%s replica %s physical devices %r are not integer GPU ids; "
+                    "all serial LLM replicas will share one init group",
+                    replica.metadata.stage_id,
+                    replica.replica_id,
+                    physical,
+                )
+            device_sets.append(parsed)
+        for i, key in zip(pending, device_overlap_group_keys(device_sets), strict=True):
+            keys[i] = key
+        return cast(list[str], keys)
+
+    def _init_group_key_override(self, replica: ReplicaInitPlan) -> str | None:
+        """Key that bypasses device-overlap grouping, or ``None`` to use it."""
         if replica.launch_mode == "local" and replica.metadata.stage_type == "diffusion":
             # Local diffusion process spawning must stay on the orchestrator
             # thread. Keep all local diffusion replicas in one sequential group.
             return "inline:diffusion"
         if replica.launch_mode == "remote":
             return f"remote:{replica.metadata.stage_id}:{replica.replica_id}"
-
-        physical_devices = self._resolve_replica_physical_devices(
-            replica.metadata.stage_id,
-            replica.metadata.runtime_cfg,
-        )
         if self._parallel_stage_init:
             # Same-device concurrency is coordinated by the engine-core SH/EX
             # device locks + pre-launch admission, so give every replica its own
             # group to let them all initialize in parallel.
             return f"parallel:{replica.metadata.stage_id}:{replica.replica_id}"
-
-        runtime_cfg = replica.metadata.runtime_cfg or {}
-        raw_devices = (
-            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        )
-        if str(raw_devices) != str(physical_devices):
-            logger.debug(
-                "[stage_init] Stage-%s init-group key: raw devices=%s -> resolved physical=%s",
-                replica.metadata.stage_id,
-                raw_devices,
-                physical_devices,
-            )
-        return f"device:{physical_devices}"
+        return None
 
     def _initialize_replica(
         self,

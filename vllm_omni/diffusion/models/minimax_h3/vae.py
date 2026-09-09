@@ -9,7 +9,7 @@ import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -22,11 +22,13 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     DistributedVaeMixin,
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
 
+from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
@@ -377,25 +379,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
-    @torch.inference_mode()
-    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        channels = int(self.config_dict["latent_channels"])
-        mean = torch.tensor(
-            self.config_dict["latents_mean"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        std = torch.tensor(
-            self.config_dict["latents_std"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        # The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
-        # and then rejects an empty share inside the gather. A rank with no
-        # tiles raises and leaves the collective while the others block in it
-        # forever, so too few tiles hangs the whole stage rather than failing
-        # it. Tile count depends only on the latent shape, so every rank takes
-        # this branch together.
+    def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
+        """Pick the tiling mode a decode of ``latent`` can safely use.
+
+        The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
+        and then rejects an empty share inside the gather. A rank with no
+        tiles raises and leaves the collective while the others block in it
+        forever, so too few tiles hangs the whole stage rather than failing
+        it. Tile count depends only on the latent shape, so every rank takes
+        this branch together.
+        """
         num_tiles = self._decoder_tile_count(latent)
         if self.parallel_size > 1 and num_tiles < self.parallel_size:
             logger.warning_once(
@@ -405,18 +398,63 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 num_tiles,
                 self.parallel_size,
             )
-            tiling_context: AbstractContextManager = self._rank_local_tiling()
-        else:
-            tiling_context = nullcontext()
+            return self._rank_local_tiling()
+        return nullcontext()
 
-        with tiling_context:
-            decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
+    @torch.inference_mode()
+    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        with self._decode_tiling_context(latent):
+            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
+
+    def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        channels = int(self.config_dict["latent_channels"])
+        mean = torch.tensor(self.config_dict["latents_mean"], device=latent.device, dtype=latent.dtype)
+        std = torch.tensor(self.config_dict["latents_std"], device=latent.device, dtype=latent.dtype)
+        shape = (1, channels, 1, 1, 1)
+        return latent * std.view(shape) + mean.view(shape)
+
+    @staticmethod
+    def _normalize_decoded_frames(decoded: torch.Tensor) -> torch.Tensor:
+        """Canonicalize remote H3 decoder output to [B,C,T,H,W]."""
+        frames = decoded
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
         return frames.float()
+
+    # Chunks are reverted through the checkpoint's processor, which
+    # denormalizes and clamps into the unit interval.
+    chunk_value_range: ClassVar[tuple[float, float]] = (0.0, 1.0)
+
+    @torch.inference_mode()
+    def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
+        """Decode temporal clips and synchronously publish frames-only chunks.
+
+        Implements :class:`SupportsChunkedVAEDecode`. Every rank participating
+        in distributed VAE execution must invoke this method with a callback so
+        the temporal collectives stay in lockstep; ``on_chunk`` is called only
+        on the rank that owns output. Chunks arrive as ``[B, C, T, H, W]``
+        float frames, normalized through the checkpoint's processor to match
+        the complete decode path. After a callback failure, the remaining
+        chunks are decoded and discarded before the exception is re-raised.
+        """
+        if not callable(on_chunk):
+            raise TypeError("on_chunk must be callable")
+        if not callable(getattr(self.model, "_adaptive_decode", None)):
+            raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
+        group = None
+        if self.is_distributed_enabled():
+            group = self._native_parallel_state().get("sp_process_group")
+            if group is None or dist.get_world_size(group) != self.parallel_size:
+                raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
+        # Native H3 tiling performs its own collectives for every temporal clip,
+        # so this path needs the same too-few-tiles fallback as the complete
+        # decode: without it a shape that leaves some ranks tileless hangs the
+        # gather instead of decoding rank-locally.
+        with self._decode_tiling_context(z):
+            decode_h3_chunks(self, z, on_chunk, group=group)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
