@@ -678,40 +678,49 @@ def test_source_filter_disabled_on_main_branch(monkeypatch: pytest.MonkeyPatch) 
 def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bypass only when no job-key prefix matched; job-key hits still win."""
+    """Fallback only when no listed prefix matched; a matching prefix still wins."""
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     monkeypatch.setenv("BUILDKITE_BRANCH", "feat/nightly-yaml")
-    npu_nightly = Path(".buildkite/npu/test-npu-nightly.yml")
+    pipeline_yaml = Path(".buildkite/npu/test-npu-nightly.yml")
     shared_paths = _load_source_file_dependencies()["source_filter_fallback"]
     assert ".buildkite/common/scripts/upload_pipeline.py" in shared_paths
 
-    # Only pipeline YAML / shared uploader → no job-key match → keep all gated jobs.
-    for changed in [str(npu_nightly.as_posix()), *shared_paths]:
-        labels = _surviving_labels(
-            _SOURCE_FILTER_DOC,
-            [changed],
-            pipeline_path=npu_nightly,
+    # Synthetic steps only — do not pin live Buildkite job labels.
+    doc = {
+        "steps": [
+            {"key": "ungated", "commands": ["true"]},
+            {
+                "key": "gated_a",
+                "source_file_dependencies": ["pkg/model_a/"],
+                "commands": ["true"],
+            },
+            {
+                "key": "gated_b",
+                "source_file_dependencies": ["pkg/model_b/"],
+                "commands": ["true"],
+            },
+        ],
+    }
+
+    def surviving_keys(changed_files: list[str]) -> set[str]:
+        rendered = _render_test_pipeline(
+            doc,
+            changed_files=changed_files,
+            pipeline_path=pipeline_yaml,
         )
-        assert "Z-Image Function" in labels, changed
-        assert "Wan Function" in labels, changed
+        return {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
-    # A different pipeline YAML is not a bypass for this upload.
-    labels = _surviving_labels(
-        _SOURCE_FILTER_DOC,
-        [".buildkite/cuda/test-nightly.yml"],
-        pipeline_path=npu_nightly,
-    )
-    assert "Z-Image Function" not in labels
-    assert "Wan Function" not in labels
-    assert "Dedicated E2E" in labels  # ungated leaf still kept
+    # Only pipeline YAML / shared uploader → no listed prefix match → keep every step.
+    for changed in [pipeline_yaml.as_posix(), *shared_paths]:
+        assert surviving_keys([changed]) == {"ungated", "gated_a", "gated_b"}, changed
 
-    # Job-key match wins over bypass files in the same diff.
-    labels = _surviving_labels(
-        _SOURCE_FILTER_DOC,
+    # A different pipeline YAML is not a fallback for this upload.
+    assert surviving_keys([".buildkite/cuda/test-nightly.yml"]) == {"ungated"}
+
+    # A matching source prefix wins over fallback files in the same diff.
+    assert surviving_keys(
         [
-            "vllm_omni/diffusion/models/z_image/transformer.py",
+            "pkg/model_a/transformer.py",
             ".buildkite/common/scripts/upload_pipeline.py",
         ],
-        pipeline_path=npu_nightly,
-    )
-    assert labels == {"Dedicated E2E", "Z-Image Function", "Doc Test"}
+    ) == {"ungated", "gated_a"}
