@@ -238,6 +238,7 @@ def flash_attn_3_varlen(
     softcap: float = 0.0,
     causal: bool = False,
     deterministic: bool = False,
+    backend: str | None = None,
     sinks: torch.Tensor | None = None,
     return_softmax_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -245,7 +246,9 @@ def flash_attn_3_varlen(
 
     Providers name the LSE request either ``return_attn_probs`` or
     ``return_softmax_lse``. Native sinks require explicit provider support; this
-    helper does not emulate sinks or select an accelerator platform.
+    helper does not emulate sinks or select an accelerator platform. ``backend``
+    is an optional provider selector; it is forwarded only when the provider
+    advertises that parameter.
     """
     func, parameters = _external_fa3_varlen()
     kwargs = {
@@ -259,10 +262,12 @@ def flash_attn_3_varlen(
         "softmax_scale": softmax_scale,
         "causal": causal,
     }
-    for name, value in (("softcap", max(float(softcap), 0.0)), ("deterministic", deterministic)):
+    for name, value in (("softcap", max(float(softcap), 0.0)), ("deterministic", deterministic), ("backend", backend)):
+        if name == "backend" and value is None:
+            continue
         if name in parameters:
             kwargs[name] = value
-        elif value:
+        elif value is not None and value is not False and value != 0.0:
             raise NotImplementedError(f"This FlashAttention-3 provider does not support {name}")
     if sinks is not None:
         if "sinks" not in parameters:
