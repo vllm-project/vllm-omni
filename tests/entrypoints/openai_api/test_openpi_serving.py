@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import json
 import threading
@@ -216,6 +219,18 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id == "robot-session-a-0"
     assert request_b.request_id == "robot-session-a-1"
     assert request_a.request_id != request_b.request_id
+
+
+def test_build_request_forwards_seed_to_sampling_params():
+    """``seed`` in the inference message is the engine-level seed; omitted, the request auto-seeds."""
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    seeded = serving._build_request({"prompt": "pick up the object", "seed": 42}, session_id="s", reset=True)
+    unseeded = serving._build_request({"prompt": "pick up the object"}, session_id="s", reset=False)
+
+    assert seeded.sampling_params.seed == 42
+    assert "seed" not in seeded.sampling_params.extra_args["robot_obs"]
+    assert isinstance(unseeded.sampling_params.seed, int)
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():

@@ -381,9 +381,9 @@ class OmniEngineArgs(EngineArgs):
                 if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
-                        from huggingface_hub import snapshot_download
+                        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                        local_dir = snapshot_download(
+                        local_dir = hf_api().snapshot_download(
                             model_path,
                             allow_patterns=[
                                 f"{tokenizer_subfolder}/tokenizer*",
@@ -504,6 +504,10 @@ class OrchestratorArgs:
     # === Lifecycle ===
     stage_init_timeout: int = 300
     init_timeout: int = 600
+    # Initialize stages sharing a physical GPU concurrently, guarded by
+    # pre-launch admission + engine-core SH/EX device locks. Off by default;
+    # enable only when the GPU is dedicated to this deployment.
+    parallel_stage_init: bool = False
 
     # === Cross-stage Communication ===
     batch_timeout: int = 10
@@ -514,7 +518,7 @@ class OrchestratorArgs:
 
     # === Config Files ===
     deploy_config: str | None = None
-    stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    stage_overrides: dict[str, dict[str, Any]] | None = None
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
     # derived sizing onto merged stages, then drops it before per-stage engine args.
     strategy_config: str | None = None
@@ -568,6 +572,9 @@ class OrchestratorArgs:
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False

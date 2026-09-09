@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
@@ -300,6 +303,17 @@ _OMNI_MODELS = {
         "gepard",
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
+    ),
+    ## audio8_tts (Audio8 TTS Preview 0.6B)
+    "Audio8TTSSlowARForConditionalGeneration": (
+        "audio8_tts",
+        "audio8_tts_slow_ar",
+        "Audio8TTSSlowARForConditionalGeneration",
+    ),
+    "Audio8TTSCodecDecoder": (
+        "audio8_tts",
+        "audio8_tts_codec_decoder",
+        "Audio8TTSCodecDecoder",
     ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (

@@ -17,9 +17,8 @@ To add a new pipeline:
 
 Out of tree pipeline configs or resolvers can also be registered with register_pipeline.
 
-NOTE: Single-stage diffusion models continue to use the
-``_create_default_diffusion_stage_cfg`` fallback in
-``async_omni_engine.py``; for now we do not add them to registry.
+NOTE: Generic single-stage diffusion is selected by ``config.resolver`` when
+no registered Omni pipeline matches.
 """
 
 from __future__ import annotations
@@ -44,6 +43,7 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTA_PIPELINE,
     AUDEX_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -72,7 +72,11 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS2_PIPELINE,
     INDEXTTS25_PIPELINE,
 )
+from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_PIPELINE,
+)
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
+from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
@@ -126,6 +130,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
+    "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,
@@ -145,6 +150,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "lance": LANCE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
+    "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
     "cosmos3_omni": COSMOS3_PIPELINE,
@@ -176,6 +182,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
+    "arktts": AUDIO8_TTS_PIPELINE,
     "ming_flash_omni": MING_FLASH_OMNI_PIPELINE,
     "ming_flash_omni_tts": MING_FLASH_OMNI_TTS_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
@@ -205,18 +212,13 @@ def register_pipeline(pipeline: PipelineConfig | PipelineResolverFunc, model_typ
     since resolvers can return multiple different PipelineConfigs depending on the
     consumed config.
     """
-    errors: list[str] = []
     if isinstance(pipeline, PipelineConfig):
-        errors = pipeline.validate()
         model_type = model_type if model_type is not None else pipeline.model_type
-    else:
-        if model_type is None:
-            raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
+    elif model_type is None:
+        raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
 
     if model_type in OMNI_PIPELINES:
-        errors.append(f"Model type {model_type} is already registered; the old mapping will be clobbered")
-    if errors:
-        logger.warning("Registration for pipeline of type %s produced the following issues: %s", model_type, errors)
+        logger.warning(f"Model type {model_type} is already registered; the old mapping will be clobbered")
     OMNI_PIPELINES[model_type] = pipeline
 
 
