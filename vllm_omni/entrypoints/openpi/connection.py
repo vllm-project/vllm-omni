@@ -17,6 +17,13 @@ Inbound payloads accept both the openpi-client markers above and the legacy
 vLLM-native markers:
     ndarray -> {nd: true, type, kind, shape, data}
     scalar  -> {nd: false, type, kind, data}
+
+`kind` is required on the `nd` markers because it is what separates them from a
+plain user mapping, but its value is dialect-specific: the vLLM-native markers
+carry the dtype kind character while the `msgpack-numpy` package leaves it empty
+for plain dtypes and sets "V" for structured ones. Both spellings are accepted.
+Scalars packed by `msgpack-numpy` omit `kind` entirely and are therefore left as
+mappings.
 """
 
 from __future__ import annotations
@@ -83,9 +90,14 @@ def _decode_vllm_numpy_marker(obj: dict[Any, Any]) -> Any:
     if nd is _MISSING or dtype is _MISSING or kind is _MISSING or data is _MISSING:
         return _MISSING
 
-    dtype_obj = np.dtype(_decode_marker_text(dtype))
     kind_text = _decode_marker_text(kind)
-    if dtype_obj.kind != kind_text:
+    # Structured markers carry a dtype descriptor list in `type`, so reject them
+    # before `np.dtype()` sees something it cannot parse.
+    if kind_text == "V":
+        raise ValueError("Unsupported dtype: structured arrays")
+
+    dtype_obj = np.dtype(_decode_marker_text(dtype))
+    if kind_text not in ("", dtype_obj.kind):
         raise ValueError(f"NumPy dtype marker kind mismatch: {dtype_obj.kind!r} != {kind_text!r}")
     if dtype_obj.kind in ("V", "O", "c"):
         raise ValueError(f"Unsupported dtype: {dtype_obj}")

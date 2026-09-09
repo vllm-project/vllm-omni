@@ -71,6 +71,21 @@ class VideoFrames(list[Image.Image]):
         self.source_path = source_path
 
 
+class _ImagePixelLimitError(InvalidInputReferenceError):
+    """An image exceeded a configured or decoder-enforced pixel limit."""
+
+
+def _validate_image_pixel_limit(image: Image.Image) -> None:
+    width, height = image.size
+    max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+    if max_pixels > 0 and width * height > max_pixels:
+        raise _ImagePixelLimitError(
+            f"Image dimensions {width}x{height} ({width * height} pixels) exceed "
+            f"the maximum of {max_pixels} pixels. Set "
+            f"VLLM_MAX_IMAGE_PIXELS to increase this limit."
+        )
+
+
 def positive_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -87,7 +102,13 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
+        with Image.open(BytesIO(image_bytes)) as image:
+            _validate_image_pixel_limit(image)
+            return image.convert("RGB")
+    except _ImagePixelLimitError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise _ImagePixelLimitError(f"Invalid {source}: image exceeds the decoder pixel limit.") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
 
@@ -158,6 +179,8 @@ def _decode_media_bytes(
 ) -> Image.Image | VideoFrames:
     try:
         return _decode_image_bytes(media_bytes, source=source)
+    except _ImagePixelLimitError:
+        raise
     except InvalidInputReferenceError:
         try:
             return _decode_video_bytes(
