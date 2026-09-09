@@ -58,9 +58,10 @@ steps:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
-      - label: "Diffusion · Distributed Test · 2-GPU"
+      - label: "Diffusion · Distributed & Attention Test · 2-GPU"
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - timeout 10m pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
         mirror_hardwares: l4_2
 
       - label: "Diffusion · Distributed & Attention Test · 4-GPU"

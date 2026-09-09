@@ -57,6 +57,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
@@ -329,7 +330,36 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         if parallel_config.tensor_parallel_size > 1:
             raise NotImplementedError("Tensor parallelism is not supported by BooguImagePipeline.")
         if (parallel_config.sequence_parallel_size or 1) > 1:
-            raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
+            if parallel_config.cfg_parallel_size > 1:
+                # SP × CFG-Parallel is unvalidated: the combined path runs
+                # without crashing but drifts far from the SP=1 baseline
+                # (~19 dB PSNR at 4 steps), so guidance semantics differ.
+                # Remove this guard only alongside a parity test.
+                raise NotImplementedError(
+                    "BooguImagePipeline: sequence parallelism combined with CFG parallelism is not validated."
+                )
+            if parallel_config.ring_degree > 1 or getattr(parallel_config, "allgather_degree", 1) > 1:
+                raise NotImplementedError(
+                    "BooguImagePipeline currently supports sequence parallelism through Ulysses only."
+                )
+            if not current_omni_platform.is_cuda():
+                raise NotImplementedError("BooguImagePipeline sequence parallelism currently requires CUDA.")
+            if parallel_config.ulysses_mode == "strict":
+                # Subscript rather than get(): a missing key means the config
+                # schema has drifted and we would silently validate against a
+                # stale default, not the actual head count.
+                tf_params = self.od_config.tf_model_config.params
+                num_heads = tf_params["num_attention_heads"]
+                num_kv_heads = tf_params["num_kv_heads"]
+                if (
+                    num_heads % parallel_config.ulysses_degree != 0
+                    or num_kv_heads % parallel_config.ulysses_degree != 0
+                ):
+                    raise ValueError(
+                        "BooguImagePipeline GQA heads are not divisible by the "
+                        "configured Ulysses degree; set "
+                        "parallel_config.ulysses_mode='advanced_uaa'."
+                    )
         if parallel_config.use_hsdp:
             raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
         if self.od_config.cache_backend not in (None, "", "none"):

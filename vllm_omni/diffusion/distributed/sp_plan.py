@@ -220,10 +220,13 @@ class SequenceParallelInput:
             This is useful for layers whose outputs should be split after preprocessing
             (e.g., RoPE embeddings).
         auto_pad: If True, automatically pad the tensor if its size along split_dim
-            is not divisible by world_size. Creates an attention mask to indicate
-            valid vs padding positions. The mask is stored in ForwardContext.
+            is not divisible by world_size. Padding metadata is stored in
+            ForwardContext so models can construct attention masks when needed.
             Note: Ring attention does not support attention mask, so auto_pad
             should only be used with Ulysses SP.
+        shard_group: Optional key shared by tensors representing the same global
+            sequence. Keyed groups track independent padding metadata; omitting
+            it preserves the legacy single-sequence padding behavior.
 
     Example:
         # Split hidden_states along sequence dimension (dim 1)
@@ -240,12 +243,13 @@ class SequenceParallelInput:
     expected_dims: int | None = None
     split_output: bool = False
     auto_pad: bool = False
+    shard_group: str | None = None
 
     def __repr__(self) -> str:
         return (
             f"SequenceParallelInput(split_dim={self.split_dim}, "
             f"expected_dims={self.expected_dims}, split_output={self.split_output}, "
-            f"auto_pad={self.auto_pad})"
+            f"auto_pad={self.auto_pad}, shard_group={self.shard_group!r})"
         )
 
 
@@ -262,6 +266,8 @@ class SequenceParallelOutput:
         gather_dim: The dimension along which to gather the tensor.
         expected_dims: Expected number of dimensions. If provided, validates that
             the tensor has this many dimensions before gathering.
+        shard_group: Optional key whose padding metadata determines the gathered
+            sequence length. Omitting it preserves legacy singleton trimming.
 
     Example:
         # Gather output along sequence dimension (dim 1)
@@ -270,9 +276,13 @@ class SequenceParallelOutput:
 
     gather_dim: int
     expected_dims: int | None = None
+    shard_group: str | None = None
 
     def __repr__(self) -> str:
-        return f"SequenceParallelOutput(gather_dim={self.gather_dim}, expected_dims={self.expected_dims})"
+        return (
+            f"SequenceParallelOutput(gather_dim={self.gather_dim}, "
+            f"expected_dims={self.expected_dims}, shard_group={self.shard_group!r})"
+        )
 
 
 @dataclass(frozen=True)
@@ -396,6 +406,27 @@ def validate_sp_plan(plan: SequenceParallelModelPlan) -> None:
     if not isinstance(plan, dict):
         raise ValueError(f"_sp_plan must be a dict, got {type(plan).__name__}")
 
+    # A shard_group names one split boundary's global sequence. Reusing it
+    # across boundaries would silently overwrite the recorded length.
+    shard_group_owners: dict[str, str] = {}
+
+    def _validate_input(sp_input: AnySequenceParallelInput, *, module_id: str) -> None:
+        if not isinstance(sp_input, SequenceParallelInput) or sp_input.shard_group is None:
+            return
+        if not sp_input.auto_pad:
+            raise ValueError(
+                f"SequenceParallelInput for module {module_id!r} declares "
+                f"shard_group={sp_input.shard_group!r}, but keyed shard "
+                "metadata currently requires auto_pad=True."
+            )
+        owner = shard_group_owners.setdefault(sp_input.shard_group, module_id)
+        if owner != module_id:
+            raise ValueError(
+                f"shard_group={sp_input.shard_group!r} is used by multiple "
+                f"split boundaries ({owner!r} and {module_id!r}). Use a unique "
+                "name for each boundary."
+            )
+
     for module_id, module_plan in plan.items():
         if not isinstance(module_id, str):
             raise ValueError(f"_sp_plan keys must be strings, got {type(module_id).__name__}")
@@ -407,6 +438,8 @@ def validate_sp_plan(plan: SequenceParallelModelPlan) -> None:
             if all(isinstance(x, SequenceParallelOutput) for x in module_plan):
                 continue
             if _is_valid_input_config_list(module_plan):
+                for sp_input in module_plan:
+                    _validate_input(sp_input, module_id=module_id)
                 # List of inputs for a specific parameter (when output is tuple)
                 continue
 
@@ -428,8 +461,10 @@ def validate_sp_plan(plan: SequenceParallelModelPlan) -> None:
                             f"Integer keys (output indices) require split_output=True, "
                             f"got split_output=False for module '{module_id}'[{key}]"
                         )
+                    _validate_input(value, module_id=module_id)
                 elif _is_valid_input_config_list(value):
-                    pass  # Valid list of input configs
+                    for sp_input in value:
+                        _validate_input(sp_input, module_id=module_id)
                 else:
                     raise ValueError(
                         f"Input spec values must be SequenceParallelInput/PartialInput or list thereof, "
