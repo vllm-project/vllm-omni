@@ -221,6 +221,7 @@ def test_mirror_hardwares_b200_omits_cuda_strings_and_remaps_inferred(
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
     assert _expand_mirror_hardwares({"label": "h100", "mirror_hardwares": "h100_4"}) is None
     assert _expand_mirror_hardwares({"label": "l4", "mirror_hardwares": "l4_1"}) is None
+    assert _expand_mirror_hardwares({"label": "a100", "mirror_hardwares": "a100_1"}) is None
     b200 = _expand_mirror_hardwares({"label": "b200", "mirror_hardwares": "b200_2"})
     assert b200 is not None and b200["agents"]["queue"] == "b200-k8s"
     npu = _expand_mirror_hardwares({"label": "npu", "mirror_hardwares": "a2b3_npu_4"})
@@ -261,6 +262,7 @@ def test_mirror_hardwares_b200_omits_cuda_strings_and_remaps_inferred(
     [
         ("", "H100 and B200 and cards_2", "mithril-h100-pool", 2),
         ("b200", "H100 and B200 and cards_2", "b200-k8s", 2),
+        ("a100", "H100 and B200 and A100 and cards_1", "a100_queue", 1),
         ("", "H100 or L4 and cards_4", "mithril-h100-pool", 4),
         ("", "L4 and B200 and cards_4", "l4-k8s", 4),
         ("", "H100 and cards_2 and cards_3", "mithril-h100-pool", 3),
@@ -286,7 +288,9 @@ def test_mirror_hardwares_inferred_from_marks(
     ("selector", "expr"),
     [
         ("b200", "H100 and cards_2"),
+        ("a100", "H100 and B200 and cards_1"),
         ("", "B200 and cards_2"),
+        ("", "A100 and cards_1"),
         ("", "full_model and cards_2"),
     ],
 )
@@ -312,8 +316,11 @@ def test_cpu_step_without_mirror_hardwares_is_unchanged() -> None:
     assert _expand_mirror_hardwares(step) is step
 
 
-@pytest.mark.parametrize(("raw", "expected"), [("", ""), ("  ", ""), ("b200", "b200"), ("B200", "b200")])
-def test_mirror_hw_selector_empty_or_b200(monkeypatch: pytest.MonkeyPatch, raw: str, expected: str) -> None:
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("", ""), ("  ", ""), ("b200", "b200"), ("B200", "b200"), ("a100", "a100"), ("A100", "a100")],
+)
+def test_mirror_hw_selector_empty_or_mirror_chip(monkeypatch: pytest.MonkeyPatch, raw: str, expected: str) -> None:
     monkeypatch.setenv("MIRROR_HW", raw)
     assert _get_mirror_hw_selector() == expected
 

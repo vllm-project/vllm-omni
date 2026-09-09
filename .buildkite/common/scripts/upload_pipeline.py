@@ -22,9 +22,11 @@ Test pipeline mode (e.g. test-merge.yml):
 
     Inferred chip: unset ``MIRROR_HW`` matches ``H100`` or ``L4`` in ``-m``
     (both → H100); no match skips the step. ``MIRROR_HW=b200`` matches
-    ``B200`` in ``-m`` (otherwise skipped). ``-m`` is not rewritten.
-    ``MIRROR_HW`` must be empty or ``b200``; unknown values fail the upload.
-    A CUDA preset string such as ``h100_4`` is omitted when ``MIRROR_HW=b200``.
+    ``B200`` in ``-m`` (otherwise skipped). ``MIRROR_HW=a100`` matches
+    ``A100`` in ``-m`` (otherwise skipped). ``-m`` is not rewritten.
+    ``MIRROR_HW`` must be empty, ``b200``, or ``a100``; unknown values fail
+    the upload. A CUDA preset string such as ``h100_4`` is omitted when
+    ``MIRROR_HW`` names a different chip.
 
 Usage:
   python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
@@ -306,7 +308,7 @@ def _read_hardware_marks(expr: str) -> set[str]:
 
 
 # CI policy: not pytest-mark registry.
-_SUPPORTED_MIRROR_HW_SELECTORS = frozenset({"b200"})
+_SUPPORTED_MIRROR_HW_SELECTORS = frozenset({"a100", "b200"})
 # Unset MIRROR_HW: match H100 then L4 in -m (skip if neither).
 _DEFAULT_INFER_CHIPS = ("h100", "l4")
 _PYTEST_MARKER_ARG = re.compile(r"-m\s+(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
@@ -316,8 +318,8 @@ _CARDS_CHIP_MAX: Literal["max"] = "max"
 def _get_mirror_hw_selector() -> str:
     """Return lowercase ``MIRROR_HW``, or empty to keep string presets / marker chips.
 
-    A set value must be ``b200`` (case-insensitive). Unknown values fail closed
-    so a typo cannot silently drop the CUDA pipeline.
+    A set value must be ``a100`` or ``b200`` (case-insensitive). Unknown values
+    fail closed so a typo cannot silently drop the CUDA pipeline.
     """
     selector = os.environ.get("MIRROR_HW", "").strip().lower()
     if not selector:

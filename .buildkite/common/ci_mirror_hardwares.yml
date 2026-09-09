@@ -7,12 +7,13 @@
 # positives; not cards_1 with no positive cards_* → that chip's highest existing preset).
 # Unset MIRROR_HW matches H100 or L4 in -m (both → H100); no match skips the step.
 # MIRROR_HW=b200 matches B200 in -m (else the step is skipped).
-# MIRROR_HW must be empty or b200 (case-insensitive); unknown values fail the upload.
-# CUDA preset strings (h100_4, l4_1) are omitted when MIRROR_HW=b200.
+# MIRROR_HW=a100 matches A100 in -m (else the step is skipped).
+# MIRROR_HW must be empty, b200, or a100 (case-insensitive); unknown values fail the upload.
+# CUDA preset strings (h100_4, l4_1) are omitted when MIRROR_HW names a different chip.
 # Unset MIRROR_HW keeps string presets. NPU presets ignore MIRROR_HW.
 #
 # CUDA naming: {chip}_{count}
-#   l4_1, l4_2, l4_3, l4_4, h100_1 … h100_4, b200_1 … b200_4
+#   l4_1, l4_2, l4_3, l4_4, h100_1 … h100_4, a100_1 … a100_4, b200_1 … b200_4
 # NPU naming: {queue}_{resource_class}
 #   a2b3_npu_1  — ascend-a2b3, resource_class npu-1 (A2/B3 CI image)
 #   a2b3_npu_4  — ascend-a2b3, resource_class npu-4
@@ -21,6 +22,10 @@
 # B200 (b200-k8s): matches vLLM device ``b200-k8s`` from ci-infra
 # (AgentQueue.B200_K8S + b200_plugin_template). Queue routes the K8s pool;
 # podSpec uses hostNetwork + /raid|/mnt/shared (no H100-style nodeSelector).
+#
+# A100 (a100_queue): matches vLLM ``AgentQueue.A100`` + ``a100_plugin_template``
+# from ci-infra. nodeSelector targets NVIDIA-A100-SXM4-80GB; public ECR image
+# (no H100/B200 pull-through rewrite).
 #
 # The ``l4_*`` presets run on the EKS ``l4-k8s`` queue (agent-stack-k8s),
 # packed onto g6.12xlarge L4 nodes (``vllm.ci/gpu-pool=l4x4``). GPU / CPU /
@@ -383,6 +388,151 @@ mirror_hardwares:
                         key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  # vLLM device: a100 → agents.queue a100_queue + a100_plugin_template
+  a100_1:
+    agents:
+      queue: a100_queue
+    plugins:
+      - kubernetes:
+          podSpec:
+            priorityClassName: ci
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  a100_2:
+    agents:
+      queue: a100_queue
+    plugins:
+      - kubernetes:
+          podSpec:
+            priorityClassName: ci
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 2
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  a100_3:
+    agents:
+      queue: a100_queue
+    plugins:
+      - kubernetes:
+          podSpec:
+            priorityClassName: ci
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 3
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  a100_4:
+    agents:
+      queue: a100_queue
+    plugins:
+      - kubernetes:
+          podSpec:
+            priorityClassName: ci
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 4
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
             volumes:
               - name: devshm
                 emptyDir:
