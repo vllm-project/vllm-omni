@@ -25,7 +25,7 @@
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -137,6 +137,9 @@ try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
+
+if TYPE_CHECKING:
+    from vllm_omni.data_entry_keys import OmniPayload
 
 logger = init_logger(__name__)
 
@@ -570,9 +573,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         capture_set = set(capture_layer_indices) if capture_layer_indices else None
-        captured_hidden_states: dict[str, dict[str, dict[int, torch.Tensor]]] | None = (
-            {} if return_hidden_states else None
-        )
+        captured_hidden_states: OmniPayload | None = {} if return_hidden_states else None
 
         if captured_hidden_states is not None and capture_set and intermediate_tensors is not None:
             for layer_idx in capture_set:
