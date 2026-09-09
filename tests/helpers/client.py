@@ -1468,6 +1468,7 @@ class OnlineOmniClient:
             "instructions",
             "speed",
             "sample_rate",
+            "extra_params",
             "stream_format",
             "x_vector_only_mode",
         ):
