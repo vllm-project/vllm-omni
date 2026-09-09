@@ -14,7 +14,6 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.duplex.protocol import DuplexSession
-from vllm_omni.entrypoints.openai.protocol.audio import AudioChunkMetadata
 
 logger = init_logger(__name__)
 
@@ -262,6 +261,10 @@ class ChatFallbackProjectorMixin:
                 if isinstance(message_audio, dict):
                     audio_content = message_audio.get("data")
             if isinstance(audio_content, str) and audio_content:
+                # The OpenAI package imports duplex serving during initialization.
+                # Defer this import until chat fallback has finished loading.
+                from vllm_omni.entrypoints.openai.protocol.audio import AudioChunkMetadata
+
                 audio_metadata = AudioChunkMetadata.model_validate(choice.get("audio_metadata"))
                 duration_ms = session.record_generated_audio(
                     response_id,
