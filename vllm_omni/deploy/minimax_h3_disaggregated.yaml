@@ -16,7 +16,7 @@ stages:
           parallel_mode: tp
         video_vae:
           parallel_mode: patch
-        audio_wvae:
+        audio_vae:
           parallel_mode: leader
     default_sampling_params:
       max_tokens: 1
@@ -28,6 +28,7 @@ stages:
     max_num_seqs: 1
     model_loaded:
       text_encoder: false
+      vae_encoder: false
     parallel_config:
       tensor_parallel_size: 1
       ulysses_degree: 4

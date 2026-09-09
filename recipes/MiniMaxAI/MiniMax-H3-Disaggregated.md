@@ -28,7 +28,7 @@ Stage 0's `tensor_parallel_size` defines one shared rank group for all three
 encoder roles; it does not choose each role's execution strategy. The required
 `hf_overrides.minimax_h3_encoder_components` mapping declares those strategies
 explicitly: `text_encoder` uses tensor parallelism, `video_vae` uses patch
-parallelism, and `audio_wvae` runs on the group leader. All three role entries
+parallelism, and `audio_vae` runs on the group leader. All three role entries
 are mandatory. They share the stage's `max_num_seqs` scheduler and batch limit;
 the configuration does not create independent role schedulers or world sizes.
 
@@ -65,8 +65,12 @@ The Stage 1 VAE patch-parallel options remain independent of offload and
 quantization. See [MiniMax-H3.md](MiniMax-H3.md) for memory requirements and
 hardware-qualified profiles before combining these options.
 
-Stage 1 sets `model_loaded.text_encoder: false`; it must not load or download
-text-encoder weights. This H3 topology explicitly keeps its single-replica
+Stage 1 sets `model_loaded.text_encoder: false` and
+`model_loaded.vae_encoder: false`. It loads only the VAE decoders and skips
+tokenizer, processor, and text-encoder downloads. It requires complete text and
+media conditioning from Stage 0, with no fallback to local encoding.
+
+This H3 topology explicitly keeps its single-replica
 diffusion stage inline, avoiding serialization of decoded video through a
 subprocess. It expects both stages to run in one deployment; cross-node payload
 transport is outside this configuration.

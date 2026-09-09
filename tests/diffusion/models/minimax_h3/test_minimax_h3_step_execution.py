@@ -110,6 +110,7 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.load_text_encoder = False
     pipeline.transformer = model
     pipeline.device = torch.device("cpu")
     pipeline._transformer_for_task = lambda task: model

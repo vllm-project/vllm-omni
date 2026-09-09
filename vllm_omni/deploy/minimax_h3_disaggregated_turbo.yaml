@@ -8,6 +8,7 @@ stages:
   - stage_id: 0
     devices: "0,1"
     max_num_seqs: 1
+    gpu_memory_utilization: 0.6
     tensor_parallel_size: 2
     hf_overrides:
       minimax_h3_encoder_components:
@@ -15,7 +16,7 @@ stages:
           parallel_mode: tp
         video_vae:
           parallel_mode: patch
-        audio_wvae:
+        audio_vae:
           parallel_mode: leader
     default_sampling_params:
       max_tokens: 1
@@ -27,6 +28,7 @@ stages:
     max_num_seqs: 1
     model_loaded:
       text_encoder: false
+      vae_encoder: false
     parallel_config:
       tensor_parallel_size: 1
       ulysses_degree: 4

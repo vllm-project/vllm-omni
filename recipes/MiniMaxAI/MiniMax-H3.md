@@ -23,6 +23,12 @@ One vLLM-Omni diffusion stage can load both DiTs while instantiating the
 tokenizer, processor, Qwen3-VL text encoder, video VAE, and audio VAE only
 once. Requests select the DiT with `extra_params.task`.
 
+This single-stage recipe uses the default `model_loaded.text_encoder: true` and
+`model_loaded.vae_encoder: true`. Precomputed text conditioning can replace the
+local Qwen call. Setting `model_loaded.text_encoder: false` while leaving
+`model_loaded.vae_encoder: true` requires precomputed text conditioning;
+reference media is still encoded locally.
+
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
 ## Prerequisites
@@ -35,7 +41,7 @@ hf auth login
 export MODEL=MiniMaxAI/MiniMax-H3
 ```
 
-The vLLM-Omni pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
+By default, the pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
 `Ref2VA/transformer/**`. It does not download or load the diffusers-format
 `transformer`, `transformer_ref`, or `vae` weights at the repository root, nor
 duplicate Ref2VA copies of shared components.

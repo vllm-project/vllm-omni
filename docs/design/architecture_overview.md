@@ -131,13 +131,13 @@ for the validated batching, attention, and quantization combinations.
 
 ### MiniMax-H3: conditioning, denoising, and decode
 
-MiniMax-H3 illustrates logical component and phase boundaries between text
-encoding, task-specific denoising, and media decoding:
-`Text Encoder → DiT → VAE Decoder`. The current registered topology co-locates
-these components in one diffusion stage. These boundaries are useful for
-profiling and offload; independent placement would require a future
-multi-stage `PipelineConfig`. The stage mapping follows the implementation and
-serving recipe; the [release overview](https://minimaxi.com/blog/minimax-h3)
+MiniMax-H3 combines text and reference-media encoding, task-specific denoising,
+and media decoding. Standard serving co-locates these components in one diffusion
+stage. The opt-in
+[disaggregated topology](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Disaggregated.md)
+runs Qwen and the video/audio VAE encoders in Stage 0, then sends their conditioning
+to a Stage 1 containing the DiTs and VAE decoders. The stage mapping follows the
+implementation and serving recipe; the [release overview](https://minimaxi.com/blog/minimax-h3)
 notes that a detailed technical report is forthcoming.
 
 #### Model architecture by component
@@ -149,16 +149,15 @@ notes that a detailed technical report is forthcoming.
 | **VAE Decoder** | Video VAE and audio VAE decode the generated latents and assemble the synchronized output | Decoded video frames and stereo waveform, with FPS and audio sample rate metadata |
 
 Both DiT partitions remain behind one task-selection point; `task` chooses
-which partition runs. In the current implementation, the three logical
-components execute inside one diffusion stage. This is different from
-Qwen3-Omni's three independently scheduled stages, even though both models
-produce synchronized audio and video-like outputs.
+which partition runs.
 
 #### Representative component execution
 
+The following table describes the standard single-stage deployment.
+
 | Logical component | Batching | Attention and execution | Parallelism | Quantization |
 | --- | --- | --- | --- | --- |
-| **Text Encoder** | The current co-located pipeline follows the diffusion request scheduler; independent prompt/reference batching would require a separate multi-stage topology | Qwen3-VL attention and multimodal preprocessing | `--text-encoder-tp-size N` shards the encoder across the first `N` DiT ranks; independent placement is not part of the current topology | BF16/FP32 baseline; the H3 DiT FP8 path does not quantize the text encoder |
+| **Text Encoder** | Follows the diffusion request scheduler | Qwen3-VL attention and multimodal preprocessing | `--text-encoder-tp-size N` shards the encoder across the first `N` DiT ranks | BF16/FP32 baseline; the H3 DiT FP8 path does not quantize the text encoder |
 | **DiT** | The current H3 implementation executes one generation request per diffusion batch; use concurrency for service-level throughput | cuDNN attention for the validated two-GPU consumer profile; TRTLLM attention or FlashAttention-4 on supported Blackwell profiles | TP2 plus text-encoder TP and Ulysses/VAE parallel groups on multi-GPU profiles; DLO/CPU offload trade memory for transfer time | Online FP8 applies to eligible DiT linears and is incompatible with layerwise offload |
 | **VAE Decoder** | Decode follows each generation request; tile/patch work can be distributed even when denoising is not batched | VAE decode kernels rather than DiT attention | VAE patch parallelism and native tiled decode within the diffusion stage | BF16/FP32 baseline; the documented H3 FP8 path leaves both VAEs unchanged |
 

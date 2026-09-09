@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -6,9 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
-from PIL import Image
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tp_group
 
@@ -23,6 +22,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderMediaConditioning,
     MiniMaxH3EncoderMediaInput,
 )
+from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
 from vllm_omni.model_executor.models.minimax_h3.text_encoder import (
     MiniMaxH3TextEncoderBackbone,
 )
@@ -31,7 +31,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 _MEDIA_CONDITIONING_CACHE_KEY = "_minimax_h3_encoder_media_conditioning"
 _MEDIA_CACHE_KEY = "_minimax_h3_encoder_media"
 _COMPONENT_CONFIG_KEY = "minimax_h3_encoder_components"
-_COMPONENT_ROLES = frozenset({"text_encoder", "video_vae", "audio_wvae"})
+_COMPONENT_ROLES = frozenset({"text_encoder", "video_vae", "audio_vae"})
 
 
 def _partition_root(model_path: str) -> Path:
@@ -39,13 +39,6 @@ def _partition_root(model_path: str) -> Path:
     if path.name in {"text_encoder", "video_vae", "audio_vae"}:
         return path.parent
     return path
-
-
-def _image_from_tensor(value: torch.Tensor) -> Image.Image:
-    if value.ndim != 3 or value.shape[-1] != 3:
-        raise ValueError(f"MiniMax H3 image tensor must have shape [H, W, 3], got {tuple(value.shape)}")
-    array = value.detach().cpu().to(torch.uint8).contiguous().numpy()
-    return Image.fromarray(array, mode="RGB")
 
 
 @dataclass(frozen=True)
@@ -60,7 +53,7 @@ class MiniMaxH3EncoderComponentConfig:
         if self.video_parallel_mode not in {"leader", "patch"}:
             raise ValueError("MiniMax H3 video VAE parallel_mode must be 'leader' or 'patch'")
         if self.audio_parallel_mode != "leader":
-            raise ValueError("MiniMax H3 audio WVAE currently supports parallel_mode='leader' only")
+            raise ValueError("MiniMax H3 audio VAE currently supports parallel_mode='leader' only")
 
     @staticmethod
     def _parallel_mode(raw: Mapping[str, Any], role: str) -> str:
@@ -88,7 +81,7 @@ class MiniMaxH3EncoderComponentConfig:
         return cls(
             text_parallel_mode=cls._parallel_mode(raw, "text_encoder"),
             video_parallel_mode=cls._parallel_mode(raw, "video_vae"),
-            audio_parallel_mode=cls._parallel_mode(raw, "audio_wvae"),
+            audio_parallel_mode=cls._parallel_mode(raw, "audio_vae"),
         )
 
 
@@ -169,82 +162,11 @@ class MiniMaxH3Encoder(MiniMaxH3TextEncoderBackbone):
     def _encode_media(self, media: MiniMaxH3EncoderMediaInput) -> MiniMaxH3EncoderMediaConditioning | None:
         if not self._component_leader and self.component_config.video_parallel_mode == "leader":
             return None
-        visual_rows: list[torch.Tensor] = []
-        visual_shapes: list[tuple[int, int, int]] = []
-        if media.images or media.videos:
-            if self.video_vae is None:
-                raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
-            for value in media.images:
-                image = _image_from_tensor(value)
-                visual_rows.append(self.video_vae.encode_image(image))
-                visual_shapes.append((1, image.height // 16, image.width // 16))
-            for value in media.videos:
-                frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
-                rows, shape = self.video_vae.encode_video(frames)
-                visual_rows.append(rows)
-                visual_shapes.append(tuple(int(item) for item in shape))
-
-        if not self._component_leader:
-            return None
-
-        audio_rows: list[torch.Tensor] = []
-        audio_lengths: list[int] = []
-        embedded_audio_count = sum(item is not None for item in media.video_audios)
-        audio_inputs = [item for item in media.video_audios if item is not None]
-        max_samples_seconds = float(media.num_frames) / 24.0
-        audio_inputs.extend(
-            (waveform[..., : int(round(max_samples_seconds * sample_rate))], sample_rate)
-            for waveform, sample_rate in media.audios
-        )
-        if audio_inputs:
-            if self.audio_vae is None:
-                raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
-            for waveform, sample_rate in audio_inputs:
-                rows, length = self.audio_vae.encode_waveform(waveform, sample_rate)
-                audio_rows.append(rows)
-                audio_lengths.append(int(length))
-        if audio_lengths:
-            if any(length < 80 or length > 600 for length in audio_lengths):
-                raise ValueError("MiniMax H3 audio references must each be between 2 and 15 seconds")
-            if sum(audio_lengths) > 600:
-                raise ValueError("MiniMax H3 audio references must be at most 15 seconds in total")
-
-        ref_blocks: list[dict[str, Any]] = []
-        image_shapes = visual_shapes[: len(media.images)]
-        video_shapes = visual_shapes[len(media.images) :]
-        ref_blocks.extend({"kind": "image", "latent_h": shape[1], "latent_w": shape[2]} for shape in image_shapes)
-        embedded_lengths = iter(audio_lengths[:embedded_audio_count])
-        for shape, embedded in zip(video_shapes, media.video_audios, strict=True):
-            ref_audio_t = int(next(embedded_lengths)) if embedded is not None else 0
-            ref_blocks.append(
-                {
-                    "kind": "video_audio" if ref_audio_t else "video",
-                    "ref_audio_t": ref_audio_t,
-                    "latent_t": shape[0],
-                    "latent_h": shape[1],
-                    "latent_w": shape[2],
-                }
-            )
-        ref_blocks.extend(
-            {
-                "kind": "audio",
-                "ref_audio_t": int(length),
-            }
-            for length in audio_lengths[embedded_audio_count:]
-        )
-        return MiniMaxH3EncoderMediaConditioning(
-            task=media.task,
-            height=media.height,
-            width=media.width,
-            num_frames=media.num_frames,
-            latent_t=media.latent_t,
-            audio_t=media.audio_t,
-            visual_condition=torch.cat(visual_rows) if visual_rows else None,
-            visual_condition_shapes=tuple(visual_shapes),
-            audio_condition=torch.cat(audio_rows) if audio_rows else None,
-            audio_condition_lengths=tuple(audio_lengths),
-            ref_blocks=tuple(ref_blocks),
-            keyframe_frame_indices=media.keyframe_frame_indices,
+        return encode_media(
+            media,
+            video_vae=self.video_vae,
+            audio_vae=self.audio_vae,
+            emit_conditioning=self._component_leader,
         )
 
     @staticmethod
