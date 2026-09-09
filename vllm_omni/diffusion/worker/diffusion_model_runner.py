@@ -640,12 +640,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 gen_device = self.device
             sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
 
-    def _refresh_cache_for_requests(
-        self,
-        reqs: list[OmniDiffusionRequest],
-        *,
-        od_config: OmniDiffusionConfig,
-    ) -> None:
+    def _refresh_cache_for_requests(self, reqs: list[OmniDiffusionRequest]) -> None:
         first_req = reqs[0]
         if self.cache_backend is None or not self.cache_backend.is_enabled():
             return
@@ -659,26 +654,34 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if num_inference_steps is None and first_req.sampling_params.sigmas is not None:
             num_inference_steps = len(first_req.sampling_params.sigmas)
         if num_inference_steps is None:
-            num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
-        if num_inference_steps is None and od_config.cache_backend in (
-            "tea_cache",
-            "step_cache",
-        ):
-            # When num_inference_steps is None, some pipelines defer to their
-            # own defaults. TeaCache refresh ignores this value; step_cache
-            # refresh is a no-op because per-chunk state resets in the denoise
-            # loop. Use the pipeline default when available to keep refresh
-            # behavior aligned with single-request execution.
-            num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
+            # The request left the step count to the pipeline's own default, so
+            # ask the pipeline rather than leaving the cache context unsized.
+            num_inference_steps = self._resolve_pipeline_num_inference_steps()
 
-        if num_inference_steps is not None:
-            self.cache_backend.refresh(self.pipeline, num_inference_steps)
-        else:
-            logger.warning(
-                "Failed to refresh the diffusion transformer cache; backend %s "
-                "currently requires num_inference_steps to be passed explicitly",
-                od_config.cache_backend,
-            )
+        # Always refresh, even with an unresolved step count. Cache backends hold
+        # per-request state (residual buffers, step counters), so skipping the
+        # refresh would let this batch resume the previous request's cache and
+        # produce a corrupted output.
+        self.cache_backend.refresh(self.pipeline, num_inference_steps)
+
+    def _resolve_pipeline_num_inference_steps(self) -> int | None:
+        """Ask the pipeline which step count it will actually denoise with.
+
+        Requests may omit ``num_inference_steps`` and let the pipeline apply its
+        own default, which cache backends need in order to size a request
+        context. Returns ``None`` when the pipeline does not advertise one.
+        """
+
+        resolve = getattr(self.pipeline, "resolve_num_inference_steps", None)
+        if callable(resolve):
+            return resolve(None)
+        # Pipelines without the resolver still advertise their default either as
+        # a class-level constant or as a live attribute.
+        return (
+            getattr(self.pipeline, "default_num_inference_steps", None)
+            or getattr(self.pipeline, "num_inference_steps", None)
+            or None
+        )
 
     def _runner_output_from_outputs(
         self,
@@ -738,7 +741,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     use_prefetch=allow_single_output,
                 )
 
-            self._refresh_cache_for_requests(reqs, od_config=od_config)
+            self._refresh_cache_for_requests(reqs)
 
             batch = DiffusionRequestBatch(requests=reqs)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0

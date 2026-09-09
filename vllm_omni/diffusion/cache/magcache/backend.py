@@ -120,7 +120,7 @@ class MagCacheBackend(CacheBackend):
         self._registered = True
         self.enabled = True
 
-    def refresh(self, pipeline: Any, num_inference_steps: int) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int | None) -> None:
         """Refresh MagCache state for new generation.
 
         Clears all cached residuals and resets counters/accumulators.

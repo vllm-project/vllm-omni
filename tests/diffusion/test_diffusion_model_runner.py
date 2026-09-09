@@ -279,23 +279,27 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
         req.sampling_params.num_inference_steps = num_inference_steps
         req.sampling_params.timesteps = timesteps
         req.sampling_params.sigmas = sigmas
-        DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+        DiffusionModelRunner._refresh_cache_for_requests(runner, [req])
 
     assert [steps for _, steps, _ in cache_backend.refresh_calls] == [20, 30, 8, 8, 3, 50]
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+def test_refresh_cache_without_request_or_pipeline_default_still_refreshes():
+    """An unresolved step count must not skip the refresh.
+
+    Cache backends hold per-request state, so a skipped refresh would let this
+    request resume the previous one's step counters and residual buffers.
+    """
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
     req.sampling_params.num_inference_steps = None
 
-    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    DiffusionModelRunner._refresh_cache_for_requests(runner, [req])
 
-    assert cache_backend.refresh_calls == []
-    assert "requires num_inference_steps to be passed explicitly" in caplog.text
+    assert [steps for _, steps, _ in cache_backend.refresh_calls] == [None]
 
 
 @pytest.mark.core_model
@@ -651,6 +655,64 @@ def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(monk
 
     assert output.output == "ok"
     assert cache_summary_calls == ([(runner.pipeline, True)] if cache_dit_enabled else [])
+
+
+class _RecordingCacheBackend:
+    def __init__(self):
+        self.refresh_calls = []
+
+    def is_enabled(self):
+        return True
+
+    def refresh(self, pipeline, num_inference_steps, verbose=True):
+        self.refresh_calls.append(num_inference_steps)
+
+
+def _refresh_cache_for_request(pipeline, requested_steps, cache_backend_name="cache_dit"):
+    cache_backend = _RecordingCacheBackend()
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name=cache_backend_name)
+    runner.pipeline = pipeline
+    req = _make_request_with_params(
+        "req-0",
+        SimpleNamespace(num_inference_steps=requested_steps, timesteps=None, sigmas=None),
+    )
+
+    DiffusionModelRunner._refresh_cache_for_requests(runner, [req])
+
+    return cache_backend.refresh_calls
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_uses_the_request_step_count():
+    assert _refresh_cache_for_request(SimpleNamespace(), requested_steps=28) == [28]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_falls_back_to_the_pipeline_resolved_step_count():
+    """A request may omit the step count and let the pipeline default apply."""
+    pipeline = SimpleNamespace(resolve_num_inference_steps=lambda steps: 40)
+
+    assert _refresh_cache_for_request(pipeline, requested_steps=None) == [40]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_falls_back_to_the_pipeline_step_attribute():
+    assert _refresh_cache_for_request(SimpleNamespace(num_inference_steps=25), requested_steps=None) == [25]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("cache_backend_name", ["cache_dit", "tea_cache", "mag_cache", "step_cache"])
+def test_refresh_cache_still_runs_when_the_step_count_is_unknown(cache_backend_name):
+    """Skipping the refresh would leak the previous request's cache into this one."""
+    assert _refresh_cache_for_request(
+        SimpleNamespace(),
+        requested_steps=None,
+        cache_backend_name=cache_backend_name,
+    ) == [None]
 
 
 @pytest.mark.core_model

@@ -75,7 +75,7 @@ class CacheBackend(ABC):
         raise NotImplementedError("Subclasses must implement enable()")
 
     @abstractmethod
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int | None, verbose: bool = True) -> None:
         """
         Refresh cache state for new generation.
 
@@ -85,8 +85,11 @@ class CacheBackend(ABC):
         Args:
             pipeline: Diffusion pipeline instance. The backend can extract:
                      - transformer: via pipeline.transformer
-            num_inference_steps: Number of inference steps for the current generation.
-                                May be used for cache context updates.
+            num_inference_steps: Number of inference steps for the current generation,
+                                or None when neither the request nor the pipeline
+                                advertises one. May be used for cache context
+                                updates; implementations must still reset their
+                                per-request state when it is None.
             verbose: Whether to log refresh operations (default: True)
         """
         raise NotImplementedError("Subclasses must implement refresh()")
