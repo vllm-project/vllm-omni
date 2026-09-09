@@ -37,11 +37,6 @@ from .parallel import (
 
 logger = init_logger(__name__)
 
-# MATE's fast-exp2 softmax approximation can amplify over repeated tiny
-# transformer layers.  Dense Torch attention is also cheaper for this regime;
-# production MAGI-2 sequences are well above this bound.
-_MUSA_FA3_MIN_TOKENS = 32
-
 
 def _musa_fa3_varlen(**kwargs):
     """Run MUSA FA3 with the numerically stable MATE backend.
@@ -64,13 +59,20 @@ def _musa_fa3_varlen(**kwargs):
             raise exc
         kwargs = dict(kwargs)
         kwargs["softcap"] = max(float(kwargs.get("softcap", 0.0)), 0.0)
+        if "return_softmax_lse" in kwargs:
+            kwargs["return_attn_probs"] = kwargs.pop("return_softmax_lse")
         args = (kwargs.pop("q"), kwargs.pop("k"), kwargs.pop("v"))
         result = flash_attn_varlen_func(*args, **kwargs, backend="mutlass")
-        # MATE exposes packed LSE as [T, H], while the Omni FA3 contract is
-        # [H, T]. Normalize only this direct-provider compatibility path.
+        # Normalize a non-square packed [T, H] result to Omni's [H, T]
+        # contract; square layouts are already shape-ambiguous and unchanged.
         if isinstance(result, tuple) and len(result) > 1:
             lse = result[1]
-            if isinstance(lse, torch.Tensor) and lse.ndim == 2 and lse.shape[0] == q.shape[0]:
+            if (
+                isinstance(lse, torch.Tensor)
+                and lse.ndim == 2
+                and tuple(lse.shape) != (q.shape[1], q.shape[0])
+                and tuple(lse.shape) == (q.shape[0], q.shape[1])
+            ):
                 result = (result[0], lse.transpose(0, 1).contiguous(), *result[2:])
         return result
 
@@ -251,7 +253,6 @@ def packed_attention_with_sink(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.shape[0] > 0
         and k.shape[0] > 0
-        and q.shape[0] >= _MUSA_FA3_MIN_TOKENS
     ):
         requested_version = os.environ.get("MAGI2_FLASH_ATTN_VERSION")
         if requested_version is not None and int(requested_version) != 3:
@@ -279,7 +280,12 @@ def packed_attention_with_sink(
             assert isinstance(result, tuple)
             # Use the same correction as CUDA. Do not round learned FP32 sinks
             # to the activation dtype or require native provider sink support.
-            return correct_out_lse_with_sink(result[0], result[1], sink)[0]
+            out = result[0]
+            if sink is not None and current_omni_platform.is_musa():
+                # Keep the learned-sink denominator correction in FP32; the
+                # FA3 activation itself remains in the provider's dtype.
+                out = out.float()
+            return correct_out_lse_with_sink(out, result[1], sink)[0].to(q.dtype)
     return torch_varlen_attention_with_sink(
         q,
         k,
