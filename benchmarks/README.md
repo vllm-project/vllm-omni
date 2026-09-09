@@ -50,6 +50,12 @@ Accuracy benchmarks for image generation/editing models, adapting external suite
 - **Layout**: `accuracy/text_to_image/` (GEBench), `accuracy/image_to_image/` (GEdit-Bench)
 - **Method**: generation and judge scoring both run through local `vllm-omni serve` endpoints
 
+### [SocialOmni](socialomni/README.md) — Audio-Visual Social Interaction
+
+Speaker attribution, turn-entry decisions, and response quality through the
+chat completions endpoint. Level 2 uses video prefixes and a fixed three-judge
+panel, with separate decision, generation, and scoring phases.
+
 ### Common serving metrics framework
 
 `vllm_omni/benchmarks/` extends `vllm bench serve --omni` with Omni-specific datasets, backends, and multimodal metrics. Key metrics include:
