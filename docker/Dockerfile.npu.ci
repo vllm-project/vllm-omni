@@ -65,6 +65,7 @@ RUN python3 -m pip install -v --no-deps \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60
 
+ENV VLLM_TARGET_DEVICE=npu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 ENTRYPOINT []

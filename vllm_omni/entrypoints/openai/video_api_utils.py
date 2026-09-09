@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shared helper utilities for OpenAI-compatible video generation API.
 """
@@ -15,7 +15,7 @@ from collections import deque
 from collections.abc import Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import httpx
 import numpy as np
@@ -50,9 +50,9 @@ logger = init_logger(__name__)
 DEFAULT_AUDIO_SAMPLE_RATE = 24_000
 
 
-VideoInput = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
+VideoInput: TypeAlias = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
 AudioSample = int | float
-AudioInput = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
+AudioInput: TypeAlias = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
 
 
 class VideoFrames(list[Image.Image]):
@@ -71,6 +71,21 @@ class VideoFrames(list[Image.Image]):
         self.source_path = source_path
 
 
+class _ImagePixelLimitError(InvalidInputReferenceError):
+    """An image exceeded a configured or decoder-enforced pixel limit."""
+
+
+def _validate_image_pixel_limit(image: Image.Image) -> None:
+    width, height = image.size
+    max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+    if max_pixels > 0 and width * height > max_pixels:
+        raise _ImagePixelLimitError(
+            f"Image dimensions {width}x{height} ({width * height} pixels) exceed "
+            f"the maximum of {max_pixels} pixels. Set "
+            f"VLLM_MAX_IMAGE_PIXELS to increase this limit."
+        )
+
+
 def positive_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -87,7 +102,13 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
+        with Image.open(BytesIO(image_bytes)) as image:
+            _validate_image_pixel_limit(image)
+            return image.convert("RGB")
+    except _ImagePixelLimitError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise _ImagePixelLimitError(f"Invalid {source}: image exceeds the decoder pixel limit.") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
 
@@ -158,6 +179,8 @@ def _decode_media_bytes(
 ) -> Image.Image | VideoFrames:
     try:
         return _decode_image_bytes(media_bytes, source=source)
+    except _ImagePixelLimitError:
+        raise
     except InvalidInputReferenceError:
         try:
             return _decode_video_bytes(
@@ -396,7 +419,7 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
         # Cast to float32 first: bf16 (e.g. SANA-WM's refiner output) has no
         # numpy dtype, so ``.numpy()`` below raises on it.
         video_tensor = video_tensor.float().clamp(-1, 1) * 0.5 + 0.5
-    else:
+    elif video_tensor.dtype != torch.uint8:
         video_tensor = video_tensor.to(torch.float32) / 255.0
     video_array = video_tensor.numpy()
     return _normalize_single_video_array(video_array)
@@ -419,7 +442,7 @@ def _normalize_single_video_array(video_array: np.ndarray) -> np.ndarray:
     if np.issubdtype(video_array.dtype, np.floating):
         if video_array.size and (video_array.min() < 0.0 or video_array.max() > 1.0):
             video_array = np.clip(video_array, -1.0, 1.0) * 0.5 + 0.5
-    elif np.issubdtype(video_array.dtype, np.integer):
+    elif video_array.dtype != np.uint8 and np.issubdtype(video_array.dtype, np.integer):
         video_array = video_array.astype(np.float32) / 255.0
     return video_array
 
@@ -435,7 +458,7 @@ def _normalize_video_array(video_array: np.ndarray) -> list[np.ndarray] | np.nda
 
 
 def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
-    """Normalize a list of frames into numpy arrays with values in [0,1]."""
+    """Normalize a list of frames into numpy arrays, uint8 ones unchanged."""
     normalized: list[np.ndarray] = []
     for frame in frames:
         if isinstance(frame, torch.Tensor):
@@ -453,7 +476,7 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
         if np.issubdtype(frame_array.dtype, np.floating):
             if frame_array.size and (frame_array.min() < 0.0 or frame_array.max() > 1.0):
                 frame_array = np.clip(frame_array, -1.0, 1.0) * 0.5 + 0.5
-        elif np.issubdtype(frame_array.dtype, np.integer):
+        elif frame_array.dtype != np.uint8 and np.issubdtype(frame_array.dtype, np.integer):
             frame_array = frame_array.astype(np.float32) / 255.0
 
         normalized.append(frame_array)
@@ -461,7 +484,14 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
 
 
 def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
-    """Convert a video payload into a list of normalized float32 frames."""
+    """Convert a video payload into a list of normalized frames.
+
+    Frames are float32 in [0, 1], except uint8 ones, which pass through: the
+    muxer's own dtype is uint8, so normalising here would only pay for a
+    full-size conversion each way. The direct planar path additionally needs
+    contiguous channel planes and falls back for interleaved RGB whatever the
+    dtype; the standard muxer takes the uint8 frames as they are.
+    """
     if isinstance(video, torch.Tensor):
         video_array = _normalize_video_tensor(video)
         return list(video_array)
@@ -553,6 +583,14 @@ def _coerce_prepared_video_to_uint8_frames(
 
 def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     """Convert a video payload into contiguous uint8 frames shaped (F, H, W, 3)."""
+    if (
+        isinstance(video, np.ndarray)
+        and video.dtype == np.uint8
+        and video.ndim == 4
+        and video.shape[-1] == 3
+        and video.flags.c_contiguous
+    ):
+        return video
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     return _coerce_prepared_video_to_uint8_frames(frames, frame_shape, common_dtype)
 
@@ -561,6 +599,8 @@ def _direct_planar_fallback_reason(
     frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
     common_dtype: np.dtype,
+    *,
+    allow_strided_rgb_planes: bool = False,
 ) -> str | None:
     """Return a stable reason when direct planar muxing cannot consume frames."""
     if len(frame_shape) != 3 or frame_shape[0] <= 0 or frame_shape[1] <= 0 or frame_shape[2] not in (3, 4):
@@ -573,7 +613,9 @@ def _direct_planar_fallback_reason(
     ):
         return "unsupported_dtype"
 
-    if not all(frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3)):
+    if not allow_strided_rgb_planes and not all(
+        frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3)
+    ):
         return "non_contiguous_rgb_planes"
 
     return None
@@ -627,6 +669,7 @@ class _PlanarFrameConverter:
             if frame.dtype == np.uint8:
                 plane_view[:height, :width] = frame[..., channel]
             else:
+                assert scratch is not None
                 np.copyto(scratch, frame[..., channel], casting="unsafe")
                 np.clip(scratch, 0.0, 1.0, out=scratch)
                 scratch *= 255.0
@@ -766,7 +809,7 @@ def _encode_video_bytes_legacy(
 
 def _encode_video_bytes(
     video: Any,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
@@ -779,7 +822,12 @@ def _encode_video_bytes(
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
-    fallback_reason = _direct_planar_fallback_reason(frames, frame_shape, common_dtype)
+    fallback_reason = _direct_planar_fallback_reason(
+        frames,
+        frame_shape,
+        common_dtype,
+        allow_strided_rgb_planes=frame_converter is not None and frame_converter.max_workers > 1,
+    )
     if fallback_reason is not None:
         _log_video_encoding_path(
             selected_path="legacy_fallback",
@@ -883,7 +931,7 @@ def create_streaming_video_encoder(
 
 def encode_video_base64(
     video: Any,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,

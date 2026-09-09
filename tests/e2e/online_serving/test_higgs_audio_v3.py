@@ -48,10 +48,6 @@ DEFAULT_SPEECH_TIMEOUT_S = 180.0
 # silence-only outputs without flagging short legitimate clips.
 _MIN_AUDIO_BYTES = 20_000
 
-_SKIP_ISSUE_6418 = pytest.mark.skip(
-    reason="https://github.com/vllm-project/vllm-omni/issues/6418",
-)
-
 # Reuse the shared TTS reference clip (clean ~5 s 24 kHz mono human speech)
 # vendored under tests/assets/qwen3_tts/. Keeps a single WAV across TTS
 # tests rather than duplicating asset bytes.
@@ -65,7 +61,7 @@ class TestHiggsAudioV3OnlineHappyPath:
 
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_plain_text_wav(self, omni_server, online_client) -> None:
         """Single non-streaming WAV request - canonical TTS happy path."""
         online_client.send_audio_speech_request(
@@ -82,10 +78,9 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_plain_text_with_max_new_tokens(self, omni_server, online_client) -> None:
         """``max_new_tokens`` is one of the few extra fields the v3 validator accepts."""
         online_client.send_audio_speech_request(
@@ -95,15 +90,14 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "max_new_tokens": 32,
+                "max_new_tokens": 1024,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
             }
         )
 
-    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_concurrent_plain_text(self, omni_server, online_client) -> None:
         """Three concurrent non-streaming requests - guards per-slot audio state and Stage-0 PC under batching."""
         online_client.send_audio_speech_request(
@@ -119,7 +113,7 @@ class TestHiggsAudioV3OnlineHappyPath:
 
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_plain_text_pcm_streaming(self, omni_server, online_client) -> None:
         """Streaming PCM via talker2code2wav_async_chunk + the connector's codec_streaming path.
 
@@ -150,7 +144,7 @@ class TestHiggsAudioV3OnlineHappyPath:
 
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_concurrent_pcm_streaming(self, omni_server, online_client) -> None:
         """Three concurrent streaming requests - guards per-request frame cursors
         in ``talker2code2wav_async_chunk`` and per-slot delay-pattern state under batched AR.
@@ -185,15 +179,13 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     tokens (pause, sfx) go inline. SFX tokens must pair with their written
     onomatopoeia.
 
-    These tests check the *serving surface* - the validator accepts the
-    payload, the engine produces audio, and the WAV has non-trivial size.
-    They do not assert audio quality (out of scope for CI).
+    These tests check the serving surface and spoken text. They do not assert
+    whether the requested control changes audio quality.
     """
 
-    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_inline_emotion_and_expressive(self, omni_server, online_client) -> None:
         """Delivery tokens (emotion + expressive_high) at the start of input."""
         online_client.send_audio_speech_request(
@@ -204,13 +196,13 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "Wait, that was actually hilarious.",
             }
         )
 
-    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_inline_style_whispering(self, omni_server, online_client) -> None:
         """Style token at the start - ``whispering``."""
         online_client.send_audio_speech_request(
@@ -221,13 +213,13 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "It is just between you and me, alright?",
             }
         )
 
-    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_inline_prosody_speed_and_pitch(self, omni_server, online_client) -> None:
         """Two prosody tokens at the start - slow speed plus low pitch."""
         online_client.send_audio_speech_request(
@@ -240,13 +232,13 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "The radar shows a storm approaching from the east.",
             }
         )
 
-    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_inline_pause_mid_text(self, omni_server, online_client) -> None:
         """Positional pause token placed inline between two clauses."""
         online_client.send_audio_speech_request(
@@ -257,13 +249,13 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "Hold on a moment. Let me think about it.",
             }
         )
 
-    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_inline_sfx_with_onomatopoeia(self, omni_server, online_client) -> None:
         """SFX token paired with its written onomatopoeia (``<|sfx:laughter|>Hehe``)."""
         online_client.send_audio_speech_request(
@@ -277,6 +269,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "I cannot believe that just happened. I am still recovering from it.",
             }
         )
 
@@ -287,7 +280,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
 
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_voice_clone_ref_audio_ref_text(self, omni_server, online_client) -> None:
         """Canonical vllm-omni voice clone via ``ref_audio`` + ``ref_text``."""
         online_client.send_audio_speech_request(
@@ -304,7 +297,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
 
     @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_voice_clone_references_alias(self, omni_server, online_client) -> None:
         """BosonAI cookbook payload: ``references=[{audio_path, text}]``.
 

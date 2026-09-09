@@ -154,8 +154,17 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
 
     torch.manual_seed(1)
     query = torch.randn(19, _NUM_HEADS, _HEAD_SIZE, dtype=torch.float16, device=device)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
+    packed_qkv = torch.randn(
+        19,
+        3 * _NUM_HEADS * _HEAD_SIZE,
+        dtype=torch.float16,
+        device=device,
+    )
+    _, key_flat, value_flat = packed_qkv.split(_NUM_HEADS * _HEAD_SIZE, dim=-1)
+    key = key_flat.reshape(19, _NUM_HEADS, _HEAD_SIZE)
+    value = value_flat.reshape(19, _NUM_HEADS, _HEAD_SIZE)
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
     omni_backend = FlashAttentionImpl(
         num_heads=_NUM_HEADS,
         head_size=_HEAD_SIZE,

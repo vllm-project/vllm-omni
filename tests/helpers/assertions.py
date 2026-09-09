@@ -269,7 +269,9 @@ def assert_video_diffusion_response(
                 "height": ...,
                 "fps": ...,
                 ...
-            }
+            },
+            "expected_audio": {"sample_rate": 44100, "channels": 2},
+            "fps_tolerance": 0.01,
         }
     """
     form_data = request_config.get("form_data", {})
@@ -280,7 +282,8 @@ def assert_video_diffusion_response(
     expected_frames = _maybe_int(form_data.get("num_frames"))
     expected_width = _maybe_int(form_data.get("width"))
     expected_height = _maybe_int(form_data.get("height"))
-    expected_fps = _maybe_int(form_data.get("fps"))
+    expected_fps = _maybe_float(form_data.get("fps"))
+    expected_audio = request_config.get("expected_audio")
 
     # Skip num_frames assertion for Helios models because they round up frames
     model = request_config.get("model", "")
@@ -294,7 +297,19 @@ def assert_video_diffusion_response(
             width=expected_width,
             height=expected_height,
             fps=expected_fps,
+            fps_tolerance=request_config.get("fps_tolerance", 1.0),
         )
+        if expected_audio is not None:
+            assert isinstance(expected_audio, dict), "expected_audio must be an object"
+            sample_rate = _maybe_int(expected_audio.get("sample_rate"))
+            channels = _maybe_int(expected_audio.get("channels"))
+            assert sample_rate is not None, "expected_audio.sample_rate is required"
+            assert channels is not None, "expected_audio.channels is required"
+            assert_video_audio_valid(
+                vid_bytes,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
 
 
 def assert_video_first_frame_matches(
@@ -346,6 +361,12 @@ def _maybe_int(value: Any) -> int | None:
     return int(value)
 
 
+def _maybe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
     """Assert the file is a loadable image with optional exact dimensions."""
     if isinstance(image, Path):
@@ -367,12 +388,14 @@ def assert_video_valid(
     width: int | None = None,
     height: int | None = None,
     fps: float | None = None,
+    fps_tolerance: float = 1.0,
 ) -> dict[str, int | float]:
     """Assert the MP4 has the expected resolution and frame count.
 
     For several diffusion backends, encoded MP4 frame count follows a codec-aligned
     convention (e.g. request `num_frames=8` can produce 9 encoded frames). Keep
     this compatibility behavior to avoid false negatives in online-serving tests.
+    Fixed-rate models can request a stricter ``fps_tolerance`` in frames/second.
     """
     temp_path = None
     cap = None
@@ -408,8 +431,9 @@ def assert_video_valid(
             assert actual_width == width, f"Expected width={width}, got {actual_width}"
         if height is not None:
             assert actual_height == height, f"Expected height={height}, got {actual_height}"
-        if fps is not None and actual_fps:
-            assert abs(actual_fps - float(fps)) < 1.0, f"Expected fps~={fps}, got {actual_fps}"
+        if fps is not None:
+            assert math.isfinite(actual_fps) and actual_fps > 0, f"Invalid video fps: {actual_fps}"
+            assert abs(actual_fps - float(fps)) < fps_tolerance, f"Expected fps~={fps}, got {actual_fps}"
         if num_frames is not None:
             expected_frames = (int(num_frames) // 4) * 4 + 1
             assert actual_frames == expected_frames, f"Expected frames={expected_frames}, got {actual_frames}"
@@ -431,6 +455,33 @@ def assert_video_valid(
                 temp_path.unlink()
             except OSError:
                 pass
+
+
+def assert_video_audio_valid(
+    video: Path | bytes | BytesIO,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    """Assert that an encoded video carries an audio stream with the requested format."""
+    if isinstance(video, Path):
+        source: str | BytesIO = str(video)
+    elif isinstance(video, bytes):
+        source = BytesIO(video)
+    elif isinstance(video, BytesIO):
+        video.seek(0)
+        source = video
+    else:
+        raise TypeError(f"Unsupported video type: {type(video)}")
+
+    with av.open(source) as container:
+        audio_streams = list(container.streams.audio)
+        assert audio_streams, "Video response does not contain an audio stream"
+        audio_stream = audio_streams[0]
+        actual_sample_rate = int(audio_stream.rate or 0)
+        actual_channels = int(audio_stream.channels or 0)
+        assert actual_sample_rate == sample_rate, f"Expected audio sample rate={sample_rate}, got {actual_sample_rate}"
+        assert actual_channels == channels, f"Expected audio channels={channels}, got {actual_channels}"
 
 
 def assert_audio_valid(
@@ -608,7 +659,11 @@ def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RA
     return float(np.mean(hnr_values)) if hnr_values else 0.0
 
 
-def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB) -> None:
+def _assert_pcm_int16_speech_hnr(
+    audio_bytes: bytes,
+    min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB,
+    sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ,
+) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
     min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
@@ -617,12 +672,16 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PC
     intrinsically around -2 dB) can pass a lower per-test threshold via
     request_config["min_hnr_db"] to keep the catastrophic-failure check
     while not gating CI on a model-intrinsic property.
+
+    ``sr`` must be the stream's real sample rate: the autocorrelation lag window
+    is derived from it, so a wrong rate detunes the 80-400 Hz pitch search and
+    understates HNR for models that do not decode at 24 kHz.
     """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
     assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    hnr = _compute_pcm_hnr_db(pcm_samples)
-    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB)")
+    hnr = _compute_pcm_hnr_db(pcm_samples, sr=sr)
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB, sr={sr})")
     assert hnr >= min_hnr_db, (
         f"Audio distortion detected: HNR={hnr:.2f} dB < {min_hnr_db} dB. "
         "Voice clone decoder may be losing ref_code speaker context on later chunks."
@@ -665,7 +724,7 @@ def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run
         return False
     if request_config.get("response_format") == "pcm":
         return False
-    return bool(request_config.get("input"))
+    return bool(request_config.get("transcript_expected_text", request_config.get("input")))
 
 
 def _resolve_audio_transcript(
@@ -873,14 +932,29 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
+    expected_sample_rate = request_config.get("sample_rate")
+    if expected_sample_rate is not None and req_fmt == "wav" and response.audio_bytes:
+        info = sf.info(io.BytesIO(response.audio_bytes))
+        assert info.samplerate == int(expected_sample_rate), (
+            f"Expected sample_rate={expected_sample_rate}, got {info.samplerate}"
+        )
+
     if run_level in {"advanced_model", "full_model"}:
         if req_fmt == "pcm" and response.audio_bytes:
             min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
-            _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
+            # Raw PCM carries no header, so the HNR pitch search has to be told
+            # the rate. Defaulting to 24 kHz for a 44.1 kHz model shifts the
+            # search window to 147-735 Hz and misses the fundamental entirely,
+            # scoring clean speech ~1.9 dB lower than it is.
+            _assert_pcm_int16_speech_hnr(
+                response.audio_bytes,
+                min_hnr_db=min_hnr_db,
+                sr=int(request_config.get("expected_sample_rate") or _PCM_SPEECH_SAMPLE_RATE_HZ),
+            )
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:
-            expected_text = request_config.get("input")
+            expected_text = request_config.get("transcript_expected_text", request_config.get("input"))
             if expected_text:
                 print(f"audio content is: {transcript}")
                 print(f"input text is: {expected_text}")
@@ -1040,5 +1114,6 @@ __all__ = [
     "assert_omni_response",
     "assert_video_diffusion_response",
     "assert_video_valid",
+    "assert_video_audio_valid",
     "assert_audio_valid",
 ]

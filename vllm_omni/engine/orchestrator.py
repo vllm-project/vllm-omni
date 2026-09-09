@@ -21,7 +21,7 @@ import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import janus
 import torch
@@ -38,6 +38,23 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.duplex.contracts import (
+    DuplexControlPlanePort,
+    DuplexOutputContext,
+    DuplexOutputDecision,
+    DuplexRequestIdentity,
+    DuplexRuntimeExtension,
+    DuplexStageRequestContext,
+    DuplexStageSubmission,
+    DuplexStageSubmissionResult,
+)
+from vllm_omni.engine.duplex.control_plane import DuplexControlPlane
+from vllm_omni.engine.duplex.lease import DuplexLeaseConfig
+from vllm_omni.engine.duplex.messages import DuplexFence
+from vllm_omni.engine.duplex.session import (
+    DuplexSessionRuntimeManager,
+    DuplexSessionRuntimeState,
+)
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -58,12 +75,13 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
-from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
+from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 logger = init_logger(__name__)
 
@@ -88,24 +106,6 @@ _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
 def _event_driven_orch_enabled() -> bool:
     return os.environ.get(_EVENT_DRIVEN_ORCH_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-if TYPE_CHECKING:
-    from vllm_omni.experimental.fullduplex.engine.contracts import (
-        DuplexControlPlanePort,
-        DuplexOutputContext,
-        DuplexOutputDecision,
-        DuplexRequestIdentity,
-        DuplexRuntimeExtension,
-        DuplexStageRequestContext,
-        DuplexStageSubmission,
-        DuplexStageSubmissionResult,
-    )
-    from vllm_omni.experimental.fullduplex.engine.duplex_session import (
-        DuplexSessionRuntimeManager,
-        DuplexSessionRuntimeState,
-    )
-    from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 
 def _processed_output_error_text(output: Any) -> str | None:
@@ -257,23 +257,51 @@ class OrchestratorRequestState:
 
 
 @dataclass
-class StreamingInputState:
-    # Flag of streaming input request
-    enabled: bool = False
+class StreamingSegmentState:
+    """Streaming segment-boundary state for one stage of a request.
+
+    Every stage of a multi-stage pipeline reaches its own segment boundaries
+    independently, so this is tracked per stage rather than per request.
+    """
+
     # Flag of segment of streaming input finished
-    segment_finished: bool = False
+    finished: bool = False
     # Tokens from the current raw segment boundary. The vLLM output processor
     # does not guarantee that EngineCoreOutput.new_token_ids survives on the
     # processed RequestOutput used by the routing layer.
-    segment_token_ids: list[int] = field(default_factory=list)
-    segment_output_metadata: dict[str, Any] = field(default_factory=dict)
-    # Streaming update prompt length
+    token_ids: list[int] = field(default_factory=list)
+    output_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StreamingInputState:
+    # Flag of streaming input request
+    enabled: bool = False
+    # Keyed by stage. ``_orchestration_loop`` records a boundary per stage poll
+    # into this one ``req_state``, while every consumer reads it for a specific
+    # ``stage_id``, so a flat slot is only correct as long as each read happens in
+    # the same iteration as its own stage's write. It is not for a stage that
+    # never records one (the ``poll_diffusion_output`` branch reaches
+    # ``_handle_processed_outputs`` without the raw-output loop) or for any
+    # consumer reading outside the writing iteration.
+    segments: dict[int, StreamingSegmentState] = field(default_factory=dict)
+    # Streaming update prompt length. NOT stage-keyed: its only consumer reads it
+    # through the streaming context on the stage-input-bridge path, not by stage
+    # id. Do not assume the rest of this struct is stage-safe.
     new_prompt_len_snapshot: int | None = None
     # Model/bridge-specific runtime states (e.g., thinker->talker)
     bridge_states: dict[str, Any] = field(default_factory=dict)
     # Synchronous stage-transition capability installed by the orchestrator
     # while the downstream input processor consumes upstream token output.
     source_token_decoder: Callable[..., str] | None = None
+
+    def segment(self, stage_id: int | None) -> StreamingSegmentState:
+        """Return ``stage_id``'s segment state, or a fresh empty one if unreported.
+
+        Fresh rather than shared: ``output_metadata`` is handed out by reference.
+        """
+        segment = self.segments.get(stage_id)
+        return segment if segment is not None else StreamingSegmentState()
 
 
 class _OrchestratorDuplexStagePort:
@@ -316,7 +344,15 @@ class _OrchestratorDuplexStagePort:
             duplex_state = {}
             request_state.streaming.bridge_states["duplex"] = duplex_state
         previous_epoch = duplex_state.get("epoch")
-        if not isinstance(duplex_state.get("model_turn_id"), int) or previous_epoch != context.fence.epoch:
+        current_model_turn_id = duplex_state.get("model_turn_id")
+        if (
+            not isinstance(current_model_turn_id, int)
+            or previous_epoch != context.fence.epoch
+            or current_model_turn_id < context.fence.turn_id
+        ):
+            # A serving-side safety boundary can close a Realtime response
+            # before the model emits its normal turn_eos. Catch up the
+            # engine-owned identity when the next fenced append starts.
             duplex_state["model_turn_id"] = context.fence.turn_id
         duplex_state.update(
             {
@@ -332,8 +368,6 @@ class _OrchestratorDuplexStagePort:
         )
 
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
-        from vllm_omni.experimental.fullduplex.engine.contracts import DuplexRequestIdentity
-
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
             request_state = OrchestratorRequestState(
@@ -355,8 +389,6 @@ class _OrchestratorDuplexStagePort:
         self._sync_bridge_state(request_state, context)
 
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
-        from vllm_omni.experimental.fullduplex.engine.contracts import DuplexStageSubmissionResult
-
         context = submission.context
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
@@ -481,9 +513,6 @@ class Orchestrator:
         self.duplex_control_plane: DuplexControlPlanePort | None = None
         self._duplex_reaper_interval_s = 1.0
         if enable_duplex_control:
-            from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
-            from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseConfig
-
             runtime_session_config = duplex_session_config or DuplexSessionRuntimeConfig()
             self._duplex_reaper_interval_s = runtime_session_config.reaper_interval_s
 
@@ -1119,15 +1148,12 @@ class Orchestrator:
             req_state = self.request_states.get(getattr(eco, "request_id", None))
             if req_state is None or not req_state.streaming.enabled:
                 continue
-            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            req_state.streaming.segment_token_ids = (
-                self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                if req_state.streaming.segment_finished
-                else []
-            )
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
             raw_mm = self._completion_multimodal_output(eco, None)
-            req_state.streaming.segment_output_metadata = (
-                dict(raw_mm) if req_state.streaming.segment_finished and isinstance(raw_mm, dict) else {}
+            req_state.streaming.segments[stage_id] = StreamingSegmentState(
+                finished=segment_finished,
+                token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
+                output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
             )
             req_state.streaming.new_prompt_len_snapshot = getattr(
                 eco,
@@ -1509,7 +1535,7 @@ class Orchestrator:
                 continue
 
             stage_metrics = None
-            segment_finished = req_state.streaming.enabled and req_state.streaming.segment_finished
+            segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
@@ -1651,9 +1677,11 @@ class Orchestrator:
         stage_id: int,
         error: str,
         *,
+        status_code: int = HTTPStatus.BAD_REQUEST.value,
+        error_type: str = DEFAULT_CLIENT_ERROR_TYPE,
         close_duplex_sessions: bool = False,
     ) -> None:
-        """Fail one request with a non-fatal 400 (bad input, engine survives).
+        """Fail one request with a non-fatal client error (400 by default).
 
         The non-fatal counterpart of `_fail_request_dead_stage`: emits a
         client-error ErrorMessage (default `fatal=False`) so the engine keeps
@@ -1662,8 +1690,8 @@ class Orchestrator:
         await self.output_async_queue.put(
             ErrorMessage(
                 error=error,
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                error_type=DEFAULT_CLIENT_ERROR_TYPE,
+                status_code=status_code,
+                error_type=error_type,
                 request_id=req_id,
                 stage_id=stage_id,
             )
@@ -1976,6 +2004,7 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
+        segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -1985,11 +2014,7 @@ class Orchestrator:
             return
 
         request_finished = False
-        if (
-            finished
-            and self.stage_pools[stage_id].final_output
-            and not (req_state.streaming.enabled and req_state.streaming.segment_finished)
-        ):
+        if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
@@ -2001,7 +2026,7 @@ class Orchestrator:
         # filter out again (the official implementation returns exactly one
         # result per audio chunk).
         is_duplex_stage0_segment = (
-            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
+            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment(0).finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
             await self.output_async_queue.put(
@@ -2013,7 +2038,10 @@ class Orchestrator:
                     metrics=stage_metrics,
                     finished=(
                         request_finished
-                        or (self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished)
+                        or (
+                            self._is_duplex_session_request(req_state)
+                            and req_state.streaming.segment(stage_id).finished
+                        )
                     ),
                     stage_submit_ts=submit_ts,
                 )
@@ -2048,7 +2076,7 @@ class Orchestrator:
             return
 
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
+            (finished or segment_finished)
             and stage_id < req_state.final_stage_id
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
@@ -2077,6 +2105,8 @@ class Orchestrator:
                 )
                 if (
                     req_state.streaming.enabled
+                    # A failed forward may already have cleaned up this request.
+                    and self.request_states.get(req_id) is req_state
                     and finished
                     and not final_only_finished
                     and not self._is_duplex_session_request(req_state)
@@ -2187,26 +2217,24 @@ class Orchestrator:
     def _duplex_output_context(
         req_state: OrchestratorRequestState,
         *,
-        stage_id: int | None = None,
+        # Required: segment state is stage-keyed, so a caller that omitted this
+        # would silently read "no boundary" rather than the intended stage's.
+        stage_id: int | None,
     ) -> DuplexOutputContext | None:
         identity = req_state.duplex_identity
         if identity is None:
             return None
-        from vllm_omni.experimental.fullduplex.engine.contracts import (
-            DuplexOutputContext,
-            DuplexRequestIdentity,
-        )
-
         fence = req_state.duplex_stage_fences.get(stage_id, identity.fence) if stage_id is not None else identity.fence
+        segment = req_state.streaming.segment(stage_id)
         return DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=identity.session_id,
                 fence=fence,
             ),
             final_stage_id=req_state.final_stage_id,
-            segment_finished=req_state.streaming.enabled and req_state.streaming.segment_finished,
-            segment_token_ids=tuple(req_state.streaming.segment_token_ids),
-            segment_output_metadata=req_state.streaming.segment_output_metadata,
+            segment_finished=req_state.streaming.enabled and segment.finished,
+            segment_token_ids=tuple(segment.token_ids),
+            segment_output_metadata=segment.output_metadata,
         )
 
     @staticmethod
@@ -2250,8 +2278,6 @@ class Orchestrator:
         action = getattr(decision.action, "value", decision.action)
         if action != "direct_response":
             raise ValueError(f"Unsupported duplex output action: {action}")
-        from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
-
         engine_output = attach_duplex_output_decision(
             OmniRequestOutput.from_stage_output(
                 output,
@@ -2742,6 +2768,16 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
+        except OmniClientError as exc:
+            await self._fail_request_client_error(
+                req_id,
+                next_logical,
+                str(exc),
+                status_code=exc.status_code,
+                error_type=exc.error_type,
+                close_duplex_sessions=self._is_duplex_session_request(req_state),
+            )
+            return
         except Exception as exc:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
@@ -2930,6 +2966,19 @@ class Orchestrator:
                     next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
                 except Exception:
                     next_prompt_len = max(1, len(prompt_token_ids))
+                # A stage may size its own prewarmed placeholder prompt via
+                # hf_overrides.async_chunk_prewarm_prompt_len (e.g. a talker
+                # whose engine positions must cover a speaker-prompt prefill;
+                # the model validates the value and reports the right one on
+                # mismatch).
+                prewarm_len = getattr(
+                    getattr(next_pool.stage_vllm_config, "model_config", None),
+                    "hf_config",
+                    None,
+                )
+                prewarm_len = getattr(prewarm_len, "async_chunk_prewarm_prompt_len", None)
+                if prewarm_len is not None and int(prewarm_len) > 1:
+                    next_prompt_len = int(prewarm_len)
 
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):

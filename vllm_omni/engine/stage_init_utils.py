@@ -14,19 +14,24 @@ from __future__ import annotations
 import copy
 import fcntl
 import importlib
+import json
 import multiprocessing as mp
 import os
+import tempfile
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
+from pathlib import Path
 from typing import Any, Literal, cast
 
+import regex as re
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
@@ -47,12 +52,13 @@ from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -82,22 +88,144 @@ class LogicalStageInitPlan:
     replicas: list[ReplicaInitPlan]
 
 
-def _resolve_model_to_local_path(model: str) -> str:
-    """Resolve an HF Hub model ID to a local cache path."""
+def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
+    """Return the entries of ``subdirs`` that are not directories under ``base``."""
+    return [subdir for subdir in subdirs if not os.path.isdir(os.path.join(base, subdir))]
+
+
+# Artifacts that make a snapshot subfolder trustworthy. A directory that
+# exists but holds none of these is an interrupted download, not a snapshot;
+# treating it as complete strips the Hub fallback vLLM would need later.
+_WEIGHT_ARTIFACT_PATTERNS = ("*.safetensors", "*.bin", "*.pt", "*.gguf")
+# Vocabulary-bearing files. Configs and chat templates are small and download
+# first, so their presence alone cannot distinguish a tokenizer folder from an
+# interrupted download.
+_TOKENIZER_ARTIFACT_NAMES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "vocab.json",
+    "vocab.txt",
+)
+# HF sharded checkpoints name their pieces `<stem>-NNNNN-of-NNNNN.<ext>` and
+# always ship an index; a shard-named file without one is a partial download.
+_SHARD_NAME_RE = re.compile(r"-\d+-of-\d+\.(safetensors|bin)$")
+
+
+def _indexed_shards_complete(folder: Path) -> bool | None:
+    """Check sharded weights against their index; ``None`` when no index exists."""
+    indexes = list(folder.rglob("*.index.json"))
+    if not indexes:
+        return None
+    for index in indexes:
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map") or {}
+        except (OSError, ValueError):
+            return False
+        shards = set(weight_map.values())
+        if not shards or any(not (index.parent / shard).is_file() for shard in shards):
+            return False
+    return True
+
+
+def _subdir_is_populated(base: str, subdir: str, needs_weights: bool) -> bool:
+    folder = Path(base) / subdir
+    if not folder.is_dir():
+        return False
+    if needs_weights:
+        indexed = _indexed_shards_complete(folder)
+        if indexed is not None:
+            return indexed
+        weights = [path for pattern in _WEIGHT_ARTIFACT_PATTERNS for path in folder.rglob(pattern)]
+        if not weights:
+            return False
+        return not any(_SHARD_NAME_RE.search(path.name) for path in weights)
+    return any((folder / name).is_file() for name in _TOKENIZER_ARTIFACT_NAMES)
+
+
+def _incomplete_stage_subdirs(
+    base: str,
+    subdirs: Sequence[str],
+    weight_subdirs: Collection[str] = (),
+) -> list[str]:
+    """Return the entries of ``subdirs`` without a POPULATED directory under ``base``.
+
+    Hub-snapshot paths use this stricter check: ``os.path.isdir`` alone accepts
+    a subfolder holding only config.json from an interrupted download, and the
+    warm-cache early return would then convert the Hub ID into a local path
+    vLLM cannot fetch missing weights for. ``weight_subdirs`` names the entries
+    that must contain a weight artifact, not merely any file.
+    """
+    return [
+        subdir for subdir in subdirs if not _subdir_is_populated(base, subdir, needs_weights=subdir in weight_subdirs)
+    ]
+
+
+def _resolve_model_to_local_path(
+    model: str,
+    required_subdirs: Sequence[str] = (),
+    weight_subdirs: Collection[str] = (),
+    *,
+    revision: str | None = None,
+    download_dir: str | None = None,
+) -> str:
+    """Resolve an HF Hub model ID to a local path that holds ``required_subdirs``.
+
+    ``snapshot_download(local_files_only=True)`` returns the snapshot root as
+    soon as *any* file of the repo is cached, even when the subfolders this
+    stage needs were never materialized. Joining a stage subdir onto such a
+    root produces a path that exists nowhere, and upstream ``EngineArgs``
+    forwards a non-directory ``model`` to HuggingFace as a repo id, which fails
+    with an ``HFValidationError`` about the cache path. Verify the subfolders
+    here and pull just the missing ones, so the join always lands on a real
+    directory or raises an error that names what is missing.
+
+    ``revision`` and ``download_dir`` mirror the engine args of the same name:
+    once the repo ID is replaced by a local path, downstream ModelConfig can no
+    longer correct either, so they must shape the snapshot selection here.
+    """
     if os.path.isdir(model):
         return model
 
+    # Keep the warm-cache path offline-friendly: no Hub round trip when the
+    # stage's subfolders are already there.
     try:
-        from huggingface_hub import snapshot_download
-
-        # Keep init path resolution offline-friendly.
-        return snapshot_download(model, local_files_only=True)
-    except Exception:
-        logger.warning(
-            "[stage_init] Could not resolve %s to local snapshot; using as-is",
-            model,
+        cached_root: str | None = hf_api().snapshot_download(
+            model, local_files_only=True, revision=revision, cache_dir=download_dir
         )
-        return model
+    except Exception:
+        cached_root = None
+    if cached_root is not None and not _incomplete_stage_subdirs(cached_root, required_subdirs, weight_subdirs):
+        return cached_root
+
+    # Cold cache, or a snapshot root whose stage subfolders were never (or
+    # only partially) downloaded: pull exactly the subfolders this stage asked
+    # for. snapshot_download resumes a partial subfolder for free.
+    allow_patterns = [f"{subdir.strip('/')}/*" for subdir in required_subdirs] or None
+    try:
+        resolved = hf_api().snapshot_download(
+            model, allow_patterns=allow_patterns, revision=revision, cache_dir=download_dir
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"[stage_init] Could not resolve {model!r} to a local snapshot containing "
+            f"{sorted(required_subdirs)}: the download failed and "
+            + (
+                f"the cached snapshot {cached_root!r} is missing or incomplete for "
+                f"{sorted(_incomplete_stage_subdirs(cached_root, required_subdirs, weight_subdirs))}."
+                if cached_root is not None
+                else "nothing is cached locally."
+            )
+        ) from exc
+
+    missing = _incomplete_stage_subdirs(resolved, required_subdirs, weight_subdirs)
+    if missing:
+        raise RuntimeError(
+            f"[stage_init] Snapshot {resolved!r} for {model!r} has no populated {sorted(missing)} "
+            "subfolder; the stage cannot be initialized from it."
+        )
+    return resolved
 
 
 def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> str:
@@ -107,14 +235,66 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     if model_subdir is None and tokenizer_subdir is None:
         return model
 
-    resolved_base = _resolve_model_to_local_path(model)
+    revision = engine_args.get("revision")
+    tokenizer_revision = engine_args.get("tokenizer_revision")
+    download_dir = engine_args.get("download_dir")
+    # A tokenizer pinned to a different revision cannot come from the model's
+    # snapshot; resolve it against its own. An empty subdir means the snapshot
+    # root and still needs its own revision.
+    split_tokenizer = tokenizer_subdir is not None and tokenizer_revision is not None and tokenizer_revision != revision
+
+    required_subdirs = [subdir for subdir in (model_subdir, tokenizer_subdir) if subdir]
+    model_required = [subdir for subdir in (model_subdir,) if subdir] if split_tokenizer else required_subdirs
+    weight_subdirs = frozenset(subdir for subdir in (model_subdir,) if subdir)
+    if is_runai_obj_uri(model):
+        # Object-storage URIs stay opaque until each stage builds its own
+        # ModelConfig, so the joins below are resolved by vLLM's streamer
+        # rather than by the local filesystem.
+        resolved_base = model
+        tokenizer_base = model
+    else:
+        resolved_base = _resolve_model_to_local_path(
+            model, model_required, weight_subdirs, revision=revision, download_dir=download_dir
+        )
+        # Reachable for a local model directory; the Hub branch above has
+        # already failed closed on a missing subfolder.
+        missing = _missing_stage_subdirs(resolved_base, model_required)
+        if missing:
+            raise RuntimeError(
+                f"[stage_init] Model directory {resolved_base!r} has no {sorted(missing)} "
+                "subfolder; the stage cannot be initialized from it."
+            )
+        if split_tokenizer:
+            # An empty subdir targets the snapshot root, which cannot be
+            # subset by allow_patterns; resolve the whole revision.
+            tokenizer_required = [tokenizer_subdir] if tokenizer_subdir else []
+            tokenizer_base = _resolve_model_to_local_path(
+                model, tokenizer_required, revision=tokenizer_revision, download_dir=download_dir
+            )
+            missing = _missing_stage_subdirs(tokenizer_base, tokenizer_required)
+            if missing:
+                raise RuntimeError(
+                    f"[stage_init] Tokenizer directory {tokenizer_base!r} has no {sorted(missing)} "
+                    "subfolder; the stage cannot be initialized from it."
+                )
+            if not tokenizer_required and not _subdir_is_populated(tokenizer_base, "", False):
+                # An empty subdir means the tokenizer lives at the snapshot
+                # root, so there is no subfolder for the check above to look
+                # at and any resolved root would otherwise pass. Require the
+                # vocabulary artifacts themselves.
+                raise RuntimeError(
+                    f"[stage_init] Tokenizer directory {tokenizer_base!r} holds none of "
+                    f"{list(_TOKENIZER_ARTIFACT_NAMES)}; the stage cannot be initialized from it."
+                )
+        else:
+            tokenizer_base = resolved_base
 
     if model_subdir:
         model = os.path.join(resolved_base, model_subdir)
         logger.info("[stage_init] Using model subdirectory: %s", model)
 
     if tokenizer_subdir is not None:
-        tokenizer_path = os.path.join(resolved_base, tokenizer_subdir) if tokenizer_subdir else resolved_base
+        tokenizer_path = os.path.join(tokenizer_base, tokenizer_subdir) if tokenizer_subdir else tokenizer_base
         engine_args["tokenizer"] = tokenizer_path
         logger.info("[stage_init] Using tokenizer from: %s", tokenizer_path)
     elif model_subdir and "tokenizer" not in engine_args:
@@ -584,13 +764,14 @@ def prepare_engine_environment() -> None:
         pass
 
 
-def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
+def _maybe_set_qwen3_omni_moe_backend(engine_args_dict: dict[str, Any]) -> None:
+    """Choose the stable MoE backend when Qwen3-Omni has no explicit choice."""
     if (
         engine_args_dict.get("model_arch") == "Qwen3OmniMoeForConditionalGeneration"
-        and "VLLM_USE_FLASHINFER_MOE_FP16" not in os.environ
+        and engine_args_dict.get("moe_backend", "auto") == "auto"
     ):
-        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
-        logger.info("[stage_init] Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni stage")
+        engine_args_dict["moe_backend"] = "triton"
+        logger.info("[stage_init] Set moe_backend=triton for Qwen3-Omni stage")
 
 
 def split_devices_for_replicas(
@@ -906,7 +1087,8 @@ def _project_omni_stage_engine_args(
         ),
         (
             stage_config.runtime_config,
-            frozenset({"devices", "num_replicas", "env", "num_gpus"}),
+            frozenset({"devices", "num_replicas", "env", "num_gpus"})
+            | (frozenset({"additional_config"}) if is_diffusion else frozenset()),
         ),
     ):
         engine_args.update(
@@ -1075,9 +1257,19 @@ def _finalize_engine_args_dict(
     if is_diffusion:
         from vllm_omni.diffusion.data import parse_attention_config
 
-        if engine_args_dict.get("diffusion_attention_config") is not None:
+        # Fold the attention shorthand into the structured config so only one
+        # representation reaches OmniDiffusionConfig.from_kwargs.
+        attention_backend = engine_args_dict.pop("diffusion_attention_backend", None)
+        fastvideo_vsa_topk = engine_args_dict.pop("fastvideo_vsa_topk", None)
+        if (
+            engine_args_dict.get("diffusion_attention_config") is not None
+            or attention_backend is not None
+            or fastvideo_vsa_topk is not None
+        ):
             engine_args_dict["diffusion_attention_config"] = parse_attention_config(
-                engine_args_dict["diffusion_attention_config"],
+                engine_args_dict.get("diffusion_attention_config"),
+                attention_backend=attention_backend,
+                fastvideo_vsa_topk=fastvideo_vsa_topk,
             )
     else:
         resolve_worker_cls(engine_args_dict)
@@ -1092,9 +1284,8 @@ def _finalize_engine_args_dict(
     engine_args_dict["has_sampling_extra_args"] = has_sampling_extra_args
     engine_args_dict["sampling_extra_args_keys"] = sampling_extra_args_keys
 
-    # TODO: Remove this after the performance regression is fixed
-    # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
-    _maybe_set_qwen3_omni_moe_env(engine_args_dict)
+    # Select the typed backend option during stage argument finalization.
+    _maybe_set_qwen3_omni_moe_backend(engine_args_dict)
     return engine_args_dict
 
 
@@ -1105,7 +1296,7 @@ def build_legacy_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Implement engine-argument building for the legacy stage representation."""
-    engine_args_dict = _to_dict(stage_config.engine_args)
+    engine_args_dict = copy.deepcopy(_to_dict(stage_config.engine_args))
     # Legacy configs can materialize an omitted optional TP size as None.
     # Remove it from the detached adapter dict so the backend default applies
     # without mutating stage_config.engine_args.
@@ -1374,43 +1565,108 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     return input_processor
 
 
-def _cleanup_stale_lock_if_dead(lock_file: str) -> bool:
-    """If *lock_file* exists and its recorded PID is dead, unlink the file.
+def device_init_lock_path(device_id: int, lock_dir: str = "/tmp") -> str:
+    """Return the per-physical-device initialization lock file path.
 
-    Returns ``True`` if the stale lock was cleaned up (caller should retry),
-    ``False`` otherwise (lock holder appears alive, or file could not be read).
+    Shared by the orchestrator-side ``acquire_device_locks`` (legacy full-init
+    ``LOCK_EX``) and the engine-core-side ``DevicePhaseLock`` (parallel-stage-init
+    SH/EX phase locks) so both coordinate on the *same* file per device.
+
+    That coordination only holds while the **inode** is stable, so nothing may
+    unlink this path: two holders of the same pathname on different inodes do not
+    conflict. The PID written into the file is diagnostic only.
+    """
+    return os.path.join(lock_dir, f"vllm_omni_device_{device_id}_init.lock")
+
+
+def _open_existing_lock_file(lock_file: str) -> tuple[int, bool] | None:
+    """Open an already-existing lock file; ``None`` if it does not exist yet.
+
+    Prefers ``O_RDWR`` so the holder can stamp its PID, but falls back to
+    ``O_RDONLY``: ``flock`` locks attach to the open file description and, unlike
+    POSIX ``fcntl`` record locks, require no write access, so a read-only
+    descriptor still provides full mutual exclusion.
     """
     try:
-        with open(lock_file) as fh:
-            content = fh.read().strip()
-        if not content:
-            return False
-        pid = int(content)
-    except (OSError, ValueError):
-        return False
-
-    # Check whether the PID is still alive.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        # PID does not exist — stale lock.
-        logger.info(
-            "Removing stale device lock %s (PID %s is dead)",
-            lock_file,
-            pid,
-        )
-        try:
-            os.unlink(lock_file)
-            return True
-        except OSError:
-            logger.debug("Failed to unlink stale lock %s", lock_file)
-            return False
+        return os.open(lock_file, os.O_RDWR), True
+    except FileNotFoundError:
+        return None
     except PermissionError:
-        # PID exists but we cannot signal it (different user) — treat as alive.
-        return False
+        # Created by another user on this shared machine; read-only still locks.
+        pass
+    try:
+        return os.open(lock_file, os.O_RDONLY), False
+    except FileNotFoundError:
+        return None
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Device init lock {lock_file} exists but is not readable by this user "
+            f"({exc}). It coordinates GPU initialization across users, so it must stay "
+            "readable by all of them; have its owner remove it or chmod it to 0644."
+        ) from exc
 
-    # PID is alive — legitimate lock holder.
-    return False
+
+def open_device_lock_file(lock_file: str) -> tuple[int, bool]:
+    """Open a per-device lock file, tolerating one created by another user.
+
+    Returns ``(fd, writable)``.
+
+    These lock files coordinate *across* users -- two people running on the same
+    physical GPU must contend on the same file -- so every user has to be able to
+    open whichever one exists. Two things make that awkward:
+
+    * whoever creates it owns it, so later users may only get read access, which
+      ``flock`` is perfectly happy with; and
+    * the mode passed to ``os.open`` is filtered by the creator's ``umask``, so
+      under 0027 or 0077 the file would land 0640 or 0600 and lock everyone else
+      out entirely.
+
+    Creating it therefore stages a temporary file, widens it with ``fchmod``, and
+    publishes it with an atomic ``os.link``. Creating in place with ``O_EXCL`` and
+    widening afterwards would briefly expose the file at the umask-filtered mode,
+    and a concurrent user opening it in that window would be locked out -- the
+    very failure this avoids. ``link`` also fails cleanly if another process wins
+    the race, which keeps the "first creator wins" inode stable.
+    """
+    existing = _open_existing_lock_file(lock_file)
+    if existing is not None:
+        return existing
+
+    lock_dir = os.path.dirname(lock_file) or "."
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=lock_dir, prefix=".vllm_omni_device_lock_")
+    published = False
+    try:
+        os.fchmod(tmp_fd, 0o644)
+        try:
+            os.link(tmp_path, lock_file)
+        except FileExistsError:
+            pass  # another process published first; fall through and open theirs
+        else:
+            published = True
+            return tmp_fd, True
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            logger.debug("Could not remove staged device lock %s", tmp_path)
+        if not published:
+            os.close(tmp_fd)
+
+    existing = _open_existing_lock_file(lock_file)
+    if existing is not None:
+        return existing
+    raise PermissionError(f"Device init lock {lock_file} could not be created or opened")
+
+
+def record_lock_holder_pid(fd: int, writable: bool) -> None:
+    """Stamp the holder's PID into an open lock file (diagnostic only)."""
+    if not writable:
+        return
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
 
 
 def acquire_device_locks(
@@ -1489,28 +1745,31 @@ def acquire_device_locks(
         # Acquire locks
         wait_start = time.time()
         for device_id in devices_to_lock:
-            lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+            lock_file = device_init_lock_path(device_id)
             lock_acquired = False
-            already_cleaned_stale = False  # only try stale cleanup once per device
 
             while not lock_acquired:
                 try:
-                    lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
+                    lock_fd, lock_writable = open_device_lock_file(lock_file)
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        os.ftruncate(lock_fd, 0)
-                        os.write(lock_fd, f"{os.getpid()}\n".encode())
-                        os.fsync(lock_fd)
+                        record_lock_holder_pid(lock_fd, lock_writable)
                         lock_acquired = True
                         lock_fds.append(lock_fd)
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
-                        # Detect and clean stale locks from dead processes.
-                        if not already_cleaned_stale:
-                            already_cleaned_stale = True
-                            if _cleanup_stale_lock_if_dead(lock_file):
-                                continue  # retry flock immediately
+                        # NOTE: no stale-lock cleanup here. ``flock`` is released
+                        # by the kernel when the holder exits (SIGKILL included),
+                        # so a dead holder never keeps this lock. Unlinking the
+                        # path on a dead *recorded* PID was actively unsafe: the
+                        # PID is written by every holder, and under the
+                        # parallel-stage-init SH/EX protocol several LOCK_SH
+                        # holders overwrite it. Unlinking while one still held the
+                        # old inode let a contender create a fresh file with the
+                        # same name and take LOCK_EX on it, which then conflicted
+                        # with nobody -- breaking the interoperability between the
+                        # legacy full-init lock and the phase locks.
                         if time.time() - wait_start > stage_init_timeout:
                             logger.warning(
                                 "Timeout waiting for device %s initialization lock, proceeding anyway",
@@ -1519,8 +1778,10 @@ def acquire_device_locks(
                             break
                         time.sleep(0.01)
                 except OSError as e:
-                    logger.debug(
-                        "Failed to acquire lock for device %s: %s, continuing anyway",
+                    logger.warning(
+                        "Failed to acquire lock for device %s: %s. Continuing WITHOUT "
+                        "device-init serialization; concurrent initialization on this "
+                        "device may incorrectly measure available memory.",
                         device_id,
                         e,
                     )
@@ -1552,7 +1813,7 @@ def release_device_locks(lock_fds: list[int]) -> None:
 
 
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
-    """Load omni transfer config from an explicit path or resolved model config.
+    """Load omni transfer config from the resolver-selected deploy config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
     that connectors defined in the base config are visible to the transfer
@@ -1561,12 +1822,11 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
-        resolved_config_path = config_path or resolve_model_config_path(model)
-        if resolved_config_path is None:
+        if config_path is None:
             return None
         from vllm_omni.config.stage_config import resolve_deploy_yaml
 
-        resolved_dict = resolve_deploy_yaml(resolved_config_path)
+        resolved_dict = resolve_deploy_yaml(config_path)
         return load_omni_transfer_config(config_dict=resolved_dict)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
@@ -1635,7 +1895,6 @@ def initialize_diffusion_stage(
     stage_cfg: Any,
     metadata: StageMetadata,
     stage_init_timeout: int,
-    batch_size: int = 1,
     use_inline: bool = False,
 ) -> Any:
     """Build a diffusion stage client.
@@ -1645,15 +1904,12 @@ def initialize_diffusion_stage(
         stage_cfg: Stage configuration.
         metadata: Extracted stage metadata.
         stage_init_timeout: Timeout in seconds for stage initialization handshake
-        batch_size: Client-side request batch width. Does not set scheduler
-            ``max_num_seqs``; pass ``--max-num-seqs`` or stage YAML for that.
-            Forwarded to ``StageDiffusionClient``.
         use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 
 def _stage_declares_cfg_pairs(model_config: Any) -> bool:

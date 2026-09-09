@@ -633,6 +633,15 @@ class StagePool:
             if callable(pop_native_text_metrics):
                 native_text_metrics = pop_native_text_metrics(request_id)
         native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        finish_reason = next(
+            (
+                str(reason)
+                for request_output in reversed(request_outputs)
+                for completion in reversed(getattr(request_output, "outputs", []) or [])
+                if (reason := getattr(completion, "finish_reason", None)) is not None
+            ),
+            None,
+        )
         num_tokens_out = (
             max(int(native_generation_tokens), 0)
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
@@ -701,6 +710,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
+            finish_reason=finish_reason,
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
@@ -729,10 +739,16 @@ class StagePool:
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
         final_output_type = getattr(self.stage_client, "final_output_type", None)
 
-        if self._has_image_output(request_outputs) or final_output_type in {"image", "images"}:
-            return "image"
-        if self._has_video_output(request_outputs) or final_output_type in {"video", "videos"}:
+        # Prefer declared modality over payload heuristics: video diffusion often
+        # stores frames in ``images`` (see serving_video / output_formatter).
+        if final_output_type in {"video", "videos"}:
             return "video"
+        if final_output_type in {"image", "images"}:
+            return "image"
+        if self._has_video_output(request_outputs):
+            return "video"
+        if self._has_image_output(request_outputs):
+            return "image"
         if self._has_audio_output(request_outputs) or final_output_type == "audio":
             return "audio"
         if self._has_trajectory_latent_output(request_outputs) or self._has_latent_output(request_outputs):
@@ -768,6 +784,10 @@ class StagePool:
             total_videos = sum(self._count_videos(ro) for ro in request_outputs)
             if total_videos > 0:
                 return total_videos
+            # Video payloads are commonly carried on ``images`` for diffusion.
+            total_images = sum(self._count_images(ro) for ro in request_outputs)
+            if total_images > 0:
+                return total_images
         if unit_type == "latent":
             total_latents = sum(
                 self._count_value_units(getattr(ro, "trajectory_latents", None))
