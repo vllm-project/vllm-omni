@@ -3184,6 +3184,29 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         num_frames = max_tokens // num_frame_tokens
         return num_frames
 
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        """Return closed-form per-item token budgets.
+
+        The default ``None`` path builds dummy 448x4032 images plus up to 64
+        video frames and runs them through MiniCPMOProcessor. That sits on the
+        Stage-0 runner ``__init__`` path after the HF processor is created; a
+        native abort there kills the engine core with no Python traceback
+        (``Failed core proc(s): {}``).
+        """
+        mm_counts = mm_counts or {}
+        tokens: dict[str, int] = {}
+        if mm_counts.get("image", 0) > 0:
+            tokens["image"] = self.get_max_image_tokens()
+        if mm_counts.get("audio", 0) > 0:
+            tokens["audio"] = self.get_max_audio_tokens()
+        if mm_counts.get("video", 0) > 0:
+            tokens["video"] = self.get_max_video_tokens(seq_len, mm_counts)
+        return tokens
+
 
 class MiniCPMO45OmniLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiniCPMO45OmniLLMProcessingInfo]):
     """Builder for dummy inputs for MiniCPM-o thinker."""

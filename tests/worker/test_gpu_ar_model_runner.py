@@ -23,6 +23,7 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import sparse_audio
+from vllm_omni.worker.async_omni_output import _accel_module, _resolve_accel_module
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
@@ -44,8 +45,8 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     return runner
 
 
-def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, object]]:
-    received: dict[str, object] = {}
+def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, Any]]:
+    received: dict[str, Any] = {}
 
     def post_sample_talker_mtp(*, input_ids, hidden_states, req_ids, req_infos):
         received.update(
@@ -263,12 +264,17 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     input_batch.sampling_metadata = input_batch._make_sampling_metadata()
 
     received = []
+
+    def _sample(logits, metadata):
+        received.append(metadata)
+        return "model-sampler"
+
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = input_batch
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
-        sample=lambda logits, metadata: received.append(metadata) or "model-sampler",
+        sample=_sample,
     )
     runner.sampler = SimpleNamespace()
     logits = torch.zeros((1, 4))
@@ -308,6 +314,60 @@ def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests(
 
     assert engine_output_type == "latent"
     assert payload_req_ids == ["r2"]
+
+
+def test_resolve_pooler_payload_req_ids_client_keys_keep_terminal_text():
+    runner = _make_runner(engine_output_type="text", downstream_req_ids=set())
+    runner.model = SimpleNamespace(omni_client_multimodal_output_keys=("nvc_function_token",))
+
+    engine_output_type, payload_req_ids = GPUARModelRunner._resolve_pooler_payload_req_ids(runner, ["r1", "r2"])
+
+    assert engine_output_type == "text"
+    assert payload_req_ids == ["r1", "r2"]
+
+
+def test_build_omni_output_filters_client_multimodal_keys(monkeypatch):
+    runner = _make_async_output_runner(engine_output_type="text")
+    runner.model = SimpleNamespace(
+        has_postprocess=False,
+        omni_client_multimodal_output_keys=("nvc_function_token",),
+    )
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("text", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"r1": 1},
+        ),
+        hidden_states=torch.tensor([[1.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"nvc_function_token": torch.tensor([7.0]), "hidden": torch.tensor([1.0])},
+        req_ids_output_copy=["r1"],
+        req_id_to_index_output_copy={"r1": 0},
+        valid_sampled_token_ids=[[11]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
+    )
+
+    assert output.multimodal_outputs is not None
+    assert set(output.multimodal_outputs[0]) == {"nvc_function_token"}
+    assert output.inter_stage_outputs is not None
+    assert "hidden" in output.inter_stage_outputs[0]
 
 
 def test_sparse_mm_req_ids_requires_sparse_audio_marker():
@@ -434,6 +494,7 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
     async_output._logprobs_tensors_cpu = None
     async_output._routed_experts = None
     async_output._routed_experts_cpu = None
+    async_output._has_fault = None
     async_output.vocab_size = 10
 
     output = async_output.get_output()
@@ -501,10 +562,15 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
         "accumulate_full_payload_output",
         lambda self, rid, payload, request: events.append(f"accumulate:{rid}"),
     )
+
+    def _get_omni_connector_output(self):
+        events.append("connector")
+        return "connector-output"
+
     monkeypatch.setattr(
         GPUARModelRunner,
         "get_omni_connector_output",
-        lambda self: events.append("connector") or "connector-output",
+        _get_omni_connector_output,
     )
 
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
@@ -631,6 +697,82 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
     assert len(seen) == 2
     assert torch.equal(seen[0], torch.tensor([[1.0]]))
     assert torch.equal(seen[1], torch.tensor([[2.0], [3.0]]))
+
+
+def test_accel_module_rejects_npu_without_torch_npu(monkeypatch):
+    monkeypatch.setattr(torch, "npu", None, raising=False)
+    with pytest.raises(RuntimeError, match="torch.npu is not available"):
+        _accel_module("npu")
+
+
+def test_resolve_accel_module_prefers_runner_device():
+    class _Stream:
+        pass
+
+    accel = _resolve_accel_module(
+        device=torch.device("cuda"),
+        copy_stream=_Stream(),
+        sampled_token_ids=torch.tensor([1]),
+    )
+    assert accel is torch.cuda
+
+
+def test_resolve_accel_module_requires_an_explicit_device():
+    class _Stream:
+        pass
+
+    with pytest.raises(RuntimeError, match="could not resolve the accelerator"):
+        _resolve_accel_module(
+            device=None,
+            copy_stream=_Stream(),
+            sampled_token_ids=torch.tensor([1]),
+        )
+
+
+def test_build_omni_output_uses_predrained_connector_without_recalling(monkeypatch):
+    runner = _make_async_output_runner()
+    events = []
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("audio", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+
+    def _get_omni_connector_output(self):
+        events.append("connector")
+        return "should-not-run"
+
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", _get_omni_connector_output)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            num_scheduled_tokens={"r1": 2},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"foo": torch.tensor([10.0, 20.0])},
+        req_ids_output_copy=["r1"],
+        req_id_to_index_output_copy={"r1": 0},
+        valid_sampled_token_ids=[[101]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([2], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
+        omni_connector_output="predrained",
+        skip_accumulate_full_payload=True,
+    )
+
+    assert output.omni_connector_output == "predrained"
+    assert events == []
 
 
 def test_async_omni_output_guard_requires_safe_conditions():
@@ -804,7 +946,7 @@ def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
 def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
     class QueryStartLoc:
         def __init__(self):
-            self.np = np.full(5, -1, dtype=np.int32)
+            self.np: Any = np.full(5, -1, dtype=np.int32)
             self.copied = False
 
         def copy_to_gpu(self):
@@ -1635,8 +1777,8 @@ class TestMergeModelKvTransferMetadata:
             def get_kv_transfer_metadata(self, req_id, num_computed_tokens):
                 return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
 
-        original_meta = {"a": 1}
-        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        original_meta: dict[str, Any] = {"a": 1}
+        original: dict[str, dict[str, Any]] = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
         runner = self._runner_with_model(_Model())
 
         merged = runner._merge_model_kv_transfer_metadata(original)
@@ -1690,7 +1832,7 @@ class TestDownstreamPayloadMemoization:
         return runner
 
     def test_missing_marker_defaults_true_without_memoizing(self):
-        stages = {"r1": None}
+        stages: dict[str, int | None] = {"r1": None}
         runner = self._runner(stages)
 
         assert runner._request_needs_downstream_stage_payload("r1") is True

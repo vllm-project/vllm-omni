@@ -1,5 +1,9 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
+# Both AR stages default to async_scheduling, so async_chunk also turns on
+# async Omni output materialization (payload built off the decode path) as
+# long as the remaining gates hold: no Omni prefix cache, no speculative
+# decoding, no routed-expert return.
 async_chunk: true
 # Native full-duplex shares this profile with /v1/chat/completions. Every other
 # duplex_session knob keeps its runtime default.

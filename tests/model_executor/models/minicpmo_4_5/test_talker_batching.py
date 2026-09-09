@@ -20,10 +20,13 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _CODEC_PENALTY_WINDOW,
     _DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    _GPU_RESIDENT_BUFFER_KEYS,
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
     _REPETITION_PENALTY_CHUNK_SIZE,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
+    _as_recent_codec_history,
+    _extend_recent_codec_history,
     _native_duplex_chunk_budget,
     _restore_weight_norm_weight,
     blank_scheduler_prompt_for_penalties,
@@ -109,6 +112,65 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     with torch.no_grad():
         talker.head_code[0].weight.copy_(torch.eye(8, 2))
     return talker
+
+
+def test_talker_keeps_the_buffer_keys_its_decode_step_writes_on_device() -> None:
+    """``gpu_resident_buffer_keys`` must name the keys ``preprocess`` writes.
+
+    The runner only skips the per-step D2H copy for declared
+    ``(type_key, qualifier)`` pairs, so a key that does not match the emitted
+    payload silently reintroduces a copy of the codec codes on the decode path.
+    """
+    talker = _make_talker()
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+
+    _, _, update = talker.preprocess(
+        torch.tensor([3], dtype=torch.long),
+        None,
+        audio_state={"finished": False, "step": 1},
+        request_id="req",
+    )
+
+    emitted = {(key, qualifier) for key, value in update.items() if isinstance(value, dict) for qualifier in value}
+    assert ("codes", "audio") in emitted
+    assert _GPU_RESIDENT_BUFFER_KEYS <= emitted
+
+
+def test_stage_wrapper_republishes_the_talker_omni_output_contracts() -> None:
+    """The runner reads the Omni contracts off the wrapper, not off the Talker.
+
+    Stage 1 loads ``MiniCPMO45OmniForConditionalGeneration``; the Talker is one
+    of its submodules, so flags declared only on the Talker would silently be
+    invisible to the runner (re-adding a per-step D2H of the codec codes and
+    the hidden-state copy the async payload is meant to skip).
+    """
+    talker = _make_talker()
+    talker.use_async_omni_output = True
+    talker.omni_pooler_payload_include_hidden = False
+    talker.gpu_resident_buffer_keys = set(_GPU_RESIDENT_BUFFER_KEYS)
+
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "tts"
+    wrapper.model = talker
+    wrapper._publish_omni_output_contracts()
+
+    assert wrapper.use_async_omni_output is True
+    assert wrapper.omni_pooler_payload_include_hidden is False
+    assert wrapper.gpu_resident_buffer_keys == set(_GPU_RESIDENT_BUFFER_KEYS)
+
+
+def test_stage_wrapper_defaults_to_hidden_payload_without_talker_overrides() -> None:
+    """A stage model that declares nothing keeps the Thinker's defaults."""
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "llm"
+    wrapper.model = nn.Linear(2, 2)
+    wrapper._publish_omni_output_contracts()
+
+    assert wrapper.use_async_omni_output is True
+    assert wrapper.omni_pooler_payload_include_hidden is True
+    assert not hasattr(wrapper, "gpu_resident_buffer_keys")
 
 
 def _routed(output, index: int):
@@ -373,8 +435,36 @@ def test_codec_penalty_forgets_codes_older_than_the_upstream_window(mocker) -> N
     for _ in range(_CODEC_PENALTY_WINDOW):
         scored = emit(0)
 
-    assert talker._request_audio_states["req-window"]["recent_codes"] == [0] * _CODEC_PENALTY_WINDOW
+    recent = talker._request_audio_states["req-window"]["recent_codes"]
+    assert isinstance(recent, torch.Tensor)
+    assert recent.tolist() == [0] * _CODEC_PENALTY_WINDOW
     torch.testing.assert_close(scored[0, 1], raw[0, 1])
+
+
+def test_recent_codec_history_stays_on_the_hidden_device() -> None:
+    """Stage-1 must not ``tolist()`` the penalty window after forward."""
+    hidden = torch.zeros(1, 2)
+    state: dict[str, object] = {}
+    first = _extend_recent_codec_history(state, torch.tensor([[4, 5]]), device=hidden.device)
+    second = _extend_recent_codec_history(state, torch.tensor([[6]]), device=hidden.device)
+
+    assert first.device == hidden.device
+    assert second.tolist() == [4, 5, 6]
+    assert state["recent_codes"] is second
+    # A leftover Python list from an older request still upgrades in place.
+    upgraded = _as_recent_codec_history([1, 2, 3], device=hidden.device)
+    assert upgraded.tolist() == [1, 2, 3]
+    assert upgraded.device == hidden.device
+
+
+def test_identity_repetition_penalty_does_not_need_a_host_sync() -> None:
+    logits = torch.tensor([[-2.0, 1.0, 3.0]])
+    histories = [torch.tensor([1, 1, 2])]
+
+    actual = _apply_batched_repetition_penalty(logits, histories, penalty=1.0, window_size=3)
+
+    torch.testing.assert_close(actual, logits)
+    assert actual is not logits
 
 
 def test_sample_honours_a_request_that_disabled_penalties(mocker) -> None:

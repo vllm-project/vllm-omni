@@ -138,6 +138,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # tts_token_ids/tts_hidden_states handoff into its conditioning
         # embeddings and initializes request-local codec generation state.
         self.has_preprocess = self.model_stage in {"llm", "tts"}
+        self._publish_omni_output_contracts()
+
+    def _publish_omni_output_contracts(self) -> None:
+        """Re-export the inner stage model's Omni output contracts.
+
+        The runner reads these flags off the top-level model, but the Thinker
+        and the Talker are only submodules here, so their declarations would
+        otherwise never reach it. Both AR stages build their payload off the
+        decode critical path; the Talker additionally drops the hidden-state
+        copy (its codec codes are produced in make_omni_output before the
+        snapshot) and keeps those codes on the accelerator.
+        """
+        self.use_async_omni_output = getattr(self.model, "use_async_omni_output", True)
+        self.omni_pooler_payload_include_hidden = getattr(self.model, "omni_pooler_payload_include_hidden", True)
+        inner_gpu_resident_keys = getattr(self.model, "gpu_resident_buffer_keys", None)
+        if inner_gpu_resident_keys is not None:
+            self.gpu_resident_buffer_keys: set[tuple[str, str]] = set(inner_gpu_resident_keys)
 
     @cached_property
     def sampler(self):

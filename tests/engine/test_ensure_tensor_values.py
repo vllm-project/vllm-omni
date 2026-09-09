@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for _ensure_tensor_values boundary enforcement."""
 
 import pytest
 import torch
 
-from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
+from vllm_omni.worker.async_omni_output import _ensure_tensor_values
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -45,49 +45,18 @@ from vllm_ascend.worker.model_runner_v1 import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
-from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.worker.async_omni_output import (
+    AsyncOmniOutputRunnerMixin,
+    OmniAsyncGPUModelRunnerOutput,
+)
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
-
-
-def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
-    """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
-
-    Non-tensor scalars (int, float, bool) are wrapped with ``torch.tensor()``.
-    Values that cannot be safely converted are dropped with a warning.
-    This enforces the tensor-only invariant required by the
-    ``OmniEngineCoreOutput.multimodal_output`` wire field and msgspec
-    serialization. Mirrors ``gpu_ar_model_runner._ensure_tensor_values``.
-    """
-    result: dict[str, torch.Tensor] = {}
-    for key, val in payload.items():
-        if isinstance(val, torch.Tensor):
-            result[key] = val
-        elif isinstance(val, (int, float, bool)):
-            result[key] = torch.tensor(val)
-        elif isinstance(val, (list, tuple)):
-            try:
-                result[key] = torch.tensor(val)
-            except (ValueError, TypeError, RuntimeError):
-                logger.warning(
-                    "Dropping non-tensorizable multimodal output key '%s' (type=%s) from wire payload.",
-                    key,
-                    type(val).__name__,
-                )
-        else:
-            logger.warning(
-                "Dropping non-tensor multimodal output key '%s' (type=%s) from wire payload.",
-                key,
-                type(val).__name__,
-            )
-    return result
 
 
 class ExecuteModelState(NamedTuple):
@@ -108,11 +77,20 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
 
-class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
+class NPUARModelRunner(
+    OmniNPUModelRunner,
+    OmniConnectorModelRunnerMixin,
+    DuplexSamplingRunnerMixin,
+    AsyncOmniOutputRunnerMixin,
+):
     """Autoregressive NPU model runner that returns hidden states per request."""
+
+    kv_extracted_req_ids: list[str] | None
+    sampling_done_event: Any
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.kv_extracted_req_ids = None
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -267,6 +245,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _maybe_get_combined_prefix_cache_tensors(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_cpu: torch.Tensor | None,  # GPU-compatible; unused on NPU merge path
         multimodal_outputs: dict,
         num_scheduled_tokens: dict[str, int],
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
@@ -292,97 +271,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         return combined_hidden_states, combined_multimodal_outputs
 
-    @staticmethod
-    def _resolve_req_hidden_states(
-        hidden_states_cpu: torch.Tensor,
-        combined_hidden_states: dict[str, torch.Tensor] | None,
-        rid: str,
-        start: int,
-        end: int,
-    ):
-        if combined_hidden_states is not None:
-            if rid not in combined_hidden_states:
-                raise RuntimeError("Request IDs in the batch are missing from the merged states!")
-            return combined_hidden_states[rid]
-        return hidden_states_cpu[start:end]
-
-
-    def _build_multimodal_outputs(
-        self,
-        per_req_payloads: list[dict[str, object] | None] | None,
-    ) -> list[dict[str, torch.Tensor] | None] | None:
-        if self.vllm_config.model_config.engine_output_type == "text":
-            return None
-        if per_req_payloads is None:
-            return None
-        wire_payloads: list[dict[str, torch.Tensor] | None] = []
-        for payload in per_req_payloads:
-            if not payload:
-                wire_payloads.append(None)
-            else:
-                wire_payloads.append(_ensure_tensor_values(payload))
-        if all(item is None for item in wire_payloads):
-            return None
-        return wire_payloads
-
-
-    def _request_final_stage_id(self, req_id: str) -> int | None:
-        info = self.model_intermediate_buffer.get(req_id)
-        if not isinstance(info, dict):
-            req_state = self.requests.get(req_id)
-            info = getattr(req_state, "additional_information_cpu", None)
-        if not isinstance(info, dict):
-            return None
-        val = info.get("omni_final_stage_id")
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            return None
-
-    def _request_needs_downstream_stage_payload(self, req_id: str) -> bool:
-        cached = self._downstream_payload_cache.get(req_id)
-        if cached is not None:
-            return cached
-        final_stage_id = self._request_final_stage_id(req_id)
-        needs_payload = final_stage_id is None or final_stage_id > 0
-        self._downstream_payload_cache[req_id] = needs_payload
-        return needs_payload
-
-    def _resolve_pooler_payload_req_ids(self, req_ids_output_copy: list[str]) -> tuple[str, list[str]]:
-        downstream_req_ids = [rid for rid in req_ids_output_copy if self._request_needs_downstream_stage_payload(rid)]
-        engine_output_type = (self.vllm_config.model_config.engine_output_type or "").lower()
-        # Single-stage AR TTS models (e.g. VoxCPM2) finish on this stage but still
-        # need multimodal payloads for final audio postprocess/output.
-        if engine_output_type == "audio" and not downstream_req_ids:
-            downstream_req_ids = req_ids_output_copy
-        return engine_output_type, downstream_req_ids
-
-    @staticmethod
-    def _sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
-        if not isinstance(multimodal_outputs, dict):
-            return None
-        meta = multimodal_outputs.get("meta")
-        req_ids = None
-        sparse_audio = False
-        if isinstance(meta, dict):
-            req_ids = meta.get("req_id")
-            sparse_audio = NPUARModelRunner._is_sparse_audio_marker(meta.get("sparse_audio"))
-        if req_ids is None:
-            req_ids = multimodal_outputs.get("meta.req_id")
-            sparse_audio = NPUARModelRunner._is_sparse_audio_marker(multimodal_outputs.get("meta.sparse_audio"))
-        if not sparse_audio:
-            return None
-        if not isinstance(req_ids, list):
-            return None
-        return [rid for rid in req_ids if isinstance(rid, str)]
-
-    @staticmethod
-    def _is_sparse_audio_marker(value: Any) -> bool:
-        if isinstance(value, list):
-            return any(str(item).lower() in ("1", "true", "yes", "on") for item in value)
-        if isinstance(value, str):
-            return value.lower() in ("1", "true", "yes", "on")
-        return bool(value)
     #  -------------------------------------- Omni-new -------------------------------------------------
 
     @torch.inference_mode()
@@ -402,7 +290,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 self._sync_device()
                 self._execution_start_time = time.perf_counter()
-        if self.execute_model_state is not None:
+        if self.execute_model_state is not None:  # type: ignore[has-type]
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
         #  -------------------------------------- Omni-new -------------------------------------------------
@@ -910,7 +798,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         pp = get_pp_group()
@@ -919,13 +806,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         #  -------------------------------------- Omni-new -------------------------------------------------
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
-        combined_hidden_states = None
-        combined_multimodal_outputs = None
-        mm_cpu = {}
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
         if self.execute_model_state is None:
+            # receive sampled token ids from the last PP rank.
+            if self.use_async_scheduling and not pp.is_last_rank:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # noqa
@@ -955,9 +842,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             multimodal_outputs, # Omni-Specific
         ) = self.execute_model_state
         # Clear ephemeral state.
-        self.execute_model_state = None
-        hidden_seq_len = int(hidden_states.shape[0])
-        scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
+        self.execute_model_state = None  # type: ignore[assignment]
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1090,209 +975,61 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
 
         #  -------------------------------------- Omni-new -------------------------------------------------
-        engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
-        sparse_mm_req_ids = self._sparse_mm_req_ids(multimodal_outputs)
-        sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
-        if engine_output_type == "audio" and sparse_mm_req_ids is not None:
-            sparse_req_id_set = set(sparse_mm_req_ids)
-            downstream_req_ids = [rid for rid in req_ids_output_copy if rid in sparse_req_id_set]
-        needs_pooler_payload = len(downstream_req_ids) > 0
-        downstream_req_id_set = set(downstream_req_ids)
-        hidden_states_cpu = None
-        req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
-        needs_scheduled_hidden_payload = needs_pooler_payload and (
-            self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
-        )
-        if needs_scheduled_hidden_payload:
-            num_valid_tokens = min(
-                int(scheduler_output.total_num_scheduled_tokens),
-                int(hidden_states.shape[0]),
-            )
-            if audio_sparse_output:
-                pass
-            elif len(downstream_req_ids) == len(req_ids_output_copy):
-                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
-            else:
-                req_hidden_states_cpu = {}
-        num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
-        if num_scheduled_tokens_np is None:
+        scheduled_tokens = getattr(self, "_omni_num_scheduled_tokens_np", None)
+        if scheduled_tokens is None:
             req_ids = self.input_batch.req_ids
             num_scheduled_tokens_np = np.array(
                 [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
                 dtype=np.int32,
             )
-        query_start_loc_cpu = self.query_start_loc.cpu
-        if callable(query_start_loc_cpu):
-            query_start_loc_cpu = query_start_loc_cpu()
+        else:
+            # The deferred builder must not observe the next step mutating this buffer.
+            num_scheduled_tokens_np = np.asarray(scheduled_tokens, dtype=np.int32).copy()
+        query_start_loc_cpu = self._snapshot_query_start_loc_cpu()
 
-        self._stage_deferred_prefix_cache_mm_outputs(
-            scheduler_output=scheduler_output,
-            multimodal_outputs=multimodal_outputs,
-            query_start_loc_cpu=query_start_loc_cpu,
+        # Async Omni output (PR #4476): move the per-request payload construction
+        # off the AR decode critical path into a background builder, after
+        # snapshotting hidden/mm tensors to CPU on a dedicated copy stream.
+        # Disabled for the ascend profiling-chunk path, which needs the output
+        # synchronously to record execution_time_ms, and when full-payload
+        # accumulation would mutate request state from a background thread.
+        profiling_need_timing = bool(
+            self.ascend_config.scheduler_config.profiling_chunk_config.need_timing
+            and hasattr(self, "_execution_start_time")
+        )
+        accumulate_needed = self._should_accumulate_full_payload_output()
+        use_async_omni_output = (
+            self._should_use_async_omni_output() and not profiling_need_timing and not accumulate_needed
         )
 
-        pooler_output: list[dict[str, object]] | None = None
-        if needs_pooler_payload:
-            combined_hidden_states = None
-            combined_multimodal_outputs = None
-            mm_cpu = None
-            if self.omni_prefix_cache is not None:
-                (
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                ) = self._maybe_get_combined_prefix_cache_tensors(
-                    hidden_states,
-                    multimodal_outputs,
-                    scheduler_output.num_scheduled_tokens,
-                )
-            if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
-                mm_cpu = build_mm_cpu(
-                    flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
-                )
+        # Snapshot mutable python state so the deferred builder cannot observe the
+        # next decode step mutating shared runner structures (mirrors GPU AR runner).
+        scheduler_output = self._snapshot_scheduler_output_for_async_omni_output(scheduler_output)
+        req_ids_output_copy = list(req_ids_output_copy)
+        req_id_to_index_output_copy = dict(req_id_to_index_output_copy)
+        valid_sampled_token_ids = [list(token_ids) for token_ids in valid_sampled_token_ids]
+        logprobs_lists = copy(logprobs_lists) if logprobs_lists is not None else None
+        prompt_logprobs_dict = dict(prompt_logprobs_dict) if prompt_logprobs_dict is not None else {}
 
-            self._process_additional_information_updates(
-                hidden_states,
-                multimodal_outputs,
-                num_scheduled_tokens_np,
-                scheduler_output,
-                combined_hidden_states,
-                combined_multimodal_outputs,
-                req_ids_filter=downstream_req_id_set,
+        # Models with a postprocess hook (e.g. talker) must run it on live device
+        # tensors before the async D2H snapshot; the deferred builder then skips it.
+        omni_postprocess_already_applied = False
+        if use_async_omni_output:
+            omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_async_output(
+                hidden_states=hidden_states,
+                multimodal_outputs=multimodal_outputs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                scheduler_output=scheduler_output,
+                req_ids_output_copy=req_ids_output_copy,
+                query_start_loc_cpu=query_start_loc_cpu,
             )
 
-            if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                for rid in downstream_req_ids:
-                    idx = req_id_to_index_output_copy[rid]
-                    start = int(query_start_loc_cpu[idx])
-                    sched = int(num_scheduled_tokens_np[idx])
-                    end = start + sched
-                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
-
-            pooler_output = []
-            for rid in req_ids_output_copy:
-                if rid not in downstream_req_id_set:
-                    pooler_output.append({})
-                    continue
-                idx = req_id_to_index_output_copy[rid]
-                start = int(query_start_loc_cpu[idx])
-                sched = int(num_scheduled_tokens_np[idx])
-                end = start + sched
-                payload: dict[str, object] = {}
-                if not audio_sparse_output:
-                    if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                        req_hidden_states = req_hidden_states_cpu[rid]
-                    else:
-                        req_hidden_states = self._resolve_req_hidden_states(
-                            hidden_states_cpu,
-                            combined_hidden_states,
-                            rid,
-                            start,
-                            end,
-                        )
-                    payload["hidden"] = req_hidden_states
-
-                mm_payload: dict[str, object] = {}
-                if combined_multimodal_outputs or mm_cpu:
-                    if combined_multimodal_outputs:
-                        # Prefix cache enabled; all items have already been processed
-                        # and split apart for each request as needed, and all tensors
-                        # have already been detached to the CPU.  Lists are kept as
-                        # passthrough data for consistent behavior in postprocess.
-                        # Recurse into nested dicts so list-valued sub-keys (e.g.
-                        # embed.tts_bos = [tensor]) are unwrapped to bare tensors
-                        # at the leaves; downstream flatten_payload then yields a
-                        # wire-clean dict[str, torch.Tensor].
-                        def _unwrap_lists(v):
-                            if isinstance(v, list):
-                                return v[idx] if idx < len(v) else v[0]
-                            if isinstance(v, dict):
-                                return {k: _unwrap_lists(sv) for k, sv in v.items()}
-                            return v
-
-                        for mm_key in combined_multimodal_outputs.keys():
-                            mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
-                    else:
-                        for mm_key, mm_val in mm_cpu.items():
-                            if mm_key in {"meta.req_id", "meta.sparse_audio"}:
-                                continue
-                            if audio_sparse_output and isinstance(mm_val, list):
-                                sparse_idx = sparse_mm_index.get(rid)
-                                if sparse_idx is None:
-                                    continue
-                                if sparse_idx >= len(mm_val):
-                                    logger.warning(
-                                        "Sparse multimodal payload mismatch for request %s: index %d >= %d.",
-                                        rid,
-                                        sparse_idx,
-                                        len(mm_val),
-                                    )
-                                    continue
-                                sparse_val = mm_val[sparse_idx]
-                                mm_payload[mm_key] = (
-                                    sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
-                                )
-                                continue
-                            mm_payload[mm_key] = to_payload_element(
-                                element=mm_val,
-                                idx=idx,
-                                start=start,
-                                end=end,
-                                pass_lists_through=False,
-                                seq_len=hidden_seq_len,
-                                scheduled_seq_len=scheduled_seq_len,
-                            )
-                    payload.update(mm_payload)
-                pooler_output.append(flatten_payload(payload))
-
-        pooler_output = pooler_output or []
-        if self._async_chunk and stage_sends_async_output(self.model_config):
-            pooler_inter, pooler_client = partition_payload_list(pooler_output)
-        else:
-            # Non-async-chunk ships the full payload to the next stage via
-            # inter_stage_outputs (the NPU runner has no separate full-payload
-            # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
-            pooler_inter, pooler_client = pooler_output, pooler_output
-
-        # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
-        if pooler_inter and self._should_accumulate_full_payload_output():
-            with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
-                for i, rid in enumerate(req_ids_output_copy):
-                    req_state = self.requests.get(rid)
-                    if req_state is not None and pooler_inter[i]:
-                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
-
-        inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-        multimodal_outputs = (
-            inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
-        )
-        model_runner_output = OmniModelRunnerOutput(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=None,
+        output_tensor_snapshot = self._snapshot_omni_output_tensors_for_async_output(
+            use_async_omni_output=use_async_omni_output,
+            hidden_states=hidden_states,
+            staged_hidden_states_cpu=None,
             multimodal_outputs=multimodal_outputs,
-            inter_stage_outputs=inter_stage_outputs,
-            kv_connector_output=kv_connector_output,
-            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
-            cudagraph_stats=cudagraph_stats,
         )
-        model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
-        model_runner_output.routed_experts = routed_experts_lists
-        model_runner_output.spec_token_ids = output_spec_token_ids
-        with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
-            model_runner_output.omni_connector_output = self.get_omni_connector_output()
-        #  -------------------------------------- Omni-new -------------------------------------------------
-
-        if (
-            profiling_chunk_config.enabled
-            and profiling_chunk_config.need_timing
-            and hasattr(self, "_execution_start_time")
-        ):
-            self._sync_device()
-            model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB update"):
@@ -1308,6 +1045,76 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             ):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+
+        # In async scheduling + PP, broadcast sampled token ids from the
+        # last PP rank so other PP ranks can receive them without going
+        # through the scheduler/engine IPC path. Skip when logits were
+        # already broadcast (broadcast_pp_output), matching upstream vLLM.
+        if self.use_async_scheduling:
+            if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
+                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+
+        # Connector drain can HCCL-broadcast. Keep it on the decode thread.
+        with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
+            omni_connector_output = self.get_omni_connector_output()
+
+        def output_builder() -> OmniModelRunnerOutput:
+            if output_tensor_snapshot.async_payload is not None:
+                with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
+                    output_tensor_snapshot.async_payload.wait()
+            with record_function_or_nullcontext("omni_output_builder:total"):
+                built_output = self._build_omni_model_runner_output_from_snapshot(
+                    scheduler_output=scheduler_output,
+                    hidden_states=output_tensor_snapshot.hidden_states,
+                    staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
+                    multimodal_outputs=output_tensor_snapshot.multimodal_outputs,
+                    req_ids_output_copy=req_ids_output_copy,
+                    req_id_to_index_output_copy=req_id_to_index_output_copy,
+                    valid_sampled_token_ids=valid_sampled_token_ids,
+                    logprobs_lists=logprobs_lists,
+                    prompt_logprobs_dict=prompt_logprobs_dict,
+                    num_nans_in_logits=None,
+                    kv_connector_output=kv_connector_output,
+                    ec_connector_output=ec_connector_output,
+                    cudagraph_stats=cudagraph_stats,
+                    kv_extracted_req_ids=kv_extracted_req_ids,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    postprocess_already_applied=omni_postprocess_already_applied,
+                    omni_connector_output=omni_connector_output,
+                    skip_accumulate_full_payload=use_async_omni_output,
+                )
+            if routed_experts_lists is not None:
+                built_output.routed_experts = routed_experts_lists
+            built_output.spec_token_ids = output_spec_token_ids
+            return built_output
+
+        if use_async_omni_output:
+            async_output = OmniAsyncGPUModelRunnerOutput(
+                model_runner_output_builder=output_builder,
+                cuda_device=self.device,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                # Keep the sampled-token D2H on the runner's own copy stream.
+                # The Omni payload stream already carries the (much larger)
+                # hidden/mm snapshot, and the next decode step blocks on the
+                # sampled-token event.
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            )
+            self.input_batch.set_async_sampled_token_ids(
+                async_output.sampled_token_ids_cpu,
+                async_output.async_copy_ready_event,
+            )
+            return async_output
+
+        model_runner_output = output_builder()
+        #  -------------------------------------- Omni-new -------------------------------------------------
+
+        if profiling_need_timing:
+            self._sync_device()
+            model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
 
         if not self.use_async_scheduling:
             return model_runner_output
