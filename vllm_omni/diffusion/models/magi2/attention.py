@@ -37,6 +37,43 @@ from .parallel import (
 
 logger = init_logger(__name__)
 
+# MATE's fast-exp2 softmax approximation can amplify over repeated tiny
+# transformer layers.  Dense Torch attention is also cheaper for this regime;
+# production MAGI-2 sequences are well above this bound.
+_MUSA_FA3_MIN_TOKENS = 32
+
+
+def _musa_fa3_varlen(**kwargs):
+    """Run MUSA FA3 with the numerically stable MATE backend.
+
+    Older torchada ``flash_attn_3`` wrappers do not expose the provider's
+    backend selector.  Prefer the shared adapter, then use MATE's public
+    varlen wrapper when that selector is unavailable; this keeps backend
+    selection out of the generic CUDA path.
+    """
+
+    try:
+        return flash_attn_3_varlen(**kwargs, backend="mutlass")
+    except NotImplementedError as exc:
+        q = kwargs["q"]
+        if not current_omni_platform.is_musa() or not getattr(q, "is_cuda", False):
+            raise exc
+        try:
+            from mate.mha_interface import flash_attn_varlen_func
+        except (ImportError, AttributeError):
+            raise exc
+        kwargs = dict(kwargs)
+        kwargs["softcap"] = max(float(kwargs.get("softcap", 0.0)), 0.0)
+        args = (kwargs.pop("q"), kwargs.pop("k"), kwargs.pop("v"))
+        result = flash_attn_varlen_func(*args, **kwargs, backend="mutlass")
+        # MATE exposes packed LSE as [T, H], while the Omni FA3 contract is
+        # [H, T]. Normalize only this direct-provider compatibility path.
+        if isinstance(result, tuple) and len(result) > 1:
+            lse = result[1]
+            if isinstance(lse, torch.Tensor) and lse.ndim == 2 and lse.shape[0] == q.shape[0]:
+                result = (result[0], lse.transpose(0, 1).contiguous(), *result[2:])
+        return result
+
 
 @cache
 def _resolve_flash_attn_version() -> int:
@@ -214,15 +251,16 @@ def packed_attention_with_sink(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.shape[0] > 0
         and k.shape[0] > 0
+        and q.shape[0] >= _MUSA_FA3_MIN_TOKENS
     ):
         requested_version = os.environ.get("MAGI2_FLASH_ATTN_VERSION")
         if requested_version is not None and int(requested_version) != 3:
             raise ValueError("MAGI-2 MUSA attention supports FlashAttention version 3 only")
         try:
-            result = flash_attn_3_varlen(
-                q,
-                k,
-                v,
+            result = _musa_fa3_varlen(
+                q=q,
+                k=k,
+                v=v,
                 cu_seqlens_q=cu_q,
                 cu_seqlens_k=cu_k,
                 max_seqlen_q=max_q,
