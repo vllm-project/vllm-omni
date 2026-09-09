@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import wave
 from collections.abc import Iterator
 from pathlib import Path
@@ -20,20 +22,57 @@ def _run_ffmpeg(args: list[str]) -> bytes:
 
 
 def materialize_media(value: Any, output_dir: str | Path, stem: str, suffix: str) -> Path:
-    """Resolve common Hugging Face media values to a local file."""
+    """Resolve common Hugging Face media values to a local file.
+
+    ``str``/``Path`` values are returned as-is. Inline byte payloads (a
+    ``bytes``/``bytearray`` or a Hugging Face ``Audio``/``Video``/``Image``
+    feature mapping ``{"bytes": ..., "path": ...}``) are written to a real file
+    under ``output_dir`` and that existing path is returned. For such mappings
+    the ``path`` key is the original artifact name inside the dataset, which is
+    usually *not* present on the local disk, so it is only used to pick a
+    content extension and never treated as an existing file. A mapping or
+    object carrying only a ``path`` (no inline ``bytes``) is returned as an
+    already-materialized file reference.
+    """
     if isinstance(value, str | Path):
         return Path(value)
     path = value.get("path") if isinstance(value, dict) else getattr(value, "path", None)
-    if path:
-        return Path(path)
     payload = value.get("bytes") if isinstance(value, dict) else None
     if payload is None and isinstance(value, bytes | bytearray):
         payload = value
-    if payload is None:
-        raise ValueError(f"cannot materialize media value for {stem!r}")
-    destination = Path(output_dir) / f"{stem}{suffix}"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(bytes(payload))
+    if payload is not None:
+        return _write_media_bytes(payload, output_dir, stem, _media_extension(path, suffix))
+    if path:
+        return Path(path)
+    raise ValueError(f"cannot materialize media value for {stem!r}")
+
+
+def _media_extension(path: str | Path | None, fallback: str) -> str:
+    """Pick a safe lower-case file extension from ``path`` when available."""
+    extension = Path(str(path)).suffix.lower() if path else ""
+    if extension.startswith(".") and len(extension) <= 8 and extension[1:].isalnum():
+        return extension
+    return fallback
+
+
+def _write_media_bytes(payload: bytes | bytearray, output_dir: str | Path, stem: str, extension: str) -> Path:
+    data = bytes(payload)
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / f"{stem}{extension}"
+    if destination.exists() and destination.read_bytes() == data:
+        return destination
+    fd, temporary = tempfile.mkstemp(dir=root, prefix=f".{destination.name}.", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(temporary, destination)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
     return destination
 
 
