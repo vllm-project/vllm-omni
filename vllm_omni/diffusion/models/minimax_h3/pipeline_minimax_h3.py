@@ -389,12 +389,20 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
 
 def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
     """Quantize decoded frames in place before worker-to-engine transfer."""
-    video = video.detach().float()
+    video = video.detach()
+    if video.dtype == torch.uint8:
+        # Streaming decode already quantized and clamped; only the transfer
+        # layout remains.
+        return video.permute(0, 2, 3, 4, 1).contiguous()
+    video = video.float()
     video.clamp_(0, 1).mul_(255).round_()
-    return video.permute(0, 2, 3, 4, 1).to(
-        dtype=torch.uint8,
-        memory_format=torch.contiguous_format,
-    )
+    permuted = video.permute(0, 2, 3, 4, 1)
+    out = torch.empty(permuted.shape, dtype=torch.uint8, device=video.device)
+    # copy_ fuses the layout change and the cast into one kernel;
+    # ``.to(dtype=uint8, memory_format=contiguous_format)`` materializes a
+    # contiguous FP32 intermediate first (~4.2GB for a 15s clip).
+    out.copy_(permuted)
+    return out
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -1624,6 +1632,12 @@ class MiniMaxH3Pipeline(
     @contextmanager
     def _component_on_device(self, component: nn.Module):
         if getattr(self, "_model_cpu_offload_modules", None):
+            # Sequential offload hooks whole modules (enable_omni_model_cpu_offload
+            # registers them on the discovered components, e.g. the real
+            # video_vae). Split-residency proxies carry no hook, so unwrap to the
+            # hooked module before entering the context — whole-module movement
+            # has no half-residency benefit anyway.
+            component = getattr(component, "sequential_offload_target", component)
             with sequential_offload_component(component):
                 yield
             return
@@ -1670,8 +1684,12 @@ class MiniMaxH3Pipeline(
         _, rank, _ = _dit_rank_world()
         # Keep image and video references in one residency window when both
         # appear in a request; otherwise the video branch would reload the VAE.
+        # Encoding touches only the CNN encoder half, so the 9GB ViT decoder
+        # stays off the device for the whole window.
         needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
-        video_vae_context = self._component_on_device(self.video_vae) if needs_video_vae else nullcontext()
+        video_vae_context = (
+            self._component_on_device(self.video_vae.encoder_component) if needs_video_vae else nullcontext()
+        )
         with video_vae_context:
             if images:
                 image_rows = None
@@ -1692,6 +1710,10 @@ class MiniMaxH3Pipeline(
                 )
                 rows.append(video_rows)
                 shapes.extend(video_shapes)
+        # The latents are extracted; the encode's input/staging pages are idle
+        # and must not stay mapped through the denoise and decode peaks.
+        if needs_video_vae:
+            self._release_stage_cache()
         return (torch.cat(rows) if rows else None), shapes
 
     def _encode_audio_conditions_resident(
@@ -2145,6 +2167,26 @@ class MiniMaxH3Pipeline(
             audio_t=audio_t,
         )
 
+    def _release_stage_cache(self) -> None:
+        """Return idle allocator pages to the device at stage boundaries.
+
+        The bounded component cache releases only past its idle-cache bound
+        (>25% of device capacity), which on large devices lets a finished
+        stage's freed activations -- the DiT's denoise buffers, an encode
+        input, a decoded frame tensor -- stay physically mapped across the
+        next stage's peak. Forcing the release at a boundary is exact (only
+        free pages are returned; live tensors are untouched) and costs one
+        remap per later allocation.
+        """
+        cache = getattr(self, "_dlo_component_cache", None)
+        if cache is not None:
+            try:
+                cache.release_if_needed(force=True)
+            except BaseException:
+                logger.exception("Failed to release retained allocator cache at stage boundary")
+            return
+        current_omni_platform.empty_cache()
+
     def decode(
         self,
         video_latent: torch.Tensor,
@@ -2153,7 +2195,11 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with self._component_on_device(self.video_vae):
+        # Denoise just ended: its freed activation pages must not stay mapped
+        # through the VAE decode peak. Decoding needs only the ViT decoder
+        # half of the VAE, so the CNN encoder stays off the device.
+        self._release_stage_cache()
+        with self._component_on_device(self.video_vae.decoder_component):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
@@ -2530,6 +2576,11 @@ class MiniMaxH3Pipeline(
                 width=context["width"],
             )
             videos.append(_prepare_minimax_h3_video_output(video))
+            # The FP32 decoded frames are quantized into the appended uint8
+            # tensor; drop the reference and return the idle pages instead of
+            # holding them through the next output's denoise/decode.
+            del video
+            self._release_stage_cache()
             audios.append(audio)
         video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
         audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
@@ -2835,6 +2886,7 @@ class MiniMaxH3Pipeline(
             width=shape["width"],
         )
         video = _prepare_minimax_h3_video_output(video)
+        self._release_stage_cache()
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),

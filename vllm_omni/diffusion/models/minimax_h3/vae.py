@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -29,10 +31,14 @@ from vllm_omni.diffusion.offloader.module_residency import (
 
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+
+# Escape hatch back to the checkpoint's whole-video numpy preparation path.
+_VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
 
 
 logger = init_logger(__name__)
@@ -57,6 +63,11 @@ def _minimax_h3_keyframe_encode_context(
         allow_tf32=True,
     ):
         yield
+
+
+def _legacy_encode_prep_enabled() -> bool:
+    value = os.environ.get(_VAE_ENCODE_LEGACY_PREP_ENV, "0")
+    return value.strip().lower() not in ("", "0", "false", "off")
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -133,6 +144,49 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
         return False
 
 
+class _VideoVAEPartProxy(nn.Module):
+    """Residency proxy for one half of the split video VAE.
+
+    The pipeline's ``_component_on_device`` drives whatever object it is
+    given through ``load_to_device``/``offload_to_cpu``. The checkpoint's
+    ViT decoder holds ~9GB of FP32 weights while the CNN encoder holds
+    ~0.7GB, and each is used by exactly one direction, so routing those
+    calls per half keeps the decoder off the device while reference videos
+    encode and the encoder off while latents decode. ``object.__setattr__``
+    keeps the back-reference out of the module registry (registering the
+    adapter as a submodule would recurse through ``parameters()``).
+    """
+
+    def __init__(self, vae: MiniMaxH3VideoVAE, part: str) -> None:
+        super().__init__()
+        object.__setattr__(self, "_vae", vae)
+        object.__setattr__(self, "_part", part)
+
+    def load_to_device(self) -> None:
+        self._vae._load_part_to_device(self._part)
+
+    def offload_to_cpu(self) -> None:
+        self._vae._offload_part_to_cpu(self._part)
+
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._vae.set_omni_component_cache(cache)
+
+    @property
+    def sequential_offload_target(self) -> MiniMaxH3VideoVAE:
+        """The module model-level CPU offload actually hooks.
+
+        ``enable_omni_model_cpu_offload`` registers the sequential hook on the
+        real ``video_vae``, and the hook moves the whole module through
+        ``parameters()`` — entering the sequential context through this proxy
+        would find no ``_hook_registry`` and raise, and whole-module movement
+        has no half-residency benefit anyway. ``_component_on_device`` unwraps
+        through this property before entering its sequential-offload branch;
+        the manual per-half staging above stays proxy-driven, where split
+        residency is the whole point.
+        """
+        return self._vae
+
+
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
 
@@ -162,40 +216,111 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 decoder,
                 device=device,
             )
-        self._stager = None
-        if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
-            self._stager = PinnedModuleStager(
-                self.remote,
-                device,
-                pin_memory=True,
-            )
+        install_temporal_stream_patches(self.remote.model)
         self.model = self.remote.model
+        self._stager = None
+        self._encoder_stager = None
+        self._decoder_stager = None
+        if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
+            self._build_residency_stagers(device)
+        self.encoder_component = _VideoVAEPartProxy(self, "encoder")
+        self.decoder_component = _VideoVAEPartProxy(self, "decoder")
         self.use_tiling = True
         self.use_slicing = False
         self.parallel_size = 1
         self.device_module = torch.get_device_module()
 
-    def load_to_device(self) -> None:
+    def _build_residency_stagers(self, device: torch.device) -> None:
+        """Stage the encode and decode halves of the remote separately.
+
+        The encode path touches only ``encoder`` + ``quant_conv`` and the
+        decode path only ``post_quant_conv`` + ``decoder`` (verified against
+        the checkpoint's ``AutoencoderKLLegacy``: the one cross reference,
+        ``tiled_decode``'s ``getattr(self.encoder, "mask_enabled")``, is
+        short-circuited by ``self.training`` at inference). No storage is
+        shared across the two groups, so independent staging is exact. When
+        the checkpoint's structure is not discoverable, fall back to
+        whole-module staging (the previous single-stager behavior).
+        """
+        part_names = ("encoder", "quant_conv", "post_quant_conv", "decoder")
+        if all(isinstance(getattr(self.model, name, None), nn.Module) for name in part_names):
+            self._encoder_stager = PinnedModuleStager(
+                [self.model.encoder, self.model.quant_conv],
+                device,
+                pin_memory=True,
+            )
+            self._decoder_stager = PinnedModuleStager(
+                [self.model.post_quant_conv, self.model.decoder],
+                device,
+                pin_memory=True,
+            )
+            return
+        self._stager = PinnedModuleStager(
+            self.remote,
+            device,
+            pin_memory=True,
+        )
+
+    def _part_stager(self, part: str) -> PinnedModuleStager | None:
+        if part == "encoder":
+            return self._encoder_stager
+        if part == "decoder":
+            return self._decoder_stager
+        raise ValueError(f"unknown video VAE part {part!r}")
+
+    def _load_part_to_device(self, part: str) -> None:
+        stager = self._part_stager(part)
+        if stager is not None:
+            stager.load()
+        elif self._stager is not None:
+            self._stager.load()
+        else:
+            # No staged residency (the component lives on the device already
+            # or is fully CPU-resident): fall back to whole-module placement.
+            self.remote.to(self._device_target)
+
+    def _offload_part_to_cpu(self, part: str) -> None:
+        stager = self._part_stager(part)
+        if stager is not None:
+            stager.offload()
+            return
         if self._stager is not None:
+            self._stager.offload()
+            return
+        self.remote.to("cpu")
+        self._release_component_cache()
+
+    def _release_component_cache(self) -> None:
+        cache = getattr(self, "_omni_component_cache", None)
+        if cache is None:
+            torch.accelerator.empty_cache()
+        else:
+            cache.release_if_needed()
+
+    def load_to_device(self) -> None:
+        if self._encoder_stager is not None:
+            self._encoder_stager.load()
+            self._decoder_stager.load()
+        elif self._stager is not None:
             self._stager.load()
         else:
             self.remote.to(self._device_target)
 
     def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
         self._omni_component_cache = cache
-        if self._stager is not None:
-            self._stager.set_cache_retention(cache)
+        for stager in (self._encoder_stager, self._decoder_stager, self._stager):
+            if stager is not None:
+                stager.set_cache_retention(cache)
 
     def offload_to_cpu(self) -> None:
-        if self._stager is not None:
+        if self._encoder_stager is not None:
+            self._encoder_stager.offload()
+            self._decoder_stager.offload()
+        elif self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            cache = getattr(self, "_omni_component_cache", None)
-            if cache is None:
-                torch.accelerator.empty_cache()
-            else:
-                cache.release_if_needed()
+            self._release_component_cache()
 
     def set_parallel_size(
         self,
@@ -330,6 +455,91 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             patch_size=(1, 2, 2),
         ).float()
 
+    def _stream_prepare_video_tensor(
+        self,
+        frames: np.ndarray,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Upload a uint8 ``(T, H, W, 3)`` video as one normalized FP32 tensor.
+
+        The checkpoint's numpy path uploads the whole video as FP32, then
+        ``transform_tensor`` materializes a second normalized copy, then
+        ``encode_temporal`` pads through a full-video ``torch.cat``: three
+        resident pixel-scale copies on the device. Here the padding is
+        replicated on the host, a single preallocated ``(3, T', H, W)`` tensor
+        receives clip-by-clip uploads, and the ``÷255 → (x-mean)/std`` chain
+        runs in place on each clip's staging buffer in the same op order as
+        ``convert_numpy_to_tensor`` → ``transform_tensor``, so peak device
+        memory is the output tensor plus one clip instead of three copies.
+
+        Returns ``None`` whenever the checkpoint contract this mirrors (uint8
+        frames, ``clip_length`` alignment, processor ``transform`` constants)
+        is not discoverable; callers fall back to the legacy path.
+        """
+        if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[-1] != 3:
+            return None
+        if int(frames.shape[0]) == 0:
+            return None
+        model = self.model
+        clip_length = getattr(model, "clip_length", None)
+        transform = getattr(getattr(model, "processor", None), "transform", None)
+        mean = getattr(transform, "mean", None)
+        std = getattr(transform, "std", None)
+        if not isinstance(clip_length, int) or clip_length <= 0:
+            return None
+        if mean is None or std is None or len(mean) != 3 or len(std) != 3:
+            return None
+        # Mirror the checkpoint's temporal alignment so the device-side
+        # ``get_suitable_video_length`` trim is a no-op and the
+        # ``encode_temporal`` padding ``torch.cat`` never triggers. A
+        # trim-stable length is ``k * clip_length + tail`` (tail = frame
+        # overlap plus the isolated last frame); it also satisfies
+        # encode_temporal only when ``tail % clip_length == offset_frame``.
+        # With an asymmetric checkpoint (isolated last frame but no isolated
+        # first frame) no trim-stable length can satisfy encode_temporal, so
+        # the remote re-pads through a whole-video cat regardless and any
+        # host-side pad would be trimmed away before that -- keep the legacy
+        # frame count there instead of uploading dead frames.
+        isolated_first_frame = bool(getattr(model, "isolated_first_frame", False))
+        frame_pre_padding = int(getattr(model, "frame_pre_padding", 0) or 0)
+        offset = 1 if isolated_first_frame and frame_pre_padding == 0 else 0
+        processor = getattr(model, "processor", None)
+        tail = int(getattr(processor, "frame_overlap", 0) or 0)
+        if bool(getattr(processor, "isolated_last_frame", False)):
+            tail += 1
+        num_frames = int(frames.shape[0])
+        pad = 0
+        if tail % clip_length == offset:
+            align = getattr(processor, "align_video_length", None)
+            if callable(align):
+                pad = max(0, int(align(num_frames, mode="pad", granularity="chunk")))
+            else:
+                chunks = -(-(num_frames - tail) // clip_length)
+                pad = max(max(chunks, 1) * clip_length + tail - num_frames, 0)
+        if pad:
+            frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)])
+            num_frames += pad
+        mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        height, width = int(frames.shape[1]), int(frames.shape[2])
+        out = torch.empty(
+            (3, num_frames, height, width),
+            dtype=torch.float32,
+            device=device,
+        )
+        for start in range(0, num_frames, clip_length):
+            end = min(start + clip_length, num_frames)
+            # Frame slices of a C-contiguous (T, H, W, 3) array stay
+            # contiguous, so each clip uploads at uint8 width (4x less host
+            # traffic than the legacy FP32 upload) before the in-place
+            # normalization chain. permute lands on the checkpoint's
+            # (3, T, H, W) layout directly.
+            chunk = torch.from_numpy(frames[start:end]).to(device=device)
+            chunk = chunk.permute(3, 0, 1, 2).to(torch.float32).div_(255.0)
+            chunk = chunk.sub_(mean_t).div_(std_t)
+            out[:, start:end].copy_(chunk)
+        return out
+
     @torch.inference_mode()
     def encode_video(
         self,
@@ -346,6 +556,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                prepared = None
+                if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
+                    prepared = self._stream_prepare_video_tensor(frames, parameter.device)
+                if prepared is not None:
+                    # Tensor inputs already carry the checkpoint's expected
+                    # (3, T, H, W) normalized-FP32 contract, so encode_videos
+                    # skips its own convert/transform/pad whole-video copies.
+                    frames = [prepared]
                 latent = self.model.encode_videos(
                     frames,
                     use_fp16_latent=True,
@@ -411,12 +629,45 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
         with tiling_context:
             decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
+        if decoded.dtype == torch.uint8:
+            # The streaming uint8 write-back already ran the revert and the
+            # output quantizer inside write_part; nothing remains but the
+            # shape contract.
+            frames = decoded
+        else:
+            frames = self._revert_decoded_inplace(decoded)
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
-        return frames.float()
+        return frames if frames.dtype == torch.uint8 else frames.float()
+
+    def _revert_decoded_inplace(self, decoded: torch.Tensor) -> torch.Tensor:
+        """In-place counterpart of the processor's ``revert_tensor``.
+
+        The checkpoint version materializes a denormalized copy, a clamped
+        copy, and a contiguous copy of the whole decoded video -- three
+        pixel-scale tensors resident at the decode peak. Decoding owns the
+        tensor here, so the same op order (torchvision ``Normalize`` is
+        ``(x - mean) / std``, then ``clamp(0, 1)``) runs in place on the
+        original ``(B, C, T, H, W)`` layout, which is bit-identical
+        elementwise to normalizing the ``(b t) c h w`` rearrangement and
+        returns with zero whole-video copies.
+
+        Falls back to ``processor.revert_tensor`` when the checkpoint's
+        denormalization constants are not discoverable.
+        """
+        processor = getattr(self.model, "processor", None)
+        transform_rev = getattr(processor, "transform_rev", None)
+        mean = getattr(transform_rev, "mean", None)
+        std = getattr(transform_rev, "std", None)
+        if mean is None or std is None or len(mean) != 3 or len(std) != 3:
+            return processor.revert_tensor(decoded)
+        if bool(getattr(processor, "use_3d_conv", True)) and decoded.ndim == 4:
+            decoded = decoded.unsqueeze(2)
+        mean_t = torch.as_tensor(mean, dtype=decoded.dtype, device=decoded.device).view(1, 3, 1, 1, 1)
+        std_t = torch.as_tensor(std, dtype=decoded.dtype, device=decoded.device).view(1, 3, 1, 1, 1)
+        return decoded.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
