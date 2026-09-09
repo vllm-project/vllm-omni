@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PersonaPlex pipeline: Talker (AR decode -> Mimi codebooks) -> Code2Wav (codebooks -> 24 kHz PCM).
 
 PersonaPlex is a Moshi finetune (full-duplex speech-to-speech). For offline/batch
@@ -32,10 +32,10 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
     model_arch="PersonaPlexTalkerForConditionalGeneration",
     default_deploy_config_name="personaplex.yaml",
     duplex_runtime_extension=(
-        "vllm_omni.experimental.fullduplex.personaplex.runtime_extension.PersonaPlexDuplexRuntimeExtension"
+        "vllm_omni.model_executor.models.personaplex.duplex.runtime_extension.PersonaPlexDuplexRuntimeExtension"
     ),
     duplex_serving_adapter=(
-        "vllm_omni.experimental.fullduplex.personaplex.serving_adapter.PersonaPlexServingRuntimeAdapter"
+        "vllm_omni.model_executor.models.personaplex.duplex.serving_adapter.PersonaPlexServingRuntimeAdapter"
     ),
     duplex_control_enabled=True,
     stages=(

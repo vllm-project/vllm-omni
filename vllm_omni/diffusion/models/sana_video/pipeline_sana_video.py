@@ -273,7 +273,8 @@ def retrieve_timesteps(
 
 
 def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
-    cache_backend = od_config.cache_backend
+    # Treat None like "none", matching the other pipelines' cache checks.
+    cache_backend = od_config.cache_backend or "none"
     if cache_backend not in ("none", "cache_dit"):
         raise NotImplementedError(
             f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
@@ -333,6 +334,9 @@ class SanaVideoPipeline(
     _encoder_modules = ["text_encoder"]
     _vae_modules = ["vae"]
     supports_step_execution = False
+    # Warmup must yield >= 4 latent frames on both VAE variants (temporal /4
+    # and /8) so every allowed SP degree has one frame per rank.
+    dummy_run_num_frames = 25
     default_num_inference_steps = 50
 
     def __init__(

@@ -39,9 +39,9 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     """
     if Path(model_ref).is_dir():
         return model_ref
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+    return hf_api().snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -143,6 +143,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     replace_runtime_additional_information = True
     requires_raw_input_tokens = True
     requires_request_ids = True
+    requires_exact_input_shape = True
     has_preprocess = False
     has_postprocess = False
 

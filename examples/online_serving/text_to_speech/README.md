@@ -14,6 +14,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 | --- | --- | --- | --- | --- | --- |
+| Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | `stream=true` response, non-chunk | uploaded audio voice only; no presets | — |
@@ -24,6 +25,7 @@ For the full list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
+| dots.tts | `dots-studio/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
@@ -96,6 +98,44 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## dots.tts
+
+Single-stage, text-only TTS at 48 kHz. The current integration supports
+no-reference synthesis; voice cloning, reference audio, named voices, and
+precomputed speaker embeddings are not supported yet.
+
+### Launch
+
+```bash
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
+```
+
+### Sending requests
+
+```bash
+# Non-streaming WAV
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a dots TTS online-serving test.",
+        "voice": "default",
+        "response_format": "wav"
+    }' --output output.wav
+
+# Streaming 48 kHz mono PCM
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a streaming dots TTS test.",
+        "voice": "default",
+        "stream": true,
+        "stream_format": "audio",
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
+```
 
 ---
 
@@ -214,15 +254,142 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
 
 ---
 
-## Fish Speech S2 Pro
+## Audio8 TTS Preview
 
-4B dual-AR TTS at 44.1 kHz. Server uses the DAC codec.
+0.6B DualAR TTS at 44.1 kHz, 11 languages, zero-shot voice cloning.
 
 ### Prerequisites
+None beyond the base install: the neural audio codec is implemented in tree and
+its weights (`codec.pth`) ship with the checkpoint.
+
+### Launch
+```bash
+vllm serve Audio8/Audio8-TTS-Preview-0.6b --omni --port 8092
+# or:
+./audio8_tts/run_server.sh
+```
+The deploy config auto-loads from `vllm_omni/deploy/audio8_tts.yaml` (HF
+`model_type` is `arktts`). Do **not** pass `--trust-remote-code`: vllm-omni
+registers its own `arktts` config, and transformers would otherwise prefer the
+checkpoint's remote code and bypass it.
+
+### Text-only synthesis
+```bash
+curl -X POST http://localhost:8092/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Welcome to Audio8 TTS.",
+        "response_format": "wav"
+    }' --output output.wav
+```
+
+### Voice cloning
+```bash
+curl -X POST http://localhost:8092/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Welcome to Audio8 TTS.",
+        "ref_audio": "https://example.com/reference.wav",
+        "ref_text": "The exact transcript of the reference recording."
+    }' --output cloned.wav
+```
+`ref_audio` also accepts a `data:audio/wav;base64,...` URL. `ref_text` is
+mandatory whenever `ref_audio` is present and must match the recording.
+Uploading a voice via `POST /v1/audio/voices` lets the server reuse the encoded
+reference codes across requests (`voice: "<name>"`).
+
+### Streaming
+```bash
+python audio8_tts/speech_client.py --text "Welcome to Audio8 TTS." --stream --output out.pcm
+ffplay -f s16le -ar 44100 -ac 1 out.pcm
+```
+
+### Gradio demo
+```bash
+./audio8_tts/run_gradio_demo.sh          # server + demo
+python audio8_tts/gradio_demo.py --api-base http://localhost:8092   # demo only
+```
+
+### Benchmark
 
 ```bash
-pip install fish-speech
+export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100   # required: harness defaults to 24 kHz
+vllm bench serve --omni --host 127.0.0.1 --port 8092 \
+    --model Audio8/Audio8-TTS-Preview-0.6b \
+    --backend openai-audio-speech --endpoint /v1/audio/speech \
+    --dataset-name seed-tts-text --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+    --seed-tts-locale en --num-prompts 20 --num-warmups 2 \
+    --max-concurrency 1 --request-rate inf \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun
 ```
+
+Measured on 1x H20 **shared with an unrelated job holding ~80% SM**, so treat
+these as a lower bound. 20 prompts from `seed_tts_smoke/en`, mean audio 4.5 s,
+deploy defaults:
+
+| | HF reference (batch=1) | vllm-omni c=1 | c=4 | c=8 |
+|---|---|---|---|---|
+| RTF (mean) | 1.008 | **0.19** | 0.30 | 0.54 |
+| Throughput (req/s) | 0.23 | 1.18 | 2.84 | **2.93** |
+| E2E latency (mean, ms) | 4375 | 850 | 1349 | 2361 |
+| Time to first packet (mean, ms) | n/a (no streaming) | 63 | 105 | 1124 |
+| Underrun p99 / continuity OK | n/a | 0 s / 100% | 0 s / 100% | 0 s / 100% |
+
+~5.3x lower per-request RTF than the upstream reference implementation at
+concurrency 1, ~12.8x aggregate throughput at concurrency 8.
+
+#### Stage-0 `max_num_seqs`: first-packet vs throughput
+
+This subsection is operator tuning guidance, not a claim this PR optimizes
+anything: the shipped deploy default is unchanged (`max_num_seqs: 4`). The
+numbers below are a single run on the same contended H20 as above (one unrelated
+job holding ~80% SM, no repeats), so read them as directional, not as measured
+speedups. Same setup, varying stage 0's `max_num_seqs` (stage 1 stays at 1):
+
+| stage-0 `max_num_seqs` | client concurrency | req/s | RTF | TTFP mean / p99 (ms) | underrun p99 (s) |
+|---|---|---|---|---|---|
+| 4 (default) | 1 | 1.18 | 0.19 | 63 / 67 | 0.00 |
+| 4 | 4 | 2.84 | 0.30 | 105 / 148 | 0.00 |
+| 4 | 8 | 2.93 | 0.54 | 1124 / 1642 | 0.00 |
+| 8 | 1 | 1.16 | 0.19 | 64 / 70 | 0.00 |
+| 8 | 4 | 2.88 | 0.30 | 107 / 148 | 0.00 |
+| 8 | 8 | **3.72** | 0.40 | **247** / 733 | 0.22 |
+| 8 | 16 | 3.91 | 0.65 | 1366 / 2530 | 0.29 |
+
+Reading of this:
+
+- Below the limit (`concurrency <= max_num_seqs`) the setting is irrelevant, as
+  expected — c=1 and c=4 are identical for both.
+- At c=8, raising the limit to 8 admits every request instead of queueing half
+  of them: in this single run, roughly +27% throughput and ~4.5x lower
+  first-packet latency.
+- Throughput saturates around 3.7-3.9 req/s (~17 s of audio per second). Past
+  c=8 you only buy queueing delay.
+- The cost of admitting more streams is a 0.22-0.29 s worst-case buffer deficit
+  in 1 of 20 requests (`Streaming continuity OK rate` 95%), because stage 1 runs
+  `max_num_seqs: 1` and the codec window round-robins across streams. Client-side
+  prebuffering (the bundled Gradio demo holds 2 chunks) absorbs that; raising
+  stage 1's `max_num_seqs` is the untested knob if you need both.
+
+The shipped default stays at 4 because every measured point there had zero
+underrun. Raise it to 8 if first-packet latency under load matters more than a
+rare sub-300 ms gap.
+
+### Notes
+- Output: 44.1 kHz mono; ~21.5 codec frames per second.
+- No built-in speaker presets. Omit `voice` for a random timbre, or clone one.
+- `max_new_tokens` caps generated codec frames (1 frame ~= 46 ms).
+- Context is 2048 packed text+audio positions (`max_model_len: 2048`).
+- Do not send `temperature: 0`: greedy decoding is degenerate for this
+  checkpoint and truncates the utterance. The deploy defaults
+  (0.7 / top_k 50 / top_p 0.9) mirror `generation_config.json`.
+
+---
+
+## Fish Speech S2 Pro
+
+4B dual-AR TTS at 44.1 kHz. Server uses the DAC codec, which is vendored in
+vLLM-Omni (no extra packages required).
 
 ### Kvcache attention fast path
 
@@ -629,11 +796,19 @@ Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and
 
 ### Streaming WebSocket
 
-The `/v1/audio/speech/stream` endpoint accepts text incrementally and synthesizes the buffered text as one continuous request on `input.done`:
+The `/v1/audio/speech/stream` endpoint accepts text incrementally and, by default, synthesizes the buffered text as one continuous request on `input.done`:
 
 ```bash
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1
+```
+
+For per-sentence audio (including Indic danda `।`) before `input.done`:
+
+```bash
+python qwen3_tts/streaming_speech_client.py \
+    --text "नमस्ते। कैसे हो?" \
+    --split-granularity sentence
 ```
 
 `input.done` flushes without closing, so repeating `--text` synthesizes several utterances over one connection:

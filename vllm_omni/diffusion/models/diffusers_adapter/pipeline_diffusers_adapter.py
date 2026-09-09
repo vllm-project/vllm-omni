@@ -237,6 +237,13 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def _raise_unsupported_features(self) -> None:
         """Raise an error for incompatible feature switches."""
+        if self.od_config.diffusion_offload_config is not None:
+            raise NotImplementedError(
+                "diffusion_offload_config is not supported with the diffusers backend. "
+                "Its component selectors cannot be represented by Diffusers' pipeline-wide "
+                "CPU-offload hooks. Use the legacy enable_cpu_offload or "
+                "enable_layerwise_offload option, or use a native pipeline."
+            )
         pc = self.od_config.parallel_config
         if pc.tensor_parallel_size > 1:
             raise NotImplementedError(

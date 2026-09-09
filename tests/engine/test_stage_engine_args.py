@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from pydantic.fields import FieldInfo
+from transformers import Qwen3OmniMoeConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import LoadConfig as VllmLoadConfig
@@ -19,6 +20,7 @@ from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
 
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
     _LLM_STAGE_ENGINE_FIELDS,
     OmniStageCacheConfig,
@@ -104,7 +106,6 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
 def _stable_engine_arg_environment(monkeypatch, tmp_path):
     from vllm_omni import platforms
 
-    monkeypatch.delenv("VLLM_USE_FLASHINFER_MOE_FP16", raising=False)
     xcodec_model = tmp_path / "xcodec-model"
     xcodec_model.mkdir()
     monkeypatch.setenv("XCODEC1_PATH", str(xcodec_model))
@@ -135,6 +136,63 @@ def _stable_engine_arg_environment(monkeypatch, tmp_path):
         worker_module = types.ModuleType(f"test.{worker_type}")
         setattr(worker_module, "Worker", _TestWorker)
         monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+
+def test_qwen3_omni_defaults_to_triton_moe_backend():
+    engine_args = {"model_arch": "Qwen3OmniMoeForConditionalGeneration"}
+
+    stage_init_utils._maybe_set_qwen3_omni_moe_backend(engine_args)
+
+    assert engine_args["moe_backend"] == "triton"
+
+
+def test_qwen3_omni_preserves_explicit_moe_backend():
+    engine_args = {
+        "model_arch": "Qwen3OmniMoeForConditionalGeneration",
+        "moe_backend": "flashinfer",
+    }
+
+    stage_init_utils._maybe_set_qwen3_omni_moe_backend(engine_args)
+
+    assert engine_args["moe_backend"] == "flashinfer"
+
+
+def test_qwen3_omni_preserves_explicit_auto_moe_backend():
+    engine_args = {
+        "model_arch": "Qwen3OmniMoeForConditionalGeneration",
+        "moe_backend": "auto",
+    }
+
+    stage_init_utils._maybe_set_qwen3_omni_moe_backend(engine_args)
+
+    assert engine_args["moe_backend"] == "auto"
+
+
+def test_qwen3_omni_nvfp4_ci_config_preserves_auto_moe_backend(tmp_path):
+    """The NVFP4 CI deploy opts stage 0 into vLLM's auto backend selection."""
+    hf_config = Qwen3OmniMoeConfig(enable_audio_output=True)
+    pipeline = resolve_pipeline_config("qwen3_omni_moe", hf_config)
+    assert pipeline is not None
+    nvfp4_deploy = modify_stage_config(
+        get_deploy_config_path("ci/qwen3_omni_moe.yaml"),
+        updates={"stages": {0: {"moe_backend": "auto"}}},
+    )
+    deploy = load_deploy_config(nvfp4_deploy)
+    legacy_stages = merge_pipeline_deploy(pipeline, copy.deepcopy(deploy))
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+        cli_overrides={"model": str(tmp_path)},
+    )
+
+    for stage_id, expected_backend in ((0, "auto"), (1, "triton")):
+        legacy_stage = next(stage for stage in legacy_stages if stage.stage_id == stage_id)
+        typed_stage = omni_config.stage_by_id(stage_id)
+        for engine_args in (
+            build_engine_args_dict(legacy_stage.to_omegaconf(), str(tmp_path)),
+            build_engine_args_dict_from_omni_stage_config(typed_stage, str(tmp_path)),
+        ):
+            assert engine_args["moe_backend"] == expected_backend
 
 
 def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, str]:
@@ -517,6 +575,8 @@ def test_typed_engine_args_preserve_explicit_backend_default_overrides(tmp_path)
 
     assert {name: legacy_args[name] for name in expected} == expected
     assert {name: typed_args[name] for name in expected} == expected
+    assert legacy_args["moe_backend"] == "triton"
+    assert typed_args["moe_backend"] == "triton"
 
 
 @pytest.mark.parametrize("stage_scoped", [False, True], ids=["global", "stage-scoped"])

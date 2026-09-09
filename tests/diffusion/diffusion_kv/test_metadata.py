@@ -8,8 +8,81 @@ from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
     DiffusionKVSequenceMetadata,
 )
+from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_native_request_metadata_round_trips_and_stays_optional() -> None:
+    params = {
+        "transfer_id": "xfer-req-0",
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": "dit-engine-0",
+    }
+    kv_request = DiffusionKVRequest(
+        "req-0/diffusion-kv/0",
+        sequence_id=0,
+        prefix_len=4,
+        target_len=2,
+        seq_len=6,
+        kv_transfer_params=params,
+        prompt_token_ids=[0] * 6,
+    )
+    public_request = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="req-0",
+        kv_transfer_params=params,
+    )
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=0,
+        num_waiting_reqs=0,
+    )
+
+    assert kv_request.kv_transfer_params is params
+    assert kv_request.prompt_token_ids == [0] * 6
+    assert public_request.kv_transfer_params is params
+    assert scheduler_output.kv_connector_metadata is None
+
+
+class _MetadataScheduler(BaseScheduler):
+    def update_from_output(self, sched_output, output) -> set[str]:
+        del sched_output, output
+        return set()
+
+
+def test_scheduler_copies_opaque_params_to_sequence_requests() -> None:
+    params = {"transfer_id": "xfer-req-0", "do_remote_prefill": True}
+    sequence = DiffusionKVRequest(
+        "req-0/diffusion-kv/0",
+        sequence_id=0,
+        prefix_len=4,
+        target_len=2,
+        seq_len=6,
+    )
+    request = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="req-0",
+        diffusion_kv_requests=(sequence,),
+        kv_transfer_params=params,
+    )
+    scheduler = _MetadataScheduler()
+    scheduler._diffusion_kv_manager = object()
+
+    state = scheduler._make_request_state("req-0", request)
+
+    assert state.diffusion_kv_requests[0].kv_transfer_params == params
+    assert state.diffusion_kv_requests[0].kv_transfer_params is not params
 
 
 def test_diffusion_kv_metadata_uses_native_cache_group_block_ids() -> None:

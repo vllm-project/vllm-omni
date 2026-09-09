@@ -10,11 +10,11 @@ from diffusers.loaders.lora_conversion_utils import (
     _convert_non_diffusers_qwen_lora_to_diffusers,
     _convert_non_diffusers_wan_lora_to_diffusers,
 )
-from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -131,7 +131,7 @@ def _load_lora_state_dict(
 
     # finally, we try to load it from the internet
     try:
-        model_file = hf_hub_download(
+        model_file = hf_api().hf_hub_download(
             pretrained_model_name_or_path,
             filename=weights_name,
             subfolder=subfolder,
@@ -209,6 +209,7 @@ class LoraLoaderMixin:
     # Set by the pipeline this mixin is combined with; annotated, not assigned.
     transformer: torch.nn.Module
     _lora_loaded: dict[str | None, dict[str, torch.Tensor]]
+    _lora_is_fused: bool
 
     # Lazy initialization to avoid MRO issues: __init__ may not be called
     # when mixin with nn.Module
@@ -221,6 +222,18 @@ class LoraLoaderMixin:
     @lora_loaded.setter
     def lora_loaded(self, value):
         self._lora_loaded = value
+
+    @property
+    def lora_is_fused(self) -> bool:
+        """True when LoRA weights are fused into base weights.
+
+        Mixin loads are in-place fusions, so non-empty `_lora_loaded` implies fused.
+        """
+        return getattr(self, "_lora_is_fused", False) or bool(getattr(self, "_lora_loaded", None))
+
+    @lora_is_fused.setter
+    def lora_is_fused(self, value: bool):
+        self._lora_is_fused = value
 
     @classmethod
     def load_lora_into_module(

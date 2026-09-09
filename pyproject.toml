@@ -53,7 +53,9 @@ dev = [
     "soundfile==0.14.0",
     "imageio[ffmpeg]==2.37.4",
     "opencv-python==5.0.0.93",
-    "mooncake-transfer-engine-cuda13==0.3.11.post1",
+    # 0.3.12 includes acknowledged TCP writes (Mooncake #2850): completion
+    # must mean the receive buffer is ready before zero-copy consumers read it.
+    "mooncake-transfer-engine-cuda13==0.3.12.post1",
     "av==18.0.0", # for ComfyUI tests
     "openpyxl==3.1.5", # for nightly CI
     "pyttsx3==2.99",
@@ -75,7 +77,6 @@ dev = [
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
-    "silero-vad==6.1", # Realtime server-VAD duplex E2E
 ]
 
 demo = [
@@ -85,9 +86,6 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
-server-vad = [
-    "silero-vad==6.1",
-]
 
 forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
@@ -351,6 +349,8 @@ extend-ignore-re = [
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
+# Einstein-summation index tuple for head/expert/dimension axes.
+hed = "hed"
 semantics = "semantics"
 fullset = "fullset"
 Vai = "Vai"
@@ -374,3 +374,7 @@ ba = "ba"
 SER = "SER"
 # NumPy ndarray.flags.writeable (canonical flag name, not "writable").
 writeable = "writeable"
+# "convnet" abbreviates convolutional network. It appears in the vendored Fish
+# Speech DAC codec identifiers (convnet_type, transconvnet_type) and is not a
+# typo of "convent".
+convnet = "convnet"

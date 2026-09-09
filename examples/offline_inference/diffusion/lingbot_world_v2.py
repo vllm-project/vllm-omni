@@ -30,7 +30,6 @@ from typing import Any
 import numpy as np
 
 _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
-_NUM_INFERENCE_STEPS = 4
 _MAX_SEQUENCE_LENGTH = 512
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_RAW_FRAMES = 117
@@ -209,7 +208,6 @@ def build_request(
         "height": args.height,
         "width": args.width,
         "num_frames": args.num_frames,
-        "num_inference_steps": _NUM_INFERENCE_STEPS,
         "max_sequence_length": _MAX_SEQUENCE_LENGTH,
         "seed": args.seed,
         "fps": args.fps,
