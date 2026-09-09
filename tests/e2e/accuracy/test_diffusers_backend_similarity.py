@@ -49,16 +49,25 @@ from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter imp
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
-def _set_matched_attention_backend(pipe: DiffusionPipeline) -> None:
-    """Walk the same backend chain the omni server's diffusers adapter walks.
+def _flash_attempt_backends() -> list[str]:
+    """Backends in ``CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS`` that can actually launch.
 
-    The server side (--diffusion-load-format diffusers) resolves its attention
-    backend through the adapter's preference chain, skipping backends that are
-    unavailable on the image (e.g. the FA3 hub kernel has no build variant for
-    the image's torch — build 2953). The reference run must resolve to the
-    same backend or the similarity comparison measures kernel differences.
+    Those names are Hopper FA2/FA3. ``set_attention_backend`` only checks import,
+    so a newer GPU still "selects" them and then dies with "no kernel image".
+    Do not probe by launching: a missing cubin can leave the CUDA context dead.
+    Capability >= 10 is outside that wheel, including future SKUs in that family.
     """
-    for backend in CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS:
+    if not torch.cuda.is_available():
+        return []
+    major, _ = torch.cuda.get_device_capability()
+    if major >= 10:
+        return []
+    return list(CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS)
+
+
+def _set_matched_attention_backend(pipe: DiffusionPipeline) -> None:
+    """Pick a Diffusers attention backend the reference run can actually execute."""
+    for backend in _flash_attempt_backends():
         try:
             pipe.transformer.set_attention_backend(backend)
             return
@@ -164,6 +173,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=FLOW_SHIFT)
         pipe.to("cuda")
+        _set_matched_attention_backend(pipe)
 
         _diffusers_dummy_run(pipe)
 
