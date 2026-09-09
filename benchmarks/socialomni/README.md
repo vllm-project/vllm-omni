@@ -34,7 +34,8 @@ prefix cache. Start a text-output server:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --host 127.0.0.1 --port 8091 \
-    --deploy-config vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_thinking.yaml \
+    --max-model-len 65536
 ```
 
 The upstream deployment configuration uses two GPUs and text output only,
@@ -145,6 +146,26 @@ selection checks the evaluation flow, not representative model quality.
 This run used vLLM 0.28.0, PyTorch 2.13.0+cu130, and Transformers 5.14.1.
 Judge latency depends on the provider and its load; elapsed time also depends
 on video duration, prefix cache state, and request concurrency.
+
+A full run with the same deployment processed all 2,000 Level 1 and 209
+Level 2 samples in 76.3 minutes, including prefix preparation and judging.
+All 2,342 measured model requests and 399 judge requests succeeded, with no
+unparsable answers. Level 1 accuracy was 74.40%. Level 2 results were:
+
+| Metric | All 209 samples | First 200 samples |
+| ------ | --------------- | ----------------- |
+| When accuracy | 60.29% | 60.50% |
+| `QGold` | 53.57 | 52.86 |
+| `QEns` | 52.96 | 52.17 |
+| `Cov+` | 93.23% | 92.97% |
+| `QEns_joint` | 49.37 | 48.50 |
+
+The run used benchmark commit `0c96505280b1` and model snapshot
+`ea64d566a2a0731823dc44965e7f89bad78f95cb`, with model concurrency 1, one warmup
+per model phase, and judge concurrency 2/2/1 for GPT-4o/Gemini/Qwen3-Omni.
+These are observed results for this deployment, not a cross-framework
+performance comparison. The full command is the mini command above with
+`--mini` removed; set the judge concurrency values in `judges.json` accordingly.
 
 `--max-concurrency` bounds model requests. Each non-empty model phase runs one
 warmup request per configured concurrent worker; `--warmup N` overrides this
