@@ -362,6 +362,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
+        omni_conn_out = getattr(model_runner_output, "omni_connector_output", None)
+        _omni_connector_info = getattr(omni_conn_out, "connector_info", None) if omni_conn_out else None
 
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
 
@@ -532,6 +534,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         self.chunk_transfer_adapter.segment_finished_requests.discard(req_id)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    if kv_transfer_params is None and _omni_connector_info is not None:
+                        kv_transfer_params = _omni_connector_info
                     if self.chunk_transfer_adapter is not None:
                         self.chunk_transfer_adapter.cleanup(
                             request.request_id,
@@ -597,6 +601,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             ec_transfer_params = None
             if finished:
                 kv_transfer_params, ec_transfer_params = self._free_request(request)
+                if kv_transfer_params is None and _omni_connector_info is not None:
+                    kv_transfer_params = _omni_connector_info
                 if self.chunk_transfer_adapter is not None:
                     self.chunk_transfer_adapter.cleanup(
                         request.request_id,

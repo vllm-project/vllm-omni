@@ -34,6 +34,7 @@ class OmniConnectorOutput:
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
+    connector_info: dict | None = None
 
 
 @dataclass
