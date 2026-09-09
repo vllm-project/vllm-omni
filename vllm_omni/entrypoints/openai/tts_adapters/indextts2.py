@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 serving adapter."""
 
 from __future__ import annotations
@@ -100,6 +101,7 @@ def indextts2_conditioning_cache_salt(
         "voice",
         "voice_name",
         "voice_created_at",
+        "voice_cache_key",
         "emo_audio",
         "emo_vector",
         "emo_alpha",
@@ -265,6 +267,12 @@ class IndexTTS2Adapter(ARTTSAdapter):
             wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio_source)
             params["voice"] = [[wav_list, sr]]
             params["ref_audio_cache_key"] = [cache_key]
+            # Forward the decoded-audio identity so Stage 0 can reuse Wav2Vec,
+            # CAMPPlus, and reference-mel artifacts.
+            get_artifact_key = getattr(server, "_get_resolved_ref_audio_artifact_key", None)
+            artifact_key = get_artifact_key(cache_key) if callable(get_artifact_key) else None
+            if artifact_key and not using_uploaded_voice:
+                params["voice_cache_key"] = [artifact_key]
         if using_uploaded_voice and voice_lower:
             params["voice_name"] = [voice_lower]
             params["voice_created_at"] = [server._voice_created_at(voice_lower)]

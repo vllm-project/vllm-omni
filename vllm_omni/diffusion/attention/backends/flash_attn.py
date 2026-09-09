@@ -19,6 +19,66 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _run_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run the selected packed kernel and normalize FA2/FA3 output forms."""
+    from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+
+    if flash_attn_varlen_func is None:
+        raise ImportError("Variable-length attention requires flash_attn_varlen_func")
+    out = flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+        softmax_scale=softmax_scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+# vLLM's bundled FA2/FA3 operators have no Meta implementation. Keep only
+# the kernel opaque; packing, projections, and output reshaping remain compiled.
+# Match other attention backends' idempotent registration for test re-imports.
+if not hasattr(torch.ops.vllm_omni, "flash_attn_varlen_forward"):
+    _varlen_attention_op = torch.library.custom_op(
+        "vllm_omni::flash_attn_varlen_forward", _run_varlen_attention, mutates_args=()
+    )
+
+    @_varlen_attention_op.register_fake
+    def _varlen_attention_fake(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, softmax_scale):
+        return q.new_empty((q.shape[0], q.shape[1], v.shape[-1]))
+
+
+def _compiled_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Preserve eager dispatch while providing a forward-only compile boundary."""
+    kernel = torch.ops.vllm_omni.flash_attn_varlen_forward if torch.compiler.is_compiling() else _run_varlen_attention
+    return kernel(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, softmax_scale)
+
+
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
@@ -177,7 +237,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_length_q = query_length
             indices_q = None
 
-        out_unpad = flash_attn_varlen_func(
+        out_unpad = _compiled_varlen_attention(
             q,
             k,
             v,
@@ -185,10 +245,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             cu_seqlens_k=cu_seq_lens_k,
             max_seqlen_q=max_length_q,
             max_seqlen_k=max_length_k,
-            **{
-                "causal": self.causal,
-                "softmax_scale": self.softmax_scale,
-            },
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
         if indices_q is None:
@@ -221,7 +279,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
             raise ValueError("Packed variable-length attention currently requires batch size 1")
 
-        out = flash_attn_varlen_func(
+        out = _compiled_varlen_attention(
             q=query.flatten(0, 1),
             k=key.flatten(0, 1),
             v=value.flatten(0, 1),
@@ -264,7 +322,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         key = key.flatten(0, 1)
         value = value.flatten(0, 1)
 
-        out = flash_attn_varlen_func(
+        out = _compiled_varlen_attention(
             q=query,
             k=key,
             v=value,

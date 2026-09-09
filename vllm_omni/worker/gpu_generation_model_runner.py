@@ -153,6 +153,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
+            model_work_fn = getattr(self, "_execute_scheduled_model_work", None)
+            if model_work_fn is not None:
+                model_work_output = model_work_fn(scheduler_output, deferred_state_corrections_fn)
+                if model_work_output is not NotImplemented:
+                    return model_work_output
+
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,

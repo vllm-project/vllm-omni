@@ -1419,7 +1419,7 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
-    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
     assert od_config.kv_transfer_config.engine_id == "dit-engine-1"
 
