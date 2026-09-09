@@ -13,6 +13,11 @@ stages:
     # without compilation: the dual-expert (und/gen) routing is captured with
     # the dummy all-text mask and replays the wrong expert during t2i decode.
     enforce_eager: false
+    # Async scheduling is unsafe for embed-early multimodal models: the input
+    # embedding runs during input prep, before the previous step's sampled
+    # token id is written back, and gathers the -1 sentinel (OOB crash at
+    # batch >= 8). Keep it off until embed-early is made async-safe.
+    async_scheduling: false
     trust_remote_code: true
     enable_prefix_caching: false
 
