@@ -17,9 +17,8 @@ To add a new pipeline:
 
 Out of tree pipeline configs or resolvers can also be registered with register_pipeline.
 
-NOTE: Single-stage diffusion models continue to use the
-``_create_default_diffusion_stage_cfg`` fallback in
-``async_omni_engine.py``; for now we do not add them to registry.
+NOTE: Generic single-stage diffusion is selected by ``config.resolver`` when
+no registered Omni pipeline matches.
 """
 
 from __future__ import annotations
@@ -67,6 +66,9 @@ from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO
 from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS2_PIPELINE,
     INDEXTTS25_PIPELINE,
+)
+from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
@@ -123,6 +125,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
+    "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,

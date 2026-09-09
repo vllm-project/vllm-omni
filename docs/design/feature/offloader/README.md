@@ -53,6 +53,11 @@ must use distinct hook names and remove only hooks they own.
 
 ## Discovery and topology
 
+`resolve_offload_plan(pipeline, config)` is the single topology entry point.
+Every backend calls it once when `enable()` starts and then consumes the
+resolved components, block stacks, resident heads, and staged-residency flags
+it returns. Backends do not re-read model declarations.
+
 Pipeline component discovery prefers `SupportsComponentDiscovery` declarations:
 
 - `_dit_modules`;
@@ -61,16 +66,26 @@ Pipeline component discovery prefers `SupportsComponentDiscovery` declarations:
 - `_resident_modules`.
 
 Dotted paths are supported. Legacy pipelines may use the fallback scan of
-well-known attribute names, but new integrations should declare components
-explicitly.
+well-known attribute names; it now warns once per pipeline class, and new
+integrations must declare components explicitly.
 
-Both layerwise backends first consume pipeline `OffloadPlan` metadata. A
-plan's `block_attrs` maps each DiT path to its ordered block containers, while
-`encoder_block_attrs` declares streamable encoder stacks. DiTs absent from the
-plan fall back to `_layerwise_offload_blocks_attrs` (including the deprecated
-singular-name compatibility path). Discovery metadata describes structure
-only; the backend remains responsible for transfer, synchronization, and
-storage ownership.
+Block topology comes from the pipeline `OffloadPlan` first: `block_attrs` maps
+each DiT path to its ordered block containers, `encoder_block_attrs` declares
+streamable encoder stacks, `on_demand_component_paths` marks pipeline-managed
+residency, `resident_dit_paths` marks the DiTs that may hold resident layers,
+and `encoder_dlo_weight_replication` marks the encoders whose loader-produced
+weights are safe for AllGather. DiTs absent from the plan fall back to
+`_layerwise_offload_blocks_attrs` (including the deprecated singular-name
+compatibility path).
+
+The resolver is pure: it moves no tensor, installs no hook, writes no module
+attribute, and reads no process group — multi-rank facts come from
+`OffloadConfig`. It owns topology validation, so a configuration the model
+cannot serve fails before the first component is placed. Explicit component
+selection turns every declaration problem into an error, while the
+compatibility topology (no component selector) keeps the historical
+warn-and-skip behavior. Metadata still describes structure only; the backend
+remains responsible for transfer, synchronization, and storage ownership.
 
 ## Cross-strategy invariants
 

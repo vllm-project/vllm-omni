@@ -6,7 +6,6 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +36,7 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     pipeline_cfg_resolver,
 )
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -451,13 +451,8 @@ class TestStageConfigFactory:
 
     def test_default_diffusion_with_parallel_config(self):
         """Test diffusion config calculates devices from parallel_config."""
-
-        @dataclass
-        class MockParallelConfig:
-            world_size: int = 4
-
         kwargs = {
-            "parallel_config": MockParallelConfig(),
+            "parallel_config": DiffusionParallelConfig(tensor_parallel_size=4),
             "cache_backend": "tea_cache",
         }
         configs = StageConfigFactory.create_default_diffusion(kwargs)
@@ -1602,7 +1597,7 @@ stages:
         assert stage.max_model_len == 1024
         assert stage.max_num_batched_tokens == 1024
         assert stage.max_num_seqs == 1
-        assert stage.gpu_memory_utilization == 0.7
+        assert stage.gpu_memory_utilization == 0.8
         assert stage.skip_mm_profiling is True
         assert stage.enforce_eager is True
         assert stage.async_scheduling is False

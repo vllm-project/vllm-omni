@@ -3,6 +3,7 @@
 
 import json
 import sys
+from contextlib import contextmanager
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -176,9 +177,9 @@ def _write_partition_index(path, *, partition, tasks):
 
 
 def test_modular_diffusers_index_is_resolved_generically(tmp_path):
+    from vllm_omni.config.resolver import resolve_omni_config
     from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
     from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
-    from vllm_omni.entrypoints.utils import resolve_model_config_path
 
     (tmp_path / "modular_model_index.json").write_text(
         json.dumps(
@@ -192,7 +193,16 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
 
     assert is_diffusion_model(str(tmp_path))
     assert resolve_model_class_name(str(tmp_path)) == "MiniMaxH3ModularPipeline"
-    assert resolve_model_config_path(str(tmp_path)) is None
+    resolved = resolve_omni_config(
+        str(tmp_path),
+        trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides=None,
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    assert resolved.config_path is None
+    assert resolved.stage_by_id(0).engine_args.model_class_name == "MiniMaxH3ModularPipeline"
 
     config = OmniDiffusionConfig(model=str(tmp_path))
     config.enrich_config()
@@ -1548,6 +1558,97 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     )
 
     assert next(video_vae.parameters()).dtype == torch.float32
+
+
+def test_keyframe_encode_pins_and_restores_cudnn_settings():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        _minimax_h3_keyframe_encode_context,
+    )
+
+    cudnn = torch.backends.cudnn
+    original = (
+        cudnn.enabled,
+        cudnn.benchmark,
+        cudnn.deterministic,
+        cudnn.allow_tf32,
+    )
+    try:
+        cudnn.enabled = False
+        cudnn.benchmark = True
+        cudnn.deterministic = False
+        cudnn.allow_tf32 = False
+
+        with _minimax_h3_keyframe_encode_context(torch.device("cuda")):
+            assert cudnn.enabled
+            assert not cudnn.benchmark
+            assert cudnn.deterministic
+            assert cudnn.allow_tf32
+
+        assert not cudnn.enabled
+        assert cudnn.benchmark
+        assert not cudnn.deterministic
+        assert not cudnn.allow_tf32
+    finally:
+        (
+            cudnn.enabled,
+            cudnn.benchmark,
+            cudnn.deterministic,
+            cudnn.allow_tf32,
+        ) = original
+
+
+@pytest.mark.parametrize("fail_encode", [False, True])
+def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    events = []
+    input_image = Image.new("RGB", (32, 32))
+
+    @contextmanager
+    def track_context(device):
+        assert device == torch.device("cpu")
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.parallel_tiling = True
+
+        def encode_images(self, image, *, use_fp16_latent):
+            assert events == ["enter"]
+            assert image is input_image
+            assert use_fp16_latent
+            events.append("encode")
+            if fail_encode:
+                raise RuntimeError("encode failed")
+            return [torch.ones(1, 1, 2, 2)]
+
+    video_vae = object.__new__(vae_module.MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(video_vae)
+    video_vae.model = FakeModel()
+    video_vae.config_dict = {
+        "latent_channels": 1,
+        "latents_mean": [0.0],
+        "latents_std": [1.0],
+    }
+    monkeypatch.setattr(vae_module, "_minimax_h3_keyframe_encode_context", track_context)
+
+    if fail_encode:
+        with pytest.raises(RuntimeError, match="encode failed"):
+            video_vae.encode_image(input_image)
+    else:
+        rows = video_vae.encode_image(input_image)
+        torch.testing.assert_close(rows, torch.ones(1, 4))
+
+    assert events == ["enter", "encode", "exit"]
+    assert video_vae.model.parallel_tiling
 
 
 def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
