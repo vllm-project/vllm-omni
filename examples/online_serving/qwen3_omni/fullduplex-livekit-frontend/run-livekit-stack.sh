@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Runs the frontend, LiveKit server, and agent together; exits (and tears
 # down the other two) the moment any one of them exits.
 #
@@ -19,17 +22,29 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FRONTEND_DIR="$SCRIPT_DIR/agent-starter-react"
 LOG_DIR="/tmp/livekit"
 
+if command -v pnpm >/dev/null 2>&1; then
+	NODE_PM=pnpm
+elif command -v npm >/dev/null 2>&1; then
+	NODE_PM=npm
+else
+	echo "pnpm or npm is required; aborting." >&2
+	exit 1
+fi
+
 mkdir -p "$LOG_DIR"
 
 if [ ! -d "$FRONTEND_DIR" ]; then
-	read -rp "agent-starter-react not found at $FRONTEND_DIR. Clone it now and install Node dependecies? [y/N] " reply
+	read -rp "agent-starter-react not found at $FRONTEND_DIR. Clone it now and install Node dependencies? [y/N] " reply
 	if [[ "$reply" =~ ^[Yy]$ ]]; then
 		git clone https://github.com/livekit-examples/agent-starter-react.git "$FRONTEND_DIR"
-		(cd "$FRONTEND_DIR" && pnpm install)
 	else
 		echo "agent-starter-react is required; aborting." >&2
 		exit 1
 	fi
+fi
+
+if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
+	(cd "$FRONTEND_DIR" && "$NODE_PM" install)
 fi
 
 if ! command -v livekit-server >/dev/null 2>&1; then
@@ -42,12 +57,13 @@ if ! command -v livekit-server >/dev/null 2>&1; then
 	fi
 fi
 
-if command -v uvx; then
-	PYX_CMD=uv
-elif command -v pipx; then
-	PYX_CMD=pipx
+if command -v uv >/dev/null 2>&1; then
+	PYX_CMD=(uv run)
+elif command -v pipx >/dev/null 2>&1; then
+	PYX_CMD=(pipx run)
 else
-	echo "either of uvx or pipx is required; aborting." >&2
+	echo "uv or pipx is required; aborting." >&2
+	exit 1
 fi
 
 pkill -f 'livekit-server --dev' 2>/dev/null
@@ -57,6 +73,7 @@ pids=()
 names=()
 logs=()
 
+# shellcheck disable=SC2329 # only invoked indirectly, via the trap below
 cleanup() {
     for pid in "${pids[@]}"; do
         kill "$pid" 2>/dev/null
@@ -65,13 +82,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-(cd "$FRONTEND_DIR" && pnpm dev) > "$LOG_DIR/frontend.log" 2>&1 &
+(cd "$FRONTEND_DIR" && "$NODE_PM" run dev) > "$LOG_DIR/frontend.log" 2>&1 &
 pids+=("$!"); names+=("frontend"); logs+=("$LOG_DIR/frontend.log")
 
 livekit-server --dev > "$LOG_DIR/server.log" 2>&1 &
 pids+=("$!"); names+=("server"); logs+=("$LOG_DIR/server.log")
 
-($PYX_CMD run agent.py start) > "$LOG_DIR/agent.log" 2>&1 &
+("${PYX_CMD[@]}" agent.py start) > "$LOG_DIR/agent.log" 2>&1 &
 pids+=("$!"); names+=("agent"); logs+=("$LOG_DIR/agent.log")
 
 echo "frontend pid=${pids[0]} -> $LOG_DIR/frontend.log"

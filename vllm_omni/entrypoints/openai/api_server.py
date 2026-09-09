@@ -1895,15 +1895,19 @@ async def realtime_websocket(websocket: WebSocket):
         return
 
     model_name = state.openai_serving_models.base_model_paths[0].name
+    # Some OpenAI-compatible clients always send ``model=`` even when the
+    # caller leaves model selection to this single-model Omni server.
     requested_model = websocket.query_params.get("model")
-    if requested_model is not None and requested_model != model_name:
+    if requested_model and requested_model != model_name:
         await _reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
         return
 
+    tokenizer = await state.engine_client.get_tokenizer()
     connection = OpenAIFullDuplexConnection(
         websocket=websocket,
         engine=state.engine_client,
         model_name=model_name,
+        tokenizer=tokenizer,
         tool_call_parser=getattr(state.args, "tool_call_parser", None),
         enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
     )

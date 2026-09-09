@@ -1,0 +1,55 @@
+name: vllm-omni-livekit
+
+services:
+  livekit:
+    build:
+      context: .
+      dockerfile: Dockerfile.livekit
+      args:
+        LIVEKIT_REF: ${LIVEKIT_REF:-v1.10.1}
+    command:
+      - --config
+      - /etc/livekit.yaml
+      - --dev
+      - --node-ip
+      - ${LIVEKIT_NODE_IP:-127.0.0.1}
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "${LIVEKIT_HTTP_PORT:-7880}:7880"
+      - "${LIVEKIT_TCP_PORT:-7881}:7881/tcp"
+      - "${LIVEKIT_UDP_PORT:-7882}:7882/udp"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        FRONTEND_REF: ${FRONTEND_REF:-main}
+    environment:
+      NODE_ENV: development
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL:-ws://localhost:7880}
+      AGENT_NAME: ${AGENT_NAME:-}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - livekit
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    environment:
+      VLLM_OMNI_HOST: ${VLLM_OMNI_HOST:-host.docker.internal}
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      - livekit
+    restart: unless-stopped
