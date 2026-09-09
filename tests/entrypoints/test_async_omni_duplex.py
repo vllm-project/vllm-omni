@@ -1,21 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.engine.messages import OutputMessage
-from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.messages import DuplexFence
+from vllm_omni.engine.duplex.runtime import (
     DuplexOutputAction,
     DuplexOutputDecision,
     duplex_resource_request_id,
 )
-from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
-from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+from vllm_omni.engine.messages import OutputMessage
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.duplex_request_client import DuplexRequestClient
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 
 def test_async_omni_uses_extracted_duplex_request_client():

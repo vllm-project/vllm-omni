@@ -146,6 +146,27 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
     return OmniINCConfig(**filtered)
 
 
+def _build_torchao(**kw: Any) -> QuantizationConfig:
+    """Build a TorchAO runtime or serialized-checkpoint config."""
+    from vllm.model_executor.layers.quantization.torchao import TorchAOConfig
+
+    if "quant_type" in kw:
+        return TorchAOConfig.from_config({**kw, "quant_method": "torchao"})
+    return TorchAOConfig(**kw)
+
+
+def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
+    """Build the serialized TorchAO FP8 weight-only checkpoint config."""
+    from torchao.quantization import Float8WeightOnlyConfig
+
+    return _build_torchao(
+        torchao_config=Float8WeightOnlyConfig(
+            set_inductor_config=False,
+        ),
+        is_checkpoint_torchao_serialized=True,
+    )
+
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "int8": _build_int8,
     "bitsandbytes": _build_bitsandbytes,
@@ -156,6 +177,8 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,
+    "torchao": _build_torchao,
+    "torchao_float8_weight_only": _build_torchao_float8_weight_only,
 }
 
 

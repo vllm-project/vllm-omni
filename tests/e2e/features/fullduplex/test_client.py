@@ -15,7 +15,11 @@ from vllm_omni.experimental.fullduplex.client import (
     read_pcm16_wav,
     write_pcm16_wav,
 )
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+from vllm_omni.experimental.fullduplex.video_stacking import (
+    concat_frames,
+    unit_subframe_offsets,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     MiniCPMO45DuplexPolicy,
 )
 
@@ -24,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_realtime_client_builds_explicit_native_duplex_url():
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&minicpmo45_native_duplex=0&session_id=stale",
+        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&native_duplex=0&session_id=stale",
         "openbmb/MiniCPM-o-4_5",
         session_id="session-a",
     )
@@ -34,7 +38,7 @@ def test_realtime_client_builds_explicit_native_duplex_url():
         "custom": ["1"],
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
-        "minicpmo45_native_duplex": ["1"],
+        "native_duplex": ["1"],
         "session_id": ["session-a"],
     }
 
@@ -61,7 +65,7 @@ def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
 
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
-    assert query["minicpmo45_native_duplex"] == ["1"]
+    assert query["native_duplex"] == ["1"]
 
 
 @pytest.mark.asyncio
@@ -228,7 +232,7 @@ async def test_realtime_client_configure_explicit_tts_opts_out_of_native_duplex(
     session_extra_body = client.sent[0]["session"]["extra_body"]
     assert session_extra_body == {
         "ref_audio": "data:audio/wav;base64,AAAA",
-        "minicpmo45_native_duplex": False,
+        "native_duplex": False,
     }
 
 
@@ -418,3 +422,62 @@ def test_realtime_client_pcm16_wav_round_trip(tmp_path):
         assert wav_file.getnchannels() == 1
         assert wav_file.getframerate() == 16_000
     assert read_pcm16_wav(path) == pcm16
+
+
+def _stack_test_image(color, size=(40, 30)):
+    from PIL import Image
+
+    return Image.new("RGB", size, color)
+
+
+def test_video_stacking_tiles_a_units_subframes_into_one_image():
+    frames = [_stack_test_image((255, 0, 0)), _stack_test_image((0, 255, 0))]
+
+    composite = concat_frames(frames)
+
+    # Landscape cells stack into a column because that canvas is squarer, and
+    # the interior seam carries the separator band that lets the model tell the
+    # sub-frames apart.
+    assert composite.size == (40, 30 * 2 + 6)
+    assert composite.getpixel((20, 30 + 3)) == (0, 0, 0)
+
+
+def test_video_stacking_picks_the_squarest_grid():
+    portrait = [_stack_test_image((255, 0, 0), size=(20, 60)) for _ in range(2)]
+    four = [_stack_test_image((0, 0, 255)) for _ in range(4)]
+
+    # A portrait clip tiles side by side, four frames always tile 2x2.
+    assert concat_frames(portrait).size == (20 * 2 + 6, 60)
+    assert concat_frames(four).size == (40 * 2 + 6, 30 * 2 + 6)
+
+
+def test_video_stacking_skips_the_subframe_that_duplicates_the_base_frame():
+    # Official samples stack_frames=5 as 0.2/0.4/0.6/0.8 s: offset 0 is the base
+    # frame, already sent as frame_list[0].
+    assert unit_subframe_offsets(5) == pytest.approx([0.2, 0.4, 0.6, 0.8])
+    assert unit_subframe_offsets(1) == []
+
+
+def test_realtime_client_sends_each_units_composite_beside_its_base_frame():
+    sent: list[dict] = []
+
+    class _Client(RealtimeDuplexClient):
+        def __init__(self):
+            pass
+
+        async def send(self, event):
+            sent.append(event)
+
+    asyncio.run(
+        _Client().stream_pcm16(
+            b"\x01\x00" * (16_000 * 3),
+            chunk_ms=200,
+            realtime=False,
+            video_frames=["f0", "f1"],
+            stacked_video_frames=["s0", None],
+        )
+    )
+
+    # A composite belongs to the unit it was captured in, so it rides the same
+    # append as that unit's base frame; a unit without one sends the base alone.
+    assert [event["video_frames"] for event in sent if "video_frames" in event] == [["f0", "s0"], ["f1"]]

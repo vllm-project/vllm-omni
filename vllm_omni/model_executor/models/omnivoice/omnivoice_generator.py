@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.omnivoice.fused_qkv_rope import fused_qkv_norm_rope
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
@@ -100,44 +101,46 @@ try:
 
     @triton.jit
     def _swiglu_fwd_kernel(
-        gate_ptr,
-        up_ptr,
+        inp_ptr,
         out_ptr,
-        stride,
+        in_stride,
+        out_stride,
         n_cols: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,  # noqa: N803
     ):
         pid = tl.program_id(0).to(tl.int64)
-        gate_ptr += pid * stride
-        up_ptr += pid * stride
-        out_ptr += pid * stride
+        inp_ptr += pid * in_stride
+        out_ptr += pid * out_stride
         cols = tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
-        gate = tl.load(gate_ptr + cols, mask=mask, other=0).to(tl.float32)
-        up = tl.load(up_ptr + cols, mask=mask, other=0)
+        gate = tl.load(inp_ptr + cols, mask=mask, other=0).to(tl.float32)
+        up = tl.load(inp_ptr + n_cols + cols, mask=mask, other=0)
         silu_gate = gate * tl.sigmoid(gate)
         out = silu_gate.cast(up.dtype) * up
         tl.store(out_ptr + cols, out, mask=mask)
 
-    def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-        gate = gate.contiguous()
-        up = up.contiguous()
-        shape = gate.shape
-        n_cols = shape[-1]
-        g2d = gate.view(-1, n_cols)
-        u2d = up.view(-1, n_cols)
-        out = torch.empty_like(g2d)
+    def triton_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
+        """SwiGLU over a packed ``[..., 2 * intermediate]`` activation.
+
+        Reading both halves straight out of the fused projection's output keeps
+        the packing free: splitting it first would hand this kernel two strided
+        views and cost a full copy of each half per layer per step.
+        """
+        n_cols = gate_up.shape[-1] // 2
+        gate_up = gate_up.contiguous()
+        x2d = gate_up.view(-1, 2 * n_cols)
+        out = torch.empty(x2d.shape[0], n_cols, dtype=gate_up.dtype, device=gate_up.device)
         BLOCK_SIZE, num_warps = _calculate_settings(n_cols)
-        _swiglu_fwd_kernel[(g2d.shape[0],)](
-            g2d,
-            u2d,
+        _swiglu_fwd_kernel[(x2d.shape[0],)](
+            x2d,
             out,
+            x2d.stride(0),
             out.stride(0),
             n_cols=n_cols,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
-        return out.view(*shape)
+        return out.view(*gate_up.shape[:-1], n_cols)
 
     @triton.jit
     def _fused_add_rms_norm_fwd_kernel(
@@ -267,9 +270,11 @@ class OmniVoiceAttention(nn.Module):
         self.num_kv_heads = config.llm_num_key_value_heads
         self.head_dim = config.llm_head_dim
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        # q/k/v are packed into one projection: the three are sibling GEMMs over
+        # the same activation, and at this model's shapes (2 x 44 rows) three
+        # small GEMMs cost noticeably more than one wide one.
+        self.num_qkv_heads = self.num_heads + 2 * self.num_kv_heads
+        self.qkv_proj = nn.Linear(self.hidden_size, self.num_qkv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         # Qwen3 uses per-head QK norm
@@ -281,40 +286,25 @@ class OmniVoiceAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        rope_table: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states).view(batch_size, seq_len, self.num_qkv_heads, self.head_dim)
 
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-
-        # Per-head QK norm (Qwen3)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # Apply RoPE
-        if cos is not None and sin is not None:
-            q = _apply_rotary_pos_emb(q, cos, sin)
-            k = _apply_rotary_pos_emb(k, cos, sin)
-
-        # Expand KV heads for GQA (8 KV heads → 16 Q heads)
-        if self.num_kv_heads != self.num_heads:
-            repeat_factor = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat_factor, dim=2)
-            v = v.repeat_interleave(repeat_factor, dim=2)
-
-        # Full bidirectional attention via SDPA with proper mask support
-        # Permute to (batch, heads, seq, head_dim) for SDPA
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        # One kernel for the whole prologue: split the packed projection, RMSNorm
+        # Q and K per head, rotate both, broadcast K and V across their query
+        # groups, and emit SDPA's [batch, heads, positions, head_dim] layout.
+        q, k, v = fused_qkv_norm_rope(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            rope_table,
+            self.q_norm.eps,
+            self.num_heads,
+            self.num_kv_heads,
+        )
 
         # Caller passes a float mask; materialize float form if a bool slips through.
         sdpa_mask = attention_mask
@@ -340,14 +330,24 @@ class OmniVoiceMLP(nn.Module):
 
     def __init__(self, config: OmniVoiceConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(config.llm_hidden_size, config.llm_intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.llm_hidden_size, config.llm_intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.llm_intermediate_size, config.llm_hidden_size, bias=False)
+        self.intermediate_size = config.llm_intermediate_size
+        self.gate_up_proj = nn.Linear(config.llm_hidden_size, 2 * self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, config.llm_hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x)
         if _TRITON_AVAILABLE:
-            return self.down_proj(triton_swiglu(self.gate_proj(x), self.up_proj(x)))
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+            return self.down_proj(triton_swiglu(gate_up))
+        gate, up = gate_up.chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
+
+# Fused parameter -> the HF checkpoint shards it absorbs, in packing order.
+# The checkpoint keeps q/k/v and gate/up separate; load_weights packs them.
+_FUSED_PROJECTIONS: dict[str, tuple[str, ...]] = {
+    "self_attn.qkv_proj": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
+    "mlp.gate_up_proj": ("mlp.gate_proj", "mlp.up_proj"),
+}
 
 
 class OmniVoiceTransformerBlock(nn.Module):
@@ -364,12 +364,34 @@ class OmniVoiceTransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask, cos=cos, sin=sin)
+        rope_table: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(normed_hidden_states, residual)``.
+
+        The residual is threaded across the block boundary rather than being
+        added at the end. The MLP's residual add and the next block's input
+        RMSNorm are the same read of the same tensor, so handing the pending
+        residual on lets both happen in one fused kernel instead of a bare add
+        followed by a separate norm. Only the first block, which has no pending
+        residual, still pays for a standalone norm.
+        """
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        elif _TRITON_AVAILABLE:
+            hidden_states, residual = triton_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states = self.self_attn(hidden_states, rope_table, attention_mask=attention_mask)
 
         if _TRITON_AVAILABLE:
             # Fused: (attn_out + residual) + RMSNorm in one kernel
@@ -384,9 +406,7 @@ class OmniVoiceTransformerBlock(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return self.mlp(hidden_states), residual
 
 
 # ---------------------------------------------------------------------------
@@ -394,30 +414,22 @@ class OmniVoiceTransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _precompute_rope(
+def _precompute_rope_table(
     head_dim: int,
     max_seq_len: int,
     theta: float = 1000000.0,
     device: torch.device | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Precompute RoPE cos/sin pre-doubled to full head_dim so the hot path skips a per-call cat."""
+) -> torch.Tensor:
+    """Precompute the packed ``[max_seq_len, head_dim]`` RoPE table.
+
+    Layout is what ``fused_qkv_norm_rope`` expects: the first half of each row
+    holds ``cos(theta)`` and the second half ``sin(theta)``, each of width
+    ``head_dim // 2``. Precomputing it keeps the hot path free of any cat.
+    """
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
     t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
-    cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)
-    sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1)
-    return cos, sin
-
-
-def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embedding. x shape: (B, S, H, D). cos/sin are pre-doubled to width D."""
-    seq_len = x.shape[1]
-    cos = cos[:seq_len].unsqueeze(0).unsqueeze(2)  # (1, S, 1, D)
-    sin = sin[:seq_len].unsqueeze(0).unsqueeze(2)
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    rotated = torch.cat([-x2, x1], dim=-1)
-    return x * cos + rotated * sin
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -449,13 +461,17 @@ def _maybe_enable_tf32() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _additive_float_mask(mask: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def _additive_float_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Convert a boolean attention mask to its additive float form.
 
     ``True`` (attend) maps to ``0.0`` and ``False`` (masked) to ``-inf``. A bool
     mask must never be copied straight into a float buffer: the implicit cast
     maps True/False to 1.0/0.0, which leaves masked positions at 0.0 and so
     silently *unmasks* them.
+
+    ``dtype`` is required rather than defaulting to float32: SDPA rejects an
+    additive mask whose dtype differs from the query, so the mask has to follow
+    the model dtype and a default would just hide that coupling.
     """
     if mask.dtype != torch.bool:
         return mask
@@ -536,10 +552,7 @@ class _OmniVoiceCUDAGraphForward:
         _, bucket = key
         device = input_ids.device
 
-        self._gen._ensure_rope(bucket, device)
-        model_dtype = self._gen.text_embedding.weight.dtype
-        static_cos = self._gen._rope_cos[:bucket].to(device=device, dtype=model_dtype).contiguous()
-        static_sin = self._gen._rope_sin[:bucket].to(device=device, dtype=model_dtype).contiguous()
+        static_rope_table = self._gen._rope_table_for(bucket, device, self._gen.model_dtype)
 
         static_input_ids = input_ids.clone()
         static_audio_mask = audio_mask.clone()
@@ -550,8 +563,7 @@ class _OmniVoiceCUDAGraphForward:
                 static_input_ids,
                 static_audio_mask,
                 static_attn_mask,
-                static_cos,
-                static_sin,
+                static_rope_table,
             )
         torch.accelerator.synchronize(device)
 
@@ -569,8 +581,7 @@ class _OmniVoiceCUDAGraphForward:
                     static_input_ids,
                     static_audio_mask,
                     static_attn_mask,
-                    static_cos,
-                    static_sin,
+                    static_rope_table,
                 )
 
         entry = {
@@ -578,8 +589,7 @@ class _OmniVoiceCUDAGraphForward:
             "static_input_ids": static_input_ids,
             "static_audio_mask": static_audio_mask,
             "static_attn_mask": static_attn_mask,
-            "static_cos": static_cos,
-            "static_sin": static_sin,
+            "static_rope_table": static_rope_table,
             "static_output": static_output,
         }
         logger.info("OmniVoice CUDA Graph captured for key %s", key)
@@ -600,8 +610,9 @@ class _OmniVoiceCUDAGraphForward:
             key = (two_b, bucket)
             dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
             dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
-            # Capture with a float mask to match what forward() feeds at replay time.
-            dummy_attn = torch.zeros(two_b, 1, bucket, bucket, dtype=torch.float32, device=device)
+            # Capture with a float mask to match what forward() feeds at replay time,
+            # in the model dtype so replay can copy_ into it without a cast.
+            dummy_attn = torch.zeros(two_b, 1, bucket, bucket, dtype=self._gen.model_dtype, device=device)
             self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
         logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
@@ -612,12 +623,8 @@ class _OmniVoiceCUDAGraphForward:
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if torch.cuda.is_current_stream_capturing():
-            seq_len = input_ids.shape[-1]
-            self._gen._ensure_rope(seq_len, input_ids.device)
-            dtype = self._gen.text_embedding.weight.dtype
-            cos = self._gen._rope_cos[:seq_len].to(device=input_ids.device, dtype=dtype)
-            sin = self._gen._rope_sin[:seq_len].to(device=input_ids.device, dtype=dtype)
-            return self._gen._step_forward(input_ids, audio_mask, attention_mask, cos, sin)
+            rope_table = self._gen._rope_table_for(input_ids.shape[-1], input_ids.device, self._gen.model_dtype)
+            return self._gen._step_forward(input_ids, audio_mask, attention_mask, rope_table)
 
         seq_len = input_ids.shape[-1]
         two_b = input_ids.shape[0]
@@ -626,7 +633,7 @@ class _OmniVoiceCUDAGraphForward:
         # Graphs are captured with (and their static buffers hold) the additive
         # float mask, so normalize here, before padding or any copy_ into them.
         if attention_mask is not None:
-            attention_mask = _additive_float_mask(attention_mask)
+            attention_mask = _additive_float_mask(attention_mask, self._gen.model_dtype)
 
         if bucket is None:
             # Lazy capture: oversized sequence or non-unit batch (no pre-warmed bucket).
@@ -726,24 +733,37 @@ class OmniVoiceGenerator(nn.Module):
         )
 
         # Precompute RoPE
-        self._rope_cos = None
-        self._rope_sin = None
+        self._rope_table = None
 
         # CUDA Graph (bucket-size pre-capture; lazy fallback for oversized shapes)
         self._cuda_graph_fwd: _OmniVoiceCUDAGraphForward | None = (
             _OmniVoiceCUDAGraphForward(self, config.cuda_graph_capture_sizes) if config.enable_cuda_graph else None
         )
 
+    @property
+    def model_dtype(self) -> torch.dtype:
+        """The dtype every activation and mask in the generator has to match."""
+        return self.text_embedding.weight.dtype
+
     def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
-        """Lazily compute RoPE cos/sin if needed."""
-        if self._rope_cos is None or self._rope_cos.shape[0] < seq_len:
+        """Lazily compute the packed RoPE table if needed."""
+        if self._rope_table is None or self._rope_table.shape[0] < seq_len:
             max_len = max(seq_len, 4096)
-            self._rope_cos, self._rope_sin = _precompute_rope(
+            self._rope_table = _precompute_rope_table(
                 self.config.llm_head_dim,
                 max_len,
                 theta=self.config.llm_rope_theta,
                 device=device,
             )
+
+    def _rope_table_for(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """The packed [seq_len, head_dim] table the fused prologue indexes.
+
+        It depends only on the bucket and dtype, so callers build it once per
+        request or per captured graph, never per layer.
+        """
+        self._ensure_rope(seq_len, device)
+        return self._rope_table[:seq_len].to(device=device, dtype=dtype).contiguous()
 
     def _prepare_embeddings(
         self,
@@ -781,27 +801,21 @@ class OmniVoiceGenerator(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
+        rope_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run through transformer layers.
 
         Args:
             inputs_embeds: [B, S, hidden_size]
             attention_mask: [B, 1, S, S] or None
-            cos, sin: optional precomputed RoPE tables in target dtype
+            rope_table: optional precomputed [B * S, head_dim] RoPE table
 
         Returns:
             hidden_states: [B, S, hidden_size]
         """
-        device = inputs_embeds.device
-        seq_len = inputs_embeds.shape[1]
-        self._ensure_rope(seq_len, device)
-
         hidden_states = inputs_embeds
-        if cos is None or sin is None:
-            cos = self._rope_cos.to(device=device, dtype=hidden_states.dtype)
-            sin = self._rope_sin.to(device=device, dtype=hidden_states.dtype)
+        if rope_table is None:
+            rope_table = self._rope_table_for(inputs_embeds.shape[1], inputs_embeds.device, hidden_states.dtype)
 
         # Safety: convert bool mask if caller hasn't (e.g. external paths beyond forward()).
         if attention_mask is not None and attention_mask.dtype == torch.bool:
@@ -809,15 +823,16 @@ class OmniVoiceGenerator(nn.Module):
                 ~attention_mask, float("-inf")
             )
 
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                cos=cos,
-                sin=sin,
+                rope_table=rope_table,
+                residual=residual,
             )
 
-        return self.norm(hidden_states)
+        return self.norm(hidden_states + residual)
 
     def _get_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project hidden states to per-codebook logits.
@@ -842,14 +857,16 @@ class OmniVoiceGenerator(nn.Module):
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        rope_table: torch.Tensor,
     ) -> torch.Tensor:
-        """Single unmasking-step forward using pre-cast RoPE tensors (CUDA graph safe)."""
+        """Single unmasking-step forward using a pre-cast RoPE table (CUDA graph safe)."""
         hidden_states = self._prepare_embeddings(input_ids, audio_mask)
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask, cos=cos, sin=sin)
-        return self._get_logits(self.norm(hidden_states))
+            hidden_states, residual = layer(
+                hidden_states, attention_mask=attention_mask, rope_table=rope_table, residual=residual
+            )
+        return self._get_logits(self.norm(hidden_states + residual))
 
     @torch.inference_mode()
     def forward(
@@ -926,19 +943,14 @@ class OmniVoiceGenerator(nn.Module):
         c_lens = attention_mask[:B, 0, 0].sum(dim=-1).tolist()
 
         # Materialize the SDPA float mask once so the captured graph (and eager path) skip per-layer conversion.
-        sdpa_attn_mask = torch.zeros_like(attention_mask, dtype=torch.float32).masked_fill_(
-            ~attention_mask, float("-inf")
-        )
+        sdpa_attn_mask = _additive_float_mask(attention_mask, self.model_dtype)
 
         use_cuda_graph = self._cuda_graph_fwd is not None and input_ids.is_cuda
         if not use_cuda_graph:
             # Eager-path-only constants (the cuda-graph captures its own).
             text_embeds_cached = self.text_embedding(input_ids[:, 0, :])
             audio_mask_3d = audio_mask.unsqueeze(-1)
-            self._ensure_rope(input_ids.shape[-1], device)
-            target_dtype = text_embeds_cached.dtype
-            cos = self._rope_cos.to(device=device, dtype=target_dtype)
-            sin = self._rope_sin.to(device=device, dtype=target_dtype)
+            rope_table = self._rope_table_for(input_ids.shape[-1], device, text_embeds_cached.dtype)
 
         # Main iterative loop
         for step in range(num_step):
@@ -946,11 +958,11 @@ class OmniVoiceGenerator(nn.Module):
                 # Float mask skips per-layer conversion; fp32 cast deferred to the per-item slices below.
                 batch_logits = self._cuda_graph_fwd(input_ids, audio_mask, sdpa_attn_mask)
             else:
-                # Eager fallback reuses hoisted constants (text embeds, sdpa mask, cos/sin).
+                # Eager fallback reuses hoisted constants (text embeds, sdpa mask, rope table).
                 inputs_embeds = self._prepare_embeddings(
                     input_ids, audio_mask, text_embeds=text_embeds_cached, audio_mask_3d=audio_mask_3d
                 )
-                hidden_states = self._transformer_forward(inputs_embeds, sdpa_attn_mask, cos=cos, sin=sin)
+                hidden_states = self._transformer_forward(inputs_embeds, sdpa_attn_mask, rope_table=rope_table)
                 # fp32 cast deferred to the per-item slices below.
                 batch_logits = self._get_logits(hidden_states)
             # batch_logits: [2*B, 8, S, 1025]
@@ -1014,6 +1026,52 @@ class OmniVoiceGenerator(nn.Module):
 
         return tokens
 
+    def _load_fused_projections(self, state_dict: dict[str, torch.Tensor]) -> set[str]:
+        """Pack the checkpoint's separate q/k/v and gate/up shards into the fused params.
+
+        This has to happen explicitly. The generic per-tensor path below looks
+        the destination up by name, and ``q_proj``/``gate_proj`` no longer exist
+        as modules -- so it would find nothing, log a warning nobody reads, and
+        leave the fused parameters at their random initialization. A corrupted
+        model that still answers requests is worse than a failed load, so a
+        missing or wrong-shaped shard raises here.
+        """
+        loaded: set[str] = set()
+        packed_params = 0
+        for idx, layer in enumerate(self.layers):
+            for fused_path, shard_paths in _FUSED_PROJECTIONS.items():
+                keys = [f"llm.layers.{idx}.{path}.weight" for path in shard_paths]
+                missing = [k for k in keys if k not in state_dict]
+                if len(missing) == len(keys):
+                    continue
+                if missing:
+                    raise ValueError(
+                        f"OmniVoice checkpoint is missing {missing} needed to build "
+                        f"layers.{idx}.{fused_path}; refusing to load a partially "
+                        f"initialized fused projection."
+                    )
+                module = layer
+                for part in fused_path.split("."):
+                    module = getattr(module, part)
+                packed = torch.cat([state_dict[k] for k in keys], dim=0)
+                if packed.shape != module.weight.shape:
+                    raise ValueError(
+                        f"OmniVoice checkpoint shards {keys} pack to {tuple(packed.shape)} "
+                        f"but layers.{idx}.{fused_path}.weight is {tuple(module.weight.shape)}."
+                    )
+                module.weight.data.copy_(packed)
+                loaded.update(keys)
+                packed_params += 1
+
+        expected = len(self.layers) * len(_FUSED_PROJECTIONS)
+        if loaded and packed_params != expected:
+            raise ValueError(
+                f"OmniVoice checkpoint filled {packed_params}/{expected} fused projections; "
+                f"the remaining ones would stay randomly initialized."
+            )
+        logger.info("Generator: packed %d/%d fused projections", packed_params, expected)
+        return loaded
+
     def load_weights(self, model_dir: str, device: torch.device) -> None:
         """Load weights from HuggingFace OmniVoice model.safetensors.
 
@@ -1053,8 +1111,13 @@ class OmniVoiceGenerator(nn.Module):
                 self.audio_heads.weight.data.copy_(state_dict[key])
                 loaded_keys.add(key)
 
-        # 4. Transformer layers: llm.layers.N.* -> layers.N.*
+        # 4a. Fused projections, packed from their separate checkpoint shards.
+        loaded_keys |= self._load_fused_projections(state_dict)
+
+        # 4b. Remaining transformer weights: llm.layers.N.* -> layers.N.*
         for key, value in state_dict.items():
+            if key in loaded_keys:
+                continue
             if key.startswith("llm.layers."):
                 # llm.layers.0.self_attn.q_proj.weight -> layers.0.self_attn.q_proj.weight
                 our_key = key.replace("llm.layers.", "layers.")

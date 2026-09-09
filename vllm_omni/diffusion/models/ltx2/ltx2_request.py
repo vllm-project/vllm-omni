@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Request normalization and validation shared by LTX pipeline variants."""
 
@@ -86,6 +86,7 @@ def validate_pipeline_request(
     vae_spatial_compression_ratio: int,
     vae_temporal_compression_ratio: int,
     pipeline_name: str,
+    min_video_latent_spatial_size: tuple[int, int] | None = None,
     request_sigmas: list[float] | None = None,
     request_phase_sigmas: tuple[list[float] | None, ...] | None = None,
 ) -> None:
@@ -96,6 +97,18 @@ def validate_pipeline_request(
             f"{pipeline_name} resolution must be divisible by {alignment}, got "
             f"{request_inputs.width}x{request_inputs.height}."
         )
+
+    if min_video_latent_spatial_size is not None:
+        min_latent_height, min_latent_width = min_video_latent_spatial_size
+        latent_height = request_inputs.height // vae_spatial_compression_ratio
+        latent_width = request_inputs.width // vae_spatial_compression_ratio
+        if latent_height < min_latent_height or latent_width < min_latent_width:
+            raise ValueError(
+                f"{pipeline_name} DiffVAE requires video latent spatial dimensions of at least "
+                f"{min_latent_width}x{min_latent_height} for neighborhood attention, got "
+                f"{latent_width}x{latent_height} from request resolution "
+                f"{request_inputs.width}x{request_inputs.height}."
+            )
 
     if request_inputs.num_frames < 1 or (request_inputs.num_frames - 1) % vae_temporal_compression_ratio != 0:
         raise ValueError(
@@ -484,7 +497,6 @@ class LTXRequestMixin:
         image_crf = _normalize_image_crf(first_image_crf if first_image_crf is not None else image_crf)
 
         sampling = sampling_params_list[0]
-        is_dummy_run = req.is_dummy_run()
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
         negative_prompt = _resolve_negative_prompts(
             req.prompts,
@@ -498,8 +510,6 @@ class LTXRequestMixin:
         num_inference_steps = (
             sampling.num_inference_steps or num_inference_steps or self.pipeline_recipe.num_inference_steps
         )
-        if is_dummy_run and self.pipeline_recipe.fixed_num_inference_steps:
-            num_inference_steps = self.pipeline_recipe.num_inference_steps
         num_inference_steps = max(int(num_inference_steps), 2)
 
         num_videos_per_prompt = (
@@ -515,8 +525,6 @@ class LTXRequestMixin:
             for item in sampling_params_list
         ]
         guidance = guidance_specs[0]
-        if is_dummy_run and not self.pipeline_recipe.phases[0].allow_guidance_override:
-            guidance = self.pipeline_recipe.request_guidance
         if any(item != guidance for item in guidance_specs[1:]):
             raise ValueError("Batched LTX requests must use identical video/audio guidance parameters.")
 

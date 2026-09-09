@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import math
@@ -144,16 +147,15 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
-    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
-        """Replace a downstream stage's placeholder with its next payload."""
+    def _reset_streaming_session_replacement_state(self, session: Request) -> None:
+        """Fence transport and async state that belongs to an old prompt."""
+        session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
             watermark = getattr(adapter, "requests_num_chunks_sent", None)
             if watermark is not None:
                 watermark.pop(session.external_req_id, None)
-        session._output_token_ids.clear()
-        session._all_token_ids.clear()
         # In-flight outputs from the previous segment were optimistically
         # scheduled (async lookahead). Mark them stale so update_from_output
         # drops them instead of underflowing num_output_placeholders
@@ -168,18 +170,15 @@ class OmniSchedulerMixin:
         session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
-        new_prompt = update.prompt_token_ids or ()
-        session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
-        session.prompt_token_ids = new_prompt
+
+    def _finish_streaming_session_update(self, session: Request, update: StreamingUpdate) -> None:
+        """Install payload metadata and send an updated session to admission."""
         session.additional_information = update.additional_information or None
         session.model_intermediate_buffer = getattr(
             update,
             "model_intermediate_buffer",
             None,
         )
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(new_prompt)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -190,6 +189,19 @@ class OmniSchedulerMixin:
             self._enqueue_waiting_request(session)
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+        """Replace a downstream stage's placeholder with its next payload."""
+        self._reset_streaming_session_replacement_state(session)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = new_prompt
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(new_prompt)
+        self._finish_streaming_session_update(session, update)
 
     def _release_replaced_streaming_prompt_cache(self, session: Request) -> None:
         """Discard cache state that belongs to a replaced prompt."""
@@ -260,9 +272,29 @@ class OmniSchedulerMixin:
                 self.running,
                 scheduler_requests=self.requests,
             )
+            # Prompt-window contracts are finalized on this scheduler thread
+            # and may surface a permanent receive failure.
+            self._process_chunk_receive_failures()
             self._reset_ready_async_chunk_replacements()
             self._process_pending_chunk_timeouts()
             self._log_failed_chunk_sends()
+
+    def _process_chunk_receive_failures(self) -> None:
+        """Fail requests whose consumed streaming input violated its contract."""
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        collector = getattr(adapter, "collect_failed_receive_request_ids", None)
+        if collector is None:
+            return
+        failures = collector()
+        present_ids = {request_id for request_id in failures if request_id in self.requests}
+        if not present_ids:
+            return
+        logger.error(
+            "Marking %d request(s) as FINISHED_ERROR after invalid streaming input: %s",
+            len(present_ids),
+            {request_id: failures[request_id] for request_id in sorted(present_ids)},
+        )
+        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
 
     def _restore_omni_wait_queues(self) -> None:
         """Restore requests temporarily parked by Omni input gates."""
@@ -588,10 +620,14 @@ class OmniSchedulerMixin:
             self.skipped_waiting.remove_requests(removable)
 
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
-        """Resume connector polling without waiting for an external update."""
+        """Resume duplex connector polling without an external update."""
         adapter = self.chunk_transfer_adapter
         adapter.segment_finished_requests.discard(request.request_id)
-        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+        if (
+            not adapter.receives_chunks
+            or getattr(self.vllm_config.model_config, "session_mode", "turn") != "duplex"
+            or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+        ):
             return
         self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.WAITING
@@ -676,6 +712,7 @@ class OmniSchedulerMixin:
         )
         finished = super().finish_requests(request_ids, finished_status)
         self._purge_finished_from_running(target_request_ids)
+        self._resync_streaming_input_counter()
 
         for request in finished:
             self._free_input_coordinator_request(request.request_id)
@@ -841,3 +878,25 @@ class OmniSchedulerMixin:
             return resumable_segment_stop and req.request_id not in target_request_ids
 
         self.running[:] = [req for req in self.running if keep_running(req)]
+
+    def _drop_aborted_queued_requests(self) -> None:
+        for queue in (self.waiting, self.skipped_waiting):
+            aborted = [req for req in queue if req.status == RequestStatus.FINISHED_ABORTED]
+            if aborted:
+                queue.remove_requests(aborted)
+        self.running[:] = [req for req in self.running if req.status != RequestStatus.FINISHED_ABORTED]
+
+    def _resync_streaming_input_counter(self) -> None:
+        counter = getattr(self, "num_waiting_for_streaming_input", None)
+        if counter is None:
+            return
+        parked = sum(
+            1
+            for queue in (getattr(self, "waiting", None), getattr(self, "skipped_waiting", None))
+            if queue
+            for request in queue
+            if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        )
+        if parked != counter:
+            logger.debug("[Omni] resynced streaming-input counter %s -> %s", counter, parked)
+            self.num_waiting_for_streaming_input = parked

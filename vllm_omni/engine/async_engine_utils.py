@@ -24,6 +24,24 @@ logger = init_logger(__name__)
 SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
 SHUTDOWN_JOIN_TIMEOUT_S = 30.0
 _WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
+_JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
+_LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"
+_RPC_RESULT_ROUTER_CLOSED_MESSAGES = {
+    "RPC result router closed",
+    "RPC result router is closed",
+}
+
+
+def is_janus_sync_queue_shutdown(exc: Exception) -> bool:
+    if _JANUS_SYNC_QUEUE_SHUTDOWN is not None:
+        return isinstance(exc, _JANUS_SYNC_QUEUE_SHUTDOWN)
+    return isinstance(exc, RuntimeError) and str(exc) == _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE
+
+
+def is_abort_transport_shutdown(exc: Exception) -> bool:
+    return is_janus_sync_queue_shutdown(exc) or (
+        isinstance(exc, RuntimeError) and str(exc) in _RPC_RESULT_ROUTER_CLOSED_MESSAGES
+    )
 
 
 def inject_global_id(target: Any, request_id: str) -> None:
