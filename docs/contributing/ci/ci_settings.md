@@ -142,7 +142,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Hardware in YAML:** `mirror_hardwares` preset (string), expanded to `agents`, top-level `image`, and `plugins`. Presets: `a2b3_npu_1`, `a2b3_npu_4`, `a3_npu_2` in `common/ci_mirror_hardwares.yml`.
 
-    **Path filter in YAML:** same `source_file_dependencies` presets as CUDA, on **L4** leaf jobs in `test-npu-nightly.yml`. Filtering applies on the PR `nightly-test` label; `main` + `NIGHTLY=1` keeps every job. See [Step filtering](#step-filtering).
+    **Path filter in YAML:** same `source_file_dependencies` presets as CUDA, on **L4** leaf jobs in `test-npu-nightly.yml`. Filtering applies on the PR `nightly-test` label; `main` + `NIGHTLY=1` keeps every job. If no job-key prefix matches, a change to the pipeline YAML being uploaded, or to any path under `source_filter_fallback`, keeps every job in that upload. See [Step filtering](#step-filtering).
 
     **Conventions**
 
@@ -306,7 +306,7 @@ Unit coverage: `tests/buildkite/test_skip_ci.py`.
 
 CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-merge.yml`), **L4** (`.buildkite/cuda/test-nightly.yml`), **L5** (`.buildkite/cuda/test-weekly.yml`), and NPU **L4** (`.buildkite/npu/test-npu-nightly.yml`). Bootstrap upload entry: `upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml` (or `npu/bootstrap-upload-steps.yml`).
 
-**When filtering applies:** only **PR label** uploads (`ready`, `merge-test`, `nightly-test`, `weekly-test`). On **`main` + env** (`NIGHTLY=1`, post-merge L3, `WEEKLY=1` / `NON_CRITICAL=1`, `WEEKLY=1 --e2e`) the uploader keeps every job and still strips the key.
+**When filtering applies:** only **PR label** uploads (`ready`, `merge-test`, `nightly-test`, `weekly-test`). On **`main` + env** (`NIGHTLY=1`, post-merge L3, `WEEKLY=1` / `NON_CRITICAL=1`, `WEEKLY=1 --e2e`) the uploader keeps every job and still strips the key. If **no** job-key prefix matches the diff, a change to the pipeline YAML being uploaded, or any path under the `source_filter_fallback` key in `ci_source_file_dependencies.yml`, keeps every job in that upload. `source_filter_fallback` is not a job key — do not attach it to a step. When any job-key prefix already matches, normal filtering wins (the fallback does not expand the selection). Without this fallback, command / env / hardware-only edits would match nothing (NPU drops every step; CUDA nightly keeps only the email aggregator). A different pipeline YAML does not trigger the fallback for this upload.
 
 **Uploader-only keys** — removed before Buildkite sees the YAML; never used at runtime on agents:
 
@@ -443,11 +443,12 @@ List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
 change there is filtered out of normal PR builds and only surfaces in a later
 nightly. `tests/buildkite/test_upload_pipeline.py` covers the filter behavior with
 a synthetic job (it does not pin real merge labels).
-Editing only the surrounding CI YAML still does not schedule them, so a PR that
-touches just the wiring needs a full E2E run (or the commands run on a GPU host)
-to produce artifacts. When checking a new model's
-artifacts, compare `lines-covered` between the online and offline XML rather than
-just confirming both files exist.
+If no job-key prefix matches, editing the pipeline YAML being uploaded, or any
+path under the `source_filter_fallback` registry key, keeps every job in that
+upload (including coverage jobs) so the wiring can be validated before merge.
+When a job-key prefix already matches, bypass does not expand the selection. A
+change to a different pipeline YAML still does not schedule them. When checking a new model's artifacts, compare `lines-covered`
+between the online and offline XML rather than just confirming both files exist.
 
 ### Validation checklist
 

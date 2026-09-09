@@ -5,7 +5,8 @@
 # YAML anchors above the registry hold model business-code paths. Job keys
 # ({model}_function / _perf / _accuracy / _reliability / _doc / _cov) alias
 # those anchors and add the scripts the job actually runs. Feature keys below
-# are unchanged.
+# are unchanged. ``source_filter_fallback`` is not a job key: when no job-key
+# prefix matches, a matching diff keeps every job for that upload.
 #
 # YAML anchors are nested lists; the loader flattens them.
 
@@ -114,6 +115,14 @@ x-lingbot-world: &lingbot_world
 
 
 source_file_dependencies:
+  # Shared uploader/registry paths. Not a job key — do not attach this to a step.
+  # Used only when no job-key prefix matches: then a hit keeps every job.
+  source_filter_fallback:
+    - .buildkite/common/scripts/upload_pipeline.py
+    - .buildkite/common/ci_source_file_dependencies.yml
+    - .buildkite/common/ci_mirror_hardwares.yml
+    - tests/helpers/
+
   # --- features ---
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
@@ -159,7 +168,6 @@ source_file_dependencies:
   # --- omni / tts jobs ---
   omni_qwen3_omni_function:
     - *qwen3_omni
-    - tests/helpers/runtime.py
     - tests/e2e/offline_inference/test_qwen3_omni.py
     - tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
     - tests/e2e/offline_inference/test_qwen3_omni_autoround_w4a16_expansion.py
@@ -186,10 +194,14 @@ source_file_dependencies:
 
   omni_qwen3_omni_doc:
     - *qwen3_omni
+    - examples/online_serving/qwen3_omni/
+    - examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py
     - tests/examples/online_serving/test_qwen3_omni.py
 
   omni_qwen2_5_omni_doc:
     - *qwen2_5_omni
+    - examples/online_serving/qwen2_5_omni/
+    - examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py
     - tests/examples/online_serving/test_qwen2_5_omni.py
 
   omni_minicpmo_4_5_function:
@@ -210,6 +222,8 @@ source_file_dependencies:
 
   omni_minicpmo_4_5_doc:
     - *minicpmo_4_5
+    - examples/online_serving/minicpmo/realtime_web/
+    - examples/online_serving/minicpmo/realtime_duplex_demo.py
     - tests/examples/test_minicpmo_realtime_web_server.py
     - tests/examples/test_minicpmo_realtime_web_static.py
     - tests/examples/test_minicpmo_realtime_duplex_simple_demo.py
@@ -226,6 +240,7 @@ source_file_dependencies:
     - tests/e2e/online_serving/run_minicpmo_realtime_duplex_server_vad.py
     - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
     - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+    - tests/assets/minicpmo_4_5/
     - tests/clients/
     - tests/engine/duplex/
     - tests/entrypoints/duplex/
@@ -239,7 +254,6 @@ source_file_dependencies:
 
   tts_qwen3_tts_function:
     - *qwen3_tts
-    - tests/helpers/media.py
     - tests/e2e/features/prefill_phase/
     - tests/e2e/offline_inference/test_qwen3_tts_base.py
     - tests/e2e/offline_inference/test_qwen3_tts_customvoice.py
@@ -322,6 +336,8 @@ source_file_dependencies:
   diffusion_text_to_image_doc:
     - *qwen_image
     - *z_image
+    - examples/offline_inference/text_to_image/
+    - examples/online_serving/text_to_image/
     - tests/examples/offline_inference/test_text_to_image.py
     - tests/examples/online_serving/test_text_to_image.py
     - vllm_omni/diffusion/models/nextstep_1_1/
@@ -360,10 +376,6 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
     - tests/e2e/online_serving/minimax_h3/
     - tests/diffusion/models/minimax_h3/
-    - tests/helpers/assertions.py
-    - tests/helpers/mark.py
-    - tests/helpers/media.py
-    - tests/helpers/runtime.py
     - vllm_omni/diffusion/lora/
     - vllm_omni/diffusion/offloader/
     - vllm_omni/diffusion/distributed/

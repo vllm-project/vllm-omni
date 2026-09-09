@@ -358,8 +358,17 @@ def test_mirror_hw_typo_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-def _surviving_labels(doc: dict, changed_files: list[str]) -> set[str]:
-    rendered = _render_test_pipeline(doc, changed_files=changed_files)
+def _surviving_labels(
+    doc: dict,
+    changed_files: list[str],
+    *,
+    pipeline_path: Path | None = None,
+) -> set[str]:
+    rendered = _render_test_pipeline(
+        doc,
+        changed_files=changed_files,
+        pipeline_path=pipeline_path,
+    )
     labels: set[str] = set()
 
     def walk(steps: list | None) -> None:
@@ -664,3 +673,45 @@ def test_source_filter_disabled_on_main_branch(monkeypatch: pytest.MonkeyPatch) 
     ]
     monkeypatch.setenv("BUILDKITE_BRANCH", "main")
     assert _changed_files_for_source_filter(_Ctx(), force_all=True, e2e_only=False) is None
+
+
+def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bypass only when no job-key prefix matched; job-key hits still win."""
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "feat/nightly-yaml")
+    npu_nightly = Path(".buildkite/npu/test-npu-nightly.yml")
+    shared_paths = _load_source_file_dependencies()["source_filter_fallback"]
+    assert ".buildkite/common/scripts/upload_pipeline.py" in shared_paths
+
+    # Only pipeline YAML / shared uploader → no job-key match → keep all gated jobs.
+    for changed in [str(npu_nightly.as_posix()), *shared_paths]:
+        labels = _surviving_labels(
+            _SOURCE_FILTER_DOC,
+            [changed],
+            pipeline_path=npu_nightly,
+        )
+        assert "Z-Image Function" in labels, changed
+        assert "Wan Function" in labels, changed
+
+    # A different pipeline YAML is not a bypass for this upload.
+    labels = _surviving_labels(
+        _SOURCE_FILTER_DOC,
+        [".buildkite/cuda/test-nightly.yml"],
+        pipeline_path=npu_nightly,
+    )
+    assert "Z-Image Function" not in labels
+    assert "Wan Function" not in labels
+    assert "Dedicated E2E" in labels  # ungated leaf still kept
+
+    # Job-key match wins over bypass files in the same diff.
+    labels = _surviving_labels(
+        _SOURCE_FILTER_DOC,
+        [
+            "vllm_omni/diffusion/models/z_image/transformer.py",
+            ".buildkite/common/scripts/upload_pipeline.py",
+        ],
+        pipeline_path=npu_nightly,
+    )
+    assert labels == {"Dedicated E2E", "Z-Image Function", "Doc Test"}

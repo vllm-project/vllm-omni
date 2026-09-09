@@ -15,6 +15,10 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     (string/list keys from ci_source_file_dependencies.yml, or inline path
     prefixes). Filtering applies on **PR label** uploads only; ``main`` + env
     schedule (NIGHTLY/WEEKLY/merge push) keeps every job and still strips the field.
+    If no job-key prefix matches, a change to the pipeline YAML being uploaded
+    or to a path under the ``source_filter_fallback`` registry key keeps every
+    job so command, env, and hardware edits can be validated before merge.
+    When any job-key prefix already matches, normal filtering wins.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
@@ -83,6 +87,9 @@ BOOTSTRAP_UPLOAD_IF_KEYS = {
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
 CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_dependencies.yml"
+# Registry key whose prefixes bypass source filtering. Paths live in
+# ci_source_file_dependencies.yml; do not attach this key to a job.
+SOURCE_FILTER_FALLBACK_KEY = "source_filter_fallback"
 
 # Bootstrap Buildkite ``if`` expressions.
 # ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
@@ -324,6 +331,11 @@ def _resolve_source_file_dependencies(step: dict[str, Any]) -> list[str] | None:
         return merged
 
     def lookup(key: str) -> list[str]:
+        if key == SOURCE_FILTER_FALLBACK_KEY:
+            raise ValueError(
+                f"source_file_dependencies {key!r} bypasses filtering and cannot be attached to a step "
+                f"({_get_step_label(step)!r})",
+            )
         registry = _load_source_file_dependencies()
         paths = registry.get(key)
         if paths is None:
@@ -659,10 +671,25 @@ def _select_e2e_group_steps(steps: list[Any]) -> list[Any]:
     return selected
 
 
+def _any_source_dependency_match(steps: list[Any], changed_files: list[str]) -> bool:
+    """True when any step with ``source_file_dependencies`` matches *changed_files*."""
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        deps = _resolve_source_file_dependencies(step)
+        if deps is not None and _match_source_file(changed_files, deps):
+            return True
+        nested = step.get("steps")
+        if isinstance(nested, list) and _any_source_dependency_match(nested, changed_files):
+            return True
+    return False
+
+
 def _render_test_pipeline(
     doc: dict[str, Any],
     changed_files: list[str] | None,
     *,
+    pipeline_path: Path | None = None,
     e2e_only: bool = False,
 ) -> dict[str, Any]:
     """Filter steps by PR diff and strip uploader-only ``source_file_dependencies`` metadata."""
@@ -675,11 +702,53 @@ def _render_test_pipeline(
         return doc
     if e2e_only:
         steps = _select_e2e_group_steps(steps)
+    # Bypass is a fallback: only when no job-key prefix matched.
+    if changed_files is not None and pipeline_path is not None:
+        if not _any_source_dependency_match(steps, changed_files):
+            bypass = _source_filter_fallback_reason(changed_files, pipeline_path)
+            if bypass is not None:
+                _log(f"keep all jobs (no source_file_dependencies match; bypassed by {bypass})")
+                changed_files = None
     steps = _process_test_steps(steps, changed_files)
     return {**doc, "steps": steps}
 
 
 # --- Entry (read file → bootstrap or test render → YAML string) ---
+
+
+def _repo_relative_posix(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.as_posix().replace("\\", "/")
+
+
+def _source_filter_fallback_prefixes() -> list[str]:
+    """Shared uploader/registry prefixes from ``source_filter_fallback``. Not a job key."""
+    registry = _load_source_file_dependencies()
+    prefixes = registry.get(SOURCE_FILTER_FALLBACK_KEY)
+    if not prefixes:
+        raise ValueError(
+            f"source_file_dependencies[{SOURCE_FILTER_FALLBACK_KEY!r}] must list shared uploader paths "
+            f"in {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
+        )
+    return prefixes
+
+
+def _source_filter_fallback_reason(changed_files: list[str] | None, pipeline_path: Path) -> str | None:
+    """Return the changed path that should disable source filtering, if any."""
+    if not changed_files:
+        return None
+    changed = set(changed_files)
+    pipeline_rel = _repo_relative_posix(pipeline_path)
+    if pipeline_rel in changed:
+        return pipeline_rel
+    prefixes = _source_filter_fallback_prefixes()
+    for path in changed_files:
+        if _match_source_file([path], prefixes):
+            return path
+    return None
 
 
 def _changed_files_for_source_filter(
@@ -692,7 +761,9 @@ def _changed_files_for_source_filter(
 
     ``source_file_dependencies`` is label-only: scheduled ``main`` uploads
     (NIGHTLY/WEEKLY/post-merge) run the full pipeline. ``--all`` / ``--e2e``
-    also disable filtering.
+    also disable filtering. Pipeline YAML / ``source_filter_fallback`` matches
+    are applied later in ``_render_test_pipeline`` only when no job-key prefix
+    already matched.
     """
     if force_all or e2e_only:
         return None
@@ -725,7 +796,12 @@ def _render_pipeline(
     if not isinstance(doc, dict):
         raise ValueError(f"invalid pipeline YAML: {path}")
 
-    doc = _render_test_pipeline(doc, changed_files, e2e_only=e2e_only)
+    doc = _render_test_pipeline(
+        doc,
+        changed_files,
+        pipeline_path=path,
+        e2e_only=e2e_only,
+    )
     return yaml.safe_dump(doc, sort_keys=False)
 
 
