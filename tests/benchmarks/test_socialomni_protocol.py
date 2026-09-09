@@ -19,6 +19,8 @@ from benchmarks.socialomni.client import RequestResult, run_phase
 from benchmarks.socialomni.dataset import SocialOmniLevel1Sample, SocialOmniLevel2Sample
 from benchmarks.socialomni.protocol import (
     JUDGE_MAX_TOKENS,
+    LEVEL2_RESPONSE_MAX_TOKENS,
+    LEVEL2_WHEN_MAX_TOKENS,
     build_judge_prompt,
     build_response_prompt,
     build_when_prompt,
@@ -230,6 +232,10 @@ async def test_complete_protocol_over_http(tmp_path, monkeypatch, failed_judge):
             assert base64.b64decode(encoded, validate=True) == expected
             assert "private reference" not in json.dumps(payload)
             assert "videos" not in payload and "use_audio_in_video" not in payload
+            if limit == 32:
+                assert content[1]["text"].endswith(
+                    "Reply only as Answer: X, where X is A, B, C, or D. Do not include an explanation."
+                )
         text = {32: "Answer: A", 8: "Answer: B", 256: "candidate", 8192: "75"}[limit]
         return _completion(text, usage={"prompt_tokens": 2, "completion_tokens": 1})
 
@@ -286,6 +292,99 @@ async def test_complete_protocol_over_http(tmp_path, monkeypatch, failed_judge):
         assert not result["failures"]
         assert metrics["quality"]["qgold"] == 75
         assert metrics["quality"]["cov_plus"] == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_response_makes_level2_incomplete(tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix.mp4"
+    prefix.write_bytes(b"prefix")
+    sample = replace(_level2(0), gold_when="YES", video_path=str(prefix))
+
+    async def prepared(*args):
+        return prefix
+
+    async def completion(request):
+        payload = await request.json()
+        if payload["max_tokens"] == LEVEL2_RESPONSE_MAX_TOKENS:
+            return web.json_response({})
+        assert payload["max_tokens"] == LEVEL2_WHEN_MAX_TOKENS
+        return _completion("Answer: A")
+
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    monkeypatch.setattr(protocol, "create_video_prefix", prepared)
+    monkeypatch.setattr(entrypoint, "load_socialomni_level2_samples", lambda *a, **k: [sample])
+    monkeypatch.setattr(entrypoint, "inspect_socialomni_dataset", lambda *a, **k: {})
+    async with _server(completion) as base_url:
+        judges = tmp_path / "judges.json"
+        judges.write_text(
+            json.dumps(
+                {
+                    "judges": [
+                        {"name": name, "model": name, "base_url": base_url}
+                        for name in entrypoint.SOCIALOMNI_JUDGE_NAMES
+                    ]
+                }
+            )
+        )
+        result = await entrypoint.run_socialomni(
+            _config(level="level2", base_url=base_url, judge_config=str(judges), warmup=0)
+        )
+    assert result["summary"]["status"] == "incomplete"
+    assert not result["per_sample"]["level2"][0]["gold_response_success"]
+    assert len(result["failures"]) == 1
+    assert "invalid completion response" in result["failures"][0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"choices": []},
+        {"choices": [None]},
+        {"choices": [{}]},
+        {"choices": [{"message": {}}]},
+        {"choices": [{"message": {"content": 42}}]},
+        {"choices": [{"message": {"content": [{"type": "text", "text": 42}]}}]},
+    ],
+)
+async def test_malformed_completion_is_a_request_failure(body, monkeypatch):
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+
+    async def completion(request):
+        return web.json_response(body)
+
+    async with _server(completion) as base_url:
+        async with aiohttp.ClientSession() as session:
+            result = await request_chat_completion(
+                session,
+                api_url=f"{base_url}/v1/chat/completions",
+                payload={},
+                request_id="response",
+            )
+    assert not result.is_success
+    assert "invalid completion response" in result.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", None, []])
+async def test_empty_completion_remains_successful(content, monkeypatch):
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+
+    async def completion(request):
+        return _completion(content)
+
+    async with _server(completion) as base_url:
+        async with aiohttp.ClientSession() as session:
+            result = await request_chat_completion(
+                session,
+                api_url=f"{base_url}/v1/chat/completions",
+                payload={},
+                request_id="response",
+            )
+    assert result.is_success
+    assert result.text == ""
+    assert result.error == ""
 
 
 @pytest.mark.asyncio

@@ -109,22 +109,27 @@ def validate_judge_credentials(judges: Sequence[JudgeSpec]) -> None:
 def _response_text(body: dict[str, Any]) -> str:
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices:
-        return ""
+        raise RuntimeError("invalid completion response: expected non-empty choices")
     if not isinstance(choices[0], dict):
-        return ""
+        raise RuntimeError("invalid completion response: expected a choice object")
     message = choices[0].get("message")
     if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
+        raise RuntimeError("invalid completion response: expected a message object")
+    if "content" not in message:
+        raise RuntimeError("invalid completion response: missing message content")
+    content = message["content"]
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        return "\n".join(
-            str(part.get("text", "")).strip()
+        if any(
+            not isinstance(part, dict) or part.get("type") != "text" or not isinstance(part.get("text"), str)
             for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        ).strip()
-    return ""
+        ):
+            raise RuntimeError("invalid completion response: expected text content parts")
+        return "\n".join(part["text"].strip() for part in content).strip()
+    if content is None:
+        return ""
+    raise RuntimeError("invalid completion response: unsupported message content")
 
 
 async def request_chat_completion(
@@ -259,7 +264,7 @@ def build_level1_prompt(sample: SocialOmniLevel1Sample) -> str:
     )
     return (
         f"{sample.question}\n{options}\nUse the video and its audio. "
-        "Reply on the last line as Answer: X, where X is A, B, C, or D."
+        "Reply only as Answer: X, where X is A, B, C, or D. Do not include an explanation."
     )
 
 
