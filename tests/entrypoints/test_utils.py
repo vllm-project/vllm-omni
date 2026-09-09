@@ -28,6 +28,7 @@ from vllm_omni.entrypoints.utils import (
     coerce_param_message_types,
     filter_dataclass_kwargs,
 )
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -295,6 +296,31 @@ class TestFilterDataclassKwargs:
 
 
 class TestResolveOmniConfig:
+    def test_bare_deploy_name_returns_packaged_resolved_path(self, tmp_path, mocker: MockerFixture):
+        deploy_name = "qwen3_omni_moe.yaml"
+        deploy_path = tmp_path / deploy_name
+        deploy_path.write_text(
+            "duplex_session:\n  server_vad_model_path: /models/silero_vad.onnx\nstages: []\n",
+            encoding="utf-8",
+        )
+        mocker.patch("vllm_omni.config.config_factory._DEPLOY_DIR", tmp_path)
+        mocker.patch("vllm_omni.config.omni_config._DEPLOY_DIR", tmp_path)
+        mocker.patch(
+            "vllm_omni.config.config_factory.StageConfigFactory.get_pipeline_config",
+            return_value=QWEN3_OMNI_PIPELINE,
+        )
+
+        resolved = resolve_omni_config(
+            "dummy-model",
+            trust_remote_code=False,
+            deploy_config_path=deploy_name,
+            cli_overrides={},
+            stage_overrides=None,
+            strategy_config_path=None,
+        )
+
+        assert resolved.config_path == str(deploy_path)
+
     def test_stage_lookup_error_lists_resolved_ids(self):
         resolved = OmniConfigResolution(
             config_path=None,

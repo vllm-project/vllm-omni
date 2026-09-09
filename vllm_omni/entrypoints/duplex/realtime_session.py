@@ -42,6 +42,10 @@ class NativeRealtimeSessionProtocol(
     def bind_sender(self, send_realtime_json) -> None:
         self._send_realtime_json = send_realtime_json
 
+    def bind_native_input_append(self, enabled: bool) -> None:
+        """Use the serving-selected input path, independent of interruption policy."""
+        self._native_input_append = enabled
+
     def _default_session_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": self._default_model,

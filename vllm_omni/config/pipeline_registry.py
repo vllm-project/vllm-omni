@@ -39,6 +39,7 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTA_PIPELINE,
     AUDEX_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -66,6 +67,9 @@ from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO
 from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS2_PIPELINE,
     INDEXTTS25_PIPELINE,
+)
+from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
@@ -122,6 +126,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
+    "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,
@@ -168,6 +173,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
+    "arktts": AUDIO8_TTS_PIPELINE,
     "ming_flash_omni": MING_FLASH_OMNI_PIPELINE,
     "ming_flash_omni_tts": MING_FLASH_OMNI_TTS_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,

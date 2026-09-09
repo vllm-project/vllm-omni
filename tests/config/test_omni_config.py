@@ -261,6 +261,57 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
 
+@pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
+def test_llm_additional_config_roundtrip_and_isolation(stage_id, monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    # Worker discovery requires hardware support; this test covers config transport.
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    additional_config = {"backend_options": {"enabled": True}}
+    pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=i, engine_extras={"additional_config": additional_config}) for i in (0, 2)]
+    )
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    stage = config.stage_by_id(stage_id)
+    assert stage.runtime_config.additional_config == additional_config
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == additional_config
+
+    engine_args["additional_config"]["backend_options"]["enabled"] = False
+    assert stage.runtime_config.additional_config["backend_options"]["enabled"] is True
+    stage.runtime_config.additional_config["backend_options"]["enabled"] = False
+    assert config.stage_by_id(2 if stage_id == 0 else 0).runtime_config.additional_config == additional_config
+    assert additional_config["backend_options"]["enabled"] is True
+
+
+@pytest.mark.parametrize("deploy_name", ["minicpmo_4_5", "minicpmo_4_5_2gpu", "minicpmo_4_5_3gpu"])
+def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_name):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
+    expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    assert stage.runtime_config.additional_config == expected
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == expected
+
+
+def test_diffusion_additional_config_keeps_diffusion_owner():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    additional_config = {"torchair_graph_config": {"enabled": True}}
+    stage = _from_pipeline_key("dreamzero", cli_overrides={"additional_config": additional_config}).stage_by_id(0)
+    assert stage.runtime_config.additional_config is None
+    assert stage.diffusion_config.additional_config == additional_config
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == additional_config
+
+
 @pytest.mark.parametrize(
     ("engine_extras", "cli_overrides"),
     [
@@ -532,6 +583,17 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 
+def test_joyai_code2wav_waits_for_full_payload():
+    config = _from_pipeline_key("joyai_vl_interaction")
+    talker = config.stage_by_id(1)
+    code2wav = config.stage_by_id(2)
+
+    assert talker.custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
+    assert code2wav.custom_process_input_func.endswith("talker2code2wav_token_only")
+    assert code2wav.connector_config.async_chunk is False
+    assert code2wav.model_config.requires_full_payload_input is True
+
+
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert not hasattr(BaseVllmOmniStageConfig, "from_stage_config")
     assert not hasattr(BaseVllmOmniStageConfig, "to_legacy_stage_config")
@@ -559,6 +621,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
 
 def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "additional_config",
         "distributed_executor_backend",
         "worker_cls",
         "devices",

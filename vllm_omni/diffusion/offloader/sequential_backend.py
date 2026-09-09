@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
@@ -13,9 +13,8 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
-from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT
-from .module_collector import ModuleDiscovery
-from .offload_plan import get_offload_plan
+from .config import DIT_COMPONENT
+from .plan_resolver import resolve_offload_plan
 
 logger = init_logger(__name__)
 
@@ -329,59 +328,44 @@ class ModelLevelOffloadBackend(OffloadBackend):
             )
             return
 
-        modules = ModuleDiscovery.discover(pipeline)
-        plan = get_offload_plan(pipeline)
-        selected_encoders = [
-            encoder
-            for encoder, name in zip(modules.encoders, modules.encoder_names)
-            if self.config.should_offload_encoder(name, plan)
-        ]
-        if self.config.components is not None:
-            if not modules.dits:
-                raise ValueError("Component-selective model offload requires a DiT/transformer module")
-            if not modules.encoders:
-                raise ValueError("Component-selective model offload requires an encoder execution stage")
-            if self.config.offloads(TEXT_ENCODER_COMPONENT) and not selected_encoders:
-                raise ValueError("No text encoder modules found for selected text_encoder module offload")
+        resolved = resolve_offload_plan(pipeline, self.config)
+        dits = [component.module for component in resolved.dits]
+        encoders = [component.module for component in resolved.encoders]
+        vaes = [component.module for component in resolved.vaes]
+        residents = [component.module for component in resolved.residents]
+        selected_encoders = [component.module for component in resolved.encoders if component.selected]
 
-        all_modules = [
-            *modules.dits,
-            *modules.encoders,
-            *modules.vaes,
-            *modules.resident_modules,
-        ]
+        all_modules = [*dits, *encoders, *vaes, *residents]
         initial_devices = _capture_tensor_devices(all_modules)
         try:
-            for encoder in modules.encoders:
+            for encoder in encoders:
                 encoder.to(self.device)
-            for vae in modules.vaes:
+            for vae in vaes:
                 vae.to(self.device, non_blocking=True)
-            for resident in modules.resident_modules:
+            for resident in residents:
                 resident.to(self.device)
 
-            if not modules.dits:
+            if not dits:
                 logger.warning("No DiT/transformer modules found, skipping model-level offloading")
                 return
-            if not modules.encoders:
-                for dit in modules.dits:
+            if not encoders:
+                for dit in dits:
                     dit.to(self.device)
                 logger.warning("No encoder modules found, skipping model-level offloading")
                 return
 
             apply_sequential_offload(
-                dit_modules=modules.dits,
-                encoder_modules=modules.encoders,
+                dit_modules=dits,
+                encoder_modules=encoders,
                 device=self.device,
                 pin_memory=self.config.pin_cpu_memory,
                 use_hsdp=self.config.use_hsdp,
-                offload_dit_modules=(
-                    modules.dits if self.config.components is None or self.config.offloads(DIT_COMPONENT) else ()
-                ),
+                offload_dit_modules=(dits if self.config.offloads(DIT_COMPONENT) else ()),
                 offload_encoder_modules=selected_encoders,
             )
         except BaseException:
             try:
-                remove_sequential_offload([*modules.dits, *modules.encoders])
+                remove_sequential_offload([*dits, *encoders])
             except BaseException:
                 logger.exception("Failed to remove every model-level hook during rollback")
             try:
@@ -391,15 +375,19 @@ class ModelLevelOffloadBackend(OffloadBackend):
             raise
 
         # Track modules for cleanup
-        self._offload_modules = [*modules.dits, *modules.encoders]
+        self._offload_modules = [*dits, *encoders]
 
         self.enabled = True
 
         logger.info(
             "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
-            ", ".join(modules.dit_names),
-            ", ".join(modules.encoder_names),
-            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
+            ", ".join(component.path for component in resolved.dits),
+            ", ".join(component.path for component in resolved.encoders),
+            (
+                f"; resident on GPU: {', '.join(component.path for component in resolved.residents)}"
+                if resolved.residents
+                else ""
+            ),
         )
 
     def disable(self) -> None:
