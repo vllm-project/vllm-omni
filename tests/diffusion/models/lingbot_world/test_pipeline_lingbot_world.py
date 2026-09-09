@@ -1915,13 +1915,14 @@ def test_stepwise_progress_metadata_and_commit_trace() -> None:
         assert output.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
 
 
-def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
+@pytest.mark.parametrize("num_chunks", [2, 12])
+def test_stepwise_matches_tick_transformer_trace_and_latents(num_chunks) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
     pipeline._ar_height = 16
     pipeline._ar_width = 16
-    script = ((("w",), ("w",), ("w",)), (("d",), ("d",), ("d",)))
+    script = ((("w",), ("w",), ("w",)), (("d",), ("d",), ("d",))) * (num_chunks // 2)
     fake = _FakeARState("world-1")
 
     with pipeline.bind_ar_diffusion_state("world-1", fake):
@@ -1948,7 +1949,7 @@ def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
     transformer.calls.clear()
     pipeline.close_ar_diffusion_session("world-1")
 
-    stepwise_state = _stepwise_state(request_id="req-1", num_frames=21, script=script, seed=17)
+    stepwise_state = _stepwise_state(request_id="req-1", num_frames=12 * num_chunks - 3, script=script, seed=17)
     stepwise_fake = _FakeARState(stepwise_state.request_id)
     with pipeline.bind_ar_diffusion_state(stepwise_state.request_id, stepwise_fake):
         stepwise_outputs = _run_stepwise(pipeline, stepwise_state)
@@ -1957,6 +1958,14 @@ def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
     assert [call["start_frame"] for call in transformer.calls] == [call["start_frame"] for call in tick_calls]
     for tick_latent, output in zip(tick_latents, stepwise_outputs, strict=True):
         torch.testing.assert_close(output.output["payload"]["latents"], tick_latent)
+    for step_call, tick_call in zip(transformer.calls, tick_calls, strict=True):
+        torch.testing.assert_close(step_call["hidden_states"], tick_call["hidden_states"])
+        torch.testing.assert_close(step_call["camera_hidden_states"], tick_call["camera_hidden_states"])
+    assert stepwise_state.extra["image_condition"].shape[2] == 6
+    assert [video.shape[2] for video in pipeline.vae.encode_inputs] == [21, 21]
+    assert stepwise_fake.commits == ["main"] * num_chunks
+    assert len(stepwise_outputs) == num_chunks and stepwise_outputs[-1].finished
+    assert pipeline.vae.decode_inputs == []
 
 
 def test_stepwise_trajectory_camera_matches_request_mode_under_non_uniform_speed(monkeypatch) -> None:

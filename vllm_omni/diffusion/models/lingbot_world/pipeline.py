@@ -862,6 +862,18 @@ class LingBotWorldCausalDMDPipeline(
             )
         return condition
 
+    def _prepare_bounded_condition(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
+        """Prepare the initial condition and one reusable blank-tail block."""
+        latent_frames = _REALTIME_CONDITION_BLOCKS * int(self.transformer.config.num_frames_per_block)
+        return self._prepare_condition(
+            replace(
+                inputs,
+                num_frames=(latent_frames - 1) * self.vae_scale_factor_temporal + 1,
+                num_latent_frames=latent_frames,
+            ),
+            dtype=dtype,
+        )
+
     def _prepare_camera(
         self,
         inputs: _LingBotRequestInputs,
@@ -1130,16 +1142,7 @@ class LingBotWorldCausalDMDPipeline(
         else:
             assert session_state is not None
             if session_state.image_condition is None:
-                condition_latent_frames = _REALTIME_CONDITION_BLOCKS * block_frames
-                condition_pixel_frames = (condition_latent_frames - 1) * self.vae_scale_factor_temporal + 1
-                session_state.image_condition = self._prepare_condition(
-                    replace(
-                        inputs,
-                        num_frames=condition_pixel_frames,
-                        num_latent_frames=condition_latent_frames,
-                    ),
-                    dtype=dtype,
-                )
+                session_state.image_condition = self._prepare_bounded_condition(inputs, dtype=dtype)
             condition_block = min(tick.chunk_index, _REALTIME_CONDITION_BLOCKS - 1)
             condition_start = condition_block * block_frames
             condition = session_state.image_condition[
@@ -1287,12 +1290,6 @@ class LingBotWorldCausalDMDPipeline(
             self._cached_video_processor = processor
         return processor
 
-    def _horizon_latent_frames(self) -> int:
-        return (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-
-    def _max_realtime_chunks(self) -> int:
-        return self._horizon_latent_frames() // int(self.transformer.config.num_frames_per_block)
-
     def _require_bound_ar_state(self) -> None:
         if self._ar_diffusion_kv_state is None:
             raise RuntimeError("LingBot step execution requires AR-Diffusion session binding.")
@@ -1319,13 +1316,6 @@ class LingBotWorldCausalDMDPipeline(
             )
         block_frames = int(self.transformer.config.num_frames_per_block)
         total_chunks = inputs.num_latent_frames // block_frames
-        max_chunks = self._max_realtime_chunks()
-        if total_chunks > max_chunks:
-            raise ValueError(
-                "LingBot step execution currently supports at most "
-                f"{max_chunks} chunks because the image-condition horizon is "
-                f"{_MAX_RAW_FRAMES} pixel frames."
-            )
         if inputs.camera_action_script is not None and len(inputs.camera_action_script) != total_chunks:
             raise ValueError(
                 "camera_action_script must contain one action list per generated chunk; "
@@ -1337,14 +1327,7 @@ class LingBotWorldCausalDMDPipeline(
             max_sequence_length=inputs.max_sequence_length,
             dtype=dtype,
         )
-        image_condition = self._prepare_condition(
-            replace(
-                inputs,
-                num_frames=_MAX_RAW_FRAMES,
-                num_latent_frames=self._horizon_latent_frames(),
-            ),
-            dtype=dtype,
-        )
+        image_condition = self._prepare_bounded_condition(inputs, dtype=dtype)
         camera_trajectory_cache = None
         camera_embedding_cache = None
         if inputs.camera_trajectory is not None:
@@ -1394,9 +1377,8 @@ class LingBotWorldCausalDMDPipeline(
         start_frame = state.chunk_index * block_frames
         stop_frame = start_frame + block_frames
         image_condition = extra["image_condition"]
-        if stop_frame > image_condition.shape[2]:
-            raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
-        condition = image_condition[:, :, start_frame:stop_frame]
+        condition_start = min(state.chunk_index, _REALTIME_CONDITION_BLOCKS - 1) * block_frames
+        condition = image_condition[:, :, condition_start : condition_start + block_frames]
         previous = extra.get("camera_tail")
         if extra.get("camera_action_script") is not None:
             chunk_actions = extra["camera_action_script"][state.chunk_index]
