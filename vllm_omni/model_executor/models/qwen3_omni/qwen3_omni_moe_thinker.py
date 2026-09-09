@@ -25,7 +25,7 @@
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -118,6 +118,7 @@ from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerMultiModalDataParser,
@@ -137,9 +138,6 @@ try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
-
-if TYPE_CHECKING:
-    from vllm_omni.data_entry_keys import OmniPayload
 
 logger = init_logger(__name__)
 
