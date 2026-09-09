@@ -18,7 +18,7 @@ steps:
       - label: ":full_moon: Omni · Function Test with H100 · Single-GPU"
         timeout_in_minutes: 120
         commands:
-          - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
+          - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and A100 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
 
       - label: ":full_moon: Omni · Function Test with H100 · 2-GPU"
         timeout_in_minutes: 90

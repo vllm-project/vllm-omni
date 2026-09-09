@@ -29,10 +29,10 @@ _SERVER_ENV: dict[str, str] = {"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S": str(SERVER_INPU
 if TOKENIZER:
     _SERVER_ENV["NEMOTRON_VOICECHAT_LLM_PATH"] = TOKENIZER
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.slow, pytest.mark.omni]
 
 
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     [

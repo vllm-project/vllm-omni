@@ -342,7 +342,7 @@ def test_is_hardware_nested_baseline():
     assert not is_hardware_nested_baseline({"mean_ttft_ms": {"1": 1.0, "32": 2.0}})
     assert not is_hardware_nested_baseline({})
     # Alias-only labels (not [hardware-resource] markers) are rejected for baselines.
-    assert not is_hardware_nested_baseline({"A100": {"throughput_qps": 1.0}})
+    assert not is_hardware_nested_baseline({"T4": {"throughput_qps": 1.0}})
     # Unknown top-level hardware label is rejected.
     assert not is_hardware_nested_baseline({"UnknownGPU": {"throughput_qps": 1.0}})
     # Empty per-hardware metric map is rejected.
@@ -388,9 +388,9 @@ def test_resolve_baseline_for_sweep_rejects_flat_baseline():
 def test_resolve_baseline_for_sweep_rejects_unknown_hardware_label():
     from tests.dfx.conftest import resolve_baseline_for_sweep
 
-    with pytest.raises(ValueError, match=r"Unknown hardware label\(s\): \['A100'\].*pyproject\.toml"):
+    with pytest.raises(ValueError, match=r"Unknown hardware label\(s\): \['T4'\].*pyproject\.toml"):
         resolve_baseline_for_sweep(
-            {"A100": {"throughput_qps": 1.0}},
+            {"T4": {"throughput_qps": 1.0}},
             sweep_index=0,
         )
 
