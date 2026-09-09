@@ -186,9 +186,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         # model_config; hooks install once at startup and forward()
         # reconciles per-request state (step count, CFG parity).
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
-        self._cache_dit_summary_enabled = bool(
-            getattr(vllm_config.model_config, "enable_cache_dit_summary", False)
-        )
+        self._cache_dit_summary_enabled = bool(getattr(vllm_config.model_config, "enable_cache_dit_summary", False))
         cache_backend = getattr(vllm_config.model_config, "cache_backend", None)
         cache_config = getattr(vllm_config.model_config, "cache_config", None)
         self._cache_dit_config: DiffusionCacheConfig | None = None
@@ -202,9 +200,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             backend.enable(self)
             self._cache_dit_runtime.adopt(backend, installation_key=_MAMMOTHMODA2_CACHE_DIT_KEY)
         elif cache_backend not in (None, "", "none", "None"):
-            logger.warning(
-                "Cache backend '%s' is not supported for MammothModa2 yet; ignoring.", cache_backend
-            )
+            logger.warning("Cache backend '%s' is not supported for MammothModa2 yet; ignoring.", cache_backend)
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt a runner-installed Cache-DiT backend (request-scoped protocol)."""
