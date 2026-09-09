@@ -64,6 +64,52 @@ def test_hugging_face_subset_names_are_splits(monkeypatch):
     assert sample.task_type == "correction"
 
 
+def test_local_hf_dataset_directory_is_routed_to_hf_loader(tmp_path, monkeypatch):
+    # An existing local Hugging Face dataset layout (directory with a
+    # ``data/*.parquet`` file) must be loaded through ``datasets.load_dataset``
+    # instead of being parsed as a JSON/JSONL manifest.
+    hf_dir = tmp_path / "Omni-DuplexEval"
+    data_dir = hf_dir / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "train-00000-of-00001.parquet").write_bytes(b"PAR1")
+    calls = []
+
+    def fake_load_dataset(name, **kwargs):
+        calls.append((name, kwargs))
+        return [{"id": "pr", "split": "PR_correction", "question_text": "Correct this."}]
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
+    samples = load_samples(hf_dir)
+    assert calls == [(str(hf_dir), {})]
+    assert len(samples) == 1
+    assert samples[0].task_type == "correction"
+
+
+def test_local_parquet_file_is_routed_to_hf_loader(tmp_path, monkeypatch):
+    parquet = tmp_path / "samples.parquet"
+    parquet.write_bytes(b"PAR1")
+    calls = []
+
+    def fake_load_dataset(name, **kwargs):
+        calls.append((name, kwargs))
+        return [{"id": "pr", "split": "PR_correction", "question_text": "Correct this."}]
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
+    samples = load_samples(str(parquet))
+    assert calls == [("parquet", {"data_files": str(parquet)})]
+    assert len(samples) == 1
+    assert samples[0].family == "pr"
+
+
+def test_non_manifest_file_raises_clear_error(tmp_path):
+    # A plain non-JSON file (e.g. a README) must surface a clear ValueError
+    # listing the accepted inputs instead of a raw JSONDecodeError.
+    bad = tmp_path / "README.md"
+    bad.write_text("# readme\nnot a manifest", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON/JSONL manifest"):
+        load_samples(str(bad))
+
+
 def test_response_aliases_and_clock_guard():
     assert split_text("One. Two!") == ["One.", "Two!"]
     assert normalize_response_items({"chunks": [{"text": "x", "current_time": 800}]}) == [

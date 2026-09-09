@@ -3,7 +3,8 @@
 
 """Dataset and split normalization for Omni-DuplexEval.
 
-The loader accepts a Hugging Face dataset id, a JSON/JSONL manifest, or an
+The loader accepts a Hugging Face dataset id, a local Hugging Face dataset
+layout (a directory or a ``.parquet`` file), a JSON/JSONL manifest, or an
 already materialized iterable.  Media is deliberately resolved at use time so
 the benchmark remains usable in air-gapped environments.
 """
@@ -148,6 +149,33 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
     return payload
 
 
+def _rows_from_hf(dataset: str, *, split: str | None) -> list[dict[str, Any]]:
+    """Load rows from a Hugging Face dataset id or a local dataset layout.
+
+    ``datasets.load_dataset`` accepts a remote id, a local dataset directory
+    (``dataset_info.json`` + ``data/*.parquet``) and, via the ``parquet``
+    builder, a single ``.parquet`` file, which keeps the benchmark usable
+    offline with a locally mirrored copy of the dataset.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "datasets is required to load a Hugging Face dataset id or a local "
+            "dataset directory/parquet file; use a local JSON/JSONL manifest instead"
+        ) from exc
+    load_kwargs: dict[str, Any] = {}
+    if split and split != "all":
+        load_kwargs["split"] = split
+    if Path(dataset).suffix.lower() == ".parquet":
+        loaded = load_dataset("parquet", data_files=dataset, **load_kwargs)
+    else:
+        loaded = load_dataset(dataset, **load_kwargs)
+    if isinstance(loaded, dict):
+        return [{**dict(row), "split": name} for name, table in loaded.items() for row in table]
+    return [dict(row) for row in loaded]
+
+
 def load_samples(
     dataset: str | Path | Iterable[dict[str, Any]] = DEFAULT_DATASET,
     *,
@@ -157,25 +185,29 @@ def load_samples(
     limit: int | None = None,
     ids: Iterable[str] | None = None,
 ) -> list[DuplexSample]:
-    if isinstance(dataset, (str, Path)) and Path(str(dataset)).exists():
-        rows = _read_manifest(Path(str(dataset)))
-    elif not isinstance(dataset, (str, Path)):
-        rows = list(dataset)
-    else:
-        try:
-            from datasets import load_dataset
-        except ImportError as exc:
-            raise RuntimeError("datasets is required for Hugging Face loading; use a local manifest instead") from exc
-        kwargs: dict[str, Any] = {}
-        if split and split != "all":
-            kwargs["split"] = split
-        loaded = load_dataset(str(dataset), **kwargs)
-        if isinstance(loaded, dict):
-            rows = []
-            for name, table in loaded.items():
-                rows.extend({**dict(row), "split": name} for row in table)
+    if isinstance(dataset, str | Path):
+        path = Path(str(dataset))
+        if path.exists():
+            # A directory or a ``.parquet`` file is a Hugging Face dataset
+            # layout (e.g. a locally mirrored Omni-DuplexEval snapshot); only
+            # single JSON/JSONL files are parsed as manifests.  Routing by path
+            # shape instead of mere existence lets local Hugging Face datasets
+            # load through ``datasets.load_dataset``.
+            if path.is_dir() or path.suffix.lower() == ".parquet":
+                rows = _rows_from_hf(str(path), split=split)
+            else:
+                try:
+                    rows = _read_manifest(path)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError(
+                        f"cannot load dataset from {str(path)!r}: expected a "
+                        "JSON/JSONL manifest file, a local Hugging Face dataset "
+                        "directory, or a single .parquet file"
+                    ) from exc
         else:
-            rows = [dict(row) for row in loaded]
+            rows = _rows_from_hf(str(dataset), split=split)
+    else:
+        rows = list(dataset)
     wanted = set(str(item) for item in ids) if ids else None
     root = Path(media_root).expanduser() if media_root else None
     result = []
