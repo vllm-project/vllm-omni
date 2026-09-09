@@ -45,6 +45,7 @@ class StageRequestStats:
     stage_id: int | None = None
     replica_id: int | None = None
     final_output_type: str | None = None
+    finish_reason: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
     diffusion_metrics: dict[str, float] = None
@@ -126,6 +127,7 @@ STAGE_EXCLUDE = {
     "rx_decode_time_ms",
     "rx_in_flight_time_ms",
     "final_output_type",
+    "finish_reason",
     "pipeline_timings",
 }
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
@@ -473,6 +475,7 @@ class OrchestratorAggregator:
             current = {
                 "stage_id": sid,
                 "final_output_type": evt.final_output_type,
+                "finish_reason": evt.finish_reason,
                 defs.NUM_TOKENS_IN: int(evt.num_tokens_in),
                 defs.NUM_TOKENS_OUT: int(evt.num_tokens_out),
                 defs.STAGE_GEN_TIME_MS: float(evt.stage_gen_time_ms),
@@ -498,6 +501,8 @@ class OrchestratorAggregator:
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
         current[defs.NUM_TOKENS_OUT] = int(current.get(defs.NUM_TOKENS_OUT, 0)) + int(evt.num_tokens_out)
+        if evt.finish_reason is not None:
+            current["finish_reason"] = evt.finish_reason
         current[defs.STAGE_GEN_TIME_MS] = float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) + float(evt.stage_gen_time_ms)
         current[defs.POSTPROCESS_TIME_MS] = float(current.get(defs.POSTPROCESS_TIME_MS, 0.0)) + float(
             evt.postprocess_time_ms

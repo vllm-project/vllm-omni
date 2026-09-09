@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -9,6 +10,7 @@ from typing import (
     ClassVar,
     Literal,
     Protocol,
+    TypeGuard,
     runtime_checkable,
 )
 
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -43,6 +46,34 @@ class SupportAudioInput(Protocol):
 @runtime_checkable
 class SupportAudioOutput(Protocol):
     support_audio_output: ClassVar[bool] = True
+
+
+DecodedChunkConsumer = Callable[["torch.Tensor"], None]
+
+
+@runtime_checkable
+class SupportsChunkedVAEDecode(Protocol):
+    """Optional capability for VAEs that stream decoded temporal chunks.
+
+    Implementations must drain decoding before surfacing callback errors. In a
+    distributed VAE, every rank invokes the method so collectives stay in
+    lockstep, while ``on_chunk`` is called only on the rank that owns output.
+    """
+
+    def decode_with_chunks(
+        self,
+        z: torch.Tensor,
+        *,
+        on_chunk: DecodedChunkConsumer,
+    ) -> None:
+        """Decode ``z`` and synchronously deliver committed chunks in order."""
+        ...
+
+
+def supports_chunked_vae_decode(vae: object) -> TypeGuard[SupportsChunkedVAEDecode]:
+    """Return whether ``vae`` exposes the optional chunked decode capability."""
+
+    return isinstance(vae, SupportsChunkedVAEDecode)
 
 
 @runtime_checkable
@@ -108,30 +139,34 @@ def supports_step_execution(pipeline: object) -> bool:
 
 
 @runtime_checkable
-class SupportsPromptUpdate(Protocol):
-    """Optional protocol for pipelines that support midway prompt updates.
+class SupportsInteractionApply(Protocol):
+    """Optional protocol for pipelines with unified mid-generation, chunk-boundary hooks."""
 
-    Pipelines typically implement this via
-    :class:`~vllm_omni.diffusion.prompt_update.PromptUpdateMixin`.
-    """
+    def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
+        """Return the media timeline represented by the upcoming/current chunk.
 
-    supports_prompt_update: ClassVar[bool] = True
+        Useful when interaction handler needs interpolation/integration on a frame-by-frame basis,
+        or for backpressure/pacing.
+        """
+        ...
 
-    def prepare_prompt_update(
-        self,
-        state: StepRequestState,
-        prompt: str,
-        event_id: str,
-        transition_chunks: int | None = None,
-    ) -> None:
-        """Encode and queue a prompt update on request-local state."""
+    def apply_interaction_at_chunk_boundary(self, state: StepRequestState) -> None:
+        """Advance queued interactions before the next generation chunk."""
+        ...
+
+    def prepare_next_chunk(self, state: StepRequestState) -> None:
+        """Set up pipeline state for the next chunk after interaction apply.
+
+        Default implementations is a no-op; model-specific pipelines override
+        when chunk transitions require latent/history bookkeeping.
+        """
         ...
 
 
-def supports_prompt_update(pipeline: object) -> bool:
-    """Return whether ``pipeline`` implements :class:`SupportsPromptUpdate`."""
+def supports_interaction_apply(pipeline: object) -> bool:
+    """Return whether ``pipeline`` implements :class:`SupportsInteractionApply`."""
 
-    return isinstance(pipeline, SupportsPromptUpdate)
+    return isinstance(pipeline, SupportsInteractionApply)
 
 
 @runtime_checkable

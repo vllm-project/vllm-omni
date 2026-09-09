@@ -10,10 +10,12 @@ Generate text from text or image inputs with vLLM-Omni's shared offline entrypoi
 | --- | --- | --- | --- |
 | `ByteDance-Seed/BAGEL-7B-MoT` | Yes | Yes | `vllm_omni/deploy/bagel.yaml` |
 | `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | `vllm_omni/deploy/hunyuan_image3_ar.yaml` |
+| `bytedance-research/MammothModa2-Preview` | Yes | Yes | `vllm_omni/deploy/mammoth_moda2_ar.yaml` |
+| `bytedance-research/MammothModa2-Dev` | Yes | Yes | `vllm_omni/deploy/mammoth_moda2_ar.yaml` |
 
 The script recognizes these model families from `config.json`, applies the
-model-specific prompt format, and selects an AR-only deploy for HunyuanImage-3.
-BAGEL uses its registered default deploy.
+model-specific prompt format, and selects an AR-only deploy for HunyuanImage-3
+and MammothModa2. BAGEL uses its registered default deploy.
 
 ## Text-To-Text
 
@@ -30,6 +32,22 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 ```bash
 python examples/offline_inference/x_to_text/x_to_text.py \
   --model tencent/HunyuanImage-3.0-Instruct \
+  --prompt "Explain multimodal inference in three concise sentences."
+```
+
+### MammothModa2
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model bytedance-research/MammothModa2-Preview \
+  --prompt "Explain multimodal inference in three concise sentences."
+```
+
+The same command supports the Dev checkpoint:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model bytedance-research/MammothModa2-Dev \
   --prompt "Explain multimodal inference in three concise sentences."
 ```
 
@@ -54,6 +72,16 @@ python examples/offline_inference/x_to_text/x_to_text.py \
   --prompt "Describe this image in detail."
 ```
 
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model bytedance-research/MammothModa2-Preview \
+  --image image.png \
+  --prompt "Describe this image in detail."
+```
+
+Use `bytedance-research/MammothModa2-Dev` in the same command to run I2T with
+the Dev checkpoint.
+
 ## Key Arguments
 
 | Argument | Default | Description |
@@ -74,4 +102,4 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 
 The committed HunyuanImage-3 AR-only default uses four GPUs with TP=4. To use a
 different topology, pass a custom AR-only YAML through `--deploy-config`.
-BAGEL uses its repository deploy default unless overridden.
+BAGEL and MammothModa2 use their repository deploy defaults unless overridden.

@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
 import pytest
 
 from tests.helpers import assertions
-from tests.helpers.assertions import _assert_transcript_matches, _resolve_audio_transcript
+from tests.helpers.assertions import (
+    _assert_transcript_matches,
+    _resolve_audio_transcript,
+    assert_audio_speech_response,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -69,6 +73,40 @@ def test_resolve_transcript_leaves_language_unset_by_default(monkeypatch):
 
     assert captured["language"] is None
     assert captured["model_size"] == "small"
+
+
+@pytest.mark.parametrize(
+    ("request_config", "expected_text"),
+    [
+        ({"input": "spoken words"}, "spoken words"),
+        (
+            {
+                "input": "<|style:whispering|>spoken words",
+                "transcript_expected_text": "spoken words",
+            },
+            "spoken words",
+        ),
+    ],
+)
+def test_speech_transcript_expected_text(monkeypatch, request_config, expected_text):
+    captured: dict = {}
+
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", lambda *_args, **_kwargs: "spoken words")
+
+    def capture_match(_transcript, _audio_bytes, expected_text, **_kwargs):
+        captured["expected_text"] = expected_text
+
+    monkeypatch.setattr(assertions, "_assert_transcript_matches", capture_match)
+    response = SimpleNamespace(success=True, audio_bytes=b"fake-wav", audio_format="audio/wav")
+    request_config["response_format"] = "wav"
+
+    assert_audio_speech_response(
+        response,
+        request_config,
+        "advanced_model",
+    )
+
+    assert captured["expected_text"] == expected_text
 
 
 def test_escalated_transcript_keeps_declared_language(monkeypatch):

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
+import threading
 from io import BytesIO
+from typing import Any
 
 import av
 import httpx
@@ -40,7 +42,7 @@ def _install_http_transport(monkeypatch, handler, client_kwargs):
 @pytest.mark.asyncio
 async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
     requested_paths = []
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         requested_paths.append(request.url.path)
@@ -62,7 +64,7 @@ async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
 @pytest.mark.asyncio
 async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
     requested_paths = []
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         requested_paths.append(request.url.path)
@@ -80,7 +82,7 @@ async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_decode_image_url_reports_http_status(monkeypatch):
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         return httpx.Response(404)
@@ -94,7 +96,7 @@ async def test_decode_image_url_reports_http_status(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_decode_image_url_reports_connection_failure(monkeypatch):
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         raise httpx.ConnectError("connection refused", request=request)
@@ -140,7 +142,7 @@ def _install_fake_video_mux(monkeypatch, mux_calls):
 
 
 def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
-    mux_calls = []
+    mux_calls: list[dict[str, Any]] = []
     _install_fake_video_mux(monkeypatch, mux_calls)
 
     frames = [np.full((2, 2, 3), fill_value=i / 5, dtype=np.float32) for i in range(5)]
@@ -221,6 +223,19 @@ def test_channel_first_video_tensor_is_converted_to_channel_last():
     np.testing.assert_array_equal(frames, video.permute(1, 2, 3, 0).numpy())
 
 
+def test_contiguous_uint8_video_reaches_mux_without_conversion(monkeypatch):
+    video = np.arange(2 * 4 * 5 * 3, dtype=np.uint8).reshape(2, 4, 5, 3)
+
+    def fail_prepare(*args, **kwargs):
+        raise AssertionError("ready-to-encode uint8 video must not be normalized")
+
+    monkeypatch.setattr(video_api_utils, "_prepare_video_frames", fail_prepare)
+
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+
+    assert frames is video
+
+
 def test_channel_first_video_tensor_uses_direct_planar_mux(monkeypatch):
     calls = []
 
@@ -247,6 +262,95 @@ def test_channel_first_video_tensor_uses_direct_planar_mux(monkeypatch):
     assert all(frame.format.name == "gbrp" for frame in frames)
     assert audio is None
     assert options["fps"] == 12.0
+
+
+def test_planar_converter_serial_and_parallel_outputs_match():
+    frames = [np.full((2, 3, 3), fill_value=value / 10, dtype=np.float32) for value in (1, 4, 7)]
+
+    serial_converter = video_api_utils._PlanarFrameConverter(max_workers=1)
+    parallel_converter = video_api_utils._PlanarFrameConverter(max_workers=2)
+    try:
+        serial = [
+            frame.to_ndarray(format="rgb24") for frame in serial_converter.iter_frames(frames, np.dtype(np.float32))
+        ]
+        parallel = [
+            frame.to_ndarray(format="rgb24") for frame in parallel_converter.iter_frames(frames, np.dtype(np.float32))
+        ]
+    finally:
+        serial_converter.shutdown()
+        parallel_converter.shutdown()
+
+    np.testing.assert_array_equal(np.stack(serial), np.stack(parallel))
+
+
+def test_planar_converter_preserves_fifo_order_and_bounds_pending_futures(monkeypatch):
+    converter = video_api_utils._PlanarFrameConverter(max_workers=2)
+    started = threading.Event()
+    release = threading.Event()
+    four_submitted = threading.Event()
+    outstanding = 0
+    peak_outstanding = 0
+    lock = threading.Lock()
+    real_submit = converter._executor.submit
+
+    def fake_build(frame, _common_dtype):
+        started.set()
+        release.wait(timeout=2)
+        return int(frame[0, 0, 0])
+
+    def submit(*args, **kwargs):
+        nonlocal outstanding, peak_outstanding
+        with lock:
+            outstanding += 1
+            peak_outstanding = max(peak_outstanding, outstanding)
+            if peak_outstanding >= 4:
+                four_submitted.set()
+        future = real_submit(*args, **kwargs)
+
+        def done(_future):
+            nonlocal outstanding
+            with lock:
+                outstanding -= 1
+
+        future.add_done_callback(done)
+        return future
+
+    monkeypatch.setattr(converter, "_build_frame", fake_build)
+    monkeypatch.setattr(converter._executor, "submit", submit)
+    frames = [np.full((1, 1, 3), value, dtype=np.uint8) for value in range(8)]
+    result: list[int] = []
+    iterator = converter.iter_frames(frames, np.dtype(np.uint8))
+    consumer = threading.Thread(target=lambda: result.extend(iterator))
+    consumer.start()
+    try:
+        assert started.wait(timeout=2)
+        assert four_submitted.wait(timeout=2)
+        release.set()
+        consumer.join(timeout=2)
+        assert not consumer.is_alive()
+    finally:
+        release.set()
+        iterator.close()
+        converter.shutdown()
+
+    assert result == list(range(8))
+    assert peak_outstanding <= 4
+
+
+def test_planar_converter_reuses_executor_and_shutdowns_after_cancel():
+    converter = video_api_utils._PlanarFrameConverter(max_workers=2)
+    executor = converter._executor
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(4)]
+    try:
+        list(converter.iter_frames(frames, np.dtype(np.uint8)))
+        iterator = converter.iter_frames(frames, np.dtype(np.uint8))
+        next(iterator)
+        iterator.close()
+        assert converter._executor is executor
+    finally:
+        converter.shutdown()
+
+    assert executor._shutdown
 
 
 @pytest.mark.parametrize(
@@ -347,6 +451,35 @@ def test_video_only_does_not_log_default_audio_sample_rate(monkeypatch):
     assert log_messages == []
 
 
+def test_planar_mux_accepts_none_rate_and_defaults_audio_to_44100():
+    def make_frame():
+        return next(
+            video_api_utils._iter_planar_video_frames(
+                [np.zeros((2, 2, 3), dtype=np.uint8)],
+                np.dtype(np.uint8),
+            )
+        )
+
+    video_only = media_utils.mux_av_video_audio_bytes(
+        [make_frame()],
+        width=2,
+        height=2,
+        audio_sample_rate=None,
+    )
+    with av.open(BytesIO(video_only), mode="r", format="mp4") as container:
+        assert not container.streams.audio
+
+    with_audio = media_utils.mux_av_video_audio_bytes(
+        [make_frame()],
+        width=2,
+        height=2,
+        audio_waveform=np.zeros((1, 1024), dtype=np.float32),
+        audio_sample_rate=None,
+    )
+    with av.open(BytesIO(with_audio), mode="r", format="mp4") as container:
+        assert container.streams.audio[0].rate == 44100
+
+
 def test_interleaved_video_uses_legacy_fallback_automatically(monkeypatch):
     calls = []
     path_logs = []
@@ -383,7 +516,34 @@ def test_interleaved_video_uses_legacy_fallback_automatically(monkeypatch):
     assert "reason=non_contiguous_rgb_planes" in path_logs[0]
     assert "audio_present=False" in path_logs[0]
     assert "effective_audio_sample_rate=None" in path_logs[0]
+    assert "effective_frame_conversion_workers=0" in path_logs[0]
     assert len(coerce_calls) == 1
+
+
+def test_uint8_frames_reach_the_muxer_without_a_float_round_trip():
+    """uint8 is the muxer's own dtype, so normalisation must leave it alone.
+
+    MiniMax-H3 quantises on the accelerator to keep the response small across
+    its two process hops. Re-normalising to float here would undo that at the
+    last step and cost a full-size conversion in each direction.
+    """
+    video = np.arange(2 * 4 * 5 * 3, dtype=np.uint8).reshape(2, 4, 5, 3)
+
+    frames, frame_shape, common_dtype = video_api_utils._prepare_video_frames(video)
+
+    assert common_dtype == np.dtype(np.uint8)
+    assert frame_shape == (4, 5, 3)
+    np.testing.assert_array_equal(np.stack(frames), video)
+
+
+def test_non_uint8_integer_frames_are_still_normalised():
+    """Only uint8 is the muxer's dtype; other integer payloads still scale."""
+    video = np.full((2, 4, 5, 3), 255, dtype=np.int32)
+
+    frames, _, common_dtype = video_api_utils._prepare_video_frames(video)
+
+    assert np.issubdtype(common_dtype, np.floating)
+    np.testing.assert_allclose(frames[0], 1.0)
 
 
 @pytest.mark.parametrize(
@@ -418,15 +578,54 @@ def test_prepared_automatic_fallback_preserves_legacy_quantization(monkeypatch, 
     monkeypatch.setattr(media_utils, "mux_video_audio_bytes", fake_compat_mux)
 
     prepared_frames, frame_shape, _ = video_api_utils._prepare_video_frames(video)
-    reference = np.rint(np.clip(np.stack([frame[..., :3] for frame in prepared_frames]), 0.0, 1.0) * 255.0).astype(
-        np.uint8
-    )
+    stacked = np.stack([frame[..., :3] for frame in prepared_frames])
+    # uint8 frames are the muxer's own dtype and reach it unchanged; everything
+    # else is still quantised out of the normalised [0, 1] range.
+    reference = stacked if stacked.dtype == np.uint8 else np.rint(np.clip(stacked, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     assert video_api_utils._encode_video_bytes(video, fps=12) == b"legacy-video"
     assert len(mux_inputs) == 1
     assert mux_inputs[0].dtype == np.uint8
     assert mux_inputs[0].shape == (len(prepared_frames), *frame_shape[:-1], 3)
     np.testing.assert_array_equal(mux_inputs[0], reference)
+
+
+@pytest.mark.parametrize(
+    ("worker_count", "expected_path", "expected_reason"),
+    [
+        (None, "legacy_fallback", "non_contiguous_rgb_planes"),
+        (1, "legacy_fallback", "non_contiguous_rgb_planes"),
+        (8, "direct_planar", None),
+    ],
+)
+def test_interleaved_video_routing(monkeypatch, worker_count, expected_path, expected_reason):
+    routes = []
+
+    def fake_planar_mux(*args, **kwargs):
+        return b"planar-video"
+
+    def fake_compat_mux(frames, audio, **kwargs):
+        return b"legacy-video"
+
+    monkeypatch.setattr(media_utils, "mux_av_video_audio_bytes", fake_planar_mux)
+    monkeypatch.setattr(media_utils, "mux_video_audio_bytes", fake_compat_mux)
+    monkeypatch.setattr(video_api_utils, "_log_video_encoding_path", lambda **kwargs: routes.append(kwargs))
+
+    converter = None if worker_count is None else video_api_utils._PlanarFrameConverter(max_workers=worker_count)
+    try:
+        encoded = video_api_utils._encode_video_bytes(
+            np.zeros((2, 4, 6, 3), dtype=np.float32),
+            fps=12,
+            frame_converter=converter,
+        )
+    finally:
+        if converter is not None:
+            converter.shutdown()
+
+    assert encoded == (b"planar-video" if expected_path == "direct_planar" else b"legacy-video")
+    assert len(routes) == 1
+    assert routes[0]["selected_path"] == expected_path
+    assert routes[0].get("reason") == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -570,7 +769,8 @@ def test_planar_bool_frames_match_bounded_compatible_output():
 )
 def test_planar_frame_rejects_undersized_plane(monkeypatch, plane_height, line_size):
     class FakePlane:
-        pass
+        height: int
+        line_size: int
 
     plane = FakePlane()
     plane.height = plane_height
@@ -636,6 +836,32 @@ def test_direct_and_compatible_paths_produce_equivalent_mp4(with_audio):
     assert direct_streams == compatible_streams
     assert ("audio" in direct_streams) is with_audio
     np.testing.assert_array_equal(direct_frames, compatible_frames)
+
+
+@pytest.mark.parametrize("with_audio", [False, True])
+def test_parallel_interleaved_and_legacy_paths_produce_equivalent_mp4(with_audio):
+    rng = np.random.default_rng(7)
+    video = rng.random((3, 32, 32, 3), dtype=np.float32)
+    audio = np.zeros((2, 2400), dtype=np.float32) if with_audio else None
+    kwargs = {
+        "fps": 12,
+        "audio": audio,
+        "audio_sample_rate": 24000,
+        "video_codec_options": {"preset": "ultrafast", "threads": "1"},
+    }
+
+    converter = video_api_utils._PlanarFrameConverter(max_workers=8)
+    try:
+        parallel_bytes = video_api_utils._encode_video_bytes(
+            video,
+            **kwargs,
+            frame_converter=converter,
+        )
+    finally:
+        converter.shutdown()
+    legacy_bytes = video_api_utils._encode_video_bytes_legacy(video, **kwargs)
+
+    assert parallel_bytes == legacy_bytes
 
 
 def test_mux_closes_container_and_preserves_generator_error(monkeypatch):

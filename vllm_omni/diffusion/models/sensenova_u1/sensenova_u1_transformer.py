@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3 LLM with Mixture-of-Tokenizers (MoT) for SenseNova-U1.
 
 Ported from the sensenova_u1 package with vllm tensor-parallel support:
@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from cache_dit import ForwardPattern
 from transformers.cache_utils import DynamicCache
 from vllm.logger import init_logger
@@ -163,6 +164,18 @@ class Qwen3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def _build_3d_rope(config) -> tuple[Qwen3RotaryEmbedding, Qwen3RotaryEmbedding]:
+    """The t and h/w rotary modules: t uses half head_dim, h/w a quarter each."""
+    t_config = copy.deepcopy(config)
+    t_config.head_dim = config.head_dim // 2
+
+    hw_config = copy.deepcopy(config)
+    hw_config.head_dim = config.head_dim // 4
+    hw_config.rope_theta = config.rope_theta_hw
+    hw_config.max_position_embeddings = config.max_position_embeddings_hw
+    return Qwen3RotaryEmbedding(config=t_config), Qwen3RotaryEmbedding(config=hw_config)
+
+
 # ---------------------------------------------------------------------------
 # Norms
 # ---------------------------------------------------------------------------
@@ -175,11 +188,9 @@ class Qwen3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        # F.rms_norm keeps the fp32 accumulation internal and rounds once; the
+        # cast chain it replaces rounded to bf16 before the weight multiply.
+        return F.rms_norm(hidden_states, self.weight.shape, self.weight, self.variance_epsilon)
 
 
 # ---------------------------------------------------------------------------
@@ -303,23 +314,16 @@ class SenseNovaU1Attention(nn.Module):
         self.q_norm_hw_mot_gen = Qwen3RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
         self.k_norm_hw_mot_gen = Qwen3RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
 
-        # 3D RoPE: t uses half head_dim, h/w each use quarter head_dim
-        t_config = copy.deepcopy(config)
-        t_config.head_dim = config.head_dim // 2
-        self.rotary_emb = Qwen3RotaryEmbedding(config=t_config)
-
-        hw_config = copy.deepcopy(config)
-        hw_config.head_dim = config.head_dim // 4
-        hw_config.rope_theta = config.rope_theta_hw
-        hw_config.max_position_embeddings = config.max_position_embeddings_hw
-        self.rotary_emb_hw = Qwen3RotaryEmbedding(config=hw_config)
-
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.scaling,
-            num_kv_heads=self.num_heads,
+            # Keep K/V at their real head count. The SDPA backend already picks
+            # a fused GQA kernel when the runtime shape allows one and expands
+            # K/V itself when it does not; expanding here hides the GQA shape
+            # from that check, so it never fires.
+            num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn",
         )
         self.attn.attention = self.attn.sdpa_fallback
@@ -339,10 +343,6 @@ class SenseNovaU1Attention(nn.Module):
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run unified attention with [B, H, S, D] inputs. Returns [B, S, H, D]."""
-        if self.num_kv_groups > 1:
-            n = self.num_kv_groups
-            key_bhsd = key_bhsd.repeat_interleave(n, dim=1)
-            value_bhsd = value_bhsd.repeat_interleave(n, dim=1)
         q = query_bhsd.transpose(1, 2).contiguous()
         k = key_bhsd.transpose(1, 2).contiguous()
         v = value_bhsd.transpose(1, 2).contiguous()
@@ -358,16 +358,16 @@ class SenseNovaU1Attention(nn.Module):
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run unified attention with [B, S, H, D] inputs. Returns [B, S, H, D]."""
-        if self.num_kv_groups > 1:
-            n = self.num_kv_groups
-            key_bshd = key_bshd.repeat_interleave(n, dim=2)
-            value_bshd = value_bshd.repeat_interleave(n, dim=2)
         attention_mask = self._align_mask_dtype(attention_mask, query_bshd)
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
 
-    def _project_and_rope(self, hidden_states, indexes, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw):
-        """Project Q/K/V via the given QKVParallelLinear and apply 3D RoPE."""
+    def _project_and_rope(self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw):
+        """Project Q/K/V via the given QKVParallelLinear and apply 3D RoPE.
+
+        The three tables come from the model, which builds them once per forward
+        because every layer is handed the same `indexes`.
+        """
         input_shape = hidden_states.shape[:-1]  # (B, S)
         qkv, _ = qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -376,9 +376,7 @@ class SenseNovaU1Attention(nn.Module):
         k = k.view(*input_shape, self.num_kv_heads, self.head_dim)
         v = v.view(*input_shape, self.num_kv_heads, self.head_dim)
 
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = position_embeddings
 
         value_states = v.transpose(1, 2)  # [B, H, S, D]
         try:
@@ -433,13 +431,23 @@ class SenseNovaU1Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         query_states, key_states, value_states = self._project_and_rope(
             hidden_states,
-            indexes,
+            kwargs["position_embeddings"],
             self.qkv_proj,
             self.q_norm,
             self.k_norm,
             self.q_norm_hw,
             self.k_norm_hw,
         )
+        # Single-token decode with a paged cache: append this step's K/V and let
+        # the kernel read the valid prefix via `seqused_k`. Shapes stay fixed,
+        # which is what makes the step capturable as a CUDA graph.
+        paged = kwargs.get("paged_cache")
+        if paged is not None and attention_mask is None and query_states.shape[2] == 1:
+            attn_output = paged.attend(self.layer_idx, query_states, key_states, value_states, self.scaling)
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output, _ = self.o_proj(attn_output)
+            return attn_output
+
         update_cache = kwargs.get("update_cache", True)
         if past_key_values is not None:
             if update_cache:
@@ -460,7 +468,7 @@ class SenseNovaU1Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         query_states, key_states, value_states = self._project_and_rope(
             hidden_states,
-            indexes,
+            kwargs["position_embeddings"],
             self.qkv_proj_mot_gen,
             self.q_norm_mot_gen,
             self.k_norm_mot_gen,
@@ -659,6 +667,10 @@ class SenseNovaU1Model(nn.Module):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_mot_gen = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Every layer receives the same `indexes`, so the tables are the same for
+        # all of them: build them once per forward here and thread them down,
+        # rather than giving every layer its own pair.
+        self.rotary_emb, self.rotary_emb_hw = _build_3d_rope(config)
 
     def forward(
         self,
@@ -690,15 +702,25 @@ class SenseNovaU1Model(nn.Module):
             past_len = past_key_values.get_seq_length() if past_key_values else 0
             seq_len = inputs_embeds.shape[1]
             total_len = past_len + seq_len
-            mask = torch.zeros(1, 1, seq_len, total_len, device=inputs_embeds.device)
             if seq_len > 1:
+                mask = torch.zeros(1, 1, seq_len, total_len, device=inputs_embeds.device)
                 causal = torch.tril(torch.ones(seq_len, seq_len, device=inputs_embeds.device))
                 mask[:, :, :, past_len:] = torch.where(causal == 1, 0.0, float("-inf"))
+            else:
+                # A single query token attends to every cached key, so the mask
+                # this branch used to build was all zeros. Passing it changed no
+                # result, only which SDPA kernel was reachable.
+                mask = None
             causal_mask_mapping = {"full_attention": mask}
         else:
             causal_mask_mapping = attention_mask
 
         hidden_states = inputs_embeds
+        position_embeddings = (
+            self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
+            self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
+            self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
+        )
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
@@ -706,6 +728,7 @@ class SenseNovaU1Model(nn.Module):
                 exist_und=exist_und,
                 exist_gen=exist_gen,
                 indexes=indexes,
+                position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
                 use_cache=use_cache,

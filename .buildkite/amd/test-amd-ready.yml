@@ -107,6 +107,11 @@ steps:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - timeout 20m pytest -s -v tests/diffusion/distributed/test_sequence_parallel.py -m core_model
+        - >-
+          timeout 20m pytest -s -v
+          tests/diffusion/models/ltx2/test_ltx2_transformer_ulysses.py
+          -m 'core_model and rocm and cards_2'
+          --run-level "core_model"
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2
@@ -122,7 +127,13 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        - timeout 15m pytest -sv tests/diffusion/models/ -m 'core_model and cuda' --run-level "core_model"
+        # Preserve legacy one-GPU tests without cards_1 while excluding every
+        # registered multi-GPU marker from this one-GPU job.
+        - >-
+          timeout 15m pytest -sv tests/diffusion/models/
+          -m 'core_model and cuda and not
+          (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+          --run-level "core_model"
 
     - label: "Diffusion · Wan22 Test"
       agent_pool: mi300_1
@@ -191,10 +202,7 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        - |
-          timeout 45m bash -c '
-            pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"
-          '
+        - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs

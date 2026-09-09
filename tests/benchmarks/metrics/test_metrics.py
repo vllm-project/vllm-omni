@@ -279,17 +279,79 @@ def test_unmeasured_tpot_stays_missing_after_tokenizer_fallback():
     assert metrics.request_goodput == 0.0
 
 
-def test_measured_zero_itl_is_not_treated_as_missing():
+def test_zero_itl_does_not_create_zero_tpot():
     output = _make_output(100, output_tokens=3)
     output.itl = [0.0, 0.0]
     output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
 
     metrics = _calculate_test_metrics([output], {"tpot": 1.0})
 
-    assert (metrics.num_tpot_samples, metrics.num_itl_samples) == (1, 2)
-    assert metrics.mean_tpot_ms == 0.0
+    assert (metrics.num_tpot_samples, metrics.num_itl_samples) == (0, 2)
+    assert math.isnan(metrics.mean_tpot_ms)
     assert metrics.mean_itl_ms == 0.0
-    assert metrics.request_goodput == 1.0
+    assert metrics.request_goodput == 0.0
+
+
+def test_stage_output_tokens_without_client_timing_omit_tpot(capsys):
+    output = _make_output(100, output_tokens=5)
+    output.itl = []
+    output.text_latency = 0.0
+    output.ttft = 0.1
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["tpot"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+
+    printed = capsys.readouterr().out
+    assert metrics.num_tpot_samples == 0
+    assert math.isnan(metrics.mean_tpot_ms)
+    assert "Time per Output Token" not in printed
+    assert "Mean TPOT" not in printed
+
+
+def test_consistent_client_latency_can_supply_tpot_fallback():
+    output = _make_output(100, output_tokens=10)
+    output.itl = []
+    output.ttft = 0.1
+    output.text_latency = 1.0
+
+    metrics = _calculate_test_metrics([output])
+
+    assert metrics.num_tpot_samples == 1
+    assert metrics.mean_tpot_ms == pytest.approx(100.0)
+
+
+def test_single_token_responses_do_not_report_zero_tpot(capsys):
+    output = _make_output(100, output_tokens=1)
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["tpot"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+
+    printed = capsys.readouterr().out
+    assert metrics.num_tpot_samples == 0
+    assert math.isnan(metrics.mean_tpot_ms)
+    assert "Time per Output Token" not in printed
 
 
 def test_duplex_goodput_does_not_pair_measurements_from_different_requests():
@@ -393,6 +455,137 @@ def test_text_benchmark_still_reports_ttft(capsys):
 
     out = capsys.readouterr().out
     assert "Time to First Token" in out, "text benchmarks must keep TTFT"
+
+
+# ============================================================================
+# Suppress text metrics for pure image / video endpoints
+# ============================================================================
+
+
+def _make_image_output(prompt_len: int) -> MixRequestFuncOutput:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = prompt_len
+    output.output_tokens = 0
+    output.generated_text = ""
+    output.ttft = 0.0
+    output.text_latency = 0.0
+    output.latency = 2.5
+    output.start_time = 0.0
+    output.itl = []
+    output.image_count = 1
+    output.image_generation_time_ms = 2000.0
+    output.image_pixels = 1024 * 1024
+    output.input_audio_duration = 0.0
+    output.error = ""
+    return output
+
+
+def _make_video_output(prompt_len: int) -> MixRequestFuncOutput:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = prompt_len
+    output.output_tokens = 0
+    output.generated_text = ""
+    output.ttft = 0.0
+    output.text_latency = 0.0
+    output.latency = 5.0
+    output.start_time = 0.0
+    output.itl = []
+    output.video_duration = 2.0
+    output.video_frames = 48
+    output.video_generation_time_ms = 4000.0
+    output.video_rtf = 2.0
+    output.input_audio_duration = 0.0
+    output.error = ""
+    return output
+
+
+_MEDIA_PERCENTILE_METRICS = ["e2el", "ttft"]
+
+
+def test_pure_image_benchmark_omits_text_result(capsys):
+    """Pure image generation must not print Text Result or invent peak tok/s."""
+    outputs = [_make_image_output(64), _make_image_output(64)]
+
+    metrics, actual_output_lens = calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=5.0,
+        tokenizer=None,
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_MEDIA_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=5.0,
+    )
+
+    out = capsys.readouterr().out
+    assert actual_output_lens == [0, 0]
+    assert metrics.total_output == 0
+    assert metrics.max_output_tokens_per_s == 0.0
+    assert " Text Result " not in out
+    assert "Peak output token throughput" not in out
+    assert "Time to First Token" not in out
+    assert " Image Result " in out
+
+
+def test_pure_video_benchmark_omits_text_result(capsys):
+    """Pure video generation must not print Text Result or invent peak tok/s."""
+    outputs = [_make_video_output(63), _make_video_output(63)]
+
+    metrics, actual_output_lens = calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_MEDIA_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    out = capsys.readouterr().out
+    assert actual_output_lens == [0, 0]
+    assert metrics.total_output == 0
+    assert metrics.max_output_tokens_per_s == 0.0
+    assert " Text Result " not in out
+    assert "Peak output token throughput" not in out
+    assert "Time to First Token" not in out
+    assert " Video Result " in out
+
+
+def test_image_with_generated_text_still_reports_text_result(capsys):
+    """Image edits / AR text alongside images must keep Text Result."""
+    output = _make_image_output(64)
+    output.output_tokens = 8
+    output.generated_text = "revised caption"
+    output.ttft = 0.05
+    output.itl = [0.01] * 7
+
+    calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=3.0,
+        tokenizer=_EmptyAwareTokenizer(),
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_MEDIA_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=3.0,
+    )
+
+    out = capsys.readouterr().out
+    assert " Text Result " in out
+    assert "Time to First Token" in out
+    assert " Image Result " in out
 
 
 if __name__ == "__main__":

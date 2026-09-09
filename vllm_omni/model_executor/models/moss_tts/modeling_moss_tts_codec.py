@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -226,6 +229,7 @@ class MossTTSCodecDecoder(nn.Module):
     has_postprocess: bool = False
     enable_update_additional_information: bool = True
     requires_raw_input_tokens: bool = True
+    requires_exact_input_shape: bool = True
 
     _OUTPUT_SAMPLE_RATE: int = 24_000
 

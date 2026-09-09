@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
@@ -263,6 +263,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             self.model = self.code2wav
             self.requires_raw_input_tokens = True
+            # torch.split below requires sum(counts) == input_ids.numel() (#6712)
+            self.requires_exact_input_shape = True
         else:
             raise ValueError(
                 f"Invalid model_stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'"
