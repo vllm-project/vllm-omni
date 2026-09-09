@@ -415,7 +415,7 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
             audio_path=audio_path,
         )
         extra_body = {
-            # Optional, it has default settings in stage configs. you can override them here.
+            # Optional; defaults come from the resolved pipeline and deploy config.
         }
         if args.query_type == "use_audio_in_video":
             extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}

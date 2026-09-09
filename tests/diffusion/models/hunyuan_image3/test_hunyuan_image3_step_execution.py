@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -7,7 +7,10 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
+import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -18,6 +21,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_PROMPT_KV,
     HunyuanImage3Pipeline,
 )
+from vllm_omni.diffusion.models.hunyuan_image3.request_layout import HunyuanPreparedLayout
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -34,6 +38,7 @@ def _pipeline():
         cache_backend=None,
         diffusion_kv_cache_skip_step_indices=None,
     )
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=False, use_meanflow=False)
     pipeline._pipeline = SimpleNamespace()
     return pipeline
 
@@ -74,6 +79,72 @@ def _sampling_params(**extra_args):
         guidance_rescale=0.0,
         generator=None,
     )
+
+
+def _prepared_layout() -> HunyuanPreparedLayout:
+    return HunyuanPreparedLayout(
+        tokenizer_output=TokenizerEncodeOutput(
+            tokens=torch.arange(21).reshape(1, 21),
+            gen_image_mask=torch.ones(1, 21, dtype=torch.bool),
+            gen_timestep_scatter_index=torch.tensor([[4]]),
+            all_image_slices=[[slice(5, 21)]],
+            joint_image_slices=[[]],
+            gen_image_slices=[[slice(5, 21)]],
+            real_pos=torch.tensor([[21]]),
+        ),
+        rope_image_info=[[(slice(5, 21), (4, 4))]],
+        generated_image_info=ImageInfo(
+            image_type="gen_image",
+            image_width=512,
+            image_height=512,
+            token_width=4,
+            token_height=4,
+            image_token_length=16,
+        ),
+    )
+
+
+def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):
+    pipeline = _pipeline()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    rope_kwargs = {}
+
+    def fake_build_batch_2d_rope(**kwargs):
+        rope_kwargs.update(kwargs)
+        return torch.zeros(1), torch.zeros(1)
+
+    monkeypatch.setattr(hy3_module, "build_batch_2d_rope", fake_build_batch_2d_rope)
+
+    def fail_apply_chat_template(**_kwargs):
+        pytest.fail("prepared Hunyuan execution must not apply the chat template again")
+
+    pipeline._tkwrapper = SimpleNamespace(
+        apply_chat_template=fail_apply_chat_template,
+        eos_token_id=2,
+        boi_token_id=3,
+        end_recaption_token_id=4,
+        end_answer_token_id=5,
+    )
+    pipeline.config = SimpleNamespace(
+        attention_head_dim=2,
+        rope_theta=10000.0,
+    )
+    prepared = _prepared_layout()
+
+    model_inputs = pipeline.prepare_model_inputs(
+        prompt="prompt",
+        mode="gen_image",
+        guidance_scale=1.0,
+        image_size=(512, 512),
+        device=torch.device("cpu"),
+        generator=[torch.Generator().manual_seed(0)],
+        prepared_layout=prepared,
+    )
+
+    assert model_inputs["tokenizer_output"] is prepared.tokenizer_output
+    assert model_inputs["batch_gen_image_info"] == [prepared.generated_image_info]
+    assert rope_kwargs["image_infos"] is prepared.rope_image_info
+    torch.testing.assert_close(model_inputs["input_ids"], prepared.tokenizer_output.tokens)
 
 
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
@@ -131,12 +202,13 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
         captured.update(kwargs)
         raise RuntimeError("stop after prepare_model_inputs")
 
-    monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
+    monkeypatch.setattr(hy3_layout_module, "get_system_prompt", fake_get_system_prompt)
     pipeline.prepare_model_inputs = fake_prepare_model_inputs
     state = StepRequestState(
         request_id="req-bot-task",
         sampling=sampling,
         prompt=prompt_item,
+        prepared_layout=_prepared_layout(),
     )
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
@@ -144,6 +216,7 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
 
     assert captured["bot_task"] == expected_model_bot_task
     assert captured["system_prompt_bot_task"] == expected_system_bot_task
+    assert captured["prepared_layout"] is state.prepared_layout
 
 
 def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
@@ -159,23 +232,22 @@ def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
         captured.update(kwargs)
         raise RuntimeError("stop after prepare_model_inputs")
 
-    monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
+    monkeypatch.setattr(hy3_layout_module, "get_system_prompt", fake_get_system_prompt)
     pipeline.prepare_model_inputs = fake_prepare_model_inputs
-    req = DiffusionRequestBatch(
-        requests=[
-            SimpleNamespace(
-                request_id="req-forward-bot-task",
-                sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
-                prompt={"prompt": "prompt", "bot_task": "vanilla"},
-            )
-        ]
+    request = SimpleNamespace(
+        request_id="req-forward-bot-task",
+        sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
+        prompt={"prompt": "prompt", "bot_task": "vanilla"},
+        prepared_layout=_prepared_layout(),
     )
+    req = DiffusionRequestBatch(requests=[request])
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
         pipeline.forward(req)
 
     assert captured["bot_task"] == "think"
     assert captured["system_prompt_bot_task"] == "think"
+    assert captured["prepared_layout"] is request.prepared_layout
 
 
 def test_grouped_denoise_rejects_non_sdpa_attention_backend():
@@ -197,6 +269,17 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline = _pipeline()
 
     pipeline._ensure_grouped_attention_backend_supported(2)
+
+
+def test_scheduler_paged_step_execution_is_rejected():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    state = _state("paged-step", 0)
+
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.prepare_encode(state)
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.denoise_step(InputBatch.make_batch([state]))
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
@@ -369,3 +452,44 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (2, 1, 2, 6)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 4)], [(2, 4)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 6)], [(4, 6)]]
+
+
+def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=True, use_meanflow=True)
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    state = _state("distilled", 1)
+    state.latents = torch.zeros(1, 1)
+    state.extra[_STEP_GUIDANCE_SCALE] = 2.5
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 2, 4, dtype=torch.bool),
+            "full_attn_spans": [[(2, 4)]],
+        }
+    )
+    state.extra[_STEP_PROMPT_KV] = [
+        {
+            "key": torch.zeros(1, 2, 1, 1),
+            "value": torch.zeros(1, 2, 1, 1),
+            "lens": torch.tensor([2]),
+        }
+    ]
+    state.scheduler = SimpleNamespace(get_timestep_r=lambda _timestep: torch.tensor(0.25))
+    captured = {}
+
+    pipeline._restore_prompt_kv_cache = lambda *_args: None
+
+    def fake_prepare_inputs(input_ids, images, timestep, **model_kwargs):
+        del input_ids, images, timestep
+        captured.update(model_kwargs)
+        return {"model_kwargs": model_kwargs}
+
+    pipeline.prepare_inputs_for_generation = fake_prepare_inputs
+    pipeline.forward_call = lambda **_kwargs: {"diffusion_prediction": torch.tensor([[1.0]])}
+    pipeline._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
+
+    output = pipeline.denoise_step(InputBatch.make_batch([state]))
+
+    torch.testing.assert_close(output, torch.tensor([[1.0]]))
+    torch.testing.assert_close(captured["guidance"], torch.tensor([2500.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(captured["timesteps_r"], torch.tensor([0.25]))

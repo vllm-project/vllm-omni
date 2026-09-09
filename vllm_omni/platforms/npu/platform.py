@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
+from functools import cache
 from typing import Any
 
 import torch
@@ -21,6 +22,28 @@ _DIFFUSION_PACKED_MODULES_MAPPING = {
 }
 
 
+@cache
+def _get_strict_ulysses_paged_backend() -> type:
+    """Return an Ascend backend that bypasses vLLM PCP dispatch."""
+
+    from vllm_ascend.attention.attention_v1 import (
+        AscendAttentionBackend,
+        AscendAttentionBackendImpl,
+        AscendAttentionMetadataBuilder,
+    )
+
+    class AscendStrictUlyssesPagedBackend(AscendAttentionBackend):
+        @staticmethod
+        def get_impl_cls() -> type:
+            return AscendAttentionBackendImpl
+
+        @staticmethod
+        def get_builder_cls() -> type:
+            return AscendAttentionMetadataBuilder
+
+    return AscendStrictUlyssesPagedBackend
+
+
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     """NPU/Ascend implementation of OmniPlatform.
 
@@ -36,6 +59,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.utils import adapt_patch
 
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+            apply_minicpmo_4_5_code2wav_patch,
+        )
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
         )
@@ -44,6 +70,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         )
 
         adapt_patch(is_global_patch=True)
+        apply_minicpmo_4_5_code2wav_patch()
         apply_qwen3_tts_code2wav_patch()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
@@ -73,13 +100,95 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
         from vllm_ascend.ascend_config import init_ascend_config
+        from vllm_ascend.utils import adapt_patch
 
+        # Omni's custom DiffusionWorker does not pass through vLLM-Ascend's
+        # NPUWorker constructor, where worker-local patches are normally
+        # installed.  In particular, AscendBlockTables needs the patched
+        # non-UVA buffer implementation on NPU.
+        adapt_patch()
         init_ascend_config(vllm_config)
+
+    @classmethod
+    def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
+        """Use the block geometry required by Ascend's native paged kernel."""
+        if getattr(od_config, "diffusion_kv_mode", None) is None:
+            return
+        from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+
+        if od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        supported_sizes = [
+            size for size in AscendAttentionBackend.get_supported_kernel_block_sizes() if type(size) is int and size > 0
+        ]
+        if not supported_sizes:
+            raise RuntimeError("Ascend paged attention did not expose an integer kernel block size")
+        # vLLM's generic default is 16, while the Ascend FIA backend stores
+        # cache pages as 128-token blocks. Set the Manager geometry
+        # before KV specs are collected so Scheduler and Worker agree.
+        vllm_config.cache_config.block_size = supported_sizes[0]
+
+    @classmethod
+    def requires_diffusion_paged_kv_prewrite(cls) -> bool:
+        """Write the full K/V span once before piecewise FIA segments."""
+
+        return True
+
+    @classmethod
+    def get_diffusion_paged_kv_attn_backend(cls, attn_backend: type, *, ulysses_degree: int) -> type:
+        """Keep strict Ulysses paged FIA out of vLLM's PCP implementation."""
+
+        del cls
+        if ulysses_degree <= 1:
+            return attn_backend
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        if not isinstance(attn_backend, type) or not issubclass(attn_backend, AscendAttentionBackend):
+            return attn_backend
+        return _get_strict_ulysses_paged_backend()
+
+    @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        from vllm_ascend.worker.v2.block_table import AscendBlockTables
+
+        return AscendBlockTables
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        """Build the Ascend metadata required by the native NPU backend."""
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+        from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+
+        kwargs = dict(kwargs)
+        seq_lens_cpu = kwargs.pop("seq_lens_cpu")
+        kwargs["seq_lens_np"] = seq_lens_cpu.detach().cpu().numpy()
+        # The diffusion adapter always supplies a paged cache and the current
+        # K/V write span. ChunkedPrefill is Ascend's cache-backed FIA state for
+        # both multi-token updates and single-token updates in this path.
+        kwargs["attn_state"] = AscendAttentionState.ChunkedPrefill
+        return build_attn_metadata(**kwargs)
 
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
 
+        from vllm_omni.platforms.npu.models.minimax_h3 import (
+            apply_minimax_h3_qwen3vl_patch,
+            apply_minimax_h3_qwen3vl_sdpa_patch,
+            apply_minimax_h3_qwen3vl_swiglu_patch,
+        )
+
+        # These patches import the MiniMax encoder package, whose __init__ loads
+        # pipeline_minimax_h3 → diffusion.data. Doing that during platform
+        # construction races vllm_omni/__init__.py (patch before config) and
+        # closes a cycle through pipeline_registry → PI0_PIPELINE →
+        # DiffusionOutput. Apply them only after the platform exists, before
+        # the diffusion pipeline is loaded.
+        apply_minimax_h3_qwen3vl_patch()
+        apply_minimax_h3_qwen3vl_sdpa_patch()
+        apply_minimax_h3_qwen3vl_swiglu_patch()
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 
@@ -130,6 +239,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "
@@ -137,6 +247,23 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                     "FLASH_ATTN."
                 )
                 backend_upper = "FLASH_ATTN"
+
+            if backend_upper in ("FLASH_ATTN", "RAINFUSION_ATTN") and find_spec("mindiesd"):
+                # Eager-import mindiesd only for backends that actually reach
+                # mindiesd kernels: FLASH_ATTN directly, and RAINFUSION_ATTN
+                # via its dense FlashAttention fallback (used before
+                # start_step and on any layer without a sparsifiable video
+                # segment). Other backends (e.g. TORCH_SDPA) never touch
+                # mindiesd, so a broken optional install must not block them.
+                # CANN snapshots the custom-op registry at the first
+                # custom-op regInfo lookup in the process (e.g. a
+                # vllm-ascend custom op during model load/warmup). Import
+                # mindiesd here so its env.py prepends the mindiesd vendor
+                # dirs (aie_ascendc etc.) to ASCEND_CUSTOM_OPP_PATH before
+                # that snapshot; otherwise aclnnLaserAttention /
+                # FusedAttentionScore fail with EZ1001 "does not support
+                # opType" for the rest of the process.
+                import mindiesd  # noqa: F401
 
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
@@ -152,6 +279,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         logger.debug("Falling back to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+
+    @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Return whether MindIE-SD is installed for dense NPU FlashAttention."""
+
+        from importlib.util import find_spec
+
+        return find_spec("mindiesd") is not None
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
@@ -187,7 +322,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         """
         try:
             torch.npu.current_stream().synchronize()
-            event = torch.npu.Event()
+            # The async output worker uses the public ``torch.Stream`` API.
+            # With torch_npu 2.10, a native ``torch.npu.Event`` cannot be
+            # consumed by that wrapper stream (the reverse direction is
+            # supported), while ``torch.Event`` is dispatched to the active
+            # NPU backend and remains cross-stream compatible.
+            event = torch.Event()
             event.record()
             return event
         except Exception:

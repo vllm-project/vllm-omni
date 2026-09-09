@@ -24,7 +24,6 @@ from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_QWEN3_TTS_REF_TEXT,
@@ -131,7 +130,7 @@ def build_sampling_params() -> list[SamplingParams]:
 
 
 def save_stage_output(stage_outputs, output_dir: str) -> None:
-    output = stage_outputs.request_output
+    output = stage_outputs
     request_id = output.request_id
     if stage_outputs.final_output_type == "text":
         text_output = output.outputs[0].text
@@ -228,7 +227,6 @@ def parse_args():
     parser.add_argument("--init-timeout", type=int, default=2000, help="Overall initialization timeout.")
     parser.add_argument("--stage-init-timeout", type=int, default=2000, help="Per-stage initialization timeout.")
     parser.add_argument("--log-stats", action="store_true", default=False, help="Enable stats logging.")
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

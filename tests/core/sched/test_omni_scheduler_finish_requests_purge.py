@@ -157,3 +157,71 @@ def test_finish_requests_leaves_healthy_running_intact(
     )
 
     assert scheduler.running == [alive]
+
+
+@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
+def test_finish_requests_preserves_unrelated_resumable_segment(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_cls,
+    scheduler_mod,
+) -> None:
+    paused = _StubRequest("req-paused", RequestStatus.FINISHED_STOPPED)
+    paused.resumable = True
+    leaving = _StubRequest("req-leaving", RequestStatus.FINISHED_STOPPED)
+    scheduler = _make_scheduler(
+        scheduler_cls,
+        requests={paused.request_id: paused},
+        running=[paused],
+        waiting=[],
+    )
+
+    def fake_finish_requests(self, request_ids, finished_status):
+        return [leaving]
+
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
+
+    scheduler_cls.finish_requests(scheduler, [leaving.request_id], RequestStatus.FINISHED_ABORTED)
+
+    assert scheduler.running == [paused]
+    assert scheduler.requests == {paused.request_id: paused}
+
+
+@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
+def test_finish_requests_materializes_single_pass_request_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_cls,
+    scheduler_mod,
+) -> None:
+    request = _StubRequest("req-generator", RequestStatus.RUNNING)
+    scheduler = _make_scheduler(
+        scheduler_cls,
+        requests={request.request_id: request},
+        running=[request],
+        waiting=[],
+    )
+
+    def fake_finish_requests(self, request_ids, finished_status):
+        assert tuple(request_ids) == (request.request_id,)
+        return [request]
+
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
+
+    result = scheduler_cls.finish_requests(
+        scheduler,
+        (request_id for request_id in [request.request_id]),
+        RequestStatus.FINISHED_ABORTED,
+    )
+
+    assert result == [request]
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniGenerationScheduler])
+def test_finish_requests_does_not_reopen_off_queue_deferred_free_terminal(scheduler_cls) -> None:
+    terminal = _StubRequest("req-deferred-free", RequestStatus.FINISHED_STOPPED)
+    terminal.resumable = True
+    scheduler = _make_scheduler(scheduler_cls, requests={terminal.request_id: terminal}, running=[], waiting=[])
+    scheduler._free_request = lambda *args, **kwargs: pytest.fail("off-queue request was freed")
+
+    assert scheduler_cls.finish_requests(scheduler, [terminal.request_id], RequestStatus.FINISHED_ABORTED) == []
+    assert scheduler.requests == {terminal.request_id: terminal}
+    assert terminal.status == RequestStatus.FINISHED_STOPPED

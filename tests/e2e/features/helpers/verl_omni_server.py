@@ -294,7 +294,7 @@ class vLLMOmniHttpServerLocal:
             "global_steps": self.global_steps,
         }
 
-        req_output = final_res.request_output
+        req_output = final_res
         if req_output is not None and hasattr(req_output, "finish_reason"):
             finish_reason = req_output.finish_reason or "stop"
         else:

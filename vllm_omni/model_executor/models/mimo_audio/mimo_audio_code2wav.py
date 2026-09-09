@@ -459,7 +459,7 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         if not self.audio_tokenizer_path:
             raise ValueError(
                 "Audio tokenizer path is not set. Provide "
-                "`model_config.audio_tokenizer_path` in the stage config "
+                "`model_config.audio_tokenizer_path` in the model configuration "
                 "or export MIMO_AUDIO_TOKENIZER_PATH."
             )
 

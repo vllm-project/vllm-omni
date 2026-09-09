@@ -52,6 +52,7 @@ def test_positional_construction_matches_base_request():
     assert req.external_req_id is None
     assert req.additional_information is None
     assert req.prompt_embeds_payload is None
+    assert req.num_stale_output_tokens == 0
 
 
 def test_positional_prompt_embeds_does_not_collide():

@@ -47,7 +47,7 @@ If no, check your shell running the ComfyUI process. There may be some error mes
 This extension offers the following nodes based on the output modalities (at **ComfyUI sidebar -> Node Library**):
 
 - **Generate Image** for text-to-image and image-to-image tasks
-- **Generate Video** for text-to-video and image-to-video tasks
+- **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
 
@@ -105,7 +105,7 @@ You can configure per-stage sampling parameters for multi-stage models.
 > [!TIP]
 > The node automatically choose text-to-image or image-to-image API endpoints depending on whether you connect an image input or not.
 
-### Text-to-video and image-to-video generation (e.g., Wan)
+### Text-to-video and image-to-video generation (e.g., Wan, MiniMax-H3)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Video Generation**)
 
@@ -117,7 +117,11 @@ You can configure per-stage sampling parameters for multi-stage models.
 </p>
 
 > [!TIP]
-> The node automatically choose text-to-video or image-to-video API endpoints depending on whether you connect an image input or not.
+> Connect a **frame** image for first-frame / image-to-video (e.g., Wan I2V, MiniMax-H3 FL2VA).
+>
+> For reference-conditioned generation (MiniMax-H3 Ref2VA), connect a **Video References** node instead.
+>
+> Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
 
 ### TTS (e.g., Qwen TTS series)
 

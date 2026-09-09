@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/hifigan
 # Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu, Kai Hu)
 
@@ -200,6 +200,11 @@ class SineGen2(torch.nn.Module):
         self.flag_for_pulse = flag_for_pulse
         self.upsample_scale = upsample_scale
         self.causal = causal
+        self.register_buffer(
+            "harmonic_ids",
+            torch.arange(1, self.harmonic_num + 2, dtype=torch.float32).view(1, 1, -1),
+            persistent=False,
+        )
         if causal is True:
             self.rand_ini = torch.rand(1, 9)
             self.rand_ini[:, 0] = 0
@@ -277,7 +282,7 @@ class SineGen2(torch.nn.Module):
         output uv: tensor(batchsize=1, length, 1)
         """
         # fundamental component
-        fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
+        fn = torch.multiply(f0, self.harmonic_ids)
 
         # generate sine waveforms
         sine_waves = self._f02sine(fn) * self.sine_amp
@@ -463,7 +468,11 @@ class HiFTGenerator(nn.Module):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.register_buffer(
+            "stft_window",
+            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            persistent=False,
+        )
         self.f0_predictor = f0_predictor
 
     def remove_weight_norm(self):
@@ -485,7 +494,7 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window.to(x.device),
+            window=self._get_stft_window(x),
             return_complex=True,
         )
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
@@ -500,11 +509,20 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window.to(magnitude.device),
+            window=self._get_stft_window(magnitude),
         )
         return inverse_transform
 
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def _get_stft_window(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.stft_window.device != tensor.device:
+            self.stft_window = self.stft_window.to(tensor.device)
+        return self.stft_window
+
+    def _decode_pre_istft(
+        self,
+        x: torch.Tensor,
+        s: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
@@ -533,10 +551,16 @@ class HiFTGenerator(nn.Module):
         x = self.conv_post(x)
         magnitude = torch.exp(x[:, : self.istft_params["n_fft"] // 2 + 1, :])
         phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1 :, :])  # actually, sin is redundancy
+        return magnitude, phase
 
+    def _finalize_decode(self, magnitude, phase):
         x = self._istft(magnitude, phase)
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
+
+    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        magnitude, phase = self._decode_pre_istft(x, s)
+        return self._finalize_decode(magnitude, phase)
 
     def forward(
         self,
@@ -555,7 +579,11 @@ class HiFTGenerator(nn.Module):
         return generated_speech, f0
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def _inference_pre_istft(
+        self,
+        speech_feat: torch.Tensor,
+        cache_source: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
@@ -565,7 +593,13 @@ class HiFTGenerator(nn.Module):
         # use cache_source to avoid glitch
         if cache_source.shape[2] != 0:
             s[:, :, : cache_source.shape[2]] = cache_source
-        generated_speech = self.decode(x=speech_feat, s=s)
+        magnitude, phase = self._decode_pre_istft(speech_feat, s)
+        return magnitude, phase, s
+
+    @torch.inference_mode()
+    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        magnitude, phase, s = self._inference_pre_istft(speech_feat, cache_source)
+        generated_speech = self._finalize_decode(magnitude, phase)
         return generated_speech, s
 
 
@@ -667,7 +701,11 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.register_buffer(
+            "stft_window",
+            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            persistent=False,
+        )
         self.conv_pre_look_right = conv_pre_look_right
         self.f0_predictor = f0_predictor
 

@@ -101,13 +101,14 @@ def encode_image_base64_with_compression(
     """
     buffer = io.BytesIO()
     image = prepare_image_for_output_format(image, format)
+    pil_format = "jpeg" if format == "jpg" else format
     save_kwargs = {}
     if format in ("jpg", "jpeg", "webp"):
         save_kwargs["quality"] = output_compression
     elif format == "png":
         save_kwargs["compress_level"] = max(0, min(9, 9 - output_compression // 11))
 
-    image.save(buffer, format=format, **save_kwargs)
+    image.save(buffer, format=pil_format, **save_kwargs)
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
 

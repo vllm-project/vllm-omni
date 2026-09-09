@@ -420,6 +420,93 @@ _patch_fp8_use_quack_fused_bias()
 
 
 # =============================================================================
+# Patch torch inductor: prove factorable symbolic divisibility (CantSplit)
+# =============================================================================
+# WHY: torch 2.13's SizeVarAllocator.statically_known_multiple_of proves
+# symbolic divisibility via torch's own Mod (torch.utils._sympy.functions),
+# which deliberately stays unevaluated to bound compile time on wide
+# expressions. torch <= 2.11 used python `%` (sympy.Mod), whose eval factors
+# common terms. As a result an expression like
+#   15360*s31 + 15360*s87  vs  s31 + s87
+# — FLUX's fp8 graph with two dynamic sequence dims — is no longer provably
+# divisible, and inductor raises CantSplit on the first compiled forward,
+# killing the engine core during the warmup dummy run (nightly builds
+# 2953/2954, Diffusion Quantization Test).
+#
+# SCOPE: wraps statically_known_multiple_of. The wrapper can only ADD True
+# results, and only when sympy.cancel(numerator/denominator) yields a
+# polynomial with integer coefficients — then numerator == denominator * q
+# identically, so divisibility holds for every symbol assignment; this is
+# unconditionally sound. Everything else defers to the original result.
+# Guards: polynomial inputs only (inductor's FloorDiv/ModularIndexing atoms
+# never reach sympy.cancel) and <= 20 free symbols (mirrors upstream's own
+# cost cap).
+#
+# FRAGILITY / REMOVE WHEN: self-extinguishes at install time by probing
+# whether the unpatched method already proves the canonical factorable case
+# (as torch <= 2.11 does). When upstream restores factor-aware proving, the
+# probe passes and nothing is patched.
+def _provably_factorable_multiple(numerator, denominator) -> bool:
+    """True only when numerator/denominator cancels to an integer polynomial."""
+    try:
+        import sympy
+
+        num = sympy.sympify(numerator)
+        den = sympy.sympify(denominator)
+        if den.is_zero:
+            return False
+        symbols = num.free_symbols | den.free_symbols
+        if len(symbols) > 20:
+            return False
+        if not (num.is_polynomial(*symbols) and den.is_polynomial(*symbols)):
+            return False
+        quotient = sympy.cancel(num / den)
+        _, q_den = sympy.fraction(sympy.together(quotient))
+        if q_den != 1:
+            return False
+        if quotient.is_Integer:
+            return True
+        poly = sympy.Poly(quotient, *sorted(quotient.free_symbols, key=str))
+        return all(coeff.is_integer for coeff in poly.coeffs())
+    except Exception:  # noqa: BLE001 - a proof failure must never break compile
+        return False
+
+
+def _patch_inductor_factorable_divisibility():
+    try:
+        import sympy
+        from torch._inductor.sizevars import SizeVarAllocator
+    except ImportError:
+        return
+
+    original = SizeVarAllocator.statically_known_multiple_of
+    if getattr(original, "_vllm_omni_factorable_divisibility", False):
+        return
+
+    try:
+        _a, _b = sympy.symbols("_omni_probe_a _omni_probe_b", positive=True, integer=True)
+        if original(SizeVarAllocator(), 7 * _a + 7 * _b, _a + _b):
+            _PATCH_LOGGER.info("inductor factorable-divisibility patch: skipped (upstream already proves it).")
+            return
+    except Exception:  # noqa: BLE001
+        # Probe broke (constructor drift etc.) — install anyway; the wrapper
+        # never subtracts results from the original.
+        pass
+
+    def statically_known_multiple_of(self, numerator, denominator):
+        if original(self, numerator, denominator):
+            return True
+        return _provably_factorable_multiple(numerator, denominator)
+
+    statically_known_multiple_of._vllm_omni_factorable_divisibility = True
+    SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of
+    _PATCH_LOGGER.info("inductor factorable-divisibility patch: installed.")
+
+
+_patch_inductor_factorable_divisibility()
+
+
+# =============================================================================
 # Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
 # =============================================================================
 # WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free

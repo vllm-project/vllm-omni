@@ -15,11 +15,13 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniDiffusionSampling,
     VLLMOmniGenerateImage,
     VLLMOmniGenerateVideo,
+    VLLMOmniMiniMaxH3Params,
     VLLMOmniQwenTTSParams,
     VLLMOmniRemoteLoRA,
     VLLMOmniSamplingParamsList,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
+    VLLMOmniVideoReferences,
     VLLMOmniVoiceClone,
     VLLMOmniWanParams,
 )
@@ -32,6 +34,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
     "VLLMOmniTTS": VLLMOmniTTS,
     "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
+    "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
     # === Params ===
     "VLLMOmniARSampling": VLLMOmniARSampling,
     "VLLMOmniDiffusionSampling": VLLMOmniDiffusionSampling,
@@ -39,6 +42,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniRemoteLoRA": VLLMOmniRemoteLoRA,
     "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
     "VLLMOmniWanParams": VLLMOmniWanParams,
+    "VLLMOmniMiniMaxH3Params": VLLMOmniMiniMaxH3Params,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -49,6 +53,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniUnderstanding": "Multimodality Understanding",
     "VLLMOmniTTS": "TTS (Text to Speech)",
     "VLLMOmniVoiceClone": "TTS Voice Cloning",
+    "VLLMOmniVideoReferences": "Video References",
     # === Params ===
     "VLLMOmniARSampling": "AR Sampling Params",
     "VLLMOmniDiffusionSampling": "Diffusion Sampling Params",
@@ -56,6 +61,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniRemoteLoRA": "LoRA",
     "VLLMOmniQwenTTSParams": "Qwen TTS Params",
     "VLLMOmniWanParams": "Wan Video Params",
+    "VLLMOmniMiniMaxH3Params": "MiniMax-H3 Video Params",
 }
 
 WEB_DIRECTORY = "./web"

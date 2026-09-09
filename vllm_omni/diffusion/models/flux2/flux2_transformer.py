@@ -15,6 +15,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from diffusers.utils import is_torch_npu_available
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -37,6 +38,8 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+logger = init_logger(__name__)
 
 
 def _join_prefix(prefix: str, name: str) -> str:
@@ -946,7 +949,13 @@ class Flux2Transformer2DModel(nn.Module):
             ctx = get_forward_context()
         else:
             ctx = None
-        if ctx is not None and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        if (
+            ctx is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
             batch_size = hidden_states.shape[0]
             img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
@@ -958,6 +967,22 @@ class Flux2Transformer2DModel(nn.Module):
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
             if hidden_states_mask.all():
                 hidden_states_mask = None
+        elif (
+            ctx is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
 
         if hidden_states_mask is not None:
             joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask

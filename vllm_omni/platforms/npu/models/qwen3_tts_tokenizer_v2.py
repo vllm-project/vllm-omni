@@ -9,6 +9,10 @@ import torch
 import torch_npu
 from vllm.logger import init_logger
 
+from vllm_omni.platforms.npu.layers.rotary_embedding import (
+    npu_rotary_mul_with_bsnd_fallback,
+)
+
 logger = init_logger(__name__)
 
 _PATCHED = False
@@ -23,9 +27,10 @@ def _apply_rotary_pos_emb_npu(
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del position_ids
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    return torch_npu.npu_rotary_mul(q, cos, sin), torch_npu.npu_rotary_mul(k, cos, sin)
+    return (
+        npu_rotary_mul_with_bsnd_fallback(q, cos, sin, unsqueeze_dim),
+        npu_rotary_mul_with_bsnd_fallback(k, cos, sin, unsqueeze_dim),
+    )
 
 
 def _rms_norm_forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:

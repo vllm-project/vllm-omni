@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Serving layer for robot policy inference via `/v1/realtime/robot/openpi`.
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ActionOutput = np.ndarray | dict[str, np.ndarray]
+ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -150,6 +150,9 @@ class ServingRealtimeRobotOpenPI:
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+        # An optional integer ``seed`` in the inference message becomes the engine request's
+        # ``sampling_params.seed``; omitted, ``OmniDiffusionRequest`` assigns a random one.
+        seed = obs.pop("seed", None)
         extra_args = {
             "reset": reset,
             "session_id": session_id,
@@ -157,7 +160,10 @@ class ServingRealtimeRobotOpenPI:
         }
 
         prompt = obs.get("prompt", "")
-        sampling_params = OmniDiffusionSamplingParams(extra_args=extra_args)
+        sampling_params = OmniDiffusionSamplingParams(
+            seed=int(seed) if seed is not None else None,
+            extra_args=extra_args,
+        )
         return OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,

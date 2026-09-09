@@ -53,5 +53,5 @@ vllm-omni serve "$MODEL" \
     --host 0.0.0.0 \
     --port "$PORT" \
     --trust-remote-code \
-    --stage-configs-path "$DEPLOY_YAML" \
+    --deploy-config "$DEPLOY_YAML" \
     --omni

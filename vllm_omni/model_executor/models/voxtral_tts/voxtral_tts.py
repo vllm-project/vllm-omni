@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from functools import cached_property
@@ -6,7 +9,6 @@ from pathlib import Path
 import regex as re
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
@@ -28,6 +30,7 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     VoxtralTTSMultiModalProcessor,
     VoxtralTTSProcessingInfo,
 )
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -45,10 +48,12 @@ def parse_batched_audio_input(input_ids: torch.Tensor, num_codebooks: int) -> tu
     """
     all_audio_tokens: list[torch.Tensor] = []
     all_ctx_frames: list[int] = []
+    # One D2H copy up-front avoids 2 syncs per request inside the loop.
+    header_view = input_ids.cpu() if input_ids.is_cuda else input_ids
     offset = 0
     while offset < input_ids.numel():
-        ctx_frames = int(input_ids[offset].item())
-        context_length = int(input_ids[offset + 1].item())
+        ctx_frames = int(header_view[offset])
+        context_length = int(header_view[offset + 1])
         offset += 2
 
         req_input_ids_length = (ctx_frames + context_length) * num_codebooks
@@ -131,7 +136,7 @@ class VoxtralTTSForConditionalGeneration(
                 self.voice_to_embedding = {}
                 for sid in speaker_id:
                     if self.is_hf_model:
-                        path = hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt")
+                        path = hf_api().hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt")
                     else:
                         path = Path(self.repo_id) / "voice_embedding" / f"{sid}.pt"
                     if Path(path).exists():
@@ -155,6 +160,9 @@ class VoxtralTTSForConditionalGeneration(
                 architectures=["VoxtralTTSAudioTokenizer"],
             )
             self.model = self.audio_tokenizer
+            # forward() returns a runtime-length per-request list; FULL CUDAGraphWrapper
+            # would freeze that length at capture.
+            self.supports_cudagraph_full = False
         else:
             raise ValueError("Invalid model stage")
 

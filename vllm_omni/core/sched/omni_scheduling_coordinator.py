@@ -22,70 +22,19 @@ from vllm_omni.core.sched.output import OmniChunkRecvHandle
 logger = init_logger(__name__)
 
 
-# (arch, model_stage) pairs that route their full_payload stage input via
-# the worker connector and therefore need the scheduler-side coordinator to
-# park requests in WAITING_FOR_INPUT until the recv side delivers.  This set
-# must stay aligned with the arch scope of `init_omni_connectors` in
-# gpu_ar_model_runner.py and gpu_generation_model_runner.py.  Adding a stage
-# here without also wiring its worker connector init produces a permanent
-# Stage 1 hang (gate parks the request, no transport ever releases it).
-#
-_FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("Qwen3OmniMoeForConditionalGeneration", "talker"),
-        ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
-        # qwen2_5_omni thinker->talker uses the real full-payload
-        # producer builder (text_hidden_states routed via
-        # pooler_output["hidden"] -> accumulator -> connector).  Both
-        # stages of qwen2_5_omni are enabled.
-        ("Qwen2_5OmniForConditionalGeneration", "talker"),
-        ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
-        # covo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).
-        ("CovoAudioForConditionalGeneration", "code2wav"),
-        # mimo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).
-        ("MiMoAudioModel", "code2wav"),
-        # qwen3_tts: Qwen3TTSTalkerForConditionalGeneration (Stage 0)
-        # -> Qwen3TTSCode2Wav (Stage 1).  Stage 1 is the consumer.
-        ("Qwen3TTSCode2Wav", "code2wav"),
-        # minicpmo_4_5: Talker (Stage 1) -> Code2Wav (Stage 2).
-        ("MiniCPMO45Code2Wav", "code2wav"),
-        # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
-        ("CosyVoice3Model", "cosyvoice3_code2wav"),
-        # audex TTS sync path: thinker (Stage 0) -> streaming decoder (Stage 1).
-        # The default deploy is async_chunk; this covers async_chunk: false.
-        ("AudexCode2Wav", "audex_code2wav"),
-        # audex TTA: tta thinker (Stage 0) -> XCodec1 (Stage 1, always sync
-        # full-payload — CNN codec decoded over the full sequence).
-        ("AudexXCodec1", "audex_xcodec"),
-        # indextts2: indextts2_talker (Stage 0) -> indextts2_s2mel_decoder
-        # (Stage 1). Stage 1 consumes the complete mel/latent payload.
-        ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
-        # dynin: token2text (Stage 0) -> token2image (Stage 1) ->
-        # token2audio (Stage 2).  Producer wires via
-        # custom_process_next_stage_input_func: *_full_payload in deploy yaml.
-        ("DyninOmniForConditionalGeneration", "token2image"),
-        ("DyninOmniForConditionalGeneration", "token2audio"),
-    }
-)
-
-
 def uses_full_payload_input_coordinator(model_config: Any) -> bool:
     """Returns True if this stage parks pending requests in
     WAITING_FOR_INPUT awaiting a full_payload delivery on the worker connector.
 
-    Gated by (model_arch, model_stage) — see _FULL_PAYLOAD_INPUT_STAGES for the
-    rationale on why this is a whitelist instead of a marker-driven structural
-    gate.
+    Gated by the topology-declared ``requires_full_payload_input`` capability on
+    downstream (stage_id > 0) stages, and only on the non-async-chunk path
+    (async-chunk stages are fed through the streamed connector instead).
     """
     if getattr(model_config, "stage_id", 0) <= 0:
         return False
     if getattr(model_config, "async_chunk", False):
         return False
-    key = (
-        getattr(model_config, "model_arch", None),
-        getattr(model_config, "model_stage", None),
-    )
-    return key in _FULL_PAYLOAD_INPUT_STAGES
+    return bool(getattr(model_config, "requires_full_payload_input", False))
 
 
 class OmniSchedulingCoordinator:

@@ -5,7 +5,6 @@
 # Stage 1: replicas on GPU 4, 5, 6, and 7
 base_config: minicpmo_4_5_8x4090.yaml
 pipeline: minicpmo_4_5
-session_mode: duplex
 
 stages:
   - stage_id: 0

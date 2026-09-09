@@ -14,17 +14,31 @@ import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
+from PIL import Image
 from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import (
+    SupportImageInput,
+    SupportsComponentDiscovery,
+)
+from vllm_omni.diffusion.models.lingbot_video.image_condition import (
+    LingBotImageCondition,
+    apply_clean_prefix,
+    prepare_ti2v_image_condition,
+)
 from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import LingBotVideoTransformer3DModel
+from vllm_omni.diffusion.models.lingbot_video.request_utils import (
+    LingBotGenerationMode,
+    normalize_lingbot_request,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 
 TOKEN_LENGTH = 37698
 HIDDEN_STATE_SKIP_LAYER = 0
@@ -43,6 +57,7 @@ PROMPT_TEMPLATE = (
     "commentary or evaluations:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
+IMG_PROMPT_TEMPLATE = "<|vision_start|><|image_pad|><|vision_end|>"
 DEFAULT_NEGATIVE_PROMPT = (
     '{"universal_negative": {"visual_quality": ["low quality", "worst quality", "blurry", '
     '"pixelated", "jpeg artifacts", "low resolution", "unstable color", "color flicker", '
@@ -55,6 +70,17 @@ DEFAULT_NEGATIVE_PROMPT = (
     '"incoherent motion", "unnatural movement", "static object with sudden jump", '
     '"frame-to-frame inconsistency"], "material_and_structure": ["plastic-like glass", '
     '"unrealistic texture", "deformed bottle", "liquid freezing improperly", '
+    '"distorted reflections"]}}'
+)
+DEFAULT_NEGATIVE_PROMPT_IMAGE = (
+    '{"universal_negative": {"visual_quality": ["low quality", "worst quality", '
+    '"blurry", "pixelated", "jpeg artifacts", "low resolution", "underexposed", '
+    '"overexposed", "invisible subject", "subject hidden in darkness"], '
+    '"artistic_style": ["painting", "illustration", "drawing", "cartoon", '
+    '"3d render", "cgi", "sketch", "digital art"], "composition_and_content": '
+    '["text", "watermark", "signature", "logo", "pillarboxed", "side bars", '
+    '"portrait image in landscape frame"], "material_and_structure": '
+    '["plastic-like glass", "unrealistic texture", "deformed bottle", '
     '"distorted reflections"]}}'
 )
 
@@ -72,17 +98,6 @@ def _dtype_from_name(value: Any, default: torch.dtype) -> torch.dtype:
     if normalized in {"fp32", "float32", "torch.float32"}:
         return torch.float32
     raise ValueError(f"Unsupported LingBot dtype: {value!r}.")
-
-
-def _extract_prompt(req: OmniDiffusionRequest) -> tuple[str, str | None]:
-    prompt_obj = req.prompt
-    if isinstance(prompt_obj, str):
-        return prompt_obj, None
-    if isinstance(prompt_obj, Mapping):
-        prompt = prompt_obj.get("prompt", "")
-        negative_prompt = prompt_obj.get("negative_prompt")
-        return str(prompt), None if negative_prompt is None else str(negative_prompt)
-    raise TypeError(f"Unsupported LingBot prompt type: {type(prompt_obj)!r}.")
 
 
 def _module_dtype(module: torch.nn.Module) -> torch.dtype:
@@ -213,19 +228,85 @@ def _batch_cfg_prompt_inputs(
     )
 
 
+def _load_lingbot_image(value: Any) -> Image.Image:
+    if isinstance(value, Image.Image):
+        return value.convert("RGB")
+    if isinstance(value, str):
+        try:
+            with Image.open(value) as image:
+                return image.convert("RGB")
+        except OSError as exc:
+            raise OmniClientError(f"Unable to load LingBot input image from {value!r}: {exc}.") from exc
+    raise OmniClientError(f"Unsupported LingBot image format {type(value)!r}; expected a PIL image or local path.")
+
+
+def get_lingbot_video_pre_process_func(od_config: OmniDiffusionConfig):
+    del od_config
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        prompt = request.prompt
+        if isinstance(prompt, str):
+            return request
+        if not isinstance(prompt, Mapping):
+            raise OmniClientError(f"LingBot prompt must be a string or mapping, got {type(prompt)!r}.")
+        multi_modal_data = prompt.get("multi_modal_data")
+        if multi_modal_data is None:
+            return request
+        if not isinstance(multi_modal_data, Mapping):
+            raise OmniClientError("LingBot `multi_modal_data` must be a mapping.")
+        raw_images = multi_modal_data.get("image")
+        if raw_images is None:
+            return request
+
+        multiple = isinstance(raw_images, (list, tuple))
+        image_values = list(raw_images) if multiple else [raw_images]
+        images = [_load_lingbot_image(image) for image in image_values]
+        normalized_prompt = dict(prompt)
+        normalized_multi_modal_data = dict(multi_modal_data)
+        normalized_multi_modal_data["image"] = images if multiple else images[0]
+        normalized_prompt["multi_modal_data"] = normalized_multi_modal_data
+        if request.is_dummy_run() and "modalities" not in normalized_prompt:
+            normalized_prompt["modalities"] = ["video"]
+        request.prompt = normalized_prompt
+        return request
+
+    return pre_process_func
+
+
 def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
 
-    def post_process_func(frames: torch.Tensor, sampling_params=None):
+    def post_process_func(frames: torch.Tensor | dict[str, torch.Tensor], sampling_params=None):
+        output_key = None
+        if isinstance(frames, dict):
+            output_keys = [key for key in ("image", "video") if key in frames]
+            if len(output_keys) != 1:
+                raise ValueError(
+                    f"LingBot output must contain exactly one of 'image' or 'video', got {sorted(frames)!r}."
+                )
+            output_key = output_keys[0]
+            frames = frames[output_key]
         output_type = getattr(sampling_params, "output_type", None) or "pt"
-        if output_type == "np" and isinstance(frames, torch.Tensor):
-            return frames.float().cpu().numpy()
-        return frames
+        # The image serving path currently accepts PIL images or NumPy arrays,
+        # while LingBot decodes T2I outputs to tensors. Keep that compatibility
+        # conversion without discarding the model's image/video payload key.
+        if (
+            isinstance(frames, torch.Tensor)
+            and output_type != "latent"
+            and (output_type == "np" or output_key == "image")
+        ):
+            frames = frames.float().cpu().numpy()
+        return {output_key: frames} if output_key is not None else frames
 
     return post_process_func
 
 
-class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery):
+class LingBotVideoPipeline(
+    nn.Module,
+    SupportImageInput,
+    ProgressBarMixin,
+    SupportsComponentDiscovery,
+):
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
 
     The in-tree transformer supports both dense MLP blocks and routed MoE blocks.
@@ -235,6 +316,7 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
     """
 
     supports_step_execution: ClassVar[bool] = False
+    max_outputs_per_prompt: ClassVar[int] = 1
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -249,6 +331,7 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         self.token_length = TOKEN_LENGTH
         self.hidden_state_skip_layer = HIDDEN_STATE_SKIP_LAYER
         self.prompt_template = PROMPT_TEMPLATE
+        self.img_prompt_template = IMG_PROMPT_TEMPLATE
         self._crop_start: int | None = None
 
         model = od_config.model
@@ -298,6 +381,7 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         )
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
+        self.default_image_negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
@@ -348,12 +432,18 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
                 self._crop_start = int(prefix["input_ids"].shape[1])
         return self._crop_start
 
-    def _build_prompt_inputs(self, prompt: str | list[str]):
+    def _build_prompt_inputs(
+        self,
+        prompt: str | list[str],
+        *,
+        images: Any | None = None,
+    ):
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-        texts = [self.apply_text_to_template(text, self.prompt_template) for text in prompts]
+        visual_template = self.img_prompt_template if images is not None else ""
+        texts = [self.apply_text_to_template(visual_template + text, self.prompt_template) for text in prompts]
         return self.processor(
             text=texts,
-            images=None,
+            images=images,
             videos=None,
             do_resize=False,
             truncation=True,
@@ -367,10 +457,11 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         self,
         prompt: str | list[str],
         *,
+        images: Any | None = None,
         device: str | torch.device | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = torch.device(device) if device is not None else self.device
-        inputs = self._build_prompt_inputs(prompt).to(device)
+        inputs = self._build_prompt_inputs(prompt, images=images).to(device)
         outputs = self.text_encoder(
             **inputs,
             output_hidden_states=self.hidden_state_skip_layer is not None,
@@ -391,6 +482,35 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             prompt_embeds = prompt_embeds[:, :true_len]
             prompt_mask = prompt_mask[:, :true_len]
         return prompt_embeds, prompt_mask
+
+    def _vision_patch_size(self) -> int:
+        for obj in (
+            getattr(getattr(self.text_encoder, "config", None), "vision_config", None),
+            getattr(getattr(self.processor, "image_processor", None), "config", None),
+            getattr(self.processor, "image_processor", None),
+        ):
+            patch_size = getattr(obj, "patch_size", None)
+            if patch_size is not None:
+                return int(patch_size)
+        return 16
+
+    def prepare_ti2v_image_condition(
+        self,
+        image: Image.Image,
+        *,
+        height: int,
+        width: int,
+        generator: torch.Generator | None = None,
+    ) -> LingBotImageCondition:
+        return prepare_ti2v_image_condition(
+            image,
+            height=height,
+            width=width,
+            vae=self.vae,
+            vision_patch_size=self._vision_patch_size(),
+            device=self.device,
+            generator=generator,
+        )
 
     def prepare_latents(
         self,
@@ -441,6 +561,8 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         self,
         *,
         prompt: str,
+        mode: LingBotGenerationMode,
+        input_image: Image.Image | None = None,
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
         height: int = 480,
         width: int = 480,
@@ -467,6 +589,22 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         self.check_inputs(height, width, num_frames)
         device = self.device
         do_cfg = guidance_scale > 1.0
+        image_condition = None
+        prompt_images = None
+        # Public image/mode combinations are validated by resolve_lingbot_mode.
+        # Keep these checks as defensive invariants for direct internal calls.
+        if mode is LingBotGenerationMode.TI2V:
+            if input_image is None:
+                raise ValueError("LingBot TI2V generation requires one input image.")
+            image_condition = self.prepare_ti2v_image_condition(
+                input_image,
+                height=height,
+                width=width,
+                generator=generator,
+            )
+            prompt_images = [image_condition.vlm_image]
+        elif input_image is not None:
+            raise ValueError(f"LingBot {mode.value} generation does not accept an input image.")
         effective_batch_cfg = bool(batch_cfg)
         cfg_parallel = cfg_parallel_group is not None
         cfg_parallel_rank = 0
@@ -499,11 +637,19 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             if negative_prompt_embeds is not None:
                 negative_embeds, negative_mask = negative_prompt_embeds, negative_prompt_mask
             else:
-                negative_embeds, negative_mask = self.encode_prompt(negative_prompt, device=device)
+                negative_embeds, negative_mask = self.encode_prompt(
+                    negative_prompt,
+                    images=prompt_images,
+                    device=device,
+                )
             prompt_embeds = prompt_mask = None
         else:
             if prompt_embeds is None:
-                prompt_embeds, prompt_mask = self.encode_prompt(prompt, device=device)
+                prompt_embeds, prompt_mask = self.encode_prompt(
+                    prompt,
+                    images=prompt_images,
+                    device=device,
+                )
             if do_cfg and not cfg_parallel:
                 if null_cond_clone_zero:
                     negative_embeds = torch.zeros_like(prompt_embeds)
@@ -511,9 +657,15 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
                 elif negative_prompt_embeds is not None:
                     negative_embeds, negative_mask = negative_prompt_embeds, negative_prompt_mask
                 else:
-                    negative_embeds, negative_mask = self.encode_prompt(negative_prompt, device=device)
+                    negative_embeds, negative_mask = self.encode_prompt(
+                        negative_prompt,
+                        images=prompt_images,
+                        device=device,
+                    )
 
         latents = self.prepare_latents(num_frames, height, width, generator, latents, device)
+        if image_condition is not None:
+            latents = apply_clean_prefix(latents, image_condition.clean_latent)
         sigmas = _compute_refiner_sigmas(
             sigma_max=float(self.scheduler.sigma_max),
             sigma_min=float(self.scheduler.sigma_min),
@@ -620,7 +772,15 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
                         )[0].float()
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
 
-            latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False, generator=generator)[0]
+            latents = self.scheduler.step(
+                noise_pred,
+                timestep,
+                latents,
+                return_dict=False,
+                generator=generator,
+            )[0]
+            if image_condition is not None:
+                latents = apply_clean_prefix(latents, image_condition.clean_latent)
 
         if cfg_parallel:
             dist.barrier(group=cfg_parallel_group)
@@ -633,7 +793,14 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             if vae_offloaded and vae_restore_device is not None:
                 self.vae.to(device=vae_restore_device)
                 torch.accelerator.empty_cache()
-            return self._decode_latents(latents)
+            decoded = self._decode_latents(latents)
+            if mode is LingBotGenerationMode.T2I:
+                if decoded.shape[0] != 1:
+                    raise RuntimeError(
+                        f"LingBot T2I decode expected exactly one frame, got shape {tuple(decoded.shape)}."
+                    )
+                return decoded[0]
+            return decoded
         raise ValueError(f"Unsupported output_type: {output_type}")
 
     @torch.inference_mode()
@@ -641,9 +808,27 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         if req.num_reqs != 1:
             raise ValueError(f"LingBotVideoPipeline only supports one request per batch, got {req.num_reqs}.")
         request = req.requests[0]
-        prompt, prompt_negative = _extract_prompt(request)
         sampling = request.sampling_params
         extra_args = dict(sampling.extra_args or {})
+
+        default_shift = getattr(self.od_config, "flow_shift", None) or 3.0
+        default_output_type = getattr(self.od_config, "output_type", None) or "pt"
+        if default_output_type not in {"pt", "np", "latent"}:
+            default_output_type = "pt"
+        try:
+            if sampling.num_outputs_per_prompt != 1:
+                raise ValueError(
+                    f"LingBotVideoPipeline only supports one output per prompt, got {sampling.num_outputs_per_prompt}."
+                )
+            request_config = normalize_lingbot_request(
+                request,
+                default_negative_prompt=self.default_negative_prompt,
+                default_image_negative_prompt=self.default_image_negative_prompt,
+                default_shift=default_shift,
+                default_output_type=default_output_type,
+            )
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(str(exc)) from exc
 
         generator = sampling.generator
         if isinstance(generator, list):
@@ -651,45 +836,39 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         if generator is None and sampling.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(int(sampling.seed))
 
-        height = sampling.height if sampling.height is not None else extra_args.pop("height", 480)
-        width = sampling.width if sampling.width is not None else extra_args.pop("width", 480)
-        num_frames = sampling.num_frames or extra_args.pop("num_frames", 81)
-        num_inference_steps = (
-            sampling.num_inference_steps
-            if sampling.num_inference_steps is not None
-            else extra_args.pop("num_inference_steps", 40)
-        )
-        guidance_scale = (
-            sampling.guidance_scale if sampling.guidance_scale_provided else extra_args.pop("guidance_scale", 6.0)
-        )
-        shift = extra_args.pop(
-            "shift",
-            extra_args.pop("flow_shift", getattr(self.od_config, "flow_shift", None) or 3.0),
-        )
-        negative_prompt = extra_args.pop("negative_prompt", prompt_negative or self.default_negative_prompt)
-        output_type = (
-            sampling.output_type or getattr(self.od_config, "output_type", None) or extra_args.pop("output_type", "pt")
-        )
-        if output_type not in {"pt", "np", "latent"}:
-            output_type = "pt"
-        sampling.output_type = output_type
+        sampling.height = request_config.height
+        sampling.width = request_config.width
+        sampling.num_frames = request_config.num_frames
+        sampling.fps = request_config.fps
+        sampling.frame_rate = float(request_config.fps)
+        sampling.num_inference_steps = request_config.num_inference_steps
+        sampling.guidance_scale = request_config.guidance_scale
+        sampling.output_type = request_config.output_type
 
         frames = self._generate(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            shift=shift,
+            prompt=request_config.prompt,
+            mode=request_config.mode,
+            input_image=request_config.input_image,
+            negative_prompt=request_config.negative_prompt,
+            height=request_config.height,
+            width=request_config.width,
+            num_frames=request_config.num_frames,
+            num_inference_steps=request_config.num_inference_steps,
+            guidance_scale=request_config.guidance_scale,
+            shift=request_config.shift,
             generator=generator,
             latents=sampling.latents,
-            output_type=output_type,
-            batch_cfg=bool(extra_args.pop("batch_cfg", False)),
-            null_cond_clone_zero=bool(extra_args.pop("null_cond_clone_zero", False)),
-            offload_vae_during_denoise=bool(extra_args.pop("offload_vae_during_denoise", False)),
-            t_thresh=extra_args.pop("t_thresh", None),
-            refiner_sigma_tail_steps=int(extra_args.pop("refiner_sigma_tail_steps", LOW_NOISE_TAIL_V1_DEFAULT_STEPS)),
+            output_type=request_config.output_type,
+            batch_cfg=bool(extra_args.get("batch_cfg", False)),
+            null_cond_clone_zero=bool(extra_args.get("null_cond_clone_zero", False)),
+            offload_vae_during_denoise=bool(extra_args.get("offload_vae_during_denoise", False)),
+            t_thresh=extra_args.get("t_thresh"),
+            refiner_sigma_tail_steps=int(
+                extra_args.get(
+                    "refiner_sigma_tail_steps",
+                    LOW_NOISE_TAIL_V1_DEFAULT_STEPS,
+                )
+            ),
         )
-        return DiffusionOutput(output=frames)
+        output_key = "image" if request_config.mode is LingBotGenerationMode.T2I else "video"
+        return DiffusionOutput(output={output_key: frames})

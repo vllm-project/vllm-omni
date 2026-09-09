@@ -88,8 +88,8 @@ def _generate_single_stage_image(
         if hasattr(first_output, "images") and first_output.images:
             images = first_output.images
         else:
-            assert hasattr(first_output, "request_output") and first_output.request_output
-            request_output = first_output.request_output
+            assert isinstance(first_output, OmniRequestOutput) and first_output
+            request_output = first_output
             if isinstance(request_output, list):
                 req_out = request_output[0]
             else:
@@ -147,10 +147,10 @@ def _generate_single_stage_video(
 
         first = outputs[0]
 
-        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput.request_output).
+        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput).
         frames: Any = None
-        if hasattr(first, "request_output") and isinstance(first.request_output, list):
-            inner = first.request_output[0]
+        if isinstance(first, OmniRequestOutput) and isinstance(first, list):
+            inner = first[0]
             if isinstance(inner, OmniRequestOutput) and inner.images:
                 frames = inner.images[0]
         if frames is None and hasattr(first, "images") and first.images:
@@ -189,7 +189,7 @@ def _generate_single_stage_video(
 
 
 def _generate_bagel_image(
-    quantization_config: str | None = None,
+    diffusion_quantization_config: str | None = None,
     num_inference_steps: int = 15,
 ) -> tuple[Any, float]:
     """Generate an image with BAGEL (multi-stage: LLM + Diffusion).
@@ -199,11 +199,11 @@ def _generate_bagel_image(
     config_path = get_deploy_config_path("ci/bagel.yaml")
     omni_kwargs: dict[str, Any] = {
         "model": "ByteDance-Seed/BAGEL-7B-MoT",
-        "stage_configs_path": config_path,
+        "deploy_config": config_path,
         "stage_init_timeout": 300,
     }
-    if quantization_config:
-        omni_kwargs["quantization_config"] = quantization_config
+    if diffusion_quantization_config:
+        omni_kwargs["diffusion_quantization_config"] = diffusion_quantization_config
 
     model_name = omni_kwargs.pop("model")
     with OmniRunner(model_name, **omni_kwargs) as runner:
@@ -234,8 +234,8 @@ def _generate_bagel_image(
             if images := getattr(req_output, "images", None):
                 generated_image = images[0]
                 break
-            if hasattr(req_output, "request_output") and req_output.request_output:
-                stage_outputs = req_output.request_output
+            if isinstance(req_output, OmniRequestOutput) and req_output:
+                stage_outputs = req_output
                 if not isinstance(stage_outputs, list):
                     stage_outputs = [stage_outputs]
                 for stage_out in stage_outputs:
@@ -250,8 +250,8 @@ def _generate_bagel_image(
 
         # Check LLM stage output — should have finish_reason=stop (not length)
         for req_output in omni_outputs:
-            if hasattr(req_output, "request_output") and req_output.request_output:
-                stage_outputs = req_output.request_output
+            if isinstance(req_output, OmniRequestOutput) and req_output:
+                stage_outputs = req_output
                 if not isinstance(stage_outputs, list):
                     stage_outputs = [stage_outputs]
                 for stage_out in stage_outputs:
@@ -380,21 +380,21 @@ def test_single_stage_ltx2_fp8_uses_less_memory():
 
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_fp8_generates_image():
-    """BAGEL with FP8 quantization_config generates a valid image.
+    """BAGEL with diffusion-stage FP8 generates a valid image.
 
     FP8 should only apply to the diffusion stage (Stage-1), not the
     LLM stage (Stage-0). We verify this by checking:
       1. Image is generated successfully
       2. LLM stage finish_reason is 'stop' (not 'length' from garbled output)
     """
-    image, _ = _generate_bagel_image(quantization_config="fp8")
+    image, _ = _generate_bagel_image(diffusion_quantization_config="fp8")
     image.save("test_bagel_fp8.png")
 
 
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_bf16_generates_image():
     """BAGEL without quantization generates a valid image (baseline)."""
-    image, _ = _generate_bagel_image(quantization_config=None)
+    image, _ = _generate_bagel_image(diffusion_quantization_config=None)
     image.save("test_bagel_bf16.png")
 
 

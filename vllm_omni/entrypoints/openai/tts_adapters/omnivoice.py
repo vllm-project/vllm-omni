@@ -33,7 +33,7 @@ class OmniVoiceAdapter(ARTTSAdapter):
         server = self.ctx.server
         prompt: dict = {"input": request.input}
         if request.ref_audio:
-            wav, sr = await server._resolve_ref_audio(request.ref_audio)
+            wav, sr, _ = await server._resolve_ref_audio(request.ref_audio)
             prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
         if request.ref_text:
             prompt["ref_text"] = request.ref_text

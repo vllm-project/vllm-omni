@@ -101,7 +101,7 @@ outputs = omni.generate(
 )
 
 # Access custom trajectory data
-output = outputs[0].request_output
+output = outputs[0]
 print(f"Trajectory timesteps shape: {output.metrics['trajectory_timesteps'].shape}")
 print(f"Trajectory latents shape: {output.latents.shape}")
 ```

@@ -198,3 +198,32 @@ class TestRequestLifecycleGauges:
         out = generate_latest(registry).decode()
         assert _sample_value(out, 'vllm_omni:num_requests_running{model_name="lifecycle-test-2"}') == 1.0
         assert _sample_value(out, 'vllm_omni:num_requests_waiting{model_name="lifecycle-test-2"}') == 0.0
+
+    def test_engine_queued_requests_count_as_waiting(self, registry: CollectorRegistry) -> None:
+        from types import SimpleNamespace
+
+        from vllm_omni.entrypoints.omni_base import OmniBase
+        from vllm_omni.metrics.prometheus import OmniPrometheusMetrics, OmniRequestCounter
+
+        obj = object.__new__(OmniBase)
+        obj.engine = SimpleNamespace(
+            _running_counter=OmniRequestCounter(),
+            _engines_waiting_counter=OmniRequestCounter(),
+        )
+        obj.prom_metrics = OmniPrometheusMetrics(model_name="lifecycle-test-3")
+        obj.request_states = {}
+        obj.log_stats = False
+
+        # Three requests dispatched to a stage engine whose scheduler admits
+        # one and queues two (e.g. a diffusion engine with
+        # max_num_running_reqs=1). The orchestrator reports the queued count
+        # via _engines_waiting_counter; they must show as waiting, not running.
+        for _ in range(3):
+            obj.engine._running_counter.increment()
+        obj.engine._engines_waiting_counter.value = 2
+
+        obj._publish_request_gauges(3)
+
+        out = generate_latest(registry).decode()
+        assert _sample_value(out, 'vllm_omni:num_requests_running{model_name="lifecycle-test-3"}') == 1.0
+        assert _sample_value(out, 'vllm_omni:num_requests_waiting{model_name="lifecycle-test-3"}') == 2.0

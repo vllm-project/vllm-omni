@@ -288,7 +288,7 @@ def _extract_generated_image(outputs: list[object]) -> Image.Image:
     if images := getattr(first_output, "images", None):
         return images[0]
 
-    request_output = getattr(first_output, "request_output", None)
+    request_output = first_output
     if request_output is not None and (images := getattr(request_output, "images", None)):
         return images[0]
 

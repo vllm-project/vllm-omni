@@ -200,6 +200,8 @@ class Omni(OmniBase):
                     self._log_summary_and_cleanup(req_id)
         except Exception:
             if "active_reqs" in locals() and active_reqs:
+                for req_id in active_reqs:
+                    self._record_request_failure_once(req_id, reason="stage_error")
                 self.abort(list(active_reqs))
             raise
         finally:
@@ -210,6 +212,7 @@ class Omni(OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         self.engine.abort(request_ids)
         for req_id in request_ids:
+            self._record_request_failure_once(req_id, reason="client_abort")
             self.request_states.pop(req_id, None)
         if self.log_stats:
             logger.info("[Omni] Aborted request(s) %s", ",".join(request_ids))

@@ -441,6 +441,8 @@ class FlowMatchingAudioTransformer(nn.Module):
             torch.linspace(0, 1, self._n_steps + 1),
             persistent=False,
         )
+        # Lazy per-dtype cache of schedule constants: (timesteps, t_proj_table, dts) on device.
+        self._timesteps_cache: dict[torch.dtype, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def load_weight(self, weight: tuple[str, torch.Tensor]) -> str:
         params_dict = dict(self.named_parameters())
@@ -514,12 +516,25 @@ class FlowMatchingAudioTransformer(nn.Module):
         # Skip decoding if codebook 0 is [END_AUDIO] token.
         should_decode = semantic_code != self._end_audio_token_id
 
-        # acoustic_codes starts from x_0
-        x_0 = torch.randn(B, self.model_args.n_acoustic_codebook).to(dtype=llm_hidden.dtype, device=llm_hidden.device)
+        # acoustic_codes starts from x_0; generate directly on device to skip H2D.
+        x_0 = torch.randn(B, self.model_args.n_acoustic_codebook, dtype=llm_hidden.dtype, device=llm_hidden.device)
         x_0 = self._noise_scale * x_0
 
-        timesteps = self._timesteps.to(dtype=llm_hidden.dtype)
-        llm_hidden_zero = torch.zeros_like(llm_hidden)
+        # Build the schedule constants once per dtype and reuse them every frame.
+        cache = self._timesteps_cache.get(llm_hidden.dtype)
+        if cache is None:
+            timesteps_d = self._timesteps.to(dtype=llm_hidden.dtype)
+            t_emb_table = self.time_embedding(timesteps_d.view(-1, 1)).to(llm_hidden.dtype)
+            t_proj_table = self.time_projection(t_emb_table)
+            dts = timesteps_d[1:] - timesteps_d[:-1]
+            self._timesteps_cache[llm_hidden.dtype] = (timesteps_d, t_proj_table, dts)
+            cache = self._timesteps_cache[llm_hidden.dtype]
+        timesteps, t_proj_table, dts = cache
+
+        # Hoist the step-invariant concat + llm_projection out of the loop; inside the
+        # captured graph these would otherwise replay every step.
+        llm_batched = torch.cat([llm_hidden, torch.zeros_like(llm_hidden)], dim=0)
+        llm_proj_batched = self.llm_projection(llm_batched)
 
         # Reshape cfg_alpha for broadcasting: (B,) -> (B, 1)
         cfg_alpha = cfg_alpha.to(dtype=llm_hidden.dtype, device=llm_hidden.device)
@@ -528,20 +543,19 @@ class FlowMatchingAudioTransformer(nn.Module):
         # Euler integration with batched conditional + unconditional velocity
         sampled = x_0
         for i in range(len(timesteps) - 1):
-            t = timesteps[i]
-            dt = timesteps[i + 1] - timesteps[i]
+            dt = dts[i]  # precomputed constant step size
 
-            t_emb = self.time_embedding(t.view(-1, 1).repeat(B, 1)).to(llm_hidden.dtype)
+            # Reuse cached projected-t_emb row, expanded along batch dim.
+            t_proj = t_proj_table[i].unsqueeze(0).expand(B, -1)
 
             # Batch cond + uncond into a single forward pass (2B batch)
             x_batched = torch.cat([sampled, sampled], dim=0)
-            llm_batched = torch.cat([llm_hidden, llm_hidden_zero], dim=0)
-            t_emb_batched = torch.cat([t_emb, t_emb], dim=0)
+            t_proj_batched = torch.cat([t_proj, t_proj], dim=0)
 
             v_all = self._predict_velocity(
                 x_t=x_batched,
-                llm_output=llm_batched,
-                t_emb=t_emb_batched,
+                llm_proj=llm_proj_batched,
+                t_proj=t_proj_batched,
             )
             v_t, uncond_v_t = v_all[:B], v_all[B:]
             v_t = cfg_alpha * v_t + (1 - cfg_alpha) * uncond_v_t
@@ -558,18 +572,16 @@ class FlowMatchingAudioTransformer(nn.Module):
     def _predict_velocity(
         self,
         x_t: torch.Tensor,  # BxC
-        llm_output: torch.Tensor,  # BxD
-        t_emb: torch.Tensor,  # BxD
+        llm_proj: torch.Tensor,  # BxD, already through llm_projection
+        t_proj: torch.Tensor,  # BxD, already through time_projection
     ) -> torch.Tensor:
-        x_t = x_t.to(llm_output.dtype)
-
-        t_emb = self.time_projection(t_emb)
-        llm_output = self.llm_projection(llm_output)
+        # llm_proj/t_proj arrive pre-projected (hoisted out of the per-step loop by callers).
+        x_t = x_t.to(llm_proj.dtype)
 
         acoustic_and_semantic_embeddings = [
             self.input_projection(x_t.unsqueeze(1)),  # Bx1xD
-            t_emb.unsqueeze(1),
-            llm_output.unsqueeze(1),
+            t_proj.unsqueeze(1),
+            llm_proj.unsqueeze(1),
         ]
         acoustic_transformer_inputs = torch.concatenate(acoustic_and_semantic_embeddings, dim=1)
 
@@ -954,6 +966,8 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         self.audio_tok_id = audio_encoder.audio_token
         self.eos_tok_id = self.tokenizer.instruct.tokenizer.eos_id
         self.vocab_size = config.text_config.vocab_size
+        self._end_audio_token_id = AudioSpecialTokens.id(AudioSpecialTokens.end_audio)
+        self._fake_eos_consts: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
@@ -1052,11 +1066,15 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
             llm_hidden=hidden_states,
             cfg_alpha=cfg_alpha,
         )
-        fake_eos = torch.where(
-            audio_codes[:, 0] == AudioSpecialTokens.id(AudioSpecialTokens.end_audio),
-            torch.tensor(1.0, dtype=torch.bfloat16),
-            torch.tensor(0.0, dtype=torch.bfloat16),
-        )
+        # Cache device-resident 1.0/0.0 scalars to avoid a per-call H2D transfer.
+        consts = self._fake_eos_consts.get(audio_codes.device)
+        if consts is None:
+            consts = (
+                torch.tensor(1.0, dtype=torch.bfloat16, device=audio_codes.device),
+                torch.tensor(0.0, dtype=torch.bfloat16, device=audio_codes.device),
+            )
+            self._fake_eos_consts[audio_codes.device] = consts
+        fake_eos = torch.where(audio_codes[:, 0] == self._end_audio_token_id, consts[0], consts[1])
         # BxC -> Bx1xC since this is per-step
         # Make it a list for vllm-omni processing
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))

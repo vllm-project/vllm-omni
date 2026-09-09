@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for OmniServerStageCli process planning helpers."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,26 +39,51 @@ def test_stage_cli_builds_headless_replica_cmd(tmp_path: Path) -> None:
     assert "--headless" in cmd
     assert cmd[cmd.index("--stage-id") + 1] == "1"
     assert cmd[cmd.index("--replica-id") + 1] == "2"
-    assert cmd[cmd.index("--stage-configs-path") + 1] == server.stage_config_path
+    assert cmd[cmd.index("--deploy-config") + 1] == server.stage_config_path
 
 
-def test_stage_cli_splits_devices_per_replica(tmp_path: Path) -> None:
+def test_stage_cli_loads_stage_ids_and_replica_counts(tmp_path: Path) -> None:
     server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
 
-    assert server._devices_for_replica(1, "1,2,3", 0) == "1"
-    assert server._devices_for_replica(1, "1,2,3", 1) == "2"
-    assert server._devices_for_replica(1, "1,2,3", 2) == "3"
+    assert server.stage_ids == [0, 1]
+    assert server.stage_replica_counts == {0: 1, 1: 3}
 
 
-def test_stage_cli_maps_visible_devices_after_replica_split(tmp_path: Path) -> None:
-    server = OmniServerStageCli(
-        "fake-model",
-        _write_stage_config(tmp_path),
-        [],
-        env_dict={"CUDA_VISIBLE_DEVICES": "4,5,6,7"},
-    )
-    env: dict[str, str] = {}
+def test_stage_cli_enter_rolls_back_launched_stages_on_startup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``__exit__`` is skipped when ``__enter__`` raises; rollback must still run."""
+    monkeypatch.setattr("tests.helpers.runtime.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("tests.helpers.runtime.cleanup_test_environment", lambda: None)
 
-    server._set_stage_device_env(1, env, "1,2,3", replica_id=1)
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), ["--disable-log-stats"])
+    log_path = tmp_path / "stage0.log"
+    log_fh = open(log_path, "w", encoding="utf-8")
+    log_fh.write("partial launch\n")
+    log_fh.flush()
 
-    assert env["CUDA_VISIBLE_DEVICES"] == "6"
+    proc = SimpleNamespace(pid=4242, poll=lambda: None)
+    killed: list[int] = []
+    monkeypatch.setattr(server, "_kill_process_tree", lambda pid: killed.append(pid))
+
+    def _fake_launch(stage_id: int, *, headless: bool, replica_id: int = 0) -> None:
+        stage_key = (stage_id, replica_id)
+        server.stage_procs[stage_key] = proc  # type: ignore[assignment]
+        server._stage_log_paths[stage_key] = log_path
+        server._stage_log_files[stage_key] = log_fh
+        if stage_id == 0 and replica_id == 0:
+            server.proc = proc  # type: ignore[assignment]
+
+    def _fail_alive() -> None:
+        raise RuntimeError("Stage 0 replica 0 exited with code 1")
+
+    monkeypatch.setattr(server, "_launch_stage", _fake_launch)
+    monkeypatch.setattr(server, "_ensure_stage_processes_alive", _fail_alive)
+
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        with server:
+            raise AssertionError("context body must not run after a failed enter")
+
+    assert killed == [4242]
+    assert log_fh.closed
+    assert not log_path.exists()

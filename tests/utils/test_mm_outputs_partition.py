@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import vllm_omni.utils.mm_outputs as mm_outputs
 from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -69,3 +70,33 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
     assert "meta.turn_end" in client
     assert "meta.native_duplex_segment_text" not in client
     assert "meta.native_duplex_segment_text" in inter
+
+
+def test_snapshot_mm_payload_coalesces_compatible_tensor_list(monkeypatch):
+    chunks = [
+        torch.tensor([[7]], dtype=torch.long),
+        torch.empty(0, 1, dtype=torch.long),
+        torch.tensor([[9], [10]], dtype=torch.long),
+    ]
+    real_cat = torch.cat
+    cat_shapes = []
+
+    def recording_cat(tensors, *args, **kwargs):
+        cat_shapes.append([tuple(tensor.shape) for tensor in tensors])
+        return real_cat(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", recording_cat)
+
+    result = mm_outputs.snapshot_mm_payload({"codes.mel": chunks})
+
+    assert cat_shapes == [[(1, 1), (0, 1), (2, 1)]]
+    output_chunks = result["codes.mel"]
+    assert [tuple(chunk.shape) for chunk in output_chunks] == [
+        (1, 1),
+        (0, 1),
+        (2, 1),
+    ]
+    torch.testing.assert_close(output_chunks[0], chunks[0])
+    torch.testing.assert_close(output_chunks[1], chunks[1])
+    torch.testing.assert_close(output_chunks[2], chunks[2])
+    assert output_chunks[0].untyped_storage().data_ptr() == output_chunks[2].untyped_storage().data_ptr()

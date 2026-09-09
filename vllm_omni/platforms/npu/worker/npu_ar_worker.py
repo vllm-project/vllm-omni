@@ -11,9 +11,11 @@ from vllm_omni.worker.mixins import OmniWorkerMixin
 class NPUARWorker(OmniWorkerMixin, OmniNPUWorkerBase):
     """NPU AR worker for thinker/talker stages in Omni model."""
 
+    model_runner_cls = NPUARModelRunner
+
     def init_device(self):
         self.device = self._init_device()
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
 
-        self.model_runner = NPUARModelRunner(self.vllm_config, self.device)
+        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)

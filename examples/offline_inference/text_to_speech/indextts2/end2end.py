@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Offline inference example for IndexTTS2 via vLLM-Omni.
+"""Offline inference example for IndexTTS 2.0 and 2.5 via vLLM-Omni.
 
-Two-stage pipeline: GPT AR (Stage 0) → S2Mel + BigVGAN (Stage 1).
+Two-stage pipeline: GPT AR (Stage 0) → semantic codec + S2Mel + BigVGAN
+(Stage 1).
 Output is 22050 Hz mono WAV.
 
 Usage:
   python end2end.py \
-    --model /path/to/IndexTeam/IndexTTS-2 \
+    --model /path/to/indextts-2.5 \
+    --model-version 2.5 \
+    --lang zh \
     --text "你好，这是一个语音合成测试。" \
     --ref-audio /path/to/ref.wav
 
@@ -47,6 +50,10 @@ def build_request(
     emo_alpha: float | None = None,
     use_emo_text: bool = False,
     use_random: bool = False,
+    model_type: str = "indextts2",
+    lang: str = "zh",
+    text_normalization: bool = True,
+    tokenizer_file: str | None = None,
 ) -> dict:
     additional: dict = {"text": [text]}
     if ref_audio_path:
@@ -63,10 +70,42 @@ def build_request(
         additional["use_emo_text"] = [True]
     if use_random:
         additional["use_random"] = [True]
+    if model_type == "indextts2_5":
+        additional["lang"] = [lang]
+        additional["text_normalization"] = [text_normalization]
+    prompt_kwargs = {
+        "model_type": model_type,
+        "lang": lang,
+        "text_normalization": text_normalization,
+    }
+    if tokenizer_file is not None:
+        prompt_kwargs["tokenizer_file"] = tokenizer_file
     return {
-        "prompt_token_ids": build_indextts2_prefill_prompt_ids(model, text),
+        "prompt_token_ids": build_indextts2_prefill_prompt_ids(
+            model,
+            text,
+            **prompt_kwargs,
+        ),
         "additional_information": additional,
     }
+
+
+def _get_stage0_tokenizer_file(omni: Omni) -> str | None:
+    """Read the effective tokenizer override from the resolved Stage 0 config."""
+    stage_configs = omni.stage_configs
+    if not stage_configs:
+        return None
+    engine_args = getattr(stage_configs[0], "engine_args", None)
+    if engine_args is None:
+        return None
+    hf_overrides = getattr(engine_args, "hf_overrides", None)
+    if hf_overrides is None and isinstance(engine_args, dict):
+        hf_overrides = engine_args.get("hf_overrides")
+    if hf_overrides is None:
+        return None
+    if hasattr(hf_overrides, "get"):
+        return hf_overrides.get("tokenizer_file")
+    return getattr(hf_overrides, "tokenizer_file", None)
 
 
 def save_audio(waveform: torch.Tensor, path: str, sample_rate: int = 22050) -> None:
@@ -95,9 +134,14 @@ def extract_audio(mm: dict) -> tuple[torch.Tensor | None, int]:
 
 
 def main(args) -> None:
+    model_type = "indextts2_5" if args.model_version == "2.5" else "indextts2"
+    deploy_config = args.deploy_config
+    if deploy_config is None and args.model_version == "2.5":
+        repo_root = Path(__file__).resolve().parents[4]
+        deploy_config = str(repo_root / "vllm_omni" / "deploy" / "indextts2_5.yaml")
     omni = Omni(
         model=args.model,
-        deploy_config=args.deploy_config,
+        deploy_config=deploy_config,
         stage_init_timeout=args.stage_init_timeout,
     )
 
@@ -126,7 +170,7 @@ def main(args) -> None:
     print(f"Synthesizing: {args.text!r}")
     if args.ref_audio:
         print(f"  ref_audio: {args.ref_audio}")
-    inputs = build_request(
+    request_kwargs = dict(
         model=args.model,
         text=args.text,
         ref_audio_path=args.ref_audio,
@@ -136,7 +180,17 @@ def main(args) -> None:
         emo_alpha=args.emo_alpha,
         use_emo_text=args.use_emo_text,
         use_random=args.use_random,
+        model_type=model_type,
+        lang=args.lang,
+        text_normalization=args.text_normalization,
     )
+    if model_type == "indextts2_5":
+        tokenizer_file = _get_stage0_tokenizer_file(omni)
+        if tokenizer_file is not None:
+            request_kwargs["tokenizer_file"] = tokenizer_file
+    inputs = build_request(**request_kwargs)
+    if model_type == "indextts2_5":
+        inputs["additional_information"]["duration_factor"] = [1.0 / getattr(args, "speed", 1.0)]
 
     for i, omni_out in enumerate(omni.generate(inputs, sampling_params_list=sampling_params)):
         mm = omni_out.multimodal_output
@@ -154,8 +208,37 @@ def main(args) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="IndexTTS2 offline inference")
-    parser.add_argument("--model", required=True, help="HF model path for IndexTTS2.")
+    parser = FlexibleArgumentParser(description="IndexTTS 2.0/2.5 offline inference")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="HF model path or native bundle containing checkpoints/.",
+    )
+    parser.add_argument(
+        "--model-version",
+        choices=("2.0", "2.5"),
+        default="2.0",
+    )
+    parser.add_argument(
+        "--lang",
+        default="zh",
+        help=(
+            "IndexTTS 2.5 language code, for example zh/en/zhen/ja/yue; "
+            "zhen is mixed Chinese/English and Mandarin is a vLLM-Omni alias for zh."
+        ),
+    )
+    parser.add_argument(
+        "--no-text-normalization",
+        action="store_false",
+        dest="text_normalization",
+        help="Disable IndexTTS 2.5 text normalization.",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="IndexTTS 2.5 native synthesis speed in [0.5, 2.0]; 2.0 is faster.",
+    )
     parser.add_argument("--text", default="你好，这是IndexTTS2语音合成测试。")
     parser.add_argument("--ref-audio", required=True, help="Reference audio for voice cloning.")
     parser.add_argument("--emo-audio", default=None, help="Emotion reference audio.")
@@ -170,7 +253,15 @@ def parse_args():
     parser.add_argument("--emo-alpha", type=float, default=None, help="Emotion weight in [0, 1].")
     parser.add_argument("--use-emo-text", action="store_true", help="Infer emotion vector from emo-text or text.")
     parser.add_argument("--use-random", action="store_true", help="Use random emotion prototypes.")
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed Stage 0 AR sampling and per-request CFM noise; changing the "
+            "concurrent batch composition may still change the final waveform."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         default=os.path.join(
@@ -180,7 +271,10 @@ def parse_args():
     )
     parser.add_argument("--deploy-config", default=None)
     parser.add_argument("--stage-init-timeout", type=int, default=600)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.model_version == "2.5" and not 0.5 <= args.speed <= 2.0:
+        parser.error("IndexTTS 2.5 --speed must be between 0.5 and 2.0")
+    return args
 
 
 if __name__ == "__main__":

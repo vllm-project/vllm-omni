@@ -51,6 +51,41 @@ class CUDAGraphDiTRunner:
         self.enabled = bool(enabled)
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
         self.last_call_info: dict[str, object] = {}
+        self._stats = {
+            "calls": 0,
+            "hits": 0,
+            "captures": 0,
+            "capture_failures": 0,
+            "evictions": 0,
+            "eager": 0,
+        }
+
+    def stats_snapshot(self) -> dict[str, object]:
+        """Return bounded cumulative graph-cache telemetry."""
+        return {
+            **self._stats,
+            "cache_size": len(self._cache),
+        }
+
+    def _replay(
+        self,
+        entry: _GraphEntry,
+        *,
+        x_in: torch.Tensor,
+        c: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replay with only the inputs that vary between Euler steps.
+
+        ``input_pos`` is the same arange slice for a given cache key and the
+        runner is enabled only for all-True masks, so their capture-time
+        buffers remain valid.  The returned output is also the graph's static
+        buffer: all downstream consumers are enqueued on the same CUDA stream
+        before the next replay can overwrite it.
+        """
+        entry.static_x.copy_(x_in)
+        entry.static_c.copy_(c)
+        entry.graph.replay()
+        return entry.static_out
 
     def __call__(
         self,
@@ -59,7 +94,9 @@ class CUDAGraphDiTRunner:
         input_pos: torch.Tensor,
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        self._stats["calls"] += 1
         if not self.enabled or x_in.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+            self._stats["eager"] += 1
             self.last_call_info = {
                 "mode": "eager",
                 "reason": "ineligible",
@@ -84,6 +121,8 @@ class CUDAGraphDiTRunner:
         if entry is None:
             entry = self._capture(x_in, c, input_pos, mask)
             if entry is None:
+                self._stats["capture_failures"] += 1
+                self._stats["eager"] += 1
                 self.last_call_info = {
                     "mode": "eager",
                     "reason": "capture_failed",
@@ -91,10 +130,12 @@ class CUDAGraphDiTRunner:
                     "cache_size": len(self._cache),
                 }
                 return self.transformer(x_in, c, input_pos, mask)
+            self._stats["captures"] += 1
             self._cache[key] = entry
             while len(self._cache) > self.max_graphs:
                 _, evicted = self._cache.popitem(last=False)
                 del evicted
+                self._stats["evictions"] += 1
             # Kernels are only recorded (not executed) during capture, so
             # replay once to produce the first real output.
             entry.graph.replay()
@@ -104,22 +145,20 @@ class CUDAGraphDiTRunner:
                 "shape": tuple(x_in.shape),
                 "cache_size": len(self._cache),
             }
-            return entry.static_out.clone()
+            return entry.static_out
 
         self._cache.move_to_end(key)
-        entry.static_x.copy_(x_in)
-        entry.static_c.copy_(c)
-        entry.static_pos.copy_(input_pos)
-        if entry.static_mask is not None and mask is not None:
-            entry.static_mask.copy_(mask)
-        entry.graph.replay()
+        self._stats["hits"] += 1
+        output = self._replay(entry, x_in=x_in, c=c)
         self.last_call_info = {
             "mode": "graph",
             "reason": "hit",
             "shape": tuple(x_in.shape),
             "cache_size": len(self._cache),
         }
-        return entry.static_out.clone()
+        if self._stats["calls"] % 1000 == 0:
+            logger.info("S2Mel DiT CUDA graph stats: %s", self.stats_snapshot())
+        return output
 
     def _capture(
         self,
