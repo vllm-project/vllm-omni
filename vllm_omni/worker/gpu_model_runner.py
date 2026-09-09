@@ -635,7 +635,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 generator=generator,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
+                output_token_ids=list(getattr(new_req_data, "initial_output_token_ids", [])),
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state

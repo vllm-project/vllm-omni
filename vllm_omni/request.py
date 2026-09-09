@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine.pd_continuation import PDContinuation, validate_pd_sampling
 
 
 class OmniRequest(Request):
@@ -39,6 +40,7 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
+        pd_continuation: PDContinuation | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -58,6 +60,16 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        self.pd_continuation = pd_continuation
+        self.pd_output_prefix_pending = pd_continuation is not None
+        if pd_continuation is not None:
+            pd_continuation.validate(self.prompt_token_ids)
+            validate_pd_sampling(self.sampling_params)
+            if self.resumable or not (self.kv_transfer_params or {}).get("do_remote_prefill"):
+                raise ValueError("PD continuation requires a new remote-prefill consumer request")
+            # Use the public API so all_token_ids, output_token_ids and block
+            # hashes stay consistent. KV is NOT ready until the connector acks.
+            self.append_output_token_ids(pd_continuation.token_ids)
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -110,6 +122,7 @@ class OmniRequest(Request):
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            pd_continuation=getattr(request, "pd_continuation", None),
         )
 
 

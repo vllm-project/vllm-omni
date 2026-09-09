@@ -252,6 +252,24 @@ class PDDisaggregationMixin:
     @staticmethod
     def _prepare_prefill_sampling_params(req_id: str, sp: "SamplingParams") -> "SamplingParams":
         sp = sp.clone()
+        from vllm_omni.engine.pd_continuation import PD_PREFILL_KEY, PD_RESUME_KEY, validate_pd_sampling
+
+        if (sp.extra_args or {}).get(PD_RESUME_KEY):
+            validate_pd_sampling(sp)
+            sp.extra_args = dict(sp.extra_args or {})
+            sp.extra_args[PD_PREFILL_KEY] = True
+            sp.extra_args["kv_transfer_params"] = {
+                **(PDDisaggregationMixin._to_dict(sp.extra_args.get("kv_transfer_params")) or {}),
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
+                "transfer_id": f"xfer-{req_id}",
+            }
+            # The scheduler ends the producer after ONE sample. Preserve the
+            # logical min/max/EOS masks; the transport's finish reason is length.
+            # Stop strings are evaluated by D against the original parameters.
+            sp.stop = []
+            sp.detokenize = False
+            return sp
         sp.max_tokens = 1
         if hasattr(sp, "min_tokens"):
             try:

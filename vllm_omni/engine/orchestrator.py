@@ -2353,6 +2353,11 @@ class OrchestratorBase:
                 resumable=next_stage_resumable,
             )
             request.external_req_id = request.request_id
+            from vllm_omni.engine.pd_continuation import PD_RESUME_KEY, PDContinuation, validate_pd_sampling
+
+            if (params.extra_args or {}).get(PD_RESUME_KEY):
+                validate_pd_sampling(params)
+                request.pd_continuation = PDContinuation.from_output(output, request.prompt_token_ids)
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
