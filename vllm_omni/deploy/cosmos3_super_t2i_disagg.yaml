@@ -33,16 +33,23 @@
 # sequence of 32*32 = 1024 tokens, divisible by ulysses_degree as the
 # transformer requires.
 #
-# KEEP tensor_parallel_size EQUAL ON THE TWO STAGES
-# -------------------------------------------------
-# UND K/V is TP-sharded: the reasoner emits
-# [B, S_und, num_kv_heads // tp_size, head_dim] and stage 1's cross-attention
-# consumes exactly that shape, derived from *its own* TP size. Nothing in the
-# stage plumbing ties the two together, so scaling one stage's
-# tensor_parallel_size without the other produces a payload the other cannot
-# consume. The generator checks this at install time and raises naming both TP
-# sizes, so it fails loudly rather than silently -- but it fails. Every other
-# parallel degree (cfg, ulysses, ring, hsdp) is stage-local and free to differ.
+# EVERY PARALLEL DEGREE IS STAGE-LOCAL, tensor_parallel_size INCLUDED
+# -------------------------------------------------------------------
+# UND K/V is born TP-sharded -- the tower produces
+# [B, S_und, num_kv_heads // tp_size, head_dim] on each rank -- but that sharding
+# does not reach the wire: the reasoner all-gathers the KV-head dimension before
+# the payload leaves the tower, and each generator rank slices back out the head
+# range its own cross-attention owns. The handoff is therefore TP-independent and
+# the two stages may run different tensor_parallel_size values, as they may
+# differ in cfg, ulysses, ring and hsdp degrees.
+#
+# num_kv_heads is 8, so neither stage has anything to gain from
+# tensor_parallel_size beyond that, and a size that leaves a stage zero local KV
+# heads is simply wrong. Only the generator says so cleanly: it raises at bind
+# time, naming both TP sizes. The reasoner's own attention has no such guard --
+# to_k's 8 x 128 output stays divisible well past 8 -- so an over-wide reasoner
+# fails later, inside Cosmos3CausalAttention, on a zero-head view. Keep
+# tensor_parallel_size a divisor of 8 on both.
 #
 # The topology itself is declared in code -- see
 # vllm_omni/diffusion/models/cosmos3_pipeline_config.py -- and selected by the
@@ -112,8 +119,15 @@ stages:
     devices: "0"
     # One request in flight per stage. The two stages still pipeline across
     # requests -- that is the point of the split -- so this does not serialize the
-    # deployment; it bounds the memory each stage needs on top of its 58.1 GiB of
-    # resident weights. Raise it together with that stage's `devices`.
+    # deployment.
+    #
+    # Not a tuning knob today: no Cosmos3 pipeline sets
+    # `supports_request_batch`, so `DiffusionEngine` raises at init for
+    # max_num_seqs > 1 -- the one exception being DLO data-parallel concurrency,
+    # which needs data_parallel_size > 1 and an all-gather component and so cannot
+    # apply to this layout. It has to stay 1 on both stages until Cosmos3 supports
+    # request-level batching, at which point raising it also needs the extra
+    # memory on top of each stage's 58.1 GiB of resident weights.
     max_num_seqs: 1
     # This stage holds one tower (58.1 GiB) on a 131.3 GiB card, so it has room to
     # spare and the exact value does not bind here. Kept explicit and equal to
@@ -125,7 +139,9 @@ stages:
     # where it may eventually be worth turning off.
     enforce_eager: true
     parallel_config:
-      # tensor_parallel_size must equal stage 1's -- see the note at the top.
+      # Stage-local, like every other degree here: the K/V handoff is gathered
+      # before it leaves this stage, so it need not match stage 1's -- see the
+      # note at the top. One card, so 1.
       tensor_parallel_size: 1
       data_parallel_size: 1
       pipeline_parallel_size: 1
@@ -172,9 +188,9 @@ stages:
     # graph capture.
     enforce_eager: true
     parallel_config:
-      # Must match stage 0's tensor_parallel_size -- see the note at the top.
-      # cfg_parallel_size / ulysses_degree / hsdp are stage-local and are the
-      # knobs to reach for when scaling this stage out.
+      # Independent of stage 0's -- see the note at the top. cfg_parallel_size /
+      # ulysses_degree / hsdp are still the knobs to reach for when scaling this
+      # stage out, since they cut the per-step GEN work rather than the weights.
       tensor_parallel_size: 1
       data_parallel_size: 1
       pipeline_parallel_size: 1

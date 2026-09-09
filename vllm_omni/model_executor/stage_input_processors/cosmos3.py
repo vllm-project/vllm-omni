@@ -28,9 +28,12 @@ the same reason: the generator resolves them from those same sampling params,
 through the very helpers the reasoner used (``_resolve_t2i_geometry`` /
 ``_resolve_text_encode_params``), so a prompt-dict copy would be a second source
 of truth for values the generator does not read from the prompt dict anyway. They
-travel in ``META_KEY`` instead, purely as diagnostics -- the generator compares
-the reasoner's declared K/V layout against its own and reports a stage-config
-mismatch in those terms rather than as a bare shape error.
+travel in ``META_KEY`` instead, which is the declared half of the conditioning
+contract (``Cosmos3TextConditioning``): it names the schema the payload
+implements and the K/V layout it carries, so the generator can reject a
+mismatched payload -- or report a stage-config mismatch in the two stages' own
+terms -- instead of hitting a bare shape error inside attention. Forward it
+verbatim; a payload that arrives without it is refused.
 
 So what this forwards is exactly three things: the prompt text, the
 ``modalities`` marker the generator's own T2I check keys off, and the K/V.

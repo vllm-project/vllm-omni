@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 VFM Transformer for vllm-omni.
 
 Implements the Mixture-of-Transformers architecture with two pathways:
@@ -12,7 +12,7 @@ Ported from the TRT-LLM integration (tekit branch user/shreyasm/cosmos3).
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -985,6 +985,11 @@ class Cosmos3LanguageModel(nn.Module):
     Returns per-layer K/V tensors for the generation pathway's cross-attention.
     The UND pathway is independent of the denoising step, so its K/V can be
     computed once and reused across all sampling steps.
+
+    ``rope_only`` builds the mRoPE embedding and nothing else, for a stage that
+    does not own this tower (see ``Cosmos3VFMTransformer.owned_towers``): the GEN
+    pathway needs ``rotary_emb`` on every stage, but the embedding table, the
+    blocks and the final norm belong to whoever runs the tower.
     """
 
     _layerwise_offload_blocks_attrs = ["layers"]
@@ -1004,14 +1009,23 @@ class Cosmos3LanguageModel(nn.Module):
         mrope_section: list[int],
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        rope_only: bool = False,
     ) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.rope_only = rope_only
+        # Parameter-free (its ``inv_freq`` buffer is non-persistent), so it never
+        # appears in ``state_dict()`` and is never expected by the weight loader.
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=rope_theta,
             mrope_section=mrope_section,
         )
+        if rope_only:
+            # An empty container rather than no attribute: the offload rings and
+            # ``_model_cpu_offload_components`` introspect ``layers``.
+            self.layers = nn.ModuleList()
+            return
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.layers = nn.ModuleList(
             [
                 Cosmos3UndDecoderLayer(
@@ -1047,6 +1061,12 @@ class Cosmos3LanguageModel(nn.Module):
         real query positions only attend to real keys, and the caller trims pad
         K/V via ``max_real_len`` before the GEN cross-attention sees them.
         """
+        if self.rope_only:
+            raise RuntimeError(
+                "This Cosmos3 stage does not own the UND tower, so it holds only the "
+                "mRoPE embedding and cannot encode text. Text conditioning must come "
+                "from the stage that owns the tower."
+            )
         hidden = self.embed_tokens(text_ids)
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -1171,6 +1191,28 @@ class Cosmos3VFMTransformer(nn.Module):
     def _language_model_kwargs(self) -> dict[str, Any]:
         return {}
 
+    #: The two MoT towers, in the order the offload components name them.
+    TOWERS: tuple[str, ...] = ("reasoner", "generator")
+
+    @classmethod
+    def _resolve_owned_towers(cls, owned_towers: Sequence[str] | None) -> tuple[str, ...]:
+        """Normalize and validate the requested tower ownership.
+
+        ``None`` means the co-located default: this instance owns both towers. A
+        tower-split topology passes exactly the one its stage runs, and an unknown
+        or empty selection is a configuration bug worth failing on rather than
+        silently building a transformer with no blocks at all.
+        """
+        if owned_towers is None:
+            return cls.TOWERS
+        resolved = tuple(dict.fromkeys(owned_towers))
+        unknown = [tower for tower in resolved if tower not in cls.TOWERS]
+        if unknown or not resolved:
+            raise ValueError(
+                f"Cosmos3 owned_towers={tuple(owned_towers)!r} is not a non-empty subset of {cls.TOWERS!r}."
+            )
+        return resolved
+
     def validate_loaded_weights(self, loaded: set[str]) -> None:
         del loaded
 
@@ -1182,10 +1224,19 @@ class Cosmos3VFMTransformer(nn.Module):
         sound_gen: bool = False,
         sound_dim: int | None = None,
         sound_latent_fps: float | None = None,
+        owned_towers: Sequence[str] | None = None,
     ) -> None:
         super().__init__()
         model_config = od_config.tf_model_config
         self._validate_supported_config(model_config)
+        # Which MoT towers this instance owns. Both, unless a tower-split topology
+        # asks for one: the towers are near-symmetric in size, so a stage that runs
+        # only one must never allocate the other. Constructing and then dropping is
+        # too late -- the loader builds under the device context, so the peak is
+        # already paid by the time anything could be pruned.
+        self.owned_towers = self._resolve_owned_towers(owned_towers)
+        self.owns_reasoner = "reasoner" in self.owned_towers
+        self.owns_generator = "generator" in self.owned_towers
 
         self.hidden_size = int(_tf_config_get(model_config, "hidden_size", 4096))
         self.num_hidden_layers = int(_tf_config_get(model_config, "num_hidden_layers", 36))
@@ -1242,6 +1293,9 @@ class Cosmos3VFMTransformer(nn.Module):
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
 
+        # ``rope_only`` on a generator-only stage: the mRoPE embedding drives the GEN
+        # frequencies on every stage, but the UND embedding table, blocks and norm
+        # are the reasoner's to allocate.
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
@@ -1255,6 +1309,7 @@ class Cosmos3VFMTransformer(nn.Module):
             mrope_section=self.mrope_section,
             quant_config=quant_config,
             prefix="language_model",
+            rope_only=not self.owns_reasoner,
             **self._language_model_kwargs(),
         )
 
@@ -1296,7 +1351,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     qk_norm=self.qk_norm_for_diffusion,
                     prefix=f"gen_layers.{i}",
                 )
-                for i in range(self.num_hidden_layers)
+                for i in range(self.num_hidden_layers if self.owns_generator else 0)
             ]
         )
 
@@ -1321,11 +1376,21 @@ class Cosmos3VFMTransformer(nn.Module):
         return next(self.parameters()).device
 
     def _model_cpu_offload_components(self) -> dict[str, list[nn.Module]]:
-        """Cosmos3's mutually-exclusive reasoner/generator component sets."""
-        return {
-            "reasoner": [self.language_model.layers],
-            "generator": [self.gen_layers],
-        }
+        """Cosmos3's mutually-exclusive reasoner/generator component sets.
+
+        Only the towers this stage owns appear. On a tower-split stage the other
+        tower's ``ModuleList`` is empty, so offloading it would be a no-op -- but
+        *activating* a component evicts every other one first, so advertising an
+        empty "reasoner" on a generator stage would make the replay call round-trip
+        the resident 58 GiB GEN tower to host memory and straight back. See
+        ``_offload_context``.
+        """
+        components: dict[str, list[nn.Module]] = {}
+        if self.owns_reasoner:
+            components["reasoner"] = [self.language_model.layers]
+        if self.owns_generator:
+            components["generator"] = [self.gen_layers]
+        return components
 
     def _model_cpu_offload_component_tensor_ids(self) -> set[int]:
         component_tensors: set[int] = set()
@@ -1424,6 +1489,18 @@ class Cosmos3VFMTransformer(nn.Module):
 
     def _offload_context(self, name: str) -> AbstractContextManager[None]:
         if not getattr(self, "_model_cpu_offload_enabled", False):
+            return nullcontext()
+        if name in self.TOWERS and name not in self.owned_towers:
+            # A tower this stage does not own has no blocks to stage in, and
+            # activating it would evict the tower this stage *does* own -- 58 GiB
+            # out to host memory and immediately back, once per forward, for a
+            # call that does no work. The stock forward wraps both towers
+            # unconditionally, so this is where a tower-split stage opts out.
+            #
+            # Deliberately narrower than "not an advertised component": any *other*
+            # name is a typo or a stale call site, and must still reach
+            # ``_activate_model_cpu_offload_component`` to be rejected by name
+            # rather than silently skip staging the blocks it meant to name.
             return nullcontext()
         return self._model_cpu_offload_context(name)
 

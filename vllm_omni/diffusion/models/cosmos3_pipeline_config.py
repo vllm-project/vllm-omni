@@ -44,6 +44,13 @@ so the reasoner logs the size and warns past
 ``COSMOS3_UND_PAYLOAD_WARN_MIB``. That cost is paid once per request, against a
 GEN tower that then runs ``num_inference_steps`` times.
 
+Those figures are TP-independent. UND K/V is born sharded across the reasoner's
+tensor-parallel ranks, but the reasoner all-gathers the KV-head dimension before
+the payload leaves the tower and each generator rank slices back out the head
+range its own cross-attention owns, so what crosses the edge is always the full
+8-head set -- the same bytes a co-located TP-1 tower would produce. The two
+stages are therefore free to run different ``tensor_parallel_size`` values.
+
 WHAT DISAGGREGATION BUYS
 ------------------------
 The towers are near-symmetric in size -- 31.2 B parameters each (58.1 GiB in
@@ -70,6 +77,15 @@ from vllm_omni.config.stage_config import (
 #: pipelines and the stage input processor so the two cannot drift apart.
 COSMOS3_UND_KV_KEY = "cosmos3_und_kv"
 COSMOS3_UND_META_KEY = "cosmos3_und_meta"
+
+#: Identifier of the conditioning contract those two keys carry, owned by the code
+#: that produces it (``Cosmos3TextConditioning`` in
+#: ``cosmos3/pipeline_cosmos3_disagg.py``). It is model-specific on purpose: what
+#: crosses this edge is Cosmos3 UND per-layer text K/V with a Cosmos3-specific
+#: layout, not a generic conditioning artifact. The generator refuses a payload
+#: that does not declare exactly this string, so a future layout change is a named
+#: mismatch on the first request rather than a wrong image.
+COSMOS3_UND_SCHEMA = "cosmos3.text_conditioning/v1"
 
 #: Warn once per request when the reasoner -> generator K/V payload exceeds this
 #: size. Not a hard limit: an oversized payload is still correct, just expensive

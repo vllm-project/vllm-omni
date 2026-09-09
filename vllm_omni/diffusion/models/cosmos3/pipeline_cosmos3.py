@@ -887,6 +887,12 @@ class Cosmos3OmniDiffusersPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    #: Which MoT towers this pipeline's transformer allocates. ``None`` is the
+    #: co-located default (both). A tower-split stage names the single tower it
+    #: owns, so the other one is never constructed -- allocating both and pruning
+    #: afterwards would still pay the full peak, because the loader builds the
+    #: pipeline under the device context (see ``pipeline_cosmos3_disagg``).
+    cosmos3_owned_towers: ClassVar[tuple[str, ...] | None] = None
     _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -987,6 +993,7 @@ class Cosmos3OmniDiffusersPipeline(
             sound_gen=sound_gen,
             sound_dim=sound_dim,
             sound_latent_fps=sound_latent_fps,
+            owned_towers=self.cosmos3_owned_towers,
         )
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
 

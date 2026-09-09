@@ -27,8 +27,7 @@ recommended parallelism differ. Mode is selected per request (T2I →
 - Recommended single-card T2I layout (opt-in via `--deploy-config`):
   [`vllm_omni/deploy/cosmos3_super_t2i.yaml`](../../vllm_omni/deploy/cosmos3_super_t2i.yaml)
 - Experimental one-stage-per-tower T2I split, for when both towers do not fit on
-  one card:
-  [Cosmos3 Tower Disaggregation](../../docs/features/cosmos3_tower_disaggregation.md)
+  one card: [`Cosmos3-TowerDisagg.md`](./Cosmos3-TowerDisagg.md)
 
 ## Hardware Support
 

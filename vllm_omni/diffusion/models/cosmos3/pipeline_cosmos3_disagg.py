@@ -34,37 +34,66 @@ the GEN mRoPE frequencies are derived from the true latent geometry that stage
 actually allocated, rather than being shipped from a stage that would have to
 predict it. Only K/V crosses the wire.
 
+THE CONDITIONING CONTRACT
+-------------------------
+``Cosmos3TextConditioning`` is what crosses the edge, and it is deliberately
+model-specific: Cosmos3 UND per-layer text K/V in a Cosmos3 layout, tagged with
+the code-owned ``cosmos3.text_conditioning/v1`` schema identifier. It makes the
+four things that can silently go wrong explicit --
+
+* **branch identity** -- keyed by a fingerprint of ``text_ids``, so the
+  conditional and unconditional CFG branches cannot be confused for one another
+  even if the denoise loop reorders them;
+* **tensor layout** -- ``num_layers`` / ``num_kv_heads`` / ``head_dim``, checked
+  against the tensors themselves *and* against the consuming stage's config;
+* **sharding** -- the payload always carries the *full, unsharded* KV-head set
+  (see below), so it does not depend on either stage's TP size;
+* **lifetime** -- one payload belongs to exactly one request; the generator
+  installs it for the duration of ``forward`` and clears it afterwards.
+
+TP SHARDING IS RESOLVED ON THE EDGE, NOT ASSUMED AWAY
+-----------------------------------------------------
+The UND tower's K/V is TP-sharded at birth: ``Cosmos3CausalAttention`` builds K
+and V through ``ColumnParallelLinear(..., gather_output=False)``, so rank *r*
+holds KV heads ``[r * H_local, (r + 1) * H_local)`` and no rank holds the rest.
+Only rank 0's output leaves a stage (``MultiprocExecutor.execute_request`` passes
+``unique_reply_rank=0``), so shipping TP-local shards would hand *every*
+generator rank rank 0's heads -- and with matching TP sizes the shapes agree, so
+generator rank 1 would silently condition on the wrong heads.
+
+The reasoner therefore all-gathers the KV-head dimension before the payload
+leaves the tower (``_gather_kv_heads``), and each generator rank slices the range
+its own cross-attention expects (``_ReplayLanguageModel.install``). The wire
+format is TP-independent: the two stages may run different
+``tensor_parallel_size`` values, and the gathered payload is the same size the
+co-located tower would produce.
+
 CFG BRANCHES
 ------------
 Guidance runs the UND tower twice -- once for the conditional prompt and once
 for the unconditional/negative one -- with different token streams and hence
-different K/V. The stub keys its replay table by a fingerprint of ``text_ids``,
-so each branch gets its own entry and the lookup cannot cross-wire them. Both
-stages tokenize with the same inherited code path and the same geometry, so the
-fingerprints agree by construction.
+different K/V. Both stages tokenize with the same inherited code path and the
+same geometry, so the fingerprints agree by construction.
 
-WHY THE TOWER IS DROPPED IN ``__init__`` AND NOT IN ``load_weights``
--------------------------------------------------------------------
-``DiffusersPipelineLoader.load_weights`` snapshots the set of parameters it
-expects to fill *before* delegating to the model::
-
-    weights_to_load = self._get_expected_parameter_names(model)   # snapshot
-    loaded_weights = model.load_weights(self.get_all_weights(model))
-    ...
-    _check_unloaded_weights(weights_to_load - loaded_weights, ...)
-
-With ``quant_config is None`` that last check raises for any expected parameter
-that no checkpoint tensor filled. Dropping a tower from inside ``load_weights``
-is therefore too late -- the snapshot already contains the dropped tower's
-parameters and every one of them shows up as unloaded. Dropping in ``__init__``
-means those parameters never exist, so they are never snapshotted and never
-allocated. That is where the win is: ~58 GiB of device memory per stage.
+WHY EACH STAGE BUILDS ONLY ITS OWN TOWER
+----------------------------------------
+``DiffusionModelRunner.load_model`` selects the device and
+``DiffusersPipelineLoader._init_from_load_format`` constructs the pipeline inside
+that device context, so a tower allocated in ``__init__`` is allocated *on the
+card*. Building both towers and pruning one afterwards would therefore still pay
+the full ~120 GiB peak and fail to start on an 80 GB card -- exactly the
+two-smaller-cards case the split exists for. Instead each stage declares the
+tower it owns (``cosmos3_owned_towers``), ``Cosmos3VFMTransformer`` constructs
+only that one, and the unowned tower's checkpoint tensors match no live parameter
+and are filtered out by the inherited ``load_weights``. ``_require_unowned_absent``
+then verifies the ownership request was honoured, so a transformer that ignores it
+fails loudly instead of quietly doubling startup memory.
 
 WHAT THE SPLIT DOES *NOT* SAVE: CHECKPOINT READS
 -----------------------------------------------
 Both stages still stream the whole checkpoint. ``Cosmos3.load_weights`` filters
 by name *after* ``safetensors_weights_iterator`` has already materialized each
-tensor, so the dropped tower's tensors are read from disk and discarded rather
+tensor, so the unowned tower's tensors are read from disk and discarded rather
 than skipped (the "kept N/M tensors" line it logs is the filter, not the read).
 Splitting the towers therefore roughly doubles aggregate startup read I/O across
 the two stages instead of halving it. Fixing that means teaching the loader to
@@ -75,10 +104,15 @@ in scope here.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.logger import init_logger
 
@@ -90,6 +124,7 @@ from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
 )
 from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
     COSMOS3_UND_PAYLOAD_WARN_MIB,
+    COSMOS3_UND_SCHEMA,
 )
 
 from .pipeline_cosmos3 import (
@@ -115,9 +150,13 @@ from .pipeline_cosmos3 import (  # noqa: F401  (re-export)
 
 logger = init_logger(__name__)
 
+#: One branch of conditioning: per-layer ``(K, V)``. Stage serializers turn the
+#: pairs into 2-lists on the way across the edge, so nothing may require tuples.
+KVBranch = list[tuple[torch.Tensor, torch.Tensor]]
+
 
 def fingerprint_text_ids(text_ids: torch.Tensor) -> str:
-    """Stable content hash of a token-id tensor, used as the replay-table key.
+    """Stable content hash of a token-id tensor, used as the branch key.
 
     Hashing the ids (rather than trusting call order) keeps the conditional and
     unconditional CFG branches from being confused for one another even if the
@@ -130,26 +169,247 @@ def fingerprint_text_ids(text_ids: torch.Tensor) -> str:
 def _tp_world_size() -> int:
     """This process's TP world size, or 1 when no model-parallel group exists.
 
-    Reported in the handoff metadata so a stage-configuration mismatch can name
-    both stages' TP sizes. Purely diagnostic -- the K/V layout that actually gets
-    validated is read off the tensors and off the consuming attention module, not
-    recomputed from this. A process with no TP group is at TP 1 by definition,
-    which is also what makes this callable from a single-process test.
+    A process with no TP group is at TP 1 by definition, which is also what makes
+    this callable from a single-process test.
     """
     return get_tensor_model_parallel_world_size() if model_parallel_is_initialized() else 1
 
 
-def _drop_blocks(module_list: torch.nn.ModuleList, label: str) -> None:
-    """Empty a tower's block container in place, before weights are loaded.
+def _tp_rank() -> int:
+    """This process's rank inside its TP group, or 0 when there is no group.
 
-    The container object is kept (rather than replaced with ``None``) because the
-    offload rings, cache-dit adapter and ``_model_cpu_offload_components`` all
-    introspect it. ``get_blocks_from_dit`` raises only when a declared attribute
-    is *missing*; an empty container merely logs a "no blocks found, skipping"
-    warning, which is the correct outcome here.
+    This is the rank whose KV-head range the generator stage must slice out of the
+    gathered payload: ``ColumnParallelLinear`` hands rank *r* the contiguous output
+    range ``[r * H_local, (r + 1) * H_local)``.
     """
-    logger.info("Cosmos3 disagg: dropped %d %s block(s); their weights will not be loaded", len(module_list), label)
-    del module_list[:]
+    return get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
+
+
+def _gather_kv_heads(tensor: torch.Tensor) -> torch.Tensor:
+    """All-gather a ``[B, S, H_kv_local, D]`` tensor into the full head set.
+
+    UND K/V is born TP-sharded and only rank 0's stage output is kept, so the
+    payload has to carry every head or the generator's other ranks receive
+    conditioning that is not theirs. ``all_gather`` concatenates in rank order,
+    which is exactly the order ``ColumnParallelLinear`` sharded the heads in, so
+    the result is the head layout a TP-1 tower would have produced.
+
+    Called on activations (the tower's params are unsharded around the call), so
+    there is no DTensor to redistribute here. At TP 1 this is a no-op and no
+    collective is entered.
+    """
+    if _tp_world_size() == 1:
+        return tensor
+    return tensor_model_parallel_all_gather(tensor.contiguous(), dim=-2)
+
+
+def _require_unowned_absent(module_list: torch.nn.ModuleList, label: str) -> None:
+    """Verify the tower this stage does not own was never constructed.
+
+    ``Cosmos3VFMTransformer`` skips it when ``owned_towers`` says so, and that is
+    the whole memory saving -- so a non-empty container here means the ownership
+    request did not reach the transformer and this stage is about to hold two
+    towers' worth of weights. Fail on it rather than pruning after the fact: by
+    this point the allocation has already happened on the device.
+    """
+    if len(module_list):
+        raise RuntimeError(
+            f"Cosmos3 tower-split stage built {len(module_list)} {label} block(s) it does not own. "
+            "The transformer ignored owned_towers, so this stage would allocate both towers; "
+            "check that the pipeline's cosmos3_owned_towers reaches Cosmos3VFMTransformer.__init__."
+        )
+
+
+@dataclass(frozen=True)
+class Cosmos3TextConditioning:
+    """The reasoner -> generator conditioning contract.
+
+    Model-specific by design (see the module docstring): this describes Cosmos3
+    UND per-layer text K/V, tagged with the code-owned
+    ``cosmos3.text_conditioning/v1`` schema identifier.
+
+    ``branches`` maps a token-id fingerprint to that branch's per-layer
+    ``(K, V)``, each shaped ``[B, S_und, num_kv_heads, head_dim]`` with the
+    **full, unsharded** head set -- the reasoner gathers its TP shards before
+    building this, so the contract does not depend on either stage's TP size.
+    ``reasoner_tp_size`` is retained for diagnostics only.
+
+    Constructing one validates it: every declared field is cross-checked against
+    the tensors, so a payload cannot describe a layout it does not carry. The
+    properties the wire format does *not* declare are checked for internal
+    consistency instead -- batch size and dtype across the whole payload, UND
+    token count within each branch -- so a partially corrupted payload is rejected
+    here rather than deep inside cross-attention.
+    """
+
+    branches: dict[str, KVBranch]
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    height: int
+    width: int
+    max_sequence_length: int
+    use_system_prompt: bool
+    reasoner_tp_size: int
+    payload_mib: float
+    schema: str = COSMOS3_UND_SCHEMA
+
+    #: Metadata fields the wire format must carry. ``schema`` is checked first and
+    #: separately, so a mismatch is reported as a schema error rather than as a
+    #: missing field.
+    _WIRE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "num_layers",
+        "num_kv_heads",
+        "head_dim",
+        "height",
+        "width",
+        "max_sequence_length",
+        "use_system_prompt",
+        "reasoner_tp_size",
+        "payload_mib",
+    )
+
+    def __post_init__(self) -> None:
+        if self.schema != COSMOS3_UND_SCHEMA:
+            raise ValueError(
+                f"Cosmos3 text conditioning declares schema {self.schema!r}, but this "
+                f"stage implements {COSMOS3_UND_SCHEMA!r}. The two stages must run the "
+                "same vLLM-Omni version."
+            )
+        if not self.branches:
+            raise ValueError("Cosmos3 text conditioning carries no prompt branches.")
+        # A zero here would pass every check below vacuously -- ``num_layers=0``
+        # matches an empty branch list -- and then fail as a bare ``max()`` error
+        # from ``conditioning_length``, or replay nothing at all.
+        for field in ("num_layers", "num_kv_heads", "head_dim"):
+            if getattr(self, field) <= 0:
+                raise ValueError(
+                    f"Cosmos3 text conditioning declares {field}={getattr(self, field)}; the layout "
+                    "fields describe real tensors, so all three must be positive."
+                )
+        # Every branch replays into the same GEN forward, so one batch size has to
+        # hold across all of them. Taken from the first tensor seen rather than
+        # declared, because the reasoner does not put it on the wire.
+        batch_size: int | None = None
+        # One UND forward per branch produces every layer, so one dtype holds
+        # across the whole payload. Branch *lengths* differ, though: each branch is
+        # trimmed to its own real prompt length, so S_und is compared per branch.
+        dtype: torch.dtype | None = None
+        for key, entry in self.branches.items():
+            if len(entry) != self.num_layers:
+                raise ValueError(
+                    f"Cosmos3 text conditioning branch {key} has {len(entry)} layer(s) but "
+                    f"declares num_layers={self.num_layers}."
+                )
+            seq_len: int | None = None
+            for layer_idx, (k, v) in enumerate(entry):
+                for label, tensor in (("K", k), ("V", v)):
+                    if not isinstance(tensor, torch.Tensor):
+                        # Checked before anything reads ``.ndim``, so a corrupted or
+                        # hand-built payload is a contract error naming the member
+                        # rather than an AttributeError from inside validation.
+                        raise ValueError(
+                            f"Cosmos3 text conditioning {label} for branch {key} layer {layer_idx} is "
+                            f"{type(tensor).__name__}, not a tensor. The wire format carries K/V as "
+                            "tensors; only the (K, V) pairing itself may decode as a list."
+                        )
+                    if tensor.ndim != 4:
+                        raise ValueError(
+                            f"Cosmos3 text conditioning {label} for branch {key} layer {layer_idx} "
+                            f"has {tensor.ndim} dim(s), expected 4 ([B, S_und, num_kv_heads, head_dim])."
+                        )
+                    if tuple(tensor.shape[-2:]) != (self.num_kv_heads, self.head_dim):
+                        raise ValueError(
+                            f"Cosmos3 text conditioning {label} for branch {key} layer {layer_idx} is "
+                            f"shaped {tuple(tensor.shape)}, but the contract declares "
+                            f"[B, S_und, {self.num_kv_heads}, {self.head_dim}]."
+                        )
+                    if batch_size is None:
+                        batch_size = int(tensor.shape[0])
+                    elif int(tensor.shape[0]) != batch_size:
+                        raise ValueError(
+                            f"Cosmos3 text conditioning {label} for branch {key} layer {layer_idx} has "
+                            f"batch size {int(tensor.shape[0])}, but the rest of the payload carries "
+                            f"{batch_size}. All branches replay into the same GEN forward, so the batch "
+                            "size has to be uniform."
+                        )
+                    if seq_len is None:
+                        seq_len = int(tensor.shape[1])
+                    elif int(tensor.shape[1]) != seq_len:
+                        raise ValueError(
+                            f"Cosmos3 text conditioning {label} for branch {key} layer {layer_idx} covers "
+                            f"{int(tensor.shape[1])} UND token(s), but the rest of the branch covers "
+                            f"{seq_len}. Every layer of a branch comes from one UND forward over one "
+                            "prompt, so the token count cannot vary within it."
+                        )
+                    if dtype is None:
+                        dtype = tensor.dtype
+                    elif tensor.dtype != dtype:
+                        raise ValueError(
+                            f"Cosmos3 text conditioning {label} for branch {key} layer {layer_idx} is "
+                            f"{tensor.dtype}, but the rest of the payload is {dtype}. The reasoner emits "
+                            "one dtype for the whole payload; a mixed one means the tensors did not "
+                            "survive the stage edge intact."
+                        )
+                # No separate ``k.shape != v.shape`` check: the loop above pins every
+                # dim of *both* members -- ndim, the trailing (num_kv_heads, head_dim),
+                # the payload-wide batch size and the branch-wide token count -- so a
+                # K/V pair that disagreed on any dim has already been rejected, in
+                # terms of the dim that disagrees.
+
+    @property
+    def num_branches(self) -> int:
+        return len(self.branches)
+
+    @property
+    def conditioning_length(self) -> int:
+        """Longest trimmed UND sequence length across branches, for logging."""
+        return max(int(k.shape[1]) for entry in self.branches.values() for k, _v in entry)
+
+    def to_payload(self) -> dict[str, Any]:
+        """Flatten to the two-key dict shape that crosses the stage edge.
+
+        Kept a plain dict of tensors on purpose: the connector serde handles
+        nested dicts/lists/tensors, and the typed object is the producer- and
+        consumer-side contract rather than the wire encoding.
+        """
+        meta: dict[str, Any] = {field: getattr(self, field) for field in self._WIRE_FIELDS}
+        meta["schema"] = self.schema
+        meta["num_branches"] = self.num_branches
+        # A shallow copy of the branch mapping, not the mapping itself:
+        # ``frozen=True`` does not freeze what the fields point at, so handing out
+        # the live dict would let a caller add a branch after validation ran. The
+        # tensors are shared, so this costs nothing that matters.
+        return {KV_KEY: dict(self.branches), META_KEY: meta}
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> Cosmos3TextConditioning:
+        """Rebuild and validate the contract from what came off the wire."""
+        branches = payload.get(KV_KEY)
+        if not isinstance(branches, dict) or not branches:
+            raise ValueError(
+                f"Cosmos3 text conditioning payload has no {KV_KEY!r} branches "
+                f"(keys={sorted(payload) if isinstance(payload, dict) else '<n/a>'})."
+            )
+        meta = payload.get(META_KEY)
+        if not isinstance(meta, dict):
+            raise ValueError(
+                f"Cosmos3 text conditioning payload carries no {META_KEY!r} metadata, so its layout "
+                "and schema are undeclared. Both stages must run the same vLLM-Omni version."
+            )
+        schema = meta.get("schema")
+        if schema != COSMOS3_UND_SCHEMA:
+            raise ValueError(
+                f"Cosmos3 text conditioning declares schema {schema!r}, but this stage implements "
+                f"{COSMOS3_UND_SCHEMA!r}. The two stages must run the same vLLM-Omni version."
+            )
+        missing = [field for field in cls._WIRE_FIELDS if field not in meta]
+        if missing:
+            raise ValueError(
+                f"Cosmos3 text conditioning metadata is missing {', '.join(missing)}; "
+                f"schema {COSMOS3_UND_SCHEMA!r} requires every layout field to be declared."
+            )
+        return cls(branches=branches, **{field: meta[field] for field in cls._WIRE_FIELDS})
 
 
 class _ReplayLanguageModel(torch.nn.Module):
@@ -171,9 +431,12 @@ class _ReplayLanguageModel(torch.nn.Module):
       parameters -- only a non-persistent ``inv_freq`` buffer -- so keeping it
       costs nothing and, being non-persistent, it never appears in
       ``state_dict()`` and so is never expected by the weight loader.
-    * ``_model_cpu_offload_components`` returns ``{"reasoner":
-      [self.language_model.layers], ...}``, so ``layers`` must exist. It is an
-      empty ``ModuleList`` here: there is nothing to swap in or out.
+    * The offload rings introspect ``layers`` -- both the layerwise ring, via
+      ``_layerwise_offload_blocks_attrs`` below, and ``ModuleDiscovery`` -- so it
+      must exist. It is an empty ``ModuleList`` here: there is nothing to swap in
+      or out, which is also why ``_model_cpu_offload_components`` on a
+      generator-only transformer advertises no ``"reasoner"`` component at all
+      (see ``Cosmos3VFMTransformer._offload_context``).
 
     The stub also has to be a real ``nn.Module`` because
     ``transformer.language_model`` is named in ``_dit_modules`` and
@@ -187,67 +450,114 @@ class _ReplayLanguageModel(torch.nn.Module):
         num_hidden_layers: int,
         rotary_emb: torch.nn.Module,
         *,
+        num_kv_heads: int,
         num_kv_heads_local: int,
+        kv_head_offset: int,
         head_dim: int,
     ) -> None:
         super().__init__()
         self.num_hidden_layers = num_hidden_layers
         self.rotary_emb = rotary_emb
         self.layers = torch.nn.ModuleList()
-        # The per-layer K/V shape this stage's own cross-attention will consume,
-        # derived from this stage's config and TP world size -- see ``install``.
+        # The full head set the payload carries, and the slice of it this rank's
+        # cross-attention consumes -- see ``install``.
+        self.num_kv_heads = num_kv_heads
         self.num_kv_heads_local = num_kv_heads_local
+        self.kv_head_offset = kv_head_offset
         self.head_dim = head_dim
-        self._table: dict[str, Any] = {}
+        self._check_head_range()
+        self._table: dict[str, KVBranch] = {}
         self._dtype: torch.dtype | None = None
+        self._reasoner_settings: str | None = None
 
-    def install(self, table: dict[str, Any], dtype: torch.dtype | None = None) -> None:
-        """Validate a reasoner payload against this stage's layout, then hold it.
+    def _check_head_range(self) -> None:
+        """Reject a head range that cannot be a slice of the gathered head set.
 
-        WHY THE SHAPES ARE CHECKED HERE AND NOT IN ``forward``
-        -----------------------------------------------------
-        UND K/V is TP-sharded: ``Cosmos3SelfAttention`` produces
-        ``[B, S_und, num_kv_heads // tp_size, head_dim]`` and
-        ``Cosmos3CrossAttention`` consumes exactly that. The reasoner stage runs
-        with its *own* ``tensor_parallel_size``, and nothing in the stage
-        plumbing requires the two stages to agree on it -- so a payload built at
-        TP 1 and replayed on a TP 2 generator carries twice the KV heads this
-        stage expects. Left unchecked that surfaces either as a shape error deep
-        inside attention or, worse, as silently wrong conditioning.
-
-        Validating at install time costs ``2 * num_hidden_layers`` shape reads
-        once per request, rather than once per denoising step, and reports the
-        mismatch in terms of the two stages' configurations.
+        ``install`` slices ``[offset, offset + local)`` out of the payload's full
+        head set. Python slicing clamps instead of raising, so an out-of-range
+        range would silently replay *fewer* heads than the consumer expects, or
+        none at all -- ``num_kv_heads_local == 0`` (a generator TP size larger than
+        the KV-head count) yields an empty tensor that only fails much later, deep
+        in cross-attention. Fail at bind time, in terms of the two stages' TP
+        sizes, rather than per request in terms of a shape.
         """
-        for key, entry in table.items():
-            if len(entry) != self.num_hidden_layers:
-                raise RuntimeError(
-                    f"Cosmos3 reasoner K/V for branch {key} has {len(entry)} layer(s), "
-                    f"generator expects {self.num_hidden_layers}. The two stages must load "
-                    "the same checkpoint and the same transformer config."
-                )
-            for layer_idx, (k, v) in enumerate(entry):
-                for label, tensor in (("K", k), ("V", v)):
-                    if tensor.ndim != 4:
-                        raise RuntimeError(
-                            f"Cosmos3 reasoner {label} for branch {key} layer {layer_idx} has "
-                            f"{tensor.ndim} dim(s), expected 4 ([B, S_und, num_kv_heads_local, head_dim])."
-                        )
-                    if tensor.shape[-2:] != (self.num_kv_heads_local, self.head_dim):
-                        raise RuntimeError(
-                            f"Cosmos3 reasoner {label} for branch {key} layer {layer_idx} is shaped "
-                            f"{tuple(tensor.shape)}, but this generator stage consumes "
-                            f"[B, S_und, {self.num_kv_heads_local}, {self.head_dim}]. UND K/V is "
-                            "TP-sharded, so the reasoner and generator stages must run with the "
-                            "same tensor_parallel_size and the same transformer config."
-                        )
-                if k.shape != v.shape:
-                    raise RuntimeError(
-                        f"Cosmos3 reasoner K/V for branch {key} layer {layer_idx} disagree on shape: "
-                        f"K={tuple(k.shape)}, V={tuple(v.shape)}."
-                    )
-        self._table = table
+        stop = self.kv_head_offset + self.num_kv_heads_local
+        if self.num_kv_heads_local > 0 and self.kv_head_offset >= 0 and stop <= self.num_kv_heads:
+            return
+        raise ValueError(
+            f"Cosmos3 generator stage would replay KV heads [{self.kv_head_offset}, {stop}) of the "
+            f"{self.num_kv_heads} the reasoner ships, which is not a valid shard: this stage runs at "
+            f"tensor_parallel_size={_tp_world_size()} (rank {_tp_rank()}) with "
+            f"{self.num_kv_heads_local} local KV head(s). The K/V handoff is TP-independent, but the "
+            f"stage's own tensor_parallel_size must still divide its {self.num_kv_heads} KV heads."
+        )
+
+    def install(self, conditioning: Cosmos3TextConditioning, dtype: torch.dtype | None = None) -> None:
+        """Take this rank's KV-head shard of a validated payload, then hold it.
+
+        WHY THE SHARD IS TAKEN HERE
+        ---------------------------
+        The payload carries every KV head (the reasoner gathers its TP shards),
+        while ``Cosmos3CrossAttention`` on this rank consumes exactly
+        ``[B, S_und, num_kv_heads // tp_size, head_dim]`` -- the contiguous head
+        range ``ColumnParallelLinear`` assigned to *this* TP rank. Slicing it out
+        once per request, on the host tensors before they reach the device, is
+        both cheaper than doing it per denoising step and smaller to copy.
+
+        The layout is checked first so a stage-configuration mistake is reported
+        in terms of the two stages' settings rather than as a shape error from
+        inside attention.
+        """
+        self._check_layout(conditioning)
+        start, stop = self.kv_head_offset, self.kv_head_offset + self.num_kv_heads_local
+        # ``entry`` is a sequence of 2-sequences; deliberately not required to be a
+        # list of *tuples*, because stage serializers turn tuples into lists on the
+        # way across the stage edge.
+        self._table = {
+            key: [(k[..., start:stop, :].contiguous(), v[..., start:stop, :].contiguous()) for k, v in entry]
+            for key, entry in conditioning.branches.items()
+        }
         self._dtype = dtype
+        # Kept for the replay-miss message only. The settings that feed the
+        # fingerprint are not *validated* against this stage (the fingerprint is
+        # the check), but reporting what the reasoner resolved turns an opaque hash
+        # mismatch into the two values an operator has to compare.
+        self._reasoner_settings = (
+            f"height={conditioning.height}, width={conditioning.width}, "
+            f"max_sequence_length={conditioning.max_sequence_length}, "
+            f"use_system_prompt={conditioning.use_system_prompt}"
+        )
+
+    def _check_layout(self, conditioning: Cosmos3TextConditioning) -> None:
+        """Compare the reasoner's declared layout with what this stage consumes.
+
+        The contract already validated itself against its own tensors, so this is
+        the *cross-stage* check: same checkpoint, same transformer config. TP size
+        is deliberately not part of it -- the payload is unsharded, so the two
+        stages are free to differ -- but both sizes are reported, because they are
+        the context an operator needs when the head counts do not line up.
+        """
+        expected = {
+            "num_layers": self.num_hidden_layers,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+        }
+        mismatched = {
+            field: (getattr(conditioning, field), want)
+            for field, want in expected.items()
+            if getattr(conditioning, field) != want
+        }
+        if not mismatched:
+            return
+        detail = ", ".join(
+            f"{field}={got} from reasoner, {want} here" for field, (got, want) in sorted(mismatched.items())
+        )
+        raise RuntimeError(
+            f"Cosmos3 reasoner and generator stages disagree on the UND K/V layout: {detail}. "
+            f"Reasoner ran at tensor_parallel_size={conditioning.reasoner_tp_size}, this stage at "
+            f"{_tp_world_size()}. The K/V handoff is TP-independent, so this is a checkpoint or "
+            "transformer-config mismatch: both stages must load the same model."
+        )
 
     def clear(self) -> None:
         """Drop the installed payload.
@@ -255,11 +565,12 @@ class _ReplayLanguageModel(torch.nn.Module):
         The stub is long-lived pipeline state while a payload belongs to exactly
         one request, so the generator clears it once the request is done. That
         keeps a stale branch from ever being replayable for a later request and
-        releases the pinned host tensors instead of holding the last request's
-        K/V until the next one arrives.
+        releases the host tensors instead of holding the last request's K/V until
+        the next one arrives.
         """
         self._table = {}
         self._dtype = None
+        self._reasoner_settings = None
 
     def forward(
         self,
@@ -275,13 +586,11 @@ class _ReplayLanguageModel(torch.nn.Module):
                 f"branch (fingerprint={key}, known={sorted(self._table)}). The "
                 "reasoner and generator stages must tokenize identically: check "
                 "that max_sequence_length/use_system_prompt, the geometry and the "
-                "negative prompt reach both stages unchanged in sampling_params."
+                "negative prompt reach both stages unchanged in sampling_params. "
+                f"The reasoner resolved {self._reasoner_settings}."
             )
         device = text_ids.device
         dtype = self._dtype
-        # ``entry`` is a sequence of 2-sequences; it is deliberately not required
-        # to be a list of *tuples*, because stage serializers turn tuples into
-        # lists on the way across the stage edge.
         return [
             (
                 k.to(device=device, dtype=dtype, non_blocking=True),
@@ -298,22 +607,22 @@ class _Cosmos3TowerPipeline(Cosmos3OmniDiffusersPipeline):
     checkpoint files. The checkpoint interleaves the towers inside every
     ``layers.{i}`` entry (``mlp`` vs ``mlp_moe_gen``, ``self_attn.to_q`` vs
     ``self_attn.add_q_proj``) and the inherited remap already routes those to
-    ``language_model.layers.*`` vs ``gen_layers.*``. Keys belonging to the
-    dropped tower therefore match no live parameter and are filtered out by the
-    inherited ``load_weights`` -- which is what lets each stage load half a model
-    without a separately prepared checkpoint. The filter runs after the tensor
-    has been read, so this saves device memory, not startup I/O; see the module
-    docstring.
+    ``language_model.layers.*`` vs ``gen_layers.*``. Keys belonging to the tower
+    this stage does not own therefore match no live parameter and are filtered out
+    by the inherited ``load_weights`` -- which is what lets each stage load half a
+    model without a separately prepared checkpoint. The filter runs after the
+    tensor has been read, so this saves device memory, not startup I/O; see the
+    module docstring.
     """
 
     def __init__(self, *, od_config: Any, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Must happen here, not in load_weights -- see the module docstring.
-        # ``weights_sources`` is assigned by the base __init__, so the loader
-        # still finds the checkpoint after this returns.
-        self._drop_unused_tower()
+        # ``super().__init__`` built only the owned tower, because
+        # ``cosmos3_owned_towers`` reached the transformer. Verify that, then bind
+        # whatever stands in for the tower this stage does not run.
+        self._bind_owned_tower()
 
-    def _drop_unused_tower(self) -> None:
+    def _bind_owned_tower(self) -> None:
         raise NotImplementedError
 
 
@@ -325,6 +634,9 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
     stage never allocates latents, never denoises and never touches the VAE.
     """
 
+    #: Only the UND tower is constructed here: no GEN blocks are allocated at all.
+    cosmos3_owned_towers: ClassVar[tuple[str, ...]] = ("reasoner",)
+
     # Skip the engine's synthetic warmup run. Same mechanism as the generator
     # (see that class), different trigger: ``_dummy_run`` builds
     # ``{"prompt": "dummy run"}`` with no ``modalities`` key, and stock Cosmos3
@@ -334,8 +646,8 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
     # no latents, no denoise loop, no VAE.
     dummy_run_num_frames: ClassVar[int] = 0
 
-    def _drop_unused_tower(self) -> None:
-        _drop_blocks(self.transformer.gen_layers, "GEN (generator)")
+    def _bind_owned_tower(self) -> None:
+        _require_unowned_absent(self.transformer.gen_layers, "GEN (generator)")
 
     def forward(self, req: Any) -> Any:  # type: ignore[override]
         """Engine entry point: emit K/V instead of pixels.
@@ -362,11 +674,11 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
             # prompt to "" before tokenizing the unconditional branch.
             negative_prompt = prompt_data.get("negative_prompt") or ""
 
-        payload = self.encode_prompt_to_kv(prompt, negative_prompt, req.sampling_params)
-        return DiffusionOutput(output=payload)
+        conditioning = self.encode_text_conditioning(prompt, negative_prompt, req.sampling_params)
+        return DiffusionOutput(output=conditioning.to_payload())
 
-    def encode_prompt_to_kv(self, prompt: str, negative_prompt: str, sp: Any) -> dict[str, Any]:
-        """Run the UND tower and build the reasoner -> generator payload.
+    def encode_text_conditioning(self, prompt: str, negative_prompt: str, sp: Any) -> Cosmos3TextConditioning:
+        """Run the UND tower and build the reasoner -> generator contract.
 
         Every geometry/tokenization value is resolved exactly the way the stock
         T2I ``forward`` resolves it, because the generator stage re-derives the
@@ -420,9 +732,9 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
         # agree on this; if they ever did not, the generator's replay lookup
         # would raise rather than silently produce a wrong image.
         do_cfg = guidance_scale > 1.0
-        branches = [(cond_ids, cond_mask)]
+        branches_to_encode = [(cond_ids, cond_mask)]
         if do_cfg and uncond_ids is not None:
-            branches.append((uncond_ids, uncond_mask))
+            branches_to_encode.append((uncond_ids, uncond_mask))
 
         # UNSHARDING IS MANDATORY UNDER HSDP
         # ----------------------------------
@@ -441,8 +753,8 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
         if is_fsdp:
             transformer.unshard()
         try:
-            table: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
-            for text_ids, text_mask in branches:
+            branches: dict[str, KVBranch] = {}
+            for text_ids, text_mask in branches_to_encode:
                 text_ids = text_ids.to(self.device)
                 text_mask = text_mask.to(self.device)
                 max_real_len = int(text_mask.sum(dim=1).max().item())
@@ -451,13 +763,19 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
                 with transformer._offload_context("reasoner"):
                     cached_kv_full = transformer.language_model(text_ids, freqs_und)
 
-                # Trim padding exactly as the co-located forward does. Shipping
-                # already-trimmed K/V makes the generator's own trim a no-op and
-                # keeps the payload proportional to the real prompt length.
-                # ``.cpu()`` also materializes any DTensor-backed result into a
-                # plain tensor, which is what has to cross the stage boundary.
-                table[fingerprint_text_ids(text_ids)] = [
-                    (k[:, :max_real_len].contiguous().cpu(), v[:, :max_real_len].contiguous().cpu())
+                # Trim padding exactly as the co-located forward does, *then*
+                # gather the TP-local heads: every rank derives ``max_real_len``
+                # from the same mask, so the trimmed shapes agree and the
+                # collective moves only real tokens. Shipping already-trimmed K/V
+                # makes the generator's own trim a no-op and keeps the payload
+                # proportional to the real prompt length. ``.cpu()`` also
+                # materializes any DTensor-backed result into a plain tensor,
+                # which is what has to cross the stage boundary.
+                branches[fingerprint_text_ids(text_ids)] = [
+                    (
+                        _gather_kv_heads(k[:, :max_real_len]).contiguous().cpu(),
+                        _gather_kv_heads(v[:, :max_real_len]).contiguous().cpu(),
+                    )
                     for k, v in cached_kv_full
                 ]
         finally:
@@ -465,16 +783,33 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
                 transformer.reshard()
 
         payload_mib = (
-            sum(k.numel() * k.element_size() + v.numel() * v.element_size() for kv in table.values() for k, v in kv)
+            sum(
+                k.numel() * k.element_size() + v.numel() * v.element_size()
+                for entry in branches.values()
+                for k, v in entry
+            )
             / 2**20
         )
         # Every branch has the same layout -- same tower, same config -- so one
-        # tensor describes all of them.
-        sample_branch = next(iter(table.values()))
-        sample_k = sample_branch[0][0]
+        # tensor describes all of them. Read off the tensors that were actually
+        # produced rather than recomputed from the config, so the contract cannot
+        # describe a payload this stage did not emit.
+        sample_k = next(iter(branches.values()))[0][0]
+        conditioning = Cosmos3TextConditioning(
+            branches=branches,
+            num_layers=len(next(iter(branches.values()))),
+            num_kv_heads=int(sample_k.shape[-2]),
+            head_dim=int(sample_k.shape[-1]),
+            height=height,
+            width=width,
+            max_sequence_length=max_sequence_length,
+            use_system_prompt=use_system_prompt,
+            reasoner_tp_size=_tp_world_size(),
+            payload_mib=round(payload_mib, 1),
+        )
         logger.info(
             "Cosmos3 reasoner: %d branch(es) (cfg=%s), K/V payload=%.1f MiB, target=%dx%d",
-            len(table),
+            conditioning.num_branches,
             do_cfg,
             payload_mib,
             height,
@@ -491,39 +826,24 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
                 "Consider lowering max_sequence_length (currently %d).",
                 payload_mib,
                 COSMOS3_UND_PAYLOAD_WARN_MIB,
-                max(k.shape[1] for kv in table.values() for k, _v in kv),
+                conditioning.conditioning_length,
                 max_sequence_length,
             )
-        return {
-            KV_KEY: table,
-            META_KEY: {
-                "height": height,
-                "width": width,
-                "max_sequence_length": max_sequence_length,
-                "use_system_prompt": use_system_prompt,
-                "num_branches": len(table),
-                "payload_mib": round(payload_mib, 1),
-                # K/V layout, so the generator can report a stage-configuration
-                # mismatch in terms of the two stages' settings instead of a bare
-                # shape error from inside attention. Read off the tensors that were
-                # actually produced rather than recomputed from the config, so it
-                # cannot describe a payload this stage did not emit. UND K/V is
-                # TP-sharded, so ``tp_size`` belongs here too -- it is the one part
-                # of the layout no shape reveals.
-                "num_layers": len(sample_branch),
-                "num_kv_heads_local": int(sample_k.shape[-2]),
-                "head_dim": int(sample_k.shape[-1]),
-                "tp_size": _tp_world_size(),
-            },
-        }
+        return conditioning
 
 
 class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
     """Stage 1 -- the GEN / diffusion tower only.
 
-    Replaces the UND tower with a replay stub fed by the reasoner payload, then
-    runs the stock denoise loop and VAE decode unmodified.
+    The UND tower is never constructed here; ``language_model`` is a replay stub
+    fed by the reasoner payload, and the stock denoise loop and VAE decode run
+    unmodified.
     """
+
+    #: Only the GEN tower is constructed here. The transformer still builds the
+    #: mRoPE embedding that lives on ``language_model`` (the GEN frequencies need
+    #: it every step) but none of the UND embedding table, blocks or norm.
+    cosmos3_owned_towers: ClassVar[tuple[str, ...]] = ("generator",)
 
     #: Skip the engine's warmup run. ``DiffusionEngine._dummy_run`` returns
     #: before it even builds a request when this is <= 0, which is what we want:
@@ -532,14 +852,14 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
     #: first request warms the same GEN kernels.
     dummy_run_num_frames: ClassVar[int] = 0
 
-    def _drop_unused_tower(self) -> None:
+    def _bind_owned_tower(self) -> None:
         transformer = self.transformer
         language_model = transformer.language_model
-        _drop_blocks(language_model.layers, "UND (reasoner)")
-        # Swap the (now block-less) tower for the replay stub, carrying the real
-        # rotary embedding across -- see _ReplayLanguageModel's docstring. Both
-        # towers are built from ``transformer.num_hidden_layers``, so that is also
-        # the per-layer K/V count the reasoner will ship.
+        _require_unowned_absent(language_model.layers, "UND (reasoner)")
+        # Swap the (block-less, rope-only) tower for the replay stub, carrying the
+        # real rotary embedding across -- see _ReplayLanguageModel's docstring.
+        # Both towers are built from ``transformer.num_hidden_layers``, so that is
+        # also the per-layer K/V count the reasoner will ship.
         #
         # The expected K/V shape is read from the module that will actually receive
         # the replayed tensors, rather than recomputed from the config and the TP
@@ -547,10 +867,12 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
         # ``num_kv_heads // tp_size`` for itself at construction time, so taking it
         # from there cannot disagree with the consumer.
         consumer = self._kv_consumer()
-        self.transformer.language_model = _ReplayLanguageModel(
+        transformer.language_model = _ReplayLanguageModel(
             transformer.num_hidden_layers,
             language_model.rotary_emb,
+            num_kv_heads=consumer.num_kv_heads,
             num_kv_heads_local=consumer.num_kv_heads_local,
+            kv_head_offset=_tp_rank() * consumer.num_kv_heads_local,
             head_dim=consumer.head_dim,
         )
 
@@ -564,7 +886,7 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
         if not len(gen_layers):
             raise RuntimeError(
                 "Cosmos3 generator stage has no GEN blocks, so there is nothing to "
-                "replay reasoner K/V into. _drop_unused_tower dropped the wrong tower."
+                "replay reasoner K/V into. The stage did not build the tower it owns."
             )
         return gen_layers[0].cross_attention
 
@@ -577,7 +899,7 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
         match, and would pin the host K/V until the next request overwrote it.
         """
         payload = self._extract_und_payload(req)
-        self.install_und_kv(payload)
+        self.install_text_conditioning(payload)
         try:
             return super().forward(req)
         finally:
@@ -610,59 +932,26 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
             "(reasoner) via the stage router."
         )
 
-    def install_und_kv(self, payload: dict[str, Any]) -> None:
-        """Load the reasoner's K/V into the replay stub for this request."""
-        table = payload.get(KV_KEY) or {}
-        if not table:
-            raise ValueError("Cosmos3 generator stage received an empty reasoner K/V payload.")
+    def install_text_conditioning(self, payload: dict[str, Any]) -> Cosmos3TextConditioning:
+        """Load this rank's shard of the reasoner's conditioning into the stub."""
+        conditioning = Cosmos3TextConditioning.from_payload(payload)
         stub = self.transformer.language_model
         if not isinstance(stub, _ReplayLanguageModel):
             raise RuntimeError(
                 "Cosmos3 generator stage is not running the replay UND stub; "
                 "the pipeline was not built by Cosmos3GeneratorPipeline."
             )
-        meta = payload.get(META_KEY) or {}
-        self._check_meta_layout(meta, stub)
-        stub.install(table, dtype=self.transformer.proj_in.weight.dtype)
+        stub.install(conditioning, dtype=self.transformer.proj_in.weight.dtype)
         logger.info(
-            "Cosmos3 generator: installed reasoner K/V for %d branch(es) (%s MiB); UND tower skipped",
-            len(table),
-            meta.get("payload_mib", "?"),
+            "Cosmos3 generator: installed reasoner K/V for %d branch(es) (%.1f MiB, "
+            "heads [%d, %d) of %d); UND tower not loaded on this stage",
+            conditioning.num_branches,
+            conditioning.payload_mib,
+            stub.kv_head_offset,
+            stub.kv_head_offset + stub.num_kv_heads_local,
+            conditioning.num_kv_heads,
         )
-
-    def _check_meta_layout(self, meta: dict[str, Any], stub: _ReplayLanguageModel) -> None:
-        """Compare the reasoner's declared K/V layout with this stage's.
-
-        ``_ReplayLanguageModel.install`` already validates the tensors themselves,
-        so this is not what makes replay safe -- it is what makes a
-        stage-configuration mistake *diagnosable*. The reasoner reports the
-        ``tensor_parallel_size`` it sharded at, which no tensor shape reveals: a
-        payload built at TP 2 with 16 KV heads and one built at TP 1 with 8 are
-        indistinguishable by shape alone, so without this the operator sees a
-        shape mismatch with no hint that the two stages' TP sizes disagree.
-
-        Silent when the reasoner reported no layout at all (an older stage, or a
-        hand-built payload in a test); ``install`` still checks those.
-        """
-        expected = {
-            "num_layers": stub.num_hidden_layers,
-            "num_kv_heads_local": stub.num_kv_heads_local,
-            "head_dim": stub.head_dim,
-        }
-        mismatched = {
-            field: (meta[field], want) for field, want in expected.items() if field in meta and meta[field] != want
-        }
-        if not mismatched:
-            return
-        detail = ", ".join(
-            f"{field}={got} from reasoner, {want} here" for field, (got, want) in sorted(mismatched.items())
-        )
-        raise RuntimeError(
-            f"Cosmos3 reasoner and generator stages disagree on the UND K/V layout: {detail}. "
-            f"Reasoner ran at tensor_parallel_size={meta.get('tp_size', '?')}, this stage at "
-            f"{_tp_world_size()}. UND K/V is TP-sharded, so both stages must "
-            "load the same checkpoint and run with the same tensor_parallel_size."
-        )
+        return conditioning
 
 
 def get_cosmos3_reasoner_post_process_func(od_config: Any):

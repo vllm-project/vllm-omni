@@ -304,14 +304,23 @@ class TestDisaggDeployConfig:
         assert not stage0.default_sampling_params
         assert not stage1.default_sampling_params
 
-    def test_both_stages_run_the_same_tensor_parallel_size(self):
-        """UND K/V is TP-sharded, so this is a correctness constraint, not a
-        preference: the reasoner emits [B, S, num_kv_heads // tp, head_dim] and the
-        generator's cross-attention consumes the shape *its own* TP size implies."""
-        stages = [_stage(_deploy(DISAGG_YAML), i) for i in (0, 1)]
-        tp_sizes = {s.engine_extras["parallel_config"]["tensor_parallel_size"] for s in stages}
+    def test_tensor_parallel_size_is_stage_local(self):
+        """Every parallel degree in this topology is the stage's own business.
 
-        assert len(tp_sizes) == 1
+        UND K/V is born TP-sharded, but the reasoner all-gathers the KV-head
+        dimension before the payload leaves the tower and each generator rank slices
+        back out the range its own cross-attention owns, so the handoff is
+        TP-independent. Nothing in the merged config may therefore tie the two
+        stages' degrees together -- each stage carries its own ``parallel_config``,
+        and the shipped values are 1 because each tower fits on one card.
+        """
+        stages = [_stage(_deploy(DISAGG_YAML), i) for i in (0, 1)]
+
+        for stage in stages:
+            assert stage.engine_extras["parallel_config"]["tensor_parallel_size"] == 1
+        # Distinct dicts, not one shared object: a change to one stage's degrees
+        # cannot leak into the other's.
+        assert stages[0].engine_extras["parallel_config"] is not stages[1].engine_extras["parallel_config"]
 
     def test_merges_into_reasoner_plus_generator(self):
         stages = merge_pipeline_deploy(COSMOS3_DISAGG_PIPELINE, _deploy(DISAGG_YAML))

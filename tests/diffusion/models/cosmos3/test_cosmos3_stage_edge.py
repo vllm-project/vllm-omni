@@ -33,6 +33,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_disagg as disagg
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_disagg import (
     Cosmos3GeneratorPipeline,
@@ -66,44 +67,65 @@ class _StubUndTower(nn.Module):
 
     Marking the tensors is what lets the generator side assert it replayed *this*
     branch's K/V rather than merely something of the right shape.
+
+    Each head is offset by its index so a rank that replays the wrong KV-head range
+    is distinguishable too. ``rope_only`` is the shape the real tower takes on a
+    stage that does not own it: the mRoPE embedding stays, the blocks are absent.
     """
 
-    def __init__(self, num_layers: int) -> None:
+    def __init__(self, num_layers: int, *, rope_only: bool = False) -> None:
         super().__init__()
         self.rotary_emb = nn.Identity()
-        self.layers = nn.ModuleList(nn.Linear(1, 1) for _ in range(num_layers))
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList() if rope_only else nn.ModuleList(nn.Linear(1, 1) for _ in range(num_layers))
 
     def forward(self, text_ids: torch.Tensor, freqs: Any) -> list[tuple[torch.Tensor, torch.Tensor]]:
         del freqs
         batch, seq = text_ids.shape
         marker = float(text_ids.sum().item())
+        heads = torch.arange(KV_HEADS, dtype=torch.float32).reshape(1, 1, KV_HEADS, 1)
         return [
             (
-                torch.full((batch, seq, KV_HEADS, HEAD_DIM), marker + layer),
-                torch.full((batch, seq, KV_HEADS, HEAD_DIM), -(marker + layer)),
+                (heads + (marker + layer)).expand(batch, seq, KV_HEADS, HEAD_DIM).contiguous(),
+                (heads - (marker + layer)).expand(batch, seq, KV_HEADS, HEAD_DIM).contiguous(),
             )
-            for layer in range(len(self.layers))
+            for layer in range(self.num_layers)
         ]
 
 
 class _StubCrossAttention(nn.Module):
-    def __init__(self, num_kv_heads_local: int, head_dim: int) -> None:
+    def __init__(self, num_kv_heads: int, num_kv_heads_local: int, head_dim: int) -> None:
         super().__init__()
+        self.num_kv_heads = num_kv_heads
         self.num_kv_heads_local = num_kv_heads_local
         self.head_dim = head_dim
 
 
 class _StubGenBlock(nn.Module):
-    def __init__(self, num_kv_heads_local: int, head_dim: int) -> None:
+    def __init__(self, num_kv_heads: int, num_kv_heads_local: int, head_dim: int) -> None:
         super().__init__()
-        self.cross_attention = _StubCrossAttention(num_kv_heads_local, head_dim)
+        self.cross_attention = _StubCrossAttention(num_kv_heads, num_kv_heads_local, head_dim)
 
 
 class _StubTransformer(nn.Module):
-    def __init__(self, *, num_kv_heads_local: int = KV_HEADS, head_dim: int = HEAD_DIM) -> None:
+    """``owned_towers`` reproduces what the real transformer does with the
+    pipeline's ``cosmos3_owned_towers``: the unowned tower is never constructed."""
+
+    def __init__(
+        self,
+        *,
+        owned_towers: tuple[str, ...],
+        num_kv_heads: int = KV_HEADS,
+        num_kv_heads_local: int = KV_HEADS,
+        head_dim: int = HEAD_DIM,
+    ) -> None:
         super().__init__()
-        self.language_model = _StubUndTower(NUM_LAYERS)
-        self.gen_layers = nn.ModuleList(_StubGenBlock(num_kv_heads_local, head_dim) for _ in range(NUM_LAYERS))
+        self.owned_towers = tuple(owned_towers)
+        self.language_model = _StubUndTower(NUM_LAYERS, rope_only="reasoner" not in self.owned_towers)
+        self.gen_layers = nn.ModuleList(
+            _StubGenBlock(num_kv_heads, num_kv_heads_local, head_dim)
+            for _ in range(NUM_LAYERS if "generator" in self.owned_towers else 0)
+        )
         self.proj_in = nn.Linear(HEAD_DIM, HEAD_DIM)
         self.num_hidden_layers = NUM_LAYERS
 
@@ -178,18 +200,22 @@ def _install_tokenizer(pipeline) -> None:
     pipeline._format_and_tokenize_prompts = _format_and_tokenize_prompts
 
 
-def _make_stage(cls: type, **transformer_kwargs: Any) -> Any:
+def _make_stage(cls: type[Any], **transformer_kwargs: Any) -> Any:
     pipeline: Any = object.__new__(cls)
     nn.Module.__init__(pipeline)
+    # Each stage builds only the tower it declares ownership of, exactly as the
+    # real transformer does with cosmos3_owned_towers.
+    transformer_kwargs.setdefault("owned_towers", cls.cosmos3_owned_towers)
     pipeline.transformer = _StubTransformer(**transformer_kwargs)
     pipeline.device = torch.device("cpu")
     pipeline.vae_scale_factor_spatial = 8
     pipeline.is_edge_model = False
     pipeline.is_distilled_model = False
     _install_tokenizer(pipeline)
-    # Real _drop_unused_tower: the reasoner loses gen_layers, the generator's UND
-    # tower becomes the replay stub with the layout its cross-attention implies.
-    pipeline._drop_unused_tower()
+    # Real _bind_owned_tower: the reasoner asserts no GEN blocks were built, and the
+    # generator swaps its block-less UND tower for the replay stub, with the layout
+    # and head range its own cross-attention implies.
+    pipeline._bind_owned_tower()
     return pipeline
 
 
@@ -384,12 +410,93 @@ class TestStageEdge:
                 generator_sp=_sampling_params(max_sequence_length=256),
             )
 
-    def test_a_generator_at_a_different_tp_size_is_rejected_by_name(self):
-        """Same checkpoint, mismatched tensor_parallel_size: the operator must be
-        told which knob disagrees, not handed a bare shape error."""
+    def test_a_generator_at_a_larger_tp_size_replays_its_own_head_shard(self):
+        """The two stages need not run the same tensor_parallel_size.
+
+        The reasoner gathers its heads before the payload leaves the tower, so a
+        generator sharded more finely simply takes the range its own
+        cross-attention owns -- here rank 0's half of the reasoner's full head set.
+        """
         reasoner = _make_stage(Cosmos3ReasonerPipeline)
-        # Half the local KV heads is what TP 2 against the reasoner's TP 1 looks like.
-        generator = _make_stage(Cosmos3GeneratorPipeline, num_kv_heads_local=KV_HEADS // 2)
+        # Half the local KV heads out of the same full count is what TP 2 against the
+        # reasoner's TP 1 looks like.
+        local_heads = KV_HEADS // 2
+        generator = _make_stage(Cosmos3GeneratorPipeline, num_kv_heads_local=local_heads)
+
+        run = _run_stage_edge(reasoner, generator)
+
+        assert run.result == "image"
+        # The wire still carried every head, TP-independently.
+        assert run.payload[META_KEY]["num_kv_heads"] == KV_HEADS
+        emitted = run.payload[KV_KEY]
+        for branch in run.replayed:
+            for k, v in branch:
+                assert k.shape == (1, 3, local_heads, HEAD_DIM)
+            # And what it replayed is this rank's slice of one emitted entry.
+            matches = [
+                entry
+                for entry in emitted.values()
+                if all(
+                    torch.equal(k, ek[..., :local_heads, :]) and torch.equal(v, ev[..., :local_heads, :])
+                    for (k, v), (ek, ev) in zip(branch, entry, strict=True)
+                )
+            ]
+            assert len(matches) == 1
+
+    def test_a_nonzero_tp_rank_replays_its_own_heads_through_the_whole_chain(self):
+        """The finding, end to end, at the rank where it actually bit.
+
+        Every other test in this file runs as rank 0, whose shard starts at head 0 --
+        indistinguishable from the rank-agnostic handoff this replaces, where every
+        rank received rank 0's heads. Here the generator stage believes it is rank 1
+        of a 2-rank group, so the payload it must replay is the *second* half of the
+        reasoner's gathered head set, and it travels the real chain to get there:
+        reasoner forward -> post-process -> serde -> bridge -> install -> replay.
+        """
+        reasoner = _make_stage(Cosmos3ReasonerPipeline)
+        local_heads = KV_HEADS // 2
+        # The rank identity is patched for the *bind* only, then dropped: the offset
+        # is captured there, and the two stages are separate processes in a real
+        # deployment, so the reasoner must go on running at its own TP size (1 here,
+        # against the generator's 2 -- the TP-independence this handoff is for).
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(disagg, "_tp_rank", lambda: 1)
+            mp.setattr(disagg, "_tp_world_size", lambda: 2)
+            generator = _make_stage(Cosmos3GeneratorPipeline, num_kv_heads_local=local_heads)
+        assert generator.transformer.language_model.kv_head_offset == local_heads
+
+        run = _run_stage_edge(reasoner, generator)
+
+        assert run.result == "image"
+        emitted = run.payload[KV_KEY]
+        for branch in run.replayed:
+            for k, _v in branch:
+                assert k.shape == (1, 3, local_heads, HEAD_DIM)
+            matches = [
+                entry
+                for entry in emitted.values()
+                if all(
+                    torch.equal(k, ek[..., local_heads : 2 * local_heads, :])
+                    and torch.equal(v, ev[..., local_heads : 2 * local_heads, :])
+                    for (k, v), (ek, ev) in zip(branch, entry, strict=True)
+                )
+            ]
+            assert len(matches) == 1
+            # And explicitly *not* rank 0's shard: the stub tower marks each head
+            # with its index, so the two halves cannot coincide.
+            for (k, _v), entry in zip(branch, next(iter(emitted.values())), strict=False):
+                assert not torch.equal(k, entry[0][..., :local_heads, :])
+
+    def test_a_generator_expecting_another_layout_is_rejected_by_name(self):
+        """Two different checkpoints, or two different transformer configs: the
+        operator must be told which field disagrees, not handed a shape error from
+        inside attention."""
+        reasoner = _make_stage(Cosmos3ReasonerPipeline)
+        generator = _make_stage(
+            Cosmos3GeneratorPipeline,
+            num_kv_heads=KV_HEADS * 2,
+            num_kv_heads_local=KV_HEADS * 2,
+        )
 
         with pytest.raises(RuntimeError, match="disagree on the UND K/V layout"):
             _run_stage_edge(reasoner, generator)

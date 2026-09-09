@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.cosmos3_pipeline_config import COSMOS3_UND_SCHEMA
 from vllm_omni.model_executor.stage_input_processors.cosmos3 import (
     KV_KEY,
     META_KEY,
@@ -41,9 +42,10 @@ def _meta(**overrides: Any) -> dict[str, Any]:
         "num_branches": 1,
         "payload_mib": 12.5,
         "num_layers": 2,
-        "num_kv_heads_local": 8,
+        "num_kv_heads": 8,
         "head_dim": 128,
-        "tp_size": 1,
+        "reasoner_tp_size": 1,
+        "schema": COSMOS3_UND_SCHEMA,
     }
     meta.update(overrides)
     return meta
@@ -163,14 +165,27 @@ class TestReasoner2Generator:
         assert result["extra"][META_KEY]["max_sequence_length"] == 256
 
     def test_forwards_the_kv_layout_for_the_generators_consistency_check(self):
-        """The generator compares these against its own config to report a
-        stage-configuration mismatch in those terms rather than as a bare shape
-        error from inside cross-attention."""
-        output = _reasoner_output(meta=_meta(num_layers=64, num_kv_heads_local=4, head_dim=128, tp_size=2))
+        """The declared half of the conditioning contract. The generator compares
+        these against its own config to report a stage-configuration mismatch in
+        those terms rather than as a bare shape error from inside cross-attention.
+
+        ``num_kv_heads`` is the full head count the payload carries -- the reasoner
+        gathered its TP shards -- and ``reasoner_tp_size`` is diagnostics only, so
+        forwarding it must not be mistaken for a constraint on this stage's TP size.
+        """
+        output = _reasoner_output(meta=_meta(num_layers=64, num_kv_heads=8, head_dim=128, reasoner_tp_size=2))
 
         meta = reasoner2generator([output], prompt={"prompt": "x"})["extra"][META_KEY]
 
-        assert (meta["num_layers"], meta["num_kv_heads_local"], meta["head_dim"], meta["tp_size"]) == (64, 4, 128, 2)
+        assert (meta["num_layers"], meta["num_kv_heads"], meta["head_dim"]) == (64, 8, 128)
+        assert meta["reasoner_tp_size"] == 2
+
+    def test_forwards_the_schema_identifier(self):
+        """The generator refuses a payload that does not declare the schema it
+        implements, so the bridge has to carry it verbatim."""
+        meta = reasoner2generator([_reasoner_output()], prompt={"prompt": "x"})["extra"][META_KEY]
+
+        assert meta["schema"] == COSMOS3_UND_SCHEMA
 
     def test_forwards_negative_prompt(self):
         """With guidance active the reasoner encoded an unconditional branch from
