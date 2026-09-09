@@ -62,6 +62,7 @@ pytestmark = [pytest.mark.slow]
 # AR-only understanding A/B
 # ---------------------------------------------------------------------------
 
+
 def _stage_config(quantization: str | None) -> str:
     """Return a patched AR deploy config for the requested quantization.
 
@@ -157,11 +158,7 @@ def test_bf16_vs_fp8_generation_consistency():
     logprob_cos = _cosine_sim(bf16_lp[:lp_common], fp8_lp[:lp_common]) if lp_common > 0 else float("nan")
     logprob_mae = _mean_abs_diff(bf16_lp[:lp_common], fp8_lp[:lp_common]) if lp_common > 0 else float("nan")
 
-    print(
-        f"[FP8 A/B] token_agreement={token_agree:.4f} "
-        f"logprob_cosine={logprob_cos:.4f} "
-        f"logprob_mae={logprob_mae:.4f}"
-    )
+    print(f"[FP8 A/B] token_agreement={token_agree:.4f} logprob_cosine={logprob_cos:.4f} logprob_mae={logprob_mae:.4f}")
 
     assert token_agree >= MIN_TOKEN_AGREEMENT, (
         f"BF16/FP8 greedy sequences diverge too much: agreement={token_agree:.3f} < "
@@ -169,8 +166,7 @@ def test_bf16_vs_fp8_generation_consistency():
     )
     if logprob_cos == logprob_cos:  # not NaN
         assert logprob_cos >= MIN_LOGPROB_COSINE, (
-            f"BF16/FP8 logprob sequences diverge too much: cosine={logprob_cos:.4f} < "
-            f"{MIN_LOGPROB_COSINE}"
+            f"BF16/FP8 logprob sequences diverge too much: cosine={logprob_cos:.4f} < {MIN_LOGPROB_COSINE}"
         )
 
 
@@ -355,9 +351,5 @@ def test_bf16_vs_fp8_t2i_image_consistency():
 
     # Same seed + greedy AR + deterministic DiT: a correctly quantized
     # gen_mlp/gen_head must reproduce the same visual tokens, hence the image.
-    assert metrics["cosine"] >= 0.99, (
-        f"BF16/FP8 t2i images diverge too much: cosine={metrics['cosine']:.6f} < 0.99"
-    )
-    assert metrics["rel_l2"] < 0.05, (
-        f"BF16/FP8 t2i images diverge too much: rel_l2={metrics['rel_l2']:.6f} >= 0.05"
-    )
+    assert metrics["cosine"] >= 0.99, f"BF16/FP8 t2i images diverge too much: cosine={metrics['cosine']:.6f} < 0.99"
+    assert metrics["rel_l2"] < 0.05, f"BF16/FP8 t2i images diverge too much: rel_l2={metrics['rel_l2']:.6f} >= 0.05"

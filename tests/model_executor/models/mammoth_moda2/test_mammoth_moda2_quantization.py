@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from vllm.model_executor.model_loader.weight_utils import maybe_remap_kv_scale_name
+
 from vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2 import (
     MammothModa2Qwen3ARForConditionalGeneration,
     moe_enable,
