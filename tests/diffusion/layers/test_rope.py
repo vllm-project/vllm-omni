@@ -39,6 +39,7 @@ def _load_rope_module():
         "vllm_omni.diffusion": types.ModuleType("vllm_omni.diffusion"),
         "vllm_omni.diffusion.layers": types.ModuleType("vllm_omni.diffusion.layers"),
         "vllm_omni.diffusion.layers.custom_op": MagicMock(),
+        "vllm_omni.platforms": MagicMock(current_omni_platform=MagicMock(device_type="cpu")),
         "vllm.logger": MagicMock(init_logger=lambda name: MagicMock()),
     }
     with patch.dict(sys.modules, mocks):
