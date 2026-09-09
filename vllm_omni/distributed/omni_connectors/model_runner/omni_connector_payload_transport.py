@@ -19,18 +19,11 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
     should_accumulate_full_payload_output,
 )
 from vllm_omni.outputs import OmniConnectorOutput
-from vllm_omni.utils.payload_span import (
-    get_tensor_span,
-    merge_tensor_spans,
-)
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
-
-
-_EMBED_SPAN_GROUPS: tuple[tuple[str, str, str], ...] = (("decode", "decode_token_start", "decode_token_end"),)
 
 
 class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
@@ -1298,25 +1291,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if isinstance(value, dict):
                 origin_sub = origin.get(key)
                 merged_sub = dict(origin_sub) if isinstance(origin_sub, dict) else {}
-                span_handled: set[str] = set()
-                if key == "embed" and isinstance(origin_sub, dict):
-                    for tk, sk, ek in _EMBED_SPAN_GROUPS:
-                        if tk not in value or (key, tk) in override_keys:
-                            continue
-                        span = merge_tensor_spans(
-                            get_tensor_span(origin_sub, tensor_key=tk, start_key=sk, end_key=ek),
-                            get_tensor_span(value, tensor_key=tk, start_key=sk, end_key=ek),
-                        )
-                        if span is None:
-                            continue
-                        t, s, e = span
-                        merged_sub[tk] = t
-                        merged_sub[sk] = s
-                        merged_sub[ek] = e
-                        span_handled |= {tk, sk, ek}
                 for qual, qval in value.items():
-                    if qual in span_handled:
-                        continue
                     if key == "meta" and qual == "finished":
                         merged_sub[qual] = qval
                         continue

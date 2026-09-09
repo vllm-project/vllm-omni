@@ -1062,6 +1062,45 @@ class TestKVTransferLifecycle(unittest.TestCase):
 class TestAsyncPayloadLifecycle(unittest.TestCase):
     """Regression tests for async payload delivery lifecycle."""
 
+    def test_accumulate_payload_concatenates_chunks(self):
+        host = MixinHost()
+        host._send_side_request_payload = {}
+        first = host._accumulate_payload(
+            "r1",
+            {
+                "embed": {"decode": torch.tensor([[1.0, 2.0]])},
+                "ids": {"output": [1]},
+                "meta": {"finished": False},
+            },
+        )
+        merged = host._accumulate_payload(
+            "r1",
+            {
+                "embed": {"decode": torch.tensor([[3.0, 4.0], [5.0, 6.0]])},
+                "ids": {"output": [2, 3]},
+                "meta": {"finished": True},
+            },
+        )
+        torch.testing.assert_close(merged["embed"]["decode"], torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+        self.assertEqual(merged["ids"]["output"], [1, 2, 3])
+        self.assertIs(merged["meta"]["finished"], True)
+        self.assertEqual(first["embed"]["decode"].shape, (1, 2))
+        self.assertEqual(first["ids"]["output"], [1])
+        self.assertIs(first["meta"]["finished"], False)
+
+    def test_accumulate_payload_replaces_override_keys(self):
+        host = MixinHost()
+        host._send_side_request_payload = {}
+        host._accumulate_payload("r1", {"embed": {"decode": torch.ones(2, 2)}, "ids": {"output": [1, 2]}})
+        payload = {
+            "embed": {"decode": torch.zeros(1, 2)},
+            "ids": {"output": [3]},
+            "meta": {"override_keys": [["embed", "decode"], ["ids", "output"]]},
+        }
+        merged = host._accumulate_payload("r1", payload)
+        torch.testing.assert_close(merged["embed"]["decode"], payload["embed"]["decode"])
+        self.assertEqual(merged["ids"]["output"], [3])
+
     def test_send_side_request_payload_not_cleared_before_payload_is_consumable(self):
         host = MixinHost()
         host.init_omni_connectors(
