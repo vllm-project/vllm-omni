@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from functools import partial
 from typing import Any
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -269,7 +270,7 @@ class ChatFallbackProjectorMixin:
                 )
                 if duration_ms is None:
                     return
-                accepted = await send_json(
+                await send_json(
                     {
                         "type": "response.output_audio.delta",
                         "session_id": session.session_id,
@@ -280,10 +281,9 @@ class ChatFallbackProjectorMixin:
                         "sample_rate_hz": audio_metadata.sample_rate_hz,
                         "channels": audio_metadata.channels,
                         "audio_duration_ms": duration_ms,
-                    }
+                    },
+                    on_accepted=partial(session.mark_audio_sent, duration_ms, response_id=response_id),
                 )
-                if accepted is True:
-                    session.mark_audio_sent(duration_ms, response_id=response_id)
 
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None and modality != "audio":

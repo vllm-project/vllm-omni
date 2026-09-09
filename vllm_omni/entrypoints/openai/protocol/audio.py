@@ -23,7 +23,7 @@ def _normalize_ref_audio_value(value):
         return None
     if isinstance(value, str):
         return value
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         items = []
         for item in value:
             if not isinstance(item, str):
@@ -38,16 +38,16 @@ def _normalize_ref_audio_value(value):
 def _normalize_speaker_embedding_value(value):
     if value is None:
         return None
-    if not isinstance(value, list | tuple):
+    if not isinstance(value, (list, tuple)):
         raise TypeError("'speaker_embedding' must be a list of numbers or list of embedding vectors")
     if not value:
         return []
 
     first = value[0]
-    if isinstance(first, list | tuple):
+    if isinstance(first, (list, tuple)):
         embeddings = []
         for item in value:
-            if not isinstance(item, list | tuple):
+            if not isinstance(item, (list, tuple)):
                 raise TypeError("'speaker_embedding' must not mix flat and nested values")
             embeddings.append([float(x) for x in item])
         return embeddings

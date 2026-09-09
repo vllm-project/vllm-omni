@@ -7,6 +7,7 @@ import asyncio
 import binascii
 import json
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
 
@@ -99,7 +100,9 @@ class DuplexSessionRunnerMixin:
             if callable(close):
                 await close(code=1000, reason=reason)
 
-        async def send_attachment_payload(payload: dict[str, object], *, journal: bool) -> None:
+        async def send_attachment_payload(
+            payload: dict[str, object], *, journal: bool, on_accepted: Callable[[], None] | None = None
+        ) -> None:
             assert session is not None
             session_id = session.session_id
             should_journal = journal and session_id not in self._resync_required_sessions
@@ -108,6 +111,7 @@ class DuplexSessionRunnerMixin:
                     session_id,
                     payload,
                     journal=should_journal,
+                    on_accepted=on_accepted,
                 )
             except DuplexJournalOverflowError:
                 first_overflow = session_id not in self._resync_required_sessions
@@ -129,6 +133,7 @@ class DuplexSessionRunnerMixin:
                     session_id,
                     payload,
                     journal=False,
+                    on_accepted=on_accepted,
                 )
 
         if realtime_protocol is not None:
@@ -155,23 +160,29 @@ class DuplexSessionRunnerMixin:
 
         event_emit_lock = asyncio.Lock()
 
-        async def send_outbound(payload: dict[str, object]) -> None:
+        async def send_outbound(payload: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
             if not attachment_ready or session is None:
                 await actor.send_json(dict(payload))
+                if on_accepted is not None:
+                    on_accepted()
                 return
             if realtime_protocol is None:
                 await send_attachment_payload(
                     payload,
                     journal=payload.get("type") not in {"session.created", "session.resumed"},
+                    on_accepted=on_accepted,
                 )
                 return
             for projected in realtime_protocol.encode_outbound_event(payload):
                 await send_attachment_payload(
                     projected,
                     journal=projected.get("type") not in {"session.created", "session.resumed"},
+                    # Item/part announcements may precede the audio. Only the
+                    # actual audio event establishes acceptance of this chunk.
+                    on_accepted=on_accepted if projected.get("type") == "response.audio.delta" else None,
                 )
 
-        async def emit_event(payload: dict[str, object]) -> bool:
+        async def emit_event(payload: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
             deferred_precreate_response = False
             async with event_emit_lock:
                 accepted, deferred_overlap_payload = await self._apply_outbound_session_event(
@@ -182,8 +193,8 @@ class DuplexSessionRunnerMixin:
                     realtime_protocol=realtime_protocol,
                 )
                 if not accepted:
-                    return False
-                await send_outbound(payload)
+                    return
+                await send_outbound(payload, on_accepted=on_accepted)
                 if deferred_overlap_payload is not None:
                     deferred_precreate_response = native.deferred_precreate_response
                     native.deferred_precreate_response = False
@@ -197,8 +208,6 @@ class DuplexSessionRunnerMixin:
                         deferred_overlap_payload if native.committed_audio_payload is deferred_overlap_payload else None
                     ),
                 )
-
-            return True
 
         writer_task = asyncio.create_task(actor.writer_loop(), name="duplex-session-writer")
         reader_task: asyncio.Task[None] | None = None

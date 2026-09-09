@@ -9,6 +9,7 @@ import io
 import json
 import struct
 import wave
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
@@ -5024,9 +5025,10 @@ async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
     response_id = session.begin_response()
     sent: list[dict[str, Any]] = []
 
-    async def send_json(data: dict[str, Any]) -> bool:
+    async def send_json(data: dict[str, Any], *, on_accepted: Callable[[], None] | None = None) -> None:
         sent.append(data)
-        return True
+        if on_accepted is not None:
+            on_accepted()
 
     await handler._emit_chat_payload(
         session,
@@ -5117,9 +5119,10 @@ async def test_duplex_chat_full_audio_message_preserves_actual_format_and_durati
     response_id = session.begin_response()
     sent: list[dict[str, object]] = []
 
-    async def send_json(data: dict[str, object]) -> bool:
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
         sent.append(data)
-        return True
+        if on_accepted is not None:
+            on_accepted()
 
     await handler._emit_chat_payload(
         session,
@@ -5161,9 +5164,10 @@ async def test_duplex_chat_audio_does_not_round_each_fragment():
     response_id = session.begin_response()
     sent: list[dict[str, object]] = []
 
-    async def send_json(data: dict[str, object]) -> bool:
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
         sent.append(data)
-        return True
+        if on_accepted is not None:
+            on_accepted()
 
     for _ in range(23):
         await handler._emit_chat_payload(
@@ -5189,8 +5193,8 @@ async def test_duplex_chat_rejected_audio_is_generated_but_not_sent():
     session = DuplexSession(session_id="sid-chat-rejected-audio", config=DuplexSessionConfig())
     response_id = session.begin_response()
 
-    async def reject(data: dict[str, object]) -> bool:
-        return False
+    async def reject(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
+        pass
 
     await handler._emit_chat_payload(session, _chat_audio_completion_payload(), session.epoch, response_id, reject)
 
@@ -5209,7 +5213,7 @@ async def test_duplex_chat_failed_audio_send_does_not_advance_sent():
     session = DuplexSession(session_id="sid-chat-failed-audio", config=DuplexSessionConfig())
     response_id = session.begin_response()
 
-    async def fail_send(data: dict[str, object]) -> bool:
+    async def fail_send(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
         raise RuntimeError("output unavailable")
 
     with pytest.raises(RuntimeError, match="output unavailable"):
@@ -5233,10 +5237,11 @@ async def test_duplex_chat_late_send_completion_only_updates_old_response():
     send_started = asyncio.Event()
     finish_send = asyncio.Event()
 
-    async def delayed_send(data: dict[str, object]) -> bool:
+    async def delayed_send(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
         send_started.set()
         await finish_send.wait()
-        return True
+        assert on_accepted is not None
+        on_accepted()
 
     emit_task = asyncio.create_task(
         handler._emit_chat_payload(session, _chat_audio_completion_payload(), session.epoch, old_response, delayed_send)
@@ -5277,9 +5282,10 @@ async def test_duplex_chat_missing_audio_metadata_reports_error():
     session = DuplexSession(session_id="sid-chat-missing-metadata", config=DuplexSessionConfig())
     sent: list[dict[str, object]] = []
 
-    async def send_json(data: dict[str, object]) -> bool:
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
         sent.append(data)
-        return True
+        if on_accepted is not None:
+            on_accepted()
 
     await handler._run_response(session, send_json)
 
@@ -5334,9 +5340,10 @@ async def test_duplex_chat_stage_metrics_use_latest_streaming_snapshot():
     )
     sent: list[dict[str, Any]] = []
 
-    async def send_json(data: dict[str, Any]) -> bool:
+    async def send_json(data: dict[str, Any], *, on_accepted: Callable[[], None] | None = None) -> None:
         sent.append(data)
-        return True
+        if on_accepted is not None:
+            on_accepted()
 
     await handler._run_response(session, send_json)
 

@@ -123,6 +123,103 @@ def test_event_journal_overflow_is_explicit_and_does_not_evict_silently() -> Non
 
 
 @pytest.mark.asyncio
+async def test_registry_accepts_journaled_event_before_transport_failure(mocker) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    accepted = mocker.Mock()
+
+    async def failing_send(payload):
+        accepted.assert_called_once_with()
+        raise RuntimeError("transport lost")
+
+    await registry.create("sid-accepted-failure", incarnation=0, send=failing_send, close=mocker.AsyncMock())
+
+    with pytest.raises(RuntimeError, match="transport lost"):
+        await registry.send_event(
+            "sid-accepted-failure", {"type": "response.audio.delta", "delta": "AAAA"}, on_accepted=accepted
+        )
+
+    accepted.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journal", [False, True])
+async def test_registry_detached_event_is_accepted_only_when_journaled(mocker, journal: bool) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    send = mocker.AsyncMock()
+    accepted = mocker.Mock()
+    created = await registry.create("sid-detached-acceptance", incarnation=0, send=send, close=mocker.AsyncMock())
+    await registry.detach("sid-detached-acceptance", attachment_generation=created.attachment_generation)
+
+    entry = await registry.send_event(
+        "sid-detached-acceptance",
+        {"type": "response.audio.delta", "delta": "AAAA"},
+        journal=journal,
+        on_accepted=accepted,
+    )
+
+    send.assert_not_awaited()
+    assert (entry is not None) is journal
+    assert accepted.call_count == int(journal)
+
+
+@pytest.mark.asyncio
+async def test_registry_unjournaled_event_is_accepted_after_successful_send(mocker) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    accepted = mocker.Mock()
+
+    async def send(payload):
+        accepted.assert_not_called()
+
+    await registry.create("sid-live-acceptance", incarnation=0, send=send, close=mocker.AsyncMock())
+
+    entry = await registry.send_event(
+        "sid-live-acceptance",
+        {"type": "response.audio.delta", "delta": "AAAA"},
+        journal=False,
+        on_accepted=accepted,
+    )
+
+    assert entry is None
+    accepted.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_registry_unjournaled_failed_send_is_not_accepted(mocker) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    accepted = mocker.Mock()
+    send = mocker.AsyncMock(side_effect=RuntimeError("transport lost"))
+    await registry.create("sid-live-failure", incarnation=0, send=send, close=mocker.AsyncMock())
+
+    with pytest.raises(RuntimeError, match="transport lost"):
+        await registry.send_event(
+            "sid-live-failure",
+            {"type": "response.audio.delta", "delta": "AAAA"},
+            journal=False,
+            on_accepted=accepted,
+        )
+
+    accepted.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_registry_overflow_does_not_accept_or_send_event(mocker) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=100)
+    accepted = mocker.Mock()
+    send = mocker.AsyncMock()
+    await registry.create("sid-overflow-acceptance", incarnation=0, send=send, close=mocker.AsyncMock())
+
+    with pytest.raises(DuplexJournalOverflowError, match="byte limit"):
+        await registry.send_event(
+            "sid-overflow-acceptance",
+            {"type": "response.audio.delta", "delta": "A" * 200},
+            on_accepted=accepted,
+        )
+
+    accepted.assert_not_called()
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_registry_resume_rotates_token_replays_and_atomically_replaces_attachment() -> None:
     clock = _Clock()
     registry = DuplexSessionAttachmentRegistry(

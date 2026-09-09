@@ -2822,7 +2822,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
         # AudioVAE rate via multimodal_output["sr"].
         sr_raw = mm_output.get("sr")
-        if isinstance(sr_raw, list | tuple):
+        if isinstance(sr_raw, (list, tuple)):
             sr_raw = next((item for item in sr_raw if item is not None), None)
         if sr_raw is None:
             sample_rate = 24000
