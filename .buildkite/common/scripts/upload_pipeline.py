@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import os
 import re
 import subprocess
 import sys
@@ -321,7 +320,8 @@ def _get_mirror_hw_selector() -> str:
     A set value must be ``a100`` or ``b200`` (case-insensitive). Unknown values
     fail closed so a typo cannot silently drop the CUDA pipeline.
     """
-    selector = os.environ.get("MIRROR_HW", "").strip().lower()
+    # TEMP: hardcode A100. Revert: selector = os.environ.get("MIRROR_HW", "").strip().lower()
+    selector = "a100"
     if not selector:
         return ""
     if selector not in _SUPPORTED_MIRROR_HW_SELECTORS:
