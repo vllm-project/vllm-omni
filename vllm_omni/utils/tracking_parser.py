@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 from typing import Any
@@ -51,6 +51,17 @@ class TrackingNamespace(argparse.Namespace):
             object.__setattr__(self, name, value)
         else:
             setattr(self.unfiltered_ns, name, value)
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Preserve the wrapped namespace when API workers use ``spawn``."""
+        return {
+            "unfiltered_ns": self.unfiltered_ns,
+            "explicit_keys": self.explicit_keys,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        object.__setattr__(self, "unfiltered_ns", state["unfiltered_ns"])
+        object.__setattr__(self, "explicit_keys", state["explicit_keys"])
 
     def get_explicit_kwargs_dict(self):
         """Return a dict containing only the explicitly passed key-value pairs."""

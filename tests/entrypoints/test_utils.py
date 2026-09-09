@@ -529,3 +529,21 @@ class TestCumulativeStreamingCoercion:
         assert all([isinstance(r, SamplingParams) for r in result])
         assert result[0].output_kind == RequestOutputKind.DELTA
         assert result[1].output_kind == RequestOutputKind.DELTA
+
+
+@pytest.mark.parametrize("api_server_count", [1, 2])
+def test_prepare_stage_config_inputs_filters_frontend_options(api_server_count):
+    from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
+
+    kwargs = {
+        "api_server_count": api_server_count,
+        "disable_log_stats": True,
+        "model_tag": "example",
+        "max_num_seqs": 8,
+        "stage_overrides": '{"0": {"max_num_seqs": 4}}',
+    }
+    inputs = prepare_stage_config_inputs("example", kwargs, trust_remote_code=None)
+
+    assert inputs.kwargs == {"max_num_seqs": 8}
+    assert inputs.stage_overrides == {"0": {"max_num_seqs": 4}}
+    assert kwargs["api_server_count"] == api_server_count
