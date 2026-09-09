@@ -493,7 +493,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # loading so they cannot compete with targeted staging faults.
         self._stop_weights_prewarm()
 
-
         # Decide the static gate before choosing the source iterator. Excluded
         # paths must retain their existing multi-thread loader rather than pay
         # the deterministic-order cost for cooperation they will never enter.

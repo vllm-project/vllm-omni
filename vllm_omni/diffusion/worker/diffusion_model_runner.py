@@ -460,6 +460,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 model_tag=self.od_config.model_class_name,
             )
 
+        self._interaction_coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
+        if hasattr(self.pipeline, "_interaction_coordinator"):
+            self.pipeline._interaction_coordinator = self._interaction_coordinator
+
         log_startup_duration(
             logger,
             "model.runtime_setup",

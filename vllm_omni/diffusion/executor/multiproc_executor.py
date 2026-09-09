@@ -379,6 +379,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # Without this, every worker inherits one Torch thread per core, so an
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
+        user_omp = "OMP_NUM_THREADS" in os.environ
         set_multiprocessing_worker_envs()
         # Diffusion weight loading casts fp32 checkpoints to bf16 on the CPU
         # during pageable H2D copies; with vllm's default OMP_NUM_THREADS=1
@@ -387,7 +388,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # worker sized to the host: workers x threads ~= core count, so the
         # cap still bounds contention without serializing the casts.
         workers = max(1, int(getattr(od_config, "num_gpus", 1) or 1))
-        if "OMP_NUM_THREADS" not in os.environ:
+        if not user_omp:
             os.environ["OMP_NUM_THREADS"] = str(max(2, (os.cpu_count() or 8) // workers))
         mp.set_start_method("spawn", force=True)
 
