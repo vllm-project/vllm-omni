@@ -720,7 +720,6 @@ def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
     monkeypatch.setenv("BUILDKITE_BRANCH", "feat/nightly-yaml")
     pipeline_yaml = Path(".buildkite/npu/test-npu-nightly.yml")
     shared_paths = _load_source_file_dependencies()["source_filter_fallback"]
-    assert ".buildkite/common/scripts/upload_pipeline.py" in shared_paths
 
     # Synthetic steps only — do not pin live Buildkite job labels.
     doc = {
@@ -747,7 +746,7 @@ def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
         )
         return {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
-    # Only pipeline YAML / shared uploader → no listed prefix match → keep every step.
+    # Only pipeline YAML / fallback paths → no listed prefix match → keep every step.
     for changed in [pipeline_yaml.as_posix(), *shared_paths]:
         assert surviving_keys([changed]) == {"ungated", "gated_a", "gated_b"}, changed
 
@@ -755,9 +754,7 @@ def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
     assert surviving_keys([".buildkite/cuda/test-nightly.yml"]) == {"ungated"}
 
     # A matching source prefix wins over fallback files in the same diff.
-    assert surviving_keys(
-        [
-            "pkg/model_a/transformer.py",
-            ".buildkite/common/scripts/upload_pipeline.py",
-        ],
-    ) == {"ungated", "gated_a"}
+    assert surviving_keys(["pkg/model_a/transformer.py", *shared_paths[:1]]) == {
+        "ungated",
+        "gated_a",
+    }

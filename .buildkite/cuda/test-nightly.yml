@@ -390,6 +390,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 Device-Postprocess Equivalence Test"
+        source_file_dependencies: diffusion_wan22_function
         timeout_in_minutes: 90
         commands:
           - |
