@@ -41,6 +41,11 @@ PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
 
+# Force safetensors page-cache prefetch in CI/test runners. Auto-prefetch only
+# enables on recognized network FS (NFS/Lustre/Ceph); VIRTIOFS and similar
+# skip it unless ``--safetensors-load-strategy=prefetch`` is set explicitly.
+_SAFETENSORS_LOAD_STRATEGY = "prefetch"
+
 
 def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     """Return a local TCP port that is suitable for binding a new listener.
@@ -163,9 +168,12 @@ class OmniServer:
     ) -> None:
         cleanup_test_environment()
         self.model = model
-        args = list(serve_args)
-        self.serve_args = args
-        self.log_stats = "--disable-log-stats" not in args and "--log-stats" in args
+        self.serve_args = list(serve_args)
+        if not any(
+            a == "--safetensors-load-strategy" or a.startswith("--safetensors-load-strategy=") for a in self.serve_args
+        ):
+            self.serve_args.append(f"--safetensors-load-strategy={_SAFETENSORS_LOAD_STRATEGY}")
+        self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
@@ -610,6 +618,7 @@ class OmniRunner:
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
         self.omni: Any = None
+        kwargs.setdefault("safetensors_load_strategy", _SAFETENSORS_LOAD_STRATEGY)
         try:
             from vllm_omni.entrypoints.omni import Omni
 
