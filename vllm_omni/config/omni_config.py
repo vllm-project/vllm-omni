@@ -167,6 +167,19 @@ class _ModelEngineOverrides(TypedDict, total=False):
     enable_multithread_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
+    # Upstream ModelConfig inputs that users pass as global CLI flags.
+    served_model_name: str | list[str]
+    allowed_local_media_path: str
+    allowed_media_domains: list[str]
+    max_logprobs: int
+    logprobs_mode: str
+    mm_processor_kwargs: dict[str, Any]
+    mm_processor_cache_type: str
+    hf_token: bool | str
+    hf_config_path: str
+    generation_config: str
+    override_generation_config: dict[str, Any]
+    enable_prompt_embeds: bool
 
 
 class _LoadEngineOverrides(TypedDict, total=False):
@@ -443,6 +456,19 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    # Upstream ModelConfig inputs that users pass as global CLI flags.
+    served_model_name: str | list[str] | None = None
+    allowed_local_media_path: str | None = None
+    allowed_media_domains: list[str] | None = None
+    max_logprobs: int | None = None
+    logprobs_mode: str | None = None
+    mm_processor_kwargs: dict[str, Any] | None = None
+    mm_processor_cache_type: str | None = None
+    hf_token: bool | str | None = None
+    hf_config_path: str | None = None
+    generation_config: str | None = None
+    override_generation_config: dict[str, Any] | None = None
+    enable_prompt_embeds: bool | None = None
 
 
 @_enforce_keyword_only_init
