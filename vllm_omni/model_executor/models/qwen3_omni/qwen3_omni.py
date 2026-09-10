@@ -86,6 +86,45 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def _replay_messages(
+    history: list[dict[str, Any]],
+    audio_placeholder: str,
+    instructions: str | None,
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Build the replayed chat messages and the audio that backs them.
+
+    Returned as a pair on purpose: the audio placeholders in `messages` are matched
+    POSITIONALLY against this audio list when it becomes `multi_modal_data`, so any
+    drift between the two silently misattributes one turn's audio to another. Emitting
+    both from one loop makes that drift impossible by construction.
+
+    A user turn may carry audio, text, or both:
+      * audio    -> one placeholder, the shape a live turn has. Preferred when that is
+                    all there is, since this endpoint returns no transcript of the
+                    user's speech and audio keeps prosody a transcript loses.
+      * text     -> the text, no placeholder. What a caller with an existing transcript
+                    (ASR elsewhere, or a migrated text conversation) can offer, at a
+                    small fraction of the tokens and bytes.
+      * both     -> placeholder followed by the text, in one message. Content here is a
+                    plain string rather than a content-part list, so this is simply
+                    concatenation - the same rendering the chat template produces for a
+                    mixed audio+text user turn on /v1/chat/completions.
+    """
+    messages: list[dict[str, Any]] = []
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    past_audio: list[Any] = []
+    for past in history:
+        role = past.get("role") or "assistant"
+        text = past.get("content") or ""
+        if role == "user" and past.get("audio") is not None:
+            messages.append({"role": "user", "content": audio_placeholder + text})
+            past_audio.append(past["audio"])
+        else:
+            messages.append({"role": role, "content": text})
+    return messages, past_audio
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -281,6 +320,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
+        tools: list[dict[str, Any]] | None = None,
+        speaker: str | None = None,
+        instructions: str | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -295,9 +338,78 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
-        prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
+        # Prior conversation as an ordered message list. User turns carry the
+        # ORIGINAL AUDIO (`{"role": "user", "audio": ndarray}`) because this endpoint
+        # is audio-in and returns only the model's own reply text - there is no
+        # transcript of the user's speech to replay. Everything else carries text,
+        # including the `assistant` message holding a `<tool_call>` and the `tool`
+        # message holding its result: a completed tool turn has to be replayed in
+        # full or the model stops calling tools on later turns (it reads the history
+        # as "answer these from knowledge") and confabulates instead. Cheap in
+        # context: audio costs ~25 thinker tokens/second here.
+        history = list(history or [])
+        # Drop a trailing user turn with no reply yet - that is the turn being
+        # spoken now, and replaying it would duplicate the live audio.
+        while history and history[-1].get("role") == "user":
+            history.pop()
+
+        # Audio for the replayed user turns, in placeholder order. Filled by
+        # _replay_messages so it cannot drift from the placeholders it emits;
+        # stays empty when the chat-template branch below is skipped.
+        past_audio: list[np.ndarray] = []
+
+        if tools or instructions or history:
+            # Render through the model's own chat template (rather than the
+            # hardcoded f-string below) so the thinker gets the <tools>...</tools>
+            # system preamble and <tool_call></tool_call> output format it was
+            # trained on (see chat_template.json) when tools are present, an
+            # actual system message when instructions are present, and the prior
+            # turns when history is present - the same mechanisms
+            # /v1/chat/completions already supports for this checkpoint, just
+            # never previously wired into the realtime audio-in path. When all
+            # three are empty this renders byte-identical to the plain
+            # f-string below, so that path is untouched to keep this change
+            # scoped to the new capability.
+            #
+            # tokenizer.apply_chat_template() alone raises here: the tokenizer
+            # object itself has no .chat_template set. safe_apply_chat_template
+            # is the same helper vLLM's own /v1/chat/completions path uses to
+            # resolve the template from model_config before calling
+            # apply_chat_template - but its own auto-resolution
+            # (resolve_chat_template in vllm/renderers/hf.py) explicitly skips
+            # the AutoProcessor-based lookup whenever `tools` is given (its
+            # 2nd-priority path is gated on `tools is None`), and for this
+            # multimodal checkpoint the chat_template genuinely lives on the
+            # processor, not the raw tokenizer - so with tools set it falls
+            # through silently to vLLM's generic (non-tool-aware) fallback
+            # template instead of erroring. Passing the processor's own
+            # chat_template explicitly bypasses that broken auto-resolution
+            # (resolve_chat_template's 1st priority: an explicit template
+            # always wins and still respects `tools` when applying it).
+            from vllm.renderers.hf import safe_apply_chat_template
+
+            # Replay the prior messages verbatim, then the turn being spoken now.
+            messages, past_audio = _replay_messages(history, audio_placeholder, instructions)
+            messages.append({"role": "user", "content": audio_placeholder})
+
+            prompt_template = safe_apply_chat_template(
+                model_config,
+                tokenizer,
+                messages,
+                tools=tools,
+                chat_template=processor.chat_template,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        else:
+            prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
         prompt_token_ids = tokenizer.encode(prompt_template)
+        # Same shape /v1/chat/completions uses (serving_chat.py): a one-element
+        # list under "speaker" in additional_information, read back out by
+        # talker_preprocess_prefill via payload.get("speaker").
+        additional_information = {"speaker": [speaker]} if speaker else None
+        extra_prompt_kwargs = {"additional_information": additional_information} if additional_information else {}
 
         # In non-async-chunk (full-payload) mode the engine treats each
         # streaming TokensPrompt as a fresh decode, so mid-stream segment
@@ -306,6 +418,13 @@ class Qwen3OmniMoeForConditionalGeneration(
         # flush so the thinker sees one complete prompt.
         async_chunk = getattr(model_config, "async_chunk", False)
 
+        def _mm(current: np.ndarray) -> dict[str, Any]:
+            # Prior turns first, current turn last - same order as the audio
+            # placeholders rendered above. With no history keep passing the bare
+            # array rather than a 1-element list, so the existing single-turn
+            # path stays byte-identical.
+            return {"audio": [*past_audio, current] if past_audio else current}
+
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
@@ -313,14 +432,16 @@ class Qwen3OmniMoeForConditionalGeneration(
                 while (segment := buffer.read_audio()) is not None:
                     yield TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
-                        multi_modal_data={"audio": segment},
+                        multi_modal_data=_mm(segment),
+                        **extra_prompt_kwargs,
                     )
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
             yield TokensPrompt(
                 prompt_token_ids=prompt_token_ids,
-                multi_modal_data={"audio": remaining},
+                multi_modal_data=_mm(remaining),
+                **extra_prompt_kwargs,
             )
 
     # ==================== Device utilities ====================
