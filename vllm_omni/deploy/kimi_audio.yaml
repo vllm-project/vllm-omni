@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+# Kimi-Audio non-streaming deployment placeholder, not a runnable configuration.
+# Add deployment settings after the stage implementations and pipeline exist.

@@ -1,0 +1,178 @@
+{
+  "official_revision": "349251e1d8f4f98d58fda59246381faecd7392e0",
+  "hf_revision": "9a82a84c37ad9eb1307fb6ed8d7b397862ef9e6b",
+  "scope": "Official reduced networks with synthetic weights; CPU SDPA replaces FlashAttention, eager BigVGAN replaces CUDA activation.",
+  "fm_config": {
+    "normalize_mel": true,
+    "mel_mean": -4.479605,
+    "mel_std": 3.4584913,
+    "model": {
+      "dit": {
+        "chunk_params": {
+          "hz": 50,
+          "max_chunk": 3.0,
+          "max_chunk_history": 50000000,
+          "min_chunk": 0.5,
+          "need_block_shift": false
+        },
+        "condition_input_dim": 1280,
+        "condition_type": "discrete_codes",
+        "depth": 2,
+        "ffn_act_layer": "gleu_tanh",
+        "ffn_conv_kernel_size": 5,
+        "ffn_gated_glu": false,
+        "ffn_type": "vanilla_mlp",
+        "hidden_size": 32,
+        "input_size": 80,
+        "max_seq_len": 4096,
+        "mlp_ratio": 2,
+        "num_heads": 4,
+        "position_embedding_type": "skip",
+        "prompt_cfg_dropout": 0.2,
+        "rope_params": {
+          "max_position_embeddings": 4096,
+          "rope_base": 10000.0,
+          "rope_interpolation_factor": 1.0
+        },
+        "semantic_cfg_dropout": 0.2,
+        "semantic_vocab_size": 16,
+        "use_chunk_setting": true,
+        "use_rope": true
+      }
+    }
+  },
+  "vocoder_config": {
+    "resblock": "1",
+    "upsample_rates": [
+      5,
+      2,
+      2,
+      2,
+      2,
+      3,
+      2
+    ],
+    "upsample_kernel_sizes": [
+      9,
+      4,
+      4,
+      4,
+      4,
+      5,
+      4
+    ],
+    "upsample_initial_channel": 128,
+    "resblock_kernel_sizes": [
+      3
+    ],
+    "resblock_dilation_sizes": [
+      [
+        1,
+        3,
+        5
+      ]
+    ],
+    "activation": "snakebeta",
+    "snake_logscale": true,
+    "num_mels": 80,
+    "sampling_rate": 24000,
+    "hop_size": 480,
+    "use_tanh_at_final": false,
+    "use_bias_at_final": false
+  },
+  "max_kv_cache_tokens": 16,
+  "look_ahead_tokens": 2,
+  "ode_steps": 4,
+  "cases": [
+    {
+      "name": "single",
+      "chunks": [
+        [
+          0
+        ]
+      ],
+      "max_pos_size": 4096,
+      "seed": 9,
+      "positions": [
+        0
+      ],
+      "cache_lengths": [
+        0
+      ]
+    },
+    {
+      "name": "prefix",
+      "chunks": [
+        [
+          0,
+          1,
+          2,
+          3
+        ],
+        [
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        [
+          9,
+          10,
+          11
+        ]
+      ],
+      "max_pos_size": 4096,
+      "seed": 10,
+      "positions": [
+        8,
+        28,
+        0
+      ],
+      "cache_lengths": [
+        8,
+        16,
+        0
+      ]
+    },
+    {
+      "name": "rollover",
+      "chunks": [
+        [
+          0,
+          1,
+          2,
+          3
+        ],
+        [
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        [
+          9,
+          10,
+          11
+        ]
+      ],
+      "max_pos_size": 32,
+      "seed": 11,
+      "positions": [
+        8,
+        0,
+        0
+      ],
+      "cache_lengths": [
+        8,
+        0,
+        0
+      ]
+    }
+  ],
+  "full_config_meta_keys": {
+    "dit": 171,
+    "vocoder_learned": 868
+  }
+}

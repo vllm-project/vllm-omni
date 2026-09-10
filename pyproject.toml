@@ -98,6 +98,12 @@ indextts2 = [
     "WeTextProcessing; sys_platform == 'linux'",
 ]
 
+kimi-audio = [
+    "torchdyn==1.0.6",  # Preserve the official NeuralODE Euler time grid.
+    "timm>=1.0.0,<2",  # DiTPrefix's checkpoint-compatible MLP.
+    "flash-attn>=2.7.0,<3; sys_platform == 'linux'",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",
@@ -162,6 +168,7 @@ include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni.model_executor.models.kimi_audio" = ["NOTICE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+# Kimi-Audio streaming deployment placeholder, not a runnable configuration.
+# A shared pipeline may ultimately use async_chunk to switch modes in one YAML.
