@@ -634,29 +634,24 @@ def test_pure_ulysses_parallel_config_is_supported() -> None:
     assert pipeline.transformer is not None
 
 
-@pytest.mark.parametrize("degree_field", ["ring_degree", "allgather_degree"])
-def test_non_ulysses_sequence_parallelism_is_rejected(degree_field) -> None:
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sequence_parallel_size": 4, "ring_degree": 2},  # Normalized hybrid.
+        {"ulysses_degree": 1, "allgather_degree": 2},  # Normalized AllGather-KV.
+        {"ring_degree": 2},  # Isolate each clause from the SP-size mismatch.
+        {"allgather_degree": 2},
+        {"ulysses_mode": "advanced_uaa"},
+    ],
+)
+def test_unsupported_sp_config_fails_before_component_loading(overrides):
     module = _load_pipeline_module()
-    parallel_config = _od_config().parallel_config
-    parallel_config.sequence_parallel_size = 2
-    parallel_config.ulysses_degree = 2
-    # Isolate the degree checks from sequence_parallel_size != ulysses_degree.
-    setattr(parallel_config, degree_field, 2)
-
+    config = _od_config().parallel_config
+    config.sequence_parallel_size = config.ulysses_degree = 2
+    for name, value in overrides.items():
+        setattr(config, name, value)
     with pytest.raises(NotImplementedError, match="pure Ulysses"):
-        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
-
-
-def test_advanced_uaa_is_rejected_before_component_loading() -> None:
-    module = _load_pipeline_module()
-    parallel_config = _od_config().parallel_config
-    parallel_config.sequence_parallel_size = 5
-    parallel_config.ulysses_degree = 5
-    parallel_config.ulysses_mode = "advanced_uaa"
-
-    with pytest.raises(NotImplementedError, match="advanced_uaa"):
-        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
-
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
     assert module._loader_state.prefetch_calls == []
 
 
@@ -2092,14 +2087,3 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert "from .pipeline import" in lingbot_init
     assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
     assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init
-
-
-@pytest.mark.parametrize("parallel_kwargs", [{"ulysses_degree": 2, "ring_degree": 2}, {"allgather_degree": 2}])
-def test_normalized_hybrid_and_allgather_configs_fail_before_loading(parallel_kwargs):
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-    module = _load_pipeline_module()
-    config = DiffusionParallelConfig(**parallel_kwargs)
-    with pytest.raises(NotImplementedError, match="pure Ulysses"):
-        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
-    assert module._loader_state.prefetch_calls == []
