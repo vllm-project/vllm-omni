@@ -91,6 +91,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     invalid_logits_req_ids: set[str] = field(default_factory=set)
     # Request-local model failures, materialized after asynchronous D2H.
     request_errors: dict[str, str] | None = None
+    # Serialized request generators after P accepts the first token.
+    pd_rng_states: dict[str, bytes] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

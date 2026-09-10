@@ -45,13 +45,8 @@ stages:
       kv_ip: "127.0.0.1"
       kv_connector_extra_config:
         mooncake_bootstrap_port: 25201
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1
-      top_k: -1
-      max_tokens: 1
-      detokenize: false
-      skip_special_tokens: false
+    # P derives logical sampling defaults and request overrides from D.
+    # The scheduler stops P after one accepted sample.
 
   - stage_id: 1
     devices: "2,3"
@@ -81,6 +76,7 @@ stages:
       to_stage_2: rdma_connector
     default_sampling_params:
       temperature: 0.0
+      seed: 42
       top_p: 1
       top_k: -1
       max_tokens: 8192
