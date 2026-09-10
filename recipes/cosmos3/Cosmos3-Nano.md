@@ -115,6 +115,57 @@ shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
 
+### RTX 4080 Super 16GB (T2I low-VRAM validation)
+
+The following low-VRAM recipe has been validated for text-to-image serving on a
+single RTX 4080 Super 16GB. This is not yet a blanket validation for the video,
+audio, or action modes in this recipe.
+
+Tested environment:
+
+- GPU: NVIDIA RTX 4080 Super 16GB
+- Host: WSL2 with `memory=24GB` and `swap=8GB`
+- API path: `POST /v1/images/generations`
+- Guardrails: disabled with `--no-guardrails`
+
+```bash
+TORCHDYNAMO_DISABLE=1 \
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --no-guardrails \
+  --enable-layerwise-offload \
+  --disable-multithread-weight-load \
+  --cpu-offload-gb 4 \
+  --quantization fp8_per_block \
+  --gpu-memory-utilization 0.60 \
+  --vae-use-slicing \
+  --vae-use-tiling \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --init-timeout 1800
+```
+
+Validation run:
+
+| Metric | Value |
+|---|---:|
+| Server ready time | 414.9 s |
+| T2I request latency | 19.77 s |
+| Startup peak VRAM | 15.62 GiB |
+| Startup WSL RAM | 19.55 GiB |
+| Response | HTTP 200, valid 1024x1024 PNG |
+
+Notes:
+
+- `TORCHDYNAMO_DISABLE=1` avoids an observed Torch Dynamo/Inductor compile
+  failure in the online per-block FP8 cast path.
+- `--disable-multithread-weight-load` limits concurrent host allocations while
+  loading model shards in the constrained WSL2 memory envelope.
+- The WSL2 memory cap matters: a smaller local WSL memory envelope around
+  15 GiB killed the diffusion worker during startup.
+- Output quality and prompt following should still be evaluated separately for
+  production use.
+
 #### Verification
 
 Best quality uses the JSON-upsampled prompts from `assets/` (download with
