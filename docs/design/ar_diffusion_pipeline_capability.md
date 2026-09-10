@@ -152,6 +152,11 @@ class WorldPipeline:
         self.model_states.pop(session_id, None)
 ```
 
+`ARDiffusionKVCacheSpec.cross_attention_num_kv_heads` optionally sets the local
+head count for static cross-attention pools and their memory budget. It defaults
+to `num_kv_heads`; LingBot overrides it because SP shards self-attention heads
+but replicates TP-local text heads.
+
 The model writes/reads named cross-attention KV through the bound state and uses
 the `"main"` KV branch for paged self-attention. Pipelines without a warmup
 provider are loaded normally and skip AR rollout warmup.

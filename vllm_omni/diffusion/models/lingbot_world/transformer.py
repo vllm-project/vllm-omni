@@ -421,13 +421,6 @@ class LingBotCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.num_local_heads = num_heads // tp_size
-        self.ulysses_world_size, self.ulysses_rank, self.ulysses_group = _ulysses_state()
-        if self.num_local_heads % self.ulysses_world_size:
-            raise ValueError(
-                "LingBot local cross-attention heads must be divisible by the Ulysses degree: "
-                f"heads={self.num_local_heads}, ulysses={self.ulysses_world_size}."
-            )
-        self.num_sp_heads = self.num_local_heads // self.ulysses_world_size
         self.tp_inner_dim = self.num_local_heads * self.head_dim
 
         self.q = ColumnParallelLinear(
@@ -465,9 +458,9 @@ class LingBotCrossAttention(nn.Module):
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
         self.norm_k = _LingBotRMSNorm(self.tp_inner_dim, eps)
         self.attn = Attention(
-            num_heads=self.num_sp_heads,
+            num_heads=self.num_local_heads,
             head_size=self.head_dim,
-            num_kv_heads=self.num_sp_heads,
+            num_kv_heads=self.num_local_heads,
             softmax_scale=self.head_dim**-0.5,
             causal=False,
             role="cross",
@@ -476,14 +469,6 @@ class LingBotCrossAttention(nn.Module):
             skip_sequence_parallel=True,
             disable_kv_quant=True,
         )
-
-    def shard_kv_heads(self, value: torch.Tensor) -> torch.Tensor:
-        """Select this Ulysses rank's projected K/V heads."""
-
-        if self.ulysses_world_size == 1:
-            return value
-        start = self.ulysses_rank * self.num_sp_heads
-        return value[:, :, start : start + self.num_sp_heads].clone(memory_format=torch.contiguous_format)
 
     def forward(
         self,
@@ -494,17 +479,15 @@ class LingBotCrossAttention(nn.Module):
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         query = self.norm_q(self.q(hidden_states))
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
-        if self.ulysses_world_size > 1:
-            query = SeqAllToAll4D.apply(self.ulysses_group, query, 2, 1, False)
 
-        # Text K/V is constant within a request and is projected once per layer.
+        # Keep all TP-local text heads on each SP rank; local queries need no exchange.
         if cache is None:
             if encoder_hidden_states is None:
                 raise ValueError("encoder_hidden_states are required when the cross-attention cache is empty.")
             key = self.norm_k(self.k(encoder_hidden_states))
             value = self.v(encoder_hidden_states)
-            key = self.shard_kv_heads(key.unflatten(2, (self.num_local_heads, self.head_dim)))
-            value = self.shard_kv_heads(value.unflatten(2, (self.num_local_heads, self.head_dim)))
+            key = key.unflatten(2, (self.num_local_heads, self.head_dim))
+            value = value.unflatten(2, (self.num_local_heads, self.head_dim))
             cache = LingBotAttentionCache(
                 key=key,
                 value=value,
@@ -517,8 +500,6 @@ class LingBotCrossAttention(nn.Module):
             value = cache.value[:, : cache.end]
 
         output = self.attn(query, key, value)
-        if self.ulysses_world_size > 1:
-            output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
         return self.o(output.flatten(2, 3)), cache
 
 
@@ -713,13 +694,26 @@ class _LingBotHead(nn.Module):
         self,
         hidden_states: torch.Tensor,
         timestep_embedding: torch.Tensor,
+        *,
+        tokens_per_frame: int | None = None,
+        token_offset: int = 0,
     ) -> torch.Tensor:
         num_frames = timestep_embedding.shape[1]
-        tokens_per_frame = hidden_states.shape[1] // num_frames
         modulation = self.modulation.unsqueeze(1) + timestep_embedding.unsqueeze(2).float()
         shift, scale = modulation.chunk(2, dim=2)
-        normalized = self.norm(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
-        normalized = (normalized * (1 + scale) + shift).flatten(1, 2).to(hidden_states.dtype)
+        normalized = self.norm(hidden_states.float())
+        if tokens_per_frame is None:
+            normalized = normalized.unflatten(1, (num_frames, -1))
+            normalized = (normalized * (1 + scale) + shift).flatten(1, 2)
+        else:
+            # A sequence shard can begin/end inside a frame.
+            frames = (
+                torch.arange(hidden_states.shape[1], device=hidden_states.device) + token_offset
+            ) // tokens_per_frame
+            scale = scale.squeeze(2).index_select(1, frames)
+            shift = shift.squeeze(2).index_select(1, frames)
+            normalized = normalized * (1 + scale) + shift
+        normalized = normalized.to(hidden_states.dtype)
         return self.head(normalized)
 
 
@@ -1272,12 +1266,17 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             )
             cache.cross_attention[index] = cross_cache
 
-        # Phase 4: gather SP shards, map tokens to per-patch 16-channel flow
-        # values, and restore [B, C, F, H, W] for the Pipeline's sampler.
+        # Phase 4: project local tokens before gathering the much narrower flow values.
+        hidden_states = self.head(
+            hidden_states,
+            timestep_embedding,
+            tokens_per_frame=tokens_per_frame if sp_size > 1 else None,
+            token_offset=get_sp_group().ulysses_rank * (global_tokens // sp_size) if sp_size > 1 else 0,
+        )
         hidden_states = self.sp_output_gather(hidden_states)
-        if sp_size > 1 and hidden_states.shape != (batch_size, global_tokens, hidden_dim):
-            raise RuntimeError("LingBot SP output hook did not gather the full token sequence.")
-        hidden_states = self.head(hidden_states, timestep_embedding)
+        projected_dim = self.config.out_channels * math.prod(self.config.patch_size)
+        if sp_size > 1 and hidden_states.shape != (batch_size, global_tokens, projected_dim):
+            raise RuntimeError("LingBot SP output hook did not gather the full projected token sequence.")
         return self._unpatchify(
             hidden_states,
             batch_size=batch_size,

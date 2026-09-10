@@ -833,6 +833,8 @@ def _rollout(model, mode, dtype, batch):
             session_capacity=1,
             frames_per_block=_FRAMES,
             max_scratch_tokens_per_branch=_FRAMES * _TOKENS_PER_FRAME,
+            cross_attention_lengths={"text": 5},
+            cross_attention_num_kv_heads=model.blocks[0].cross_attn.num_local_heads,
             device=device,
         )
         state = ARDiffusionKVState(kv, "numeric", {"main": kv.begin_request("numeric")}, num_layers=_LAYERS)
@@ -855,7 +857,7 @@ def _rollout(model, mode, dtype, batch):
                     )
                 output = model(
                     latent,
-                    torch.full((batch,), 500.0, device=device),
+                    torch.tensor([100.0, 400.0, 900.0], device=device).expand(batch, -1),
                     text,
                     camera,
                     cache=cache,
@@ -864,6 +866,14 @@ def _rollout(model, mode, dtype, batch):
                 )
                 outputs.append(output.float().cpu())
                 if state is not None:
+                    if not state.is_cross_attention_populated("main", "text"):
+                        state.populate_cross_attention(
+                            "main", "text", [(layer.key, layer.value) for layer in cache.cross_attention]
+                        )
+                        for layer, pool in zip(
+                            cache.cross_attention, state.get_cross_attention_kv("main", "text"), strict=True
+                        ):
+                            layer.key, layer.value = pool["k"], pool["v"]
                     state.commit_paged_context("main")
         cross = [
             (layer.key.detach().float().cpu(), layer.value.detach().float().cpu()) for layer in cache.cross_attention
@@ -884,7 +894,6 @@ def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
         destroy_model_parallel,
-        get_sp_group,
         init_distributed_environment,
         initialize_model_parallel,
     )
@@ -936,11 +945,8 @@ def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
                         bound = 1e-5 if dtype == torch.float32 else 1e-2
                         error = (result - expected).double().norm() / expected.double().norm()
                         assert error <= bound, f"rank={rank}, TP{tp} SP{sp}: relative L2 {error.item():.3g} > {bound}"
-                        local_heads = _HEADS // tp // sp
-                        first = (
-                            get_tensor_model_parallel_rank() * (_HEADS // tp)
-                            + get_sp_group().ulysses_rank * local_heads
-                        )
+                        local_heads = _HEADS // tp
+                        first = get_tensor_model_parallel_rank() * local_heads
                         for (k, v), (ek, ev) in zip(cross, expected_cross, strict=True):
                             tolerance = 1e-5 if dtype == torch.float32 else 2e-2
                             torch.testing.assert_close(

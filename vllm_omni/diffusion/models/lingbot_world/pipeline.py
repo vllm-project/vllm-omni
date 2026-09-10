@@ -210,7 +210,7 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
         if size > 1:
             raise NotImplementedError(f"LingBot World v1 does not support {feature} ({field}={size}).")
     sequence_parallel_size = getattr(parallel_config, "sequence_parallel_size", 1) or 1
-    ulysses_degree = getattr(parallel_config, "ulysses_degree", sequence_parallel_size) or 1
+    ulysses_degree = getattr(parallel_config, "ulysses_degree", 1) or 1
     ring_degree = getattr(parallel_config, "ring_degree", 1) or 1
     allgather_degree = getattr(parallel_config, "allgather_degree", 1) or 1
     ulysses_mode = getattr(parallel_config, "ulysses_mode", "strict")
@@ -571,7 +571,10 @@ class LingBotWorldCausalDMDPipeline(
         latent_height = self._ar_height // spatial
         latent_width = self._ar_width // spatial
         tokens_per_frame = (latent_height // patch_height) * (latent_width // patch_width)
-        num_local_heads = self.transformer.blocks[0].self_attn.num_sp_heads
+        parallel_config = self.od_config.parallel_config
+        tp_size = getattr(parallel_config, "tensor_parallel_size", 1)
+        ulysses_degree = getattr(parallel_config, "ulysses_degree", 1) or 1
+        num_tp_heads = int(self.transformer.config.num_attention_heads) // tp_size
         total_window_frames = (
             int(self.transformer.config.local_attn_size)
             if int(self.transformer.config.local_attn_size) != -1
@@ -592,7 +595,7 @@ class LingBotWorldCausalDMDPipeline(
         )
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
-            num_kv_heads=num_local_heads,
+            num_kv_heads=num_tp_heads // ulysses_degree,
             head_size=int(self.transformer.config.attention_head_dim),
             tokens_per_frame=tokens_per_frame,
             frames_per_block=int(self.transformer.config.num_frames_per_block),
@@ -607,6 +610,7 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             ),
             model_owned_state_bytes_per_session=condition_bytes_per_session,
+            cross_attention_num_kv_heads=num_tp_heads,
         )
 
     @contextmanager
@@ -973,24 +977,9 @@ class LingBotWorldCausalDMDPipeline(
             def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
                 for block in self.transformer.blocks:
                     cross_attention = block.cross_attn
-                    key = cross_attention.shard_kv_heads(
-                        cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
-                            2,
-                            (
-                                cross_attention.num_local_heads,
-                                cross_attention.head_dim,
-                            ),
-                        )
-                    )
-                    value = cross_attention.shard_kv_heads(
-                        cross_attention.v(projected_text).unflatten(
-                            2,
-                            (
-                                cross_attention.num_local_heads,
-                                cross_attention.head_dim,
-                            ),
-                        )
-                    )
+                    shape = (cross_attention.num_local_heads, cross_attention.head_dim)
+                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
+                    value = cross_attention.v(projected_text).unflatten(2, shape)
                     yield key, value
 
             state.populate_cross_attention(

@@ -126,8 +126,6 @@ class _RecordingTransformer(nn.Module):
             sink_size=3,
         )
         self.blocks = nn.ModuleList([nn.Identity(), nn.Identity()])
-        for block in self.blocks:
-            block.self_attn = SimpleNamespace(num_local_heads=2, num_sp_heads=2, head_dim=4)
         self.calls: list[dict] = []
         self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
@@ -441,14 +439,19 @@ def test_pipeline_respects_loader_managed_component_placement(offload_field: str
     assert getattr(pipeline.vae, "to_calls", []) == []
 
 
-def test_ar_diffusion_capability_uses_transformer_local_head_geometry() -> None:
+@pytest.mark.parametrize(("tp_size", "sp_size"), [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_ar_diffusion_capability_uses_config_local_head_geometry(tp_size, sp_size) -> None:
     module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-
+    config = _od_config()
+    config.parallel_config.tensor_parallel_size = tp_size
+    config.parallel_config.sequence_parallel_size = config.parallel_config.ulysses_degree = sp_size
+    pipeline = _pipeline(module, od_config=config)
+    pipeline.transformer.config.num_attention_heads = 8
     spec = pipeline.ar_diffusion_kv_cache_spec()
 
     assert spec.num_layers == 2
-    assert spec.num_kv_heads == 2
+    assert spec.num_kv_heads == 8 // tp_size // sp_size
+    assert spec.cross_attention_num_kv_heads == 8 // tp_size
     assert spec.head_size == 4
     assert spec.tokens_per_frame == 1
     assert spec.frames_per_block == 3
@@ -642,6 +645,7 @@ def test_pure_ulysses_parallel_config_is_supported() -> None:
         {"ring_degree": 2},  # Isolate each clause from the SP-size mismatch.
         {"allgather_degree": 2},
         {"ulysses_mode": "advanced_uaa"},
+        {"ulysses_degree": None},  # Missing degree must not imply pure Ulysses.
     ],
 )
 def test_unsupported_sp_config_fails_before_component_loading(overrides):
@@ -649,7 +653,10 @@ def test_unsupported_sp_config_fails_before_component_loading(overrides):
     config = _od_config().parallel_config
     config.sequence_parallel_size = config.ulysses_degree = 2
     for name, value in overrides.items():
-        setattr(config, name, value)
+        if value is None:
+            delattr(config, name)
+        else:
+            setattr(config, name, value)
     with pytest.raises(NotImplementedError, match="pure Ulysses"):
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
     assert module._loader_state.prefetch_calls == []
