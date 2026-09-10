@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -168,7 +168,7 @@ def test_postprocess_preserves_image_contract_for_serving():
         format_diffusion_outputs,
         normalize_diffusion_postprocess_output,
     )
-    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
+    from vllm_omni.entrypoints.openai.images.helpers import _extract_images_from_result
 
     sampling = OmniDiffusionSamplingParams(
         num_inference_steps=1,

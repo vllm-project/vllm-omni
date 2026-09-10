@@ -50,6 +50,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_SINGLE_STAGE_PIPELINE,
     BAGEL_THINK_PIPELINE,
 )
+from vllm_omni.model_executor.models.cosmos3.pipeline import COSMOS3_POLICY_PIPELINE
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dots_tts.pipeline import DOTS_TTS_PIPELINE
@@ -158,6 +159,11 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # selected only by an explicit `pipeline: cosmos3_omni_disagg` in the deploy
     # YAML (see cosmos3_pipeline_config for why it declares no architectures).
     "cosmos3_omni_disagg": COSMOS3_DISAGG_PIPELINE,
+    # Cosmos3 policy checkpoints share HF metadata with the T2I/video Cosmos3
+    # checkpoints (which stay on the single-stage diffusion fallback), so this
+    # entry is only reachable through a deploy yaml's ``pipeline:`` key
+    # (see deploy/cosmos3_policy_droid.yaml).
+    "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,

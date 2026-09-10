@@ -54,7 +54,7 @@ from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
-from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+from vllm_omni.inputs.preprocess import build_omni_renderer, omni_renderer_cls
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
@@ -1549,25 +1549,24 @@ class _TokenOnlyRenderer(BaseRenderer):
 
 
 def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
-    return _TokenOnlyRenderer(stage_vllm_config, tokenizer=None)
+    return omni_renderer_cls(_TokenOnlyRenderer)(stage_vllm_config, tokenizer=None)
 
 
 def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
-    """Build the shared stage-0 input processor."""
+    """Build the shared stage-0 input processor.
+
+    The renderer is the Omni subclass of the upstream renderer class that
+    ``renderer_from_config`` would have picked (or of the token-only renderer
+    when the stage skips tokenizer initialization), so upstream's
+    ``InputProcessor`` runs unmodified on top of it.
+    """
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
     if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
-        input_processor = InputProcessor(
-            vllm_config=stage_vllm_config,
-            renderer=_build_token_only_renderer(stage_vllm_config),
-        )
+        renderer = _build_token_only_renderer(stage_vllm_config)
     else:
-        input_processor = InputProcessor(vllm_config=stage_vllm_config)
-    input_processor.input_preprocessor = OmniInputPreprocessor(
-        vllm_config=stage_vllm_config,
-        renderer=input_processor.renderer,
-    )
-    return input_processor
+        renderer = build_omni_renderer(stage_vllm_config)
+    return InputProcessor(vllm_config=stage_vllm_config, renderer=renderer)
 
 
 def device_init_lock_path(device_id: int, lock_dir: str = "/tmp") -> str:

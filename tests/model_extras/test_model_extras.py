@@ -177,6 +177,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
             "resolution",
             "image_size",
             "use_state",
+            "format_prompt_as_json",
             "observation",
             "robot_obs",
             "deterministic_seed",
