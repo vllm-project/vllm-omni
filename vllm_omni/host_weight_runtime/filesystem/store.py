@@ -23,7 +23,7 @@ import regex as re
 import torch
 from safetensors import SafetensorError, safe_open
 
-from ..config import CapacityPolicy, IntegrityPolicy, StorageClass, StorageDomainPolicy, ValidationLevel
+from ..config import CapacityPolicy, IntegrityPolicy, StorageClass, StorageDomainPolicy, ValidationLevel, WaitPolicy
 from ..errors import FailureCode, HostWeightError, HostWeightFailure, ResolutionStage
 from ..identity import CanonicalJson, WeightArtifactIdentity, canonical_json
 from ..inspection import (
@@ -429,6 +429,8 @@ class FilesystemHostWeightStore:
         domain: StorageDomainPolicy,
         capacity: CapacityPolicy,
         integrity: IntegrityPolicy,
+        *,
+        wait: WaitPolicy = WaitPolicy(),
     ) -> None:
         self.domain_policy = domain
         self.capacity_policy = capacity
@@ -464,7 +466,7 @@ class FilesystemHostWeightStore:
                 )
             )
         try:
-            self._initialize_domain()
+            self._initialize_domain(deadline=time.monotonic() + wait.coordination_timeout_seconds)
         except HostWeightError:
             raise
         except OSError as exc:
@@ -485,7 +487,7 @@ class FilesystemHostWeightStore:
                 )
             ) from exc
 
-    def _initialize_domain(self) -> None:
+    def _initialize_domain(self, *, deadline: float) -> None:
         try:
             self.filesystem_type = detect_filesystem_type(self.root)
             detected_storage_class = _storage_class_for_filesystem_type(self.filesystem_type)
@@ -545,7 +547,7 @@ class FilesystemHostWeightStore:
                         )
                     )
 
-        with FileLock(self.locks_dir / "domain-init.lock", exclusive=True, deadline=None):
+        with FileLock(self.locks_dir / "domain-init.lock", exclusive=True, deadline=deadline):
             domain_path = self.root / _DOMAIN_FILE
             if domain_path.exists():
                 domain_metadata = _read_json_file(domain_path)
