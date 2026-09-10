@@ -71,6 +71,24 @@ def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict
     return result
 
 
+def build_parallel_knob_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Forward explicitly-set parallel knobs so they can override a deploy YAML.
+
+    The argparse defaults are ``None``; only explicitly supplied values enter
+    the returned dict, letting a deploy YAML's parallel_config stay in effect
+    when the flags are omitted (and letting explicit values equal to the old
+    argparse defaults, e.g. ``--ulysses-degree 1``, still override the YAML).
+    """
+    knob_names = (
+        "ulysses_degree",
+        "ring_degree",
+        "ulysses_mode",
+        "cfg_parallel_size",
+        "vae_patch_parallel_size",
+    )
+    return {name: getattr(args, name) for name in knob_names if getattr(args, name) is not None}
+
+
 def _normalize_images_for_save(images: list[Any]) -> list[Any]:
     """Convert NumPy diffusion outputs to PIL images before saving."""
     normalized = []
@@ -82,7 +100,8 @@ def _normalize_images_for_save(images: list[Any]) -> list[Any]:
     return normalized
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the example's CLI parser (kept separate for testability)."""
     parser = argparse.ArgumentParser(description="Generate an image with supported diffusion models.")
     parser.add_argument(
         "--model",
@@ -161,28 +180,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ulysses-degree",
         type=int,
-        default=1,
-        help="Number of GPUs used for ulysses sequence parallelism.",
+        default=None,
+        help="Number of GPUs used for ulysses sequence parallelism. "
+        "Explicitly passing 1 overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--ulysses-mode",
         type=str,
-        default="strict",
+        default=None,
         choices=["strict", "advanced_uaa"],
-        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA). "
+        "Explicitly passing 'strict' overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--ring-degree",
         type=int,
-        default=1,
-        help="Number of GPUs used for ring sequence parallelism.",
+        default=None,
+        help="Number of GPUs used for ring sequence parallelism. Explicitly passing 1 overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--cfg-parallel-size",
         type=int,
-        default=1,
+        default=None,
         choices=[1, 2],
-        help="Number of GPUs used for classifier free guidance parallel size.",
+        help="Number of GPUs used for classifier free guidance parallel size. "
+        "Explicitly passing 1 overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--enforce-eager",
@@ -291,8 +313,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
-        default=1,
-        help="Number of ranks used for VAE patch/tile parallelism (decode/encode).",
+        default=None,
+        help="Number of ranks used for VAE patch/tile parallelism (decode/encode). "
+        "Explicitly passing 1 overrides a deploy YAML value.",
     )
     # NextStep-1.1 specific arguments
     parser.add_argument(
@@ -398,7 +421,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     current_omni_platform.pre_register_and_update(parser)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def _apply_ar_stage_inputs(
@@ -588,16 +615,7 @@ def main():
         omni_kwargs["enable_cache_dit_summary"] = True
     if args.enable_diffusion_pipeline_profiler:
         omni_kwargs["enable_diffusion_pipeline_profiler"] = True
-    if args.ulysses_degree and args.ulysses_degree > 1:
-        omni_kwargs["ulysses_degree"] = args.ulysses_degree
-    if args.ring_degree and args.ring_degree > 1:
-        omni_kwargs["ring_degree"] = args.ring_degree
-    if args.ulysses_mode != "strict":
-        omni_kwargs["ulysses_mode"] = args.ulysses_mode
-    if args.cfg_parallel_size and args.cfg_parallel_size > 1:
-        omni_kwargs["cfg_parallel_size"] = args.cfg_parallel_size
-    if args.vae_patch_parallel_size and args.vae_patch_parallel_size > 1:
-        omni_kwargs["vae_patch_parallel_size"] = args.vae_patch_parallel_size
+    omni_kwargs.update(build_parallel_knob_kwargs(args))
 
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
@@ -617,11 +635,17 @@ def main():
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
     tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
+
+    def _knob_display(value: Any, default: Any) -> Any:
+        return value if value is not None else f"deploy/default ({default})"
+
     print(
         f"  Parallel configuration: tensor_parallel_size={tp_display}, "
-        f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
-        f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
-        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
+        f"ulysses_degree={_knob_display(args.ulysses_degree, 1)}, "
+        f"ulysses_mode={_knob_display(args.ulysses_mode, 'strict')}, "
+        f"ring_degree={_knob_display(args.ring_degree, 1)}, "
+        f"cfg_parallel_size={_knob_display(args.cfg_parallel_size, 1)}, "
+        f"vae_patch_parallel_size={_knob_display(args.vae_patch_parallel_size, 1)}, "
         f"enable_expert_parallel={args.enable_expert_parallel}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
