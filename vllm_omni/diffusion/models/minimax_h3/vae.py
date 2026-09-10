@@ -190,8 +190,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.use_slicing = False
         self.parallel_size = 1
         self.device_module = torch.get_device_module()
-        self._tile_gather_buffers: dict[tuple[Any, ...], torch.Tensor] = {}
-        self._tile_gather_stats = {"hits": 0, "allocs": 0, "bytes": 0}
+        self._tile_gather_workspace: torch.Tensor | None = None
+        self._tile_gather_stats = {"hits": 0, "allocs": 0, "workspace_bytes": 0}
         self._checkpoint_tile_gather = None
         if self._tile_gather_reuse_enabled():
             self._install_persistent_tile_gather()
@@ -261,27 +261,36 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         return parallel_module.get_parallel_state()
 
     def _tile_gather_reuse_enabled(self) -> bool:
-        """Whether this device needs the tiled-VAE gather buffer pinned.
+        """Whether this device needs the tiled-VAE gather address kept stable.
 
         XPU only. The accumulation this guards against is an XCCL-side
         registration that is kept for every distinct receive-buffer address and
         never reclaimed; no other backend in tree does that, so everywhere else
         the checkpoint's own method is left in place and behaviour is unchanged.
+        The stable address comes from one grow-only byte workspace, so what the
+        adapter holds resident is one buffer for the largest geometry it has
+        seen rather than one per geometry.
         """
 
         return self._device_target.type == "xpu"
 
     def _install_persistent_tile_gather(self) -> None:
-        """Route the checkpoint's tiled-VAE gather through a pinned buffer.
+        """Route the checkpoint's tiled-VAE gather through a bounded workspace.
 
         The checkpoint's ``_all_gather_tiled_results`` allocates its gather
         output afresh on every call. Model-level offload calls ``empty_cache()``
         once per request, so the next request's output lands on a new device
         address; XCCL registers a non-reclaimable resource per new receive
         address, and the registrations accumulate until the card is full. The
-        replacement below keeps one landing buffer per (shape, dtype, device)
-        alive on this adapter, so the address the collective writes to is the
-        same one every request.
+        replacement below keeps a single byte workspace alive on this adapter
+        and carves every gather out of its front, so the address the collective
+        writes to is the same one every request.
+
+        The workspace only ever grows: a geometry that fits in the current
+        block reuses it as is, and a larger one replaces the block, which
+        drops the previous allocation before allocating its own. Resident
+        memory is therefore bounded by one buffer for the largest geometry the
+        adapter has seen, not by one buffer per distinct geometry.
 
         The override is bound on the checkpoint *instance*, not its class: the
         class is remote code shared by every component loaded from the same
@@ -310,8 +319,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         so every rank can compute every other rank's task count from
         ``num_tiles`` and ``sp_size`` alone. That makes the per-rank payloads
         equal once the leading task dimension is padded to ``max_tasks``, which
-        is what lets a single ``all_gather_into_tensor`` into a pinned buffer
+        is what lets a single ``all_gather_into_tensor`` into a stable buffer
         replace the variable-shape gather.
+
+        The landing buffer is a view onto the front of one byte workspace that
+        this adapter keeps alive and only ever grows, so its address stays
+        stable across requests while resident memory stays bounded by the
+        largest geometry seen rather than growing per geometry. A byte
+        workspace is dtype-agnostic, so mixed-precision requests share it too.
 
         Returned tiles are cloned out of the buffer: the buffer is overwritten
         by the next call and callers hold the tiles past that point.
@@ -342,17 +357,22 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             torch.stack(tasks, dim=0, out=stacked[: len(tasks)])
             stacked[len(tasks) :].zero_()
 
-        key = (tuple(stacked.shape), stacked.dtype, str(stacked.device))
-        buffer = self._tile_gather_buffers.get(key)
-        if buffer is None:
-            buffer = stacked.new_empty((sp_size, *stacked.shape))
-            self._tile_gather_buffers[key] = buffer
+        need_bytes = sp_size * stacked.numel() * stacked.element_size()
+        workspace = self._tile_gather_workspace
+        if workspace is None or workspace.device != stacked.device or workspace.numel() < need_bytes:
+            # Drop the previous block before allocating its replacement so the
+            # two are never resident at once; only one workspace is ever held.
+            workspace = None
+            self._tile_gather_workspace = None
+            workspace = torch.empty(need_bytes, dtype=torch.uint8, device=stacked.device)
+            self._tile_gather_workspace = workspace
             self._tile_gather_stats["allocs"] += 1
-            self._tile_gather_stats["bytes"] += buffer.numel() * buffer.element_size()
+            self._tile_gather_stats["workspace_bytes"] = need_bytes
             reuse = "alloc"
         else:
             self._tile_gather_stats["hits"] += 1
             reuse = "hit"
+        buffer = workspace[:need_bytes].view(stacked.dtype).view(sp_size, *stacked.shape)
         # Quantities, not just presence: a line that only says "installed"
         # cannot distinguish a buffer that is being reused from one that is
         # reallocated every request, which is the whole failure being fixed.
@@ -360,14 +380,15 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # per request on the canonical 1344x768 geometry) and the one-shot
         # "installed" line above is what an operator needs at info level.
         logger.debug(
-            "[H3_VAE_GATHER] reuse=%s key=%s/%s buf_ptr=0x%x hits=%d allocs=%d resident_mib=%.2f",
+            "[H3_VAE_GATHER] reuse=%s shape=%s/%s need_mib=%.2f workspace_mib=%.2f buf_ptr=0x%x hits=%d allocs=%d",
             reuse,
             tuple(stacked.shape),
             stacked.dtype,
-            buffer.data_ptr(),
+            need_bytes / (1024.0 * 1024.0),
+            self._tile_gather_stats["workspace_bytes"] / (1024.0 * 1024.0),
+            workspace.data_ptr(),
             self._tile_gather_stats["hits"],
             self._tile_gather_stats["allocs"],
-            self._tile_gather_stats["bytes"] / (1024.0 * 1024.0),
         )
         dist.all_gather_into_tensor(buffer, stacked, group=group)
 

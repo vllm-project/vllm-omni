@@ -82,9 +82,19 @@ def _peer_stacks(all_tiles, num_tiles, sp_size):
     return stacks
 
 
-def _tiles(num_tiles, seed=0):
+def _tiles(num_tiles, seed=0, dtype=torch.float32):
     generator = torch.Generator().manual_seed(seed)
-    return [torch.rand(TILE, generator=generator) for _ in range(num_tiles)]
+    return [torch.rand(TILE, generator=generator).to(dtype) for _ in range(num_tiles)]
+
+
+def _workspace_bytes(num_tiles, sp_size, dtype=torch.float32):
+    """Bytes one gather needs: ``sp_size`` copies of the padded local stack."""
+    max_tasks = -(-num_tiles // sp_size)
+    element_size = torch.empty(0, dtype=dtype).element_size()
+    numel = 1
+    for dim in TILE:
+        numel *= dim
+    return sp_size * max_tasks * numel * element_size
 
 
 @pytest.fixture
@@ -154,8 +164,8 @@ def _vae(sp_size, sp_rank=0):
     vae.remote = type("Remote", (), {"__module__": "fake_gather_ckpt.klvae"})()
     vae.model = _FakeCheckpointModel()
     vae._device_target = torch.device("xpu")
-    vae._tile_gather_buffers = {}
-    vae._tile_gather_stats = {"hits": 0, "allocs": 0, "bytes": 0}
+    vae._tile_gather_workspace = None
+    vae._tile_gather_stats = {"hits": 0, "allocs": 0, "workspace_bytes": 0}
     vae._checkpoint_tile_gather = None
     vae._install_persistent_tile_gather()
     return vae
@@ -167,8 +177,10 @@ def _run(vae, calls, all_tiles, num_tiles, sp_size, sp_rank):
 
 
 # --------------------------------------------------------------------------
-# The address is pinned across calls. This is what the accumulation is about:
-# drop the dictionary lookup and every call registers a new receive address.
+# The address is stable across calls. This is what the accumulation is about:
+# drop the workspace and every call registers a new receive address. And the
+# workspace is one grow-only block, so varying request geometries cannot keep
+# adding resident buffers the way a per-geometry cache would.
 # --------------------------------------------------------------------------
 
 
@@ -180,15 +192,16 @@ def test_the_landing_buffer_address_is_stable_across_calls(fake_collective):
         pointers.append(fake_collective[-1]["buf_ptr"])
 
     assert len(set(pointers)) == 1, f"gather buffer moved across calls: {pointers}"
-    buffer = next(iter(vae._tile_gather_buffers.values()))
     assert vae._tile_gather_stats == {
         "hits": 2,
         "allocs": 1,
-        "bytes": buffer.numel() * buffer.element_size(),
+        "workspace_bytes": _workspace_bytes(8, 4),
     }
+    assert vae._tile_gather_workspace.numel() == _workspace_bytes(8, 4)
+    assert vae._tile_gather_workspace.dtype is torch.uint8
 
 
-def test_each_distinct_shape_gets_its_own_pinned_buffer(fake_collective):
+def test_distinct_shapes_share_the_one_workspace(fake_collective):
     """One decode gathers several temporal clips, and the head/tail clips differ."""
     vae = _vae(4)
     _run(vae, fake_collective, _tiles(8), 8, 4, 0)
@@ -198,10 +211,90 @@ def test_each_distinct_shape_gets_its_own_pinned_buffer(fake_collective):
     _run(vae, fake_collective, _tiles(8, seed=5), 8, 4, 0)
     third = fake_collective[-1]["buf_ptr"]
 
-    assert first != second
-    assert third == first
+    # The larger geometry did not fit, so the block was replaced -- not added to.
+    assert second == third
     assert vae._tile_gather_stats["allocs"] == 2
     assert vae._tile_gather_stats["hits"] == 1
+    assert vae._tile_gather_stats["workspace_bytes"] == _workspace_bytes(12, 4)
+    # ``first`` is deliberately not compared: the replaced block is freed, so
+    # the allocator is free to hand its address back for the larger one.
+    assert isinstance(first, int)
+
+
+def test_workspace_is_bounded_across_geometries(fake_collective):
+    """Alternating geometries must not each retain a buffer of their own."""
+    sp_size = 4
+    large, small, largest = 12, 8, 20
+    vae = _vae(sp_size)
+
+    pointers = []
+    for round_index in range(3):
+        for num_tiles in (large, small):
+            _run(vae, fake_collective, _tiles(num_tiles, seed=round_index), num_tiles, sp_size, 0)
+            pointers.append(fake_collective[-1]["buf_ptr"])
+
+    assert len(pointers) == 6
+    assert len(set(pointers)) == 1, f"workspace moved across geometries: {pointers}"
+    assert vae._tile_gather_stats["allocs"] == 1
+    assert vae._tile_gather_stats["workspace_bytes"] == _workspace_bytes(large, sp_size)
+    assert vae._tile_gather_workspace.numel() == _workspace_bytes(large, sp_size)
+
+    # A geometry that does not fit grows the single block; it does not add one.
+    _run(vae, fake_collective, _tiles(largest), largest, sp_size, 0)
+    grown = fake_collective[-1]["buf_ptr"]
+    assert vae._tile_gather_stats["allocs"] == 2
+    assert vae._tile_gather_stats["workspace_bytes"] == _workspace_bytes(largest, sp_size)
+    assert vae._tile_gather_workspace.numel() == _workspace_bytes(largest, sp_size)
+
+    # ...and the geometries seen before it now fit, so nothing reallocates again.
+    for num_tiles in (large, small):
+        _run(vae, fake_collective, _tiles(num_tiles, seed=7), num_tiles, sp_size, 0)
+        assert fake_collective[-1]["buf_ptr"] == grown
+    assert vae._tile_gather_stats["allocs"] == 2
+    assert vae._tile_gather_stats["workspace_bytes"] == _workspace_bytes(largest, sp_size)
+
+
+def test_workspace_grows_only_upward(fake_collective):
+    """Resident bytes track the largest geometry seen, not the sum of them."""
+    sp_size = 4
+    small, large = 8, 12
+    vae = _vae(sp_size)
+
+    _run(vae, fake_collective, _tiles(small), small, sp_size, 0)
+    assert vae._tile_gather_stats["workspace_bytes"] == _workspace_bytes(small, sp_size)
+
+    _run(vae, fake_collective, _tiles(large), large, sp_size, 0)
+
+    assert vae._tile_gather_stats["allocs"] == 2
+    assert vae._tile_gather_stats["hits"] == 0
+    assert vae._tile_gather_stats["workspace_bytes"] == _workspace_bytes(large, sp_size)
+    assert vae._tile_gather_stats["workspace_bytes"] < _workspace_bytes(small, sp_size) + _workspace_bytes(
+        large, sp_size
+    )
+    assert vae._tile_gather_workspace.numel() == _workspace_bytes(large, sp_size)
+
+
+def test_mixed_dtype_shares_one_workspace(fake_collective):
+    """The workspace is bytes, so a narrower dtype reuses it instead of adding one."""
+    sp_size, num_tiles = 4, 8
+    vae = _vae(sp_size)
+    fp32_bytes = _workspace_bytes(num_tiles, sp_size, dtype=torch.float32)
+
+    pointers = []
+    for round_index in range(2):
+        for dtype in (torch.float32, torch.bfloat16):
+            tiles = _tiles(num_tiles, seed=round_index, dtype=dtype)
+            produced = _run(vae, fake_collective, tiles, num_tiles, sp_size, 0)
+            pointers.append(fake_collective[-1]["buf_ptr"])
+            assert all(tile.dtype is dtype for tile in produced)
+            for index, tile in enumerate(produced):
+                assert torch.equal(tile, tiles[index])
+
+    assert len(set(pointers)) == 1, f"workspace moved across dtypes: {pointers}"
+    assert vae._tile_gather_stats["allocs"] == 1
+    assert vae._tile_gather_stats["hits"] == 3
+    assert vae._tile_gather_stats["workspace_bytes"] == fp32_bytes
+    assert vae._tile_gather_workspace.numel() == fp32_bytes
 
 
 # --------------------------------------------------------------------------
@@ -272,8 +365,7 @@ def test_returned_tiles_do_not_alias_the_pinned_buffer(fake_collective):
     vae = _vae(sp_size)
     produced = _run(vae, fake_collective, first_tiles, num_tiles, sp_size, 0)
 
-    buffer = next(iter(vae._tile_gather_buffers.values()))
-    buffer_storage = buffer.untyped_storage().data_ptr()
+    buffer_storage = vae._tile_gather_workspace.untyped_storage().data_ptr()
     for tile in produced:
         assert tile.untyped_storage().data_ptr() != buffer_storage
 
@@ -372,5 +464,10 @@ def test_the_receipt_line_reports_hits_allocs_and_the_address(fake_collective, g
     assert len(lines) == 2
     assert "reuse=alloc" in lines[0] and "hits=0 allocs=1" in lines[0]
     assert "reuse=hit" in lines[1] and "hits=1 allocs=1" in lines[1]
+    # Resident bytes are reported, not just the bytes this one gather needed.
+    needed = _workspace_bytes(8, 4) / (1024.0 * 1024.0)
+    for line in lines:
+        assert f"need_mib={needed:.2f}" in line
+        assert f"workspace_mib={needed:.2f}" in line
     assert f"buf_ptr=0x{first_ptr:x}" in lines[0]
     assert f"buf_ptr=0x{first_ptr:x}" in lines[1]
