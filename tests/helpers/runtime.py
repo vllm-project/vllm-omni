@@ -8,6 +8,7 @@ this module re-exports them for backward-compatible imports.
 """
 
 import errno
+import json
 import os
 import socket
 import subprocess
@@ -41,10 +42,14 @@ PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
 
-# Force safetensors page-cache prefetch in CI/test runners. Auto-prefetch only
-# enables on recognized network FS (NFS/Lustre/Ceph); VIRTIOFS and similar
-# skip it unless ``--safetensors-load-strategy=prefetch`` is set explicitly.
-_SAFETENSORS_LOAD_STRATEGY = "prefetch"
+# Prefetch only Stage 0: one pass warms the OS page cache; later stages use
+# ``lazy`` so they do not repeat prefetch I/O (global prefetch raised total
+# latency on VIRTIOFS). Auto-prefetch skips unrecognized FS unless forced.
+_STAGE_SAFETENSORS_LOAD_OVERRIDES: dict[str, dict[str, str]] = {
+    "0": {"safetensors_load_strategy": "prefetch"},
+    "1": {"safetensors_load_strategy": "lazy"},
+    "2": {"safetensors_load_strategy": "lazy"},
+}
 
 
 def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
@@ -169,10 +174,16 @@ class OmniServer:
         cleanup_test_environment()
         self.model = model
         self.serve_args = list(serve_args)
-        if not any(
+        has_safetensors_strategy = any(
             a == "--safetensors-load-strategy" or a.startswith("--safetensors-load-strategy=") for a in self.serve_args
-        ):
-            self.serve_args.append(f"--safetensors-load-strategy={_SAFETENSORS_LOAD_STRATEGY}")
+        )
+        has_stage_overrides = any(
+            a == "--stage-overrides" or a.startswith("--stage-overrides=") for a in self.serve_args
+        )
+        if not has_safetensors_strategy and not has_stage_overrides:
+            self.serve_args.extend(
+                ["--stage-overrides", json.dumps(_STAGE_SAFETENSORS_LOAD_OVERRIDES, separators=(",", ":"))]
+            )
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
@@ -618,7 +629,18 @@ class OmniRunner:
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
         self.omni: Any = None
-        kwargs.setdefault("safetensors_load_strategy", _SAFETENSORS_LOAD_STRATEGY)
+        if "safetensors_load_strategy" not in kwargs:
+            existing = kwargs.get("stage_overrides")
+            if existing is None:
+                kwargs["stage_overrides"] = dict(_STAGE_SAFETENSORS_LOAD_OVERRIDES)
+            elif isinstance(existing, dict):
+                merged = {
+                    stage_id: dict(overrides) for stage_id, overrides in _STAGE_SAFETENSORS_LOAD_OVERRIDES.items()
+                }
+                for stage_id, overrides in existing.items():
+                    base = merged.get(str(stage_id), {})
+                    merged[str(stage_id)] = {**base, **dict(overrides)}
+                kwargs["stage_overrides"] = merged
         try:
             from vllm_omni.entrypoints.omni import Omni
 

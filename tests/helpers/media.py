@@ -801,6 +801,21 @@ def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> No
     executor.shutdown(wait=True)
 
 
+def get_audio_transcriber_pids() -> frozenset[int]:
+    """Return PIDs of the living Whisper transcription worker(s), if any.
+
+    Used by device-memory cleanup waits so resident Whisper VRAM is not treated
+    as leaked engine memory. Does not start or stop the worker.
+    """
+    with _TRANSCRIBER_LOCK:
+        executor = _TRANSCRIBER
+    if executor is None:
+        return frozenset()
+    # ProcessPoolExecutor fills ``_processes`` after the first task is scheduled.
+    processes = getattr(executor, "_processes", None) or {}
+    return frozenset(int(pid) for pid in processes.keys())
+
+
 def release_audio_transcriber() -> None:
     """Shut the transcription worker down, freeing the device memory its models hold.
 
@@ -880,6 +895,7 @@ __all__ = [
     "generate_synthetic_image",
     "generate_synthetic_video",
     "get_asset_path",
+    "get_audio_transcriber_pids",
     "preprocess_text",
     "release_audio_transcriber",
 ]
