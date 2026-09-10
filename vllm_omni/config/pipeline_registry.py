@@ -40,6 +40,7 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTS_PIPELINE,
 )
 from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
+from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -158,6 +159,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "dots_tts": DOTS_TTS_PIPELINE,
+    "auk": AUK_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
     "audex_tts": AUDEX_TTS_PIPELINE,
     "audex_tta": AUDEX_TTA_PIPELINE,

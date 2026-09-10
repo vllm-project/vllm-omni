@@ -84,6 +84,7 @@ recipes/
 | [`SenseNova/SenseNova-U1.md`](./SenseNova/SenseNova-U1.md) | Unified image generation and understanding | 1x or 2x H200 / 1x AMD MI300X |
 | [`SenseNova/SenseNova-U1.5.md`](./SenseNova/SenseNova-U1.5.md) | Unified image generation and understanding, with an 8-step distilled LoRA | 1x A800 80GB |
 | [`StabilityAI/Stable-Audio-Open.md`](./StabilityAI/Stable-Audio-Open.md) | Offline + online text-to-audio generation (Stable Audio Open) | 1x RTX 4090 24GB / 1x AMD MI300X |
+| [`Tencent/AuK-H100.md`](./Tencent/AuK-H100.md) | Offline instruction-driven TTS, speech editing, enhancement and separation (AuK base and Flash) | 1x H100 80GB |
 | [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md) | Online serving for audio chat | 1x A100 80GB |
 | [`Tencent/HunyuanImage-3.0-Instruct.md`](./Tencent/HunyuanImage-3.0-Instruct.md) | DiT-only text-to-image serving and benchmark, including ModelOpt mixed FP8/NVFP4 | 4x H100/H800 80GB / 2x B200 |
 | [`Wan-AI/Wan2.2-T2V.md`](./Wan-AI/Wan2.2-T2V.md) | Text-to-video serving (Wan2.2 14B) with Skip-Softmax sparse attention | 1x datacenter Blackwell (B200/B300) |
