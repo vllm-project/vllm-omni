@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -427,7 +428,8 @@ def test_transformer_declares_token_aligned_ulysses_sp_plan() -> None:
     assert set(plan["sp_prepare"]) == {0, 1, 2, 3, 4}
     assert plan["sp_prepare"][0].split_dim == 1
     assert plan["sp_prepare"][1].split_dim == 1
-    assert plan["sp_prepare"][2].split_dim == 1
+    assert plan["sp_prepare"][2].split_dim == 0
+    assert plan["sp_prepare"][2].expected_dims == 1
     assert plan["sp_prepare"][3].split_dim == 0
     assert plan["sp_prepare"][4].split_dim == 0
     assert plan["sp_output_gather"].gather_dim == 1
@@ -697,3 +699,34 @@ def test_official_default_shapes_match_public_safetensors_header_fixture() -> No
         shape, dtype = parameter_specs[name]
         assert tuple(shape) == tuple(expected_shape), name
         assert dtype == expected_dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_framewise_modulation_matches_dense_tokens_across_frame_boundaries(monkeypatch, dtype):
+    module = attention_tests._load_module()
+    hidden = torch.randn(2, 12, 4).to(dtype)
+    camera = torch.randn_like(hidden)
+    table = torch.randn(2, 3, 6, 4)
+    rotary = (torch.randn(12, 2), torch.randn(12, 2))
+    prepare = module._LingBotSPPrepare()
+    assert prepare(hidden, camera, table, rotary)[2] is None
+    monkeypatch.setattr(module, "get_sp_group", lambda: SimpleNamespace(ulysses_world_size=2))
+    indices = prepare(hidden, camera, table, rotary)[2]
+    assert indices.dtype == torch.int32 and indices.tolist() == [0] * 4 + [1] * 4 + [2] * 4
+    assert indices.numel() == hidden.shape[1]
+    assert indices.untyped_storage().nbytes() == indices.numel() * indices.element_size()
+    scale, shift = table[:, :, 0], table[:, :, 1]
+    dense_scale = scale.repeat_interleave(4, dim=1)
+    dense_shift = shift.repeat_interleave(4, dim=1)
+    for bias in (None, shift):
+        expected = hidden * dense_scale
+        if bias is not None:
+            expected = expected + dense_shift
+        broadcast = module._apply_framewise_affine(hidden, scale, bias)
+        # Six-token shards cut through the middle of a frame.
+        shards = [
+            module._apply_framewise_affine(part, scale, bias, ids)
+            for part, ids in zip(hidden.chunk(2, dim=1), indices.chunk(2), strict=True)
+        ]
+        torch.testing.assert_close(broadcast, expected, rtol=0, atol=0)
+        torch.testing.assert_close(torch.cat(shards, dim=1), expected, rtol=0, atol=0)

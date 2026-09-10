@@ -181,8 +181,9 @@ For LingBot World v2:
 ## Ulysses sequence parallelism
 
 LingBot supports pure Ulysses sequence parallelism for both direct and
-AR-Diffusion execution. Hidden tokens, camera features, token-expanded timestep
-modulation, and RoPE tables are sharded together. Self-attention performs the
+AR-Diffusion execution. Hidden tokens, camera features, frame indices, and RoPE
+tables are sharded together. Timestep modulation stays frame-sized: SP1 uses
+frame broadcasting, while SP ranks index the component needed by each local token. Self-attention performs the
 sequence-to-head all-to-all before reading or writing paged KV, while static
 text K/V uses the same local head shard. Ring and AllGather-KV modes remain
 unsupported for this model.

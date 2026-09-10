@@ -140,7 +140,7 @@ def _ulysses_state() -> tuple[int, int, torch.distributed.ProcessGroup | None]:
 
 
 class _LingBotSPPrepare(nn.Module):
-    """Expand frame conditioning to tokens before synchronized SP sharding."""
+    """Shard frame indices alongside tokens while keeping conditioning frame-sized."""
 
     def forward(
         self,
@@ -148,14 +148,18 @@ class _LingBotSPPrepare(nn.Module):
         camera_hidden_states: torch.Tensor,
         timestep_projection: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         num_frames = timestep_projection.shape[1]
         if hidden_states.shape[1] % num_frames:
             raise ValueError("LingBot token count must be divisible by the latent frame count.")
         tokens_per_frame = hidden_states.shape[1] // num_frames
-        token_timestep = timestep_projection.unsqueeze(2).expand(-1, -1, tokens_per_frame, -1, -1).flatten(1, 2)
+        frame_indices = None
+        if get_sp_group().ulysses_world_size > 1:
+            frame_indices = torch.arange(num_frames, device=hidden_states.device, dtype=torch.int32).repeat_interleave(
+                tokens_per_frame
+            )
         cosine, sine = rotary_emb
-        return hidden_states, camera_hidden_states, token_timestep, cosine, sine
+        return hidden_states, camera_hidden_states, frame_indices, cosine, sine
 
 
 class LingBotSelfAttention(nn.Module):
@@ -519,6 +523,26 @@ class LingBotCrossAttention(nn.Module):
         return self.o(output.flatten(2, 3)), cache
 
 
+def _apply_framewise_affine(
+    hidden_states: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor | None = None,
+    frame_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if frame_indices is None:
+        # SP1/TP-only: broadcast the small frame table without expanding it to tokens.
+        hidden_states = hidden_states.unflatten(1, (scale.shape[1], -1))
+        output = hidden_states * scale.unsqueeze(2)
+        if shift is not None:
+            output = output + shift.unsqueeze(2)
+        return output.flatten(1, 2)
+    # Gather only the component being consumed, not all six modulation channels.
+    output = hidden_states * scale.index_select(1, frame_indices)
+    if shift is not None:
+        output = output + shift.index_select(1, frame_indices)
+    return output
+
+
 class LingBotAttentionBlock(nn.Module):
     """Checkpoint-compatible LingBot block with causal video attention."""
 
@@ -602,21 +626,27 @@ class LingBotAttentionBlock(nn.Module):
         sink_tokens: int,
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        frame_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
-        if timestep_projection.shape != (batch_size, token_count, 6, dim):
-            raise ValueError(
-                "LingBot token timestep projection must align with hidden states; "
-                f"got {tuple(timestep_projection.shape)} and {tuple(hidden_states.shape)}."
-            )
+        if (
+            timestep_projection.ndim != 4
+            or timestep_projection.shape[0] != batch_size
+            or timestep_projection.shape[2:] != (6, dim)
+        ):
+            raise ValueError("LingBot timestep projection must have shape (batch, frames, 6, dim).")
+        if frame_indices is not None and frame_indices.shape != (token_count,):
+            raise ValueError("LingBot frame indices must align with the local hidden tokens.")
         # Timestep, camera, and text remain separate conditioning paths.
-        modulation = self.modulation + timestep_projection.float()
+        modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
         shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = (
             value.squeeze(2) for value in modulation.chunk(6, dim=2)
         )
 
         normalized = self.norm1(hidden_states.float())
-        normalized = (normalized * (1 + scale_msa) + shift_msa).to(hidden_states.dtype)
+        normalized = _apply_framewise_affine(normalized, 1 + scale_msa, shift_msa, frame_indices).to(
+            hidden_states.dtype
+        )
         attention_output = self.self_attn(
             normalized,
             cache=self_cache,
@@ -625,7 +655,9 @@ class LingBotAttentionBlock(nn.Module):
             sink_tokens=sink_tokens,
             update_cache=update_cache,
         )
-        hidden_states = (hidden_states + attention_output * gate_msa).to(hidden_states.dtype)
+        hidden_states = (
+            hidden_states + _apply_framewise_affine(attention_output, gate_msa, frame_indices=frame_indices)
+        ).to(hidden_states.dtype)
 
         camera_features = self.cam_injector_layer2(F.silu(self.cam_injector_layer1(camera_hidden_states)))
         camera_features = camera_features + camera_hidden_states
@@ -641,9 +673,13 @@ class LingBotAttentionBlock(nn.Module):
         hidden_states = hidden_states + attention_output
 
         normalized = self.norm2(hidden_states.float())
-        normalized = (normalized * (1 + scale_ffn) + shift_ffn).to(hidden_states.dtype)
+        normalized = _apply_framewise_affine(normalized, 1 + scale_ffn, shift_ffn, frame_indices).to(
+            hidden_states.dtype
+        )
         ffn_output = self.ffn(normalized)
-        hidden_states = (hidden_states + ffn_output * gate_ffn).to(hidden_states.dtype)
+        hidden_states = (hidden_states + _apply_framewise_affine(ffn_output, gate_ffn, frame_indices=frame_indices)).to(
+            hidden_states.dtype
+        )
         return hidden_states, cast(LingBotAttentionCache, cross_cache)
 
 
@@ -748,7 +784,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         "sp_prepare": {
             0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
             1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
-            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
+            2: SequenceParallelInput(split_dim=0, expected_dims=1, split_output=True),
             3: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),
             4: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),
         },
@@ -1215,7 +1251,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
-        hidden_states, camera_hidden_states, timestep_projection, cosine, sine = self.sp_prepare(
+        hidden_states, camera_hidden_states, frame_indices, cosine, sine = self.sp_prepare(
             hidden_states,
             camera_hidden_states,
             timestep_projection,
@@ -1237,6 +1273,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
                 rotary_emb=rotary_emb,
+                frame_indices=frame_indices,
             )
             cache.cross_attention[index] = cross_cache
 
