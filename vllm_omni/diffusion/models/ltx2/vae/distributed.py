@@ -25,7 +25,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 
-from .ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
+from .decoder import LTX2VideoDiffusionDecoderModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 

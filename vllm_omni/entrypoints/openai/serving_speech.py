@@ -24,12 +24,10 @@ import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
-from vllm.entrypoints.launcher import terminate_if_errored
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    RequestResponseMetadata,
-)
+from vllm.entrypoints.launchers.launcher import terminate_if_errored
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
@@ -712,6 +710,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if self._tts_model_type in (
                 "cosyvoice3",
                 "fish_tts",
+                "audio8_tts",
                 "omnivoice",
                 "moss_tts_nano",
                 "glm_tts",
@@ -721,6 +720,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 label = {
                     "cosyvoice3": "CosyVoice3",
                     "fish_tts": "Fish Speech",
+                    "audio8_tts": "Audio8 TTS",
                     "omnivoice": "OmniVoice",
                     "moss_tts_nano": "MOSS-TTS-Nano",
                     "higgs_audio_v2": "Higgs-Audio V2",
@@ -2113,6 +2113,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args.update(extra)
+
+                sampling = sampling_params_list[0]
+
+                # This change allows StepScheduler read total_steps from upper
+                # sampling.num_inference_steps, check diffusion/sched/step_scheduler:_get_total_steps
+                if "num_inference_steps" in extra:
+                    value = extra["num_inference_steps"]
+                    try:
+                        sampling.num_inference_steps = int(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("num_inference_steps must be an integer") from exc
+
+                if "guidance_scale" in extra:
+                    value = extra["guidance_scale"]
+                    try:
+                        sampling.guidance_scale = float(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("guidance_scale must be a number") from exc
+
                 logger.info("Applied extra_params to diffusion: %s", extra)
 
             generator = self._diffusion_engine.generate(

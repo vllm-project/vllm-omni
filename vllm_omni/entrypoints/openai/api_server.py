@@ -34,7 +34,10 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
-from vllm.entrypoints.launcher import serve_http, terminate_if_errored
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.launchers.cli_args import make_arg_parser
+from vllm.entrypoints.launchers.launcher import serve_http, terminate_if_errored
+from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
@@ -43,19 +46,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from vllm.entrypoints.openai.cli_args import make_arg_parser
 
 # yapf conflicts with isort for this block
 # yapf: disable
 # yapf: enable
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    ModelCard,
-    ModelList,
-    ModelPermission,
-    RequestResponseMetadata,
-)
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
@@ -64,14 +59,13 @@ from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAISer
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
-
-# vLLM < 0.28 keeps create_error_response under serve.utils (it is not
-# re-exported from vllm.entrypoints.serve); 0.28+ moved it under
-# serve.exception_handling and re-exports it from the package root.
-try:
-    from vllm.entrypoints.serve import create_error_response
-except ImportError:
-    from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve import create_error_response
+from vllm.entrypoints.serve.engine.protocol import (
+    ErrorResponse,
+    ModelCard,
+    ModelList,
+    ModelPermission,
+)
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
@@ -85,7 +79,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
@@ -161,6 +154,8 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
+    _decode_image_bytes,
+    _validate_image_pixel_limit,
     decode_audio_url,
     decode_input_reference,
 )
@@ -3438,6 +3433,15 @@ def _validate_minimax_h3_image_payload(
     try:
         with Image.open(io.BytesIO(payload)) as image:
             image_format = str(image.format or "").lower()
+            if image_format in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
+                _validate_image_pixel_limit(image)
+    except InvalidInputReferenceError as exc:
+        raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    except Image.DecompressionBombError as exc:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid uploaded image reference: {filename}; image exceeds the decoder pixel limit.",
+        ) from exc
     except (OSError, ValueError) as exc:
         if allow_non_image:
             return
@@ -3478,10 +3482,14 @@ async def _persist_uploaded_media_references(
             if kind == "image":
                 try:
                     _validate_minimax_h3_image_payload(payload, filename=upload.filename)
-                    with Image.open(io.BytesIO(payload)) as image:
-                        images.append(image.convert("RGB"))
-                except (OSError, ValueError) as exc:
-                    raise HTTPException(400, detail=f"Invalid uploaded image reference: {upload.filename}") from exc
+                    images.append(
+                        _decode_image_bytes(
+                            payload,
+                            source=f"uploaded image reference: {upload.filename}",
+                        )
+                    )
+                except InvalidInputReferenceError as exc:
+                    raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
                 continue
             suffix = Path(upload.filename or "").suffix.lower()
             if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:

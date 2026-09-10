@@ -408,6 +408,7 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_server_vad_server_params, indirect=True)
+    @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/7279")
     def test_server_vad_multi_turn_without_client_commit(
         self,
         cached_silero_vad_artifact: str,

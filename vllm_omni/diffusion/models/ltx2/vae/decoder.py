@@ -7,18 +7,23 @@
 
 """LTX-2.5 Native-weight adapter for Diffusers' diffusion VAE decoder."""
 
+import math
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
 import torch
 from diffusers.models.autoencoders import (
     LTX2VideoDiffusionDecoderModel as DiffusersLTX2VideoDiffusionDecoderModel,
 )
+from diffusers.models.autoencoders import ltx2_diffusion_decoder as diffusers_decoder
 from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
     LTX2VideoDiffusionDecoder3d as DiffusersLTX2VideoDiffusionDecoder3d,
 )
 from diffusers.models.autoencoders.vae import DecoderOutput
 from safetensors import safe_open
+
+from ..ops import is_ltx2_fna_eligible, is_ltx2_fusion_eligible, resolve_ltx2_vae_operators
 
 LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID = "Lightricks/LTX-2.5"
 LTX25_NATIVE_ARTIFACT_REVISION = "8a4ff96f581e72bedc1b44367581c49d544a05f1"
@@ -131,6 +136,177 @@ def load_ltx25_native_diffusion_decoder_state_dict(path: str) -> dict[str, torch
     return convert_ltx25_native_diffusion_decoder_state_dict(native_state_dict)
 
 
+@cache
+def _load_natten_token_permutation():
+    from kernels import get_kernel
+
+    natten = get_kernel("shi-labs/natten", version=1)
+    return natten.token_permute.token_permute_operation, natten.token_permute.token_unpermute_operation
+
+
+class LTX2VideoVaeNeighborhoodNattenProcessor(diffusers_decoder.LTX2VideoVaeNeighborhoodNattenProcessor):
+    """NATTEN dispatch with Omni FNA for eligible stage-5 grids."""
+
+    def __call__(
+        self, attn: "LTX2VideoVaeNeighborhoodAttention", hidden_states: torch.Tensor, block_mask=None
+    ) -> torch.Tensor:
+        batch_size, num_frames, height, width, channels = hidden_states.shape
+        query, key, value = attn.project_qkv(hidden_states)
+        # NATTEN's CUTLASS kernels silently produce wrong output for non-contiguous inputs.
+        query, key, value = query.contiguous(), key.contiguous(), value.contiguous()
+        operators = resolve_ltx2_vae_operators(hidden_states.device) if is_ltx2_fna_eligible(hidden_states) else None
+        # `scale=1.0`: the query is already scaled in `project_qkv`, as in the reference.
+        if (
+            tuple(attn.kernel_size) == (11, 11, 11)
+            and hidden_states.dtype == torch.bfloat16
+            and channels == 256
+            and attn.head_dim == 64
+            and operators is not None
+            and operators.fna is not None
+            # The native metadata encodes KV tile indices in 15 bits.
+            and math.prod((n + tile - 1) // tile for n, tile in zip((num_frames, height, width), (4, 4, 8))) <= 1 << 15
+        ):
+            token_permute, token_unpermute = _load_natten_token_permutation()
+            query_permuted, token_shape, _ = token_permute(query, (4, 4, 4), flip_tiled_dims=True)
+            key_permuted, _, _ = token_permute(key, (4, 4, 8), flip_tiled_dims=True)
+            value_permuted, _, _ = token_permute(value, (4, 4, 8), flip_tiled_dims=True)
+            output = operators.fna(
+                query_permuted,
+                key_permuted,
+                value_permuted,
+                shape=(num_frames, height, width),
+                window=tuple(attn.kernel_size),
+            )
+            hidden_states = token_unpermute(
+                output,
+                token_layout_shape=token_shape,
+                tile_shape=(4, 4, 4),
+                flip_tiled_dims=True,
+            )
+        else:
+            hidden_states = self._na3d(
+                query,
+                key,
+                value,
+                kernel_size=attn.kernel_size,
+                scale=1.0,
+                backend=self.backend,
+            )
+        hidden_states = hidden_states.reshape(batch_size, num_frames, height, width, channels)
+        return attn.to_out[0](hidden_states)
+
+
+class LTX2VideoVaeNeighborhoodAttention(diffusers_decoder.LTX2VideoVaeNeighborhoodAttention):
+    _available_processors = [
+        *diffusers_decoder.LTX2VideoVaeNeighborhoodAttention._available_processors,
+        LTX2VideoVaeNeighborhoodNattenProcessor,
+    ]
+
+    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, num_frames, height, width, _ = hidden_states.shape
+        shape = (batch_size, num_frames, height, width, self.heads, self.head_dim)
+        query = self.to_q(hidden_states).view(shape)
+        key = self.to_k(hidden_states).view(shape)
+        value = self.to_v(hidden_states).view(shape)
+
+        operators = resolve_ltx2_vae_operators(query.device) if is_ltx2_fusion_eligible(query) else None
+        optimized = (
+            None
+            if operators is None
+            else operators.qk_norm_rope(
+                query,
+                key,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                self.norm_q.eps,
+                self.scale,
+                self.rope.rope_dim_split,
+                self.rope.base,
+            )
+        )
+        if optimized is not None:
+            query, key = optimized
+            return query, key, value
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        query = query * self.scale
+        return self.rope(query), self.rope(key), value
+
+
+class LTX2VideoVaeSwiGLU(diffusers_decoder.LTX2VideoVaeSwiGLU):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        operators = resolve_ltx2_vae_operators(hidden_states.device) if is_ltx2_fusion_eligible(hidden_states) else None
+        optimized = (
+            None
+            if operators is None
+            else operators.swiglu(hidden_states, self.w_gate.weight, self.w_up.weight, self.w_down.weight)
+        )
+        return super().forward(hidden_states) if optimized is None else optimized
+
+
+class LTX2VideoVaeDiffusionNABlock(diffusers_decoder.LTX2VideoVaeDiffusionNABlock):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        latent_context: torch.Tensor,
+        modulation: tuple[torch.Tensor, ...],
+        block_mask=None,
+    ) -> torch.Tensor:
+        if hidden_states.dtype is not torch.bfloat16 or not is_ltx2_fusion_eligible(hidden_states):
+            return super().forward(hidden_states, latent_context, modulation, block_mask)
+        operators = resolve_ltx2_vae_operators(hidden_states.device)
+        assert operators is not None
+
+        scale_msa, shift_msa, _, scale_mlp, shift_mlp, _, _ = [
+            modulation[i] + self.scale_shift_table[i].view(1, 1, 1, 1, -1) for i in range(self.num_mod_params)
+        ]
+        context_output = self.context_proj(latent_context)
+        attention_input = operators.residual_norm(
+            hidden_states,
+            context_output,
+            None,
+            self.norm1.weight,
+            scale_msa,
+            shift_msa,
+            self.norm1.eps,
+        )
+        if attention_input is None:
+            hidden_states = hidden_states + context_output
+            hidden_states = hidden_states + self.attn(
+                self.norm1(hidden_states) * (1 + scale_msa) + shift_msa, block_mask
+            )
+            hidden_states = hidden_states + self.mlp(self.norm2(hidden_states) * (1 + scale_mlp) + shift_mlp)
+            return hidden_states
+
+        attention_output = self.attn(attention_input, block_mask)
+        mlp_input = operators.residual_norm(
+            hidden_states,
+            context_output,
+            attention_output,
+            self.norm2.weight,
+            scale_mlp,
+            shift_mlp,
+            self.norm2.eps,
+        )
+        if mlp_input is None:
+            residual = hidden_states + context_output
+            residual = residual + attention_output
+            mlp_input = self.norm2(residual) * (1 + scale_mlp) + shift_mlp
+        mlp_output = self.mlp(mlp_input)
+        output = operators.residual_add(
+            hidden_states,
+            context_output,
+            attention_output,
+            mlp_output,
+        )
+        if output is not None:
+            return output
+        residual = hidden_states + context_output
+        residual = residual + attention_output
+        return residual + mlp_output
+
+
 class LTX2VideoDiffusionDecoder3d(DiffusersLTX2VideoDiffusionDecoder3d):
     """Diffusers decoder core with the short-clip NATTEN context fix."""
 
@@ -200,6 +376,15 @@ class LTX2VideoDiffusionDecoderModel(DiffusersLTX2VideoDiffusionDecoderModel):
         # to this behavior-only subclass preserves parameters and state-dict keys.
         self.decoder.__class__ = LTX2VideoDiffusionDecoder3d
         self.decoder.stage5_kernel = tuple(decoder_stage5_kernel)
+        overrides = {
+            diffusers_decoder.LTX2VideoVaeNeighborhoodAttention: LTX2VideoVaeNeighborhoodAttention,
+            diffusers_decoder.LTX2VideoVaeSwiGLU: LTX2VideoVaeSwiGLU,
+            diffusers_decoder.LTX2VideoVaeDiffusionNABlock: LTX2VideoVaeDiffusionNABlock,
+        }
+        # Preserve every module and parameter object; only execution methods change.
+        for module in self.decoder.modules():
+            if replacement := overrides.get(type(module)):
+                module.__class__ = replacement
 
     @classmethod
     def from_ltx25_native_checkpoint(

@@ -93,7 +93,7 @@ steps:
     commands:
       - |
         timeout 15m bash -c "
-                  pytest -sv tests/engine/ tests/model_executor/ -m 'core_model and cuda' --run-level 'core_model'
+                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py -m 'core_model and cuda' --run-level 'core_model'
         "
     mirror_hardwares: l4_1
 
@@ -188,6 +188,7 @@ steps:
       - label: "Omni · MiniCPM-o 4.5 Online Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_minicpmo_4_5.py
+          - vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja
           - vllm_omni/model_executor/models/minicpmo_4_5/
           - vllm_omni/model_executor/models/step_audio2/
           - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/

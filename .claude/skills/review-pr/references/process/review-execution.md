@@ -39,13 +39,13 @@ isolated detached worktree. Run every source read, `rg` search, import, and test
 from that snapshot, not the caller's checkout. A detached worktree provides
 snapshot isolation, not a security boundary.
 
-Treat a fork head as untrusted unless the user and environment policy explicitly
-establish trust. Never run its imports, tests, builds, hooks, package setup, or
-repo-configurable linters/plugins on the reviewer host. Execute them only in a
-disposable sandbox or VM with no credentials or inherited secrets, no host agent
-or service sockets, minimal read-only host mounts, disabled or explicitly
-allowlisted network, resource/time limits, and destruction after the run. If
-that boundary is unavailable, limit the review to the remote diff, SHA-addressed
+Treat a fork head as untrusted until the user and environment policy
+explicitly establish trust. Without recorded trust, never run its imports,
+tests, builds, hooks, package setup, or repo-configurable linters/plugins on
+the reviewer host. Once the user explicitly trusts this pinned commit for
+this host, record the trusted SHA with the review state and execute with
+credentials, agent sockets, and other secrets out of scope. Without recorded
+trust, limit the review to the remote diff, SHA-addressed
 reads such as `git show <head_sha>:<path>`, and existing CI evidence; report all
 executable validation as a gap.
 
