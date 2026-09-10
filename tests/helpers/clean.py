@@ -73,53 +73,108 @@ def wait_for_gpu_memory_to_clear(
 
     device_list = ", ".join(str(d) for d in devices)
     if threshold_bytes is not None:
-        condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB"
+        condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB (excl. Whisper worker)"
 
         def is_free(used, total):
             return used <= threshold_bytes / 2**30
     else:
         ratio = threshold_ratio
         assert ratio is not None
-        condition_str = f"Memory usage ratio ≤ {ratio * 100:.1f}%"
+        condition_str = f"Memory usage ratio ≤ {ratio * 100:.1f}% (excl. Whisper worker)"
 
         def is_free(used, total):
             return used / total <= ratio
 
     print(f"[Device Memory Monitor] Waiting for device(s) {device_list} to free memory, Condition: {condition_str}")
 
-    def get_mem_gib(device: int) -> tuple[float, float]:
+    def get_mem_gib(device: int) -> tuple[float, float, float]:
+        """Return (used_excl_whisper_gib, total_gib, whisper_gib)."""
         with current_omni_platform.device(device):
             free_bytes, total_bytes = current_omni_platform.mem_get_info()
-        return (total_bytes - free_bytes) / 2**30, total_bytes / 2**30
+        used_gib = (total_bytes - free_bytes) / 2**30
+        total_gib = total_bytes / 2**30
+        whisper_gib = _whisper_worker_memory_gib(device)
+        return max(0.0, used_gib - whisper_gib), total_gib, whisper_gib
 
     while True:
         output_raw = {d: get_mem_gib(d) for d in devices}
-        output = {
-            d: f"{used:.1f}GiB/{total:.1f}GiB ({(used / total) * 100 if total > 0 else 0:.1f}%)"
-            for d, (used, total) in output_raw.items()
-        }
-
-        print("[Device Memory Status] Current usage:")
-        for device_id, mem_info in output.items():
-            print(f"  Device {device_id}: {mem_info}")
+        print("[Device Memory Status] Current usage (engine view excludes Whisper worker):")
+        for device_id, (used, total, whisper) in output_raw.items():
+            ratio_pct = (used / total) * 100 if total > 0 else 0.0
+            line = f"  Device {device_id}: {used:.1f}GiB/{total:.1f}GiB ({ratio_pct:.1f}%)"
+            if whisper > 0:
+                line += f" [Whisper worker {whisper:.1f}GiB excluded]"
+            print(line)
 
         dur_s = time.time() - start_time
-        if all(is_free(used, total) for used, total in output_raw.values()):
+        if all(is_free(used, total) for used, total, _whisper in output_raw.values()):
             print(f"[Device Memory Freed] Device(s) {device_list} meet memory condition")
             print(f"   Condition: {condition_str}")
             print(f"   Wait time: {dur_s:.1f} seconds ({dur_s / 60:.1f} minutes)")
             break
 
         if dur_s >= timeout_s:
+            status = "\n".join(
+                f"  Device {d}: {used:.1f}GiB/{total:.1f}GiB"
+                + (f" (+Whisper {whisper:.1f}GiB excluded)" if whisper > 0 else "")
+                for d, (used, total, whisper) in output_raw.items()
+            )
             raise ValueError(
                 f"[Device Memory Timeout] Device(s) {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
                 f"Condition: {condition_str}\n"
-                f"Current status:\n" + "\n".join(f"  Device {d}: {output[d]}" for d in devices)
+                f"Current status:\n{status}"
             )
 
         gc.collect()
         current_omni_platform.empty_cache()
         time.sleep(5)
+
+
+def _whisper_worker_memory_gib(physical_device: int) -> float:
+    """Sum Whisper transcription-worker VRAM on *physical_device* (GiB).
+
+    Leaves the worker alive; only used so cleanup waits ignore its footprint.
+    """
+    try:
+        from tests.helpers.media import get_audio_transcriber_pids
+    except Exception:
+        return 0.0
+
+    pids = get_audio_transcriber_pids()
+    if not pids or not current_omni_platform.is_cuda():
+        return 0.0
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={physical_device}",
+                "--query-compute-apps=pid,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return 0.0
+
+    total_mib = 0.0
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        if int(parts[0]) not in pids:
+            continue
+        try:
+            total_mib += float(parts[1])
+        except ValueError:
+            continue
+    return total_mib / 1024.0
 
 
 def _run_smi(label: str, cmd: list[str], head_lines: int, timeout: float = 5) -> None:
