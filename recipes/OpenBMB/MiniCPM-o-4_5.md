@@ -28,13 +28,13 @@ also provided.
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
-  - Default single-GPU compatibility layout (auto-loaded):
+    - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - Recommended 2-GPU continuous-batching layout:
+    - Recommended 2-GPU continuous-batching layout:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
-  - 3-GPU layout:
+    - 3-GPU layout:
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
-  - 8x RTX 4090 layout:
+    - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
 - Online example + Gradio demo:
   [`examples/online_serving/minicpmo/`](../../examples/online_serving/minicpmo/)
@@ -126,8 +126,19 @@ video. Use the two-GPU profile for production throughput.
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --trust-remote-code \
+    --chat-template vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja \
+    --chat-template-content-format openai \
     --host 0.0.0.0 --port 8099
 ```
+
+Run these commands from the repository root. The bundled chat template
+matches the Hugging Face `chat(omni_mode=True)` content layout: media and text
+parts are concatenated without adding separators, while whitespace explicitly
+included in a text part is preserved. This matters for speech generation because
+an inserted newline changes the Thinker condition passed to Talker. For image
+questions, place the image before the question, as in the native image-chat
+layout. Continue to request `use_tts_template: true` and
+`enable_thinking: false` for spoken answers.
 
 The deploy config is auto-loaded by the model registry — no
 `--deploy-config` flag needed for this default single-GPU layout.
@@ -271,6 +282,8 @@ uses GPU 5. GPUs 6–7 are left free.
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --deploy-config vllm_omni/deploy/minicpmo_4_5_8x4090.yaml \
     --trust-remote-code \
+    --chat-template vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja \
+    --chat-template-content-format openai \
     --host 0.0.0.0 --port 8099
 ```
 

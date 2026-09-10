@@ -22,34 +22,48 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # L3 Test — PR merge-test label (diff-aware) or main+WEEKLY=1 (--e2e, full E2E group)
+  # L3 Test — PR merge-test label (diff-aware) or main (full pipeline / WEEKLY --e2e)
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline
     commands:
       - |
         EXTRA=""
-        if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
-          EXTRA="--e2e"
+        if [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          if [ "${WEEKLY:-}" = "1" ]; then
+            EXTRA="--e2e"
+          else
+            EXTRA="--all"
+          fi
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
-  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
+  # L4 Test — main+NIGHTLY=1 (full pipeline), or PR nightly-test label (diff-aware)
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
     commands:
-      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-nightly.yml
+      - |
+        EXTRA=""
+        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--all"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"
 
-  # L5 Test — main+WEEKLY=1 / NON_CRITICAL=1 (scheduled), or PR with weekly-test label
+  # L5 Test — main+WEEKLY=1 / NON_CRITICAL=1 (full pipeline), or PR weekly-test label (diff-aware)
   - label: "Upload Weekly Pipeline"
     depends_on: image-build
     key: upload-weekly-pipeline
     commands:
-      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-weekly.yml
+      - |
+        EXTRA=""
+        if [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--all"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-weekly.yml
     agents:
       queue: "cpu_queue_premerge"

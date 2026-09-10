@@ -6,7 +6,7 @@ Both variants share the same build/validate flow (``_build_moss_tts_params``
 handles each); they are registered under distinct model-type names.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.inputs import tokens_input
 
@@ -61,7 +61,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         # the process-wide speaker cache.
         encoder = build_reference_encoder(
             self._get_moss_processor(),
-            variant=self._moss_variant,
+            variant=cast(str, self._moss_variant),
             speaker_cache=self._speaker_cache,
         )
         self._moss_ref_encoder = encoder
@@ -101,7 +101,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 
         return await encode_request_references(
             self._get_moss_ref_encoder(),
-            request.ref_audio,
+            cast(str, request.ref_audio),
             request.ref_audio_2 if two_speaker else None,
             resolve_ref_audio=self._resolve_ref_audio,
             get_artifact_key=self._get_resolved_ref_audio_artifact_key,
@@ -179,15 +179,16 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 
         v = self._moss_variant
 
+        params: dict[str, Any]
         # ---- Legacy nano path (unchanged) ----
         if v is None:  # moss_tts_nano
-            params: dict[str, Any] = {
+            params = {
                 "text": [request.input or ""],
                 "mode": ["voice_clone"],
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
             params["prompt_audio_array"] = [[wav_list, sr]]
             params["ref_audio_cache_key"] = cache_key
             return params
@@ -201,13 +202,13 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         # talker reads for short prompts; full Realtime support needs a
         # separate processor.from_module path which we don't wire here.
         if v == "realtime":
-            params: dict[str, Any] = {
+            params = {
                 "text": [request.input or ""],
                 "mode": ["voice_clone"],
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
             params["prompt_audio_array"] = [[wav_list, sr]]
             params["ref_audio_cache_key"] = cache_key
             return params
@@ -254,13 +255,20 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         # Build the unified-codes prompt: (L, 1+n_vq) where col 0 is text/special
         # tokens and cols 1..n_vq are the delay-pattern audio code grid (mostly
         # audio_pad_code outside the reference block).
-        user_msg = proc.build_user_message(**user_kwargs)
-        batch = proc(conversations=[[user_msg]], mode="generation")
+        if v == "local" and request.ref_text and request.ref_text.strip():
+            reference = user_kwargs.pop("reference")
+            user_kwargs["text"] = request.ref_text.strip() + " " + (request.input or "")
+            user_msg = proc.build_user_message(**user_kwargs)
+            assistant_msg = proc.build_assistant_message(audio_codes_list=reference)
+            batch = proc(conversations=[[user_msg, assistant_msg]], mode="continuation")
+        else:
+            user_msg = proc.build_user_message(**user_kwargs)
+            batch = proc(conversations=[[user_msg]], mode="generation")
         unified = batch["input_ids"][0]  # torch.LongTensor (L, 1+n_vq)
         text_ids: list[int] = unified[:, 0].tolist()
         audio_codes: torch.Tensor = unified[:, 1:].contiguous().to(torch.int64)
 
-        params: dict[str, Any] = {
+        params = {
             "prompt_token_ids": text_ids,
             "codes": {"ref": audio_codes},
         }
