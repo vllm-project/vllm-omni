@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen-Omni streaming video WebSocket handler.
 
 Accepts video frames incrementally via WebSocket, buffers them, and
@@ -29,7 +29,6 @@ from __future__ import annotations
 from typing import Any
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
-    _BAD_FRAME,
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
     StreamingVideoSessionConfig,
@@ -59,38 +58,23 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        n_buf = len(frame_buffer)
-        if n_buf <= config.num_frames:
+        if self._incremental_prefill_active(config):
+            # Frames are sampled at arrival time only (EVS + max_frames), so
+            # the buffer already is the warmed sequence. Query-time
+            # subsampling would pick a subset, which is not a prefix.
             frames = list(frame_buffer)
         else:
-            stride = max(1, n_buf // config.num_frames)
-            idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-            frames = [frame_buffer[i] for i in idx]
-
-        prewarmed = prewarmed_frames or {}
-        user_content: list[dict] = []
-        for frame_b64 in frames:
-            cached = prewarmed.get(frame_b64)
-            if cached is _BAD_FRAME:
-                continue
-            if cached is not None:
-                pil, pil_uuid = cached
-                user_content.append(
-                    {
-                        "type": "image_pil",
-                        "image_pil": pil,
-                        "uuid": pil_uuid,
-                    }
-                )
+            n_buf = len(frame_buffer)
+            if n_buf <= config.num_frames:
+                frames = list(frame_buffer)
             else:
-                user_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                    }
-                )
+                stride = max(1, n_buf // config.num_frames)
+                idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
+                frames = [frame_buffer[i] for i in idx]
+
+        user_content: list[dict] = self._build_frame_image_parts(frames, prewarmed_frames)
 
         if len(audio_buffer) > 0:
             wav_b64 = self._pcm_to_wav_b64(bytes(audio_buffer))
@@ -109,14 +93,7 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         user_message: dict[str, Any] = {"role": "user", "content": user_content}
 
-        messages: list[dict[str, Any]] = []
-        if config.system_prompt:
-            messages.append({"role": "system", "content": config.system_prompt})
-
-        recent_history = message_history[-2:] if len(message_history) > 2 else message_history
-        for hist_msg in recent_history:
-            messages.append(self._text_only_message(hist_msg))
-
+        messages = self._history_prefix_messages(config, message_history)
         messages.append(user_message)
 
         return messages, user_message
