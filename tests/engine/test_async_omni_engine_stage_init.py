@@ -926,10 +926,7 @@ def test_remote_replicas_use_distinct_init_group_keys():
         replica.launch_mode = "remote"
         replica.metadata.runtime_cfg = None
 
-    assert [runtime._replica_init_group_key(replica) for replica in plan.replicas] == [
-        "remote:1:0",
-        "remote:1:1",
-    ]
+    assert runtime._init_group_keys(plan.replicas) == ["remote:1:0", "remote:1:1"]
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
