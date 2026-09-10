@@ -279,17 +279,17 @@ def _install_native_modules(monkeypatch: pytest.MonkeyPatch, events: list[tuple]
         group = SimpleNamespace(get_metadata_builder=lambda _index: SimpleNamespace(reorder_batch_threshold=None))
         return [[group], [group]], "cg-support", [4, 8]
 
+    # vLLM 0.29 dropped attn_groups and cache_dtype from init_kv_cache: the
+    # layout now rides on the resolved CacheConfig.kv_cache_layout instead.
     def init_cache(
         runner_kv_caches,
         forward_context,
         kv_cache_config,
-        attn_groups,
         device,
-        cache_dtype,
         kernel_block_sizes,
         vllm_config,
     ):
-        events.append(("cache", kv_cache_config, attn_groups, kernel_block_sizes))
+        events.append(("cache", kv_cache_config, kernel_block_sizes))
         runner_kv_caches.extend(["cache-0", "cache-1"])
         return {"layer-0": "tensor-0", "layer-1": "tensor-1"}
 

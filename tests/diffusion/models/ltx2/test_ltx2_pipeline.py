@@ -10,6 +10,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
+import huggingface_hub
 import numpy as np
 import pytest
 import torch
@@ -302,11 +303,11 @@ def test_ltx_artifact_uses_source_revision_and_hub_fallback(
     filename = "ltx-sidecar.safetensors"
     calls = []
 
-    def fake_download(**kwargs):
+    def fake_download(self, **kwargs):
         calls.append(kwargs)
         return "/cache/ltx-sidecar.safetensors"
 
-    monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
+    monkeypatch.setattr(huggingface_hub.HfApi, "hf_hub_download", fake_download)
 
     assert (
         resolve_ltx_artifact(
@@ -331,7 +332,9 @@ def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
     filename = "ltx-sidecar.safetensors"
     expected = tmp_path / filename
     expected.write_bytes(b"sidecar")
-    monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
+    monkeypatch.setattr(
+        huggingface_hub.HfApi, "hf_hub_download", lambda *_args, **_kwargs: pytest.fail("unexpected Hub lookup")
+    )
 
     assert resolve_ltx_artifact(
         str(tmp_path),
@@ -345,11 +348,11 @@ def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
 def test_ltx_artifact_local_model_missing_sidecar_falls_back_to_hub(tmp_path, monkeypatch):
     calls = []
 
-    def fake_download(**kwargs):
+    def fake_download(self, **kwargs):
         calls.append(kwargs)
         return "/cache/ltx-sidecar.safetensors"
 
-    monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
+    monkeypatch.setattr(huggingface_hub.HfApi, "hf_hub_download", fake_download)
 
     assert (
         resolve_ltx_artifact(
