@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base WebSocket handler for streaming video input understanding.
 
 Shared session loop, frame/audio buffering, EVS pre-filter, prewarm,
@@ -84,8 +84,10 @@ class VideoStreamPipelineHooks(Protocol):
         message_history: list[dict[str, Any]],
         query_text: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Build OpenAI-style messages and the current user message."""
+        """Build messages using the supplied frame selection, or sample if omitted."""
         ...
 
     def on_turn_complete(
@@ -170,6 +172,8 @@ class OmniStreamingVideoHandler:
         message_history: list[dict[str, Any]],
         query_text: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         raise NotImplementedError
 
@@ -624,6 +628,9 @@ class OmniStreamingVideoHandler:
             ChatCompletionRequest,
         )
 
+        # Select once from this turn's snapshot so prompt images and the
+        # consumed event refer to exactly the same frames, including decode failures.
+        frame_indices = self._sample_frame_indices(frame_buffer, config.num_frames, prewarmed_frames)
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -631,6 +638,7 @@ class OmniStreamingVideoHandler:
             message_history,
             query_text,
             prewarmed_frames,
+            frame_indices=frame_indices,
         )
 
         request_kwargs: dict[str, Any] = {
@@ -661,7 +669,7 @@ class OmniStreamingVideoHandler:
             await self._send_error(websocket, f"Preprocess failed: {e}")
             return
         decoded_ready_ts_ms = _time.monotonic() * 1000
-        selected_metadata = self._sample_frame_metadata(frame_metadata or [], config.num_frames)
+        selected_metadata = [frame_metadata[index] for index in frame_indices] if frame_metadata else []
         model_selected_ts_ms = _time.monotonic() * 1000
 
         await websocket.send_json({"type": "response.start"})
@@ -1051,15 +1059,19 @@ class OmniStreamingVideoHandler:
             pass
 
     @staticmethod
-    def _sample_frame_metadata(
-        frame_metadata: list[dict[str, Any]],
+    def _sample_frame_indices(
+        frame_buffer: list[str],
         num_frames: int,
-    ) -> list[dict[str, Any]]:
-        if len(frame_metadata) <= num_frames:
-            return list(frame_metadata)
-        stride = max(1, len(frame_metadata) // num_frames)
-        indices = [index * stride for index in range(num_frames - 1)] + [len(frame_metadata) - 1]
-        return [frame_metadata[index] for index in indices]
+        prewarmed_frames: Mapping[str, object],
+    ) -> list[int]:
+        """Stride-sample with the last frame, then drop known bad frames without refilling."""
+        n_buf = len(frame_buffer)
+        if n_buf <= num_frames:
+            indices = list(range(n_buf))
+        else:
+            stride = max(1, n_buf // num_frames)
+            indices = [index * stride for index in range(num_frames - 1)] + [n_buf - 1]
+        return [index for index in indices if prewarmed_frames.get(frame_buffer[index]) is not _BAD_FRAME]
 
     @staticmethod
     async def _send_frame_ack(

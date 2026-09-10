@@ -50,6 +50,14 @@ WebSocket /v1/video/chat/stream
 | Server -> Client | `session.done` | none | Session closed. |
 | Server -> Client | `error` | `message` | Recoverable protocol or generation error. |
 
+### Frame Consumption Reporting
+
+When buffered frames include client-supplied `frame_id` values, the server emits `video.frames.consumed` after the first engine output. Its `frame_ids`, `frames`, and `latest_pts_ms` describe the images included in that query's prompt.
+
+Queries stride-sample the buffered frames, keeping the last frame, then exclude frames already known to have failed decoding. Excluded frames are not replaced with other buffered frames. Frames whose background decoding has not finished remain eligible through the image URL path.
+
+**Bugfix compatibility note:** `video.frames.consumed` now excludes known decode failures that were already excluded from the prompt. Older versions could report those frames and their timestamps as consumed. The event name and fields are unchanged; an empty selection reports empty lists and `latest_pts_ms: null`.
+
 ### `session.config` Fields
 
 | Field | Type | Default | Description |
