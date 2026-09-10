@@ -645,6 +645,19 @@ def test_non_ulysses_sequence_parallelism_is_rejected() -> None:
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
 
 
+def test_advanced_uaa_is_rejected_before_component_loading() -> None:
+    module = _load_pipeline_module()
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = 5
+    parallel_config.ulysses_degree = 5
+    parallel_config.ulysses_mode = "advanced_uaa"
+
+    with pytest.raises(NotImplementedError, match="advanced_uaa"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
+
+    assert module._loader_state.prefetch_calls == []
+
+
 def test_unsupported_quantization_fails_before_component_loading() -> None:
     module = _load_pipeline_module()
 

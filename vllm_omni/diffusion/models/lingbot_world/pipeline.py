@@ -213,11 +213,17 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
     ulysses_degree = getattr(parallel_config, "ulysses_degree", sequence_parallel_size) or 1
     ring_degree = getattr(parallel_config, "ring_degree", 1) or 1
     allgather_degree = getattr(parallel_config, "allgather_degree", 1) or 1
-    if sequence_parallel_size != ulysses_degree or ring_degree != 1 or allgather_degree != 1:
+    ulysses_mode = getattr(parallel_config, "ulysses_mode", "strict")
+    if (
+        sequence_parallel_size != ulysses_degree
+        or ring_degree != 1
+        or allgather_degree != 1
+        or ulysses_mode != "strict"
+    ):
         raise NotImplementedError(
             "LingBot World sequence parallelism currently supports pure Ulysses only: "
             f"sequence_parallel_size={sequence_parallel_size}, ulysses_degree={ulysses_degree}, "
-            f"ring_degree={ring_degree}, allgather_degree={allgather_degree}."
+            f"ring_degree={ring_degree}, allgather_degree={allgather_degree}, ulysses_mode={ulysses_mode!r}."
         )
     if getattr(parallel_config, "use_hsdp", False):
         raise NotImplementedError("LingBot World v1 does not support HSDP.")
