@@ -1,0 +1,426 @@
+{
+  "default_group": "runtime",
+  "internal_modules": [
+    "vllm_omni",
+    "tests",
+    "tools",
+    "benchmarks",
+    "examples",
+    "collect_env"
+  ],
+  "rescan_on": [
+    ".github/workflows/pre-commit.yml"
+  ],
+  "groups": {
+    "vllm": {
+      "reason": "vLLM is installed separately before vLLM-Omni (docs/getting_started/installation). Reviewed direct common requirements of vLLM 0.29.0; this is a static prerequisite contract, not installed-environment discovery. Update when the required vLLM version changes.",
+      "prerequisites": [
+        "vllm",
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "regex",
+        "cachetools",
+        "psutil",
+        "sentencepiece",
+        "numpy",
+        "requests",
+        "tqdm",
+        "blake3",
+        "py-cpuinfo",
+        "transformers",
+        "huggingface-hub",
+        "tokenizers",
+        "safetensors",
+        "protobuf",
+        "fastapi",
+        "starlette",
+        "aiohttp",
+        "openai",
+        "pydantic",
+        "prometheus-client",
+        "pillow",
+        "prometheus-fastapi-instrumentator",
+        "tiktoken",
+        "lm-format-enforcer",
+        "llguidance",
+        "outlines-core",
+        "lark",
+        "xgrammar",
+        "typing-extensions",
+        "filelock",
+        "partial-json-parser",
+        "jsonschema",
+        "pyzmq",
+        "msgspec",
+        "mistral-common",
+        "opencv-python-headless",
+        "pyyaml",
+        "six",
+        "setuptools",
+        "einops",
+        "compressed-tensors",
+        "depyf",
+        "cloudpickle",
+        "watchfiles",
+        "python-json-logger",
+        "ninja",
+        "pybase64",
+        "cbor2",
+        "ijson",
+        "setproctitle",
+        "openai-harmony",
+        "anthropic",
+        "mcp"
+      ]
+    },
+    "runtime": {
+      "extends": [
+        "vllm"
+      ],
+      "files": [
+        "requirements/common.txt"
+      ]
+    },
+    "cuda": {
+      "extends": [
+        "runtime"
+      ],
+      "files": [
+        "requirements/cuda.txt"
+      ]
+    },
+    "npu": {
+      "extends": [
+        "runtime"
+      ],
+      "files": [
+        "requirements/npu.txt"
+      ],
+      "environment": {
+        "platform_machine": "aarch64"
+      },
+      "prerequisites": [
+        "vllm-ascend",
+        "torch-npu"
+      ],
+      "reason": "Installed separately by the NPU installation guide before vllm-omni; only NPU platform files use this prerequisite contract."
+    },
+    "rocm": {
+      "extends": [
+        "runtime"
+      ],
+      "files": [
+        "requirements/rocm.txt"
+      ]
+    },
+    "xpu": {
+      "extends": [
+        "runtime"
+      ],
+      "files": [
+        "requirements/xpu.txt"
+      ]
+    },
+    "musa": {
+      "extends": [
+        "runtime"
+      ],
+      "files": [
+        "requirements/musa.txt"
+      ]
+    },
+    "dev": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "dev"
+      ]
+    },
+    "demo": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "demo"
+      ]
+    },
+    "docs": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "docs"
+      ]
+    },
+    "build": {
+      "extends": [
+        "runtime"
+      ],
+      "build_system": true
+    },
+    "indextts2": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "indextts2"
+      ]
+    },
+    "longcat-video-avatar": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "longcat-video-avatar"
+      ]
+    },
+    "quack": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "quack"
+      ]
+    },
+    "fa4": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "fa4"
+      ]
+    },
+    "forced-aligner": {
+      "extends": [
+        "runtime"
+      ],
+      "extras": [
+        "forced-aligner"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "paths": [
+        "setup.py"
+      ],
+      "group": "build"
+    },
+    {
+      "paths": [
+        "tests/*",
+        "tools/*"
+      ],
+      "group": "dev"
+    },
+    {
+      "paths": [
+        "docs/*"
+      ],
+      "group": "docs"
+    },
+    {
+      "paths": [
+        "examples/*"
+      ],
+      "group": "demo"
+    },
+    {
+      "paths": [
+        "vllm_omni/platforms/cuda.py",
+        "vllm_omni/platforms/cuda/*",
+        "vllm_omni/diffusion/platforms/cuda.py"
+      ],
+      "group": "cuda"
+    },
+    {
+      "paths": [
+        "vllm_omni/platforms/npu.py",
+        "vllm_omni/platforms/npu/*",
+        "vllm_omni/diffusion/platforms/npu.py"
+      ],
+      "group": "npu"
+    },
+    {
+      "paths": [
+        "vllm_omni/platforms/rocm.py",
+        "vllm_omni/platforms/rocm/*",
+        "vllm_omni/diffusion/platforms/rocm.py"
+      ],
+      "group": "rocm"
+    },
+    {
+      "paths": [
+        "vllm_omni/platforms/xpu.py",
+        "vllm_omni/platforms/xpu/*",
+        "vllm_omni/diffusion/platforms/xpu.py"
+      ],
+      "group": "xpu"
+    },
+    {
+      "paths": [
+        "vllm_omni/platforms/musa.py",
+        "vllm_omni/platforms/musa/*",
+        "vllm_omni/diffusion/platforms/musa.py"
+      ],
+      "group": "musa"
+    },
+    {
+      "paths": [
+        "vllm_omni/model_executor/models/indextts2/*"
+      ],
+      "group": "indextts2"
+    },
+    {
+      "paths": [
+        "vllm_omni/diffusion/models/longcat_video/*avatar*.py"
+      ],
+      "group": "longcat-video-avatar"
+    },
+    {
+      "paths": [
+        "vllm_omni/quantization/quack_fp8.py"
+      ],
+      "group": "quack"
+    },
+    {
+      "paths": [
+        "vllm_omni/diffusion/attention/backends/utils/fa.py",
+        "vllm_omni/diffusion/attention/backends/ring/ring_globals.py"
+      ],
+      "group": "fa4"
+    },
+    {
+      "paths": [
+        "vllm_omni/utils/forced_aligner.py",
+        "vllm_omni/utils/qwen3_force_align_processor.py"
+      ],
+      "group": "forced-aligner"
+    }
+  ],
+  "import_names": {
+    "PIL": [
+      "pillow"
+    ],
+    "cv2": [
+      "opencv-python",
+      "opencv-python-headless"
+    ],
+    "whisper": [
+      "openai-whisper"
+    ],
+    "quack": [
+      "quack-kernels"
+    ],
+    "yaml": [
+      "pyyaml"
+    ],
+    "zmq": [
+      "pyzmq"
+    ],
+    "cpuinfo": [
+      "py-cpuinfo"
+    ],
+    "sklearn": [
+      "scikit-learn"
+    ],
+    "skimage": [
+      "scikit-image"
+    ],
+    "google.protobuf": [
+      "protobuf"
+    ],
+    "google.generativeai": [
+      "google-generativeai"
+    ],
+    "flashinfer": [
+      "flashinfer-python"
+    ],
+    "flash_attn": [
+      "flash-attn"
+    ],
+    "flash_attn_interface": [
+      "fa3-fwd",
+      "flash-attn-3"
+    ],
+    "flash_attn.cute": [
+      "flash-attn-4"
+    ],
+    "cutlass": [
+      "nvidia-cutlass-dsl"
+    ],
+    "cuda": [
+      "cuda-python",
+      "cuda-bindings"
+    ],
+    "tvm_ffi": [
+      "apache-tvm-ffi"
+    ],
+    "onnxruntime": [
+      "onnxruntime",
+      "onnxruntime-cann",
+      "onnxruntime-rocm"
+    ],
+    "attr": [
+      "attrs"
+    ],
+    "bs4": [
+      "beautifulsoup4"
+    ],
+    "imageio_ffmpeg": [
+      "imageio-ffmpeg"
+    ],
+    "natten": [
+      "natten"
+    ],
+    "cosyvoice2": [
+      "step-audio2"
+    ],
+    "hyperpyyaml": [
+      "hyperpyyaml"
+    ],
+    "pkg_resources": [
+      "setuptools"
+    ],
+    "mistral_common": [
+      "mistral-common"
+    ],
+    "funasr": [
+      "funasr"
+    ],
+    "FlagEmbedding": [
+      "FlagEmbedding"
+    ],
+    "opencc": [
+      "opencc"
+    ],
+    "wetext": [
+      "wetext",
+      "WeTextProcessing"
+    ],
+    "fa3_fwd_interface": [
+      "fa3-fwd"
+    ],
+    "material": [
+      "mkdocs-material"
+    ],
+    "mooncake": [
+      "mooncake-transfer-engine-cuda13",
+      "mooncake-transfer-engine"
+    ]
+  },
+  "local_roots": [
+    {
+      "paths": [
+        "tests/buildkite/*",
+        "tools/pre_commit/check_buildkite.py"
+      ],
+      "roots": [
+        ".buildkite/common/scripts"
+      ],
+      "reason": "These scripts explicitly add .buildkite/common/scripts to sys.path to import repository CI helpers."
+    }
+  ]
+}
