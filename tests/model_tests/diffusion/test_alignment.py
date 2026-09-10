@@ -82,6 +82,7 @@ EXCLUDED_MODELS = [
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "SanaWmPipeline",
 ]
 

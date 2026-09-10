@@ -218,6 +218,17 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_1
 
+      - label: ":robot_face: Robot Policy OpenPI · π0.5 · H100 · Single-GPU"
+        timeout_in_minutes: 120
+        commands:
+          - pip install "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git@215abfb217dbac7d5f1273282331b9b1866c0479#subdirectory=packages/openpi-client"
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_pi05_expansion.py
+            -m "full_model and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100 · 2-GPU"
         timeout_in_minutes: 120
         commands:

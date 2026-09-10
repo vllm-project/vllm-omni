@@ -153,15 +153,19 @@ class ServingRealtimeRobotOpenPI:
         # An optional integer ``seed`` in the inference message becomes the engine request's
         # ``sampling_params.seed``; omitted, ``OmniDiffusionRequest`` assigns a random one.
         seed = obs.pop("seed", None)
+        # Nested so engine knobs cannot collide with robot-defined obs keys.
+        sampling = obs.get("sampling_params") or {}
+        robot_obs = {key: value for key, value in obs.items() if key != "sampling_params"}
         extra_args = {
             "reset": reset,
             "session_id": session_id,
-            "robot_obs": obs,
+            "robot_obs": robot_obs,
         }
 
         prompt = obs.get("prompt", "")
         sampling_params = OmniDiffusionSamplingParams(
             seed=int(seed) if seed is not None else None,
+            num_inference_steps=sampling.get("num_inference_steps"),
             extra_args=extra_args,
         )
         return OmniDiffusionRequest(
