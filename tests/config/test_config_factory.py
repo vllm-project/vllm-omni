@@ -601,9 +601,9 @@ class TestPipelineDiscovery:
         assert "omni_kv_config" not in stages[0].yaml_engine_args
         assert "output_connectors" not in stages[0].yaml_extras
         assert stages[1].yaml_engine_args["omni_kv_config"]["need_send_cache"] is True
-        assert stages[1].yaml_extras["output_connectors"] == {"to_stage_2": "rdma_connector"}
+        assert stages[1].yaml_extras["output_connectors"] == {"to_stage_2": "shared_memory_connector"}
         assert stages[2].yaml_engine_args["omni_kv_config"]["need_recv_cache"] is True
-        assert stages[2].yaml_extras["input_connectors"] == {"from_stage_1": "rdma_connector"}
+        assert stages[2].yaml_extras["input_connectors"] == {"from_stage_1": "shared_memory_connector"}
 
     def test_registry_resolver_qwen3_omni_all_stages(self):
         """Test that providing the HF config for qwen3 omni with audio enabled uses all stages."""

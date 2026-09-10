@@ -1,10 +1,43 @@
 # Prefill-Decode (PD) Disaggregation (experimental)
 
 !!! warning "Experimental design reference"
-    PD disaggregation is only partially integrated on the current `main` branch.
-    The runtime contains PD detection and routing scaffolding, but there is no
-    supported deploy overlay or end-to-end validated launch recipe yet. Treat this
-    page as a description of the current design, not as production guidance.
+    The Qwen3-Omni path described below remains experimental. HunyuanImage-3.0
+    has a single-host 1P1D deployment described in the next section. AR
+    continuation has been validated on NPU; full DiT equivalence and performance
+    still require accelerator validation.
+
+## HunyuanImage-3.0
+
+Use `vllm_omni/deploy/hunyuan_image_3_moe_pd.yaml` for AR prefill (P, stage 0),
+AR decode (D, stage 1), and DiT (stage 2). The NPU layout uses four devices per
+stage: 0–3, 4–7, and 8–11. P and D use MooncakeConnector for prompt KV transfer;
+D and DiT use SharedMemoryConnector on the same host. The non-PD counterpart is
+`vllm_omni/deploy/hunyuan_image_3_moe.yaml`.
+
+The decode configuration enables `extra_args.pd_resume_from_prefill`. P samples
+the first output token with the logical generation parameters, then stops at a
+scheduler execution boundary. D receives the original prompt KV and imports
+that token as output history. Its first forward computes the first output
+token's KV, preserving the prompt's final KV entry. The imported token counts
+toward `max_tokens`, penalties and stop conditions, and is emitted exactly once.
+If it already terminates generation, D waits for KV arrival and completes
+without a decode forward.
+
+Set logical AR sampling defaults, including `seed`, only on D. P derives a copy
+of D's effective parameters after request overrides. For random sampling,
+`temperature > 0` requires a fixed seed. After accepting its first token, P
+exports each TP rank's request generator state; D restores the corresponding
+rank's state before sampling the second token. The configured seed must match
+the handoff state and does not replace it. The default AR seed is 42, and an
+explicit request seed (including 0) overrides it in both PD and non-PD modes.
+
+P requires `async_scheduling: false`; D supports synchronous or asynchronous
+scheduling. Continuation supports one completion (`n=1`), matching TP layouts
+and device types, PP/CP size 1, and non-resumable input. Speculative decoding,
+logprobs and structured-output grammar continuation are not supported. Prefix
+caching is disabled and chunked prefill enabled in both supplied deployments.
+
+## Qwen3-Omni design reference
 
 Prefill-decode disaggregation splits the Qwen3-Omni Thinker into two logical
 stages: a prefill worker that processes the prompt and produces KV cache, and a
