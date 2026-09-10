@@ -15,7 +15,6 @@ from __future__ import annotations
 import base64
 import json
 from io import BytesIO
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -30,6 +29,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SUPPORTED_CHAT_AUDIO_FORMATS,
     CreateAudio,
 )
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -298,19 +299,26 @@ def test_chat_audio_metadata_survives_response_serialization(stream, fmt):
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     serving_chat = object.__new__(OmniOpenAIServingChat)
-    output = SimpleNamespace(
+    output = MultimodalCompletionOutput(
         index=0,
-        multimodal_output={"audio": [torch.zeros(17), torch.zeros(23)], "sr": torch.tensor(22050)},
+        text="",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+        multimodal_output=MultimodalPayload.from_dict(
+            {"audio": [torch.zeros(17), torch.zeros(23)], "sr": torch.tensor(22050)}
+        ),
         finish_reason="stop",
         stop_reason=None,
-        token_ids=[],
     )
     request = ChatCompletionRequest(
         model="test-model",
         messages=[{"role": "user", "content": "hello"}],
         audio={"format": fmt, "voice": "alloy"},
     )
-    choices = serving_chat._create_audio_choice(SimpleNamespace(outputs=[output]), "assistant", request, stream=stream)
+    choices = serving_chat._create_audio_choice(
+        OmniRequestOutput(outputs=[output], final_output_type="audio"), "assistant", request, stream=stream
+    )
     assert not isinstance(choices, ErrorResponse)
     response_type = OmniChatCompletionStreamResponse if stream else OmniChatCompletionResponse
     response = response_type(

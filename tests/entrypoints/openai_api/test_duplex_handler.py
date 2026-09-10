@@ -5333,6 +5333,13 @@ async def test_duplex_chat_stage_metrics_use_latest_streaming_snapshot():
 
     audio_deltas = [event for event in sent if event.get("type") == "response.output_audio.delta"]
     done = next(event for event in sent if event.get("type") == "response.done")
+    assert [event["audio_duration_ms"] for event in audio_deltas] == [100, 200, 300]
+    assert done["playback"] == {
+        "generated_ms": 300,
+        "sent_ms": 300,
+        "played_ms": 0,
+        "committed_ms": 0,
+    }
     assert all("vllm_omni" not in event for event in audio_deltas)
     assert done["vllm_omni"]["stage_metrics"]["0"] == {
         "num_tokens_out": 3,
