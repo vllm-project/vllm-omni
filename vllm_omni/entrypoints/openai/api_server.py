@@ -639,6 +639,7 @@ async def omni_run_server_worker(
     **uvicorn_kwargs: object,
 ) -> None:
     """Run a single API server worker."""
+    api_server_count = _resolve_api_server_count(args, client_config)
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
@@ -678,6 +679,7 @@ async def omni_run_server_worker(
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+        app.state.api_server_count = api_server_count
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         remove_route_from_app(app, "/v1/chat/completions", {"POST"})
@@ -1698,10 +1700,25 @@ async def list_voices(raw_request: Request):
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
 
 
-def _reject_process_local_mutation_with_multiple_api_workers(raw_request: Request, operation: str) -> None:
-    """Reject control-plane mutations that are not synchronized across API workers."""
-    args = getattr(raw_request.app.state, "args", None)
-    api_server_count = int(getattr(args, "api_server_count", 1) or 1)
+def _resolve_api_server_count(args: Namespace, client_config: OmniClientConfig | None) -> int:
+    """Resolve frontend topology once, from the launcher's client configuration."""
+    requested = getattr(args, "api_server_count", None)
+    actual = 1 if client_config is None else client_config.get("client_count")
+    if type(actual) is not int or actual < 1:
+        raise ValueError("API client configuration requires a positive integer client_count")
+    if requested is not None and (type(requested) is not int or requested < 1 or requested != actual):
+        raise ValueError("API server count does not match the frontend launch configuration")
+    return actual
+
+
+def _reject_process_local_state_with_multiple_api_workers(raw_request: Request, operation: str) -> None:
+    """Reject access to frontend state that is not shared across API workers."""
+    api_server_count = getattr(raw_request.app.state, "api_server_count", None)
+    if type(api_server_count) is not int or api_server_count < 1:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="API worker topology is not initialized.",
+        )
     if api_server_count > 1:
         raise HTTPException(
             status_code=HTTPStatus.CONFLICT.value,
@@ -1710,6 +1727,13 @@ def _reject_process_local_mutation_with_multiple_api_workers(raw_request: Reques
                 "the operation uses process-local frontend state"
             ),
         )
+
+
+async def _require_single_api_video_store(raw_request: Request) -> None:
+    # VIDEO_STORE and VIDEO_TASKS are process-local, including reads and
+    # cancellation. Keep this independent of the temporary diffusion launch
+    # restriction: enabling multi-API diffusion alone cannot make jobs shared.
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Asynchronous video jobs")
 
 
 @router.post(
@@ -1757,7 +1781,7 @@ async def upload_voice(
     Returns:
         JSON response with voice information
     """
-    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Runtime voice upload")
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice upload")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -1823,7 +1847,7 @@ async def delete_voice(name: str, raw_request: Request):
     Returns:
         JSON response indicating success or failure
     """
-    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Runtime voice deletion")
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice deletion")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -3897,6 +3921,7 @@ async def _parse_video_form(
 
 @router.post(
     "/v1/videos",
+    dependencies=[Depends(_require_single_api_video_store)],
     responses={
         HTTPStatus.OK.value: {"model": VideoResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -4038,7 +4063,7 @@ async def create_video_sync(
     )
 
 
-@router.get("/v1/videos", response_model=VideoListResponse)
+@router.get("/v1/videos", response_model=VideoListResponse, dependencies=[Depends(_require_single_api_video_store)])
 async def list_videos(
     after: str | None = None,
     limit: int | None = Query(None, ge=0, le=100),
@@ -4075,7 +4100,7 @@ async def list_videos(
     return VideoListResponse(data=jobs, has_more=has_more, first_id=first_id, last_id=last_id)
 
 
-@router.get("/v1/videos/{video_id}", response_model=None)
+@router.get("/v1/videos/{video_id}", response_model=None, dependencies=[Depends(_require_single_api_video_store)])
 async def retrieve_video(video_id: str) -> VideoResponse | JSONResponse:
     """Retrieve metadata for a previously created video job.
 
@@ -4103,7 +4128,7 @@ async def retrieve_video(video_id: str) -> VideoResponse | JSONResponse:
     return job
 
 
-@router.delete("/v1/videos/{video_id}")
+@router.delete("/v1/videos/{video_id}", dependencies=[Depends(_require_single_api_video_store)])
 async def delete_video(video_id: str) -> VideoDeleteResponse:
     """Delete a stored video job and any generated output.
 
@@ -4155,7 +4180,7 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     return VideoDeleteResponse(id=job.id, deleted=True)
 
 
-@router.get("/v1/videos/{video_id}/content")
+@router.get("/v1/videos/{video_id}/content", dependencies=[Depends(_require_single_api_video_store)])
 async def download_video(video_id: str) -> Response:
     """Download the generated file for a completed video job.
 
@@ -4257,7 +4282,7 @@ class OmniWakeupRequest(BaseModel):
 
 @router.post("/v1/omni/sleep")
 async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
-    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Sleep")
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Sleep")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
     if not hasattr(engine_client, "sleep"):
@@ -4270,7 +4295,7 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
 
 @router.post("/v1/omni/wakeup")
 async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
-    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Wakeup")
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Wakeup")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
     if not any(sid in sleeping_set for sid in request.stage_ids):

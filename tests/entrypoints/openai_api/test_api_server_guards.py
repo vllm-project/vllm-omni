@@ -106,7 +106,8 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
 
-    async def fake_serve_http(*_args, **_kwargs):
+    async def fake_serve_http(app, **_kwargs):
+        assert app.state.api_server_count == 2
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
@@ -763,7 +764,7 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
 @pytest.mark.asyncio
 async def test_multi_api_rejects_runtime_voice_upload() -> None:
     app = FastAPI()
-    app.state.args = Namespace(api_server_count=2)
+    app.state.api_server_count = 2
     raw_request = _request_for(app, method="POST", path="/v1/audio/voices")
 
     with pytest.raises(HTTPException) as exc_info:
@@ -782,7 +783,7 @@ async def test_multi_api_rejects_runtime_voice_upload() -> None:
 @pytest.mark.asyncio
 async def test_multi_api_rejects_sleep_route() -> None:
     app = FastAPI()
-    app.state.args = Namespace(api_server_count=2)
+    app.state.api_server_count = 2
     raw_request = _request_for(app, method="POST", path="/v1/omni/sleep")
 
     with pytest.raises(HTTPException) as exc_info:
@@ -1021,3 +1022,57 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
         must_be_none=_MULTISTAGE_MUST_BE_NONE,
     )
+
+
+@pytest.mark.parametrize("count", [None, 0, -1, "2", True])
+def test_process_local_guard_rejects_unknown_topology(count):
+    app = FastAPI()
+    if count is not None:
+        app.state.api_server_count = count
+    # CLI args cannot substitute for missing/invalid actual runtime state.
+    app.state.args = Namespace(api_server_count=1)
+    with pytest.raises(HTTPException) as exc:
+        api_server._reject_process_local_state_with_multiple_api_workers(_request_for(app), "Sleep")
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "requested,config,expected",
+    [(None, None, 1), (1, None, 1), (2, {"client_count": 2}, 2), (None, {"client_count": 2}, 2)],
+)
+def test_api_topology_resolved_from_launch(requested, config, expected):
+    assert api_server._resolve_api_server_count(Namespace(api_server_count=requested), config) == expected
+
+
+@pytest.mark.parametrize("requested,config", [(2, None), (2, {}), (2, {"client_count": 1}), (2, {"client_count": "2"})])
+def test_api_topology_rejects_inconsistent_launch(requested, config):
+    with pytest.raises(ValueError):
+        api_server._resolve_api_server_count(Namespace(api_server_count=requested), config)
+
+
+@pytest.mark.parametrize("count,status", [(2, 409), (None, 503)])
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/v1/videos"),
+        ("GET", "/v1/videos"),
+        ("GET", "/v1/videos/job"),
+        ("GET", "/v1/videos/job/content"),
+        ("DELETE", "/v1/videos/job"),
+    ],
+)
+def test_video_lifecycle_guard_precedes_processing(monkeypatch, count, status, method, path):
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    if count is not None:
+        app.state.api_server_count = count
+    app.include_router(api_server.router)
+
+    async def forbidden_form():
+        pytest.fail("video form processing must not run before topology rejection")
+
+    app.dependency_overrides[api_server._parse_video_form] = forbidden_form
+    with TestClient(app) as client:
+        response = client.request(method, path)
+    assert response.status_code == status

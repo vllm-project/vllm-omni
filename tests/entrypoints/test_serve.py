@@ -876,3 +876,22 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
 
     with pytest.raises(RuntimeError, match=r"exited with code 137"):
         run_headless(_make_headless_args(stage_id=1))
+
+
+@pytest.mark.parametrize("name", ["unfiltered_ns", "explicit_keys", "missing", "__dict__"])
+def test_tracking_namespace_uninitialized_access_raises_attribute_error(name):
+    namespace = object.__new__(TrackingNamespace)
+    with pytest.raises(AttributeError):
+        getattr(namespace, name)
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_tracking_namespace_copy_preserves_tracking(deep):
+    import copy
+
+    namespace = TrackingNamespace(
+        argparse.Namespace(model="example", api_server_count=2), frozenset({"api_server_count"})
+    )
+    restored = copy.deepcopy(namespace) if deep else copy.copy(namespace)
+    assert restored.get_explicit_kwargs_dict() == {"api_server_count": 2}
+    assert restored.model == "example"

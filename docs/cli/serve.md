@@ -123,3 +123,10 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 ## Arguments
 
 --8<-- "docs/generated/argparse_omni/omni_serve.inc.md"
+
+Async video jobs use process-local metadata and task handles. With multiple API
+workers, creating, listing, retrieving, downloading, and deleting these jobs
+returns HTTP 409. This restriction is independent of the current diffusion
+stage launch restriction: supporting multi-worker diffusion also requires a
+shared job lifecycle. Missing frontend topology state returns HTTP 503 for
+operations that require process-local state protection.

@@ -3756,6 +3756,7 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
     app = FastAPI()
     app.state.openai_serving_speech = handler
+    app.state.api_server_count = 1
     scope = {
         "type": "http",
         "app": app,

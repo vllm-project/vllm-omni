@@ -283,6 +283,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 @pytest.fixture
 def test_client():
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
     app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=FakeAsyncOmni(),
@@ -1541,6 +1542,7 @@ def test_action_extraction_accepts_multimodal_actions_payload():
 
 def test_missing_handler_returns_503():
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
     app.state.openai_serving_video = None
     client = TestClient(app)
@@ -2453,6 +2455,7 @@ def test_cosmos3_control_upload_rejects_invalid_size(control_bytes, message, tes
 
 def test_sync_missing_handler_returns_503():
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
     app.state.openai_serving_video = None
     client = TestClient(app)

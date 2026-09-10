@@ -53,7 +53,11 @@ class TrackingNamespace(argparse.Namespace):
             setattr(self.unfiltered_ns, name, value)
 
     def __getstate__(self) -> dict[str, Any]:
-        """Preserve the wrapped namespace when API workers use ``spawn``."""
+        """Preserve wrapper state when API workers use ``spawn``.
+
+        Our __dict__ property exposes the inner namespace, so default state
+        serialization would lose unfiltered_ns and explicit_keys.
+        """
         return {
             "unfiltered_ns": self.unfiltered_ns,
             "explicit_keys": self.explicit_keys,
@@ -68,7 +72,8 @@ class TrackingNamespace(argparse.Namespace):
         return {k: v for k, v in vars(self.unfiltered_ns).items() if k in self.explicit_keys}
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.unfiltered_ns, name)
+        namespace = object.__getattribute__(self, "unfiltered_ns")
+        return getattr(namespace, name)
 
     @property
     def __dict__(self):
