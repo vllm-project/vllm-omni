@@ -3,11 +3,15 @@
 """Cosmos3 topology registration, deploy YAMLs and per-stage device mapping.
 
 Cosmos3 ships two topologies over the *same* checkpoint: the co-located
-``cosmos3_omni`` (both Mixture-of-Transformers towers in one diffusion stage) and
-the disaggregated ``cosmos3_omni_disagg`` (one stage per tower). The invariant
-these tests defend is that the second one is reachable *only* through an explicit
-``pipeline:`` key in a deploy YAML -- if it ever became auto-detectable it would
-hijack every co-located Cosmos3 deployment merely by being registered.
+``cosmos3_omni_colocated`` (both Mixture-of-Transformers towers in one diffusion
+stage) and the disaggregated ``cosmos3_omni_disagg`` (one stage per tower). The
+invariant these tests defend is that *neither* is auto-detectable: every Cosmos3
+checkpoint -- T2I, T2V/I2V/V2V and policy alike -- reports
+``model_type=cosmos3_omni`` with ``model_index.json``
+``_class_name=Cosmos3OmniDiffusersPipeline``, so a topology that claimed those
+would hijack the checkpoints of the other two. Each is reachable only through an
+explicit ``pipeline:`` key in a deploy YAML, and a Cosmos3 deployment that names
+no pipeline keeps resolving through the single-stage diffusion fallback.
 """
 
 import json
@@ -62,8 +66,20 @@ def _stage(deploy, stage_id: int):
 
 class TestTopologyRegistration:
     def test_both_topologies_registered(self):
-        assert resolve_pipeline_config("cosmos3_omni") is COSMOS3_PIPELINE
+        assert resolve_pipeline_config("cosmos3_omni_colocated") is COSMOS3_PIPELINE
         assert resolve_pipeline_config("cosmos3_omni_disagg") is COSMOS3_DISAGG_PIPELINE
+
+    def test_neither_topology_claims_the_bare_checkpoint_model_type(self):
+        """``cosmos3_omni`` is the HF ``model_type`` of *every* Cosmos3 checkpoint.
+
+        Registering it would make whichever topology owned the key the
+        auto-detected answer for T2I, video and policy checkpoints alike. The
+        video case is the one that bites: this stage pins
+        ``final_output_type="image"`` while the single-stage fallback resolves
+        ``"video"`` for ``Cosmos3OmniDiffusersPipeline``, and the registry path
+        passes the pinned value through verbatim.
+        """
+        assert "cosmos3_omni" not in OMNI_PIPELINES
 
     def test_colocated_topology_is_a_single_diffusion_stage(self):
         assert len(COSMOS3_PIPELINE.stages) == 1
@@ -75,18 +91,21 @@ class TestTopologyRegistration:
         assert stage.final_output_type == "image"
         assert stage.model_arch == COSMOS3_ARCH
 
-    def test_colocated_topology_declares_no_default_deploy_config(self):
-        """Registering the topology must not change any existing deployment.
+    def test_colocated_topology_names_its_deploy_config(self):
+        """Safe to name only because the topology is unreachable without a YAML.
 
         ``_get_deploy_config`` auto-loads a pipeline's default deploy YAML for
-        every caller that passes no ``--deploy-config``, so naming one here would
-        push device count, ``max_num_seqs``, ``enforce_eager``,
-        ``gpu_memory_utilization`` and the ``guardrails`` gate onto co-located
-        deployments that never asked for a deploy config, purely as a side effect
-        of this registration. ``COLOCATED_YAML`` is opt-in; it still has to exist
-        and parse, which ``TestColocatedDeployConfig`` covers.
+        every caller that passes no ``--deploy-config``, which would be a problem
+        if this pipeline were auto-detected: it would push device count,
+        ``max_num_seqs``, ``enforce_eager``, ``gpu_memory_utilization`` and the
+        ``guardrails`` gate onto deployments that never asked for a deploy config.
+        It is not auto-detected -- the only route in is a YAML naming it -- so by
+        the time this resolves the caller has already supplied one and
+        ``_get_deploy_config`` returns *that* instead. Same reasoning as the
+        disagg config below. It is declared for the one path that does reach it:
+        selecting the topology programmatically with no deploy path.
         """
-        assert COSMOS3_PIPELINE.default_deploy_config_name is None
+        assert COSMOS3_PIPELINE.default_deploy_config_name == COLOCATED_YAML
 
     def test_disagg_topology_is_one_stage_per_tower(self):
         reasoner, generator = COSMOS3_DISAGG_PIPELINE.stages
@@ -128,40 +147,65 @@ class TestTopologyRegistration:
         assert bridge.META_KEY == COSMOS3_UND_META_KEY
 
 
-class TestDisaggIsOptInOnly:
-    def test_disagg_declares_no_auto_detect_hooks(self):
-        assert COSMOS3_DISAGG_PIPELINE.hf_architectures == ()
-        assert COSMOS3_DISAGG_PIPELINE.diffusers_class_name is None
+class TestBothTopologiesAreOptInOnly:
+    @pytest.mark.parametrize("pipeline_cfg", [COSMOS3_PIPELINE, COSMOS3_DISAGG_PIPELINE])
+    def test_declares_no_auto_detect_hooks(self, pipeline_cfg: PipelineConfig):
+        assert pipeline_cfg.hf_architectures == ()
+        assert pipeline_cfg.diffusers_class_name is None
 
-    def test_only_the_colocated_topology_claims_the_cosmos3_architecture(self):
-        """The arch fallback scans every registered pipeline; exactly one may match."""
+    def test_no_pipeline_claims_the_cosmos3_architecture(self):
+        """The arch fallback scans every registered pipeline; none may match.
+
+        A claimant here would capture every Cosmos3 checkpoint, because they all
+        ship ``architectures=["Cosmos3ForConditionalGeneration"]`` -- video and
+        policy checkpoints included.
+        """
         claimants = [
             key
             for key, entry in OMNI_PIPELINES.items()
             if isinstance(entry, PipelineConfig) and COSMOS3_HF_ARCH in entry.hf_architectures
         ]
-        assert claimants == ["cosmos3_omni"]
+        assert claimants == []
 
-    def test_only_the_colocated_topology_claims_the_diffusers_class_name(self):
+    def test_no_pipeline_claims_the_diffusers_class_name(self):
         """Same for the model_index.json fallback."""
         claimants = [
             key
             for key, entry in OMNI_PIPELINES.items()
             if isinstance(entry, PipelineConfig) and entry.diffusers_class_name == COSMOS3_ARCH
         ]
-        assert claimants == ["cosmos3_omni"]
+        assert claimants == []
 
-    def test_model_index_autodetect_selects_the_colocated_topology(self, tmp_path):
+    def test_model_index_autodetect_reaches_no_registered_pipeline(self, tmp_path):
+        """A Cosmos3 checkpoint that names no pipeline stays on the fallback.
+
+        ``get_pipeline_config`` returning None is what makes the engine build the
+        default single-stage diffusion config, where ``final_output_type`` is
+        resolved dynamically per model class ("video" for
+        ``Cosmos3OmniDiffusersPipeline``) instead of pinned by a registry entry.
+        """
         (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": COSMOS3_ARCH}), encoding="utf-8")
 
-        model_type = StageConfigFactory.try_infer_model_type(model=str(tmp_path), trust_remote_code=False)
+        assert StageConfigFactory.try_infer_model_type(model=str(tmp_path), trust_remote_code=False) is None
+        assert (
+            StageConfigFactory.get_pipeline_config(
+                model=str(tmp_path),
+                trust_remote_code=False,
+            )
+            is None
+        )
 
-        assert model_type == "cosmos3_omni"
-
-    def test_deploy_pipeline_key_selects_the_disagg_topology(self, tmp_path):
-        """The one and only route into the 2-stage topology."""
+    @pytest.mark.parametrize(
+        ("pipeline_key", "expected"),
+        [
+            ("cosmos3_omni_colocated", COSMOS3_PIPELINE),
+            ("cosmos3_omni_disagg", COSMOS3_DISAGG_PIPELINE),
+        ],
+    )
+    def test_deploy_pipeline_key_selects_the_topology(self, tmp_path, pipeline_key: str, expected: PipelineConfig):
+        """The one and only route into either topology."""
         deploy_path = tmp_path / "deploy.yaml"
-        deploy_path.write_text("pipeline: cosmos3_omni_disagg\n", encoding="utf-8")
+        deploy_path.write_text(f"pipeline: {pipeline_key}\n", encoding="utf-8")
 
         pipeline = StageConfigFactory.get_pipeline_config(
             model=str(tmp_path),
@@ -169,16 +213,17 @@ class TestDisaggIsOptInOnly:
             deploy_config_path=str(deploy_path),
         )
 
-        assert pipeline is COSMOS3_DISAGG_PIPELINE
+        assert pipeline is expected
 
 
 class TestColocatedDeployConfig:
     def test_shipped_yaml_shape(self):
         deploy = _deploy(COLOCATED_YAML)
 
-        # No `pipeline:` key -- the co-located topology is found from the
-        # checkpoint's own model_type, exactly as it was before it was registered.
-        assert deploy.pipeline is None
+        # The `pipeline:` key is mandatory here, not decoration: the co-located
+        # topology declares no auto-detect hooks (it would capture the video and
+        # policy checkpoints), so this key is the only thing that selects it.
+        assert deploy.pipeline == "cosmos3_omni_colocated"
         assert deploy.async_chunk is False
         assert len(deploy.stages) == 1
 

@@ -9,8 +9,7 @@
 #
 # THIS FILE IS OPT-IN
 # -------------------
-# The cosmos3_omni pipeline deliberately declares no default_deploy_config_name,
-# so nothing here applies unless you ask for it by name:
+# Nothing here applies unless you ask for it by name:
 #
 #   vllm-omni serve nvidia/Cosmos3-Super-Text2Image \
 #     --deploy-config cosmos3_super_t2i.yaml
@@ -18,6 +17,15 @@
 # Running without --deploy-config keeps the previous behaviour exactly: one
 # default stage built from CLI args, guardrails on, no pinned memory or batching
 # knobs. This file is the recommended single-card layout, not the baseline.
+#
+# The `pipeline:` key below is what makes that true. Every Cosmos3 checkpoint --
+# T2I, T2V/I2V/V2V and policy alike -- reports model_type=cosmos3_omni with
+# model_index.json _class_name=Cosmos3OmniDiffusersPipeline, so the co-located
+# topology cannot be auto-detected without also capturing the video and policy
+# checkpoints it is wrong for (it pins final_output_type: image, where the video
+# fallback resolves "video"). Naming the pipeline here is therefore the only
+# route into this topology, the same way cosmos3_super_t2i_disagg.yaml and
+# cosmos3_policy_droid.yaml reach theirs.
 #
 # ONE CARD IS ENOUGH, AND IS THE FASTER LAYOUT
 # --------------------------------------------
@@ -51,6 +59,7 @@
 #   sequence of 32*32 = 1024 tokens).
 #
 # For one stage per tower, see cosmos3_super_t2i_disagg.yaml.
+pipeline: cosmos3_omni_colocated
 async_chunk: false
 
 stages:

@@ -55,8 +55,9 @@
 # vllm_omni/diffusion/models/cosmos3_pipeline_config.py -- and selected by the
 # `pipeline:` key below; this file only carries deployment knobs. `pipeline:` is
 # consulted by StageConfigFactory ahead of any HF model_type inference, which is
-# what keeps the co-located `cosmos3_omni` deploy unaffected by this topology
-# merely existing in the registry.
+# what keeps the `cosmos3_omni_colocated` deploy -- and every Cosmos3 deployment
+# that names no pipeline at all -- unaffected by this topology merely existing in
+# the registry.
 pipeline: cosmos3_omni_disagg
 
 # Mandatory for a multi-stage pipeline whose stages have input_sources: with
