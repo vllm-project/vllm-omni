@@ -6,7 +6,6 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +36,7 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     pipeline_cfg_resolver,
 )
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -196,6 +196,25 @@ class TestStageConfig:
         )
         omega_config = config.to_omegaconf()
         assert omega_config.engine_args.max_num_seqs == 32
+
+    def test_to_omegaconf_dict_override_deep_merges_yaml_dict(self):
+        """A partial dict CLI override (e.g. --no-guardrails riding on
+        model_config) must layer onto the YAML dict, not clobber siblings."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "model_config": {
+                    "guardrails": True,
+                    "policy_server_config": {"action_space": "joint_position"},
+                }
+            },
+            runtime_overrides={"model_config": {"guardrails": False}},
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.engine_args.model_config.guardrails is False
+        assert omega_config.engine_args.model_config.policy_server_config.action_space == "joint_position"
 
     def test_to_omegaconf_diffusion_parallel_overrides_replace_nested_values(self):
         config = StageConfig(
@@ -451,13 +470,8 @@ class TestStageConfigFactory:
 
     def test_default_diffusion_with_parallel_config(self):
         """Test diffusion config calculates devices from parallel_config."""
-
-        @dataclass
-        class MockParallelConfig:
-            world_size: int = 4
-
         kwargs = {
-            "parallel_config": MockParallelConfig(),
+            "parallel_config": DiffusionParallelConfig(tensor_parallel_size=4),
             "cache_backend": "tea_cache",
         }
         configs = StageConfigFactory.create_default_diffusion(kwargs)
@@ -626,6 +640,58 @@ class TestPipelineDiscovery:
             stages=SINGLE_STAGE_PIPE_CFG,
         )
         assert p.hf_architectures == ("SomeCollidingArch",)
+
+
+class TestCosmos3PolicyPipeline:
+    """Cosmos3 policy serving resolves via deploy yaml selection (π0 precedent)."""
+
+    def test_registered_without_capturing_base_cosmos3_checkpoints(self):
+        assert "cosmos3_policy" in OMNI_PIPELINES
+        # T2I/video Cosmos3 checkpoints report model_type=cosmos3_omni and the
+        # same model_index.json _class_name as policy checkpoints; they must
+        # keep resolving through the single-stage diffusion fallback, so the
+        # policy pipeline must not be reachable by auto-detection.
+        assert "cosmos3_omni" not in OMNI_PIPELINES
+        pipeline = OMNI_PIPELINES["cosmos3_policy"]
+        assert pipeline.hf_architectures == ()
+        assert pipeline.diffusers_class_name is None
+
+    def test_droid_deploy_yaml_carries_policy_server_config(self):
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_policy_droid.yaml"))
+        assert deploy.pipeline == "cosmos3_policy"
+
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["cosmos3_policy"], deploy)
+        assert len(stages) == 1
+        stage = stages[0].to_omegaconf()
+
+        assert stage.stage_type == "diffusion"
+        assert stage.final_output_type == "action"
+        assert stage.engine_args.model_class_name == "Cosmos3OmniDiffusersPipeline"
+        # OpenPI websocket handshake metadata must reach the serving layer via
+        # engine_args.model_config (ServingRealtimeRobotOpenPI reads it there).
+        psc = stage.engine_args.model_config.policy_server_config
+        assert list(psc.image_resolution) == [540, 640]
+        assert psc.n_external_cameras == 2
+        assert psc.needs_wrist_camera is True
+        assert psc.needs_stereo_camera is False
+        assert psc.needs_session_id is True
+        assert psc.action_space == "joint_position"
+        # The DROID checkpoint's training recipe expects JSON-formatted prompts.
+        assert stage.default_sampling_params.extra_args.format_prompt_as_json is True
+
+    def test_no_guardrails_cli_flag_keeps_policy_server_config(self):
+        """--no-guardrails becomes a partial model_config CLI override; it must
+        deep-merge with the deploy yaml's model_config, not clobber the
+        policy_server_config the OpenPI handshake depends on."""
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_policy_droid.yaml"))
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            OMNI_PIPELINES["cosmos3_policy"],
+            {"model_config": {"guardrails": False}},
+            user_deploy_config=deploy,
+        )
+        stage = stages[0].to_omegaconf()
+        assert stage.engine_args.model_config.guardrails is False
+        assert stage.engine_args.model_config.policy_server_config.action_space == "joint_position"
 
 
 class TestStagePipelineConfig:
@@ -936,6 +1002,44 @@ class TestPipelineRegistration:
 
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
+
+    def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
+        snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+        model = str(snapshot)
+        deploy_path = get_deploy_config_path("cosyvoice3.yaml")
+
+        assert StageConfigFactory.try_infer_model_type(model, trust_remote_code=False) is None
+        assert StageConfigFactory.get_pipeline_config(model, trust_remote_code=False) is None
+
+        omni_config = StageConfigFactory.create_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+        legacy_configs, _ = StageConfigFactory.create_legacy_stage_configs_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+
+        assert omni_config is not None
+        assert omni_config.pipeline_config.model_type == "cosyvoice3"
+        assert [
+            (stage.stage_id, stage.stage_type, stage.worker_type, stage.model_stage)
+            for stage in omni_config.stage_configs
+        ] == [
+            (0, StageType.LLM, "ar", "cosyvoice3_talker"),
+            (1, StageType.LLM, "generation", "cosyvoice3_code2wav"),
+        ]
+        assert all(stage.model_config.model == model for stage in omni_config.stage_configs)
+        assert all(stage.stage_type is not StageType.DIFFUSION for stage in omni_config.stage_configs)
+
+        assert legacy_configs is not None
+        assert [stage.stage_type for stage in legacy_configs] == [StageType.LLM, StageType.LLM]
 
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
@@ -1475,6 +1579,11 @@ stages:
         deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
         stages = merge_pipeline_deploy(pipeline, deploy)
 
+        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3TextEncoder"
+        assert stages[1].yaml_engine_args["model_arch"] == "MiniMaxH3Pipeline"
+        assert stages[0].yaml_runtime["num_replicas"] == 1
+        assert stages[1].yaml_runtime["num_replicas"] == 1
+        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False}
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
         assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
         assert stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
@@ -1597,7 +1706,7 @@ stages:
         assert stage.max_model_len == 1024
         assert stage.max_num_batched_tokens == 1024
         assert stage.max_num_seqs == 1
-        assert stage.gpu_memory_utilization == 0.7
+        assert stage.gpu_memory_utilization == 0.8
         assert stage.skip_mm_profiling is True
         assert stage.enforce_eager is True
         assert stage.async_scheduling is False

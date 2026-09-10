@@ -907,6 +907,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
                 forward=lambda *args: pytest.fail("unexpected SDPA fallback"),
             ),
             _assert_metadata_compatible=lambda metadata: None,
+            _has_custom_attention=False,
             _scheduler_paged_kv=False,
             paged_kv_cache_role=None,
         )

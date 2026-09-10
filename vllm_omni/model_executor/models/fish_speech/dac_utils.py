@@ -19,12 +19,12 @@ def build_dac_codec() -> nn.Module:
     Returns the model on CPU in eval mode -- caller is responsible for
     loading weights and moving to the target device.
     """
-    from fish_speech.models.dac.modded_dac import (
+    from vllm_omni.model_executor.models.fish_speech.dac_modules import (
         DAC,
+        DownsampleResidualVectorQuantize,
         ModelArgs,
         WindowLimitedTransformer,
     )
-    from fish_speech.models.dac.rvq import DownsampleResidualVectorQuantize
 
     base_transformer_kwargs = dict(
         block_size=16384,

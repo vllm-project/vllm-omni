@@ -21,7 +21,7 @@ import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import janus
 import torch
@@ -38,6 +38,23 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.duplex.contracts import (
+    DuplexControlPlanePort,
+    DuplexOutputContext,
+    DuplexOutputDecision,
+    DuplexRequestIdentity,
+    DuplexRuntimeExtension,
+    DuplexStageRequestContext,
+    DuplexStageSubmission,
+    DuplexStageSubmissionResult,
+)
+from vllm_omni.engine.duplex.control_plane import DuplexControlPlane
+from vllm_omni.engine.duplex.lease import DuplexLeaseConfig
+from vllm_omni.engine.duplex.messages import DuplexFence
+from vllm_omni.engine.duplex.session import (
+    DuplexSessionRuntimeManager,
+    DuplexSessionRuntimeState,
+)
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -58,12 +75,13 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
-from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
+from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 logger = init_logger(__name__)
 
@@ -88,24 +106,6 @@ _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
 def _event_driven_orch_enabled() -> bool:
     return os.environ.get(_EVENT_DRIVEN_ORCH_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-if TYPE_CHECKING:
-    from vllm_omni.experimental.fullduplex.engine.contracts import (
-        DuplexControlPlanePort,
-        DuplexOutputContext,
-        DuplexOutputDecision,
-        DuplexRequestIdentity,
-        DuplexRuntimeExtension,
-        DuplexStageRequestContext,
-        DuplexStageSubmission,
-        DuplexStageSubmissionResult,
-    )
-    from vllm_omni.experimental.fullduplex.engine.duplex_session import (
-        DuplexSessionRuntimeManager,
-        DuplexSessionRuntimeState,
-    )
-    from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 
 def _build_terminal_empty_output(
@@ -342,8 +342,6 @@ class _OrchestratorDuplexStagePort:
         )
 
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
-        from vllm_omni.experimental.fullduplex.engine.contracts import DuplexRequestIdentity
-
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
             request_state = OrchestratorRequestState(
@@ -365,8 +363,6 @@ class _OrchestratorDuplexStagePort:
         self._sync_bridge_state(request_state, context)
 
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
-        from vllm_omni.experimental.fullduplex.engine.contracts import DuplexStageSubmissionResult
-
         context = submission.context
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
@@ -491,9 +487,6 @@ class Orchestrator:
         self.duplex_control_plane: DuplexControlPlanePort | None = None
         self._duplex_reaper_interval_s = 1.0
         if enable_duplex_control:
-            from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
-            from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseConfig
-
             runtime_session_config = duplex_session_config or DuplexSessionRuntimeConfig()
             self._duplex_reaper_interval_s = runtime_session_config.reaper_interval_s
 
@@ -1654,9 +1647,11 @@ class Orchestrator:
         stage_id: int,
         error: str,
         *,
+        status_code: int = HTTPStatus.BAD_REQUEST.value,
+        error_type: str = DEFAULT_CLIENT_ERROR_TYPE,
         close_duplex_sessions: bool = False,
     ) -> None:
-        """Fail one request with a non-fatal 400 (bad input, engine survives).
+        """Fail one request with a non-fatal client error (400 by default).
 
         The non-fatal counterpart of `_fail_request_dead_stage`: emits a
         client-error ErrorMessage (default `fatal=False`) so the engine keeps
@@ -1665,8 +1660,8 @@ class Orchestrator:
         await self.output_async_queue.put(
             ErrorMessage(
                 error=error,
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                error_type=DEFAULT_CLIENT_ERROR_TYPE,
+                status_code=status_code,
+                error_type=error_type,
                 request_id=req_id,
                 stage_id=stage_id,
             )
@@ -2080,6 +2075,8 @@ class Orchestrator:
                 )
                 if (
                     req_state.streaming.enabled
+                    # A failed forward may already have cleaned up this request.
+                    and self.request_states.get(req_id) is req_state
                     and finished
                     and not final_only_finished
                     and not self._is_duplex_session_request(req_state)
@@ -2197,11 +2194,6 @@ class Orchestrator:
         identity = req_state.duplex_identity
         if identity is None:
             return None
-        from vllm_omni.experimental.fullduplex.engine.contracts import (
-            DuplexOutputContext,
-            DuplexRequestIdentity,
-        )
-
         fence = req_state.duplex_stage_fences.get(stage_id, identity.fence) if stage_id is not None else identity.fence
         segment = req_state.streaming.segment(stage_id)
         return DuplexOutputContext(
@@ -2256,8 +2248,6 @@ class Orchestrator:
         action = getattr(decision.action, "value", decision.action)
         if action != "direct_response":
             raise ValueError(f"Unsupported duplex output action: {action}")
-        from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
-
         engine_output = attach_duplex_output_decision(
             OmniRequestOutput.from_stage_output(
                 output,
@@ -2748,6 +2738,16 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
+        except OmniClientError as exc:
+            await self._fail_request_client_error(
+                req_id,
+                next_logical,
+                str(exc),
+                status_code=exc.status_code,
+                error_type=exc.error_type,
+                close_duplex_sessions=self._is_duplex_session_request(req_state),
+            )
+            return
         except Exception as exc:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
@@ -2936,6 +2936,19 @@ class Orchestrator:
                     next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
                 except Exception:
                     next_prompt_len = max(1, len(prompt_token_ids))
+                # A stage may size its own prewarmed placeholder prompt via
+                # hf_overrides.async_chunk_prewarm_prompt_len (e.g. a talker
+                # whose engine positions must cover a speaker-prompt prefill;
+                # the model validates the value and reports the right one on
+                # mismatch).
+                prewarm_len = getattr(
+                    getattr(next_pool.stage_vllm_config, "model_config", None),
+                    "hf_config",
+                    None,
+                )
+                prewarm_len = getattr(prewarm_len, "async_chunk_prewarm_prompt_len", None)
+                if prewarm_len is not None and int(prewarm_len) > 1:
+                    next_prompt_len = int(prewarm_len)
 
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):
