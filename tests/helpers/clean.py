@@ -86,18 +86,21 @@ def wait_for_gpu_memory_to_clear(
             return used / total <= ratio
 
     print(f"[Device Memory Monitor] Waiting for device(s) {device_list} to free memory, Condition: {condition_str}")
-
-    def get_mem_gib(device: int) -> tuple[float, float, float]:
-        """Return (used_excl_whisper_gib, total_gib, whisper_gib)."""
-        with current_omni_platform.device(device):
-            free_bytes, total_bytes = current_omni_platform.mem_get_info()
-        used_gib = (total_bytes - free_bytes) / 2**30
-        total_gib = total_bytes / 2**30
-        whisper_gib = _whisper_worker_memory_gib(device)
-        return max(0.0, used_gib - whisper_gib), total_gib, whisper_gib
+    whisper_allowance_gib = _whisper_vram_allowance_gib()
+    if whisper_allowance_gib > 0:
+        print(f"[Device Memory Monitor] Whisper worker allowance {whisper_allowance_gib:.1f}GiB ")
 
     while True:
-        output_raw = {d: get_mem_gib(d) for d in devices}
+        used_by_device: dict[int, tuple[float, float]] = {}
+        for device in devices:
+            with current_omni_platform.device(device):
+                free_bytes, total_bytes = current_omni_platform.mem_get_info()
+            used_by_device[device] = ((total_bytes - free_bytes) / 2**30, total_bytes / 2**30)
+        whisper_device = max(used_by_device) if whisper_allowance_gib > 0 and used_by_device else None
+        output_raw: dict[int, tuple[float, float, float]] = {}
+        for device, (used_gib, total_gib) in used_by_device.items():
+            whisper_gib = min(used_gib, whisper_allowance_gib) if device == whisper_device else 0.0
+            output_raw[device] = (max(0.0, used_gib - whisper_gib), total_gib, whisper_gib)
         print("[Device Memory Status] Current usage (engine view excludes Whisper worker):")
         for device_id, (used, total, whisper) in output_raw.items():
             ratio_pct = (used / total) * 100 if total > 0 else 0.0
@@ -130,51 +133,12 @@ def wait_for_gpu_memory_to_clear(
         time.sleep(5)
 
 
-def _whisper_worker_memory_gib(physical_device: int) -> float:
-    """Sum Whisper transcription-worker VRAM on *physical_device* (GiB).
-
-    Leaves the worker alive; only used so cleanup waits ignore its footprint.
-    """
+def _whisper_vram_allowance_gib() -> float:
     try:
-        from tests.helpers.media import get_audio_transcriber_pids
+        from tests.helpers.media import whisper_resident_vram_gib
     except Exception:
         return 0.0
-
-    pids = get_audio_transcriber_pids()
-    if not pids or not current_omni_platform.is_cuda():
-        return 0.0
-
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                f"--id={physical_device}",
-                "--query-compute-apps=pid,used_gpu_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return 0.0
-
-    if result.returncode != 0 or not result.stdout.strip():
-        return 0.0
-
-    total_mib = 0.0
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 2 or not parts[0].isdigit():
-            continue
-        if int(parts[0]) not in pids:
-            continue
-        try:
-            total_mib += float(parts[1])
-        except ValueError:
-            continue
-    return total_mib / 1024.0
+    return whisper_resident_vram_gib()
 
 
 def _run_smi(label: str, cmd: list[str], head_lines: int, timeout: float = 5) -> None:

@@ -775,6 +775,34 @@ _TRANSCRIBER_CALL_LOCK = threading.Lock()
 # Guards the _TRANSCRIBER pointer itself.
 _TRANSCRIBER_LOCK = threading.Lock()
 _TRANSCRIBER: concurrent.futures.ProcessPoolExecutor | None = None
+# Parent-side record of sizes this worker has been asked to load. The child
+# caches one model per size until the pool is dropped.
+_TRANSCRIBER_MODEL_SIZES: set[str] = set()
+
+# Empirical GPU footprint for ``whisper.load_model`` (weights + CUDA context),
+# not host checkpoint size. large-v3 measured ~10.8 GiB on H100/H800.
+_WHISPER_VRAM_GIB = {
+    "tiny": 1.0,
+    "base": 1.5,
+    "small": 2.5,
+    "medium": 5.5,
+    "large": 11.0,
+    "large-v1": 11.0,
+    "large-v2": 11.0,
+    "large-v3": 11.0,
+    "large-v3-turbo": 4.0,
+    "turbo": 4.0,
+}
+_WHISPER_VRAM_GIB_DEFAULT = 11.0
+
+
+def whisper_resident_vram_gib() -> float:
+    """Estimated VRAM (GiB) held by the living Whisper worker, or 0 if none."""
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is None:
+            return 0.0
+        sizes = frozenset(_TRANSCRIBER_MODEL_SIZES)
+    return sum(_WHISPER_VRAM_GIB.get(size, _WHISPER_VRAM_GIB_DEFAULT) for size in sizes)
 
 
 def _get_transcriber() -> concurrent.futures.ProcessPoolExecutor:
@@ -797,23 +825,9 @@ def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> No
         if _TRANSCRIBER is not executor:
             return
         _TRANSCRIBER = None
+        _TRANSCRIBER_MODEL_SIZES.clear()
     # Joining the worker can block; do it outside the lock.
     executor.shutdown(wait=True)
-
-
-def get_audio_transcriber_pids() -> frozenset[int]:
-    """Return PIDs of the living Whisper transcription worker(s), if any.
-
-    Used by device-memory cleanup waits so resident Whisper VRAM is not treated
-    as leaked engine memory. Does not start or stop the worker.
-    """
-    with _TRANSCRIBER_LOCK:
-        executor = _TRANSCRIBER
-    if executor is None:
-        return frozenset()
-    # ProcessPoolExecutor fills ``_processes`` after the first task is scheduled.
-    processes = getattr(executor, "_processes", None) or {}
-    return frozenset(int(pid) for pid in processes.keys())
 
 
 def release_audio_transcriber() -> None:
@@ -831,6 +845,7 @@ def release_audio_transcriber() -> None:
     with _TRANSCRIBER_CALL_LOCK:
         with _TRANSCRIBER_LOCK:
             executor, _TRANSCRIBER = _TRANSCRIBER, None
+            _TRANSCRIBER_MODEL_SIZES.clear()
         if executor is not None:
             executor.shutdown(wait=True)
 
@@ -855,6 +870,7 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
     with _TRANSCRIBER_CALL_LOCK:
         for attempt in range(2):
             executor = _get_transcriber()
+            _TRANSCRIBER_MODEL_SIZES.add(model_size)
             try:
                 return executor.submit(
                     _whisper_transcribe_in_current_process, output_path, model_size, language
@@ -895,7 +911,7 @@ __all__ = [
     "generate_synthetic_image",
     "generate_synthetic_video",
     "get_asset_path",
-    "get_audio_transcriber_pids",
     "preprocess_text",
     "release_audio_transcriber",
+    "whisper_resident_vram_gib",
 ]
