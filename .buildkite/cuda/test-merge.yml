@@ -1,5 +1,6 @@
 # CUDA CI L3 (`advanced_model` e2e) plus L1 CPU Simple Test (`core_model and cpu`).
-# Uploaded by Upload Merge Pipeline: PR label `merge-test`, or post-merge on main.
+# Uploaded by Upload Merge Pipeline: PR label `merge-test`, or post-merge on main
+# (both diff-aware via source_file_dependencies).
 
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn

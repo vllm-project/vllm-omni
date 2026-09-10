@@ -692,19 +692,24 @@ def test_source_filter_strips_deps_and_expands_hardware(monkeypatch: pytest.Monk
     assert z_image["agents"]["queue"] == "l4-k8s"
 
 
-def test_source_filter_disabled_on_main_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_source_filter_respects_force_all_and_uses_diff_on_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _Ctx:
         changed_files = ["vllm_omni/unrelated.py"]
 
+    # Post-merge main L3 must still filter by the commit diff.
     monkeypatch.setenv("BUILDKITE_BRANCH", "main")
-    assert _changed_files_for_source_filter(_Ctx(), force_all=False, e2e_only=False) is None
+    assert _changed_files_for_source_filter(_Ctx(), force_all=False, e2e_only=False) == [
+        "vllm_omni/unrelated.py",
+    ]
 
     monkeypatch.setenv("BUILDKITE_BRANCH", "feat/source-filter")
     assert _changed_files_for_source_filter(_Ctx(), force_all=False, e2e_only=False) == [
         "vllm_omni/unrelated.py",
     ]
-    monkeypatch.setenv("BUILDKITE_BRANCH", "main")
     assert _changed_files_for_source_filter(_Ctx(), force_all=True, e2e_only=False) is None
+    assert _changed_files_for_source_filter(_Ctx(), force_all=False, e2e_only=True) is None
 
 
 def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
