@@ -42,10 +42,10 @@ _QUALITY_CONFIG = QualityTestConfig(
 
 
 def _resolve_fl2va_model_ref() -> str:
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     repo_root = Path(
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id=_MINIMAX_H3_REPO,
             revision=_MINIMAX_H3_REVISION,
             allow_patterns=["FL2VA/**"],
@@ -175,7 +175,7 @@ def _generate_joint_output(omni, config: QualityTestConfig):
         pytest.param(
             _QUALITY_CONFIG,
             id=_QUALITY_CONFIG.id,
-            marks=hardware_marks(res={"cuda": _QUALITY_CONFIG.gpu}, num_cards=2),
+            marks=hardware_marks(res={"cuda": ["H100", "B200", "A100"]}, num_cards=2),
         )
     ],
 )
@@ -214,8 +214,9 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
             f"Unexpected H3 audio sample rate: baseline={baseline_sample_rate}, quantized={quant_sample_rate}"
         )
     audio_spectral_cosine, audio_rms_ratio = _audio_quality_metrics(baseline_audio, quant_audio)
-    assert lpips_score <= config.max_lpips, (
-        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
+    gpu_key, max_lpips = config.lpips_threshold()
+    assert lpips_score <= max_lpips, (
+        f"LPIPS {lpips_score:.4f} exceeds threshold {max_lpips} ({gpu_key}) "
         f"for {config.quantization_ref()} on {config.quantized_ref()}"
     )
     assert audio_spectral_cosine >= _MIN_AUDIO_SPECTRAL_COSINE, (
@@ -234,7 +235,7 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
     print(f"  Baseline:      {config.baseline_ref()}")
     print(f"  Quantized:     {config.quantized_ref()}")
     print(f"  Method:        {config.quantization_ref()}")
-    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {config.max_lpips})")
+    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {max_lpips}, gpu: {gpu_key})")
     print(f"  PSNR:          {psnr_score:.4f} dB  (higher is better)")
     print(f"  MAE:           {mae_score:.6f}  (lower is better)")
     print(f"  Audio cosine:  {audio_spectral_cosine:.4f}  (threshold: {_MIN_AUDIO_SPECTRAL_COSINE})")
@@ -253,13 +254,13 @@ def test_resolve_fl2va_model_ref(tmp_path, monkeypatch):
     fl2va_root.mkdir()
     (fl2va_root / "model_index.json").write_text("{}", encoding="utf-8")
 
-    def fake_snapshot_download(*, repo_id, revision, allow_patterns):
+    def fake_snapshot_download(self, *, repo_id, revision, allow_patterns):
         assert repo_id == _MINIMAX_H3_REPO
         assert revision == _MINIMAX_H3_REVISION
         assert allow_patterns == ["FL2VA/**"]
         return str(tmp_path)
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", fake_snapshot_download)
     assert _resolve_fl2va_model_ref() == str(fl2va_root)
 
 

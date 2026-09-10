@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import requests
@@ -288,7 +289,7 @@ def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
 
 
 def _make_config(enable_kv_reuse: bool, path: Path) -> None:
-    config = copy.deepcopy(_DEPLOY_CONFIG)
+    config = cast(dict[str, Any], copy.deepcopy(_DEPLOY_CONFIG))
     config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
     config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
@@ -303,7 +304,7 @@ def _quant_tensor_parallel_size() -> int:
 
 
 def _make_quant_dit_config(path: Path) -> None:
-    config = copy.deepcopy(_QUANT_DIT_CONFIG)
+    config = cast(dict[str, Any], copy.deepcopy(_QUANT_DIT_CONFIG))
     config["stages"][0]["devices"] = _quant_devices()
     config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
@@ -353,7 +354,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         elapsed = time.perf_counter() - t0
 
     assert outputs, "Pipeline produced no outputs"
-    images = None
+    output_images = None
     cot_text = ""
     for out in outputs:
         ro = out
@@ -373,12 +374,12 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if not imgs and ro and hasattr(ro, "images"):
             imgs = ro.images
         if imgs:
-            images = imgs
+            output_images = imgs
 
-    assert images, "Pipeline output had no images"
+    assert output_images, "Pipeline output had no images"
     cot_text = cot_text.lstrip("\n")
 
-    image = images[0].convert("RGB")
+    image = output_images[0].convert("RGB")
     image.save(output_path / "image_offline.png")
     (output_path / "cot_offline.txt").write_text(cot_text, encoding="utf-8")
     gc.collect()
@@ -448,7 +449,7 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     """Online API test: same pipeline, same seed as offline → PSNR >= 10 dB."""
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
-    from tabulate import tabulate
+    from tabulate import tabulate  # type: ignore[import-untyped]
 
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-online")
 
@@ -556,7 +557,7 @@ def _run_dit_model(
             torch.accelerator.empty_cache()
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=8)
+@hardware_test(res={"cuda": "H200"}, num_cards=8)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
     reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
@@ -564,7 +565,7 @@ def _run_dit_model(
 def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
-    from tabulate import tabulate  # lazy import
+    from tabulate import tabulate  # type: ignore[import-untyped]
 
     """KV reuse ON vs OFF: same pipeline, same seed → PSNR >= 10 dB."""
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-offline-kv-reuse")

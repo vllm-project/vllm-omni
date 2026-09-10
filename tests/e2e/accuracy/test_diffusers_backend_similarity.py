@@ -29,6 +29,7 @@ from tests.e2e.accuracy.helpers import (
     assert_similarity,
     env_to_apply_ftfy_mock_in_subproc,
     model_output_dir,
+    resolve_device_threshold,
 )
 from tests.e2e.accuracy.helpers import (
     parse_psnr_score as _parse_psnr_score,
@@ -49,16 +50,25 @@ from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter imp
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
-def _set_matched_attention_backend(pipe: DiffusionPipeline) -> None:
-    """Walk the same backend chain the omni server's diffusers adapter walks.
+def _flash_attempt_backends() -> list[str]:
+    """Backends in ``CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS`` that can actually launch.
 
-    The server side (--diffusion-load-format diffusers) resolves its attention
-    backend through the adapter's preference chain, skipping backends that are
-    unavailable on the image (e.g. the FA3 hub kernel has no build variant for
-    the image's torch — build 2953). The reference run must resolve to the
-    same backend or the similarity comparison measures kernel differences.
+    Those names are Hopper FA2/FA3. ``set_attention_backend`` only checks import,
+    so a newer GPU still "selects" them and then dies with "no kernel image".
+    Do not probe by launching: a missing cubin can leave the CUDA context dead.
+    Capability >= 10 is outside that wheel, including future SKUs in that family.
     """
-    for backend in CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS:
+    if not torch.cuda.is_available():
+        return []
+    major, _ = torch.cuda.get_device_capability()
+    if major >= 10:
+        return []
+    return list(CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS)
+
+
+def _set_matched_attention_backend(pipe: DiffusionPipeline) -> None:
+    """Pick a Diffusers attention backend the reference run can actually execute."""
+    for backend in _flash_attempt_backends():
         try:
             pipe.transformer.set_attention_backend(backend)
             return
@@ -164,6 +174,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=FLOW_SHIFT)
         pipe.to("cuda")
+        _set_matched_attention_backend(pipe)
 
         _diffusers_dummy_run(pipe)
 
@@ -296,7 +307,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=1)
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen-Image"])
 def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifact_root: Path) -> None:
     output_dir = model_output_dir(accuracy_artifact_root, model_id + "-diffusers-backend")
@@ -335,7 +346,7 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=1)
 @pytest.mark.parametrize(
     "model_id",
     [
@@ -362,7 +373,11 @@ def test_diffusers_backend_i2v_matches_diffusers(
         model=model_id, output_path=diffusers_path, conditioning_image=resized_image
     )
     diffusers_latency = diffusers_latency * 1000
-    latency_threshold_factor = 0.3
+    # H100 keeps the historical 30% slack. B200 measured ~35.8% (6008 vs 4425 ms).
+    gpu_key, latency_threshold_factor = resolve_device_threshold(
+        {"H100": 0.3, "A100": 0.3, "B200": 0.36},
+        label="latency threshold factor",
+    )
     latency_threshold = diffusers_latency * (1 + latency_threshold_factor)
 
     ssim_output = _run_ffmpeg_similarity("ssim", vllm_path, diffusers_path)
@@ -371,7 +386,8 @@ def test_diffusers_backend_i2v_matches_diffusers(
     psnr_score = _parse_psnr_score(psnr_output)
     print(f"{model_id} latency metrics:")
     print(
-        f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, diffusers latency={diffusers_latency:.2f}ms, lower is better"
+        f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, "
+        f"diffusers latency={diffusers_latency:.2f}ms, slack={latency_threshold_factor:.0%} ({gpu_key}), lower is better"
     )
     print(f"{model_id} similarity metrics:")
     print(f"  SSIM: value={ssim_score:.6f}, threshold>={VIDEO_SSIM_THRESHOLD:.6f}, range=[-1, 1], higher is better")

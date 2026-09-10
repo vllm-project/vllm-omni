@@ -5,7 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
+            "cuda": ["H100", "B200", "A100"],
             "npu": "A3"
           },
           "num_cards": 2
@@ -121,7 +121,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200", "A100"]
           },
           "num_cards": 2
         }
@@ -285,7 +285,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200", "A100"]
           },
           "num_cards": 2
         }
@@ -416,7 +416,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200", "A100"]
           },
           "num_cards": 1
         }

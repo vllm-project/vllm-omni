@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Real multi-process numeric equivalence gate for SANA-Video sequence parallel.
 
 Runs the native transformer directly (no pipeline, no topology validation) with
@@ -273,7 +273,7 @@ def _baseline_worker(
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "B200", "A100"]}, num_cards=2)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 @pytest.mark.parametrize("num_frames", [21, 5])
 def test_sp2_matches_sp1_fp32(task: str, num_frames: int) -> None:
@@ -290,7 +290,7 @@ def test_sp2_matches_sp1_fp32(task: str, num_frames: int) -> None:
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4"}, num_cards=4)
+@hardware_test(res={"cuda": ["L4", "B200", "A100"]}, num_cards=4)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 @pytest.mark.parametrize("num_frames", [21, 5])
 def test_sp4_matches_sp1_fp32(task: str, num_frames: int) -> None:
@@ -307,7 +307,7 @@ def test_sp4_matches_sp1_fp32(task: str, num_frames: int) -> None:
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4"}, num_cards=4)
+@hardware_test(res={"cuda": ["L4", "B200", "A100"]}, num_cards=4)
 def test_sp2_cfg2_matches_sp1_fp32() -> None:
     """Four processes: CFG branches with distinct inputs each run their own SP
     group; catches CFG/SP group crossover and deadlocks."""
@@ -324,7 +324,7 @@ def test_sp2_cfg2_matches_sp1_fp32() -> None:
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4"}, num_cards=4)
+@hardware_test(res={"cuda": ["L4", "B200", "A100"]}, num_cards=4)
 def test_tp2_sp2_matches_sp1_fp32() -> None:
     """Four processes: TP shards heads and channels while SP shards frames; the
     combined mesh must still reproduce the serial output."""
@@ -342,7 +342,7 @@ def test_tp2_sp2_matches_sp1_fp32() -> None:
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "B200", "A100"]}, num_cards=2)
 def test_sp2_bf16_drift_informational() -> None:
     """Records the bf16 reduction-reorder drift magnitude; the load-bearing
     numeric gate is the fp32 suite above."""

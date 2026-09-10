@@ -138,8 +138,6 @@ def _server_args() -> list[str]:
         "--vae-parallel-mode",
         "tile",
         "--vae-use-tiling",
-        "--diffusion-attention-backend",
-        "FLASH_ATTN",
         "--stage-init-timeout",
         "1800",
         "--init-timeout",
@@ -228,7 +226,7 @@ def _assert_official_video(
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=4)
 def test_minimax_h3_i2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:
@@ -304,7 +302,7 @@ def test_minimax_h3_i2va_matches_official_reference(
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=4)
 def test_minimax_h3_ref2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:

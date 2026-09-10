@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch
 from tests.helpers.mark import hardware_marks
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.benchmark,
 ]
