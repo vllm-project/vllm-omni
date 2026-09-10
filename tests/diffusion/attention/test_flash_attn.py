@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Test script for FlashAttention backend with padding handling.
@@ -27,6 +27,30 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813
+
+
+@pytest.mark.parametrize(
+    ("device_major", "requested", "supported", "expected"),
+    [
+        (8, None, frozenset((2, 3, 4)), 2),
+        (9, None, frozenset((2, 3, 4)), 3),
+        (10, None, frozenset((2, 3, 4)), 4),
+        (12, None, frozenset((2, 3, 4)), 4),
+        (9, None, frozenset((2,)), 2),
+        (10, None, frozenset((2, 3)), 3),
+        (9, "2", frozenset((2, 3, 4)), 2),
+        (9, "4", frozenset((2, 3, 4)), 4),
+    ],
+)
+def test_versioned_flash_attention_selection(device_major, requested, supported, expected):
+    assert fa._choose_vllm_flash_attn_version(device_major, requested, supported) == expected
+
+
+def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_version():
+    with pytest.raises(ValueError, match="must be 2, 3, or 4"):
+        fa._choose_vllm_flash_attn_version(9, "5", frozenset((2, 3, 4)))
+    with pytest.raises(RuntimeError, match="FlashAttention 4 is unavailable"):
+        fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -353,8 +377,15 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
     print(f"Max absolute difference: {max_diff:.6f}")
     print(f"Mean absolute difference: {mean_diff:.6f}")
 
-    assert max_diff < 0.01, f"Max difference {max_diff} exceeds threshold 0.01"
-    assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
+    # Match the platform-specific comparison used by test_fa_vs_sdpa above.
+    if current_omni_platform.is_rocm():
+        # AITER FlashAttention and PyTorch SDPA use different BF16 reduction
+        # implementations on ROCm, so individual values can differ by one BF16
+        # step even though the outputs agree within the expected relative error.
+        torch.testing.assert_close(output_fa, output_sdpa, rtol=1e-2, atol=1.5e-2)
+    else:
+        assert max_diff < 0.01, f"Max difference {max_diff} exceeds threshold 0.01"
+        assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
 
     print("✓ Case 3 PASSED: FA and SDPA cross-attention outputs are very close!")
 

@@ -49,7 +49,7 @@ vLLM-Omni's `pre-commit` hooks will now run automatically every time you commit.
     `--all-files` run stays green while historical debt is cleaned up. The
     current `SKIP` list in
     [`.github/workflows/pre-commit.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.github/workflows/pre-commit.yml)
-    is `check-test-ci-coverage`, `markdownlint-cli2`, `shellcheck`,
+    is `check-mark`, `markdownlint-cli2`, `shellcheck`,
     `check-spdx-header`, and `mypy-3.10`. Those hooks still run on **your
     commit** for changed files. A passing GitHub pre-commit check does not mean
     they passed locally. Hooks **not** on that list (forbidden imports,
@@ -66,7 +66,7 @@ already there). `check-pickle-imports` is gone: pickle is now one rule inside
 | `markdownlint-cli2` | Markdown in `docs/`, `recipes/`, `README.md`, `CONTRIBUTING.md` (not `.claude/` / `.cursor/` / `CLAUDE.md`) | skipped |
 | `mypy-3.10` | Type-check changed `vllm_omni/` files (model trees excluded). `tests/` uses `--follow-imports skip` | skipped |
 | `mypy-3.11` / `3.12` / `3.13` | Same checker, extra Python versions | not installed; `pre-commit run --hook-stage manual mypy-3.12` |
-| `check-test-ci-coverage` | Every `tests/**/test_*.py` has a CI level mark and a hardware mark/helper | skipped |
+| `check-mark` | Every `tests/**/test_*.py` has a CI level mark and a hardware platform mark or helper; no direct `pytest.mark.H100` / SKU | skipped |
 | `check-tts-adapter-migration` | `self._tts_model_type` branches in `serving_speech.py` must not increase | runs |
 | `shellcheck` | `*.sh` quoting / undefined vars | skipped |
 | `check-spdx-header` | Omni SPDX header on `.py` / `.pyi` / `.sh` / `.rs` / `.proto` | skipped |
@@ -144,11 +144,13 @@ pre-commit run --hook-stage manual mypy-3.12
 
 #### Test CI marks
 
-`check-test-ci-coverage` requires each collected test module under `tests/` to
+`check-mark` requires each collected test module under `tests/` to
 have at least one CI **level** mark (`core_model`, `advanced_model`,
-`full_model`, `local_model`, or `slow`) and a **hardware** mark (`cpu`, `cuda`,
-`H100`, …) or helper (`hardware_test(` / `hardware_marks(`). GitHub Actions
-skips this hook; local commit does not. See the
+`full_model`, `local_model`, or `slow`) and a **hardware** platform mark
+(`cpu`, `cuda`, …) or helper (`hardware_test(` / `hardware_marks(`). SKU marks
+(`H100`, `L4`, …) must come from those helpers so `cards_{n}` is attached;
+direct `pytest.mark.H100` is rejected. GitHub Actions skips this hook; local
+commit does not. See the
 [test writing guide](./ci/test_writing_guide.md).
 
 #### TTS adapter ratchet
@@ -259,6 +261,28 @@ or serving, explain the required L2/L3 environment and provide the exact command
 ```
 
 Repository skills guide the agent, but they do not replace contributor judgment, the accepted issue or RFC, required test evidence, or maintainer review. Review all generated changes before submitting them.
+
+## AI Usage Policy
+
+AI tools are welcome in vLLM-Omni contributions. Contributors, including maintainers, remain responsible for everything they submit. These requirements apply to pull requests, issues, discussions, and review comments:
+
+- **Disclose AI assistance.** Name the tools used and describe their role in the submission, including assistance with code, tests, documentation, or writing.
+- **Understand your changes.** Review every generated change and be able to explain its behavior, design choices, and interaction with vLLM-Omni without relying on AI to answer for you.
+- **Validate before submitting.** Run relevant checks and report actual results. For model, kernel, or performance changes, include the hardware, model, configuration, and commands needed to reproduce accuracy or benchmark evidence. Clearly identify checks you could not run; generated claims are not test results.
+- **Keep communication useful.** Verify technical claims, search for existing reports, and edit AI-assisted text for accuracy and brevity. Submit only content you have personally reviewed, and take responsibility for responding to review feedback.
+- **Label generated media.** Model-generated images, video, and audio are valid examples or test artifacts for this multimodal project. Identify them as generated output and provide the model, inputs, and reproduction settings. Do not present them as ground-truth references or independent evidence of correctness.
+
+For example, a PR description could include:
+
+```text
+AI assistance: Used Codex to draft the regression test and PR description.
+I reviewed the changes and verified the test reproduces the reported failure.
+Validation: <commands, results, hardware, and any checks not run>.
+```
+
+Maintainer review time is limited. Contributions that are unverified, misleading, or beyond the author's understanding may be closed. Repeated violations may lead to contribution restrictions. New contributors are welcome to ask for help and submit small, well-understood changes.
+
+This policy is adapted from [Ghostty's AI Usage Policy](https://github.com/ghostty-org/ghostty/blob/main/AI_POLICY.md) for vLLM-Omni's contribution and multimodal validation workflows. The [coding-agent workflow](#using-repository-skills-with-coding-agents) provides practical guidance for applying it.
 
 ## Issues
 

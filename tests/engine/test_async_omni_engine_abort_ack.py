@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for acknowledged abort on AsyncOmniEngine."""
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _make_engine(request_q: queue.Queue, rpc_q: queue.Queue) -> AsyncOmniEngine:
     engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
     engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
@@ -63,7 +67,8 @@ def test_abort_async_waits_for_ack(mocker: MockerFixture):
         assert not task.done()
 
         rpc_q.put(AbortResultMessage(rpc_id="abort-rpc-1", success=True))
-        await task
+        result = await task
+        assert result == []
 
     try:
         asyncio.run(_run())
@@ -154,3 +159,110 @@ def test_abort_async_preserves_request_queue_backpressure(mocker: MockerFixture)
         asyncio.run(_run())
     finally:
         engine._correlated_rpc_client.close()
+
+
+def test_abort_async_is_noop_after_shutdown_starts():
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = True
+    engine.request_queue = None
+    engine._correlated_rpc_client = None
+
+    asyncio.run(engine.abort_async(["req-late"]))
+
+
+def test_abort_async_is_noop_for_empty_request_ids():
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = None
+    engine._correlated_rpc_client = None
+
+    asyncio.run(engine.abort_async([]))
+
+
+def test_abort_async_tolerates_request_queue_close_during_shutdown(
+    mocker: MockerFixture,
+):
+    class SyntheticSyncQueueShutDownError(Exception):
+        pass
+
+    rpc_q: queue.Queue = queue.Queue()
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+
+    class ClosingRequestQueue:
+        def put(self, item) -> None:
+            del item
+            engine._shutdown_called = True
+            raise SyntheticSyncQueueShutDownError
+
+    request_q = ClosingRequestQueue()
+    engine.request_queue = SimpleNamespace(sync_q=request_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        SyntheticSyncQueueShutDownError,
+    )
+
+    try:
+        asyncio.run(engine.abort_async(["req-submit-race"], timeout=1))
+    finally:
+        engine._correlated_rpc_client.close()
+
+
+def test_abort_async_surfaces_request_queue_close_while_engine_is_live(
+    mocker: MockerFixture,
+):
+    class SyntheticSyncQueueShutDownError(Exception):
+        pass
+
+    class ClosedRequestQueue:
+        def put(self, item) -> None:
+            del item
+            raise SyntheticSyncQueueShutDownError
+
+    request_q = ClosedRequestQueue()
+    rpc_q: queue.Queue = queue.Queue()
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = SimpleNamespace(sync_q=request_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        SyntheticSyncQueueShutDownError,
+    )
+
+    try:
+        with pytest.raises(SyntheticSyncQueueShutDownError):
+            asyncio.run(engine.abort_async(["req-live-submit"], timeout=1))
+    finally:
+        engine._correlated_rpc_client.close()
+
+
+def test_abort_async_tolerates_rpc_router_close_during_shutdown():
+    request_q: queue.Queue = queue.Queue()
+    rpc_q: queue.Queue = queue.Queue()
+    engine = _make_engine(request_q, rpc_q)
+
+    async def _run() -> None:
+        task = asyncio.create_task(engine.abort_async(["req-ack-race"], timeout=1))
+        await asyncio.to_thread(request_q.get, True, 1)
+        engine._shutdown_called = True
+        engine._correlated_rpc_client.close()
+        await task
+
+    asyncio.run(_run())
+
+
+def test_abort_async_surfaces_rpc_router_close_while_engine_is_live():
+    request_q: queue.Queue = queue.Queue()
+    rpc_q: queue.Queue = queue.Queue()
+    engine = _make_engine(request_q, rpc_q)
+
+    async def _run() -> None:
+        task = asyncio.create_task(engine.abort_async(["req-live"], timeout=1))
+        await asyncio.to_thread(request_q.get, True, 1)
+        engine._correlated_rpc_client.close()
+        with pytest.raises(RuntimeError, match="RPC result router closed"):
+            await task
+
+    asyncio.run(_run())

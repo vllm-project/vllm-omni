@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Tests for async image generation API endpoints.
 
@@ -24,11 +24,13 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
+from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
+from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -219,7 +221,7 @@ def test_client(mock_async_diffusion):
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
-    from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels
+    from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 
     app.state.openai_serving_models = _DiffusionServingModels(
         [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
@@ -2126,7 +2128,7 @@ def test_normalize_image():
     """Test _normalize_image with various input types"""
     import numpy as np
 
-    from vllm_omni.entrypoints.openai.api_server import _normalize_image
+    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
 
     # Test PIL Image input
     img = Image.new("RGB", (64, 64), color="red")
@@ -2163,7 +2165,7 @@ def test_extract_images_from_result():
     """Test _extract_images_from_result with various result formats"""
     import numpy as np
 
-    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
+    from vllm_omni.entrypoints.openai.images.helpers import _extract_images_from_result
 
     # Test empty result
     class EmptyResult:

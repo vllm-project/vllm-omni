@@ -12,14 +12,29 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from huggingface_hub import snapshot_download
 
 from tests.helpers.runtime import OmniServerParams, get_model_prefix
-from tests.helpers.stage_config import get_deploy_config_path, get_deploy_duplex_max_sessions
+from tests.helpers.stage_config import (
+    get_deploy_config_path,
+    get_deploy_duplex_max_sessions,
+    modify_stage_config,
+)
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "openbmb/MiniCPM-o-4_5"
 DEPLOY_CONFIG_REL = "minicpmo_4_5.yaml"
 DEPLOY_CONFIG = get_deploy_config_path(DEPLOY_CONFIG_REL)
+# Eager-execution variant for fast-startup core-tier probes (e.g. the duplex
+# client live test): skips CUDA-graph capture on the LLM and Talker stages.
+CORE_DEPLOY_CONFIG = modify_stage_config(
+    DEPLOY_CONFIG,
+    updates={
+        "stages": {
+            0: {"enforce_eager": True},
+            1: {"enforce_eager": True},
+        }
+    },
+)
 ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"
 RESPONSE_REQUIRED_WAV = ASSET_DIR / "response_required_16k.wav"
 RESPONSE_REQUIRED_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"
@@ -32,6 +47,18 @@ SERVER_PARAMS = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        ),
+        id="three-stage-single-gpu",
+    )
+]
+
+CORE_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=CORE_DEPLOY_CONFIG,
             use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
@@ -84,7 +111,7 @@ def resolve_ref_audio() -> Path:
     model_prefix = get_model_prefix()
     model_root = Path(model_prefix) / MODEL if model_prefix else Path(MODEL)
     if not model_root.is_dir():
-        model_root = Path(snapshot_download(MODEL, local_files_only=True))
+        model_root = Path(hf_api().snapshot_download(MODEL, local_files_only=True))
     ref_audio = model_root / REF_AUDIO_RELATIVE_PATH
     if not ref_audio.is_file():
         raise FileNotFoundError(f"MiniCPM-o checkpoint ref audio is missing: {ref_audio}")
@@ -101,7 +128,8 @@ def duplex_camera_frames(*, seconds: int, cache_dir: Path) -> list[str]:
     from tests.helpers.media import generate_synthetic_video
 
     video = generate_synthetic_video(448, 448, 30 * seconds, cache_dir=cache_dir)
-    return _video_frames_from_file(Path(video["file_path"]))
+    frames, _ = _video_frames_from_file(Path(video["file_path"]))
+    return frames
 
 
 def realtime_url(omni_server) -> str:

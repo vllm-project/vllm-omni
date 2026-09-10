@@ -3,10 +3,11 @@
 """
 E2E online tests for Qwen3-Omni /v1/realtime WebSocket (streaming PCM in, audio out).
 
-Three scenarios:
+Four scenarios:
 - Ready CI: async_chunk on, smoke only (no send delay, no accuracy check).
 - Merge CI: async_chunk on + send delay, full accuracy check.
 - Merge CI: async_chunk off, no send delay, full accuracy check.
+- Server VAD: two turns without client commits.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import wave
 import pytest
 import websockets
 
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
@@ -28,11 +30,18 @@ from tests.helpers.media import (
     generate_synthetic_audio,
 )
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.entrypoints.duplex.server_vad import (
+    SILERO_VAD_FILENAME,
+    SILERO_VAD_REPO_ID,
+    SILERO_VAD_REVISION,
+)
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+MODEL = os.environ.get("VLLM_OMNI_TEST_QWEN3_OMNI_MODEL", "Qwen/Qwen3-Omni-30B-A3B-Instruct")
+SERVER_VAD_MODEL_PATH = os.environ.get("VLLM_OMNI_TEST_SILERO_VAD_MODEL_PATH")
 
 # Synthetic input for realtime E2E (``generate_synthetic_audio``); distinct cache file per phrase.
 REALTIME_SYNTH_PHRASE_TEXT = (
@@ -48,6 +57,15 @@ SEND_DELAY_MS = 200
 
 # CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU via ``platforms:``.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+server_vad_stage_config = modify_stage_config(
+    default_stage_config,
+    {
+        "async_chunk": True,
+        "duplex_session": (
+            {"server_vad_model_path": SERVER_VAD_MODEL_PATH} if SERVER_VAD_MODEL_PATH is not None else {}
+        ),
+    },
+)
 
 realtime_sync_server_params = [
     pytest.param(
@@ -69,6 +87,17 @@ realtime_async_chunk_server_params = [
             server_args=["--async-chunk"],
         ),
         id="async_chunk",
+    ),
+]
+
+realtime_server_vad_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=server_vad_stage_config,
+            use_stage_cli=True,
+        ),
+        id="server_vad",
     ),
 ]
 
@@ -183,6 +212,86 @@ async def _run_realtime_audio_roundtrip(
     }
 
 
+async def _append_pcm16_chunks(ws, pcm16: bytes, chunk_bytes: int) -> None:
+    for offset in range(0, len(pcm16), chunk_bytes):
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm16[offset : offset + chunk_bytes]).decode("utf-8"),
+                }
+            )
+        )
+
+
+async def _receive_server_vad_turn(ws) -> list[dict]:
+    events: list[dict] = []
+    while True:
+        message = await asyncio.wait_for(ws.recv(), timeout=600)
+        if isinstance(message, bytes):
+            continue
+        event = json.loads(message)
+        events.append(event)
+        if event.get("type") == "error":
+            raise AssertionError(f"WebSocket error: {event}")
+        if event.get("type") == "response.done":
+            return events
+
+
+async def _run_server_vad_audio_roundtrips(
+    host: str,
+    port: int,
+    model: str,
+    pcm16: bytes,
+    *,
+    chunk_ms: int = 100,
+    turns: int = 2,
+) -> list[list[dict]]:
+    chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
+    turn_events: list[list[dict]] = []
+
+    async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "model": model,
+                        "audio": {
+                            "input": {
+                                "format": {"type": "audio/pcm", "rate": 16_000},
+                                "turn_detection": {"type": "server_vad"},
+                            }
+                        },
+                    },
+                }
+            )
+        )
+
+        silence = bytes(16_000 * 2 * 3 // 2)
+        for _ in range(turns):
+            await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
+            await _append_pcm16_chunks(ws, silence, chunk_bytes)
+            turn_events.append(await _receive_server_vad_turn(ws))
+
+    return turn_events
+
+
+@pytest.fixture(scope="class")
+def cached_silero_vad_artifact() -> str:
+    """Prepare the pinned artifact before the serving subprocess starts."""
+    if SERVER_VAD_MODEL_PATH is not None:
+        return SERVER_VAD_MODEL_PATH
+
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(
+        repo_id=SILERO_VAD_REPO_ID,
+        filename=SILERO_VAD_FILENAME,
+        revision=SILERO_VAD_REVISION,
+    )
+
+
 def _synthetic_pcm16_input(
     *,
     phrase_text: str = REALTIME_SYNTH_PHRASE_TEXT,
@@ -196,6 +305,11 @@ def _synthetic_pcm16_input(
     )
     wav_bytes = base64.b64decode(syn["base64"])
     return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
+
+
+def _server_vad_pcm16_input() -> bytes:
+    """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
+    return _pcm16_mono_16k_from_wav_bytes(validated_input_wav().read_bytes())
 
 
 def _assert_realtime_smoke(result: dict) -> None:
@@ -295,6 +409,93 @@ class TestQwen3OmniRealtimeWebSocket:
         assert output_duration_s > 5, (
             f"Expected an issue-like audio response longer than 5 seconds, got {output_duration_s:.2f}s"
         )
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_server_vad_server_params, indirect=True)
+    def test_server_vad_multi_turn_without_client_commit(
+        self,
+        cached_silero_vad_artifact: str,
+        omni_server,
+    ) -> None:
+        """Two Qwen turns are endpointed without client commits."""
+        assert cached_silero_vad_artifact
+        deploy = load_deploy_config(server_vad_stage_config)
+        assert deploy.session_mode == "turn"
+        assert deploy.async_chunk is True
+        assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
+        pcm16 = _server_vad_pcm16_input()
+
+        turns = asyncio.run(
+            _run_server_vad_audio_roundtrips(
+                omni_server.host,
+                omni_server.port,
+                omni_server.model,
+                pcm16,
+                chunk_ms=100,
+                turns=2,
+            )
+        )
+
+        assert len(turns) == 2
+        updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
+        effective_turn_detection = updated_session["audio"]["input"]["turn_detection"]
+        assert effective_turn_detection["type"] == "server_vad"
+        assert effective_turn_detection["silence_duration_ms"] == 500
+        assert effective_turn_detection["create_response"] is True
+        assert effective_turn_detection["interrupt_response"] is False
+        required_sequence = [
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+            "response.created",
+            "response.audio.delta",
+            "response.audio.done",
+            "response.done",
+        ]
+        input_item_ids: list[str] = []
+        response_ids: list[str] = []
+        for events in turns:
+            event_types = [event["type"] for event in events]
+            for event_type in required_sequence:
+                if event_type != "response.audio.delta":
+                    assert event_types.count(event_type) == 1, event_types
+            positions = [event_types.index(event_type) for event_type in required_sequence]
+            assert positions == sorted(positions)
+
+            started = next(event for event in events if event["type"] == "input_audio_buffer.speech_started")
+            stopped = next(event for event in events if event["type"] == "input_audio_buffer.speech_stopped")
+            committed = next(event for event in events if event["type"] == "input_audio_buffer.committed")
+            created = next(event for event in events if event["type"] == "response.created")["response"]
+            done = next(event for event in events if event["type"] == "response.done")["response"]
+
+            assert started["item_id"] == stopped["item_id"] == committed["item_id"]
+            input_item_id = committed["item_id"]
+            history_events = [
+                event
+                for event in events
+                if event["type"] in {"conversation.item.added", "conversation.item.done"}
+                and event["item"]["id"] == input_item_id
+            ]
+            assert [event["type"] for event in history_events] == [
+                "conversation.item.added",
+                "conversation.item.done",
+            ]
+            assert all(event["item"]["role"] == "user" for event in history_events)
+            output_pcm = b"".join(
+                base64.b64decode(event["delta"])
+                for event in events
+                if event["type"] == "response.audio.delta" and event.get("delta")
+            )
+            assert output_pcm
+            assert created["id"] == done["id"]
+            assert done["status"] == "completed"
+            input_item_ids.append(input_item_id)
+            response_ids.append(created["id"])
+
+        assert len(set(input_item_ids)) == 2
+        assert len(set(response_ids)) == 2
 
     @pytest.mark.advanced_model
     @pytest.mark.omni

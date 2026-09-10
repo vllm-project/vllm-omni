@@ -29,6 +29,7 @@ from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
+    uses_diffusers_adapter,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
@@ -40,11 +41,13 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
     normalize_diffusion_postprocess_output,
 )
+from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -157,8 +160,14 @@ def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) ->
 
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
-    if model_cls is None:
-        model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+    if model_cls is not None:
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    if uses_diffusers_adapter(od_config):
+        model_cls = DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "supports_request_batch", False))
@@ -174,11 +183,7 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
     parallel_config = getattr(od_config, "parallel_config", None)
     dp_size = getattr(parallel_config, "data_parallel_size", 1)
-    return (
-        dp_size > 1
-        and getattr(od_config, "enable_distributed_layerwise_offload", False)
-        and getattr(od_config, "dlo_use_allgather", True)
-    )
+    return dp_size > 1 and any_selected_component_uses_allgather(od_config)
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -435,8 +440,10 @@ class DiffusionEngine:
         generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
+            output_ready_wait_time = 0.0
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
+                output_ready_wait_start_time = time.perf_counter()
                 fut = self.executor.wait_output_ready(output.async_output_id)
                 timeout = _async_output_timeout()
                 try:
@@ -451,6 +458,7 @@ class DiffusionEngine:
                         describe(output.async_output_id) if describe else "unavailable",
                     )
                     raise
+                output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
@@ -464,9 +472,11 @@ class DiffusionEngine:
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
                 "DiffusionEngine.step_streaming breakdown: preprocess=%.2f ms, "
-                "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+                "add_req_and_wait=%.2f ms, output_ready_wait=%.2f ms, "
+                "postprocess=%.2f ms, total=%.2f ms",
                 preprocess_time * 1000,
                 exec_total_time * 1000,
+                output_ready_wait_time * 1000,
                 postprocess_time * 1000,
                 step_total_ms,
             )
@@ -474,6 +484,7 @@ class DiffusionEngine:
                 metrics_update = {
                     "preprocess_time_ms": preprocess_time * 1000,
                     "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "output_ready_wait_time_ms": output_ready_wait_time * 1000,
                     "postprocess_time_ms": postprocess_time * 1000,
                     **scheduler_metrics,
                 }
@@ -524,26 +535,33 @@ class DiffusionEngine:
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
-        if output.output is None:
-            logger.warning("Output is None, returning empty OmniRequestOutput")
-            return format_empty_diffusion_outputs(request, finished=output.finished)
-
-        # When CPU offload is enabled, move output to CPU before
-        # post-processing to avoid device OOM — model weights may still
-        # reside on the device and leave no headroom for intermediates.
-        output_data = output.output
-        if self.od_config.enable_cpu_offload:
-            output_data = _move_tensor_tree_to_cpu(output_data)
-
-        if self.post_process_func is not None:
-            # Some video pipelines need request-level controls during
-            # postprocess (for example worker-side frame interpolation).
-            postprocess_kwargs: dict[str, object] = {}
-            if self._post_process_accepts_sampling_params:
-                postprocess_kwargs["sampling_params"] = request.sampling_params
-            outputs = self.post_process_func(output_data, **postprocess_kwargs)
+        if output.media is not None:
+            if output.output is not None:
+                raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+            media = output.media.to_cpu() if self.od_config.enable_cpu_offload else output.media
+            output_data = media.video.tensor
+            outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
         else:
-            outputs = output_data
+            if output.output is None:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+                return format_empty_diffusion_outputs(request, finished=output.finished)
+
+            # When CPU offload is enabled, move output to CPU before
+            # post-processing to avoid device OOM — model weights may still
+            # reside on the device and leave no headroom for intermediates.
+            output_data = output.output
+            if self.od_config.enable_cpu_offload:
+                output_data = _move_tensor_tree_to_cpu(output_data)
+
+            if self.post_process_func is not None:
+                # Some video pipelines need request-level controls during
+                # postprocess (for example worker-side frame interpolation).
+                postprocess_kwargs: dict[str, object] = {}
+                if self._post_process_accepts_sampling_params:
+                    postprocess_kwargs["sampling_params"] = request.sampling_params
+                outputs = self.post_process_func(output_data, **postprocess_kwargs)
+            else:
+                outputs = output_data
 
         postprocess_output = normalize_diffusion_postprocess_output(outputs)
 
@@ -1005,33 +1023,12 @@ class DiffusionEngine:
                 raise RuntimeError(f"Could not {action} profiler: {e}") from e
 
     def run_startup_warmup(self) -> None:
-        dlo_use_allgather = getattr(self.od_config, "dlo_use_allgather", True)
-        # Skip dummy run when AllGather is used with more than 1 rank,
-        # because the dummy run sends only 1 request but AllGather requires
-        # all ranks to participate simultaneously.  This covers both DP > 1
-        # and SP > 1 (where dp_size is derived from sp_size in OffloadConfig).
-        pc = getattr(self.od_config, "parallel_config", None)
-        dp_size = getattr(pc, "data_parallel_size", 1) if pc else 1
-        sp_size = getattr(pc, "sequence_parallel_size", 1) if pc else 1
-        effective_shard_size = max(dp_size, sp_size)
-        skip_dummy = (
-            getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            and dlo_use_allgather
-            and effective_shard_size > 1
-        )
-        if skip_dummy:
-            logger.info(
-                "Skipping dummy run (dist_offload with AllGather, dp_size=%d, sp_size=%d)",
-                dp_size,
-                sp_size,
-            )
-            return
         try:
             self._dummy_run()
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
             self.close()
-            raise e
+            raise
 
     def _make_dummy_request(
         self,
@@ -1040,13 +1037,16 @@ class DiffusionEngine:
         width: int,
         guidance_scale: float,
         num_image_inputs: int = 1,
+        num_inference_steps: int = 1,
     ) -> OmniDiffusionRequest | None:
-        """Build a one-step model request for startup profiling or warmup."""
-
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
+        """Build a minimal model request for startup profiling or warmup."""
+        prompt = OmniTextPrompt(prompt="dummy run")
+        model_class_name = self.od_config.model_class_name
+        if model_class_name is None:
+            raise RuntimeError("Dummy request requires a resolved model_class_name")
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:
-            color_format = image_color_format(self.od_config.model_class_name)
+            color_format = image_color_format(model_class_name)
             images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
             prompt.setdefault("multi_modal_data", {})["image"] = images[0] if len(images) == 1 else images
 
@@ -1054,7 +1054,7 @@ class DiffusionEngine:
             audio_sr = 16000
             prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
-        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
         if num_frames <= 0:
             return None
         return OmniDiffusionRequest(
@@ -1063,7 +1063,7 @@ class DiffusionEngine:
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=1,
+                num_inference_steps=num_inference_steps,
                 num_frames=num_frames,
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
@@ -1094,11 +1094,14 @@ class DiffusionEngine:
             is not DiffusionKVCacheMode.PAGED_SCHEDULER
         ):
             return None
+        model_class_name = self.od_config.model_class_name
+        if model_class_name is None:
+            raise RuntimeError("Diffusion KV profiling requires a resolved model_class_name")
         request = self._make_dummy_request(
             height=1024,
             width=1024,
             guidance_scale=5.0,
-            num_image_inputs=get_dummy_run_num_image_inputs(self.od_config.model_class_name),
+            num_image_inputs=get_dummy_run_num_image_inputs(model_class_name),
         )
         if request is None:
             raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
@@ -1134,6 +1137,11 @@ class DiffusionEngine:
             height=512,
             width=512,
             guidance_scale=0.0,
+            # Dummy warmup must exercise at least one denoising iteration in
+            # every execution mode. Some pipelines (for example BAGEL) perform
+            # ``num_inference_steps - 1`` scheduler updates and reject an empty
+            # one-step schedule.
+            num_inference_steps=2,
         )
         if req is None:
             logger.info("Skipping dummy warmup run (num_frames=0)")

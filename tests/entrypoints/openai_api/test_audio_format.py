@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for audio output format handling in chat completions.
 
 Covers:
@@ -11,10 +12,15 @@ Covers:
 
 from __future__ import annotations
 
+from io import BytesIO
+
 import numpy as np
 import pytest
+import soundfile
+import torch
+import torchaudio
 
-from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
     SUPPORTED_AUDIO_FORMATS,
@@ -122,6 +128,89 @@ class TestCreateAudio:
         decoded = base64.b64decode(response.audio_data)
         assert decoded[:4] == b"RIFF"
 
+    def test_resamples_wav_to_requested_output_rate(self, mixin, audio_tensor):
+        response = mixin.create_audio(
+            CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=24000,
+                output_sample_rate=8000,
+                response_format="wav",
+                speed=1.0,
+                base64_encode=False,
+            )
+        )
+
+        with soundfile.SoundFile(BytesIO(response.audio_data)) as audio_file:
+            assert audio_file.samplerate == 8000
+            assert audio_file.frames == 8000
+
+
+class TestStreamingAudioResampler:
+    @staticmethod
+    def _resample(waveform):
+        resampler = StreamingAudioResampler(24000, 8000)
+        return np.concatenate(
+            (
+                resampler.process(waveform),
+                resampler.process(np.empty(0), final=True),
+            )
+        )
+
+    def test_chunk_boundaries_do_not_change_output(self):
+        waveform = np.sin(np.linspace(0, 200 * np.pi, 24000, endpoint=False)).astype(np.float32)
+
+        expected = self._resample(waveform)
+
+        chunked = StreamingAudioResampler(24000, 8000)
+        pieces = [chunked.process(chunk) for chunk in np.split(waveform, [137, 2048, 9001, 17003])]
+        # Bounded FIR history must own its data, not retain the last large chunk.
+        assert chunked._history.base is None
+        pieces.append(chunked.process(np.empty(0), final=True))
+        actual = np.concatenate(pieces)
+
+        assert actual.shape == (8000,)
+        np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+        reference = torchaudio.functional.resample(torch.from_numpy(waveform), 24000, 8000).numpy()
+        np.testing.assert_allclose(actual[100:-100], reference[100:-100], atol=2e-3, rtol=1e-3)
+
+    def test_preserves_passband_signal(self):
+        samples = np.arange(24000, dtype=np.float32)
+        waveform = np.sin(2 * np.pi * 3000 * samples / 24000).astype(np.float32)
+
+        output = self._resample(waveform)
+
+        input_rms = np.sqrt(np.mean(waveform**2))
+        output_rms = np.sqrt(np.mean(output[100:-100] ** 2))
+        assert output_rms == pytest.approx(input_rms, rel=0.02)
+
+    @pytest.mark.parametrize("frequency", [6000, 10000])
+    def test_attenuates_aliasing_frequencies(self, frequency):
+        samples = np.arange(24000, dtype=np.float32)
+        waveform = np.sin(2 * np.pi * frequency * samples / 24000).astype(np.float32)
+
+        output = self._resample(waveform)
+
+        input_rms = np.sqrt(np.mean(waveform**2))
+        output_rms = np.sqrt(np.mean(output[100:-100] ** 2))
+        assert output_rms < input_rms * 0.01
+
+    def test_supports_rational_downsampling_ratio(self):
+        waveform = np.sin(np.linspace(0, 200 * np.pi, 24000, endpoint=False)).astype(np.float32)
+        resampler = StreamingAudioResampler(24000, 16000)
+
+        output = resampler.process(waveform, final=True)
+        reference = torchaudio.functional.resample(torch.from_numpy(waveform), 24000, 16000).numpy()
+
+        assert output.shape == (16000,)
+        np.testing.assert_allclose(output[100:-100], reference[100:-100], atol=2e-3, rtol=1e-3)
+
+    def test_rejects_multichannel_audio(self):
+        resampler = StreamingAudioResampler(24000, 8000)
+
+        with pytest.raises(ValueError, match="only supports mono audio"):
+            resampler.process(np.zeros((2, 240), dtype=np.float32))
+
 
 class TestResolveAudioFormat:
     """Test _resolve_audio_format via the serving chat class."""
@@ -159,7 +248,7 @@ class TestResolveAudioFormat:
         assert result == "pcm"
 
     def test_invalid_format_returns_error(self, serving_chat):
-        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
         request = self._make_request({"format": "aac", "voice": "alloy"})
         result = serving_chat._resolve_audio_format(request)
@@ -167,7 +256,7 @@ class TestResolveAudioFormat:
         assert "aac" in result.error.message
 
     def test_all_supported_formats_accepted(self, serving_chat):
-        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
         for fmt in SUPPORTED_CHAT_AUDIO_FORMATS:
             request = self._make_request({"format": fmt, "voice": "alloy"})

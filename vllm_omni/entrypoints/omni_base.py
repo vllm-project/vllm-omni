@@ -187,7 +187,9 @@ class OmniBase(PDDisaggregationMixin):
         # override the deploy YAML's ``async_chunk: true`` default.
         async_chunk = kwargs.get("async_chunk")
         output_modalities = kwargs.pop("output_modalities", None)
-        diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
+
+        if "diffusion_batch_size" in kwargs:
+            raise TypeError("`diffusion_batch_size` has been removed in Omni/AsyncOmni. Use `max_num_seqs`.")
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
@@ -213,7 +215,6 @@ class OmniBase(PDDisaggregationMixin):
             model=model,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
             transfer_emitter=self.transfer_metrics,
             prom_metrics=self.prom_metrics,
             log_stats=log_stats,
@@ -338,6 +339,7 @@ class OmniBase(PDDisaggregationMixin):
         allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
         """Resolve request parameters; pipeline sampling constraints override caller values."""
+        normalized: Sequence[Any]
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
             # Set the output kind to delta since no params were specified
@@ -353,7 +355,9 @@ class OmniBase(PDDisaggregationMixin):
         if len(normalized) != self.num_stages:
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
 
-        if sampling_params_list is not None:
+        # Streaming coercion may also change a constrained output kind in
+        # the defaults (for example, an internal TTS stage's FINAL_ONLY).
+        if sampling_params_list is not None or allow_delta_coercion:
             normalized = [
                 self._apply_sampling_constraints(params, constraints)
                 for params, constraints in zip(normalized, self.sampling_constraints_list, strict=True)
@@ -363,7 +367,7 @@ class OmniBase(PDDisaggregationMixin):
     @staticmethod
     def _get_sampling_constraints_list(stage_configs: Sequence[Any]) -> list[dict[str, Any]]:
         """Extract each stage's required sampling settings from runtime configs."""
-        constraints_list = []
+        constraints_list: list[dict[str, Any]] = []
         for stage_config in stage_configs:
             constraints = getattr(stage_config, "sampling_constraints", {})
             if not isinstance(constraints, Mapping):
@@ -397,7 +401,7 @@ class OmniBase(PDDisaggregationMixin):
         req_state = self.request_states.get(request_id)
         prom = getattr(self, "prom_metrics", None)
         metrics = getattr(req_state, "metrics", None)
-        if metrics is None or prom is None:
+        if req_state is None or metrics is None or prom is None:
             return
         if str(request_id) in metrics.e2e_done or getattr(req_state, "failure_recorded", False):
             return
@@ -405,6 +409,26 @@ class OmniBase(PDDisaggregationMixin):
         req_state.failure_recorded = True
         prom.request_failed()
         prom.inc_requests_failed(normalize_failure_reason(reason))
+
+    def _publish_request_gauges(self, total: int) -> None:
+        """Publish num_requests_running / num_requests_waiting for ``total`` in-flight requests.
+
+        ``_running_counter`` counts requests from the moment the orchestrator
+        dispatches them to a stage engine, which includes requests still queued
+        inside a stage scheduler. The orchestrator reports those via
+        ``_engines_waiting_counter``.
+        """
+        prom = getattr(self, "prom_metrics", None)
+        if prom is None:
+            return
+        engine = getattr(self, "engine", None)
+        counter = getattr(engine, "_running_counter", None)
+        waiting_counter = getattr(engine, "_engines_waiting_counter", None)
+        dispatched = counter.value if counter is not None else total
+        in_engine_waiting = waiting_counter.value if waiting_counter is not None else 0
+        in_engine_waiting = min(max(0, in_engine_waiting), dispatched)
+        prom.set_running(max(0, dispatched - in_engine_waiting))
+        prom.set_waiting(max(0, total - dispatched) + in_engine_waiting)
 
     def _log_summary_and_cleanup(self, request_id: str, reason: str = "stage_error") -> None:
         req_state = self.request_states.get(request_id)
@@ -431,13 +455,7 @@ class OmniBase(PDDisaggregationMixin):
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.
-            prom = getattr(self, "prom_metrics", None)
-            counter = getattr(getattr(self, "engine", None), "_running_counter", None)
-            if prom is not None:
-                total = len(self.request_states)
-                running = counter.value if counter is not None else total
-                prom.set_running(running)
-                prom.set_waiting(max(0, total - running))
+            self._publish_request_gauges(len(self.request_states))
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
@@ -708,12 +726,8 @@ class OmniBase(PDDisaggregationMixin):
         # hasn't popped self.request_states yet — exclude the finalizing
         # request from `total` so waiting doesn't read 1 and stay stuck
         # there until the next request arrives.
-        counter = getattr(self.engine, "_running_counter", None)
         is_finalizing = finished and stage_id == final_stage_id_for_e2e
-        total = max(0, len(self.request_states) - (1 if is_finalizing else 0))
-        running = counter.value if counter is not None else total
-        self.prom_metrics.set_running(running)
-        self.prom_metrics.set_waiting(max(0, total - running))
+        self._publish_request_gauges(max(0, len(self.request_states) - (1 if is_finalizing else 0)))
 
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
