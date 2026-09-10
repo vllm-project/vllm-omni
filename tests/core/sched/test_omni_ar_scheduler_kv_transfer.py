@@ -34,6 +34,7 @@ def _request_omits_kv_transfer(*, force_kv_transfer: bool) -> tuple[bool, dict]:
     )
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler._omits_kv_transfer_cache = {}
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     request = SimpleNamespace(
         request_id="req",
         additional_information=tagged.additional_information,
@@ -89,6 +90,8 @@ def _make_free_request_scheduler(status: RequestStatus):
     scheduler.pending_stop_after_extraction = set()
     scheduler.transfer_triggered_requests = set()
     scheduler.input_coordinator = None
+    scheduler.chunk_transfer_adapter = None
+    scheduler._kv_wait_start_ts = {}
     freed: list[str] = []
     scheduler._free_blocks = lambda req: freed.append(req.request_id)
     return scheduler, request, freed
