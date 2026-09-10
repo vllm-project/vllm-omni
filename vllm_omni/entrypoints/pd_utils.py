@@ -250,6 +250,24 @@ class PDDisaggregationMixin:
         return {"prefill_bootstrap_addr": bootstrap_addr}
 
     @staticmethod
+    def _resolve_pd_sampling_params(sampling_params_list: list, pair: tuple[int, int] | None) -> list:
+        """D owns logical AR defaults and request overrides; P derives a copy.
+
+        Apply both to exposed defaults and at submission, so independently
+        configured P sampling defaults cannot silently win over D's settings.
+        Transport-only changes are applied later by prefill preparation.
+        """
+        from vllm_omni.engine.pd_continuation import PD_RESUME_KEY
+
+        result = list(sampling_params_list)
+        if pair is not None:
+            p_id, d_id = pair
+            decode_params = result[d_id]
+            if (decode_params.extra_args or {}).get(PD_RESUME_KEY):
+                result[p_id] = decode_params.clone()
+        return result
+
+    @staticmethod
     def _prepare_prefill_sampling_params(req_id: str, sp: "SamplingParams") -> "SamplingParams":
         sp = sp.clone()
         from vllm_omni.engine.pd_continuation import PD_PREFILL_KEY, PD_RESUME_KEY, validate_pd_sampling
@@ -360,6 +378,11 @@ class PDDisaggregationMixin:
 
         if prefill_kv_params:
             decode_kv_params.update(prefill_kv_params)
+
+        from vllm_omni.engine.pd_continuation import PD_RNG_STATE_KEY
+
+        # RNG travels in the handoff envelope, not in Mooncake's parameters.
+        decode_kv_params.pop(PD_RNG_STATE_KEY, None)
 
         decode_kv_params["do_remote_prefill"] = True
         decode_kv_params["do_remote_decode"] = False

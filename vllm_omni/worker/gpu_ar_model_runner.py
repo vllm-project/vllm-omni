@@ -45,8 +45,8 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
-from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.engine.serialization import request_needs_downstream_stage
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import HostCopyBatch, index_to_device
@@ -63,6 +63,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     needs_omni_connector,
 )
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
+from vllm_omni.worker.pd_rng import capture_pd_rng_states
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import (
     call_model_sampler,
@@ -2306,6 +2307,14 @@ class GPUARModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        pd_rng_states = capture_pd_rng_states(
+            self.requests,
+            req_ids_output_copy,
+            valid_sampled_token_ids,
+            tp_group=get_tp_group,
+            async_scheduling=self.use_async_scheduling,
+        )
+
         post_sample_mm = getattr(getattr(self, "model", None), "post_sample_multimodal_outputs", None)
         if callable(post_sample_mm):
             multimodal_outputs = post_sample_mm(
@@ -2437,6 +2446,7 @@ class GPUARModelRunner(
                     restored_mm=restored_mm_snapshot,
                 )
             output.omni_connector_output = omni_connector_output
+            output.pd_rng_states = pd_rng_states
             return output
 
         if not use_async_omni_output:

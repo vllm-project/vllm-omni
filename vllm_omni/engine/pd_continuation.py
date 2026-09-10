@@ -8,6 +8,12 @@ import msgspec
 
 PD_RESUME_KEY = "pd_resume_from_prefill"
 PD_PREFILL_KEY = "pd_prefill_one_token"
+# Internal handoff metadata, stripped before passing connector parameters to D.
+PD_RNG_STATE_KEY = "pd_rng_state"
+
+
+def needs_pd_rng_state(params) -> bool:
+    return params is not None and params.temperature != 0
 
 
 class PDContinuation(msgspec.Struct):
@@ -15,6 +21,7 @@ class PDContinuation(msgspec.Struct):
     token_ids: list[int]
     # Filled by the output processor before admission, using its tokenizer.
     stop_string: str | None = None
+    rng_state: bytes | None = None
 
     def validate(self, prompt_ids: list[int] | None) -> None:
         if not prompt_ids or len(prompt_ids) != self.prompt_len:
@@ -33,15 +40,21 @@ class PDContinuation(msgspec.Struct):
         token_ids = getattr(completion, "cumulative_token_ids", None)
         if token_ids is None:
             token_ids = completion.token_ids
-        result = cls(len(prompt_ids), list(token_ids))
+        result = cls(
+            len(prompt_ids),
+            list(token_ids),
+            rng_state=(getattr(output, "kv_transfer_params", None) or {}).get(PD_RNG_STATE_KEY),
+        )
         result.validate(prompt_ids)
         return result
 
 
 def validate_pd_sampling(params) -> None:
-    """Phase one supports greedy, single-completion AR continuation."""
-    if params.temperature != 0 or params.n != 1:
-        raise ValueError("PD first-token continuation currently requires temperature=0 and n=1")
+    """Single-output continuation with request-level RNG for random sampling."""
+    if params.n != 1:
+        raise ValueError("PD first-token continuation requires n=1")
+    if params.temperature != 0 and params.seed is None:
+        raise ValueError("PD random sampling requires an explicit fixed seed")
     if params.logprobs is not None or params.prompt_logprobs is not None:
         raise ValueError("PD first-token continuation does not yet transfer logprobs")
     if getattr(params, "structured_outputs", None) is not None:
