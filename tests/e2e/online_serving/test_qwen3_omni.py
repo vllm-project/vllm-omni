@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# debug for test
 """
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """

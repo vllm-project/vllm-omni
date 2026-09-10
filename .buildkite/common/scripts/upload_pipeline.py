@@ -115,9 +115,10 @@ WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build
 WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
 READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
 MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
-# TEMP: New Build validation — ignore branch for post-merge L3 path (no env vars).
-# Restore: 'build.branch == "main" && build.env("NIGHTLY") != "1" && '
-MERGE_MAIN_IF = 'build.env("NIGHTLY") != "1" && build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
+MERGE_MAIN_IF = (
+    'build.branch == "main" && build.env("NIGHTLY") != "1" && '
+    'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
+)
 READY_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({READY_LABEL_IF})"
 MERGE_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({MERGE_MAIN_IF}) || ({MERGE_LABEL_IF}))"
 BOOTSTRAP_DISABLED_IF = "false"
