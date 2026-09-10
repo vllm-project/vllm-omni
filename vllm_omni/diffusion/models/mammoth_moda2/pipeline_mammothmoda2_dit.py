@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -19,6 +20,18 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader import (
+    apply_sequential_offload,
+    remove_sequential_offload,
+    sequential_offload_component,
+)
+from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
+    OffloadStrategy,
+    TEXT_ENCODER_COMPONENT,
+    resolve_offload,
+)
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -48,6 +61,33 @@ def _root_weight_source(
         prefix="",
         fall_back_to_pt=True,
     )
+
+
+def _validate_module_offload_runtime(
+    od_config: OmniDiffusionConfig, config: Mammothmoda2Config
+) -> bool:
+    """Validate MammothModa2 module-level (component) offload preconditions.
+
+    Returns ``True`` when module-mode offload is selected, ``False`` when no
+    offload is requested. Raises ``ValueError`` for unsupported combinations.
+
+    This is the module-mode counterpart to the layerwise/DLO admission check:
+    it confirms the compact ``diffusion_offload_config`` resolves to the
+    model-level backend and rejects runtime modes that would silently break
+    component swapping.
+    """
+    resolved = resolve_offload(od_config)
+    if resolved.strategy is not OffloadStrategy.MODEL_LEVEL:
+        return False
+    if getattr(config.llm_config, "model_type", "") != "mammothmoda2_qwen2_5_vl":
+        raise ValueError(
+            "MammothModa2 module-level offload is limited to Preview text-to-image, not Dev"
+        )
+    if od_config.max_num_seqs != 1:
+        raise ValueError(
+            "MammothModa2 module-level offload requires request mode with max_num_seqs=1"
+        )
+    return True
 
 
 @dataclass(frozen=True)
@@ -95,6 +135,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.od_config = od_config
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
+        # Reject unsupported module-offload runtime modes before building modules.
+        _validate_module_offload_runtime(od_config, self.config)
         self.weights_sources = [_root_weight_source(od_config)]
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
@@ -303,7 +345,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         image_cond = full_hidden_states[image_mask].to(dtype=torch.float32).contiguous()
         return text_cond, image_cond
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         request = self._parse_request(req)
         text_cond, image_cond = self._split_ar_conditions(
@@ -320,7 +362,9 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             )
 
         # Move to model device/dtype.
-        model_device = next(self.parameters()).device
+        # Offload can replace parameter storage with CPU placeholders. The
+        # execution device is a runtime property, not a weight-residency probe.
+        model_device = self.device
         if self.gen_image_condition_refiner is not None:
             target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
         else:
@@ -345,7 +389,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         # Apply optional refiner ONLY on image condition tokens.
         if self.gen_image_condition_refiner is not None and image_embeds.shape[1] > 0:
-            image_embeds = self.gen_image_condition_refiner(image_embeds, ~image_attention_mask.bool())
+            with self._component_on_device(self.gen_image_condition_refiner):
+                image_embeds = self.gen_image_condition_refiner(image_embeds, ~image_attention_mask.bool())
             image_attention_mask = torch.ones(
                 image_embeds.shape[:2],
                 dtype=torch.bool,
@@ -435,9 +480,75 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             latents = latents / self.gen_vae.config.scaling_factor
         if self.gen_vae.config.shift_factor is not None:
             latents = latents + self.gen_vae.config.shift_factor
-        image = self.gen_vae.decode(latents, return_dict=False)[0]
+        with self._component_on_device(self.gen_vae):
+            image = self.gen_vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=image)
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+        use_hsdp: bool,
+        offload_components: frozenset[str] | None = None,
+    ) -> None:
+        """Enable component-level (module) CPU offload.
+
+        Stages the DiT against both the image-condition refiner and the VAE
+        decoder, so the VAE is offloaded during denoising and re-activated for
+        the non-``forward`` ``decode`` entry point via
+        :meth:`_component_on_device`.
+        """
+        if getattr(self, "_model_cpu_offload_modules", None):
+            return
+
+        components = ModuleDiscovery.discover(self)
+        dits = components.dits
+        stages = [*components.encoders, *components.vaes]
+        modules = [*dits, *stages]
+        selection_options: dict[str, Any] = {}
+        if offload_components is not None:
+            if DIT_COMPONENT in offload_components and not dits:
+                raise ValueError("MammothModa2 has no loaded DiT for selected module offload")
+            if TEXT_ENCODER_COMPONENT in offload_components and not components.encoders:
+                raise ValueError("MammothModa2 has no loaded text encoder for selected module offload")
+            selection_options = {
+                "offload_dit_modules": dits if DIT_COMPONENT in offload_components else (),
+                "offload_encoder_modules": (
+                    components.encoders if TEXT_ENCODER_COMPONENT in offload_components else ()
+                ),
+            }
+        apply_sequential_offload(
+            dit_modules=dits,
+            encoder_modules=stages,
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+            offload_initial_dits=offload_components is None or DIT_COMPONENT in offload_components,
+            **selection_options,
+        )
+
+        self._model_cpu_offload_modules = modules
+        logger.info(
+            "MammothModa2 model-level CPU offload enabled for selected components: %s",
+            sorted(offload_components) if offload_components is not None else "legacy full topology",
+        )
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        modules = getattr(self, "_model_cpu_offload_modules", None)
+        if not modules:
+            return
+        remove_sequential_offload(modules)
+        self._model_cpu_offload_modules = []
+
+    @contextmanager
+    def _component_on_device(self, component: nn.Module):
+        if getattr(self, "_model_cpu_offload_modules", None):
+            with sequential_offload_component(component):
+                yield
+            return
+        yield
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
