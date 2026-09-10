@@ -127,9 +127,7 @@ def test_enable_model_offload_stages_dit_encoder_and_vae(monkeypatch) -> None:
         "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit.apply_sequential_offload",
         lambda **kwargs: captured.update(kwargs),
     )
-    pipeline.enable_omni_model_cpu_offload(
-        device=torch.device("cpu"), pin_memory=True, use_hsdp=False
-    )
+    pipeline.enable_omni_model_cpu_offload(device=torch.device("cpu"), pin_memory=True, use_hsdp=False)
     assert captured["dit_modules"] == [pipeline.gen_transformer]
     assert captured["encoder_modules"] == [pipeline.gen_image_condition_refiner, pipeline.gen_vae]
     assert pipeline._model_cpu_offload_modules == [
@@ -150,9 +148,7 @@ def test_disable_model_offload_removes_hooks(monkeypatch) -> None:
         "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit.remove_sequential_offload",
         lambda modules: removed.append(modules),
     )
-    pipeline.enable_omni_model_cpu_offload(
-        device=torch.device("cpu"), pin_memory=True, use_hsdp=False
-    )
+    pipeline.enable_omni_model_cpu_offload(device=torch.device("cpu"), pin_memory=True, use_hsdp=False)
     expected = pipeline._model_cpu_offload_modules
     pipeline.disable_omni_model_cpu_offload()
     assert removed == [expected]

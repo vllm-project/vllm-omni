@@ -27,8 +27,8 @@ from vllm_omni.diffusion.offloader import (
 )
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
-    OffloadStrategy,
     TEXT_ENCODER_COMPONENT,
+    OffloadStrategy,
     resolve_offload,
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
@@ -63,9 +63,7 @@ def _root_weight_source(
     )
 
 
-def _validate_module_offload_runtime(
-    od_config: OmniDiffusionConfig, config: Mammothmoda2Config
-) -> bool:
+def _validate_module_offload_runtime(od_config: OmniDiffusionConfig, config: Mammothmoda2Config) -> bool:
     """Validate MammothModa2 module-level (component) offload preconditions.
 
     Returns ``True`` when module-mode offload is selected, ``False`` when no
@@ -80,13 +78,9 @@ def _validate_module_offload_runtime(
     if resolved.strategy is not OffloadStrategy.MODEL_LEVEL:
         return False
     if getattr(config.llm_config, "model_type", "") != "mammothmoda2_qwen2_5_vl":
-        raise ValueError(
-            "MammothModa2 module-level offload is limited to Preview text-to-image, not Dev"
-        )
+        raise ValueError("MammothModa2 module-level offload is limited to Preview text-to-image, not Dev")
     if od_config.max_num_seqs != 1:
-        raise ValueError(
-            "MammothModa2 module-level offload requires request mode with max_num_seqs=1"
-        )
+        raise ValueError("MammothModa2 module-level offload requires request mode with max_num_seqs=1")
     return True
 
 
@@ -279,7 +273,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         cfg_range = extra_args.get("cfg_range")
         if cfg_range is None:
             cfg_range = [0.0, 1.0]
-        if not isinstance(cfg_range, (list, tuple)) or len(cfg_range) != 2:
+        if not isinstance(cfg_range, list | tuple) or len(cfg_range) != 2:
             raise ValueError(f"cfg_range requires two values for request {request_id}")
         try:
             cfg_start, cfg_end = float(cfg_range[0]), float(cfg_range[1])
