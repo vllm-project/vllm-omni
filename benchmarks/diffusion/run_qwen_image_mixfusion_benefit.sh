@@ -17,6 +17,8 @@ DTYPE="${DTYPE:-bfloat16}"
 QUANTIZATION="${QUANTIZATION:-}"
 BACKEND="${BACKEND:-mp}"
 OUTPUT_TYPE="${OUTPUT_TYPE:-latent}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+ENABLE_PIPELINE_PROFILER="${ENABLE_PIPELINE_PROFILER:-0}"
 SAVE_IMAGES="${SAVE_IMAGES:-0}"
 ATTN_BACKENDS="${ATTN_BACKENDS:-FLASH_ATTN TORCH_SDPA SAGE_ATTN}"
 CASES="${CASES:-1024x1024,1024x768 1024x1024,768x1024 1024x1024,512x512 512x512,512x768}"
@@ -47,6 +49,14 @@ for ATTENTION_BACKEND in ${ATTN_BACKENDS}; do
     if [[ -n "${QUANTIZATION}" ]]; then
       QUANT_ARG=(--quantization "${QUANTIZATION}")
     fi
+    EAGER_ARG=()
+    if [[ "${ENFORCE_EAGER}" == "1" ]]; then
+      EAGER_ARG=(--enforce-eager)
+    fi
+    PROFILER_ARG=()
+    if [[ "${ENABLE_PIPELINE_PROFILER}" == "1" ]]; then
+      PROFILER_ARG=(--enable-diffusion-pipeline-profiler)
+    fi
 
     echo "==> backend=${ATTENTION_BACKEND} case=${CASE}"
     set +e
@@ -69,6 +79,8 @@ for ATTENTION_BACKEND in ${ATTN_BACKENDS}; do
         --mixfusion-max-chunks "${MIXFUSION_MAX_CHUNKS}" \
         --json-output "${JSON_OUT}" \
         "${QUANT_ARG[@]}" \
+        "${EAGER_ARG[@]}" \
+        "${PROFILER_ARG[@]}" \
         "${IMAGE_DIR_ARG[@]}"
     ) > "${LOG_OUT}" 2>&1
     STATUS=$?

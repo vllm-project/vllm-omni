@@ -148,6 +148,7 @@ def make_config(args: argparse.Namespace) -> OmniDiffusionConfig:
         enforce_eager=args.enforce_eager,
         parallel_config=parallel_config,
         quantization_config=args.quantization,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         output_type=args.output_type,
         step_execution=True,
         max_num_seqs=args.max_num_seqs,
@@ -174,11 +175,15 @@ def make_sampling_params(
         num_outputs_per_prompt=1,
         max_sequence_length=args.max_sequence_length,
         output_type=args.output_type,
-        extra_args={
-            "enable_mixfusion": True,
-            "mixfusion_min_chunk_tokens": args.mixfusion_min_chunk_tokens,
-            "mixfusion_max_chunks": args.mixfusion_max_chunks,
-        },
+        extra_args=(
+            {
+                "enable_mixfusion": True,
+                "mixfusion_min_chunk_tokens": args.mixfusion_min_chunk_tokens,
+                "mixfusion_max_chunks": args.mixfusion_max_chunks,
+            }
+            if args.enable_mixfusion
+            else {}
+        ),
     )
 
 
@@ -233,13 +238,18 @@ async def run_concurrent_batch(
 def summarize_outputs(outputs: list[Any]) -> dict[str, Any]:
     peak_memory_mb = 0.0
     image_count = 0
+    stage_durations: list[dict[str, float]] = []
     for output in outputs:
+        durations = getattr(output, "stage_durations", None)
+        if durations:
+            stage_durations.append(dict(durations))
         peak_memory_mb = max(peak_memory_mb, float(getattr(output, "peak_memory_mb", 0.0) or 0.0))
         image_count += len(getattr(output, "images", None) or [])
     return {
         "num_outputs": len(outputs),
         "num_images": image_count,
         "peak_memory_mb": peak_memory_mb,
+        "stage_durations": stage_durations,
     }
 
 
@@ -365,8 +375,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixfusion-min-chunk-tokens", type=int, default=256)
     parser.add_argument("--mixfusion-max-chunks", type=int, default=128)
     parser.add_argument("--skip-rejected-mixfusion-cases", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--enable-mixfusion", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enable-expert-parallel", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--enable-diffusion-pipeline-profiler", action="store_true")
     parser.add_argument("--json-output")
     return parser.parse_args()
 

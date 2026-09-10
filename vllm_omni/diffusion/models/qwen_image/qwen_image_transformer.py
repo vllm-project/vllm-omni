@@ -46,7 +46,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_torch
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
@@ -756,18 +756,13 @@ class QwenImageCrossAttention(nn.Module):
         txt_query = self.norm_added_q(txt_query)
         txt_key = self.norm_added_k(txt_key)
 
-        img_cos = image_freq_chunks.real.to(img_query.dtype)
-        img_sin = image_freq_chunks.imag.to(img_query.dtype)
+        # Per-token rotary frequencies laid out in MixFusion chunk order:
+        # [B_chunk, chunk_size, D/2] flattened to [B_chunk*chunk_size, D/2] so
+        # every image token carries its own (chunk-position, resolution) freq.
+        img_cos = image_freq_chunks.real.to(img_query.dtype).reshape(-1, image_freq_chunks.shape[-1])
+        img_sin = image_freq_chunks.imag.to(img_query.dtype).reshape(-1, image_freq_chunks.shape[-1])
         txt_cos = text_freqs.real.to(txt_query.dtype)
         txt_sin = text_freqs.imag.to(txt_query.dtype)
-
-        # The fused RotaryEmbedding path drops 3D cos/sin to the first batch
-        # item. MixFusion needs per-chunk/per-request positions, so use the
-        # native implementation that preserves the leading dimension.
-        img_query = apply_rotary_emb_torch(img_query, img_cos, img_sin, interleaved=self.rope.interleaved)
-        img_key = apply_rotary_emb_torch(img_key, img_cos, img_sin, interleaved=self.rope.interleaved)
-        txt_query = apply_rotary_emb_torch(txt_query, txt_cos, txt_sin, interleaved=self.rope.interleaved)
-        txt_key = apply_rotary_emb_torch(txt_key, txt_cos, txt_sin, interleaved=self.rope.interleaved)
 
         seq_len_txt = encoder_hidden_states.shape[1]
         chunk_size = image_chunks.shape[1]
@@ -787,17 +782,22 @@ class QwenImageCrossAttention(nn.Module):
         flat_queries: list[torch.Tensor] = []
         flat_keys: list[torch.Tensor] = []
         flat_values: list[torch.Tensor] = []
+        flat_cos: list[torch.Tensor] = []
+        flat_sin: list[torch.Tensor] = []
         cu_seqlens = [0]
         max_seq_len = 0
         for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
             txt_len = int(real_txt_lens[req_idx])
             image_seq_len = (chunk_end - chunk_start) * chunk_size
+            chunk_span = slice(chunk_start * chunk_size, chunk_end * chunk_size)
             req_img_query = img_query[chunk_start:chunk_end].reshape(-1, self.query_num_heads, self.head_dim)
             req_img_key = img_key[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
             req_img_value = img_value[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
             flat_queries.append(torch.cat([txt_query[req_idx, :txt_len], req_img_query], dim=0))
             flat_keys.append(torch.cat([txt_key[req_idx, :txt_len], req_img_key], dim=0))
             flat_values.append(torch.cat([txt_value[req_idx, :txt_len], req_img_value], dim=0))
+            flat_cos.append(torch.cat([txt_cos[req_idx, :txt_len], img_cos[chunk_span]], dim=0))
+            flat_sin.append(torch.cat([txt_sin[req_idx, :txt_len], img_sin[chunk_span]], dim=0))
             req_len = txt_len + image_seq_len
             cu_seqlens.append(cu_seqlens[-1] + req_len)
             max_seq_len = max(max_seq_len, req_len)
@@ -805,6 +805,16 @@ class QwenImageCrossAttention(nn.Module):
         joint_query = torch.cat(flat_queries, dim=0)
         joint_key = torch.cat(flat_keys, dim=0)
         joint_value = torch.cat(flat_values, dim=0)
+        joint_cos = torch.cat(flat_cos, dim=0)
+        joint_sin = torch.cat(flat_sin, dim=0)
+
+        # Fused rotary on the reassembled flat sequence. The vLLM fused kernel
+        # takes 2D per-token cos/sin indexed by flat position (no 3D batch dim
+        # to drop), so per-chunk/per-request frequencies are preserved exactly.
+        # Replaces the unfused torch path (mul/neg/cat elementwise, 4 calls)
+        # with one fused Triton kernel per q/k.
+        joint_query = self.rope(joint_query, joint_cos, joint_sin)
+        joint_key = self.rope(joint_key, joint_cos, joint_sin)
         cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=joint_query.device)
         attn_metadata = AttentionMetadata(
             is_varlen=True,

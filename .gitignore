@@ -281,3 +281,4 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
+vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py.bak_*
