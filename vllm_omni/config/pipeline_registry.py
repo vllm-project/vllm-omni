@@ -32,6 +32,10 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
+    COSMOS3_DISAGG_PIPELINE,
+    COSMOS3_PIPELINE,
+)
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
@@ -150,6 +154,20 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
+    # The three Cosmos3 entries below are all opt-in: every Cosmos3 checkpoint
+    # reports the same `model_type` and `model_index.json` `_class_name`, so none
+    # of them may be auto-detected or it would capture the others' checkpoints.
+    # T2I/video checkpoints keep resolving through the single-stage diffusion
+    # fallback unless a deploy yaml's `pipeline:` key names one of these.
+    #
+    # Co-located topology (both Mixture-of-Transformers towers in one diffusion
+    # stage); reachable via `pipeline: cosmos3_omni_colocated`, which
+    # deploy/cosmos3_super_t2i.yaml carries.
+    "cosmos3_omni_colocated": COSMOS3_PIPELINE,
+    # Two-stage topology over that same checkpoint, one stage per tower;
+    # selected only by an explicit `pipeline: cosmos3_omni_disagg` in the deploy
+    # YAML (see cosmos3_pipeline_config for why it declares no architectures).
+    "cosmos3_omni_disagg": COSMOS3_DISAGG_PIPELINE,
     # Cosmos3 policy checkpoints share HF metadata with the T2I/video Cosmos3
     # checkpoints (which stay on the single-stage diffusion fallback), so this
     # entry is only reachable through a deploy yaml's ``pipeline:`` key

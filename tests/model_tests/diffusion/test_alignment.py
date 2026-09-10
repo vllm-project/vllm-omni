@@ -75,6 +75,13 @@ EXCLUDED_MODELS = [
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
+    # The two single-tower halves of the disaggregated Cosmos3 topology. They
+    # subclass the excluded pipeline above and share its checkpoint cost, and a
+    # tiny-model run would additionally need a two-stage server with the
+    # cross-stage K/V handoff wired up; covered by their dedicated unit tests
+    # and real-checkpoint aggregated-vs-disaggregated E2E instead.
+    "Cosmos3ReasonerPipeline",
+    "Cosmos3GeneratorPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",

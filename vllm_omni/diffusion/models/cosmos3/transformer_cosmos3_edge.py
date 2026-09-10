@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 Edge transformer variant with a Nemotron dense UND backbone."""
 
 from __future__ import annotations
@@ -259,14 +259,22 @@ class Cosmos3EdgeLanguageModel(nn.Module):
         use_und_k_norm_for_gen: bool,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        rope_only: bool = False,
     ) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        # ``rope_only``: a stage that does not own this tower keeps the mRoPE
+        # embedding (the GEN pathway needs it) and nothing else. See
+        # ``Cosmos3LanguageModel``.
+        self.rope_only = rope_only
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=rope_theta,
             mrope_section=mrope_section,
         )
+        if rope_only:
+            self.layers = nn.ModuleList()
+            return
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.layers = nn.ModuleList(
             [
                 Cosmos3EdgeUndDecoderLayer(
@@ -290,6 +298,11 @@ class Cosmos3EdgeLanguageModel(nn.Module):
         text_ids: torch.Tensor,
         freqs: tuple[torch.Tensor, torch.Tensor],
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        if self.rope_only:
+            raise RuntimeError(
+                "This Cosmos3 Edge stage does not own the UND tower, so it holds only "
+                "the mRoPE embedding and cannot encode text."
+            )
         hidden = self.embed_tokens(text_ids)
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -373,16 +386,21 @@ class Cosmos3EdgeVFMTransformer(Cosmos3VFMTransformer):
     def validate_loaded_weights(self, loaded: set[str]) -> None:
         missing: list[str] = []
         for layer_idx in range(self.num_hidden_layers):
-            required_markers = (
-                f"language_model.layers.{layer_idx}.mlp.up_proj.",
-                f"language_model.layers.{layer_idx}.mlp.down_proj.",
-                f"gen_layers.{layer_idx}.mlp.up_proj.",
-                f"gen_layers.{layer_idx}.mlp.down_proj.",
-            )
-            if self.use_und_k_norm_for_gen:
-                required_markers = (
-                    *required_markers,
-                    f"language_model.layers.{layer_idx}.self_attn.k_norm_und_for_gen.",
+            # Only the towers this stage owns were built, so only their weights can
+            # have been loaded -- a tower-split stage must not be judged against the
+            # other stage's half of the checkpoint.
+            required_markers: tuple[str, ...] = ()
+            if self.owns_reasoner:
+                required_markers += (
+                    f"language_model.layers.{layer_idx}.mlp.up_proj.",
+                    f"language_model.layers.{layer_idx}.mlp.down_proj.",
+                )
+                if self.use_und_k_norm_for_gen:
+                    required_markers += (f"language_model.layers.{layer_idx}.self_attn.k_norm_und_for_gen.",)
+            if self.owns_generator:
+                required_markers += (
+                    f"gen_layers.{layer_idx}.mlp.up_proj.",
+                    f"gen_layers.{layer_idx}.mlp.down_proj.",
                 )
             missing.extend(
                 marker.rstrip(".") for marker in required_markers if not any(marker in name for name in loaded)

@@ -263,6 +263,12 @@ for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder
 
 
+# The disaggregated Cosmos3 topology splits the two MoT towers across stages, so
+# the OpenAI endpoint sees a per-tower class name. Both accept the same Cosmos3
+# `extra_body` params as the co-located pipeline they subclass.
+_EXTRA_SPECS["Cosmos3ReasonerPipeline"] = _EXTRA_SPECS["Cosmos3OmniDiffusersPipeline"]
+_EXTRA_SPECS["Cosmos3GeneratorPipeline"] = _EXTRA_SPECS["Cosmos3OmniDiffusersPipeline"]
+
 # Multi-stage discovery reports the top-level wrapper rather than its DiT
 # submodule, so both names must resolve to the same request builders.
 _EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]

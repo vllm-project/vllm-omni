@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -267,6 +267,10 @@ def test_edge_validates_required_relu2_weights() -> None:
     model.num_hidden_layers = 1
     model.qk_norm_for_diffusion = True
     model.use_und_k_norm_for_gen = True
+    # A co-located stage owns both towers, so both halves of the checkpoint are
+    # required; the tower-split cases are below.
+    model.owns_reasoner = True
+    model.owns_generator = True
 
     complete = {
         "transformer.language_model.layers.0.mlp.up_proj.weight",
@@ -290,6 +294,55 @@ def test_edge_validates_required_relu2_weights() -> None:
 
     model.use_und_k_norm_for_gen = False
     model.validate_loaded_weights(missing_k_norm)
+
+
+@pytest.mark.parametrize(
+    ("owned_towers", "loaded", "rejected"),
+    [
+        (
+            ("reasoner",),
+            {
+                "transformer.language_model.layers.0.mlp.up_proj.weight",
+                "transformer.language_model.layers.0.mlp.down_proj.weight",
+            },
+            "gen_layers.0.mlp.up_proj",
+        ),
+        (
+            ("generator",),
+            {
+                "transformer.gen_layers.0.mlp.up_proj.weight",
+                "transformer.gen_layers.0.mlp.down_proj.weight",
+            },
+            "language_model.layers.0.mlp.up_proj",
+        ),
+    ],
+)
+def test_edge_weight_validation_only_requires_the_towers_this_stage_owns(
+    owned_towers: tuple[str, ...], loaded: set[str], rejected: str
+) -> None:
+    """A tower-split stage loads half the checkpoint, so it must be judged against
+    half. Requiring the absent tower's weights would fail every disaggregated Edge
+    stage at load time; not requiring the owned tower's would let a genuinely
+    incomplete checkpoint through."""
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
+        Cosmos3EdgeVFMTransformer,
+    )
+
+    model = object.__new__(Cosmos3EdgeVFMTransformer)
+    nn.Module.__init__(model)
+    model.num_hidden_layers = 1
+    model.qk_norm_for_diffusion = True
+    model.use_und_k_norm_for_gen = False
+    model.owns_reasoner = "reasoner" in owned_towers
+    model.owns_generator = "generator" in owned_towers
+
+    model.validate_loaded_weights(loaded)
+
+    # An empty checkpoint is still rejected, and the complaint names only the tower
+    # this stage owns -- the other one is never looked for.
+    with pytest.raises(ValueError, match="missing required weights") as excinfo:
+        model.validate_loaded_weights(set())
+    assert rejected not in str(excinfo.value)
 
 
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
@@ -963,3 +1016,186 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     )
     _, offset_gen_pos = rotary.position_ids
     assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]
+
+
+# =============================================================================
+# Tower ownership (owned_towers)
+# =============================================================================
+#
+# The tower-split topology depends on each stage *never constructing* the tower it
+# does not run. The loader builds the pipeline inside the target device's context,
+# so a tower allocated in __init__ is allocated on the card: building both and
+# pruning one afterwards still pays the full peak and fails to start on a card that
+# holds only one tower. These tests pin that down on a tiny config, where the two
+# towers are cheap enough to compare directly.
+
+
+def _tower_transformer(owned_towers, num_hidden_layers: int = 2):
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    return Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(num_hidden_layers=num_hidden_layers),
+            dtype=torch.float32,
+        ),
+        owned_towers=owned_towers,
+    )
+
+
+def test_owned_towers_defaults_to_both_towers() -> None:
+    """The co-located pipeline passes ``None``, and must keep getting both."""
+    model = _tower_transformer(None)
+
+    assert model.owned_towers == ("reasoner", "generator")
+    assert (model.owns_reasoner, model.owns_generator) == (True, True)
+    assert len(model.language_model.layers) == 2
+    assert len(model.gen_layers) == 2
+    assert model.language_model.rope_only is False
+
+
+def test_a_reasoner_only_transformer_builds_no_gen_blocks() -> None:
+    model = _tower_transformer(("reasoner",))
+
+    assert (model.owns_reasoner, model.owns_generator) == (True, False)
+    assert len(model.language_model.layers) == 2
+    assert len(model.gen_layers) == 0
+    # Still a real ModuleList: cache-dit and the offload rings introspect it.
+    assert isinstance(model.gen_layers, nn.ModuleList)
+
+
+def test_a_generator_only_transformer_builds_no_und_blocks() -> None:
+    model = _tower_transformer(("generator",))
+
+    assert (model.owns_reasoner, model.owns_generator) == (False, True)
+    assert len(model.gen_layers) == 2
+    assert len(model.language_model.layers) == 0
+    # No embedding table and no final norm either -- those are the reasoner's.
+    assert not hasattr(model.language_model, "embed_tokens")
+    assert not any(name.startswith("language_model.") for name, _ in model.named_parameters())
+
+
+def test_a_generator_only_transformer_keeps_the_mrope_embedding() -> None:
+    """``_compute_rope_freqs`` reads ``language_model.rotary_emb`` to build the GEN
+    frequencies, which every denoising step needs -- on every stage."""
+    model = _tower_transformer(("generator",))
+
+    _freqs_und, freqs_gen = model._compute_rope_freqs(
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        t=1,
+        hp=1,
+        wp=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert freqs_gen[0].shape[0] == 1
+
+
+def test_a_rope_only_tower_refuses_to_encode_text() -> None:
+    """Nothing should call it -- the generator swaps in the replay stub -- but if
+    something does, it must say which stage owns the tower rather than fail on a
+    missing attribute."""
+    model = _tower_transformer(("generator",))
+
+    with pytest.raises(RuntimeError, match="does not own the UND tower"):
+        model.language_model(torch.tensor([[1, 2]], dtype=torch.long), None)
+
+
+def test_owning_one_tower_allocates_only_that_tower_s_parameters() -> None:
+    """The point of the whole exercise, measured: each single-tower transformer is
+    strictly smaller than the co-located one, and the two together account for it."""
+
+    def _numel(model) -> int:
+        return sum(p.numel() for p in model.parameters())
+
+    both = _numel(_tower_transformer(None))
+    reasoner_only = _numel(_tower_transformer(("reasoner",)))
+    generator_only = _numel(_tower_transformer(("generator",)))
+
+    assert reasoner_only < both
+    assert generator_only < both
+    # Nothing is built twice and nothing is silently dropped: the shared, non-tower
+    # parameters (proj_in/proj_out, time embedding) are counted by both, so the sum
+    # exceeds `both` by exactly one copy of them.
+    assert reasoner_only + generator_only > both
+
+
+@pytest.mark.parametrize(
+    ("owned_towers", "expected"),
+    [
+        (None, {"reasoner", "generator"}),
+        (("reasoner",), {"reasoner"}),
+        (("generator",), {"generator"}),
+    ],
+)
+def test_offload_components_cover_exactly_the_towers_this_stage_owns(owned_towers, expected) -> None:
+    """Advertising a component whose ``ModuleList`` is empty is not free.
+
+    ``_activate_model_cpu_offload_component`` evicts every *other* component before
+    loading the named one, so an empty "reasoner" on a generator stage would make
+    the replay call round-trip the resident GEN tower out to host memory and
+    straight back, once per forward, for a call that does no work.
+    """
+    assert set(_tower_transformer(owned_towers)._model_cpu_offload_components()) == expected
+
+
+def test_the_unowned_tower_s_offload_context_does_not_evict_the_owned_tower(
+    accelerator_device: torch.device,
+) -> None:
+    """The stock forward wraps both towers unconditionally; a tower-split stage
+    opts out in ``_offload_context`` rather than by forking that forward."""
+    model = _tower_transformer(("generator",), num_hidden_layers=1)
+    model.to(accelerator_device)
+    resident = next(iter(model.gen_layers.parameters()))
+
+    model.enable_model_cpu_offload(device=accelerator_device, pin_memory=False)
+    model._activate_model_cpu_offload_component("generator")
+    assert resident.device == accelerator_device
+
+    with model._offload_context("reasoner"):
+        assert resident.device == accelerator_device
+    assert resident.device == accelerator_device
+    # And nothing was activated in its place: the generator is still the resident one.
+    assert model._active_model_cpu_offload_component == "generator"
+
+    model.disable_model_cpu_offload()
+
+
+def test_an_offload_component_that_is_not_a_tower_is_still_rejected() -> None:
+    """The opt-out above is deliberately narrow. Skipping *any* unadvertised name
+    would turn a typo or a stale call site into a silently un-staged tower, which
+    surfaces as a wrong-device error deep in a forward instead of here. The name
+    below is the module attribute rather than the component, i.e. the shape a stale
+    call site actually takes."""
+    model = _tower_transformer(("generator",), num_hidden_layers=1)
+    model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False)
+
+    with pytest.raises(ValueError, match="Unknown Cosmos3 offload component"), model._offload_context("gen_layers"):
+        pass
+
+    model.disable_model_cpu_offload()
+
+
+def test_the_owned_tower_s_offload_context_still_stages_it_in(accelerator_device: torch.device) -> None:
+    """The opt-out above must not disarm offload for the tower the stage does own."""
+    model = _tower_transformer(("generator",), num_hidden_layers=1)
+    model.to(accelerator_device)
+    resident = next(iter(model.gen_layers.parameters()))
+
+    model.enable_model_cpu_offload(device=accelerator_device, pin_memory=False)
+    # enable parks every component on CPU until a phase activates it.
+    assert resident.device.type == "cpu"
+
+    with model._offload_context("generator"):
+        assert resident.device == accelerator_device
+
+    model.disable_model_cpu_offload()
+
+
+@pytest.mark.parametrize("owned_towers", [(), ("bogus",), ("reasoner", "bogus")])
+def test_an_unknown_or_empty_tower_selection_is_rejected(owned_towers) -> None:
+    """Silently building a transformer with no blocks would surface much later, as
+    a mysteriously wrong image or an empty weight load."""
+    with pytest.raises(ValueError, match="is not a non-empty subset of"):
+        _tower_transformer(owned_towers)
