@@ -556,9 +556,7 @@ class DiffusionLoRAManager:
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
-        lora_names_by_id = (
-            {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
-        )
+        lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
 
         def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
@@ -675,6 +673,21 @@ class DiffusionLoRAManager:
                 lora_weights.lora_a.shape,
                 lora_weights.lora_b.shape,
                 scale,
+            )
+
+        if lora_model.loras and not bound_lora_names:
+            # vLLM core's checkpoint path fails fast on target-module
+            # mismatches (LoRAModel.from_local_checkpoint); the in-memory
+            # tensor path has no such guard, so an adapter whose modules
+            # match no wrappable layer would otherwise activate silently
+            # with zero effect (base-identical output).
+            unbound = sorted(lora_model.loras)
+            raise ValueError(
+                f"LoRA adapter {lora_model.id} bound to 0 of {len(unbound)} "
+                f"LoRA modules; none of its target modules matched a wrappable "
+                f"layer in the pipeline (expected target modules in "
+                f"{self._expected_lora_modules}, received {unbound[:5]}). "
+                f"Please verify that the loaded LoRA module is correct."
             )
 
         if callable(binding_validator):

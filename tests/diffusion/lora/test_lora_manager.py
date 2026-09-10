@@ -848,3 +848,91 @@ def test_removing_suspended_adapter_drops_the_upload(monkeypatch):
     assert manager._suspended_adapter_id is None
     assert layer.reset_calls == 1, "the upload must be torn down"
     assert layer.suspended_slices is None
+
+
+def test_lora_manager_raises_when_adapter_binds_zero_layers():
+    # An adapter whose tensors match no wrappable layer must fail loudly
+    # (vLLM-core checkpoint-path parity) instead of activating silently
+    # with base-identical output.
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.foo": layer}
+
+    def _weights(name: str) -> LoRALayerWeights:
+        return LoRALayerWeights(
+            module_name=name,
+            rank=2,
+            lora_alpha=2,
+            lora_a=torch.ones((2, 2)),
+            lora_b=torch.ones((2, 2)),
+        )
+
+    loras = {
+        "language_model.model.layers.0.nonexistent_target": _weights(
+            "language_model.model.layers.0.nonexistent_target"
+        ),
+        "language_model.model.layers.1.nonexistent_target": _weights(
+            "language_model.model.layers.1.nonexistent_target"
+        ),
+    }
+    manager._registered_adapters = {
+        7: type(
+            "LM",
+            (),
+            {"id": 7, "loras": loras, "get_lora": lambda self, key: self.loras.get(key)},
+        )()
+    }
+
+    with pytest.raises(ValueError, match="bound to 0 of 2"):
+        manager._activate_adapter(7, scale=1.0)
+
+    # The failed activation must roll back: no layer was ever set, none active.
+    assert len(layer.set_calls) == 0
+    assert layer.reset_calls >= 1
+    assert manager._active_adapter_id is None
+
+
+def test_lora_manager_partial_bind_still_activates():
+    # Adapters that bind some (but not all) engine layers were legal before
+    # this guard and must remain so; only a zero-bind is an error.
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    bound_layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    unmatched_layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {
+        "transformer.foo": bound_layer,
+        "transformer.bar": unmatched_layer,
+    }
+
+    lora = LoRALayerWeights(
+        module_name="transformer.foo",
+        rank=2,
+        lora_alpha=2,
+        lora_a=torch.ones((2, 2)),
+        lora_b=torch.ones((2, 2)),
+    )
+    manager._registered_adapters = {
+        7: type(
+            "LM",
+            (),
+            {"id": 7, "loras": {"transformer.foo": lora}, "get_lora": lambda self, key: self.loras.get(key)},
+        )()
+    }
+
+    manager._activate_adapter(7, scale=1.0)
+
+    assert manager._active_adapter_id == 7
+    assert len(bound_layer.set_calls) == 1
+    # The layer with no matching adapter weights is reset, not an error.
+    assert unmatched_layer.reset_calls == 1
