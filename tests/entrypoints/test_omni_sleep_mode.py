@@ -6,7 +6,7 @@
 Layering:
 1. AR protocol (#4473) — ``Qwen/Qwen2.5-Omni-7B`` thinker-only on L4
 2. Diffusion sleep/wake/generate — ``riverclouds/qwen_image_random`` on L4
-3. Light multistage orchestration — thinker-only AR + tiny DiT on H100×2
+3. Light multistage orchestration — thinker-only AR + tiny DiT on L4×2
 
 BAGEL BagelPipeline TP=2 / coordinated dual-engine stay in
 ``tests/e2e/offline_inference/test_bagel_expansion.py``.
@@ -237,13 +237,13 @@ class TestOmniDiffusionSleepMode:
 
 
 # ---------------------------------------------------------------------------
-# 3) Light multistage — small AR + small DiT (H100×2; Entrypoint L4 is cards_1)
+# 3) Light multistage — small AR + small DiT (L4×2)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_multistage_ar_diffusion_sleep_wake():
     """Orchestration: sleep/wake both stages on thinker-only AR + tiny DiT.
