@@ -60,18 +60,20 @@ steps:
 
       - label: "Diffusion · Distributed Test · 2-GPU"
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed tests/diffusion/models/lingbot_world/test_lingbot_world_transformer.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/models/lingbot_world/test_lingbot_world_transformer.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
         mirror_hardwares: l4_2
 
       - label: "Diffusion · Distributed & Attention Test · 4-GPU"
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed tests/diffusion/models/lingbot_world/test_lingbot_world_transformer.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/models/lingbot_world/test_lingbot_world_transformer.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
           - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
         mirror_hardwares: l4_4
 
       - label: "Diffusion · Model Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/models/ -m 'core_model and cuda and not cards_2 and not cards_4' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/models/ -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Other Test"
