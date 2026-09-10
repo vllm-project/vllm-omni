@@ -735,3 +735,39 @@ def test_frame_broadcast_matches_token_expanded_modulation(monkeypatch, dtype):
     for a, b in zip(cache_a.self_attention, cache_b.self_attention, strict=True):
         torch.testing.assert_close(a.key, b.key, rtol=0, atol=0)
         torch.testing.assert_close(a.value, b.value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("unsharded", [None, 0, 1, 2, 3, 4])
+def test_missing_or_partial_sp_split_fails_before_attention(monkeypatch, unsharded):
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_frames_per_block=3, sliding_window_num_frames=6)
+    cache = _cache(module, model)
+    for block in model.blocks:
+        block.self_attn.ulysses_world_size = 2
+    monkeypatch.setattr(module, "get_sp_group", lambda: SimpleNamespace(ulysses_world_size=2))
+    original = model.sp_prepare.forward
+
+    def partial_split(*args):
+        values = original(*args)
+        if unsharded is None:
+            return values
+        return tuple(
+            value if i == unsharded else value.chunk(2, dim=1 if i < 3 else 0)[0] for i, value in enumerate(values)
+        )
+
+    monkeypatch.setattr(model.sp_prepare, "forward", partial_split)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("attention/collectives must not run before shard validation")
+
+    monkeypatch.setattr(model.blocks[0], "forward", forbidden)
+    with pytest.raises(RuntimeError, match="SP input hooks"):
+        model(
+            torch.randn(1, 36, 3, 4, 4),
+            torch.tensor([1.0]),
+            torch.randn(1, 3, 6),
+            torch.randn(1, 384, 3, 4, 4),
+            cache=cache,
+            start_frame=0,
+            update_cache=False,
+        )

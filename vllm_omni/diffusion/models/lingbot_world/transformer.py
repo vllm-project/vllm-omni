@@ -1227,12 +1227,32 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+        sp_size = self.blocks[0].self_attn.ulysses_world_size
+        global_tokens = patched_frames * tokens_per_frame
+        hidden_dim = hidden_states.shape[-1]
+        rope_dim = rotary_emb[0].shape[-1]
+        if global_tokens % sp_size:
+            raise ValueError("LingBot Ulysses requires the token count to be divisible by its degree.")
         hidden_states, camera_hidden_states, timestep_projection, cosine, sine = self.sp_prepare(
             hidden_states,
             camera_hidden_states,
             timestep_projection,
             rotary_emb,
         )
+        if sp_size > 1:
+            local_tokens = global_tokens // sp_size
+            expected_hidden = (batch_size, local_tokens, hidden_dim)
+            if (
+                hidden_states.shape != expected_hidden
+                or camera_hidden_states.shape != expected_hidden
+                or timestep_projection.shape != (batch_size, local_tokens, 6, hidden_dim)
+                or cosine.shape != (local_tokens, rope_dim)
+                or sine.shape != (local_tokens, rope_dim)
+            ):
+                raise RuntimeError(
+                    "LingBot SP input hooks did not shard all conditioning tensors consistently; "
+                    f"expected {local_tokens} tokens per rank. Check SP hook registration and input dimensions."
+                )
         rotary_emb = (cosine, sine)
         # Phase 3: each layer receives its own cache entry. Text K/V is passed
         # only when absent; the returned cache is stored for subsequent DMD
@@ -1255,6 +1275,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         # Phase 4: gather SP shards, map tokens to per-patch 16-channel flow
         # values, and restore [B, C, F, H, W] for the Pipeline's sampler.
         hidden_states = self.sp_output_gather(hidden_states)
+        if sp_size > 1 and hidden_states.shape != (batch_size, global_tokens, hidden_dim):
+            raise RuntimeError("LingBot SP output hook did not gather the full token sequence.")
         hidden_states = self.head(hidden_states, timestep_embedding)
         return self._unpatchify(
             hidden_states,
