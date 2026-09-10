@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the AR-Diffusion KV cache helpers (Phase 1, PR-2).
 
 Covers the request adapter, the chunk-window spec/manager (registration + the
@@ -589,29 +588,3 @@ def test_non_contiguous_branch_indices_rejected():
             kv_branches=(ARDiffusionKVBranchSpec("main", 1),),
             session_capacity=1,
         )
-
-
-def test_cross_attention_can_use_more_heads_than_self_attention():
-    kv = ARDiffusionKVCache(
-        ARDiffusionKVConfig(enable=True, chunk_size=1, window_chunks=2, gpu_memory_fraction=1.0),
-        num_layers=1,
-        num_kv_heads=1,
-        cross_attention_num_kv_heads=2,
-        head_size=2,
-        dtype=torch.float32,
-        block_size=1,
-        max_model_len=16,
-        available_bytes=1024,
-        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
-        session_capacity=1,
-        cross_attention_lengths={"text": 3},
-        device=torch.device("cpu"),
-    )
-    assert kv.spec.num_kv_heads == 1
-    assert kv.cross_attention_bytes_per_session == 2 * 3 * 2 * 2 * 4
-    key = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
-    kv.populate_cross_attention("request", "text", "main", [(key, -key)])
-    stored = kv.read_cross_attention_kv("request", "text", 0, "main")
-    torch.testing.assert_close(stored["k"], key)
-    torch.testing.assert_close(stored["v"], -key)
-    assert kv.num_blocks_total * kv.spec.page_size_bytes + kv.cross_attention_reserved_bytes <= kv.memory_budget_bytes

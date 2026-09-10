@@ -84,7 +84,6 @@ class ARDiffusionKVCacheSpec:
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
-    cross_attention_num_kv_heads: int | None = None
 
     def __post_init__(self) -> None:
         positive_fields = {
@@ -112,8 +111,6 @@ class ARDiffusionKVCacheSpec:
                 "AR-Diffusion model_owned_state_bytes_per_session must be non-negative, "
                 f"got {self.model_owned_state_bytes_per_session}"
             )
-        if self.cross_attention_num_kv_heads is not None and self.cross_attention_num_kv_heads <= 0:
-            raise ValueError("AR-Diffusion cross_attention_num_kv_heads must be positive")
         if not self.kv_branches:
             raise ValueError("AR-Diffusion requires at least one KV branch")
         kv_branch_names = [kv_branch.name for kv_branch in self.kv_branches]

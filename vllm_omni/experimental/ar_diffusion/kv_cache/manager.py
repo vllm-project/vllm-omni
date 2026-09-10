@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Engine-level KV cache orchestration for AR-Diffusion models.
 
 This is the *body* of AR-Diffusion's KV management: it owns a vLLM ``KVCacheManager`` (a
@@ -172,7 +171,6 @@ class ARDiffusionKVCache:
         kv_branches: tuple[ARDiffusionKVBranchSpec, ...],
         session_capacity: int,
         cross_attention_lengths: dict[str, int] | None = None,
-        cross_attention_num_kv_heads: int | None = None,
         device: torch.device | None = None,
         frames_per_block: int = 1,
         max_scratch_tokens_per_branch: int = 0,
@@ -217,11 +215,6 @@ class ARDiffusionKVCache:
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.dtype = dtype
-        self.cross_attention_num_kv_heads = (
-            num_kv_heads if cross_attention_num_kv_heads is None else cross_attention_num_kv_heads
-        )
-        if self.cross_attention_num_kv_heads <= 0:
-            raise ValueError("cross_attention_num_kv_heads must be positive")
         self.cross_attention_lengths = dict(cross_attention_lengths or {})
         invalid_cross = {name: length for name, length in self.cross_attention_lengths.items() if length <= 0}
         if invalid_cross:
@@ -273,15 +266,7 @@ class ARDiffusionKVCache:
         self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
 
         def _cross_pool_bytes(length: int) -> int:
-            return int(
-                2
-                * len(self.kv_branches)
-                * length
-                * self.cross_attention_num_kv_heads
-                * head_size
-                * dtype.itemsize
-                * num_layers
-            )
+            return int(2 * len(self.kv_branches) * length * num_kv_heads * head_size * dtype.itemsize * num_layers)
 
         self.cross_attention_bytes_per_session = sum(
             _cross_pool_bytes(length) for length in self.cross_attention_lengths.values()
@@ -461,7 +446,7 @@ class ARDiffusionKVCache:
         if not self._allocate_tensors:
             raise RuntimeError("AR-Diffusion cross-attention tensors require a configured pool device")
 
-        shape = (length, self.cross_attention_num_kv_heads, self.head_size)
+        shape = (length, self.num_kv_heads, self.head_size)
         expected_input_shape = (1, *shape)
         k_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]
         v_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]

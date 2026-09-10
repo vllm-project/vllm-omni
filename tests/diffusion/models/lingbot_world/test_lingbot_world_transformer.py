@@ -834,7 +834,6 @@ def _rollout(model, mode, dtype, batch):
             frames_per_block=_FRAMES,
             max_scratch_tokens_per_branch=_FRAMES * _TOKENS_PER_FRAME,
             cross_attention_lengths={"text": 5},
-            cross_attention_num_kv_heads=model.blocks[0].cross_attn.num_local_heads,
             device=device,
         )
         state = ARDiffusionKVState(kv, "numeric", {"main": kv.begin_request("numeric")}, num_layers=_LAYERS)
@@ -894,6 +893,7 @@ def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
         destroy_model_parallel,
+        get_sp_group,
         init_distributed_environment,
         initialize_model_parallel,
     )
@@ -945,8 +945,11 @@ def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
                         bound = 1e-5 if dtype == torch.float32 else 1e-2
                         error = (result - expected).double().norm() / expected.double().norm()
                         assert error <= bound, f"rank={rank}, TP{tp} SP{sp}: relative L2 {error.item():.3g} > {bound}"
-                        local_heads = _HEADS // tp
-                        first = get_tensor_model_parallel_rank() * local_heads
+                        local_heads = _HEADS // tp // sp
+                        first = (
+                            get_tensor_model_parallel_rank() * (_HEADS // tp)
+                            + get_sp_group().ulysses_rank * local_heads
+                        )
                         for (k, v), (ek, ev) in zip(cross, expected_cross, strict=True):
                             tolerance = 1e-5 if dtype == torch.float32 else 2e-2
                             torch.testing.assert_close(

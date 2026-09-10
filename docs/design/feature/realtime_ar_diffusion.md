@@ -185,12 +185,10 @@ AR-Diffusion execution. With Ulysses degree greater than one, hidden tokens,
 camera features, token-expanded timestep modulation, and RoPE tables are sharded
 together. Without SP, timestep modulation retains the frame-broadcast path.
 Self-attention performs the sequence-to-head all-to-all before reading or writing
-paged KV. Cross-attention keeps all TP-local text K/V heads on each SP rank and
-attends with local queries, eliminating its two sequence/head all-to-all calls
-without changing attention FLOPs. The managed cache budget includes the extra
-text K/V storage: for 40 layers, 512 text tokens, 40 heads of width 128, BF16,
-and TP1, each session uses 400 MiB per rank (200/300 MiB more than head sharding
-at SP2/SP4). Self-attention KV remains head-sharded.
+paged KV, while static text K/V uses the same local head shard. Text K/V shards
+own compact storage; cross-attention exchanges query/output layouts to use these
+shards. This retains the shared cache geometry and reduces text K/V storage at
+the cost of two all-to-all calls per layer.
 
 The output head projects local tokens before gathering the flow values. For
 the 14B model this reduces the gathered width from 5120 to 64; frame modulation

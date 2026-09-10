@@ -451,7 +451,6 @@ def test_ar_diffusion_capability_uses_config_local_head_geometry(tp_size, sp_siz
 
     assert spec.num_layers == 2
     assert spec.num_kv_heads == 8 // tp_size // sp_size
-    assert spec.cross_attention_num_kv_heads == 8 // tp_size
     assert spec.head_size == 4
     assert spec.tokens_per_frame == 1
     assert spec.frames_per_block == 3

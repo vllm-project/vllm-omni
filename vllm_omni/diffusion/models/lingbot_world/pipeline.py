@@ -610,7 +610,6 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             ),
             model_owned_state_bytes_per_session=condition_bytes_per_session,
-            cross_attention_num_kv_heads=num_tp_heads,
         )
 
     @contextmanager
@@ -978,8 +977,10 @@ class LingBotWorldCausalDMDPipeline(
                 for block in self.transformer.blocks:
                     cross_attention = block.cross_attn
                     shape = (cross_attention.num_local_heads, cross_attention.head_dim)
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
-                    value = cross_attention.v(projected_text).unflatten(2, shape)
+                    key = cross_attention.shard_kv_heads(
+                        cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
+                    )
+                    value = cross_attention.shard_kv_heads(cross_attention.v(projected_text).unflatten(2, shape))
                     yield key, value
 
             state.populate_cross_attention(
