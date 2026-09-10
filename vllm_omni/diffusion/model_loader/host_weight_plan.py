@@ -330,6 +330,8 @@ def build_checkpoint_mmap_plan(
         return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
     if online_quantization:
         return HostWeightPlanResult(None, "online quantization requires the ordinary loader")
+    if any(getattr(module, "requires_ordinary_weight_loading", False) for module in pipeline.modules()):
+        return HostWeightPlanResult(None, "post-load weight conversion requires the ordinary loader")
 
     remap_fn = getattr(type(pipeline), "_remap_ckpt_key", None)
     if not callable(remap_fn):

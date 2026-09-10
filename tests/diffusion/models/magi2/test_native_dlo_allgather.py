@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from unittest.mock import patch
 
 import pytest
@@ -81,6 +81,28 @@ def _tiny_config() -> Magi2PreviewConfig:
             layers=(0, 1),
         ),
     )
+
+
+def test_mmap_plan_rejects_magi2_post_load_quantization() -> None:
+    config = replace(
+        _tiny_config(),
+        quant_config=type("QuantConfig", (), {"get_name": lambda self: "fp8"})(),
+    )
+    pipeline = nn.Module()
+    pipeline.transformer = Magi2PreviewTransformer(config)
+
+    result = build_checkpoint_mmap_plan(
+        pipeline,
+        dit_modules=(("transformer", pipeline.transformer),),
+        sources=(),
+        model_path=None,
+        tensor_parallel_size=1,
+        use_hsdp=False,
+        online_quantization=False,
+    )
+
+    assert result.plan is None
+    assert result.fallback_reason == "post-load weight conversion requires the ordinary loader"
 
 
 @contextmanager

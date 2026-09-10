@@ -434,6 +434,24 @@ def test_native_topology_rejects_cfg_data_parallel_combination():
         _validate_native_topology(_topology_config(cfg_parallel_size=2, data_parallel_size=2))
 
 
+@dataclass
+class _FakeQuantConfig:
+    name: str
+
+    def get_name(self) -> str:
+        return self.name
+
+
+def test_native_topology_accepts_self_contained_int8_and_fp8_quant_methods():
+    _validate_native_topology(_topology_config(quantization_config=_FakeQuantConfig("int8")))
+    _validate_native_topology(_topology_config(quantization_config=_FakeQuantConfig("fp8")))
+
+
+def test_native_topology_rejects_unsupported_quant_methods():
+    with pytest.raises(ValueError, match="quantization='mxfp4'"):
+        _validate_native_topology(_topology_config(quantization_config=_FakeQuantConfig("mxfp4")))
+
+
 def test_cfg_parallel_branch_adapter_preserves_packed_cfg_math():
     sampler = Magi2PreviewSampler(nn.Identity(), Magi2DataProxy(), device="cpu", dtype=torch.float32)
     latent = torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 1, 2)

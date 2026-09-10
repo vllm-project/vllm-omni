@@ -27,9 +27,11 @@ from .attention import Magi2PackedAttentionKernel, VarlenHandler, apply_rotary_e
 from .configuration_magi2 import Magi2PreviewConfig
 from .layers import (
     ElementWiseFourierEmbed,
+    Magi2GroupedLinear,
     MHCHandler,
     ModalityDispatcher,
     MultiModalityRMSNorm,
+    _quant_weight_dtype,
     make_grouped_linear,
     swiglu7,
 )
@@ -69,6 +71,7 @@ class Magi2Attention(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.linear_qkv = make_grouped_linear(
             config.hidden_size,
@@ -78,6 +81,7 @@ class Magi2Attention(nn.Module):
             dtype=config.params_dtype,
             parallel_mode="column",
             qkv_splits=(global_q_size, global_kv_size, global_kv_size),
+            quant_config=config.quant_config,
         )
         self.linear_proj = make_grouped_linear(
             global_q_size,
@@ -86,6 +90,7 @@ class Magi2Attention(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
         self.tp_group = self.linear_qkv.tp_group
         self.num_heads_q = config.num_heads_q // self.tp_group.world_size
@@ -200,6 +205,7 @@ class Magi2MLP(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.down_proj = make_grouped_linear(
             intermediate_size,
@@ -208,6 +214,7 @@ class Magi2MLP(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
 
     def forward(self, hidden_states: torch.Tensor, dispatcher: ModalityDispatcher) -> torch.Tensor:
@@ -256,6 +263,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.shared_expert_fc2 = make_grouped_linear(
             moe.shared_expert_intermediate_size,
@@ -263,6 +271,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
         self.modality_specific_shared_expert_fc1 = make_grouped_linear(
             config.hidden_size,
@@ -271,6 +280,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.modality_specific_shared_expert_fc2 = make_grouped_linear(
             moe.modality_shared_expert_intermediate_size,
@@ -279,6 +289,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
         tp_size = self.split_linear.tp_group.world_size
         self.local_shared_expert_intermediate_size = moe.shared_expert_intermediate_size // tp_size
@@ -612,6 +623,9 @@ class Magi2PreviewTransformer(nn.Module):
         super().__init__()
         self.config = config or Magi2PreviewConfig()
         self.config.validate()
+        # This conversion happens after checkpoint loading. Direct mmap binds
+        # checkpoint tensors straight into DLO and would skip that conversion.
+        self.requires_ordinary_weight_loading = _quant_weight_dtype(self.config.quant_config) is not None
         self.pre_adapter = Magi2PreAdapter(self.config)
         self.post_adapter = Magi2PostAdapter(self.config)
         self.block = Magi2TransformerBlock(self.config)
@@ -729,6 +743,12 @@ class Magi2PreviewTransformer(nn.Module):
         missing = set(targets) - loaded
         if missing:
             raise ValueError(f"MAGI-2 preview checkpoint is missing {len(missing)} weights: {sorted(missing)[:8]}")
+
+        if self.config.quant_config is not None:
+            for module in self.modules():
+                if isinstance(module, Magi2GroupedLinear):
+                    module.maybe_quantize_()
+
         return loaded
 
 
