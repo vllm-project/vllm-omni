@@ -123,22 +123,27 @@ def test_event_journal_overflow_is_explicit_and_does_not_evict_silently() -> Non
 
 
 @pytest.mark.asyncio
-async def test_registry_accepts_journaled_event_before_transport_failure(mocker) -> None:
+@pytest.mark.parametrize("journal", [False, True])
+async def test_registry_failed_send_is_accepted_only_when_journaled(mocker, journal: bool) -> None:
     registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
     accepted = mocker.Mock()
+    expected_calls = [mocker.call()] if journal else []
 
     async def failing_send(payload):
-        accepted.assert_called_once_with()
+        assert accepted.call_args_list == expected_calls
         raise RuntimeError("transport lost")
 
-    await registry.create("sid-accepted-failure", incarnation=0, send=failing_send, close=mocker.AsyncMock())
+    await registry.create("sid-send-failure", incarnation=0, send=failing_send, close=mocker.AsyncMock())
 
     with pytest.raises(RuntimeError, match="transport lost"):
         await registry.send_event(
-            "sid-accepted-failure", {"type": "response.audio.delta", "delta": "AAAA"}, on_accepted=accepted
+            "sid-send-failure",
+            {"type": "response.audio.delta", "delta": "AAAA"},
+            journal=journal,
+            on_accepted=accepted,
         )
 
-    accepted.assert_called_once_with()
+    assert accepted.call_args_list == expected_calls
 
 
 @pytest.mark.asyncio
@@ -181,24 +186,6 @@ async def test_registry_unjournaled_event_is_accepted_after_successful_send(mock
 
     assert entry is None
     accepted.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-async def test_registry_unjournaled_failed_send_is_not_accepted(mocker) -> None:
-    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
-    accepted = mocker.Mock()
-    send = mocker.AsyncMock(side_effect=RuntimeError("transport lost"))
-    await registry.create("sid-live-failure", incarnation=0, send=send, close=mocker.AsyncMock())
-
-    with pytest.raises(RuntimeError, match="transport lost"):
-        await registry.send_event(
-            "sid-live-failure",
-            {"type": "response.audio.delta", "delta": "AAAA"},
-            journal=False,
-            on_accepted=accepted,
-        )
-
-    accepted.assert_not_called()
 
 
 @pytest.mark.asyncio

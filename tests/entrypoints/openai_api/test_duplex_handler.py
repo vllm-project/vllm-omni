@@ -10,6 +10,7 @@ import json
 import struct
 import wave
 from collections.abc import Callable
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -5184,45 +5185,28 @@ async def test_duplex_chat_audio_does_not_round_each_fragment():
 
 
 @pytest.mark.asyncio
-async def test_duplex_chat_rejected_audio_is_generated_but_not_sent():
+@pytest.mark.parametrize("send_error", [None, RuntimeError("output unavailable")], ids=["rejected", "failed"])
+async def test_duplex_chat_unaccepted_audio_is_generated_but_not_sent(send_error: RuntimeError | None):
     handler = OmniDuplexSessionHandler(
         chat_service=TurnBasedFakeChatService(FakeEngineClient()),
         config_timeout_s=0.1,
         idle_timeout_s=1,
     )
-    session = DuplexSession(session_id="sid-chat-rejected-audio", config=DuplexSessionConfig())
+    session = DuplexSession(session_id="sid-chat-unaccepted-audio", config=DuplexSessionConfig())
     response_id = session.begin_response()
 
-    async def reject(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
-        pass
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
+        if send_error is not None:
+            raise send_error
 
-    await handler._emit_chat_payload(session, _chat_audio_completion_payload(), session.epoch, response_id, reject)
-
-    assert session.playback.generated_ms == 100
-    assert session.playback.sent_ms == 0
-    assert session.playback.played_ms == 0
-
-
-@pytest.mark.asyncio
-async def test_duplex_chat_failed_audio_send_does_not_advance_sent():
-    handler = OmniDuplexSessionHandler(
-        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
-    session = DuplexSession(session_id="sid-chat-failed-audio", config=DuplexSessionConfig())
-    response_id = session.begin_response()
-
-    async def fail_send(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
-        raise RuntimeError("output unavailable")
-
-    with pytest.raises(RuntimeError, match="output unavailable"):
+    with pytest.raises(RuntimeError, match="output unavailable") if send_error is not None else nullcontext():
         await handler._emit_chat_payload(
-            session, _chat_audio_completion_payload(), session.epoch, response_id, fail_send
+            session, _chat_audio_completion_payload(), session.epoch, response_id, send_json
         )
 
     assert session.playback.generated_ms == 100
     assert session.playback.sent_ms == 0
+    assert session.playback.played_ms == 0
 
 
 @pytest.mark.asyncio

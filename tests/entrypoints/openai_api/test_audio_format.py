@@ -137,45 +137,33 @@ class TestCreateAudio:
         decoded = base64.b64decode(response.audio_data)
         assert decoded[:4] == b"RIFF"
 
-    def test_resamples_wav_to_requested_output_rate(self, mixin, audio_tensor):
+    @pytest.mark.parametrize(
+        "channels,speed,frame_count",
+        [(1, 1.0, 8000), (2, 2.0, 4000)],
+        ids=["mono-resampled", "stereo-resampled-faster"],
+    )
+    def test_metadata_matches_transformed_waveform(self, mixin, audio_tensor, channels, speed, frame_count):
         response = mixin.create_audio(
             CreateAudio(
-                audio_tensor=audio_tensor,
+                audio_tensor=audio_tensor if channels == 1 else np.stack((audio_tensor, audio_tensor)),
                 sample_rate=24000,
                 output_sample_rate=8000,
                 response_format="wav",
-                speed=1.0,
+                speed=speed,
                 base64_encode=False,
             )
         )
 
         with soundfile.SoundFile(BytesIO(response.audio_data)) as audio_file:
             assert audio_file.samplerate == 8000
-            assert audio_file.frames == 8000
-            assert response.audio_metadata.sample_rate_hz == audio_file.samplerate
-            assert response.audio_metadata.frame_count == audio_file.frames
-
-    def test_metadata_matches_transformed_stereo_waveform(self, mixin, audio_tensor):
-        response = mixin.create_audio(
-            CreateAudio(
-                audio_tensor=np.stack((audio_tensor, audio_tensor)),
-                sample_rate=24000,
-                output_sample_rate=8000,
-                response_format="wav",
-                speed=2.0,
-                base64_encode=False,
-            )
-        )
-
-        with soundfile.SoundFile(BytesIO(response.audio_data)) as audio_file:
-            assert audio_file.frames == 4000
+            assert audio_file.frames == frame_count
+            assert audio_file.channels == channels
             assert response.audio_metadata.model_dump() == {
                 "format": "wav",
                 "sample_rate_hz": audio_file.samplerate,
                 "frame_count": audio_file.frames,
                 "channels": audio_file.channels,
             }
-            assert audio_file.channels == 2
 
 
 class TestStreamingAudioResampler:
