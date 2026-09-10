@@ -411,7 +411,9 @@ class OmniEngineBase:
             ),
             None,
         )
-        self.default_sampling_params_list = [client.default_sampling_params for client in self.stage_clients]
+        self.default_sampling_params_list = PDDisaggregationMixin._resolve_pd_sampling_params(
+            [client.default_sampling_params for client in self.stage_clients], self._pd_pair
+        )
         self.stage_metadata = [
             StageRuntimeInfo(
                 final_output=client.final_output,

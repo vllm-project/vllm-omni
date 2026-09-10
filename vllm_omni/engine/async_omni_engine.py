@@ -274,16 +274,12 @@ class AsyncOmniEngine(OmniEngineBase):
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
-        params = effective_sampling_params_list[0]
         pd_pair = self._pd_pair
+        effective_sampling_params_list = PDDisaggregationMixin._resolve_pd_sampling_params(
+            effective_sampling_params_list, pd_pair
+        )
+        params = effective_sampling_params_list[0]
         if pd_pair is not None and pd_pair[0] == 0:
-            from vllm_omni.engine.pd_continuation import PD_RESUME_KEY
-
-            decode_params = effective_sampling_params_list[pd_pair[1]]
-            if (decode_params.extra_args or {}).get(PD_RESUME_KEY):
-                # P's first sample belongs to D's logical generation: use D's
-                # resolved penalties, stop masks and token limits from step 0.
-                params = decode_params
             params = PDDisaggregationMixin._prepare_prefill_sampling_params(request_id, params)
             effective_sampling_params_list[0] = params
 

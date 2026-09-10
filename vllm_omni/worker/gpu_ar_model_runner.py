@@ -45,8 +45,8 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
-from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.engine.serialization import request_needs_downstream_stage
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
@@ -59,6 +59,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     needs_omni_connector,
 )
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
+from vllm_omni.worker.pd_rng import capture_pd_rng_states
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import (
     call_model_sampler,
@@ -2061,6 +2062,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        pd_rng_states = capture_pd_rng_states(
+            self.requests,
+            req_ids_output_copy,
+            valid_sampled_token_ids,
+            tp_group=get_tp_group,
+            async_scheduling=self.use_async_scheduling,
+        )
+
         multimodal_outputs = self._run_post_sample_talker_mtp(
             req_ids=req_ids_output_copy,
             valid_sampled_token_ids=valid_sampled_token_ids,
@@ -2157,6 +2166,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     prefix_cache_step_id=prefix_cache_step_id,
                 )
             output.omni_connector_output = omni_connector_output
+            output.pd_rng_states = pd_rng_states
             return output
 
         if not use_async_omni_output:

@@ -22,6 +22,7 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.pd_continuation import (
     PD_PREFILL_KEY,
     PD_RESUME_KEY,
+    PD_RNG_STATE_KEY,
     PDContinuation,
     initial_output_tokens,
     prepend_initial_output,
@@ -496,3 +497,70 @@ def test_terminal_output_flushes_on_transfer_only_step_and_releases_kv_once(sche
         scheduler.finished_req_ids_dict.clear()
         assert not scheduler.update_from_output(schedule, worker)
         scheduler.kv_cache_manager.free.assert_called_once_with(req)
+
+
+@pytest.mark.parametrize("rng_state", [b"serialized TP RNG states", None])
+def test_producer_output_carries_rng_with_connector_completion(rng_state):
+    params = SamplingParams(temperature=1, seed=42, extra_args={PD_RESUME_KEY: True})
+    params = PDDisaggregationMixin._prepare_prefill_sampling_params("req", params)
+    req = OmniRequest("req", [1, 2, 3], params, None)
+    req.status = RequestStatus.RUNNING
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.requests = {"req": req}
+    scheduler.running = [req]
+    scheduler.max_model_len = 4096
+    scheduler.perf_metrics = None
+    scheduler.connector = None
+    scheduler._pd_completed_outputs = []
+    scheduler._maybe_decode_pooling_output = Mock(return_value=None)
+    scheduler._handle_stopped_request = Mock(return_value=True)
+    connector_params = {"remote_engine_id": "P", "transfer_id": "xfer-req"}
+    scheduler._free_request = Mock(return_value=(connector_params, None))
+    scheduler.structured_output_manager = SimpleNamespace(should_advance=lambda req: False)
+    scheduler.chunk_transfer_adapter = None
+    scheduler._new_prompt_len_snapshot = {}
+    scheduler.waiting_for_transfer_free = set()
+    scheduler.transfer_triggered_requests = set()
+    scheduler.active_kv_transfers = set()
+    scheduler.pending_stop_after_extraction = set()
+    scheduler.kv_cache_manager = SimpleNamespace(take_events=lambda: None, estimate_cached_tokens=lambda req: 0)
+    scheduler.finished_req_ids_dict = defaultdict(set)
+    scheduler.make_stats = Mock(return_value=None)
+    scheduler._capture_omni_connector_output = Mock()
+    schedule = SimpleNamespace(num_scheduled_tokens={"req": 3}, scheduled_spec_decode_tokens={})
+    worker = SimpleNamespace(
+        sampled_token_ids=[[791]],
+        req_id_to_index={"req": 0},
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        routed_experts=None,
+        pd_rng_states={"req": rng_state} if rng_state else None,
+    )
+    if rng_state is None:
+        with pytest.raises(RuntimeError, match="without RNG state"):
+            scheduler.update_from_output(schedule, worker)
+        return
+    result = scheduler.update_from_output(schedule, worker)
+    output = result[req.client_index].outputs[0]
+    assert output.new_token_ids == [791] and output.finish_reason == FinishReason.LENGTH
+    assert output.kv_transfer_params == {**connector_params, PD_RNG_STATE_KEY: rng_state}
+    wire = msgspec.msgpack.decode(msgspec.msgpack.encode(output))
+    # EngineCoreOutput is an array-like wire struct in upstream vLLM.
+    wire_params = (
+        wire["kv_transfer_params"]
+        if isinstance(wire, dict)
+        else wire[type(output).__struct_fields__.index("kv_transfer_params")]
+    )
+    assert wire_params[PD_RNG_STATE_KEY] == rng_state
+    assert PD_RNG_STATE_KEY not in connector_params
+
+
+def test_random_continuation_requires_producer_state():
+    params = SamplingParams(temperature=1, seed=42)
+    validate_pd_sampling(params)
+    with pytest.raises(ValueError, match="missing producer RNG state"):
+        _request(params=params)
