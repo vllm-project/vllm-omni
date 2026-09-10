@@ -86,7 +86,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
@@ -139,7 +138,9 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.realtime.connection import (
+    OpenAIFullDuplexConnection,
+)
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -188,6 +189,40 @@ CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", "
 CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 profiler_router = APIRouter()
+
+_QWEN3_OMNI_REALTIME_ARCH = "Qwen3OmniMoeForConditionalGeneration"
+_QWEN3_OMNI_REALTIME_STAGES = {"thinker", "talker", "code2wav"}
+
+
+def _supports_qwen3_omni_realtime(stage_configs: Any) -> bool:
+    def stage_arg(stage: Any, name: str) -> Any:
+        engine_args = getattr(stage, "engine_args", None)
+        return engine_args.get(name) if isinstance(engine_args, Mapping) else getattr(engine_args, name, None)
+
+    stages = stage_configs or ()
+    return (
+        len(stages) == len(_QWEN3_OMNI_REALTIME_STAGES)
+        and all(stage_arg(stage, "model_arch") == _QWEN3_OMNI_REALTIME_ARCH for stage in stages)
+        and {stage_arg(stage, "model_stage") for stage in stages} == _QWEN3_OMNI_REALTIME_STAGES
+    )
+
+
+async def _reject_realtime_websocket(websocket: WebSocket, message: str) -> None:
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "event_id": f"evt_{random_uuid()}",
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "unsupported_model",
+                "message": message,
+                "param": "model",
+                "event_id": None,
+            },
+        }
+    )
+    await websocket.close(code=1008)
 
 
 def _load_model_chat_template_json(model: str) -> str | None:
@@ -961,7 +996,6 @@ async def omni_init_app_state(
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
             allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
-        state.openai_serving_duplex = None
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
@@ -1301,12 +1335,6 @@ async def omni_init_app_state(
             duplex_session_config=getattr(engine_client, "duplex_session_config", None),
             serving_runtime_adapter_path=getattr(engine_client, "duplex_serving_adapter_path", None),
         )
-    state.openai_serving_realtime = OpenAIServingRealtime(
-        engine_client=engine_client,
-        models=state.openai_serving_models,
-        request_logger=request_logger,
-    )
-
     state.openai_serving_video = OmniOpenAIServingVideo(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
@@ -1843,7 +1871,7 @@ async def streaming_video_output(websocket: WebSocket):
 
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
-    """WebSocket endpoint for OpenAI-style realtime interactions."""
+    """Handle an OpenAI-compatible Realtime API session."""
     # Hold real clients until the startup duplex warmup finishes (the warmup
     # connection marks itself with vllm_omni_warmup=1 and passes through).
     warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
@@ -1852,22 +1880,39 @@ async def realtime_websocket(websocket: WebSocket):
             await asyncio.wait_for(warmup_done.wait(), timeout=120)
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
-    duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+
+    state = websocket.app.state
     duplex_query = websocket.query_params.get("duplex")
-    use_duplex_realtime = duplex_handler is not None and (
-        duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
-    )
-    if use_duplex_realtime and duplex_handler is not None:
-        await duplex_handler.handle_realtime_session(websocket)
+    use_experimental_duplex = isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
+    if use_experimental_duplex:
+        serving_duplex = getattr(state, "openai_serving_duplex", None)
+        if serving_duplex is None:
+            await _reject_realtime_websocket(websocket, "The Realtime API is not available for this model")
+            return
+        await serving_duplex.handle_realtime_session(websocket)
         return
 
-    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
-    if serving is None:
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
-        await websocket.close()
+    if not _supports_qwen3_omni_realtime(getattr(state, "stage_configs", None)):
+        await _reject_realtime_websocket(websocket, "The Realtime API is only supported for Qwen3-Omni")
         return
-    connection = RealtimeConnection(websocket, serving)
+
+    model_name = state.openai_serving_models.base_model_paths[0].name
+    # Some OpenAI-compatible clients always send ``model=`` even when the
+    # caller leaves model selection to this single-model Omni server.
+    requested_model = websocket.query_params.get("model")
+    if requested_model and requested_model != model_name:
+        await _reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
+        return
+
+    tokenizer = await state.engine_client.get_tokenizer()
+    connection = OpenAIFullDuplexConnection(
+        websocket=websocket,
+        engine=state.engine_client,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        tool_call_parser=getattr(state.args, "tool_call_parser", None),
+        enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
+    )
     await connection.handle_connection()
 
 
