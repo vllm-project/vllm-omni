@@ -400,7 +400,7 @@ def _get_deploy_config(
 
 
 @config
-class OmniStageModelConfig:
+class OmniStageModelConfig(_TrackExplicitConfigFields):
     """Per-stage model behavior and resolved model-engine inputs."""
 
     model: str | None = None

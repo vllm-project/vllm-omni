@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from math import gcd
 from threading import Lock
@@ -24,7 +25,6 @@ from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -38,6 +38,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
@@ -108,7 +109,45 @@ class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
         )
 
 
-class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModalProcessingInfo]):
+class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModalProcessingInfo]):
+    def apply(self, inputs: ProcessorInputs, timing_ctx):
+        tokenizer = self.info.get_tokenizer()
+        prompt_text = tokenizer.decode(inputs.prompt, skip_special_tokens=False)
+        config = self.info.ctx.get_hf_config()
+        model_dir = self.info.ctx.model_config.model
+        self._ensure_cached_runtime_components(model_dir, config)
+
+        text_token, text_token_len = extract_text_token(
+            prompt_text,
+            self.tokenizer,
+            config.allowed_special,
+        )
+        if inputs.mm_data_items.get_all_counts().get("audio", 0):
+            reference_text = inputs.hf_processor_mm_kwargs.get("prompt_text")
+            if not isinstance(reference_text, str):
+                raise ValueError(f"prompt text is None : {reference_text}")
+            prompt_text_token, prompt_text_token_len = extract_text_token(
+                reference_text,
+                self.tokenizer,
+                config.allowed_special,
+            )
+            text_token, _ = concat_text_with_prompt_ids(
+                text_token,
+                text_token_len,
+                prompt_text_token,
+                prompt_text_token_len,
+            )
+
+        inputs = replace(
+            inputs,
+            prompt=text_token.reshape(-1).tolist(),
+            hf_processor_mm_kwargs={
+                **inputs.hf_processor_mm_kwargs,
+                self._OMNI_PROMPT_TEXT_KEY: prompt_text,
+            },
+        )
+        return super().apply(inputs, timing_ctx)
+
     def _ensure_cached_runtime_components(self, model_dir: str, config: CosyVoice3Config) -> None:
         cached_model_dir = getattr(self, "_cached_model_dir", None)
         if cached_model_dir == model_dir:
@@ -375,15 +414,6 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             "speech_token_len": MultiModalFieldConfig.batched("audio"),
             "embedding": MultiModalFieldConfig.batched("audio"),
         }
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
 
     def _get_prompt_updates(
         self,

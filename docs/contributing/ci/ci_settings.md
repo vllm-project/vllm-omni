@@ -129,7 +129,7 @@ Canonical layout (prefer these paths for new changes):
 
 === "NPU"
 
-    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3 and A3 CI images, then uploads child test pipelines.
+    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3, A3, A5, and 310P CI images, then uploads child test pipelines.
 
     **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
 
@@ -137,7 +137,12 @@ Canonical layout (prefer these paths for new changes):
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
-    **Hardware in YAML:** `mirror_hardwares` preset (string), expanded to `agents`, top-level `image`, and `plugins`. Presets: `a2b3_npu_1`, `a2b3_npu_4`, `a3_npu_2` in `common/ci_mirror_hardwares.yml`.
+    **Hardware in YAML:** `mirror_hardwares` preset (string), expanded to `agents`, top-level `image`, and `plugins`. NPU presets in `common/ci_mirror_hardwares.yml` are:
+
+    - A2: `a2b3_npu_1`, `a2b3_npu_4`, `a2b3_npu_8`
+    - A3: `a3_npu_2`, `a3_npu_4`, `a3_npu_8`, `a3_npu_16`
+    - A5: `a5_npu_2`, `a5_npu_4`, `a5_npu_8`, `a5_npu_16`
+    - 310P: `310p_npu_1`, `310p_npu_2`, `310p_npu_4`
 
     **Conventions**
 
@@ -161,7 +166,9 @@ Canonical layout (prefer these paths for new changes):
 
     **Bootstrap:** [`amd/scripts/bootstrap-amd-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/scripts/bootstrap-amd-omni.sh)—skip-ci, diff filtering, Jinja render, then `buildkite-agent pipeline upload`.
 
-    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / PR), `test-amd-merge.yml` (L3 / main).
+    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and `main`). On a PR carrying both labels, AMD combines both suites behind one image build. PR builds without either tier label retain the legacy L2 fallback for compatibility with the `amd-test` trigger. `DEBUG_TEST_YAML` remains an explicit override. AMD has no L4 file yet, so `nightly-test` does not select an additional suite.
+
+    **Trigger boundary:** AMD label handling has two layers. First, the external `vllm-omni-amd-ci` Buildkite pipeline condition decides whether a GitHub label event creates a build. Only after that build starts does this repository's bootstrap inspect all current PR labels and select L2, L3, or both. Repository-side selection therefore cannot make a `merge-test` event start AMD CI by itself. The external condition must admit both `ready` and `merge-test`, while preserving the legacy `amd-test` trigger and non-PR `main` / scheduled builds. For PR builds without a `DEBUG_TEST_YAML` override, an unreadable label set fails the bootstrap instead of silently selecting the wrong tier. Debug overrides skip label lookup and are validated directly; invalid values, including whitespace-only values, fail the bootstrap. Keep `nightly-test` out of the AMD condition until an AMD L4 suite exists; otherwise it would start a build without providing nightly coverage.
 
     **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd-build` image build and `amd_<agent_pool>` queues. Do **not** hand-edit generated `pipeline.yaml`.
 
