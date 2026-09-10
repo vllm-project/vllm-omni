@@ -2458,6 +2458,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     response_metrics.update(extra)
             choices.extend(choices_data)
 
+        # AR pipelines emit one finished output per modality (stage 0 text,
+        # then a later audio stage), and the loop above appends one choice per
+        # output. That yields two choices claiming the same index for a
+        # text+audio request, and spec-shaped clients reading choices[0]
+        # silently lose the audio: OpenAI chat-completions semantics carry
+        # text and audio in a single message (message.content + message.audio).
+        choices = self._merge_audio_choices_into_text(choices)
+
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
 
         # Compute prompt_text for non-streaming response (upstream #42052)
@@ -2769,6 +2777,46 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         kv_transfer_params = final_res.kv_transfer_params
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
+
+    @staticmethod
+    def _merge_audio_choices_into_text(
+        choices: list[ChatCompletionResponseChoice],
+    ) -> list[ChatCompletionResponseChoice]:
+        """Merge audio-only choices into the same-index text choice.
+
+        Non-streaming builders emit one choice per modality output, so a
+        text+audio request returns a text choice and an audio-only choice
+        that both claim index 0. The response model itself declares the
+        merged shape (ChatMessage carries both content and audio), and
+        OpenAI audio semantics put the waveform on message.audio of the
+        same message as the text. Audio-only requests keep their standalone
+        choice because there is no text choice to merge into.
+        """
+        merged: list[ChatCompletionResponseChoice] = []
+        text_by_index: dict[int, ChatCompletionResponseChoice] = {}
+        audio_only: dict[int, ChatCompletionResponseChoice] = {}
+        for choice in choices:
+            message = choice.message
+            if message.audio is not None and not message.content:
+                text_choice = text_by_index.get(choice.index)
+                if text_choice is not None:
+                    # Common order: text stage finishes first.
+                    text_choice.message.audio = message.audio
+                    continue
+                pending = audio_only.get(choice.index)
+                if pending is None:
+                    # Keep it for a text choice arriving later.
+                    audio_only[choice.index] = choice
+                else:
+                    merged.append(choice)
+                continue
+            pending = audio_only.pop(choice.index, None)
+            if pending is not None:
+                message.audio = pending.message.audio
+            text_by_index.setdefault(choice.index, choice)
+            merged.append(choice)
+        merged.extend(audio_only.values())
+        return merged
 
     def _create_audio_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
