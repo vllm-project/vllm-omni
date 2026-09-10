@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -21,7 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_s2v_sampling(**overrides):
-    values = {
+    values: dict[str, Any] = {
         "height": 16,
         "width": 16,
         "num_frames": 8,
@@ -715,13 +716,13 @@ def test_s2v_preencode_returns_playable_mp4_bytes_per_request(monkeypatch, batch
     from vllm_omni.diffusion.utils import chunked_video
 
     transfers = []
-    quantize = chunked_video.chunk_to_uint8_frames
+    quantize = chunked_video.quantize_chunk
 
     def capture(chunk, value_range):
         transfers.append(chunk.shape[2])
         return quantize(chunk, value_range)
 
-    monkeypatch.setattr(chunked_video, "chunk_to_uint8_frames", capture)
+    monkeypatch.setattr(chunked_video, "quantize_chunk", capture)
 
     with patch("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform") as platform:
         platform.is_available.return_value = False
