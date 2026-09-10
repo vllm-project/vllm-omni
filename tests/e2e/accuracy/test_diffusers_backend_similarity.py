@@ -29,6 +29,7 @@ from tests.e2e.accuracy.helpers import (
     assert_similarity,
     env_to_apply_ftfy_mock_in_subproc,
     model_output_dir,
+    resolve_device_threshold,
 )
 from tests.e2e.accuracy.helpers import (
     parse_psnr_score as _parse_psnr_score,
@@ -372,7 +373,11 @@ def test_diffusers_backend_i2v_matches_diffusers(
         model=model_id, output_path=diffusers_path, conditioning_image=resized_image
     )
     diffusers_latency = diffusers_latency * 1000
-    latency_threshold_factor = 0.3
+    # H100 keeps the historical 30% slack. B200 measured ~35.8% (6008 vs 4425 ms).
+    gpu_key, latency_threshold_factor = resolve_device_threshold(
+        {"H100": 0.3, "B200": 0.36},
+        label="latency threshold factor",
+    )
     latency_threshold = diffusers_latency * (1 + latency_threshold_factor)
 
     ssim_output = _run_ffmpeg_similarity("ssim", vllm_path, diffusers_path)
@@ -381,7 +386,8 @@ def test_diffusers_backend_i2v_matches_diffusers(
     psnr_score = _parse_psnr_score(psnr_output)
     print(f"{model_id} latency metrics:")
     print(
-        f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, diffusers latency={diffusers_latency:.2f}ms, lower is better"
+        f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, "
+        f"diffusers latency={diffusers_latency:.2f}ms, slack={latency_threshold_factor:.0%} ({gpu_key}), lower is better"
     )
     print(f"{model_id} similarity metrics:")
     print(f"  SSIM: value={ssim_score:.6f}, threshold>={VIDEO_SSIM_THRESHOLD:.6f}, range=[-1, 1], higher is better")

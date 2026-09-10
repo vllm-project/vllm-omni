@@ -138,8 +138,6 @@ def _server_args() -> list[str]:
         "--vae-parallel-mode",
         "tile",
         "--vae-use-tiling",
-        "--diffusion-attention-backend",
-        "FLASH_ATTN",
         "--stage-init-timeout",
         "1800",
         "--init-timeout",

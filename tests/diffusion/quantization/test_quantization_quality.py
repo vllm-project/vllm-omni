@@ -45,6 +45,7 @@ import pytest
 import torch
 from PIL import Image
 
+from tests.e2e.accuracy.helpers import resolve_device_threshold
 from tests.helpers.mark import hardware_marks
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -80,7 +81,6 @@ class QualityTestConfig:
     num_inference_steps: int = 20  # keep low for CI speed
     num_frames: int = 5  # only for t2v
     seed: int = 42
-    gpu: str = "H100"  # minimum GPU requirement
     negative_prompt: str | None = ""
     guidance_scale: float | None = None
     sigmas: list[float] | None = None
@@ -100,21 +100,8 @@ class QualityTestConfig:
         return self.quantization
 
     def lpips_threshold(self) -> tuple[str, float]:
-        """Return ``(gpu_key, threshold)`` for the current CUDA device.
-
-        ``max_lpips`` is a single threshold, or a GPU-name mapping. A mapping
-        matches when the device name contains a key such as ``H100`` or ``B200``.
-        """
-        if isinstance(self.max_lpips, float | int):
-            return "default", float(self.max_lpips)
-        if not torch.cuda.is_available():
-            raise RuntimeError(f"{self.id}: max_lpips is a GPU mapping but CUDA is unavailable")
-        device_name = torch.cuda.get_device_name()
-        for gpu_key, threshold in self.max_lpips.items():
-            if gpu_key in device_name:
-                return gpu_key, float(threshold)
-        known = ", ".join(self.max_lpips)
-        raise RuntimeError(f"{self.id}: no max_lpips entry for {device_name!r}; known: {known}")
+        """Return ``(gpu_key, threshold)`` for the current CUDA device."""
+        return resolve_device_threshold(self.max_lpips, label=f"{self.id} max_lpips")
 
     def validate(self) -> None:
         uses_explicit_models = self.baseline_model is not None or self.quantized_model is not None
