@@ -51,11 +51,15 @@ FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
-        return FlowUniPCMultistepScheduler(
+        # Native Wan builds unshifted training sigma endpoints, then applies
+        # the requested shift once when setting the inference timesteps.
+        scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
+        scheduler.set_shift(flow_shift)
+        return scheduler
     if sample_solver == "euler":
         return WanEulerScheduler(
             num_train_timesteps=1000,
