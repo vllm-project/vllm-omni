@@ -24,6 +24,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Async Chunk](feature/async_chunk.md)
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
+- [Runner-to-model Prefill/Decode Phase Contract](feature/preprocess_phase_contract.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 

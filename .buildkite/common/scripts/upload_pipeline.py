@@ -70,7 +70,15 @@ from tests.helpers.mark import (  # noqa: E402
 
 LOG = "upload_pipeline"
 BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
-BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset({"image-build", "image-build-a2", "image-build-a3"})
+BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset(
+    {
+        "image-build",
+        "image-build-a2",
+        "image-build-a3",
+        "image-build-a5",
+        "image-build-310p",
+    }
+)
 BOOTSTRAP_UPLOAD_IF_KEYS = {
     "upload-ready-pipeline": "ready",
     "upload-merge-pipeline": "merge",
@@ -79,6 +87,8 @@ BOOTSTRAP_UPLOAD_IF_KEYS = {
 }
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
+CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
+CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
 
 # Bootstrap Buildkite ``if`` expressions.
 # ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
@@ -501,6 +511,17 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
 
     expanded = copy.deepcopy(preset)
     merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
+    # A scheduled build's HF_TOKEN may override a pod env entry with the same
+    # name. The preset injects the Kubernetes secret under a collision-proof
+    # alias; restore the conventional name after Buildkite has merged env.
+    if any(preset_name == chip or preset_name.startswith(f"{chip}_") for chip in _cuda_mirror_chips()):
+        commands = merged.get("commands")
+        if isinstance(commands, list):
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, *commands]
+        elif commands is None:
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT]
+        else:
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, commands]
     # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
     if "retry" in step:
         merged["retry"] = step["retry"]

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 Tencent.
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -17,7 +20,6 @@ from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptReplacement,
@@ -26,6 +28,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
@@ -106,10 +109,7 @@ class CovoAudioDummyInputsBuilder(BaseDummyInputsBuilder[CovoAudioProcessingInfo
         )
 
 
-class CovoAudioMultiModalProcessor(BaseMultiModalProcessor[CovoAudioProcessingInfo]):
-    def _hf_processor_applies_updates(self, prompt_text, mm_items, hf_processor_mm_kwargs, tokenization_kwargs) -> bool:
-        return False
-
+class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingInfo]):
     def _call_hf_processor(
         self, prompt: str, mm_data: Mapping[str, object], mm_kwargs: Mapping[str, Any], tok_kwargs: Mapping[str, object]
     ) -> BatchFeature:

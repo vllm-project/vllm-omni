@@ -66,7 +66,8 @@ The checkpoint keeps these verified contracts:
 - scheduler data-plane append over a resumable request;
 - stale epoch/turn/response fencing;
 - `/v1/duplex` and OpenAI Realtime projection;
-- optional OpenAI `server_vad` turn detection backed by per-session Silero VAD;
+- optional OpenAI `server_vad` turn detection backed by a process-shared Silero
+  model and per-session VAD state;
 - existing JoyVL behavior.
 
 The checkpoint does not claim:
@@ -652,7 +653,7 @@ EOS decisions advance the model conversation.
 
 Explicit Realtime clients may still use `input_audio_buffer.commit` to create a
 conversation item. The translator validates that wire input before producing a
-commit carrying `realtime_item_id`. Native auto-response may already have
+commit carrying `item_id`. Native auto-response may already have
 streamed those PCM samples into the runtime, so the runner accepts a validated
 commit even when no runtime-side chunk remains. A truly empty explicit buffer
 continues to return `input_audio_buffer_empty`.
@@ -677,8 +678,7 @@ multi-turn runtime evidence.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
-item". Silent overlap no longer discards earlier user PCM. A separate explicit
-`server_vad` policy is documented in the Realtime contract above.
+item". Silent overlap no longer discards earlier user PCM.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS

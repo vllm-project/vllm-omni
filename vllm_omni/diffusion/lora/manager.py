@@ -48,6 +48,11 @@ class DiffusionLoRAManager:
     # Valid max allowed ranks for LoRA in vLLM
     _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
 
+    # Adapter whose weights are still uploaded while gated off. Class-level so
+    # a manager built without __init__ (some tests use object.__new__) reads as
+    # "nothing suspended" instead of raising.
+    _suspended_adapter_id: int | None = None
+
     def __init__(
         self,
         pipeline: nn.Module,
@@ -493,9 +498,11 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Recreate per-layer buffers with the new maximum rank.
+        # Recreate per-layer buffers with the new maximum rank. The previous
+        # upload is gone, so nothing may be re-armed afterwards.
         for lora_layer in self._lora_modules.values():
             lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        self._suspended_adapter_id = None
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -679,10 +686,23 @@ class DiffusionLoRAManager:
     def _reset_lora_layers(self) -> None:
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
+        self._suspended_adapter_id = None
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
         if self._is_active_at_scale(adapter_id, scale):
             logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            return
+
+        if self._suspended_adapter_id == adapter_id and self._adapter_scales.get(
+            adapter_id
+        ) == DiffusionLoRAManager._get_rounded_scale(scale):
+            # Weights are still uploaded from an earlier activation; re-arming
+            # the masks avoids rebuilding and re-uploading every layer.
+            for lora_layer in self._lora_modules.values():
+                lora_layer.resume_lora()
+            self._suspended_adapter_id = None
+            self._active_adapter_id = adapter_id
+            logger.debug("Re-armed suspended adapter %d", adapter_id)
             return
 
         logger.info("Activating adapter: id=%d", adapter_id)
@@ -691,6 +711,7 @@ class DiffusionLoRAManager:
         # state before the first mutation and leave every wrapper inactive if
         # any set_lora() call or model validator fails.
         self._active_adapter_id = None
+        self._suspended_adapter_id = None
         try:
             self._bind_adapter_weights(lora_model, scale)
         except Exception:
@@ -704,8 +725,10 @@ class DiffusionLoRAManager:
         if self._active_adapter_id is None:
             logger.debug("All adapters already inactive")
             return
-        logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
-        self._reset_lora_layers()
+        logger.info("Suspending all adapters: %d layers", len(self._lora_modules))
+        for lora_layer in self._lora_modules.values():
+            lora_layer.suspend_lora()
+        self._suspended_adapter_id = self._active_adapter_id
         self._active_adapter_id = None
         logger.debug("All adapters deactivated")
 
@@ -771,6 +794,11 @@ class DiffusionLoRAManager:
         logger.info("Removing adapter: id=%d", adapter_id)
         if self._active_adapter_id == adapter_id:
             self._deactivate_all_adapters()
+
+        if self._suspended_adapter_id == adapter_id:
+            # The adapter is going away, so the upload can never be resumed.
+            # Tear it down instead of leaving it in the stacked buffers.
+            self._reset_lora_layers()
 
         del self._registered_adapters[adapter_id]
         self._adapter_scales.pop(adapter_id, None)
