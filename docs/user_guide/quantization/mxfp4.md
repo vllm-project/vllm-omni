@@ -226,6 +226,50 @@ Either the checkpoint or an explicit caller can require Smooth: a `true`
 declaration is retained when per-expert metadata rebuilds the configuration,
 including when the other source omits the flag or sets it to `false`.
 
+### Native Ascend single-scale checkpoints
+
+For Wan2.2-T2V-A14B, `native_checkpoint_path` accepts an msModelSlim
+`mindie_format_saver` output root containing `high_noise_model/` and
+`low_noise_model/`, each with one `quant_model_description*.json` and one
+`quant_model_weight*.safetensors`. Pass the original **BF16 Diffusers** model
+root as `model`; it supplies pipeline configuration, T5/VAE and explicitly
+FLOAT parameters omitted by the quantized export.
+
+```python
+omni = Omni(
+    model="/models/Wan2.2-T2V-A14B-Diffusers-BF16",
+    quantization_config={
+        "method": "mxfp4",
+        "native_checkpoint_path": "/models/Wan2.2-native-MXFP4",
+        "mxfp4_scale_alg": 2,
+        "require_smooth_scale": True,
+        "w4a8_fallback_steps": [0, 1, 38, 39],
+    },
+)
+```
+
+This path is offline automatically. Omni validates descriptions, maps each
+expert's names and loads packed `uint8[N,K/2]` W4 plus `uint8[N,K/32]` scale
+bytes directly. No user conversion step or expanded weight directory is needed.
+The existing Wan loader fuses Q/K/V along output channels; row-parallel loaders
+slice packed weights, group scales and the logical input-channel Smooth tensor.
+Every input partition must contain complete groups of 32.
+
+Only `W4A4_MXFP4` and `FLOAT` labels are accepted. Quantized native layers
+are limited to the block attention projections and FFN linears managed by
+Omni. Root condition embeddings and the output head must remain FLOAT. Missing quantized weights or
+scales fail; they cannot be substituted from the original BF16 model. Native
+FLOAT descriptors determine the floating layers. Ignoring a packed layer is
+rejected. Smooth `.linear.*` / `.div.mul_scale` pairs must be complete, finite,
+positive and identical across fused Q/K/V. Other savers, rank directories,
+sharded native runtime exports, mixed quantization types and rotations are not
+supported. The existing numeric single-scale checkpoint path remains supported;
+the optional CPU conversion CLI is not required by this runtime path.
+
+Native headers identify storage, **not the generation algorithm**. C7 7.25,
+search disabled and calibration provenance still require the producer's receipt.
+A checkpoint without `mul_scale` does not demonstrate Smooth validation.
+
 ### `mxfp4` — Single-Scale Online Mode
 
 Online mode quantizes BF16/FP16 weights once at loading. On NPU,
@@ -447,6 +491,7 @@ omni = Omni(model="/path/to/Wan2.2-T2V-A14B-MXFP4-DualScale")
 | ----------- | ------ | --------- | ------------- |
 | `method` | str | — | `"mxfp4"` |
 | `mxfp4_scale_alg` | int | `0` | `0`: OCP MX; `2`: C7 A4 quantization with `dst_type_max=7.25`; A8 remains OCP MX |
+| `native_checkpoint_path` | str or null | `null` | Local native single-scale checkpoint directory, loaded alongside the original floating model |
 | `require_smooth_scale` | bool | `false` | Require calibrated Smooth tensors for offline single-scale weights |
 | `ignored_layers` | list[str] | `[]` | Layer prefixes to keep in BF16 |
 | `w4a8_fallback_layers` | list[str] | `[]` | Exact runtime Linear paths that always use A8; NPU only |

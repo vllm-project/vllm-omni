@@ -68,7 +68,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
-from vllm.model_executor.parameter import ModelWeightParameter
+from vllm.model_executor.parameter import ModelWeightParameter, PackedvLLMParameter
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
@@ -83,6 +83,7 @@ from vllm_omni.quantization.mxfp8_config import (
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
+    from vllm_omni.quantization.tools.mxfp4_native import NativeMXFP4Expert
 
 logger = init_logger(__name__)
 
@@ -154,9 +155,16 @@ class DiffusionMXFP4Config(QuantizationConfig):
         require_smooth_scale: bool = False,
         w4a8_fallback_layers: list[str] | None = None,
         mxfp4_scale_alg: int = 0,
+        native_checkpoint_path: str | None = None,
     ) -> None:
         super().__init__()
-        self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+        if native_checkpoint_path is not None and (
+            not isinstance(native_checkpoint_path, str) or not native_checkpoint_path.strip()
+        ):
+            raise ValueError("native_checkpoint_path must be a non-empty local directory path")
+        self.native_checkpoint_path = native_checkpoint_path
+        self.native_checkpoint: NativeMXFP4Expert | None = None
+        self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized or native_checkpoint_path is not None
         self.ignored_layers = ignored_layers or []
         self.w4a8_fallback_steps = _validate_w4a8_fallback_steps(w4a8_fallback_steps)
         self.w4a8_fallback_layers = _validate_w4a8_fallback_layers(w4a8_fallback_layers)
@@ -202,6 +210,7 @@ class DiffusionMXFP4Config(QuantizationConfig):
             w4a8_fallback_layers=config.get("w4a8_fallback_layers"),
             require_smooth_scale=config.get("require_smooth_scale", False),
             mxfp4_scale_alg=config.get("mxfp4_scale_alg", 0),
+            native_checkpoint_path=config.get("native_checkpoint_path"),
         )
 
     def get_quant_method(
@@ -328,17 +337,27 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
+        native = self.quant_config.native_checkpoint_path is not None
+        if native and self.quant_config.native_checkpoint is None:
+            raise ValueError("Native MXFP4 must be prepared by the Wan2.2 T2V loader before creating Linear weights")
+        if native and input_size_per_partition % 32:
+            raise ValueError("Native MXFP4 requires complete group32 in every tensor-parallel input partition")
+        # Native uint8 stores two FP4 codes per byte. Legacy checkpoints contain
+        # numeric FP4 values and retain their floating placeholder/cast path.
+        weight_cls = PackedvLLMParameter if native else ModelWeightParameter
+        packed_attrs: dict[str, int] = {"packed_dim": 1, "packed_factor": 2} if native else {}
         layer.register_parameter(
             "weight",
-            ModelWeightParameter(
+            weight_cls(
                 data=torch.empty(
                     output_size_per_partition,
-                    input_size_per_partition,
-                    dtype=params_dtype,
+                    input_size_per_partition // 2 if native else input_size_per_partition,
+                    dtype=torch.uint8 if native else params_dtype,
                 ),
                 input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
+                **packed_attrs,
             ),
         )
 
@@ -392,7 +411,10 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
 
         # NPU: cast to float4_e2m1fn_x2. Weight stays (N, K) — no pre-transpose.
         w = layer.weight
-        if w.dtype != torch_npu.float4_e2m1fn_x2:
+        if self.quant_config.native_checkpoint_path is not None:
+            if w.dtype != torch.uint8:
+                raise ValueError("Native MXFP4 weight must retain packed uint8 bytes")
+        elif w.dtype != torch_npu.float4_e2m1fn_x2:
             w = torch_npu.npu_dtype_cast(w.npu(), torch_npu.float4_e2m1fn_x2)
 
         # Scale: checkpoint stores uint8 bytes that ARE float8_e8m0fnu bits.

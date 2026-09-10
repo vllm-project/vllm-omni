@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -335,6 +335,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model: nn.Module | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
+        if model is not None:
+            from vllm_omni.diffusion.model_loader.checkpoint_adapters.mxfp4_native import get_native_mxfp4_weights
+
+            native_weights = get_native_mxfp4_weights(model, source)
+            if native_weights is not None:
+                if self.counter_before_loading_weights == 0.0:
+                    self.counter_before_loading_weights = time.perf_counter()
+                return native_weights
         _, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
@@ -755,8 +763,23 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     del model
                     return self.load_fresh_canonical_model()
             raise
+        self._log_w4a8_fallback_load_summaries(model)
         self._attach_offload_startup_state(model)
         return model
+
+    @staticmethod
+    def _log_w4a8_fallback_load_summaries(model: nn.Module) -> None:
+        """Ask discovered DiTs to report W4A8 state at the common load exit.
+
+        Each DiT derives readiness from its processed layers, so a deferred
+        weight plan cannot be mistaken for the ordinary or HSDP load path.
+        """
+        components = ModuleDiscovery.discover(model)
+        for component_name, dit in zip(components.dit_names, components.dits):
+            candidate = getattr(dit, "_log_w4a8_fallback_load_summary", None)
+            if callable(candidate):
+                reporter = cast(Callable[[str], None], candidate)
+                reporter(component_name)
 
     @staticmethod
     def _request_offload_after_quant(model: nn.Module) -> int:

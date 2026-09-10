@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
+    resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -60,6 +61,8 @@ def create_vace_transformer_from_config(
     config: dict,
     quant_config: QuantizationConfig | None = None,
     prefix: str = "",
+    *,
+    component: str = "transformer",
 ) -> WanVACETransformer3DModel:
     """Create WanVACETransformer3DModel from config dict."""
     kwargs = {}
@@ -97,6 +100,7 @@ def create_vace_transformer_from_config(
         kwargs["vace_layers"] = config["vace_layers"]
     if "vace_in_channels" in config:
         kwargs["vace_in_channels"] = config["vace_in_channels"]
+    quant_config = resolve_wan_transformer_quant_config(config, quant_config, component)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
     if prefix:
@@ -205,10 +209,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
 
         super().__init__(od_config=od_config, prefix=prefix)
 
-    def _create_transformer(self, config: dict) -> WanVACETransformer3DModel:
+    def _create_transformer(self, config: dict, component: str = "transformer") -> WanVACETransformer3DModel:
         """Build VACE transformer. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_vace_transformer_from_config(config, quant_config=quant_config)
+        return create_vace_transformer_from_config(config, quant_config=quant_config, component=component)
 
     def diffuse(
         self,
