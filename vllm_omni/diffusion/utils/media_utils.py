@@ -7,14 +7,34 @@ from __future__ import annotations
 import io
 import queue
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from fractions import Fraction
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import av
 import numpy as np
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _CHUNKED_MP4_DONE = object()
+
+
+class _QueuedChunk(NamedTuple):
+    """One queued chunk plus the callback that returns its buffer to its owner."""
+
+    frames: np.ndarray
+    on_consumed: Callable[[], None] | None
+
+
+def _release_chunk(on_consumed: Callable[[], None] | None) -> None:
+    """Hand a chunk's buffer back, never letting the callback wedge the worker."""
+    if on_consumed is None:
+        return
+    try:
+        on_consumed()
+    except BaseException:  # noqa: BLE001
+        logger.exception("Chunked MP4 encoder failed to release a consumed chunk")
 
 
 def normalize_preencode_batch_frames(value: Any) -> int:
@@ -110,19 +130,29 @@ class ChunkedMP4Encoder:
 
     def _drain_until_done(self) -> None:
         # A flush/mux failure can occur after _frames consumed the sentinel.
-        if not self._input_done:
-            while self._queue.get() is not _CHUNKED_MP4_DONE:
-                pass
+        if self._input_done:
+            return
+        while True:
+            entry = self._queue.get()
+            if entry is _CHUNKED_MP4_DONE:
+                return
+            _release_chunk(cast(_QueuedChunk, entry).on_consumed)
 
     def _frames(self):
         while True:
-            chunk = self._queue.get()
-            if chunk is _CHUNKED_MP4_DONE:
+            entry = self._queue.get()
+            if entry is _CHUNKED_MP4_DONE:
                 self._input_done = True
                 return
-            assert isinstance(chunk, np.ndarray)
-            for frame_data in chunk:
-                yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+            assert isinstance(entry, _QueuedChunk)
+            try:
+                for frame_data in entry.frames:
+                    yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+            finally:
+                # Also runs when the muxer raises part-way through this chunk
+                # and abandons the generator, so a lent buffer is never
+                # stranded in the encoder.
+                _release_chunk(entry.on_consumed)
 
     def _validate_chunk(self, chunk: np.ndarray) -> None:
         _validate_video_chunk(chunk, width=self.width, height=self.height)
@@ -133,11 +163,22 @@ class ChunkedMP4Encoder:
         if self._closed:
             raise RuntimeError("ChunkedMP4Encoder is already closed")
 
-    def push(self, chunk: np.ndarray) -> None:
-        """Queue a chunk; asynchronous failures surface here or at finish()."""
-        self._validate_chunk(chunk)
-        self._raise_if_failed()
-        self._queue.put(chunk)
+    def push(self, chunk: np.ndarray, *, on_consumed: Callable[[], None] | None = None) -> None:
+        """Queue a chunk; asynchronous failures surface here or at finish().
+
+        ``on_consumed`` fires exactly once after this encoder has read
+        ``chunk``, including when the chunk is discarded by an abort or by a
+        failed encode. Ownership transfers on call: whether this returns or
+        raises, the callback is this encoder's responsibility, so a caller
+        lending a pooled host buffer never compensates on the error path.
+        """
+        try:
+            self._validate_chunk(chunk)
+            self._raise_if_failed()
+        except BaseException:
+            _release_chunk(on_consumed)
+            raise
+        self._queue.put(_QueuedChunk(chunk, on_consumed))
         self._raise_if_failed()
 
     def _send_done(self) -> None:
@@ -168,9 +209,11 @@ class ChunkedMP4Encoder:
                 self._aborted = True
                 while True:
                     try:
-                        self._queue.get_nowait()
+                        entry = self._queue.get_nowait()
                     except queue.Empty:
                         break
+                    if entry is not _CHUNKED_MP4_DONE:
+                        _release_chunk(cast(_QueuedChunk, entry).on_consumed)
                 self._send_done()
         self._thread.join()
 

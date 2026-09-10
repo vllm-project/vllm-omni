@@ -45,8 +45,10 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
             self.kwargs = kwargs
             self.__class__.instances.append(self)
 
-        def push(self, frames):
+        def push(self, frames, *, on_consumed=None):
             self.pushes.append(np.array(frames, copy=True))
+            if on_consumed is not None:
+                on_consumed()
 
         def finish(self):
             return b"mp4"
@@ -172,8 +174,10 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             self.kwargs = kwargs
             self.__class__.instances.append(self)
 
-        def push(self, frames):
+        def push(self, frames, *, on_consumed=None):
             del frames
+            if on_consumed is not None:
+                on_consumed()
 
         def finish(self):
             return b"mp4"
