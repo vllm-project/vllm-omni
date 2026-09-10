@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+
+import requests
 
 from .omni_duplex_eval_clock import normalize_response_items, validate_clock
 from .omni_duplex_eval_dataset import DuplexSample
@@ -38,6 +40,53 @@ def _write(path: Path, value: Any) -> None:
 
 def _text(items: list[dict[str, Any]]) -> str:
     return " ".join(str(item.get("sentence", item.get("text", ""))).strip() for item in items).strip()
+
+
+_T = TypeVar("_T")
+
+
+def _uniform_subsample(values: list[_T], count: int) -> list[_T]:
+    if count >= len(values):
+        return list(values)
+    if count <= 1:
+        return [values[len(values) // 2]]
+    stride = (len(values) - 1) / (count - 1)
+    return [values[round(i * stride)] for i in range(count)]
+
+
+def _is_prompt_too_long_error(exc: requests.HTTPError) -> bool:
+    response = exc.response
+    text = response.text if response is not None else str(exc)
+    normalized = text.lower()
+    return "prompt" in normalized and "longer than the maximum model length" in normalized
+
+
+def _judge_content_with_frame_budget(
+    judge: DuplexJudge,
+    prompt: str,
+    video_path: str | Path,
+    frames: list[bytes],
+    *,
+    mode: str,
+) -> tuple[str, list[bytes], int]:
+    """Retry frame-sample judging with fewer representative frames on length overflow.
+
+    The judge owns the exact multimodal tokenization rules, so use its explicit
+    max-model-length rejection as the budget signal instead of hard-coding a
+    model-specific pixels-to-tokens approximation.
+    """
+    original_frames = list(frames)
+    used_frames = original_frames
+    retries = 0
+    while True:
+        try:
+            return judge.content(prompt, video_path, frames=used_frames, mode=mode), used_frames, retries
+        except requests.HTTPError as exc:
+            if mode != "frame-sample" or len(used_frames) <= 1 or not _is_prompt_too_long_error(exc):
+                raise
+            next_count = max(1, len(used_frames) // 2)
+            used_frames = _uniform_subsample(original_frames, next_count)
+            retries += 1
 
 
 def evaluate_sample(
@@ -106,16 +155,19 @@ def evaluate_sample(
         content_frames = None
         if judge_video_mode == "frame-sample":
             content_frames = _extract_frames(video_path, _content_frame_times(duration))
-        content = parse_judge_json(
-            judge.content(
-                build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2]),
-                video_path,
-                frames=content_frames,
-                mode=judge_video_mode,
-            )
+        content_prompt = build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2])
+        content_response, used_content_frames, frame_budget_retries = _judge_content_with_frame_budget(
+            judge,
+            content_prompt,
+            video_path,
+            content_frames or [],
+            mode=judge_video_mode,
         )
+        content = parse_judge_json(content_response)
         if content_frames is not None:
-            content["frame_count"] = len(content_frames)
+            content["frame_count_initial"] = len(content_frames)
+            content["frame_count"] = len(used_content_frames)
+            content["frame_budget_retries"] = frame_budget_retries
         result.update(
             {
                 "temporal": {"sentences": temporal_rows, "summary": summarize_temporal_results(temporal_rows)},

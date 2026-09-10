@@ -9,16 +9,94 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import requests
 
+from vllm_omni.benchmarks.duplex import omni_duplex_eval_eval as eval_mod
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import _judge_content_with_frame_budget
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.entrypoints.cli.benchmark import omni_duplex_eval as cli
 from vllm_omni.entrypoints.cli.benchmark.omni_duplex_eval import OmniDuplexEvalSubcommand
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
+
+
+def _judge_http_error(text: str) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = 500
+    response._content = text.encode()
+    return requests.HTTPError("500 response from judge", response=response)
+
+
+def test_frame_sample_judge_degrades_only_for_prompt_length_errors():
+    calls = []
+
+    class Judge:
+        def content(self, prompt, video, frames, *, mode):
+            calls.append(list(frames))
+            if len(frames) > 4:
+                raise _judge_http_error(
+                    "The decoder prompt (length 93016) is longer than the maximum model length of 65536"
+                )
+            return '{"content_score": 4}'
+
+    result, used_frames, retries = _judge_content_with_frame_budget(
+        Judge(), "prompt", Path("video.mp4"), list(range(16)), mode="frame-sample"
+    )
+
+    assert result == '{"content_score": 4}'
+    assert used_frames == [0, 5, 10, 15]
+    assert retries == 2
+    assert [len(frames) for frames in calls] == [16, 8, 4]
+
+
+def test_frame_sample_judge_does_not_hide_unrelated_http_errors():
+    class Judge:
+        def content(self, prompt, video, frames, *, mode):
+            raise _judge_http_error("Internal model worker failure")
+
+    with pytest.raises(requests.HTTPError, match="500 response from judge"):
+        _judge_content_with_frame_budget(Judge(), "prompt", Path("video.mp4"), [b"a", b"b"], mode="frame-sample")
+
+
+def test_evaluate_records_frame_budget_degradation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    response_path = tmp_path / "sample.json"
+    response_path.write_text("[]", encoding="utf-8")
+    response_path.with_name("sample.meta.json").write_text('{"clock": "media"}', encoding="utf-8")
+    score_path = tmp_path / "score.json"
+    sample = SimpleNamespace(
+        id="sample",
+        family="rtd",
+        task_type="content",
+        video="video.mp4",
+        video_duration=30.0,
+        question_text="question",
+        answer1="a1",
+        answer2="a2",
+    )
+    monkeypatch.setattr(eval_mod, "materialize_media", lambda *args, **kwargs: Path("video.mp4"))
+    monkeypatch.setattr(eval_mod, "_content_frame_times", lambda duration: list(range(16)))
+    monkeypatch.setattr(eval_mod, "_extract_frames", lambda path, timestamps: [bytes([i]) for i in timestamps])
+
+    class Judge:
+        model = "judge"
+
+        def content(self, prompt, video, frames, *, mode):
+            if len(frames) > 4:
+                raise _judge_http_error(
+                    "The decoder prompt (length 93016) is longer than the maximum model length of 65536"
+                )
+            return '{"content_score": 4}'
+
+    result = eval_mod.evaluate_sample(sample, response_path, score_path, Judge(), judge_video_mode="frame-sample")
+    assert result["content"]["content_score"] == 4
+    assert result["content"]["frame_count_initial"] == 16
+    assert result["content"]["frame_count"] == 4
+    assert result["content"]["frame_budget_retries"] == 2
 
 
 def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
