@@ -11,6 +11,8 @@ import json
 import multiprocessing as mp
 import os
 import shutil
+import stat
+import tempfile
 import threading
 import time
 import warnings
@@ -406,6 +408,38 @@ def _make_store(
     return FilesystemHostWeightStore(domain, capacity or CapacityPolicy(), integrity or IntegrityPolicy())
 
 
+def _publish_test_artifact(
+    store: FilesystemHostWeightStore,
+    identity: WeightArtifactIdentity | None = None,
+) -> tuple[WeightArtifactIdentity, Path]:
+    identity = identity or _identity()
+    result = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert result.status is StoreStatus.BUILT
+    assert result.lease is not None
+    result.lease.close()
+    return identity, store.artifacts_dir / identity.key
+
+
+def _corrupt_test_payload(artifact: Path) -> None:
+    payload = artifact / "weights.safetensors"
+    os.chmod(artifact, 0o755)
+    os.chmod(payload, 0o644)
+    with payload.open("r+b") as handle:
+        handle.seek(-1, os.SEEK_END)
+        value = handle.read(1)
+        handle.seek(-1, os.SEEK_END)
+        handle.write(bytes([value[0] ^ 0xFF]))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(payload, 0o444)
+    os.chmod(artifact, 0o555)
+
+
 def _build_process(root: str, counter: str, initial_lookup_barrier: object, result_queue: object) -> None:
     try:
         identity = _identity()
@@ -448,6 +482,25 @@ def _controlled_build_process(root: str, started: object, release: object, resul
         result_queue.put(("error", repr(exc)))  # type: ignore[attr-defined]
 
 
+def _pausing_weak_lookup_process(root: str, opened: object, resume: object, result_queue: object) -> None:
+    try:
+        policy = StorageDomainPolicy(root=Path(root), storage_class=detect_storage_class(Path(root)))
+        store = PausingOpenLeaseStore(
+            policy,
+            CapacityPolicy(),
+            IntegrityPolicy(),
+            lease_opened=opened,  # type: ignore[arg-type]
+            resume_lookup=resume,  # type: ignore[arg-type]
+        )
+        result = store.lookup(_identity(), validation=ValidationLevel.MANIFEST_AND_METADATA)
+        if result.lease is not None:
+            result.lease.close()
+        code = result.failure.code.value if result.failure is not None else None
+        result_queue.put((result.status.value, code, None))  # type: ignore[attr-defined]
+    except BaseException as exc:
+        result_queue.put(("error", None, repr(exc)))  # type: ignore[attr-defined]
+
+
 def _crash_build_process(root: str) -> None:
     identity = _identity()
     store = _make_store(Path(root))
@@ -457,6 +510,101 @@ def _crash_build_process(root: str) -> None:
         validation=ValidationLevel.FULL_CHECKSUM,
         deadline=time.monotonic() + 15,
     )
+
+
+def _crash_cleanup_process(root: str) -> None:
+    identity = _identity()
+    store = _make_store(Path(root))
+
+    def crash_before_removal(path: Path) -> None:
+        if path.parent == store.quarantine_dir and ".cleanup." in path.name:
+            os._exit(23)
+        FilesystemHostWeightStore._remove_tree(path)
+
+    store._remove_tree = crash_before_removal  # type: ignore[method-assign]
+    store.cleanup(identity)
+    raise AssertionError("cleanup did not reach the injected crash point")
+
+
+def _crash_cleanup_before_rename_process(root: str) -> None:
+    identity = _identity()
+    store = _make_store(Path(root))
+    artifact = store.artifacts_dir / identity.key
+    original_replace = os.replace
+
+    def crash_before_rename(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        if Path(source) == artifact and ".cleanup." in Path(destination).name:
+            os._exit(31)
+        original_replace(source, destination)
+
+    filesystem_store_module.os.replace = crash_before_rename
+    store.cleanup(identity)
+    raise AssertionError("cleanup did not reach the pre-rename crash point")
+
+
+def _crash_quarantine_after_rename_process(root: str) -> None:
+    identity = _identity()
+    store = _make_store(Path(root))
+    original_harden = filesystem_store_module._harden_open_directory
+
+    def crash_before_destination_hardening(fd: int, path: Path, mode: int) -> None:
+        if path.parent == store.quarantine_dir:
+            os._exit(37)
+        original_harden(fd, path, mode)
+
+    filesystem_store_module._harden_open_directory = crash_before_destination_hardening
+    with FileLock(store._artifact_lock_path(identity.key), exclusive=True, deadline=None):
+        store._quarantine_locked(identity.key, reason="validation_failure")
+    raise AssertionError("quarantine did not reach the post-rename crash point")
+
+
+def _crash_after_artifacts_fsync_process(root: str) -> None:
+    identity = _identity()
+    store = _make_store(Path(root))
+    original_fsync_directory = filesystem_store_module._fsync_directory
+
+    def crash_after_artifacts_fsync(path: Path) -> None:
+        original_fsync_directory(path)
+        if path == store.artifacts_dir:
+            os._exit(29)
+
+    filesystem_store_module._fsync_directory = crash_after_artifacts_fsync
+    store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 15,
+    )
+    raise AssertionError("publication did not reach the injected crash point")
+
+
+def _crash_after_publication_hardening_process(root: str) -> None:
+    identity = _identity()
+    store = _make_store(Path(root))
+    artifact = store.artifacts_dir / identity.key
+    original_chmod = os.chmod
+
+    def crash_after_hardening(
+        path: str | os.PathLike[str],
+        mode: int,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        original_chmod(path, mode, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(path) == artifact and mode == 0o555:
+            os._exit(41)
+
+    filesystem_store_module.os.chmod = crash_after_hardening
+    store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 15,
+    )
+    raise AssertionError("publication did not reach the post-hardening crash point")
 
 
 def _join_processes(
@@ -551,6 +699,570 @@ def test_publication_hardens_artifact_after_atomic_rename(tmp_path: Path) -> Non
     built.lease.close()
     artifact_dir = store.artifacts_dir / identity.key
     assert artifact_dir.stat().st_mode & 0o777 == 0o555
+
+
+@pytest.mark.parametrize(
+    ("expected_filesystem", "filesystem_root"),
+    [("overlay", Path("/tmp")), ("tmpfs", Path("/dev/shm"))],
+)
+def test_hardened_artifact_cleanup_on_supported_filesystem(
+    expected_filesystem: str,
+    filesystem_root: Path,
+) -> None:
+    if not filesystem_root.is_dir():
+        pytest.skip(f"{filesystem_root} is unavailable")
+    try:
+        filesystem_type = detect_filesystem_type(filesystem_root)
+    except OSError as exc:
+        pytest.skip(f"cannot inspect {filesystem_root} filesystem type: {exc}")
+    if filesystem_type != expected_filesystem:
+        pytest.skip(f"{filesystem_root} is {filesystem_type!r}, not {expected_filesystem}")
+    if not os.access(filesystem_root, os.W_OK | os.X_OK):
+        pytest.skip(f"{filesystem_root} is not writable")
+
+    with tempfile.TemporaryDirectory(prefix="vllm-omni-hwr-", dir=filesystem_root) as directory:
+        store = _make_store(Path(directory) / "store")
+        identity, artifact = _publish_test_artifact(store)
+        assert artifact.stat().st_mode & 0o777 == 0o555
+
+        assert store.cleanup(identity) is None
+        assert not artifact.exists()
+        assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+@pytest.mark.parametrize("failure_point", ["chmod", "rename"])
+def test_failed_cleanup_move_preserves_ready_immutability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    artifact_inode = artifact.stat().st_ino
+
+    if failure_point == "chmod":
+        original_fchmod = os.fchmod
+
+        def fail_make_writable(fd: int, mode: int) -> None:
+            if os.fstat(fd).st_ino == artifact_inode and mode & stat.S_IWUSR:
+                raise OSError(errno.EIO, "injected artifact chmod failure")
+            original_fchmod(fd, mode)
+
+        monkeypatch.setattr(os, "fchmod", fail_make_writable)
+    else:
+        original_replace = os.replace
+
+        def fail_artifact_rename(
+            source: str | os.PathLike[str],
+            destination: str | os.PathLike[str],
+        ) -> None:
+            if Path(source) == artifact:
+                raise OSError(errno.EIO, "injected artifact rename failure")
+            original_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", fail_artifact_rename)
+
+    failure = store.cleanup(identity)
+
+    assert failure is not None
+    assert failure.code is FailureCode.QUARANTINE_FAILED
+    assert failure.retryable
+    assert artifact.stat().st_mode & 0o777 == 0o555
+    assert not list(store.quarantine_dir.iterdir())
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+
+
+def test_move_artifact_one_shot_restore_failure_still_hardens_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    destination = store.quarantine_dir / f"{identity.key}.direct-test"
+    artifact_inode = artifact.stat().st_ino
+    original_fchmod = os.fchmod
+    injected = False
+
+    def fail_first_hardening(fd: int, mode: int) -> None:
+        nonlocal injected
+        if os.fstat(fd).st_ino == artifact_inode and destination.exists() and not mode & 0o222 and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected artifact hardening failure")
+        original_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fchmod", fail_first_hardening)
+    with FileLock(store._artifact_lock_path(identity.key), exclusive=True, deadline=None):
+        filesystem_store_module._move_artifact_locked(artifact, destination)
+
+    assert injected
+    assert not artifact.exists()
+    assert destination.is_dir()
+    assert not destination.stat().st_mode & 0o222
+
+
+@pytest.mark.parametrize("failing_parent", ["artifacts", "quarantine"])
+def test_cleanup_move_fsync_failure_leaves_retryable_immutable_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_parent: str,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    original_fsync_directory = filesystem_store_module._fsync_directory
+    failed_path = store.artifacts_dir if failing_parent == "artifacts" else store.quarantine_dir
+
+    def fail_parent_fsync(path: Path) -> None:
+        if path == failed_path:
+            raise OSError(errno.EIO, "injected cleanup fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(filesystem_store_module, "_fsync_directory", fail_parent_fsync)
+    failure = store.cleanup(identity)
+
+    assert failure is not None
+    assert failure.code is FailureCode.QUARANTINE_FAILED
+    assert failure.retryable
+    assert not artifact.exists()
+    tombstones = list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+    assert len(tombstones) == 1
+    assert tombstones[0].stat().st_mode & 0o777 == 0o555
+    assert tombstones[0].stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+
+    monkeypatch.setattr(filesystem_store_module, "_fsync_directory", original_fsync_directory)
+    assert store.cleanup(identity) is None
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+def test_cleanup_retries_removal_failure_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    original_rmtree = shutil.rmtree
+
+    def fail_cleanup_removal(
+        path: str | os.PathLike[str],
+    ) -> None:
+        if Path(path).parent == store.quarantine_dir and ".cleanup." in Path(path).name:
+            raise OSError(errno.EIO, "injected cleanup removal failure")
+        original_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_cleanup_removal)
+    failure = store.cleanup(identity)
+
+    assert failure is not None
+    assert failure.code is FailureCode.QUARANTINE_FAILED
+    assert failure.retryable
+    assert not artifact.exists()
+    tombstones = list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+    assert len(tombstones) == 1
+
+    monkeypatch.setattr(shutil, "rmtree", original_rmtree)
+    assert store.cleanup(identity) is None
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+@pytest.mark.parallel
+def test_cleanup_after_move_crash_tombstone_is_removed_by_next_build(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    store = _make_store(root)
+    identity, artifact = _publish_test_artifact(store)
+    process = mp.get_context("spawn").Process(target=_crash_cleanup_process, args=(str(root),))
+
+    process.start()
+    _join_processes([process])
+
+    assert process.exitcode == 23
+    assert not artifact.exists()
+    tombstones = list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+    assert len(tombstones) == 1
+    assert not tombstones[0].stat().st_mode & 0o222
+
+    rebuilt = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert rebuilt.status is StoreStatus.BUILT
+    assert rebuilt.lease is not None
+    rebuilt.lease.close()
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+
+
+@pytest.mark.parallel
+def test_pre_rename_cleanup_crash_leaves_persistently_denied_artifact(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    store = _make_store(root)
+    identity, artifact = _publish_test_artifact(store)
+    process = mp.get_context("spawn").Process(
+        target=_crash_cleanup_before_rename_process,
+        args=(str(root),),
+    )
+
+    process.start()
+    _join_processes([process])
+
+    assert process.exitcode == 31
+    assert artifact.is_dir()
+    assert artifact.stat().st_mode & stat.S_IWUSR
+    assert artifact.stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+    weak_store = _make_store(
+        root,
+        integrity=IntegrityPolicy(require_trusted_permissions=False),
+    )
+    denied = weak_store.lookup(identity, validation=ValidationLevel.MANIFEST_AND_METADATA)
+    assert denied.status is StoreStatus.INVALID
+    assert denied.failure is not None and denied.failure.code is FailureCode.ARTIFACT_DENIED
+
+    rebuilt = weak_store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert rebuilt.status is StoreStatus.BUILT
+    assert rebuilt.lease is not None
+    rebuilt.lease.close()
+    quarantined = list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))
+    assert len(quarantined) == 1
+    assert not quarantined[0].stat().st_mode & 0o222
+    assert not quarantined[0].stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert not list(store.tmp_dir.iterdir())
+
+
+@pytest.mark.parallel
+def test_post_rename_quarantine_crash_is_rehardened_by_next_build(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    store = _make_store(root)
+    identity, artifact = _publish_test_artifact(store)
+    process = mp.get_context("spawn").Process(
+        target=_crash_quarantine_after_rename_process,
+        args=(str(root),),
+    )
+
+    process.start()
+    _join_processes([process])
+
+    assert process.exitcode == 37
+    assert not artifact.exists()
+    quarantined = list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].stat().st_mode & stat.S_IWUSR
+    assert quarantined[0].stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+
+    rebuilt = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert rebuilt.status is StoreStatus.BUILT
+    assert rebuilt.lease is not None
+    rebuilt.lease.close()
+    assert not quarantined[0].stat().st_mode & 0o222
+    assert not quarantined[0].stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert not list(store.tmp_dir.iterdir())
+
+
+@pytest.mark.parametrize("failure_point", ["chmod", "artifact_inode_fsync", "artifacts_fsync"])
+def test_post_rename_failure_quarantines_non_authoritative_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity = _identity()
+    original_fsync_directory = filesystem_store_module._fsync_directory
+    injected = False
+
+    if failure_point == "chmod":
+        original_chmod = os.chmod
+
+        def fail_publication_chmod(
+            path: str | os.PathLike[str],
+            mode: int,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal injected
+            if Path(path) == store.artifacts_dir / identity.key and mode == 0o555 and not injected:
+                injected = True
+                raise OSError(errno.EIO, "injected publication chmod failure")
+            original_chmod(path, mode, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "chmod", fail_publication_chmod)
+    else:
+        failed_path = (
+            store.artifacts_dir / identity.key if failure_point == "artifact_inode_fsync" else store.artifacts_dir
+        )
+
+        def fail_publication_fsync(path: Path) -> None:
+            nonlocal injected
+            if path == failed_path and not injected:
+                injected = True
+                raise OSError(errno.EIO, f"injected {failure_point} publication failure")
+            original_fsync_directory(path)
+
+        monkeypatch.setattr(filesystem_store_module, "_fsync_directory", fail_publication_fsync)
+    result = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert injected
+    assert result.status is StoreStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.stage is ResolutionStage.LIFECYCLE
+    assert result.failure.code is FailureCode.PUBLICATION_FAILED
+    assert not result.failure.retryable
+    assert store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM).status is StoreStatus.MISS
+    quarantined = list(store.quarantine_dir.iterdir())
+    assert len(quarantined) == 1
+    assert ".publication_failure." in quarantined[0].name
+    assert quarantined[0].stat().st_mode & 0o777 == 0o555
+    assert not list(store.tmp_dir.iterdir())
+
+    monkeypatch.setattr(filesystem_store_module, "_fsync_directory", original_fsync_directory)
+    rebuilt = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert rebuilt.status is StoreStatus.BUILT
+    assert rebuilt.lease is not None
+    rebuilt.lease.close()
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+def test_uncontained_publication_failure_is_retryable_and_outcome_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity = _identity()
+    artifact = store.artifacts_dir / identity.key
+    original_fsync_directory = filesystem_store_module._fsync_directory
+    original_open = os.open
+    publication_failed = False
+
+    def fail_artifact_inode_fsync(path: Path) -> None:
+        nonlocal publication_failed
+        if path == artifact:
+            publication_failed = True
+            raise OSError(errno.EIO, "injected publication inode fsync failure")
+        original_fsync_directory(path)
+
+    def fail_containment_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if publication_failed and Path(os.fsdecode(path)) == artifact:
+            raise OSError(errno.EIO, "injected persistent containment failure")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(filesystem_store_module, "_fsync_directory", fail_artifact_inode_fsync)
+        fault.setattr(os, "open", fail_containment_open)
+        result = store.get_or_build(
+            BuildRequest(identity),
+            FakeProducer(identity),
+            validation=ValidationLevel.FULL_CHECKSUM,
+            deadline=time.monotonic() + 10,
+        )
+
+    assert publication_failed
+    assert result.status is StoreStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.stage is ResolutionStage.DOMAIN
+    assert result.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert result.failure.retryable
+    details = result.failure.details.to_value()
+    assert isinstance(details, dict)
+    assert details["outcome_uncertain"] is True
+    assert artifact.is_dir()
+    assert not artifact.stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+    assert not list(store.quarantine_dir.iterdir())
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+
+
+@pytest.mark.parallel
+def test_crash_after_publication_hardening_leaves_logically_committed_hit(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    store = _make_store(root)
+    identity = _identity()
+    process = mp.get_context("spawn").Process(
+        target=_crash_after_publication_hardening_process,
+        args=(str(root),),
+    )
+
+    process.start()
+    _join_processes([process])
+
+    assert process.exitcode == 41
+    artifact = store.artifacts_dir / identity.key
+    assert artifact.is_dir()
+    assert not artifact.stat().st_mode & 0o222
+    assert not artifact.stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert not list(store.tmp_dir.iterdir())
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+    assert not list(store.quarantine_dir.iterdir())
+
+
+@pytest.mark.parallel
+def test_crash_after_final_artifacts_fsync_leaves_authoritative_hit(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    store = _make_store(root)
+    identity = _identity()
+    process = mp.get_context("spawn").Process(target=_crash_after_artifacts_fsync_process, args=(str(root),))
+
+    process.start()
+    _join_processes([process])
+
+    assert process.exitcode == 29
+    artifact = store.artifacts_dir / identity.key
+    assert artifact.is_dir()
+    assert not artifact.stat().st_mode & 0o222
+    assert not artifact.stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert not list(store.tmp_dir.iterdir())
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+
+    joined = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert joined.status is StoreStatus.HIT
+    assert joined.lease is not None
+    joined.lease.close()
+    assert not list(store.quarantine_dir.iterdir())
+
+
+@pytest.mark.parametrize("lock_kind", ["artifact", "build"])
+def test_post_commit_lock_release_error_keeps_authoritative_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lock_kind: str,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity = _identity()
+    lock_path = (
+        store._artifact_lock_path(identity.key) if lock_kind == "artifact" else store._build_lock_path(identity.key)
+    )
+    original_fsync_directory = filesystem_store_module._fsync_directory
+    original_close = FileLock.close
+    committed = False
+    injected = False
+
+    def observe_publication_commit(path: Path) -> None:
+        nonlocal committed
+        original_fsync_directory(path)
+        if path == store.artifacts_dir:
+            committed = True
+
+    def fail_post_commit_close(lock: FileLock) -> None:
+        nonlocal injected
+        original_close(lock)
+        if committed and lock.path == lock_path and not injected:
+            injected = True
+            raise OSError(errno.EIO, f"injected post-commit {lock_kind} lock release failure")
+
+    monkeypatch.setattr(filesystem_store_module, "_fsync_directory", observe_publication_commit)
+    monkeypatch.setattr(FileLock, "close", fail_post_commit_close)
+    result = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert committed
+    assert injected
+    assert result.status is StoreStatus.BUILT
+    assert result.lease is not None
+    result.lease.close()
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+    assert not list(store.quarantine_dir.iterdir())
+    assert not list(store.tmp_dir.iterdir())
+
+
+def test_joined_build_lock_release_error_keeps_authoritative_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, _ = _publish_test_artifact(store)
+    build_lock_path = store._build_lock_path(identity.key)
+    producer_count = tmp_path / "producer-count"
+    original_lookup = store.lookup
+    original_close = FileLock.close
+    lookup_count = 0
+    injected = False
+
+    def miss_once(
+        lookup_identity: WeightArtifactIdentity,
+        *,
+        validation: ValidationLevel,
+        deadline: float | None = None,
+    ) -> StoreResult:
+        nonlocal lookup_count
+        lookup_count += 1
+        if lookup_count == 1:
+            return StoreResult(StoreStatus.MISS)
+        return original_lookup(lookup_identity, validation=validation, deadline=deadline)
+
+    def fail_joined_build_lock_close(lock: FileLock) -> None:
+        nonlocal injected
+        original_close(lock)
+        if lock.path == build_lock_path and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected joined build-lock release failure")
+
+    monkeypatch.setattr(store, "lookup", miss_once)
+    monkeypatch.setattr(FileLock, "close", fail_joined_build_lock_close)
+    result = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity, counter_path=producer_count),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert lookup_count == 2
+    assert injected
+    assert result.status is StoreStatus.JOINED
+    assert result.lease is not None
+    result.lease.close()
+    assert not producer_count.exists()
 
 
 def test_concurrent_lease_close_waits_for_resource_teardown(tmp_path: Path) -> None:
@@ -765,9 +1477,365 @@ def test_overlapping_weaker_lookup_cannot_return_after_artifact_is_denied(tmp_pa
     assert weak.failure is not None and weak.failure.code is FailureCode.ARTIFACT_DENIED
 
 
+@pytest.mark.parametrize(
+    ("failure_errno", "expected_stage", "expected_code"),
+    [
+        (errno.ENOSPC, ResolutionStage.CAPACITY, FailureCode.ENOSPC),
+        (errno.EDQUOT, ResolutionStage.CAPACITY, FailureCode.ENOSPC),
+        (errno.EIO, ResolutionStage.DOMAIN, FailureCode.DOMAIN_UNAVAILABLE),
+    ],
+)
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="fault targeting requires Linux /proc/self/fd",
+)
+def test_deny_write_failure_surfaces_as_retryable_storage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_errno: int,
+    expected_stage: ResolutionStage,
+    expected_code: FailureCode,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    _corrupt_test_payload(artifact)
+    deny_path = store.deny_dir / f"{identity.key}.json"
+    original_write = os.write
+
+    def fail_deny_write(fd: int, data: bytes) -> int:
+        if Path(os.readlink(f"/proc/self/fd/{fd}")) == deny_path:
+            raise OSError(failure_errno, "injected deny write failure")
+        return original_write(fd, data)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "write", fail_deny_write)
+        failed = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+
+    assert failed.status is StoreStatus.FAILED
+    assert failed.failure is not None
+    assert failed.failure.stage is expected_stage
+    assert failed.failure.code is expected_code
+    assert failed.failure.retryable
+    assert deny_path.exists()
+    assert not artifact.exists()
+    assert len(list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))) == 1
+
+    rebuilt = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert rebuilt.status is StoreStatus.BUILT
+    assert rebuilt.lease is not None
+    rebuilt.lease.close()
+    assert not deny_path.exists()
+
+
+def test_deny_open_failure_is_not_reported_as_successful_invalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    _corrupt_test_payload(artifact)
+    deny_path = store.deny_dir / f"{identity.key}.json"
+    original_open = os.open
+
+    def fail_deny_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(os.fsdecode(path)) == deny_path and flags & os.O_CREAT:
+            raise OSError(errno.EIO, "injected deny open failure")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "open", fail_deny_open)
+        failed = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+
+    assert failed.status is StoreStatus.FAILED
+    assert failed.failure is not None
+    assert failed.failure.stage is ResolutionStage.DOMAIN
+    assert failed.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert failed.failure.retryable
+    assert not deny_path.exists()
+    assert not artifact.exists()
+    quarantined = list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))
+    assert len(quarantined) == 1
+    assert not quarantined[0].stat().st_mode & 0o222
+
+    assert store.lookup(identity, validation=ValidationLevel.MANIFEST_AND_METADATA).status is StoreStatus.MISS
+    rebuilt = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert rebuilt.status is StoreStatus.BUILT
+    assert rebuilt.lease is not None
+    rebuilt.lease.close()
+    assert not deny_path.exists()
+
+
+def test_deny_method_eio_synchronously_excludes_artifact_from_weaker_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    _corrupt_test_payload(artifact)
+
+    def fail_deny(_key: str, _failure: object) -> None:
+        raise OSError(errno.EIO, "injected deny publication failure")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store, "_write_deny", fail_deny)
+        failed = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+
+    assert failed.status is StoreStatus.FAILED
+    assert failed.failure is not None
+    assert failed.failure.stage is ResolutionStage.DOMAIN
+    assert failed.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert failed.failure.retryable
+    assert "injected deny publication failure" in failed.failure.message
+    assert not artifact.exists()
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert store.lookup(identity, validation=ValidationLevel.MANIFEST_AND_METADATA).status is StoreStatus.MISS
+    quarantined = list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))
+    assert len(quarantined) == 1
+    assert not quarantined[0].stat().st_mode & 0o222
+
+
+def test_deny_failure_containment_preserves_a_replacement_publication(tmp_path: Path) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    old_inode = (artifact.stat().st_dev, artifact.stat().st_ino)
+    _corrupt_test_payload(artifact)
+    shared_lock = FileLock(
+        store._artifact_lock_path(identity.key),
+        exclusive=False,
+        deadline=time.monotonic() + 10,
+    )
+    rebuilt_publications: list[tuple[str, tuple[int, int]]] = []
+
+    class RebuildOnSharedLockRelease:
+        def close(self) -> None:
+            shared_lock.close()
+            rebuilt = store.get_or_build(
+                BuildRequest(identity),
+                FakeProducer(identity),
+                validation=ValidationLevel.FULL_CHECKSUM,
+                deadline=time.monotonic() + 10,
+            )
+            assert rebuilt.status is StoreStatus.BUILT
+            assert rebuilt.lease is not None
+            rebuilt_inode = (artifact.stat().st_dev, artifact.stat().st_ino)
+            rebuilt_publications.append((rebuilt.lease.provenance.publication_id, rebuilt_inode))
+            rebuilt.lease.close()
+
+    containment = store._contain_invalid_after_deny_failure(
+        identity.key,
+        RebuildOnSharedLockRelease(),  # type: ignore[arg-type]
+        deadline=time.monotonic() + 10,
+    )
+
+    assert containment["invalidation_marker"] == "durable"
+    assert containment["quarantine"] == "already_replaced"
+    assert len(rebuilt_publications) == 1
+    publication_id, rebuilt_inode = rebuilt_publications[0]
+    assert rebuilt_inode != old_inode
+    assert (artifact.stat().st_dev, artifact.stat().st_ino) == rebuilt_inode
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    assert hit.lease.provenance.publication_id == publication_id
+    hit.lease.close()
+    assert len(list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))) == 1
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+@pytest.mark.parallel
+def test_deny_failure_blocks_overlapping_weaker_lookup_across_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = mp.get_context("spawn")
+    root = tmp_path / "store"
+    store = _make_store(root)
+    identity, artifact = _publish_test_artifact(store)
+    _corrupt_test_payload(artifact)
+    lease_opened = ctx.Event()
+    resume_lookup = ctx.Event()
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_pausing_weak_lookup_process,
+        args=(str(root), lease_opened, resume_lookup, result_queue),
+    )
+    strong_results: list[StoreResult] = []
+
+    def fail_deny(_key: str, _failure: object) -> None:
+        raise OSError(errno.EIO, "injected deny publication failure")
+
+    def strong_lookup() -> None:
+        strong_results.append(
+            store.lookup(
+                identity,
+                validation=ValidationLevel.FULL_CHECKSUM,
+                deadline=time.monotonic() + 10,
+            )
+        )
+
+    process.start()
+    strong_thread = threading.Thread(target=strong_lookup)
+    strong_started = False
+    try:
+        assert lease_opened.wait(timeout=_PROCESS_START_TIMEOUT_SECONDS)
+        monkeypatch.setattr(store, "_write_deny", fail_deny)
+        strong_thread.start()
+        strong_started = True
+        marker_deadline = time.monotonic() + 5
+        while not artifact.stat().st_mode & filesystem_store_module._ARTIFACT_INVALIDATION_MODE:
+            assert time.monotonic() < marker_deadline, "invalidation marker was not published"
+            time.sleep(0.01)
+    finally:
+        resume_lookup.set()
+        if strong_started:
+            strong_thread.join(timeout=10)
+        _join_processes([process])
+
+    assert not strong_thread.is_alive()
+    assert process.exitcode == 0
+    assert result_queue.get(timeout=3) == (
+        StoreStatus.INVALID.value,
+        FailureCode.ARTIFACT_DENIED.value,
+        None,
+    )
+    assert len(strong_results) == 1
+    strong = strong_results[0]
+    assert strong.status is StoreStatus.FAILED
+    assert strong.failure is not None and strong.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert not artifact.exists()
+    assert len(list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))) == 1
+
+
+@pytest.mark.parametrize("failure_point", ["entry_open", "ready_read", "payload_hash"])
+def test_operational_lookup_eio_is_retryable_without_denying_valid_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+
+    with monkeypatch.context() as fault:
+        if failure_point == "entry_open":
+            original_open = os.open
+
+            def fail_entry_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if Path(os.fsdecode(path)) == artifact:
+                    raise OSError(errno.EIO, "injected artifact open failure")
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            fault.setattr(os, "open", fail_entry_open)
+        elif failure_point == "ready_read":
+            original_read_json_at = filesystem_store_module._read_json_at
+
+            def fail_ready_read(
+                directory_fd: int,
+                name: str,
+                *,
+                require_read_only: bool = False,
+            ) -> dict[str, object]:
+                if name == "READY.json":
+                    raise OSError(errno.EIO, "injected READY metadata read failure")
+                return original_read_json_at(
+                    directory_fd,
+                    name,
+                    require_read_only=require_read_only,
+                )
+
+            fault.setattr(filesystem_store_module, "_read_json_at", fail_ready_read)
+        else:
+
+            def fail_hash(_fd: int, _size: int) -> str:
+                raise OSError(errno.EIO, "injected hash failure")
+
+            fault.setattr(filesystem_store_module, "_sha256_fd", fail_hash)
+        failed = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+
+    assert failed.status is StoreStatus.FAILED
+    assert failed.failure is not None
+    assert failed.failure.stage is ResolutionStage.DOMAIN
+    assert failed.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert failed.failure.retryable
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+
+
+@pytest.mark.parametrize("failure_point", ["entry_stat", "deny_stat"])
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="lock descriptor assertions require Linux /proc/self/fd",
+)
+def test_lookup_state_probe_eio_is_typed_and_releases_artifact_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    deny_path = store.deny_dir / f"{identity.key}.json"
+    target = artifact if failure_point == "entry_stat" else deny_path
+    artifact_lock_target = str(store._artifact_lock_path(identity.key))
+    lock_fds_before = _open_fd_targets().count(artifact_lock_target)
+    original_lstat = Path.lstat
+    injected = False
+
+    def fail_state_probe(path: Path) -> os.stat_result:
+        nonlocal injected
+        if path == target and not injected:
+            injected = True
+            raise OSError(errno.EIO, f"injected {failure_point} failure")
+        return original_lstat(path)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Path, "lstat", fail_state_probe)
+        failed = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+
+    assert injected
+    assert failed.status is StoreStatus.FAILED
+    assert failed.failure is not None
+    assert failed.failure.stage is ResolutionStage.DOMAIN
+    assert failed.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert failed.failure.retryable
+    assert _open_fd_targets().count(artifact_lock_target) == lock_fds_before
+    assert not deny_path.exists()
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+
+
 def test_full_checksum_denies_quarantines_and_rebuilds_corrupt_payload(tmp_path: Path) -> None:
     identity = _identity()
     store = _make_store(tmp_path / "store")
+    rebuild_count = tmp_path / "rebuild-count"
     built = store.get_or_build(
         BuildRequest(identity),
         FakeProducer(identity),
@@ -778,18 +1846,7 @@ def test_full_checksum_denies_quarantines_and_rebuilds_corrupt_payload(tmp_path:
     built.lease.close()
 
     artifact_dir = store.artifacts_dir / identity.key
-    payload = artifact_dir / "weights.safetensors"
-    os.chmod(artifact_dir, 0o755)
-    os.chmod(payload, 0o644)
-    with payload.open("r+b") as handle:
-        handle.seek(-1, os.SEEK_END)
-        original = handle.read(1)
-        handle.seek(-1, os.SEEK_END)
-        handle.write(bytes([original[0] ^ 0xFF]))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(payload, 0o444)
-    os.chmod(artifact_dir, 0o555)
+    _corrupt_test_payload(artifact_dir)
 
     metadata_only = store.lookup(identity, validation=ValidationLevel.MANIFEST_AND_METADATA)
     assert metadata_only.status is StoreStatus.HIT
@@ -808,7 +1865,7 @@ def test_full_checksum_denies_quarantines_and_rebuilds_corrupt_payload(tmp_path:
 
     rebuilt = store.get_or_build(
         BuildRequest(identity),
-        FakeProducer(identity),
+        FakeProducer(identity, counter_path=rebuild_count),
         validation=ValidationLevel.FULL_CHECKSUM,
         deadline=time.monotonic() + 10,
     )
@@ -816,8 +1873,45 @@ def test_full_checksum_denies_quarantines_and_rebuilds_corrupt_payload(tmp_path:
     assert rebuilt.lease is not None
     assert torch.equal(rebuilt.lease.tensors["layer.weight"], _weight())
     rebuilt.lease.close()
+    assert rebuild_count.read_text(encoding="utf-8").count("\n") == 1
     assert not (store.deny_dir / f"{identity.key}.json").exists()
-    assert len(list(store.quarantine_dir.iterdir())) == 1
+    quarantined = list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))
+    assert len(quarantined) == 1
+    assert not quarantined[0].stat().st_mode & 0o222
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+def test_pre_writable_crash_state_is_quarantined_immutably_and_rebuilt(tmp_path: Path) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    rebuild_count = tmp_path / "rebuild-count"
+    os.chmod(artifact, 0o755)
+
+    invalid = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+
+    assert invalid.status is StoreStatus.INVALID
+    assert invalid.failure is not None and invalid.failure.code is FailureCode.MANIFEST_CORRUPT
+    assert (store.deny_dir / f"{identity.key}.json").is_file()
+
+    rebuilt = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity, counter_path=rebuild_count),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert rebuilt.status is StoreStatus.BUILT
+    assert rebuilt.lease is not None
+    rebuilt.lease.close()
+    assert rebuild_count.read_text(encoding="utf-8").count("\n") == 1
+    assert not (store.artifacts_dir / identity.key).stat().st_mode & 0o222
+    quarantined = list(store.quarantine_dir.glob(f"{identity.key}.validation_failure.*"))
+    assert len(quarantined) == 1
+    assert not quarantined[0].stat().st_mode & 0o222
+    assert not (store.deny_dir / f"{identity.key}.json").exists()
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
 
 
 def test_malformed_safetensors_is_a_typed_invalid_artifact(tmp_path: Path) -> None:
@@ -947,6 +2041,118 @@ def test_noncooperative_conflicting_publication_is_reported_without_replacement(
     assert torch.equal(winner.lease.tensors["layer.weight"], _weight(100))
     winner.lease.close()
     assert len(list(store.quarantine_dir.iterdir())) == 1
+
+
+def test_same_semantic_competing_publication_remains_authoritative_on_staging_cleanup_eio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity()
+    root = tmp_path / "store"
+    store = _make_store(root)
+    injected = False
+    original_remove_tree = FilesystemHostWeightStore._remove_tree
+
+    class CompetingProducer(FakeProducer):
+        def produce(self, writer: object) -> ProductionMetadata:
+            competing = NonCooperativeStore(store.domain_policy, store.capacity_policy, store.integrity_policy)
+            published = competing.get_or_build(
+                BuildRequest(identity),
+                FakeProducer(identity),
+                validation=ValidationLevel.FULL_CHECKSUM,
+                deadline=time.monotonic() + 10,
+            )
+            assert published.status is StoreStatus.BUILT
+            assert published.lease is not None
+            published.lease.close()
+            return super().produce(writer)
+
+    def fail_primary_staging_cleanup_once(path: Path) -> None:
+        nonlocal injected
+        if path.parent == store.tmp_dir and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected same-semantic staging cleanup failure")
+        original_remove_tree(path)
+
+    monkeypatch.setattr(store, "_remove_tree", fail_primary_staging_cleanup_once)
+    result = store.get_or_build(
+        BuildRequest(identity),
+        CompetingProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert injected
+    assert result.status is StoreStatus.BUILT
+    assert result.lease is not None
+    result.lease.close()
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.deny_dir.iterdir())
+    assert not list(store.quarantine_dir.iterdir())
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
+
+
+def test_competing_publication_manifest_eio_is_retryable_and_preserves_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity()
+    root = tmp_path / "store"
+    store = _make_store(root)
+    artifact = store.artifacts_dir / identity.key
+    manifest_path = artifact / "manifest.json"
+    original_read_json_file = filesystem_store_module._read_json_file
+    injected = False
+
+    class CompetingProducer(FakeProducer):
+        def produce(self, writer: object) -> ProductionMetadata:
+            competing = NonCooperativeStore(store.domain_policy, store.capacity_policy, store.integrity_policy)
+            published = competing.get_or_build(
+                BuildRequest(identity),
+                FakeProducer(identity),
+                validation=ValidationLevel.FULL_CHECKSUM,
+                deadline=time.monotonic() + 10,
+            )
+            assert published.status is StoreStatus.BUILT
+            assert published.lease is not None
+            published.lease.close()
+            return super().produce(writer)
+
+    def fail_competing_manifest_read_once(path: Path) -> dict[str, object]:
+        nonlocal injected
+        if path == manifest_path and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected competing manifest read failure")
+        return original_read_json_file(path)
+
+    monkeypatch.setattr(filesystem_store_module, "_read_json_file", fail_competing_manifest_read_once)
+    result = store.get_or_build(
+        BuildRequest(identity),
+        CompetingProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert injected
+    assert result.status is StoreStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.stage is ResolutionStage.DOMAIN
+    assert result.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert result.failure.retryable
+    details = result.failure.details.to_value()
+    assert isinstance(details, dict)
+    assert details["outcome_uncertain"] is True
+    assert details["competing_entry"] == "preserved"
+    assert artifact.is_dir()
+    assert not list(store.quarantine_dir.iterdir())
+    assert not list(store.tmp_dir.iterdir())
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.status is StoreStatus.HIT
+    assert hit.lease is not None
+    hit.lease.close()
 
 
 def test_payload_symlink_is_rejected_without_following_it(tmp_path: Path) -> None:
@@ -1118,6 +2324,7 @@ def test_capacity_and_enospc_failures_are_typed_and_clean_staging(
         (errno.ENOSPC, ResolutionStage.CAPACITY, FailureCode.ENOSPC),
         (errno.EDQUOT, ResolutionStage.CAPACITY, FailureCode.ENOSPC),
         (errno.EACCES, ResolutionStage.DOMAIN, FailureCode.DOMAIN_UNAVAILABLE),
+        (errno.EIO, ResolutionStage.DOMAIN, FailureCode.DOMAIN_UNAVAILABLE),
     ],
 )
 def test_staging_directory_failures_are_typed_and_clean(
@@ -1153,6 +2360,108 @@ def test_staging_directory_failures_are_typed_and_clean(
     assert result.failure is not None
     assert result.failure.stage is expected_stage
     assert result.failure.code is expected_code
+    assert result.failure.retryable
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.artifacts_dir.iterdir())
+
+
+def test_post_producer_staging_io_failure_is_retryable_domain_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity()
+    store = _make_store(tmp_path / "store")
+    original_fsync_directory = filesystem_store_module._fsync_directory
+
+    def fail_staging_fsync(path: Path) -> None:
+        if path.parent == store.tmp_dir:
+            raise OSError(errno.EIO, "injected post-producer staging fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(filesystem_store_module, "_fsync_directory", fail_staging_fsync)
+    result = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert result.status is StoreStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.stage is ResolutionStage.DOMAIN
+    assert result.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert result.failure.retryable
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.artifacts_dir.iterdir())
+
+
+def test_async_payload_fsync_eio_is_retryable_domain_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity()
+    store = _make_store(tmp_path / "store")
+    injection_count = 0
+
+    def fail_payload_fsync(fd: int) -> None:
+        nonlocal injection_count
+        injection_count += 1
+        try:
+            raise OSError(errno.EIO, "injected payload-fsync EIO")
+        finally:
+            os.close(fd)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(filesystem_writer_module, "_fsync_payload", fail_payload_fsync)
+        failed = store.get_or_build(
+            BuildRequest(identity),
+            FakeProducer(identity),
+            validation=ValidationLevel.FULL_CHECKSUM,
+            deadline=time.monotonic() + 10,
+        )
+
+    assert injection_count == 1
+    assert failed.status is StoreStatus.FAILED
+    assert failed.failure is not None
+    assert failed.failure.stage is ResolutionStage.DOMAIN
+    assert failed.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+    assert failed.failure.retryable
+    assert "injected payload-fsync EIO" in failed.failure.message
+    assert not list(store.tmp_dir.iterdir())
+    assert not list(store.artifacts_dir.iterdir())
+
+    recovered = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert recovered.status is StoreStatus.BUILT
+    assert recovered.lease is not None
+    recovered.lease.close()
+
+
+def test_producer_raised_eio_remains_nonretryable_producer_failure(tmp_path: Path) -> None:
+    identity = _identity()
+    store = _make_store(tmp_path / "store")
+
+    class FailingProducer(FakeProducer):
+        def produce(self, writer: object) -> ProductionMetadata:
+            del writer
+            raise OSError(errno.EIO, "injected producer failure")
+
+    result = store.get_or_build(
+        BuildRequest(identity),
+        FailingProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert result.status is StoreStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.stage is ResolutionStage.PRODUCTION
+    assert result.failure.code is FailureCode.PRODUCER_FAILED
+    assert not result.failure.retryable
     assert not list(store.tmp_dir.iterdir())
     assert not list(store.artifacts_dir.iterdir())
 

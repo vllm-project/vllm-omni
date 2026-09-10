@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from vllm_omni.config.stage_config import load_deploy_config
+
 
 def modify_stage_config(
     yaml_path: str,
@@ -669,6 +671,16 @@ def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
     raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
 
 
+def get_deploy_duplex_max_sessions(rel_path: str) -> int:
+    """Return the duplex session capacity a deploy yaml admits.
+
+    Loads through ``load_deploy_config`` so ``base_config`` merging and
+    ``DuplexSessionRuntimeConfig`` defaults stay in lockstep with the server
+    instead of being re-implemented here.
+    """
+    return load_deploy_config(get_deploy_config_path(rel_path)).duplex_session.max_sessions
+
+
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
     """Return ``stage_id`` values from a new-schema deploy YAML (``stages``)."""
     with open(stage_config_path, encoding="utf-8") as f:
@@ -734,6 +746,7 @@ def stage_config_path_for_run_level(stage_config_path: str | None, run_level: st
 __all__ = [
     "get_deploy_config_path",
     "get_deploy_config_stage",
+    "get_deploy_duplex_max_sessions",
     "get_stage_entries",
     "load_stage_ids",
     "load_stage_replica_counts",

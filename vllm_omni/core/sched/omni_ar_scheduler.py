@@ -589,10 +589,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
                         if self.vllm_config.model_config.stage_id != 0:
-                            # Downstream async-chunk stages receive real payloads from the
-                            # connector, not an external StreamingUpdate. Move the
-                            # resumable request back to the ordinary waiting queue so
-                            # connector polling starts again immediately.
+                            # Only a connector-fed receiver in native duplex can
+                            # poll the next segment without an external update.
+                            # Sender-only and turn-mode stages remain parked.
                             self._resume_downstream_chunk_receiver(request)
                     outstanding_async_tokens = request.num_output_placeholders
                     # Always record the discard signal (0 when nothing is in

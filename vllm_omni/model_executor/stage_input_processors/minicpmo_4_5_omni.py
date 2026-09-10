@@ -550,6 +550,29 @@ def _native_tts_boundary_token_ids(special_token_ids):
     }
 
 
+def _native_duplex_output_is_control_only(
+    output_ids: Sequence[int],
+    special_token_ids: Mapping[str, int],
+) -> bool:
+    if not output_ids:
+        return True
+    control_ids = {
+        token_id
+        for token_id in (
+            special_token_ids.get("tts_eos_token_id"),
+            special_token_ids.get("tts_pad_token_id"),
+            special_token_ids.get("listen_token_id"),
+            special_token_ids.get("chunk_eos_token_id"),
+            special_token_ids.get("chunk_tts_eos_token_id"),
+            special_token_ids.get("turn_eos_token_id"),
+            special_token_ids.get("unit_token_id"),
+            special_token_ids.get("unit_end_token_id"),
+        )
+        if token_id is not None
+    }
+    return bool(control_ids) and all(token_id in control_ids for token_id in output_ids)
+
+
 def _decode_native_duplex_token_ids(
     token_ids: list[int],
     streaming_context,
@@ -757,10 +780,16 @@ def llm2tts(
             )
         prompt_token_ids_len = len(prompt_token_ids)
 
+        is_native_duplex_handoff = _has_native_duplex_prompt_metadata(mm_output)
+
         latent = mm_output.get("latent", None)
         if latent is None:
             latent = output.hidden_states if hasattr(output, "hidden_states") else None
             if latent is None:
+                if is_native_duplex_handoff and _native_duplex_output_is_control_only(
+                    llm_output_ids, special_token_ids
+                ):
+                    continue
                 raise ValueError("No latent or hidden_states found in thinker output")
 
         thinker_hidden_states = latent.detach()
@@ -771,7 +800,6 @@ def llm2tts(
         full_token_ids = prompt_token_ids + llm_output_ids
 
         tts_bos_id = special_token_ids.get("tts_bos_token_id")
-        is_native_duplex_handoff = _has_native_duplex_prompt_metadata(mm_output)
         if is_native_duplex_handoff:
             _require_native_tts_boundary_metadata(special_token_ids)
         tts_end_ids = _native_tts_boundary_token_ids(special_token_ids)

@@ -25,10 +25,10 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
+def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
-    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=stage_id))
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode))
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
@@ -446,11 +446,15 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
         return result
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode="duplex"))
     sched.running = []
     sched.waiting = queue()
     sched.skipped_waiting = queue(session)
     sched.num_waiting_for_streaming_input = 1
-    sched.chunk_transfer_adapter = SimpleNamespace(segment_finished_requests={session.request_id})
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        segment_finished_requests={session.request_id},
+    )
 
     sched._resume_downstream_chunk_receiver(session)
     sched._remove_stopped_requests_from_queues(set(), {session})
@@ -460,3 +464,37 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     assert session not in sched.skipped_waiting.requests
     assert sched.num_waiting_for_streaming_input == 0
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+
+
+@pytest.mark.parametrize(
+    ("receives_chunks", "session_mode"),
+    [
+        (False, "duplex"),
+        (True, "turn"),
+    ],
+)
+def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
+    receives_chunks: bool,
+    session_mode: str,
+) -> None:
+    """Only duplex connector-driven receivers resume without an update."""
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
+    sched.num_waiting_for_streaming_input = 1
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=receives_chunks,
+        segment_finished_requests={session.request_id},
+    )
+    sched.skipped_waiting = MagicMock()
+    sched._enqueue_waiting_request = MagicMock()
+
+    sched._resume_downstream_chunk_receiver(session)
+
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert sched.num_waiting_for_streaming_input == 1
+    assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+    sched.skipped_waiting.remove_requests.assert_not_called()
+    sched._enqueue_waiting_request.assert_not_called()

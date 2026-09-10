@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Online serving smokes for all four canonical LTX-2.5 pipelines."""
 
@@ -73,8 +73,8 @@ def test_ltx25_pipeline_entries(
                 "form_data": {
                     "model": omni_server.model,
                     "prompt": PROMPT,
-                    "height": 128,
-                    "width": 128,
+                    "height": 256,
+                    "width": 256,
                     "num_frames": 9,
                     "fps": 24,
                     "num_inference_steps": num_inference_steps,

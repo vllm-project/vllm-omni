@@ -27,7 +27,11 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    cleanup_request_artifact_dirs,
+)
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -43,6 +47,18 @@ from .test_orchestrator import (
     _enqueue_add_request,
     _wait_for,
 )
+
+
+def test_request_artifact_cleanup_is_idempotent(tmp_path):
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "prepared.mp4").touch()
+
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+
+    assert not artifact_dir.exists()
+
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -917,6 +933,36 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
     finally:
         orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_duplex_input_processor_failure_is_request_scoped(orchestrator_factory, monkeypatch) -> None:
+    class FailingStage(FakeStageClient):
+        def process_engine_inputs(self, *_args, **_kwargs):
+            raise ValueError("No latent or hidden_states found in thinker output")
+
+    fixture = orchestrator_factory(
+        [FakeStageClient(stage_type="llm"), FailingStage(stage_type="llm", final_output=True)]
+    )
+    state = OrchestratorRequestState(
+        request_id="bad",
+        prompt=SimpleNamespace(request_id="bad", prompt_token_ids=[1]),
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        duplex_identity=SimpleNamespace(),
+    )
+
+    async def no_cleanup(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(fixture.orchestrator, "_cleanup_request_ids", no_cleanup)
+    try:
+        await fixture.orchestrator._forward_to_next_stage_unguarded("bad", 0, _build_request_output("raw"), state)
+        error = await _wait_for_error_message(fixture, request_id="bad")
+        assert error.fatal is False
+    finally:
+        fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        fixture.thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

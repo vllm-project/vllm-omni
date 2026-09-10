@@ -14,6 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _STALE_API_FILES = [
     "vllm_omni/model_executor/models/hunyuan_image3/hunyuan_image3.py",
+    "vllm_omni/model_executor/models/mammoth_moda2/mammoth_moda2.py",
     "vllm_omni/model_executor/models/mimo_audio/mimo_audio_llm.py",
     "vllm_omni/model_executor/models/qwen2_5_omni/qwen2_old.py",
 ]
@@ -117,6 +118,10 @@ def test_auto_weights_loader_delegated_loaders_accept_mapped_cache_scale(
 @pytest.mark.parametrize(
     ("module_name", "class_name"),
     [
+        (
+            "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2",
+            "MammothModa2Qwen2ForCausalLM",
+        ),
         (
             "vllm_omni.model_executor.models.mimo_audio.mimo_audio_llm",
             "MiMoAudioLLMForConditionalGeneration",

@@ -60,6 +60,8 @@ class InlineStageDiffusionClient(StageClientBase):
         self.default_sampling_params = metadata.default_sampling_params
         self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
+        self.prompt_transform_func = None
+        self.prompt_expand_func = None
         self.engine_input_source = metadata.engine_input_source
         self.batch_size = batch_size
 

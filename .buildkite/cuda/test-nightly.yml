@@ -272,6 +272,12 @@ steps:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
+        timeout_in_minutes: 90
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m "full_model and cuda" --run-level "full_model"
+        mirror_hardwares: h100_2
+
       - label: ":full_moon: Diffusion X2V · Doc Test"
         timeout_in_minutes: 60
         commands:
@@ -315,6 +321,23 @@ steps:
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
             EXIT1=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
+            EXIT2=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
+            exit $$EXIT2
+        mirror_hardwares: h100_2
+
+      - label: ":full_moon: Diffusion X2V · Perf Test · HunyuanVideo-1.5"
+        key: nightly-diffusion-x2v-performance-hunyuanvideo15
+        timeout_in_minutes: 180
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
+            EXIT1=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_i2v_vllm_omni.json
             EXIT2=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"

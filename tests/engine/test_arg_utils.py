@@ -34,6 +34,11 @@ def test_sync_config_is_omni():
     assert isinstance(cfg, OmniModelConfig)
 
 
+def test_session_mode_reaches_omni_model_config():
+    assert OmniEngineArgs().create_model_config().session_mode == "turn"
+    assert OmniEngineArgs(session_mode="duplex").create_model_config().session_mode == "duplex"
+
+
 def test_default_stage_id_is_concrete_int():
     """Ensure `stage_id` stays safe for downstream arithmetic/indexing."""
     engine_args = OmniEngineArgs()

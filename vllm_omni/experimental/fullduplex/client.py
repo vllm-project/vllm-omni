@@ -497,6 +497,7 @@ class RealtimeDuplexClient:
         auto_response: bool = True,
         temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
+        turn_detection: dict[str, object] | None = None,
         session_id: str | None = None,
         idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
@@ -517,8 +518,12 @@ class RealtimeDuplexClient:
             "modalities": ["audio", "text"],
             "input_audio_format": "pcm16",
             "output_audio_format": output_audio_format,
-            "turn_detection": None,
-            "overlap_policy": "listen_only",
+            "turn_detection": dict(turn_detection) if turn_detection is not None else None,
+            "overlap_policy": (
+                "barge_in_on_speech"
+                if turn_detection is not None and turn_detection.get("interrupt_response", True) is True
+                else "listen_only"
+            ),
             "playback_commit_policy": "ack_only",
             "extra_body": session_extra_body,
         }

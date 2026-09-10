@@ -125,6 +125,23 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     return model
 
 
+def _resolve_model_path(model: str, engine_args: dict[str, Any]) -> str:
+    """Apply a model-owned path resolver from stage engine args."""
+    resolver_path = engine_args.pop("model_path_resolver", None)
+    if resolver_path is None:
+        return model
+    resolver = _resolve_omni_metadata_hook(str(resolver_path))
+    if resolver is None:
+        return model
+    return str(
+        resolver(
+            model,
+            engine_args.get("revision"),
+            engine_args.get("task_type"),
+        )
+    )
+
+
 def apply_cli_tokenizer(
     engine_args: dict[str, Any],
     *,
@@ -358,6 +375,7 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
@@ -427,6 +445,12 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         mod_path, fn_name = _cpif_path.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
+    prompt_transform_func: Callable | None = None
+    _ptf_path = _get_attr_or_item(stage_config, "prompt_transform_func")
+    if _ptf_path:
+        _mod, _fn = _ptf_path.rsplit(".", 1)
+        prompt_transform_func = getattr(importlib.import_module(_mod), _fn)
+
     prompt_expand_func: Callable | None = None
     _pef_path = _get_attr_or_item(stage_config, "prompt_expand_func")
     if _pef_path:
@@ -455,6 +479,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             custom_process_input_func=custom_process_input_func,
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
+            prompt_transform_func=prompt_transform_func,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
@@ -475,6 +500,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
+        prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
     )
 
@@ -521,6 +547,7 @@ def extract_stage_metadata_from_omni_stage_config(
             custom_process_input_func=custom_process_input_func,
             model_stage=stage_config.model_stage,
             runtime_cfg=stage_config.runtime_config,
+            prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
             cfg_kv_collect_func=_resolve_omni_metadata_hook(stage_config.cfg_kv_collect_func),
         )
 
@@ -537,6 +564,7 @@ def extract_stage_metadata_from_omni_stage_config(
         custom_process_input_func=custom_process_input_func,
         model_stage=stage_config.model_stage,
         runtime_cfg=stage_config.runtime_config,
+        prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
     )
 
@@ -920,6 +948,7 @@ def _project_omni_stage_engine_args(
         "hf_config_name": stage_config.hf_config_name,
         "engine_output_type": stage_config.engine_output_type,
         "custom_process_next_stage_input_func": stage_config.custom_process_next_stage_input_func,
+        "model_path_resolver": topology.model_path_resolver,
         "retains_state_across_chunks": topology.retains_state_across_chunks,
     }
     engine_args.update(
@@ -986,6 +1015,7 @@ def _finalize_engine_args_dict(
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
+    model = _resolve_model_path(model, engine_args_dict)
     audex_stage = str(engine_args_dict.get("model_stage") or "")
     if audex_stage == "audex_xcodec":
         # TTA stage 1 decodes with the external XCodec1 checkpoint, not a

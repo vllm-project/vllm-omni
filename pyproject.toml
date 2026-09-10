@@ -71,11 +71,11 @@ dev = [
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
     "torchdiffeq==0.2.5", # for covo_audio Test
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
-    "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
+    "silero-vad==6.1", # Realtime server-VAD duplex E2E
 ]
 
 demo = [
@@ -83,6 +83,10 @@ demo = [
     "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
     "requests>=2.28.0",  # cli/stream_client HTTP
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
+]
+
+server-vad = [
+    "silero-vad==6.1",
 ]
 
 forced-aligner = [

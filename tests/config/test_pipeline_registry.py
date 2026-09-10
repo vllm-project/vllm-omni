@@ -66,3 +66,10 @@ def test_register_resolver_requires_model_type(custom_resolver, clean_pipeline_r
     """Ensure that registering a custom resolver to OMNI_PIPELINES requires an explicit model_type."""
     with pytest.raises(ValueError):
         register_pipeline(custom_resolver)
+
+
+def test_minimax_h3_disaggregation_is_explicit_opt_in():
+    assert "minimax_h3" not in OMNI_PIPELINES
+    pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
+    assert isinstance(pipeline, PipelineConfig)
+    assert pipeline.model_type == "minimax_h3_disaggregated"

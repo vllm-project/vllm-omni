@@ -15,10 +15,11 @@ import pytest
 from huggingface_hub import snapshot_download
 
 from tests.helpers.runtime import OmniServerParams, get_model_prefix
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, get_deploy_duplex_max_sessions
 
 MODEL = "openbmb/MiniCPM-o-4_5"
-DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
+DEPLOY_CONFIG_REL = "minicpmo_4_5.yaml"
+DEPLOY_CONFIG = get_deploy_config_path(DEPLOY_CONFIG_REL)
 ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"
 RESPONSE_REQUIRED_WAV = ASSET_DIR / "response_required_16k.wav"
 RESPONSE_REQUIRED_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"
@@ -37,6 +38,16 @@ SERVER_PARAMS = [
         id="three-stage-single-gpu",
     )
 ]
+
+
+def deploy_max_sessions() -> int:
+    """Concurrent duplex sessions the deploy config under test admits.
+
+    The admission probe has to expect the capacity the server is actually
+    started with. Hardcoding it silently drifts the moment the deploy config
+    changes its capacity, turning that change into an unrelated probe timeout.
+    """
+    return get_deploy_duplex_max_sessions(DEPLOY_CONFIG_REL)
 
 
 def validated_wav(path: Path, expected_sha256: str) -> Path:

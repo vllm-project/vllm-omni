@@ -452,7 +452,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_core_resumable_request"] is True
     assert caps["supports_stage_connector_handoff"] is True
     assert caps["supports_audio_truncate"] is True
-    assert caps["supports_barge_in"] is False
+    assert caps["supports_barge_in"] is True
     assert caps["target_barge_in_latency_ms"] is None
     assert caps["supports_multi_session"] is True
     assert caps["supports_multi_session_same_replica"] is True

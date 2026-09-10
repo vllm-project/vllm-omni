@@ -25,10 +25,12 @@ import torch.distributed as dist
 import zmq
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -46,8 +48,14 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
+    get_cfg_group,
+    get_dp_group,
+    get_fs_group,
+    get_pp_group,
+    get_sp_group,
     init_distributed_environment,
     initialize_model_parallel,
+    model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
@@ -100,6 +108,38 @@ def _all_gather_rank_values(value: Any) -> list[Any]:
     values: list[Any] = [None] * dist.get_world_size()
     dist.all_gather_object(values, value)
     return values
+
+
+def _setup_diffusion_worker_proc_title_and_log_prefix(enable_ep: bool) -> None:
+    """Set the worker process title and log prefix from initialized groups."""
+    process_name = "DiffusionWorker"
+    if model_parallel_is_initialized():
+        dp_group = get_dp_group()
+        pp_group = get_pp_group()
+        sp_group = get_sp_group()
+        cfg_group = get_cfg_group()
+        tp_group = get_tp_group()
+        fs_group = get_fs_group()
+
+        if dp_group.world_size > 1:
+            process_name += f"_DP{dp_group.rank_in_group}"
+        if pp_group.world_size > 1:
+            process_name += f"_PP{pp_group.rank_in_group}"
+        if sp_group.world_size > 1:
+            process_name += f"_SP{sp_group.rank_in_group}"
+        if cfg_group.world_size > 1:
+            process_name += f"_CFG{cfg_group.rank_in_group}"
+        if tp_group.world_size > 1:
+            process_name += f"_TP{tp_group.rank_in_group}"
+        if fs_group.world_size > 1:
+            process_name += f"_FS{fs_group.rank_in_group}"
+        if enable_ep:
+            ep_group = get_ep_group()
+            if ep_group.world_size > 1:
+                process_name += f"_EP{ep_group.rank_in_group}"
+
+    set_process_title(name=process_name, prefix="vLLM-Omni")
+    decorate_logs(process_name)
 
 
 def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list[Any]:
@@ -297,6 +337,7 @@ class DiffusionWorker:
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
             )
+            _setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=parallel_config.enable_expert_parallel)
             if (
                 getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                 is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -1399,13 +1440,7 @@ class WorkerProc:
 
         set_death_signal(signal.SIGTERM)
 
-        # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
-        try:
-            import setproctitle
-
-            setproctitle.setproctitle(f"vLLM-Omni::DiffusionWorker-{rank}")
-        except ImportError:
-            pass  # setproctitle not installed, skip process title setting
+        _setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=od_config.parallel_config.enable_expert_parallel)
 
         load_omni_general_plugins()
         worker_proc = None

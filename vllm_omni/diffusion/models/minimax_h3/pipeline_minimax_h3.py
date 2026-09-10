@@ -62,6 +62,41 @@ from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
+    resolve_minimax_h3_partition,
+)
+from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+    MiniMaxH3TextConditioning,
+)
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    load_minimax_h3_images as _load_images,
+)
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    minimax_h3_multi_image_presentation,
+    minimax_h3_ref2va_presentation,
+    minimax_h3_ref2va_video_presentation,
+    minimax_h3_text_only_ids,
+)
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    resolve_minimax_h3_aspect_ratio as _resolve_minimax_h3_aspect_ratio,
+)
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    resolve_minimax_h3_output_canvas as _resolve_output_canvas,
+)
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    resolve_minimax_h3_reference_image_shape as _reference_image_shape,
+)
+from vllm_omni.model_executor.models.minimax_h3.reference_video import (
+    MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
+    deserialize_prepared_reference_videos,
+    load_audio_file,
+    load_video_audio,
+    load_video_frames,
+    prepare_reference_videos,
+    sample_reference_video_frames,
+    validate_reference_audio_files,
+    validate_reference_audio_waveforms,
+)
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import (
     resolve_component_quant_config as _resolve_component_quant_config,
@@ -97,23 +132,7 @@ from .packed_tokens import (
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
-from .presentation import (
-    minimax_h3_multi_image_presentation_ids,
-    minimax_h3_multi_image_presentation_token_tags,
-    minimax_h3_ref2va_presentation,
-    minimax_h3_ref2va_video_presentation,
-    minimax_h3_text_only_ids,
-)
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
-from .reference_video import (
-    load_audio_file,
-    load_video_audio,
-    load_video_frames,
-    prepare_reference_videos,
-    sample_reference_video_frames,
-    validate_reference_audio_files,
-    validate_reference_audio_waveforms,
-)
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
@@ -169,6 +188,28 @@ MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
     "fl2va": ["FL2VA/**"],
     "ref2va": ["Ref2VA/**"],
 }
+MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
+    "fl2va": [
+        "FL2VA/model_index.json",
+        "FL2VA/transformer/**",
+        "FL2VA/video_vae/**",
+        "FL2VA/audio_vae/**",
+    ],
+    "ref2va": [
+        "Ref2VA/model_index.json",
+        "Ref2VA/transformer/**",
+        "Ref2VA/video_vae/**",
+        "Ref2VA/audio_vae/**",
+    ],
+    "combined": [
+        "FL2VA/model_index.json",
+        "FL2VA/transformer/**",
+        "FL2VA/video_vae/**",
+        "FL2VA/audio_vae/**",
+        "Ref2VA/model_index.json",
+        "Ref2VA/transformer/**",
+    ],
+}
 
 
 def _resolve_minimax_h3_text_encoder_quant_config(
@@ -182,33 +223,27 @@ def _minimax_h3_partition_for_task(
     task_type: str | None,
     model: str | None = None,
 ) -> str:
-    task = str(task_type or "auto").lower()
-    if task == "auto" and model is not None:
-        path = Path(model)
-        if path.is_dir() and path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
-            return path.name.lower()
-    if task in {"auto", "combined"}:
-        return "combined"
-    if task in {"t2va", "fl2va"}:
-        return "fl2va"
-    if task == "ref2va":
-        return "ref2va"
-    raise ValueError(f"MiniMax-H3 task_type must be one of auto, t2va, fl2va, or ref2va; got {task_type!r}")
+    return resolve_minimax_h3_partition(model or "", task_type, auto_partition="combined")
 
 
 def _resolve_minimax_h3_model_root(
     model: str,
     revision: str | None,
     partition: str,
+    *,
+    load_text_encoder: bool,
 ) -> Path:
     path = Path(model)
     if path.is_dir():
-        if path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
+        if path.name in {"FL2VA", "Ref2VA"}:
             return path.parent
         return path
-    allow_patterns = (
-        MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
-    )
+    if load_text_encoder:
+        allow_patterns = (
+            MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
+        )
+    else:
+        allow_patterns = MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS[partition]
     return Path(
         download_weights_from_hf_specific(
             model_name_or_path=model,
@@ -287,6 +322,29 @@ def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     return DMD2SigmaSchedule.from_metadata(release)
 
 
+def resolve_minimax_h3_diffusion_model_path(
+    model: str,
+    revision: str | None,
+    task_type: str | None,
+) -> str:
+    """Resolve a repository root or Hub ID to its startup partition."""
+    partition = (
+        "combined"
+        if str(task_type or "").lower() == "combined"
+        else resolve_minimax_h3_partition(model, task_type, auto_partition="fl2va")
+    )
+    model_root = _resolve_minimax_h3_model_root(
+        model,
+        revision,
+        partition,
+        load_text_encoder=False,
+    )
+    if partition == "combined":
+        return str(model_root)
+    subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
+    return str(model_root / subdir)
+
+
 def _minimax_h3_post_process(output, output_type: str = "np"):
     """Convert the joint video/audio output without capturing worker state.
 
@@ -310,6 +368,12 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     }
 
 
+def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
+    for component in components:
+        if component is not None:
+            component.set_omni_component_cache(cache)
+
+
 def get_minimax_h3_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -328,39 +392,6 @@ def _load_image(value: Any) -> Image.Image:
     return images[0]
 
 
-def _load_images(value: Any) -> list[Image.Image]:
-    if isinstance(value, (list, tuple)):
-        if not value:
-            raise OmniClientError("MiniMax H3 image input must not be empty")
-        return [_load_image(item) for item in value]
-    if isinstance(value, (str, os.PathLike)):
-        file_size = os.path.getsize(value)
-        if file_size > MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES:
-            raise OmniClientError("MiniMax H3 reference image exceeds the 30 MiB size limit")
-        with Image.open(value) as image:
-            image_format = str(image.format or "").lower()
-            if image_format and image_format not in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
-                raise OmniClientError(
-                    f"MiniMax H3 reference image must use JPG, JPEG, PNG, WEBP, HEIC, or HEIF, got {image.format}"
-                )
-            return [image.convert("RGB")]
-    if isinstance(value, Image.Image):
-        return [value.convert("RGB")]
-    if isinstance(value, torch.Tensor):
-        tensor = value.detach().float().cpu()
-        if tensor.ndim == 4 and tensor.shape[0] == 1:
-            tensor = tensor[0]
-        if tensor.ndim != 3:
-            raise OmniClientError(f"image tensor must be [C,H,W], got {tuple(tensor.shape)}")
-        if tensor.shape[0] in (1, 3, 4):
-            tensor = tensor.permute(1, 2, 0)
-        array = tensor.numpy()
-        if array.max(initial=0) <= 1.0:
-            array = array * 255.0
-        return [Image.fromarray(array.clip(0, 255).astype(np.uint8)).convert("RGB")]
-    raise OmniClientError(f"unsupported MiniMax H3 image input {type(value)!r}")
-
-
 def _load_audio(value: Any) -> tuple[torch.Tensor, int]:
     if isinstance(value, (list, tuple)) and not (len(value) == 2 and isinstance(value[1], (int, np.integer))):
         audios = _load_audios(value)
@@ -369,7 +400,7 @@ def _load_audio(value: Any) -> tuple[torch.Tensor, int]:
         return audios[0]
     if isinstance(value, (str, os.PathLike)):
         return load_audio_file(str(value))
-    if isinstance(value, tuple) and len(value) == 2:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
         waveform, sample_rate = value
         waveform = torch.as_tensor(waveform).float()
         return waveform, int(sample_rate)
@@ -423,6 +454,21 @@ def _resolve_fl2va_keyframe_indices(extra: Mapping[str, Any], image_count: int) 
     return raw_indices
 
 
+def _reuse_prepared_reference_videos(
+    prepared: list[dict[str, Any]] | None,
+    *,
+    expected_count: int,
+) -> list[dict[str, Any]] | None:
+    if prepared is None:
+        return None
+    if len(prepared) != expected_count:
+        raise OmniClientError("MiniMax H3 prepared-reference-video count does not match the request")
+    for item in prepared:
+        if not os.path.isfile(item["prepared_path"]):
+            raise OmniClientError(f"MiniMax H3 prepared reference video is unavailable: {item['prepared_path']}")
+    return prepared
+
+
 def _validate_ref2va_reference_counts(
     image_count: int,
     video_count: int,
@@ -441,55 +487,6 @@ def _validate_ref2va_reference_counts(
         raise OmniClientError("ref2va accepts at most 3 standalone audio references")
     if image_count + video_count + audio_count > 12:
         raise OmniClientError("ref2va accepts at most 12 total references")
-
-
-def _resolve_minimax_h3_aspect_ratio(
-    task: str,
-    value: Any,
-    image: Image.Image | None,
-) -> float:
-    """Resolve H3's task-specific ratio policy.
-
-    T2VA must name one of the official ratios.  FL2VA always follows the
-    first input image, even when a generic client sends ``aspect_ratio``.
-    Ref2VA defaults to 16:9; ``adaptive``/``auto`` are retained as aliases
-    for that default for compatibility with existing clients.
-    """
-    if task == "fl2va":
-        if image is None:
-            raise OmniClientError("fl2va requires an input image to resolve its aspect ratio")
-        return float(image.width) / float(image.height)
-
-    if value is None:
-        if task == "t2va":
-            raise OmniClientError("t2va requires an explicit aspect_ratio")
-        return MINIMAX_H3_SUPPORTED_ASPECT_RATIOS["16:9"]
-
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"adaptive", "auto"}:
-            if task == "t2va":
-                raise OmniClientError("t2va requires an explicit named aspect_ratio, not adaptive")
-            return MINIMAX_H3_SUPPORTED_ASPECT_RATIOS["16:9"]
-        if normalized in MINIMAX_H3_SUPPORTED_ASPECT_RATIOS:
-            return MINIMAX_H3_SUPPORTED_ASPECT_RATIOS[normalized]
-        try:
-            numeric_value = float(normalized)
-        except (TypeError, ValueError) as exc:
-            supported = ", ".join(MINIMAX_H3_SUPPORTED_ASPECT_RATIOS)
-            raise OmniClientError(f"MiniMax H3 aspect_ratio must be one of {supported}, got {value!r}") from exc
-    elif isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
-        numeric_value = float(value)
-    else:
-        raise OmniClientError(f"MiniMax H3 aspect_ratio must be a string ratio, got {value!r}")
-
-    if not math.isfinite(numeric_value) or not any(
-        math.isclose(numeric_value, ratio, rel_tol=0.0, abs_tol=1e-6)
-        for ratio in MINIMAX_H3_SUPPORTED_ASPECT_RATIOS.values()
-    ):
-        supported = ", ".join(MINIMAX_H3_SUPPORTED_ASPECT_RATIOS)
-        raise OmniClientError(f"MiniMax H3 aspect_ratio must be one of {supported}, got {value!r}")
-    return numeric_value
 
 
 def _resolve_minimax_h3_num_outputs(value: Any) -> int:
@@ -607,49 +604,6 @@ def _broadcast_tensor(
         output = torch.empty(tensor_shape, device=device, dtype=dtype)
     dist.broadcast(output, src=0, group=group)
     return output
-
-
-def _reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    width, height = image.size
-    ratio = width / height
-    if not 0.4 <= ratio <= 2.5:
-        raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
-    if min(width, height) < 256 or max(width, height) > 5760:
-        raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
-    return (
-        _align_multiple(
-            width * scale,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-        ),
-        _align_multiple(
-            height * scale,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-        ),
-    )
-
-
-def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
-    """Resolve the official H3 ratio/area policy to a 32-pixel canvas."""
-    if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:
-        raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be positive, got {aspect_ratio!r}")
-    if short_edge != MINIMAX_H3_OUTPUT_SHORT_EDGE:
-        raise OmniClientError(f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {short_edge}")
-    if aspect_ratio >= 1.0:
-        width = float(short_edge) * aspect_ratio
-        height = float(short_edge)
-    else:
-        width = float(short_edge)
-        height = float(short_edge) / aspect_ratio
-    area = width * height
-    if area > MINIMAX_H3_OUTPUT_MAX_PIXELS:
-        scale = (MINIMAX_H3_OUTPUT_MAX_PIXELS / area) ** 0.5
-        width *= scale
-        height *= scale
-    return (
-        _align_multiple(height, 32),
-        _align_multiple(width, 32),
-    )
 
 
 class _SingleRankEncoderGroup:
@@ -806,6 +760,7 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
+        self.load_text_encoder = od_config.model_loaded["text_encoder"]
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
             str(od_config.model),
@@ -815,6 +770,7 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
             od_config.revision,
             self.partition,
+            load_text_encoder=self.load_text_encoder,
         )
         model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
         model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
@@ -886,54 +842,62 @@ class MiniMaxH3Pipeline(
                 quant_config=transformer_quant_config,
             )
 
-        self.tokenizer = Qwen2TokenizerFast.from_pretrained(
-            str(model_path),
-            subfolder="tokenizer",
-            local_files_only=os.path.isdir(model_path),
-        )
-        self.processor = Qwen3VLProcessor.from_pretrained(
-            str(model_path),
-            subfolder="processor",
-            local_files_only=os.path.isdir(model_path),
-        )
+        if self.load_text_encoder:
+            self.tokenizer = Qwen2TokenizerFast.from_pretrained(
+                str(model_path),
+                subfolder="tokenizer",
+                local_files_only=os.path.isdir(model_path),
+            )
+            self.processor = Qwen3VLProcessor.from_pretrained(
+                str(model_path),
+                subfolder="processor",
+                local_files_only=os.path.isdir(model_path),
+            )
+        else:
+            self.tokenizer = None
+            self.processor = None
 
         _, rank, dit_world = _dit_rank_world()
         self._dit_rank = rank
-        text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1))
-        if text_encoder_tp_size < 1:
-            raise ValueError(f"text_encoder_tp_size must be >= 1, got {text_encoder_tp_size}")
-        if text_encoder_tp_size > dit_world:
-            raise ValueError(
-                f"text_encoder_tp_size must not exceed the DiT group size ({dit_world}), got {text_encoder_tp_size}"
-            )
-        # The Qwen3-VL text model uses 64 attention heads / 8 KV heads; the
-        # encoder shards them across the encoder TP ranks.
-        if 64 % text_encoder_tp_size or 8 % text_encoder_tp_size:
-            raise ValueError(
-                "text_encoder_tp_size must divide both Qwen3-VL "
-                f"num_attention_heads (64) and num_key_value_heads (8), "
-                f"got {text_encoder_tp_size}"
-            )
-        self.text_encoder_tp_size = text_encoder_tp_size
-        self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
-        load_text_encoder = rank < text_encoder_tp_size
-        self.text_encoder = MiniMaxH3Qwen3VLEncoder(
-            os.path.join(model_path, "text_encoder"),
-            device=self.device,
-            load_model=load_text_encoder,
-            encoder_group=self.text_encoder_group,
-            quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
-        )
-        if load_text_encoder:
-            self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=str(model_path),
-                    subfolder="text_encoder",
-                    revision=od_config.revision,
-                    prefix="text_encoder.",
-                    fall_back_to_pt=False,
+        if self.load_text_encoder:
+            text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1))
+            if text_encoder_tp_size < 1:
+                raise ValueError(f"text_encoder_tp_size must be >= 1, got {text_encoder_tp_size}")
+            if text_encoder_tp_size > dit_world:
+                raise ValueError(
+                    f"text_encoder_tp_size must not exceed the DiT group size ({dit_world}), got {text_encoder_tp_size}"
                 )
+            # The Qwen3-VL text model uses 64 attention heads / 8 KV heads.
+            if 64 % text_encoder_tp_size or 8 % text_encoder_tp_size:
+                raise ValueError(
+                    "text_encoder_tp_size must divide both Qwen3-VL "
+                    f"num_attention_heads (64) and num_key_value_heads (8), "
+                    f"got {text_encoder_tp_size}"
+                )
+            self.text_encoder_tp_size = text_encoder_tp_size
+            self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
+            self.text_encoder = MiniMaxH3Qwen3VLEncoder(
+                os.path.join(model_path, "text_encoder"),
+                device=self.device,
+                load_model=rank < text_encoder_tp_size,
+                encoder_group=self.text_encoder_group,
+                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
+            if rank < text_encoder_tp_size:
+                self.weights_sources.append(
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(model_path),
+                        subfolder="text_encoder",
+                        revision=od_config.revision,
+                        prefix="text_encoder.",
+                        fall_back_to_pt=False,
+                    )
+                )
+        else:
+            self.text_encoder_tp_size = 0
+            self.text_encoder_group = None
+            self.text_encoder = None
+            self._encoder_modules = []
         stage_components = bool(
             od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
         )
@@ -954,8 +918,12 @@ class MiniMaxH3Pipeline(
         self._dlo_component_cache = None
         if getattr(od_config, "enable_distributed_layerwise_offload", False):
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
-            for component in (self.text_encoder, self.video_vae, self.audio_vae):
-                component.set_omni_component_cache(self._dlo_component_cache)
+            _register_dlo_component_cache(
+                self._dlo_component_cache,
+                self.text_encoder,
+                self.video_vae,
+                self.audio_vae,
+            )
 
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
@@ -992,6 +960,8 @@ class MiniMaxH3Pipeline(
         # path as the DiT.
         for component_name in ("video_vae", "audio_vae"):
             component = getattr(self, component_name)
+            if component is None:
+                continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
         return loaded_with_prefix
 
@@ -1191,12 +1161,7 @@ class MiniMaxH3Pipeline(
                 if task == "fl2va":
                     if prepared_videos:
                         raise OmniClientError("fl2va does not accept video conditions")
-                    ids = minimax_h3_multi_image_presentation_ids(
-                        self.tokenizer,
-                        prompt=prompt,
-                        image_token_counts=image_token_counts,
-                    )
-                    tags = minimax_h3_multi_image_presentation_token_tags(
+                    ids, tags = minimax_h3_multi_image_presentation(
                         self.tokenizer,
                         prompt=prompt,
                         image_token_counts=image_token_counts,
@@ -1985,12 +1950,46 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 requires a non-empty prompt")
         return prompt, multi_modal_data
 
+    @staticmethod
+    def _extract_text_conditioning(raw_prompt: Any) -> MiniMaxH3TextConditioning | None:
+        if isinstance(raw_prompt, str):
+            return None
+        additional_information = raw_prompt.get("additional_information") or {}
+        text_encoder_output = additional_information.get("text_encoder_output")
+        if text_encoder_output is None:
+            return None
+        if not isinstance(text_encoder_output, Mapping):
+            raise OmniClientError("text_encoder_output must be a mapping")
+        try:
+            return MiniMaxH3TextConditioning.from_payload(text_encoder_output)
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
+
+    @staticmethod
+    def _extract_prepared_reference_videos(raw_prompt: Any) -> list[dict[str, Any]] | None:
+        if isinstance(raw_prompt, str):
+            return None
+        additional_information = raw_prompt.get("additional_information") or {}
+        meta = additional_information.get("meta") or {}
+        descriptor = meta.get(MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY)
+        if descriptor is None:
+            return None
+        if not isinstance(descriptor, str):
+            raise OmniClientError("MiniMax H3 prepared-reference-video descriptor must be a string")
+        try:
+            _, videos = deserialize_prepared_reference_videos(descriptor)
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
+        return videos
+
     def _prepare_request_inputs(
         self,
         *,
         prompt: str,
         multi_modal_data: dict[str, Any],
         sampling: Any,
+        text_conditioning: MiniMaxH3TextConditioning | None = None,
+        prepared_reference_videos: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Resolve the task and output shape, then run every request-level encode.
 
@@ -2083,12 +2082,20 @@ class MiniMaxH3Pipeline(
                 # before starting any subsequent collective.
                 prep_error: Exception | None = None
                 try:
-                    prepared_videos = self._prepare_reference_videos(
-                        raw_videos,
-                        target_frame_count=num_frames,
-                        workdir=workdir,
-                        start_time_seconds=extra.get("start_time_seconds"),
-                    )
+                    _, rank, _ = _dit_rank_world()
+                    if prepared_reference_videos is not None:
+                        if rank == 0:
+                            prepared_videos = _reuse_prepared_reference_videos(
+                                prepared_reference_videos,
+                                expected_count=video_count,
+                            )
+                    else:
+                        prepared_videos = self._prepare_reference_videos(
+                            raw_videos,
+                            target_frame_count=num_frames,
+                            workdir=workdir,
+                            start_time_seconds=extra.get("start_time_seconds"),
+                        )
                 except Exception as exc:
                     prep_error = exc
                 _broadcast_rank0_exception(prep_error)
@@ -2129,13 +2136,27 @@ class MiniMaxH3Pipeline(
                 audio_index += 1
                 condition_labels.append(("audio", audio_index))
 
-            text_embeddings, text_tags = self.encode_prompt(
-                task=task,
-                prompt=prompt,
-                images=prepared_images,
-                prepared_videos=prepared_videos,
-                condition_labels=condition_labels if task == "ref2va" else None,
-            )
+            if text_conditioning is not None:
+                text_embeddings = text_conditioning.hidden_states.to(
+                    device=self.device,
+                    dtype=torch.bfloat16,
+                )
+                text_tags = text_conditioning.token_tags.to(
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            elif getattr(self, "text_encoder", None) is not None:
+                text_embeddings, text_tags = self.encode_prompt(
+                    task=task,
+                    prompt=prompt,
+                    images=prepared_images,
+                    prepared_videos=prepared_videos,
+                    condition_labels=condition_labels if task == "ref2va" else None,
+                )
+            else:
+                raise OmniClientError(
+                    "MiniMax H3 diffusion stage requires text_encoder_output when text_encoder is not loaded"
+                )
 
             # ``prepared_videos`` is intentionally ``None`` on non-zero DiT
             # ranks; the distributed video encoder broadcasts the prepared
@@ -2264,11 +2285,14 @@ class MiniMaxH3Pipeline(
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")
-        prompt, multi_modal_data = self._extract_prompt(request.prompts[0])
+        raw_prompt = request.prompts[0]
+        prompt, multi_modal_data = self._extract_prompt(raw_prompt)
         context = self._prepare_request_inputs(
             prompt=prompt,
             multi_modal_data=multi_modal_data,
             sampling=request.sampling_params,
+            text_conditioning=self._extract_text_conditioning(raw_prompt),
+            prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
         )
         denoise_kwargs = self._denoise_kwargs(context)
         num_outputs = context["num_outputs"]
@@ -2357,6 +2381,8 @@ class MiniMaxH3Pipeline(
             prompt=prompt,
             multi_modal_data=multi_modal_data,
             sampling=state.sampling,
+            text_conditioning=self._extract_text_conditioning(state.prompt),
+            prepared_reference_videos=self._extract_prepared_reference_videos(state.prompt),
         )
         inputs = self._build_denoise_inputs(**self._denoise_kwargs(context))
 

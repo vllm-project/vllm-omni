@@ -19,6 +19,9 @@ import msgspec
 import numpy as np
 import torch
 
+REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
+
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 
@@ -98,6 +101,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     # reproducible, and the producing stage's SamplingParams do not travel
     # with the payload.
     audio_seed: int
+    token_role_ids: torch.Tensor
+    minimax_h3_prepared_reference_videos: str
 
 
 class OmniPayload(TypedDict, total=False):
@@ -200,6 +205,8 @@ class MetaStruct(_StructBase):
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
     audio_seed: int | None = None
+    token_role_ids: torch.Tensor | None = None
+    minimax_h3_prepared_reference_videos: str | None = None
 
 
 class OmniPayloadStruct(_StructBase):
