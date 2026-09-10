@@ -481,8 +481,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         )
 
     def _get_expected_parameter_names(self, model: nn.Module) -> set[str]:
-        """Return parameter names that should be covered by strict load checks."""
-        all_parameter_names = {name for name, _ in model.named_parameters()}
+        """Return parameter names that should be covered by strict load checks.
+
+        A parameter with an initialized checkpoint default can explicitly set
+        ``is_checkpoint_optional``. It is still loaded when present on disk.
+        """
+        all_parameter_names = {
+            name for name, param in model.named_parameters() if not getattr(param, "is_checkpoint_optional", False)
+        }
         sources = self._get_weight_sources(model)
 
         # Keep strict behavior if no source metadata exists.
@@ -961,6 +967,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # that have loaded weights tracking currently.
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
+            # Offline formats can require scales that older online loaders
+            # were allowed to synthesize. Do not apply that legacy tolerance
+            # to an explicitly required checkpoint tensor.
+            required_missing = {
+                name
+                for name, param in model.named_parameters()
+                if name in weights_not_loaded and getattr(param, "is_checkpoint_required", False)
+            }
+            if required_missing:
+                raise ValueError(f"Required weights were not initialized from checkpoint: {required_missing}")
             # NOTE: if the model is quantized, ignore not_loaded check for scale
             # weights. ModelOpt FP8 carries a per-tensor `weight_scale` and a
             # static activation `input_scale`, which the quant method may
