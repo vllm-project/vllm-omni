@@ -219,8 +219,6 @@ class LingBotSelfAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    # Direct-cache cursors change per block; exclude their mutation from Dynamo guards.
-    @torch.compiler.disable
     def _update_cache(
         self,
         cache: LingBotAttentionCache,
