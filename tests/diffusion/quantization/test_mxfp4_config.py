@@ -53,6 +53,7 @@ def test_runtime_algorithm_survives_offline_storage_rebuild(runtime_alg, seriali
     )
     assert resolved.is_checkpoint_mxfp4_serialized
     assert resolved.mxfp4_scale_alg == runtime_alg
+    assert resolved.w4a8_fallback_layers == resolved.w4a8_fallback_steps == []
 
 
 def test_mxfp4_config_from_config_defaults():
@@ -61,6 +62,7 @@ def test_mxfp4_config_from_config_defaults():
     cfg = DiffusionMXFP4Config.from_config({})
     assert cfg.is_checkpoint_mxfp4_serialized is False
     assert cfg.ignored_layers == []
+    assert cfg.w4a8_fallback_layers == []
 
 
 def test_mxfp4_config_from_config_serialized():
@@ -83,6 +85,25 @@ def test_mxfp4_config_requires_offline_smooth():
         DiffusionMXFP4Config.from_config({**values, "require_smooth_scale": "false"})
 
 
+@pytest.mark.parametrize("serialized", [False, True])
+def test_mxfp4_disk_smooth_requirement_preserves_step_policy(serialized):
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    active = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=serialized, w4a8_fallback_steps=[1])
+    resolved = resolve_quant_config_from_disk(
+        active,
+        {
+            "quant_method": "mxfp4",
+            "is_checkpoint_mxfp4_serialized": True,
+            "require_smooth_scale": True,
+        },
+    )
+    assert resolved.require_smooth_scale
+    assert resolved.is_checkpoint_mxfp4_serialized
+    assert resolved.w4a8_fallback_steps == [1]
+
+
 @pytest.mark.parametrize("disk_requirement", [None, False, True])
 def test_mxfp4_expert_rebuild_cannot_weaken_explicit_smooth_requirement(disk_requirement):
     from vllm_omni.quantization.factory import resolve_quant_config_from_disk
@@ -99,6 +120,25 @@ def test_mxfp4_expert_rebuild_cannot_weaken_explicit_smooth_requirement(disk_req
     resolved = resolve_quant_config_from_disk(active, disk)
     assert resolved.require_smooth_scale
     assert resolved.ignored_layers == disk["ignored_layers"]
+
+
+@pytest.mark.parametrize("disk_qc", ["mxfp4", {"quant_method": "mxfp4"}])
+def test_mxfp4_method_only_disk_config_preserves_caller_layer_policy(disk_qc):
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    active = DiffusionMXFP4Config(
+        ignored_layers=["blocks.0.attn2.to_q"],
+        w4a8_fallback_steps=[1],
+        w4a8_fallback_layers=["blocks.1.attn1.to_qkv"],
+    )
+
+    resolved = resolve_quant_config_from_disk(active, disk_qc)
+
+    assert resolved is active
+    assert resolved.ignored_layers == ["blocks.0.attn2.to_q"]
+    assert resolved.w4a8_fallback_steps == [1]
+    assert resolved.w4a8_fallback_layers == ["blocks.1.attn1.to_qkv"]
 
 
 def test_quantization_disk_string_rejects_mismatched_active_method():
@@ -137,6 +177,199 @@ def test_mxfp4_config_from_config_modules_to_not_convert_fallback():
 
     cfg = DiffusionMXFP4Config.from_config({"modules_to_not_convert": ["proj_out"]})
     assert cfg.ignored_layers == ["proj_out"]
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"w4a8_fallback_steps": [0]},
+        {"w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"]},
+        {"w4a8_fallback_steps": [1], "w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"]},
+    ],
+)
+def test_dualscale_rejects_w4a8_configuration(serialized, policy):
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4DualScaleMixedConfig
+
+    config = {"quant_method": "mxfp4_dualscale", "is_checkpoint_serialized": serialized, **policy}
+    with pytest.raises(ValueError, match="does not support W4A8"):
+        DiffusionMXFP4DualScaleMixedConfig(is_checkpoint_serialized=serialized, **policy)
+    with pytest.raises(ValueError, match="does not support W4A8"):
+        DiffusionMXFP4DualScaleMixedConfig.from_config(config)
+    with pytest.raises(ValueError, match="does not support W4A8"):
+        build_quant_config({"transformer": config})
+    with pytest.raises(ValueError, match="does not support W4A8"):
+        resolve_quant_config_from_disk(None, config)
+
+
+@pytest.mark.parametrize("method", ["mxfp4", "mxfp4_dualscale"])
+@pytest.mark.parametrize("steps", [[-1], [True], [1.5], ["2"], "0,2", (0, 2)])
+def test_mxfp4_rejects_invalid_fallback_steps(method, steps):
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        build_quant_config({"method": method, "w4a8_fallback_steps": steps})
+
+
+def test_mxfp4_fallback_steps_follow_request_context():
+    from vllm_omni.diffusion.forward_context import (
+        ForwardContext,
+        override_forward_context,
+        set_forward_context_denoise_step_idx,
+    )
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.mxfp4_config import _use_w4a8
+
+    steps = [2, 0, 2]
+    cfg = build_quant_config({"method": "mxfp4", "w4a8_fallback_steps": steps})
+    steps.append(1)
+    assert cfg.w4a8_fallback_steps == [0, 2]
+    with override_forward_context(None):
+        assert not _use_w4a8([])
+        with pytest.raises(RuntimeError, match="publishes its denoise step"):
+            _use_w4a8(cfg.w4a8_fallback_steps)
+        for _request in range(2):
+            with override_forward_context(ForwardContext()):
+                for step, expected in [(0, True), (1, False), (2, True), (3, False)]:
+                    set_forward_context_denoise_step_idx(step)
+                    # Both CFG passes and both experts read the same index.
+                    assert [_use_w4a8(cfg.w4a8_fallback_steps) for _cfg_pass in range(2)] == [expected, expected]
+        with pytest.raises(RuntimeError, match="publishes its denoise step"):
+            _use_w4a8(cfg.w4a8_fallback_steps)
+
+
+@pytest.mark.parametrize("method,flag", [("mxfp4", "is_checkpoint_mxfp4_serialized")])
+@pytest.mark.parametrize("steps", [[], [0, 2]])
+@pytest.mark.parametrize("already_serialized", [False, True])
+def test_mxfp4_disk_rebuild_preserves_runtime_fallback(method, flag, steps, already_serialized):
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    layers = ["blocks.10.attn1.to_qkv"] if steps else []
+    active = build_quant_config(
+        {
+            "method": method,
+            flag: already_serialized,
+            "w4a8_fallback_steps": steps,
+            "w4a8_fallback_layers": layers,
+        }
+    )
+    # Separate experts may have distinct high precision layers. Both must
+    # retain the requested step policy during online/offline reconciliation.
+    for ignored in [["blocks.0.attn1.to_q"], ["blocks.1.attn1.to_q"]]:
+        resolved = resolve_quant_config_from_disk(
+            active,
+            {
+                "quant_method": method,
+                flag: True,
+                "ignored_layers": ignored,
+                "w4a8_fallback_steps": [9],
+                "w4a8_fallback_layers": ["blocks.9.ffn.net_2"],
+            },
+        )
+        assert getattr(resolved, flag)
+        assert resolved.ignored_layers == ignored
+        assert resolved.w4a8_fallback_steps == steps
+        assert resolved.w4a8_fallback_layers == layers
+    assert active.ignored_layers == []
+
+
+@pytest.mark.parametrize(
+    "runtime_policy",
+    [{}, {"w4a8_fallback_steps": [1]}, {"w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"]}],
+)
+def test_mxfp4_explicit_omission_disables_saved_policies_for_both_experts(runtime_policy):
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    active = build_quant_config({"method": "mxfp4", **runtime_policy})
+    resolved_experts = []
+    for ignored in (["blocks.0.attn2.to_q"], ["blocks.1.ffn.net_2"]):
+        disk = {
+            "quant_method": "mxfp4",
+            "is_checkpoint_mxfp4_serialized": True,
+            "ignored_layers": ignored,
+            "w4a8_fallback_steps": [9],
+            "w4a8_fallback_layers": ["blocks.9.ffn.net_2"],
+        }
+        resolved = resolve_quant_config_from_disk(active, disk)
+        assert resolved.w4a8_fallback_steps == runtime_policy.get("w4a8_fallback_steps", [])
+        assert resolved.w4a8_fallback_layers == runtime_policy.get("w4a8_fallback_layers", [])
+        assert resolved.ignored_layers == ignored
+        detected = resolve_quant_config_from_disk(None, disk)
+        assert detected.w4a8_fallback_steps == [9]
+        assert detected.w4a8_fallback_layers == ["blocks.9.ffn.net_2"]
+        resolved_experts.append(resolved)
+    assert resolved_experts[0] is not resolved_experts[1]
+    assert active.is_checkpoint_mxfp4_serialized is False
+    assert active.ignored_layers == []
+
+
+@pytest.mark.parametrize(
+    "method,flag", [("mxfp4", "is_checkpoint_mxfp4_serialized"), ("mxfp4_dualscale", "is_checkpoint_serialized")]
+)
+def test_serialized_mxfp4_disk_omission_clears_active_ignored_layers(method, flag):
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    active_spec = {
+        "method": method,
+        flag: True,
+        "ignored_layers": ["blocks.0.attn2.to_q"],
+        "w4a8_fallback_steps": [1] if method == "mxfp4" else [],
+        "w4a8_fallback_layers": ["blocks.1.attn1.to_qkv"] if method == "mxfp4" else [],
+    }
+    if method == "mxfp4":
+        active_spec["require_smooth_scale"] = True
+    active = build_quant_config(active_spec)
+
+    resolved = resolve_quant_config_from_disk(active, {"quant_method": method, flag: True})
+
+    assert resolved is not active
+    assert resolved.ignored_layers == []
+    assert resolved.w4a8_fallback_steps == active.w4a8_fallback_steps
+    assert resolved.w4a8_fallback_layers == active.w4a8_fallback_layers
+    if method == "mxfp4":
+        assert resolved.require_smooth_scale
+
+
+@pytest.mark.parametrize(
+    "method,flag", [("mxfp4", "is_checkpoint_mxfp4_serialized"), ("mxfp4_dualscale", "is_checkpoint_serialized")]
+)
+@pytest.mark.parametrize("with_active", [False, True])
+def test_serialized_mxfp4_disk_uses_modules_to_not_convert(method, flag, with_active):
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    active = None
+    disk_steps = [9] if method == "mxfp4" else []
+    active_steps = [1] if method == "mxfp4" else []
+    expected_steps = disk_steps
+    if with_active:
+        active = build_quant_config(
+            {
+                "method": method,
+                flag: True,
+                "ignored_layers": ["blocks.0.attn2.to_q"],
+                "w4a8_fallback_steps": active_steps,
+            }
+        )
+        expected_steps = active_steps
+
+    resolved = resolve_quant_config_from_disk(
+        active,
+        {
+            "quant_method": method,
+            flag: True,
+            "modules_to_not_convert": ["blocks.2.ffn.net_2"],
+            "w4a8_fallback_steps": disk_steps,
+        },
+    )
+
+    assert resolved.ignored_layers == ["blocks.2.ffn.net_2"]
+    assert resolved.w4a8_fallback_steps == expected_steps
 
 
 # ---------------------------------------------------------------------------
@@ -676,16 +909,29 @@ def test_rocm_online_dispatch_returns_rocm_method(_rocm_platform, monkeypatch):
     assert isinstance(method, ROCmMxfp4OnlineLinearMethod)
 
 
-def test_rocm_ignored_layer_returns_unquantized(_rocm_platform, monkeypatch):
+@pytest.mark.parametrize("steps", [[], [0, 2]])
+def test_rocm_ignored_layer_returns_unquantized(_rocm_platform, monkeypatch, steps):
     """A prefix in ignored_layers must return UnquantizedLinearMethod before the gfx950 probe."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
     from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
 
     _patch_gcn_arch(monkeypatch, "gfx950:sramecc+:xnack-")
-    cfg = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=False, ignored_layers=["proj_out"])
+    cfg = DiffusionMXFP4Config(
+        is_checkpoint_mxfp4_serialized=False, ignored_layers=["proj_out"], w4a8_fallback_steps=steps
+    )
 
     assert isinstance(cfg.get_quant_method(_fake_linear_layer(), "proj_out"), UnquantizedLinearMethod)
+
+
+def test_rocm_rejects_w4a8_step_fallback(_rocm_platform, monkeypatch):
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    _patch_gcn_arch(monkeypatch, "gfx950:sramecc+:xnack-")
+    cfg = DiffusionMXFP4Config(w4a8_fallback_steps=[0, 2])
+
+    with pytest.raises(NotImplementedError, match="only supported on NPU"):
+        cfg.get_quant_method(_fake_linear_layer(), "blocks.0.attn1.to_q")
 
 
 def test_rocm_non_gfx950_raises(_rocm_platform, monkeypatch):
@@ -734,3 +980,221 @@ def test_rocm_create_weights_row_parallel_tp2(_rocm_platform):
     assert layer.weight.shape == (_TP2_N, _TP2_K // _TP2)
     assert layer.input_size_per_partition == _TP2_K // _TP2
     assert layer.output_size_per_partition == _TP2_N
+
+
+@pytest.mark.parametrize("method", ["mxfp4", "mxfp4_dualscale"])
+@pytest.mark.parametrize("layers", ["blocks.1.attn1.to_qkv", [1], [True], [""], [" a"], ["blocks.*"], ["a..b"]])
+def test_mxfp4_rejects_invalid_fallback_layers(method, layers):
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="exact runtime Linear paths"):
+        build_quant_config({"method": method, "w4a8_fallback_layers": layers})
+
+
+@pytest.mark.parametrize("method", ["mxfp4"])
+def test_mxfp4_layer_policy_from_checkpoint_and_component_config(method):
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.component_config import resolve_component_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    names = ["blocks.10.attn1.to_qkv", "blocks.10.attn1.to_qkv"]
+    components = build_quant_config(
+        {"transformer": {"method": method, "w4a8_fallback_layers": names}, "transformer_2": {"method": method}}
+    )
+    names.append("blocks.11.attn1.to_qkv")
+    assert resolve_component_quant_config(components, "transformer").w4a8_fallback_layers == [names[0]]
+    assert resolve_component_quant_config(components, "transformer_2").w4a8_fallback_layers == []
+    detected = resolve_quant_config_from_disk(None, {"quant_method": method, "w4a8_fallback_layers": [names[0]]})
+    assert detected.w4a8_fallback_layers == [names[0]]
+    assert type(detected).from_config({"w4a8_fallback_layers": [names[0]]}).w4a8_fallback_layers == [names[0]]
+
+
+@pytest.mark.parametrize(
+    "kind, serialized_flag",
+    [("mxfp4", "is_checkpoint_mxfp4_serialized")],
+)
+@pytest.mark.parametrize("offline", [False, True])
+@pytest.mark.parametrize("scale_alg", [0, 2])
+def test_mxfp4_layer_and_step_union_routes_actual_methods(
+    kind, serialized_flag, offline, scale_alg, monkeypatch, mocker
+):
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+    from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+    from vllm_omni.quantization import build_quant_config, mxfp4_config
+
+    monkeypatch.setattr(mxfp4_config.current_omni_platform, "is_npu", lambda: True)
+    selected = "blocks.10.attn1.to_qkv"
+    other = "blocks.11.attn2.to_q"
+    preserved = "blocks.12.ffn.net_2"
+    config = build_quant_config(
+        {
+            "method": kind,
+            "mxfp4_scale_alg": scale_alg,
+            serialized_flag: offline,
+            "w4a8_fallback_layers": [selected, preserved],
+            "ignored_layers": [preserved],
+            "w4a8_fallback_steps": [1],
+        }
+    )
+    # Real config dispatch creates separate methods for selected and other layers.
+    linear = mocker.Mock(spec=LinearBase)
+    assert isinstance(config.get_quant_method(linear, preserved), UnquantizedLinearMethod)
+    x = torch.ones(2, 64, dtype=torch.bfloat16)
+    layer = torch.nn.Module()
+    for name in ("weight", "weight_scale", "mul_scale"):
+        layer.register_buffer(name, torch.ones(64, dtype=x.dtype))
+    calls = []
+
+    def record_a8(*args):
+        calls.append("A8")
+        return x
+
+    def record_a4(*args):
+        calls.append("A4")
+        return x
+
+    monkeypatch.setattr(mxfp4_config, "_npu_w4a8_matmul", record_a8)
+    for name in (selected, other):
+        method = config.get_quant_method(linear, name)
+        assert method.w4a8_fallback_layer == (name == selected)
+        scales = (x, x)
+        monkeypatch.setattr(method, "_quantize_activation", lambda *args: scales)
+        monkeypatch.setattr(method, "_quant_matmul", record_a4)
+        for step in (0, 1, 2):
+            with override_forward_context(ForwardContext(denoise_step_idx=step)):
+                method.apply(layer, x)
+    assert calls == ["A8", "A8", "A8", "A4", "A8", "A4"]
+    # A permanently selected layer works without a request context, even if steps are also configured.
+    with override_forward_context(None):
+        config.get_quant_method(linear, selected).apply(layer, x)
+    assert calls[-1] == "A8"
+
+
+@pytest.mark.parametrize("online", [False, True])
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("scale_alg", [0, 2])
+def test_single_scale_prepares_one_weight_for_both_activation_precisions(online, selected, scale_alg, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+    from vllm_omni.quantization import mxfp4_config
+
+    monkeypatch.setattr(torch.Tensor, "npu", lambda self: self, raising=False)
+    prepared = []
+    packed = []
+
+    def quantize(x, **kwargs):
+        prepared.append(kwargs)
+        return x.to(torch.int8), torch.full((x.shape[0], 2), 127, dtype=torch.uint8)
+
+    def pack(x, dtype):
+        packed.append(x)
+        return x.to(dtype)
+
+    fake_npu = SimpleNamespace(
+        float4_e2m1fn_x2=torch.int8,
+        float8_e8m0fnu=torch.uint8,
+        float8_e4m3fn=torch.float8_e4m3fn,
+        npu_dtype_cast=pack,
+        npu_dynamic_mx_quant=quantize,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
+    config = mxfp4_config.DiffusionMXFP4Config(
+        is_checkpoint_mxfp4_serialized=not online,
+        w4a8_fallback_layers=["blocks.0.attn1.to_qkv"] if selected else [],
+        w4a8_fallback_steps=[1],
+        mxfp4_scale_alg=scale_alg,
+    )
+    cls = mxfp4_config.NPUMxfp4OnlineLinearMethod if online else mxfp4_config.NPUMxfp4LinearMethod
+    method = cls(config, prefix="blocks.0.attn1.to_qkv")
+    layer = torch.nn.Linear(64, 2, bias=False, dtype=torch.bfloat16)
+    layer.orig_dtype = torch.bfloat16
+    if not online:
+        layer.register_parameter("weight_scale", torch.nn.Parameter(torch.full((2, 2), 127, dtype=torch.uint8), False))
+        layer.register_parameter("mul_scale", torch.nn.Parameter(torch.linspace(0.5, 2, 64), False))
+    method.process_weights_after_loading(layer)
+    pointers = (layer.weight.data_ptr(), layer.weight_scale.data_ptr())
+    method.process_weights_after_loading(layer)
+    assert len(prepared) == int(online)
+    expected = dict(dst_type=torch.int8, axis=-1, block_size=32, round_mode="rint", scale_alg=scale_alg)
+    if scale_alg == 2:
+        expected["dst_type_max"] = 7.25
+    assert prepared == ([expected] if online else [])
+    assert len(packed) == int(not online)
+    branches = []
+
+    def a4(x_q, x_scale, target, bias, dtype):
+        assert (target.weight.data_ptr(), target.weight_scale.data_ptr()) == pointers
+        branches.append("A4")
+        return torch.zeros(x_q.shape[0], 2, dtype=dtype)
+
+    def a8(x, weight, scale, bias, dtype):
+        assert (weight.data_ptr(), scale.data_ptr()) == pointers
+        branches.append("A8")
+        return torch.zeros(x.shape[0], 2, dtype=dtype)
+
+    monkeypatch.setattr(method, "_quant_matmul", a4)
+    monkeypatch.setattr(mxfp4_config, "_npu_w4a8_matmul", a8)
+    monkeypatch.setattr(method, "_quantize_activation", lambda x: (x, x))
+    monkeypatch.setattr(fake_npu, "npu_dynamic_mx_quant", lambda *a, **kw: pytest.fail("weight requantization"))
+    monkeypatch.setattr(fake_npu, "npu_dtype_cast", lambda *a, **kw: pytest.fail("weight repacking"))
+    for step in (0, 1, 2):
+        with override_forward_context(ForwardContext(denoise_step_idx=step)):
+            method.apply(layer, torch.ones(2, 64, dtype=torch.bfloat16))
+    assert branches == (["A8"] * 3 if selected else ["A4", "A8", "A4"])
+    assert (layer.weight.data_ptr(), layer.weight_scale.data_ptr()) == pointers
+    assert set(layer.state_dict()) == (
+        {"weight", "weight_scale"} if online else {"weight", "weight_scale", "mul_scale"}
+    )
+    assert not hasattr(layer, "w4a8_weight")
+    assert not hasattr(layer, "w4a8_weight_scale")
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_dualscale_without_fallback_keeps_original_a4_path(online, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from vllm_omni.quantization import mxfp4_config
+
+    monkeypatch.setattr(torch.Tensor, "npu", lambda self: self, raising=False)
+    original_ones = torch.ones
+    monkeypatch.setattr(torch, "ones", lambda *args, **kw: original_ones(*args, **{**kw, "device": "cpu"}))
+    calls = []
+
+    def quantize_dual(x, **kw):
+        calls.append(kw.get("smooth_scale"))
+        return x.to(torch.int8), torch.ones(x.shape[0], 1), torch.ones(x.shape[0], 16, dtype=torch.uint8)
+
+    fake_npu = SimpleNamespace(
+        float4_e2m1fn_x2=torch.int8,
+        npu_dtype_cast=lambda x, dtype: x.to(dtype),
+        npu_format_cast=lambda x, *args, **kw: x,
+        npu_dynamic_dual_level_mx_quant=quantize_dual,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
+    config = mxfp4_config.DiffusionMXFP4DualScaleMixedConfig(
+        is_checkpoint_serialized=not online, w4a8_fallback_steps=[], w4a8_fallback_layers=[]
+    )
+    cls = mxfp4_config.NPUMxfp4DualScaleOnlineLinearMethod if online else mxfp4_config.NPUMxfp4DualScaleLinearMethod
+    method = cls(config)
+    layer = torch.nn.Module()
+    layer.input_size_per_partition = 512
+    for name, value in {
+        "weight": torch.ones(2, 512, dtype=torch.bfloat16),
+        "weight_scale": torch.full((2, 16), 127, dtype=torch.uint8),
+        "weight_dual_scale": torch.ones(2, 1, 1),
+        "mul_scale": torch.ones(512),
+    }.items():
+        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad=False))
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
+    assert len(calls) == int(online)
+    assert set(layer.state_dict()) == {"weight", "weight_scale", "weight_dual_scale", "mul_scale"}
+    assert not hasattr(layer, "w4a8_weight")
+    monkeypatch.setattr(method, "_quant_matmul", lambda *args: torch.zeros(2, 2, dtype=torch.bfloat16))
+    method.apply(layer, torch.ones(2, 512, dtype=torch.bfloat16))
+    assert len(calls) == 1 + int(online)
+    torch.testing.assert_close(calls[-1], layer.mul_scale)

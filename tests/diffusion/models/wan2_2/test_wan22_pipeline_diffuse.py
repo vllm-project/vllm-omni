@@ -18,6 +18,16 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.fixture(autouse=True)
+def _cpu_pipeline_runtime(monkeypatch):
+    # These lightweight pipelines have no accelerator or distributed groups.
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.current_omni_platform",
+        SimpleNamespace(is_available=lambda: False),
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.distributed.parallel_state._PP", SimpleNamespace(world_size=1))
+
+
 class _StubTransformer(nn.Module):
     @property
     def dtype(self) -> torch.dtype:
@@ -341,6 +351,100 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+@pytest.mark.parametrize("fail_first_request", [False, True])
+def test_runner_publishes_wan_step_context_across_requests(fail_first_request, monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.forward_context import (
+        ForwardContext,
+        get_forward_context,
+        is_forward_context_available,
+        override_forward_context,
+    )
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.quantization.mxfp4_config import _use_w4a8
+
+    contexts: list[ForwardContext] = []
+    events = []
+
+    class InjectedPredictionError(Exception):
+        pass
+
+    class RecordingTransformer(_StubTransformer):
+        def __init__(self, expert):
+            super().__init__()
+            self.expert = expert
+
+        def forward(self, hidden_states, encoder_hidden_states, **kwargs):
+            context = get_forward_context()
+            assert context is contexts[-1]
+            request_index = len(contexts) - 1
+            step = context.denoise_step_idx
+            positive = bool(encoder_hidden_states[0, 0, 0] > 0)
+            events.append((request_index, step, self.expert, positive, _use_w4a8([0, 2])))
+            if fail_first_request and request_index == 0 and step == 1 and not positive:
+                raise InjectedPredictionError
+            return (torch.ones_like(hidden_states) * (1 if positive else -1),)
+
+    def encode_prompt(**kwargs):
+        context = get_forward_context()
+        assert context.denoise_step_idx is None
+        contexts.append(context)
+        embeds = torch.ones(1, 8, 8)
+        return embeds, -embeds
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = RecordingTransformer("high")
+    pipeline.transformer_2 = RecordingTransformer("low")
+    pipeline.scheduler = _StubScheduler([900, 500, 100])
+    monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", lambda pred, t, latents, cfg: latents)
+
+    # Use the real runner context manager, Wan forward/diffuse, and CFG
+    # dispatch. Only model computation, scheduler math and unrelated KV I/O
+    # are replaced; no test code publishes a denoise step.
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.od_config = OmniDiffusionConfig(model="", dtype=torch.float32)
+    runner.vllm_config = None
+    runner.cache_backend = None
+    monkeypatch.setattr(runner, "_prepare_request_for_forward", lambda *args, **kwargs: None)
+    with override_forward_context(None):
+        for request_index in range(2):
+            request = OmniDiffusionRequest(
+                prompt="a fox walks",
+                request_id=f"request-{request_index}",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1, num_inference_steps=3, guidance_scale=2.0, output_type="latent"
+                ),
+            )
+
+            def execute():
+                return runner._execute_request_list(
+                    [request],
+                    od_config=runner.od_config,
+                    allow_single_output=True,
+                    require_request_batch_support=False,
+                    record_name="test_wan_step_context",
+                    record_output_peak_memory=False,
+                )
+
+            if fail_first_request and request_index == 0:
+                with pytest.raises(InjectedPredictionError):
+                    execute()
+            else:
+                execute()
+            assert not is_forward_context_available()
+
+    assert len(contexts) == 2 and contexts[0] is not contexts[1]
+    expected = [
+        (request, step, "high" if step == 0 else "low", positive, step in (0, 2))
+        for request in range(2)
+        for step in range(2 if fail_first_request and request == 0 else 3)
+        for positive in (True, False)
+    ]
+    assert events == expected
 
 
 class _StubDMDScheduler:

@@ -87,6 +87,42 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _validate_w4a8_fallback_steps(steps: list[int] | None) -> list[int]:
+    if steps is None:
+        return []
+    if not isinstance(steps, list) or any(type(step) is not int or step < 0 for step in steps):
+        raise ValueError("w4a8_fallback_steps must be a list of non-negative integer denoise step indices.")
+    return sorted(set(steps))
+
+
+def _validate_w4a8_fallback_layers(layers: list[str] | None) -> list[str]:
+    """Names are exact runtime Linear paths, not checkpoint aliases or patterns."""
+    if layers is None:
+        return []
+    if not isinstance(layers, list) or any(
+        not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_0-9]+)*", name) is None
+        for name in layers
+    ):
+        raise ValueError("w4a8_fallback_layers must be a list of non-empty exact runtime Linear paths.")
+    return sorted(set(layers))
+
+
+def _use_w4a8(steps: list[int]) -> bool:
+    """Read the request's zero-based denoise index; never keep state on a Linear."""
+    if not steps:
+        return False
+
+    from vllm_omni.diffusion.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    step = get_forward_context().denoise_step_idx if is_forward_context_available() else None
+    if step is None:
+        raise RuntimeError("W4A8 step fallback requires a pipeline that publishes its denoise step in ForwardContext.")
+    return step in steps
+
+
 def _validate_smooth_scale(scale: torch.Tensor) -> None:
     """Reject malformed calibration before loading or activation dtype conversion."""
     if scale.ndim != 1 or not scale.is_floating_point():
@@ -114,12 +150,16 @@ class DiffusionMXFP4Config(QuantizationConfig):
         self,
         is_checkpoint_mxfp4_serialized: bool = False,
         ignored_layers: list[str] | None = None,
+        w4a8_fallback_steps: list[int] | None = None,
         require_smooth_scale: bool = False,
+        w4a8_fallback_layers: list[str] | None = None,
         mxfp4_scale_alg: int = 0,
     ) -> None:
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers or []
+        self.w4a8_fallback_steps = _validate_w4a8_fallback_steps(w4a8_fallback_steps)
+        self.w4a8_fallback_layers = _validate_w4a8_fallback_layers(w4a8_fallback_layers)
         if not isinstance(require_smooth_scale, bool):
             raise ValueError("require_smooth_scale must be a boolean")
         if require_smooth_scale and not self.is_checkpoint_mxfp4_serialized:
@@ -158,6 +198,8 @@ class DiffusionMXFP4Config(QuantizationConfig):
         return cls(
             is_checkpoint_mxfp4_serialized=is_serialized,
             ignored_layers=ignored_layers,
+            w4a8_fallback_steps=config.get("w4a8_fallback_steps"),
+            w4a8_fallback_layers=config.get("w4a8_fallback_layers"),
             require_smooth_scale=config.get("require_smooth_scale", False),
             mxfp4_scale_alg=config.get("mxfp4_scale_alg", 0),
         )
@@ -176,11 +218,15 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_npu():
                 if self.is_checkpoint_mxfp4_serialized:
-                    return NPUMxfp4LinearMethod(self)
-                return NPUMxfp4OnlineLinearMethod(self)
+                    return NPUMxfp4LinearMethod(self, prefix=prefix)
+                return NPUMxfp4OnlineLinearMethod(self, prefix=prefix)
             if current_omni_platform.is_rocm():
                 if self.mxfp4_scale_alg != 0:
                     raise NotImplementedError("MXFP4 C7 quantization is currently only supported on NPU (Ascend).")
+                if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
+                    raise NotImplementedError(
+                        "MXFP4 W4A8 step/layer fallback is currently only supported on NPU (Ascend)."
+                    )
                 gcn_arch = torch.cuda.get_device_properties(torch.accelerator.current_device_index()).gcnArchName
                 if "gfx950" not in gcn_arch:
                     raise NotImplementedError(f"MXFP4 on ROCm requires gfx950 (MI355X). Detected: {gcn_arch}")
@@ -215,6 +261,38 @@ def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, 
     )
 
 
+def _npu_w4a8_matmul(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """MXFP8 activations with prepared single-scale MXFP4 weights (N, K)."""
+    import torch_npu
+
+    x_q, x_scale = torch_npu.npu_dynamic_mx_quant(
+        x, dst_type=torch_npu.float8_e4m3fn, axis=-1, block_size=32, round_mode="rint", scale_alg=0
+    )
+    # Use the BF16 output/bias pair supported by the mixed FP8/FP4 kernel
+    # in the target A5 runtime. Restore the caller's dtype afterwards.
+    if bias is not None:
+        bias = bias.to(torch.bfloat16).reshape(1, -1)
+    output = torch_npu.npu_quant_matmul(
+        x_q,
+        weight.transpose(0, 1),
+        weight_scale.transpose(0, 1),
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        x2_dtype=torch_npu.float4_e2m1fn_x2,
+        pertoken_scale=x_scale,
+        pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+        bias=bias,
+        output_dtype=torch.bfloat16,
+        group_sizes=[0, 0, 32],
+    )
+    return output.to(output_dtype)
+
+
 class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
     """NPU W4A4 MXFP4 offline linear method for pre-quantized checkpoints.
 
@@ -226,7 +304,8 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
     NPUMxfp4OnlineLinearMethod normalizes to the same layout so apply() is shared.
     """
 
-    def __init__(self, quant_config: DiffusionMXFP4Config) -> None:
+    def __init__(self, quant_config: DiffusionMXFP4Config, *, prefix: str = "") -> None:
+        self.w4a8_fallback_layer = prefix in quant_config.w4a8_fallback_layers
         self.quant_config = quant_config
         self.out_dtype = torch.get_default_dtype()
 
@@ -346,6 +425,10 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         # weights the same pre-scale must precede both A4 and A8 quantization.
         if (mul_scale := getattr(layer, "mul_scale", None)) is not None:
             x = x * mul_scale.to(x.dtype)
+        if self.w4a8_fallback_layer or _use_w4a8(self.quant_config.w4a8_fallback_steps):
+            return _npu_w4a8_matmul(
+                x, cast(torch.Tensor, layer.weight), cast(torch.Tensor, layer.weight_scale), bias, ori_dtype
+            )
         return super()._apply_inner(layer, x, bias, ori_dtype)
 
     def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -872,11 +955,20 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
         is_checkpoint_serialized: bool = False,
         ignored_layers: list[str] | None = None,
         num_bf16_fallback_layers: int = 5,
+        w4a8_fallback_steps: list[int] | None = None,
+        w4a8_fallback_layers: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.is_checkpoint_serialized = is_checkpoint_serialized
         self.ignored_layers = ignored_layers or []
         self.num_bf16_fallback_layers = num_bf16_fallback_layers
+        self.w4a8_fallback_steps = _validate_w4a8_fallback_steps(w4a8_fallback_steps)
+        self.w4a8_fallback_layers = _validate_w4a8_fallback_layers(w4a8_fallback_layers)
+        if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
+            raise ValueError(
+                "mxfp4_dualscale does not support W4A8 fallback. Use mxfp4 with single-scale weights; "
+                "changing a DualScale checkpoint's method name does not convert its storage format."
+            )
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -909,6 +1001,8 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
             is_checkpoint_serialized=is_serialized,
             ignored_layers=ignored_layers,
             num_bf16_fallback_layers=num_bf16_fallback_layers,
+            w4a8_fallback_steps=config.get("w4a8_fallback_steps"),
+            w4a8_fallback_layers=config.get("w4a8_fallback_layers"),
         )
 
     def get_quant_method(

@@ -168,11 +168,15 @@ def test_single_scale_smooth_uses_real_row_parallel_loader(rank):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("scale_alg", [0, 2])
-def test_single_scale_smooth_precedes_quantization_and_preserves_output(dtype, with_bias, scale_alg, monkeypatch):
-    fallback = False
-    config = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=True, mxfp4_scale_alg=scale_alg)
+def test_single_scale_smooth_precedes_quantization_and_preserves_output(
+    dtype, fallback, with_bias, scale_alg, monkeypatch
+):
+    config = DiffusionMXFP4Config(
+        is_checkpoint_mxfp4_serialized=True, w4a8_fallback_steps=[0], mxfp4_scale_alg=scale_alg
+    )
     method = NPUMxfp4LinearMethod(config)
     layer = _CheckpointLayer(method, dtype)
     weights = {

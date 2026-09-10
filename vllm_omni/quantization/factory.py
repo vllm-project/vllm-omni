@@ -526,6 +526,12 @@ def resolve_quant_config_from_disk(
     if isinstance(disk_qc, str):
         return quant_config
 
+    # Serialized checkpoint metadata owns storage and BF16 layer routing. The
+    # active config owns runtime step/layer policies, including explicit empty
+    # lists. Preserve them when each cascade transformer rebuilds from disk.
+    for policy in ("w4a8_fallback_steps", "w4a8_fallback_layers"):
+        if hasattr(quant_config, policy):
+            qc_kwargs[policy] = list(getattr(quant_config, policy))
     if hasattr(quant_config, "mxfp4_scale_alg"):
         # Runtime activation policy is independent of how offline W4 was made.
         qc_kwargs["mxfp4_scale_alg"] = quant_config.mxfp4_scale_alg
