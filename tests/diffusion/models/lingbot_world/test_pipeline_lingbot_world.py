@@ -441,9 +441,8 @@ def test_pipeline_respects_loader_managed_component_placement(offload_field: str
     assert getattr(pipeline.vae, "to_calls", []) == []
 
 
-def test_ar_diffusion_capability_uses_fixed_tp_local_lingbot_geometry() -> None:
+def test_ar_diffusion_capability_uses_transformer_local_head_geometry() -> None:
     module = _load_pipeline_module()
-    module.get_tensor_model_parallel_world_size = lambda: 1
     pipeline = _pipeline(module)
 
     spec = pipeline.ar_diffusion_kv_cache_spec()
@@ -635,11 +634,14 @@ def test_pure_ulysses_parallel_config_is_supported() -> None:
     assert pipeline.transformer is not None
 
 
-def test_non_ulysses_sequence_parallelism_is_rejected() -> None:
+@pytest.mark.parametrize("degree_field", ["ring_degree", "allgather_degree"])
+def test_non_ulysses_sequence_parallelism_is_rejected(degree_field) -> None:
     module = _load_pipeline_module()
     parallel_config = _od_config().parallel_config
     parallel_config.sequence_parallel_size = 2
-    parallel_config.ring_degree = 2
+    parallel_config.ulysses_degree = 2
+    # Isolate the degree checks from sequence_parallel_size != ulysses_degree.
+    setattr(parallel_config, degree_field, 2)
 
     with pytest.raises(NotImplementedError, match="pure Ulysses"):
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
@@ -2090,3 +2092,14 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert "from .pipeline import" in lingbot_init
     assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
     assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init
+
+
+@pytest.mark.parametrize("parallel_kwargs", [{"ulysses_degree": 2, "ring_degree": 2}, {"allgather_degree": 2}])
+def test_normalized_hybrid_and_allgather_configs_fail_before_loading(parallel_kwargs):
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    module = _load_pipeline_module()
+    config = DiffusionParallelConfig(**parallel_kwargs)
+    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
+    assert module._loader_state.prefetch_calls == []
