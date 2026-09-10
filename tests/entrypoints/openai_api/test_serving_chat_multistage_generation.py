@@ -62,7 +62,12 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine_prompt["prompt"] == "draw a robot"
     assert engine_prompt["modalities"] == ["img2img"]
     assert engine_prompt["negative_prompt"] == "blurry"
-    assert engine_prompt["mm_processor_kwargs"] == {"target_h": 768, "target_w": 1024, "vae_generator_seed": 0}
+    assert engine_prompt["mm_processor_kwargs"] == {
+        "target_h": 768,
+        "target_w": 1024,
+        "vae_generator_seed": 0,
+        "modalities": ["img2img"],
+    }
     assert engine_prompt["multi_modal_data"]["img2img"].size == (24, 24)
 
     assert len(sampling_params_list) == 3
@@ -92,6 +97,45 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_build_multistage_generation_inputs_keeps_image_edit_serving_generic(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(
+                stage_type="llm",
+                is_comprehension=True,
+                engine_args=SimpleNamespace(model_arch="HunyuanImage3ForCausalMM"),
+            ),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0, seed=11),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    reference_image = Image.new("RGB", (24, 24), color="green")
+    gen_params = OmniDiffusionSamplingParams(height=768, width=1024, seed=42)
+
+    engine_prompt, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="将背景更改为森林",
+        extra_body={},
+        reference_images=[reference_image],
+        gen_params=gen_params,
+        request_id="img-edit-request-1",
+    )
+
+    assert engine_prompt["prompt"] == "将背景更改为森林"
+    assert engine_prompt["modalities"] == ["img2img"]
+    assert engine_prompt["multi_modal_data"]["img2img"] is reference_image
+    assert engine_prompt["multi_modal_uuids"] == {"img2img": ["img-edit-request-1-img2img-0"]}
+    assert engine_prompt["mm_processor_kwargs"]["modalities"] == ["img2img"]
+    assert "use_system_prompt" not in engine_prompt
+    assert sampling_params_list[0].seed == 42
 
 
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):
