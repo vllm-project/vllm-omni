@@ -15,12 +15,12 @@ import unittest
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
 )
+from vllm_omni.outputs import SchedulingMetadataUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -106,9 +106,9 @@ class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
         requests = {"r1": req}
 
         # Only scheduling metadata is passed now (full payload stays in model runner)
-        request_metadata = {"r1": {"next_stage_prompt_len": 50}}
+        request_metadata = {"r1": SchedulingMetadataUpdate(resize_prompt_to=50)}
 
-        coord.update_request_metadata(requests, request_metadata, model_mode="ar")
+        coord.update_request_metadata(requests, request_metadata)
 
         # next_stage_prompt_len should update prompt_token_ids
         self.assertEqual(len(req.prompt_token_ids), 50)
@@ -127,13 +127,9 @@ class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
         req._output_token_ids = [99]
         requests = {"r1": req}
 
-        request_metadata = {
-            "r1": {
-                "code_predictor_codes": [10, 20, 30],
-            }
-        }
+        request_metadata = {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 20, 30))}
 
-        coord.update_request_metadata(requests, request_metadata, model_mode="generation")
+        coord.update_request_metadata(requests, request_metadata)
 
         self.assertEqual(req.prompt_token_ids, [10, 20, 30])
         self.assertEqual(req.num_prompt_tokens, 3)
@@ -142,7 +138,7 @@ class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req._output_token_ids, [])
         self.assertIsNone(req.additional_information)
 
-    def test_generation_mode_flattens_tensor_code_predictor_codes(self):
+    def test_typed_prompt_update_replaces_existing_prompt(self):
         coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
@@ -154,8 +150,7 @@ class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
 
         coord.update_request_metadata(
             requests,
-            {"r1": {"code_predictor_codes": torch.tensor([[1, 2, 3]], dtype=torch.long)}},
-            model_mode="generation",
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(1, 2, 3))},
         )
 
         self.assertEqual(req.prompt_token_ids, [1, 2, 3])
@@ -163,7 +158,7 @@ class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req._all_token_ids, [1, 2, 3])
         self.assertEqual(req._output_token_ids, [])
 
-    def test_generation_mode_flattens_nested_code_predictor_codes(self):
+    def test_typed_prompt_update_preserves_all_token_invariants(self):
         coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
@@ -175,8 +170,7 @@ class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
 
         coord.update_request_metadata(
             requests,
-            {"r1": {"code_predictor_codes": [[1, 2], [3, 4]]}},
-            model_mode="generation",
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(1, 2, 3, 4))},
         )
 
         self.assertEqual(req.prompt_token_ids, [1, 2, 3, 4])

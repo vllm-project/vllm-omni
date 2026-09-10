@@ -19,6 +19,11 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
     get_stage_connector_role,
 )
+from vllm_omni.outputs import SchedulingMetadataUpdate
+from vllm_omni.worker.scheduling_metadata_adapter import (
+    SchedulingMetadataAdapter,
+    resolve_scheduling_metadata_adapter,
+)
 
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
@@ -82,6 +87,7 @@ class _OmniConnectorRuntimeMixin:
     _kv_transfer_manager: Any
     _async_chunk: bool
     _model_mode: str
+    _scheduling_metadata_adapter: SchedulingMetadataAdapter
     _stage_id: int
     _next_stage_id: int
     _from_tp: int
@@ -109,7 +115,7 @@ class _OmniConnectorRuntimeMixin:
     _full_payload_pending_broadcast_req_ids: set[str]
     _async_chunk_updated_req_ids: set[str]
     _local_stage_payload_cache: dict[str, dict[str, Any]]
-    _local_request_metadata: dict[str, dict[str, Any]]
+    _local_request_metadata: dict[str, SchedulingMetadataUpdate]
     _chunk_stream_completed: set[str]
     _pending_full_payload_send: dict[str, tuple[Any, ...]]
     _kv_sent_req_ids: list[str]
@@ -158,6 +164,9 @@ class _OmniConnectorRuntimeMixin:
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
         self._model_mode: str = getattr(model_config, "worker_type", "ar")
+        self._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(
+            getattr(model_config, "scheduling_metadata_adapter", None)
+        )
         stage_id = getattr(model_config, "stage_id", 0)
         if isinstance(stage_id, str):
             stage_id = int(stage_id)
@@ -240,7 +249,7 @@ class _OmniConnectorRuntimeMixin:
         # ownership.
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
         # Lightweight scheduling metadata pending delivery to the Scheduler.
-        self._local_request_metadata: dict[str, dict[str, Any]] = {}
+        self._local_request_metadata: dict[str, SchedulingMetadataUpdate] = {}
 
         # -- persistent set of request IDs whose chunk stream is complete --
         # Prevents re-registration after the finish sentinel has been received.
