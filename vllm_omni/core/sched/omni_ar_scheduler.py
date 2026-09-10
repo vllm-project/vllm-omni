@@ -26,7 +26,12 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.pd_continuation import PD_PREFILL_KEY, prepend_initial_output
+from vllm_omni.engine.pd_continuation import (
+    PD_PREFILL_KEY,
+    PD_RNG_STATE_KEY,
+    needs_pd_rng_state,
+    prepend_initial_output,
+)
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     request_needs_downstream_stage,
@@ -776,6 +781,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request._output_token_ids.clear()
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    params = request.sampling_params
+                    if (
+                        params is not None
+                        and (params.extra_args or {}).get(PD_PREFILL_KEY)
+                        and needs_pd_rng_state(params)
+                    ):
+                        rng_state = (getattr(model_runner_output, "pd_rng_states", None) or {}).get(req_id)
+                        if not rng_state:
+                            raise RuntimeError("PD producer completed without RNG state")
+                        kv_transfer_params = {**(kv_transfer_params or {}), PD_RNG_STATE_KEY: rng_state}
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:

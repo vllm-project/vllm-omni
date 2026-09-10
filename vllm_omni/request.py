@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
-from vllm_omni.engine.pd_continuation import PDContinuation, validate_pd_sampling
+from vllm_omni.engine.pd_continuation import PDContinuation, needs_pd_rng_state, validate_pd_sampling
 
 
 class OmniRequest(Request):
@@ -65,6 +65,8 @@ class OmniRequest(Request):
         if pd_continuation is not None:
             pd_continuation.validate(self.prompt_token_ids)
             validate_pd_sampling(self.sampling_params)
+            if needs_pd_rng_state(self.sampling_params) and not pd_continuation.rng_state:
+                raise ValueError("PD random continuation is missing producer RNG state")
             if self.resumable or not (self.kv_transfer_params or {}).get("do_remote_prefill"):
                 raise ValueError("PD continuation requires a new remote-prefill consumer request")
             # Use the public API so all_token_ids, output_token_ids and block

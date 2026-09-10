@@ -2426,6 +2426,9 @@ class Orchestrator:
 
         # Preserve all metadata returned by the prefill-side connector.
         decode_kv_params.update(kv_prefill_params)
+        from vllm_omni.engine.pd_continuation import PD_RNG_STATE_KEY
+
+        decode_kv_params.pop(PD_RNG_STATE_KEY, None)
 
         # Ensure these flags are set correctly after any overlay.
         decode_kv_params["do_remote_prefill"] = True

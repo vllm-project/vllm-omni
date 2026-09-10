@@ -46,8 +46,8 @@ from vllm_ascend.worker.model_runner_v1 import graph_capture
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
-from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.engine.serialization import request_needs_downstream_stage
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
@@ -55,6 +55,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
+from vllm_omni.worker.pd_rng import capture_pd_rng_states
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 
@@ -1052,6 +1053,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             spec_decode_metadata,
         )
 
+        pd_rng_states = capture_pd_rng_states(
+            self.requests,
+            req_ids_output_copy,
+            valid_sampled_token_ids,
+            tp_group=get_tp_group,
+            async_scheduling=self.use_async_scheduling,
+        )
+
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 if not early_pp_padded_drafter:
@@ -1282,6 +1291,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             cudagraph_stats=cudagraph_stats,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
+        model_runner_output.pd_rng_states = pd_rng_states
         model_runner_output.routed_experts = routed_experts_lists
         model_runner_output.spec_token_ids = output_spec_token_ids
         with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):

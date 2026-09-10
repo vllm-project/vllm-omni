@@ -26,6 +26,7 @@ class OmniNewRequestData(NewRequestData):
     """
 
     initial_output_token_ids: list[int] = field(default_factory=list)
+    pd_rng_state: bytes | None = None
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict[str, object] | None = None
@@ -44,6 +45,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             initial_output_token_ids=initial_output_tokens(request),
+            pd_rng_state=getattr(getattr(request, "pd_continuation", None), "rng_state", None),
         )
 
     @classmethod
@@ -79,6 +81,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             initial_output_token_ids=initial_output_tokens(request),
+            pd_rng_state=getattr(getattr(request, "pd_continuation", None), "rng_state", None),
         )
 
 
