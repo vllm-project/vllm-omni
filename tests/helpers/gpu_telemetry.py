@@ -18,6 +18,7 @@ Env:
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess
@@ -28,6 +29,8 @@ from typing import Any
 
 ENV_INTERVAL = "DFX_PERF_GPU_TELEMETRY_INTERVAL"
 DEFAULT_INTERVAL_S = 2.0
+# Upper bound for one nvidia-smi call; stop() waits at least this long so no query outlives the case.
+QUERY_TIMEOUT_S = 10.0
 
 # utilization.gpu >= this counts as "the GPU was doing work" for the busy stats.
 BUSY_UTIL_PCT = 50
@@ -120,6 +123,7 @@ def summarize_samples(samples: list[GpuSample]) -> dict[str, Any]:
         busy = [r for r in rows if r.util_pct is not None and r.util_pct >= BUSY_UTIL_PCT]
         util_busy = [u for u in util if u >= BUSY_UTIL_PCT]
         sm_busy = [r.sm_mhz for r in busy if r.sm_mhz is not None]
+        mem_busy = [r.mem_mhz for r in busy if r.mem_mhz is not None]
         sm_max = next((r.sm_max_mhz for r in rows if r.sm_max_mhz), None)
         power = [r.power_w for r in rows if r.power_w is not None]
         temp = [r.temp_c for r in rows if r.temp_c is not None]
@@ -139,6 +143,7 @@ def summarize_samples(samples: list[GpuSample]) -> dict[str, Any]:
             "sm_mhz_busy": _stats(sm_busy) if sm_busy else None,
             "sm_max_mhz": sm_max,
             "sm_ratio_busy_min": (min(sm_busy) / sm_max) if sm_busy and sm_max else None,
+            "mem_mhz_busy": _stats(mem_busy) if mem_busy else None,
             "power_w_max": max(power) if power else None,
             "temp_c_max": max(temp) if temp else None,
             "throttle_reasons": reasons,
@@ -182,7 +187,7 @@ def interval_from_env(default: float = DEFAULT_INTERVAL_S) -> float:
     if raw is None or raw.strip() == "":
         return default
     value = _to_float(raw)
-    if value is None or value < 0:
+    if value is None or not math.isfinite(value) or value < 0:
         return default
     return value
 
@@ -209,7 +214,7 @@ class GpuTelemetrySampler:
     def _run_query(self, fields: str) -> str | None:
         cmd = ["nvidia-smi", *_visible_device_arg(), f"--query-gpu={fields}", "--format=csv,noheader,nounits"]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=QUERY_TIMEOUT_S)
         except (OSError, subprocess.SubprocessError):
             return None
         if proc.returncode != 0:
@@ -269,7 +274,8 @@ class GpuTelemetrySampler:
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=max(5.0, self.interval_s * 2))
+            # A query may be mid-flight; wait long enough for it to finish or time out.
+            self._thread.join(timeout=QUERY_TIMEOUT_S + self.interval_s + 1.0)
             self._thread = None
         self._ended_at = time.time()
 
@@ -299,6 +305,7 @@ __all__ = [
     "ENV_INTERVAL",
     "GpuSample",
     "GpuTelemetrySampler",
+    "QUERY_TIMEOUT_S",
     "decode_throttle_reasons",
     "format_summary_line",
     "interval_from_env",

@@ -65,13 +65,14 @@ def test_summarize_samples_busy_only_for_clocks():
     assert g["sm_ratio_busy_min"] == pytest.approx(1755 / 1980)
     assert g["util_pct"]["min"] == 5.0 and g["util_pct"]["max"] == 95.0
     assert g["util_pct_busy_mean"] == pytest.approx((95 + 90 + 60) / 3)
+    assert g["mem_mhz_busy"] == {"min": 2619.0, "mean": 2619.0, "max": 2619.0}
     assert g["throttle_reasons"] == {"sw_power_cap": 1}
 
 
 def test_summarize_samples_multi_gpu_and_empty():
     out = summarize_samples([_s(index=0), _s(index=1, util=10)])
     assert set(out) == {"0", "1"}
-    assert out["1"]["busy_samples"] == 0 and out["1"]["sm_mhz_busy"] is None
+    assert out["1"]["busy_samples"] == 0 and out["1"]["sm_mhz_busy"] is None and out["1"]["mem_mhz_busy"] is None
     assert summarize_samples([]) == {}
 
 
@@ -92,6 +93,9 @@ def test_interval_from_env(monkeypatch):
     assert interval_from_env() == 0.0
     monkeypatch.setenv(gt.ENV_INTERVAL, "garbage")
     assert interval_from_env() == gt.DEFAULT_INTERVAL_S
+    for bad in ("nan", "inf", "-inf", "-1"):
+        monkeypatch.setenv(gt.ENV_INTERVAL, bad)
+        assert interval_from_env() == gt.DEFAULT_INTERVAL_S
 
 
 def test_sampler_disabled_by_env(monkeypatch):
