@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Merge W4A4_MXFP4_DUALSCALE quantized Wan2.2 weights into HF Diffusers format.
 
 msModelSlim produces a checkpoint where each linear layer is either:
@@ -31,12 +32,10 @@ stacked_params_mapping. This script keeps Q/K/V keys separate — do NOT pre-fus
 
 For mul_scale specifically: even though Q/K/V process the same input (same mul_scale value),
 they are kept separate. load_weights() routes all three to the same to_qkv.mul_scale parameter
-and each overwrites the previous. Since Q=K=V for mul_scale, the final value is correct.
+and verifies Q=K=V before accepting the shared Smooth tensor.
 
-NOTE: Pre-fusing as to_qkv.mul_scale would BREAK loading because ".attn1.to_q" is a
-substring of ".attn1.to_qkv", causing load_weights() stacked_params_mapping to produce a
-garbage key ("to_qkvkv") that is not in params_dict, triggering a break that skips the
-direct-load else branch entirely.
+NOTE: The Wan loader also accepts pre-fused to_qkv tensors and checks complete
+Q/K/V shards for split weights. This script retains the original split layout.
 
 Supported model types:
   - Wan2.2-T2V-A14B  (MoE cascade: transformer + transformer_2)
