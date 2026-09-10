@@ -79,6 +79,7 @@ def _checkpoint_od_config(
     if policy is not None:
         disk_quant_config["runtime"] = {"diffusion_step_policy": policy}
     return SimpleNamespace(
+        quantization_config=quant_config,
         tf_model_config=SimpleNamespace(
             params={"quantization_config": disk_quant_config},
             quant_config=quant_config,
@@ -334,6 +335,67 @@ def test_additional_config_overrides_and_disables_checkpoint_policy() -> None:
 
     checkpoint.additional_config = {"cosmos3_mixed_precision": {"enabled": False}}
     assert resolve_mixed_precision_config(checkpoint) == (None, "additional_config_disabled")
+
+
+@pytest.mark.parametrize("name", ["modelopt", "modelopt_fp4"])
+def test_additional_config_supports_serialized_modelopt_formats_without_checkpoint_policy(name: str) -> None:
+    od_config = _checkpoint_od_config(
+        _fake_quant_config(name),
+        additional_config={"cosmos3_mixed_precision": {}},
+    )
+    assert resolve_mixed_precision_config(od_config) == (Cosmos3MixedPrecisionConfig(), "additional_config")
+
+
+@pytest.mark.parametrize("has_checkpoint_policy", [False, True])
+@pytest.mark.parametrize(
+    ("name", "serialized"),
+    [
+        ("modelopt_mixed", True),
+        ("mxfp8", True),
+        ("compressed-tensors", True),
+        ("modelopt", False),
+        ("modelopt_fp4", False),
+    ],
+)
+def test_additional_config_rejects_incompatible_quantization(
+    name: str, serialized: bool, has_checkpoint_policy: bool
+) -> None:
+    od_config = _checkpoint_od_config(
+        _fake_quant_config(name, serialized=serialized),
+        policy=_policy() if has_checkpoint_policy else None,
+        additional_config={"cosmos3_mixed_precision": {}},
+    )
+    with pytest.raises(ValueError, match="serialized ModelOpt"):
+        resolve_mixed_precision_config(od_config)
+
+
+@pytest.mark.parametrize("additional_config", [None, {"cosmos3_mixed_precision": {}}])
+def test_policy_validates_effective_quantization_config(additional_config: dict[str, object] | None) -> None:
+    od_config = _checkpoint_od_config(
+        _fake_quant_config("modelopt"),
+        policy=_policy(),
+        additional_config=additional_config,
+    )
+    od_config.quantization_config = _fake_quant_config("modelopt_mixed")
+    with pytest.raises(ValueError, match="serialized ModelOpt FP8 or NVFP4"):
+        resolve_mixed_precision_config(od_config)
+
+
+def test_additional_config_rejects_missing_quantization_config() -> None:
+    od_config = SimpleNamespace(additional_config={"cosmos3_mixed_precision": {}})
+    with pytest.raises(ValueError, match="serialized ModelOpt FP8 or NVFP4"):
+        resolve_mixed_precision_config(od_config)
+
+
+@pytest.mark.parametrize("policy", [_policy(), True])
+def test_additional_config_disable_bypasses_incompatible_checkpoint(policy: object) -> None:
+    od_config = _checkpoint_od_config(
+        _fake_quant_config("modelopt_mixed"),
+        policy=policy,
+        additional_config={"cosmos3_mixed_precision": {"enabled": False}},
+    )
+    od_config.quantization_config = _fake_quant_config("modelopt_mixed")
+    assert resolve_mixed_precision_config(od_config) == (None, "additional_config_disabled")
 
 
 def test_runtime_allows_standard_offload_and_rejects_distributed(monkeypatch) -> None:

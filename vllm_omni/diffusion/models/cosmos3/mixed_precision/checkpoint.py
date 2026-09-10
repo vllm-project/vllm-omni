@@ -48,6 +48,8 @@ def resolve_mixed_precision_config(
         getattr(od_config, "additional_config", None)
     )
     if override_present:
+        if override is not None:
+            _validate_checkpoint_quantization(od_config)
         source: PolicySource = "additional_config" if override is not None else "additional_config_disabled"
         return override, source
 
@@ -87,7 +89,7 @@ def read_checkpoint_policy(od_config: object) -> Cosmos3MixedPrecisionConfig | N
     policy = _parse_policy(raw_policy)
     if policy is None:
         return None
-    _validate_checkpoint_quantization(getattr(tf_config, "quant_config", None))
+    _validate_checkpoint_quantization(od_config)
     return policy
 
 
@@ -147,7 +149,13 @@ def _parse_step_range(value: object, name: str) -> int:
     return _non_negative_int(value["count"], f"diffusion_step_policy.{name}.count")
 
 
-def _validate_checkpoint_quantization(quant_config: object | None) -> None:
+def _validate_checkpoint_quantization(od_config: object) -> None:
+    # Match the effective quantization used to construct the transformer linears.
+    quant_config = getattr(od_config, "quantization_config", None)
+    if quant_config is None:
+        tf_config = getattr(od_config, "tf_model_config", None)
+        quant_config = getattr(tf_config, "quant_config", None)
+
     get_name = getattr(quant_config, "get_name", None)
     name = get_name() if callable(get_name) else None
     if name not in _SUPPORTED_MODEL_OPT_CONFIGS:
