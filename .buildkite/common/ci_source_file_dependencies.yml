@@ -29,6 +29,7 @@ x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/model_executor/models/cosyvoice3/utils.py
   - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
   - vllm_omni/deploy/minicpmo_4_5.yaml
+  - vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja
 
 x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/deploy/minicpmo_4_5_duplex.yaml

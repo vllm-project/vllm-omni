@@ -24,6 +24,9 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
+_NATIVE_CHAT_TEMPLATE = (
+    Path(__file__).resolve().parents[3] / "vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja"
+)
 _CI_DEPLOY = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5.yaml"),
     updates={
@@ -63,7 +66,14 @@ test_params = [
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=False,
-            server_args=["--trust-remote-code", "--async-chunk"],
+            server_args=[
+                "--trust-remote-code",
+                "--async-chunk",
+                "--chat-template",
+                str(_NATIVE_CHAT_TEMPLATE),
+                "--chat-template-content-format",
+                "openai",
+            ],
             env_dict={
                 "VLLM_CONFIGURE_LOGGING": "1",
                 "VLLM_LOGGING_CONFIG_PATH": str(_PROMPT_LOGGING_CONFIG_PATH),
@@ -265,11 +275,18 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=True
     """
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        image_data_url=image_data_url,
-        content_text=get_prompt("text_image"),
-    )
+    # Match the native image-chat layout explicitly; do not rely on the
+    # renderer moving media placeholders ahead of text.
+    messages = [
+        get_system_prompt(),
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+                {"type": "text", "text": get_prompt("text_image")},
+            ],
+        },
+    ]
 
     request_config = {
         "model": omni_server.model,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Tests for code predictor dtype alignment (fix for #2385).
 
@@ -20,6 +20,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from pytest_mock import MockerFixture
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeTalkerCodePredictorConfig,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -41,6 +44,7 @@ _COMMON = os.path.join(_MODELS, "common")
 def _load_module(name: str, filename: str):
     path = os.path.abspath(os.path.join(_BASE, filename))
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod  # register before exec (needed for dataclasses etc.)
     spec.loader.exec_module(mod)
@@ -83,7 +87,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     vllm_parallel_mock = mocker.MagicMock()
     vllm_parallel_mock.VocabParallelEmbedding = torch.nn.Embedding
     custom_op_mock = types.ModuleType("vllm_omni.diffusion.layers.custom_op")
-    custom_op_mock.CustomOp = NativeCustomOp
+    setattr(custom_op_mock, "CustomOp", NativeCustomOp)
 
     return {
         "vllm_omni": mocker.MagicMock(),
@@ -119,6 +123,7 @@ def _load_target_classes(mocker: MockerFixture):
     common_spec = importlib.util.spec_from_file_location(
         "vllm_omni.model_executor.models.common.qwen3_code_predictor", common_cp_path
     )
+    assert common_spec is not None and common_spec.loader is not None
     common_cp_mod = importlib.util.module_from_spec(common_spec)
     sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"] = common_cp_mod
     common_spec.loader.exec_module(common_cp_mod)
@@ -207,6 +212,80 @@ def test_npu_custom_ops_use_fused_norm_and_cached_rope(mocker: MockerFixture, lo
     cos, sin = rotary.forward_npu(hidden_states, position_ids)
     torch.testing.assert_close(cos, rotary.cos_cached[position_ids].to(torch.float16))
     torch.testing.assert_close(sin, rotary.sin_cached[position_ids].to(torch.float16))
+
+
+@pytest.mark.parametrize(
+    ("rope_kwargs", "expected_theta"),
+    [
+        pytest.param(
+            {"rope_theta": 1_000_000.0},
+            1_000_000.0,
+            id="serialized_checkpoint",
+        ),
+        pytest.param(
+            {
+                "rope_theta": 10_000.0,
+                "rope_parameters": {"rope_type": "default", "rope_theta": 1_000_000.0},
+            },
+            1_000_000.0,
+            id="nested_precedence",
+        ),
+        pytest.param({}, 10_000.0, id="default"),
+    ],
+)
+def test_code_predictor_rotary_uses_qwen3_omni_rope_parameters(
+    loaded_target_classes,
+    rope_kwargs,
+    expected_theta,
+) -> None:
+    """Follow Transformers 5 deserialization and precedence for Qwen3-Omni."""
+    _ = loaded_target_classes
+    config = Qwen3OmniMoeTalkerCodePredictorConfig(
+        hidden_size=16,
+        num_attention_heads=1,
+        head_dim=16,
+        num_code_groups=16,
+        **rope_kwargs,
+    )
+    assert not hasattr(config, "rope_theta")
+    assert config.rope_parameters["rope_theta"] == expected_theta
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+
+    rotary = common_mod._RotaryEmbedding(config)
+
+    expected = 1.0 / (expected_theta ** (torch.arange(0, 16, 2, dtype=torch.float32) / 16))
+    torch.testing.assert_close(rotary.inv_freq, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("theta", [10_000.0, 1_000_000.0])
+@pytest.mark.parametrize(
+    "legacy_top_level_only",
+    [False, True],
+    ids=["normalized", "legacy_top_level"],
+)
+def test_code_predictor_rotary_preserves_qwen3_tts_rope_theta(
+    loaded_target_classes,
+    theta,
+    legacy_top_level_only,
+) -> None:
+    """Keep the shared predictor compatible with current and legacy Qwen3-TTS."""
+    config_class = loaded_target_classes[0]
+    config = config_class(
+        hidden_size=16,
+        num_attention_heads=1,
+        head_dim=16,
+        num_code_groups=16,
+        rope_theta=theta,
+    )
+    assert config.rope_parameters["rope_theta"] == theta
+    if legacy_top_level_only:
+        delattr(config, "rope_parameters")
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+
+    rotary = common_mod._RotaryEmbedding(config)
+
+    expected = 1.0 / (theta ** (torch.arange(0, 16, 2, dtype=torch.float32) / 16))
+    torch.testing.assert_close(rotary.inv_freq, expected, rtol=0, atol=0)
 
 
 class TestCodePredictorDtypeAlignment:
