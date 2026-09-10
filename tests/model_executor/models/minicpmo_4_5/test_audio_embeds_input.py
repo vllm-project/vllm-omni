@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the MiniCPM-o 4.5 ``audio_embeds`` input path.
 
 Two defects made the OpenAI ``audio_embeds`` content part unusable with this model:
@@ -70,6 +70,12 @@ class _IdentityTokenizer:
 
     def decode(self, tokens: str) -> str:
         return tokens
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        # vLLM 0.29 prompt updates select placeholder positions by token id,
+        # so the processor resolves ``<unk>`` once; the value is irrelevant here.
+        assert token == "<unk>"
+        return 0
 
 
 def _processing_info() -> MiniCPMO45OmniLLMProcessingInfo:

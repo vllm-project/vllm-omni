@@ -215,6 +215,16 @@ def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_s
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
+@pytest.mark.parametrize("disabled", [True, False])
+def test_frontend_log_stats_flag_is_not_an_unowned_stage_argument(disabled):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    config = _from_pipeline_key("dots_tts", cli_overrides={"disable_log_stats": disabled})
+    assert config.stage_configs
+    engine_args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
+    assert "disable_log_stats" not in engine_args
+
+
 def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime_bridge():
     omni_config = _from_pipeline_key(
         "qwen3_tts",

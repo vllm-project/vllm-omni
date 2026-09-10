@@ -339,6 +339,7 @@ class OmniBase(PDDisaggregationMixin):
         allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
         """Resolve request parameters; pipeline sampling constraints override caller values."""
+        normalized: Sequence[Any]
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
             # Set the output kind to delta since no params were specified
@@ -354,7 +355,9 @@ class OmniBase(PDDisaggregationMixin):
         if len(normalized) != self.num_stages:
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
 
-        if sampling_params_list is not None:
+        # Streaming coercion may also change a constrained output kind in
+        # the defaults (for example, an internal TTS stage's FINAL_ONLY).
+        if sampling_params_list is not None or allow_delta_coercion:
             normalized = [
                 self._apply_sampling_constraints(params, constraints)
                 for params, constraints in zip(normalized, self.sampling_constraints_list, strict=True)
@@ -364,7 +367,7 @@ class OmniBase(PDDisaggregationMixin):
     @staticmethod
     def _get_sampling_constraints_list(stage_configs: Sequence[Any]) -> list[dict[str, Any]]:
         """Extract each stage's required sampling settings from runtime configs."""
-        constraints_list = []
+        constraints_list: list[dict[str, Any]] = []
         for stage_config in stage_configs:
             constraints = getattr(stage_config, "sampling_constraints", {})
             if not isinstance(constraints, Mapping):
@@ -398,7 +401,7 @@ class OmniBase(PDDisaggregationMixin):
         req_state = self.request_states.get(request_id)
         prom = getattr(self, "prom_metrics", None)
         metrics = getattr(req_state, "metrics", None)
-        if metrics is None or prom is None:
+        if req_state is None or metrics is None or prom is None:
             return
         if str(request_id) in metrics.e2e_done or getattr(req_state, "failure_recorded", False):
             return

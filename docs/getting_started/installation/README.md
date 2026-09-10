@@ -1,7 +1,7 @@
 # Installation
 
 !!! important
-    vLLM-Omni is released against the matching upstream vLLM major/minor version. vLLM-Omni 0.28.x requires vLLM 0.28.x; the stable v0.28.0 instructions pin vLLM 0.28.0.
+    vLLM-Omni is released against the matching upstream vLLM major/minor version. The 0.29 development line requires vLLM 0.29.x; the source-install instructions pin vLLM 0.29.0. Published vLLM-Omni 0.28.0 wheels and images still require vLLM 0.28.x.
 
 vLLM-Omni supports the following hardware platforms:
 
