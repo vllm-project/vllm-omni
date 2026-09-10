@@ -1,7 +1,6 @@
-# HunyuanImage-3.0-Instruct phase-1 PD deploy:
+# HunyuanImage-3.0-Instruct single-host 1P1D deploy:
 # AR-Prefill (stage 0) -> AR-Decode (stage 1) -> DiT (stage 2).
-# The orchestrator currently forwards connector metadata even when it omits
-# remote_request_id; restore strict validation after the connector contract is fixed.
+# P -> D uses MooncakeConnector; D -> DiT uses shared memory on this host.
 pipeline: hunyuan_image3_pd
 async_chunk: false
 trust_remote_code: true
@@ -73,7 +72,7 @@ stages:
     omni_kv_config:
       need_send_cache: true
     output_connectors:
-      to_stage_2: rdma_connector
+      to_stage_2: shared_memory_connector
     default_sampling_params:
       temperature: 0.0
       seed: 42
@@ -99,7 +98,7 @@ stages:
       tensor_parallel_size: 2
       enable_expert_parallel: true
     input_connectors:
-      from_stage_1: rdma_connector
+      from_stage_1: shared_memory_connector
     default_sampling_params:
       num_inference_steps: 50
       guidance_scale: 0
