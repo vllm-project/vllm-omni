@@ -184,6 +184,19 @@ def _bagel_effective_image_size(
     return min(resized_height, max_image_size), min(resized_width, max_image_size)
 
 
+def _bagel_canvas_requested(sampling: OmniDiffusionSamplingParams) -> bool:
+    """Whether the caller asked for a specific output canvas.
+
+    A non-None ``height``/``width`` is not enough to conclude that: ``size=auto``
+    resolves to the source image's dimensions in the API layer, so over HTTP the
+    fields are populated either way.
+    """
+
+    return (sampling.height is not None and not getattr(sampling, "height_not_provided", False)) or (
+        sampling.width is not None and not getattr(sampling, "width_not_provided", False)
+    )
+
+
 def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
     """Resolve BAGEL execution mode and step-batch compatibility."""
 
@@ -198,7 +211,7 @@ def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
         image_shape = kv_metadata.get("image_shape")
         if image_shape is not None:
             sampling.height, sampling.width = (int(value) for value in image_shape)
-        elif isinstance(request.prompt, dict):
+        elif isinstance(request.prompt, dict) and not _bagel_canvas_requested(sampling):
             modalities = request.prompt.get("modalities") or []
             multi_modal_data = request.prompt.get("multi_modal_data") or {}
             image_input = multi_modal_data.get("img2img")
@@ -523,7 +536,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 f"latent_downsample={self.bagel.latent_downsample})."
             )
         image_shape = (height, width)
-        image_shape_requested = sampling.height is not None or sampling.width is not None
+        image_shape_requested = _bagel_canvas_requested(sampling)
 
         extra_args = getattr(sampling, "extra_args", {}) or {}
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)

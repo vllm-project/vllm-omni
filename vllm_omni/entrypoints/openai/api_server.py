@@ -2415,6 +2415,10 @@ async def edit_images(
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
+        # size="auto" still fills width/height in from the source image, so downstream
+        # cannot tell a requested canvas from a derived one without these.
+        gen_params.width_not_provided = size_was_auto
+        gen_params.height_not_provided = size_was_auto
 
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
