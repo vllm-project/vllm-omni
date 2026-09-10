@@ -483,7 +483,7 @@ class LingBotCrossAttention(nn.Module):
         if self.ulysses_world_size == 1:
             return value
         start = self.ulysses_rank * self.num_sp_heads
-        return value[:, :, start : start + self.num_sp_heads]
+        return value[:, :, start : start + self.num_sp_heads].clone(memory_format=torch.contiguous_format)
 
     def forward(
         self,
