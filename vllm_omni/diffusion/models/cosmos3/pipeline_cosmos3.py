@@ -1822,6 +1822,16 @@ class Cosmos3OmniDiffusersPipeline(
     def num_timesteps(self):
         return self._num_timesteps
 
+    def _set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+        setter = getattr(self.transformer, "set_mixed_precision_step", None)
+        if setter is not None:
+            setter(step_index, num_steps)
+
+    def _reset_mixed_precision(self) -> None:
+        resetter = getattr(self.transformer, "reset_mixed_precision", None)
+        if resetter is not None:
+            resetter()
+
     @staticmethod
     def _distilled_unsupported_error(detail: str) -> ValueError:
         return ValueError(
@@ -2819,7 +2829,8 @@ class Cosmos3OmniDiffusersPipeline(
                 # Each CFG-parallel rank runs exactly one branch (rank 0 -> cond,
                 # else uncond), so session keying loads/stores only this rank's branch.
                 cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     # Outside the interval, scale=1 makes the combined output equal
                     # the cond branch. Every rank remains on the same iteration and
@@ -2858,7 +2869,8 @@ class Cosmos3OmniDiffusersPipeline(
                 uncond_cache: tuple = (None, None)
                 keep_uncond_for_cache = self._cache_requires_paired_cfg()
 
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     cfg_active = _cfg_active_at(t)
 
@@ -2912,7 +2924,8 @@ class Cosmos3OmniDiffusersPipeline(
             else:
                 # No CFG: a single cond branch per step. Bespoke (state None) keeps
                 # using the transformer-instance cache exactly as before.
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     self._kv_load_und(kv_state, is_negative=False)
                     noise_pred = self.transformer(
@@ -2928,6 +2941,7 @@ class Cosmos3OmniDiffusersPipeline(
                         self._kv_capture_und(kv_state, is_negative=False)
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
         finally:
+            self._reset_mixed_precision()
             # Cosmos3 currently receives a unique request_id rather than a
             # reusable rollout session id. Retaining its state would only pin
             # K/V buffers on device after this generation finishes.
@@ -3112,7 +3126,8 @@ class Cosmos3OmniDiffusersPipeline(
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
         try:
-            for t in self.progress_bar(timesteps):
+            for step_index, t in enumerate(self.progress_bar(timesteps)):
+                self._set_mixed_precision_step(step_index, len(timesteps))
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
@@ -3224,6 +3239,7 @@ class Cosmos3OmniDiffusersPipeline(
                 )[0]
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
         finally:
+            self._reset_mixed_precision()
             self._cosmos3_branch_caches = None
             self.transformer.reset_cache()
         return latents

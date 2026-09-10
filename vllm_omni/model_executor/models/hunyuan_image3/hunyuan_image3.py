@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import gc
 import math
 import typing
@@ -45,13 +45,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.hunyuan_v1 import (
-    HunYuanMLP,
-    HunYuanModel,
-    HunYuanSparseMoeBlock,
-    _get_cla_factor,
-    _is_moe,
-)
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -63,6 +56,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     _merge_multimodal_embeddings,
     is_pp_missing_parameter,
     maybe_prefix,
@@ -78,7 +72,6 @@ from vllm.multimodal.parse import (
 )
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
@@ -91,6 +84,14 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
+    HunYuanMLP,
+    HunYuanModel,
+    HunYuanSparseMoeBlock,
+    _get_cla_factor,
+    _is_moe,
+)
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
@@ -1027,7 +1028,7 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
         }
 
 
-class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3ProcessingInfo]):
+class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3ProcessingInfo]):
     """Multimodal processor for HunyuanImage3 model."""
 
     def _call_hf_processor(
@@ -1045,15 +1046,6 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
         if vae_generator_seed is not None and images:
             batch_feature["vae_generator_seed"] = torch.full((len(images),), int(vae_generator_seed), dtype=torch.long)
         return batch_feature
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
 
     def _get_mm_fields_config(
         self,
@@ -2180,12 +2172,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             "timestep_r_emb",
         ]
         skip_prefixes.extend(unexpected_keywords)
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
-        )
+        loader = AutoWeightsLoader(self)
 
-        loaded_params = loader.load_weights(weights)
+        loaded_params = loader.load_weights(
+            weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
+        )
         return loaded_params
 
     def get_language_model(self) -> torch.nn.Module:

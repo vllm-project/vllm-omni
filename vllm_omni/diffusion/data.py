@@ -29,6 +29,7 @@ from vllm_omni.diffusion.diffusion_kv.config import (
     parse_diffusion_kv_cache_mode,
 )
 from vllm_omni.diffusion.lora.manager import LoRABackend
+from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -759,6 +760,15 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 
 
 @dataclass
+class VideoOutputTransportConfig:
+    enable_device_postprocess: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enable_device_postprocess, bool):
+            raise TypeError("enable_device_postprocess must be a bool")
+
+
+@dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     stage_id: int = 0
@@ -793,6 +803,7 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
 
     # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
@@ -1258,6 +1269,13 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        if self.video_output_transport is None:
+            self.video_output_transport = VideoOutputTransportConfig()
+        elif isinstance(self.video_output_transport, Mapping):
+            self.video_output_transport = VideoOutputTransportConfig(**dict(self.video_output_transport))
+        elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
+            raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
         # time. For late (post-construction) assignment, callers should use
@@ -1618,8 +1636,8 @@ class DiffusionOutput:
 
     output: torch.Tensor | tuple[Any, ...] | dict[str, Any] | None = None
 
-    # Legacy compatibility fields. New pipeline-specific payloads should be
-    # carried by output["payload"] instead.
+    # Legacy compatibility fields. Decoded video uses ``media``; other new
+    # payloads should be carried by output["payload"] instead.
     trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
@@ -1658,7 +1676,18 @@ class DiffusionOutput:
     # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
 
+    # Typed video-media contract. Declared last so the pre-existing positional
+    # constructor order (output, trajectory_timesteps, ...) that out-of-tree
+    # pipelines rely on is preserved. Mutually exclusive with ``output``.
+    media: DiffusionMediaOutput | None = None
+
     def __post_init__(self) -> None:
+        if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
+            raise TypeError(f"media must be DiffusionMediaOutput, got {type(self.media).__name__}")
+        if self.media is not None and self.output is not None:
+            raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+        if self.media is not None and self.post_process_func is not None:
+            raise ValueError("Typed diffusion media cannot carry a model-specific post_process_func")
         if not self.to_cpu:
             return
 
@@ -1674,6 +1703,10 @@ class DiffusionOutput:
             return value
 
         self.output = _maybe_to_cpu(self.output)
+        if self.media is not None:
+            if not self.media.prepared_for_transport:
+                raise ValueError("Diffusion media must be prepared before to_cpu=True")
+            self.media = self.media.to_cpu()
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)

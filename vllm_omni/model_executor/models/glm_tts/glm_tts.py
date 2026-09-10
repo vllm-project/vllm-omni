@@ -39,7 +39,6 @@ from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -51,6 +50,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one as _ras_sample_one
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -364,7 +364,7 @@ class GLMTTSMultiModalProcessingInfo(BaseProcessingInfo):
         )
 
 
-class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessingInfo]):
+class GLMTTSMultiModalProcessor(OmniMultiModalProcessor[GLMTTSMultiModalProcessingInfo]):
     """GLM-TTS voice-clone processor.
 
     Unlike CosyVoice3, GLM-TTS prompt speech tokens are normal Llama vocab IDs
@@ -372,6 +372,53 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
     the AR prompt and also carries WhisperVQ/CampPlus outputs to the AR->DiT
     handoff.
     """
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx):
+        source_tokenizer = self.info.get_tokenizer()
+        prompt_text = source_tokenizer.decode(
+            inputs.prompt,
+            skip_special_tokens=False,
+        )
+        config = self.info.ctx.get_hf_config()
+        model_dir = self.info.ctx.model_config.model
+        self._ensure_cached_runtime_components(
+            model_dir,
+            config,
+            load_voice_clone=False,
+        )
+
+        normalized_text = _normalize_glm_tts_processor_text(
+            self.text_frontend,
+            prompt_text,
+        )
+        text_ids = self._encode_text(normalized_text)
+        prompt_parts = []
+        if inputs.mm_data_items.get_all_counts().get("audio", 0):
+            reference_text = inputs.hf_processor_mm_kwargs.get("prompt_text")
+            if not isinstance(reference_text, str) or not reference_text.strip():
+                raise ValueError("GLM-TTS voice cloning requires mm_processor_kwargs['prompt_text'].")
+            normalized_reference = _normalize_glm_tts_processor_text(
+                self.text_frontend,
+                reference_text,
+                add_trailing_space=True,
+            )
+            prompt_parts.append(self._encode_text(normalized_reference))
+        prompt_parts.extend(
+            [
+                text_ids,
+                torch.tensor([[int(self.special_ids["boa"])]], dtype=torch.long),
+            ]
+        )
+        prompt_ids = torch.cat(prompt_parts, dim=1).reshape(-1).tolist()
+        inputs = replace(
+            inputs,
+            prompt=prompt_ids,
+            hf_processor_mm_kwargs={
+                **inputs.hf_processor_mm_kwargs,
+                self._OMNI_PROMPT_TEXT_KEY: prompt_text,
+            },
+        )
+        return super().apply(inputs, timing_ctx)
 
     def _ensure_cached_runtime_components(
         self,
@@ -598,15 +645,6 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
             )
             if key in hf_inputs
         }
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
 
     def _cached_apply_hf_processor(self, inputs: ProcessorInputs, timing_ctx: Any):
         # GLM-TTS builds the actual AR prompt from both the request text and

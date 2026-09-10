@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
@@ -68,6 +68,16 @@ def _nonneg_finite_float(value: str) -> float:
         raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
     if not math.isfinite(parsed) or parsed < 0:
         raise argparse.ArgumentTypeError(f"must be a finite non-negative number, got {value!r}")
+    return parsed
+
+
+def _json_object(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
     return parsed
 
 
@@ -668,6 +678,14 @@ class OmniServeCommand(CLISubcommand):
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
             'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
             "Calibration mode: add '\"mag_calibrate\": true'",
+        )
+        omni_config_group.add_argument(
+            "--video-output-transport",
+            type=_json_object,
+            default=None,
+            help=(
+                "JSON object configuring video output preparation, for example '{\"enable_device_postprocess\": true}'."
+            ),
         )
         omni_config_group.add_argument(
             "--enable-cache-dit-summary",
