@@ -91,7 +91,7 @@ def _assert_audio_outputs(responses: list[OmniResponse], *, expect_text: bool) -
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_only_batch_uses_multi_replica_talker(omni_server, online_client) -> None:
     request_config = {
@@ -108,7 +108,7 @@ def test_text_only_batch_uses_multi_replica_talker(omni_server, online_client) -
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, online_client) -> None:
     request_config = {
@@ -125,7 +125,7 @@ def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, onli
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mixed_modal_stream_batch_generates_text_and_audio(omni_server, online_client) -> None:
     request_config = {

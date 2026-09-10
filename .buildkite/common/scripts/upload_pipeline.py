@@ -330,6 +330,9 @@ def _get_mirror_hw_selector() -> str:
     so a typo cannot silently drop the CUDA pipeline.
     """
     selector = os.environ.get("MIRROR_HW", "").strip().lower()
+    # PR-DEBUG: force B200 mirror regardless of the Buildkite MIRROR_HW env.
+    # Revert: delete the next line.
+    selector = "b200"
     if not selector:
         return ""
     if selector not in _SUPPORTED_MIRROR_HW_SELECTORS:

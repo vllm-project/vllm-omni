@@ -195,7 +195,7 @@ def _generate_offline_video(*, image_source: str) -> tuple[Path, Path]:
 
 @pytest.mark.benchmark
 @pytest.mark.full_model
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_wan22_i2v_diffusers_offline_generates_video(
     wan22_i2v_image_source: str | None,
 ) -> None:
@@ -217,7 +217,7 @@ def test_wan22_i2v_diffusers_offline_generates_video(
 
 @pytest.mark.benchmark
 @pytest.mark.full_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_wan22_i2v_online_serving_generates_video(
     omni_server,
@@ -244,7 +244,7 @@ def test_wan22_i2v_online_serving_generates_video(
 
 @pytest.mark.benchmark
 @pytest.mark.full_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 def test_wan22_i2v_serving_matches_diffusers_video_similarity(
     wan22_i2v_image_source: str | None,
 ) -> None:

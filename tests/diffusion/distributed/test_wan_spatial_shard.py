@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import os
 from types import SimpleNamespace
 
@@ -538,7 +541,7 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "H100"}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
 @pytest.mark.parametrize("split_dim", ["height", "width"])
 def test_spatial_shard_decode_matches_reference(split_dim: str):
     manager = mp.get_context("spawn").Manager()

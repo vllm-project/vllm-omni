@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for CFG (Classifier-Free Guidance) parallel functionality.
 
 CPU tests mock the CFG process group and validate mixin logic without GPUs.
@@ -32,8 +32,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=2)
-_L4_THREE_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=3)
+_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
+_L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=3)
 
 
 def _set_random_seeds(seed: int) -> None:
@@ -1009,7 +1009,7 @@ def _run_multi_branch_gpu_parity(
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
 @pytest.mark.parametrize("extra_kwargs", [None, {"step_i": 1}])

@@ -175,7 +175,7 @@ def _generate_joint_output(omni, config: QualityTestConfig):
         pytest.param(
             _QUALITY_CONFIG,
             id=_QUALITY_CONFIG.id,
-            marks=hardware_marks(res={"cuda": _QUALITY_CONFIG.gpu}, num_cards=2),
+            marks=hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
         )
     ],
 )

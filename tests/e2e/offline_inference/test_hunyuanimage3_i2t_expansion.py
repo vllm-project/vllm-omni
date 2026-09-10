@@ -57,7 +57,7 @@ def omni() -> Generator[Omni, None, None]:
         yield runner.omni
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 def test_i2t_generates_text(omni: Omni) -> None:
     """Verify I2T output's first 20 token IDs match the HF greedy baseline."""
     # Solid-color image keeps the input self-contained and reproducible.

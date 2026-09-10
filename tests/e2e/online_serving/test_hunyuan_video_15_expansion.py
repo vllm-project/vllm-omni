@@ -33,19 +33,13 @@ NEGATIVE_PROMPT = "low quality, blurry, distorted"
 
 MODEL = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v"
 
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
-
-# Only the most basic single-card deployment row is cheap enough for PR (L2) / merge (L3)
-# CI; the CacheDiT / parallel feature combinations run nightly (L4).
-_CORE_MARKS = [pytest.mark.core_model, pytest.mark.advanced_model]
-_FULL_MARKS = [pytest.mark.full_model]
-
 
 def _get_diffusion_feature_cases(model: str):
     """Return diffusion feature cases for HunyuanVideo-1.5.
 
     Designed for 2x H100 environment per issue #1832.
+    Only the CPU-offload row is cheap enough for PR (L2) / merge (L3);
+    CacheDiT / parallel combinations run nightly (L4).
     """
     return [
         # (1 GPU) CPU offload
@@ -57,7 +51,11 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="single_card_cpu_offload",
-            marks=SINGLE_CARD_MARKS + _CORE_MARKS,
+            marks=[
+                *hardware_marks(res={"cuda": "H100"}),
+                pytest.mark.core_model,
+                pytest.mark.advanced_model,
+            ],
         ),
         # (1 GPU) CacheDiT + Layerwise CPU offloading
         pytest.param(
@@ -70,7 +68,10 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="single_card_cachedit_layerwise",
-            marks=SINGLE_CARD_MARKS + _FULL_MARKS,
+            marks=[
+                *hardware_marks(res={"cuda": ["H100", "B200"]}),
+                pytest.mark.full_model,
+            ],
         ),
         # (2 GPUs) CacheDiT + TP=2 + VAE patch parallel=2
         pytest.param(
@@ -87,7 +88,10 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_cachedit_tp2_vae2",
-            marks=PARALLEL_MARKS + _FULL_MARKS,
+            marks=[
+                *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
+                pytest.mark.full_model,
+            ],
         ),
     ]
 
