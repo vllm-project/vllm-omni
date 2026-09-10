@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Typed pipeline contract for the model-neutral AR-Diffusion runtime."""
 
 from __future__ import annotations
@@ -139,10 +140,13 @@ class SupportsARDiffusionPipeline(Protocol):
     """Required pipeline capability for :class:`ARDiffusionModelRunner`.
 
     A session begins when the runner first sees its ``session_id`` and persists
-    across requests until reset, explicit close, LRU eviction, or a failed
-    forward. ``bind_ar_diffusion_state`` exposes the runner-owned KV state only
-    for the duration of one request. The pipeline must not retain the state
-    after the context exits.
+    until reset, explicit close, LRU eviction, a failed forward, or request
+    completion on the stepwise path. ``bind_ar_diffusion_state`` exposes the
+    runner-owned KV state only for the duration of one runner invocation
+    (``execute_model`` or ``execute_stepwise``). The pipeline must not retain
+    the state after the context exits. Uncommitted scratch lives on the
+    runner-owned session object and survives across stepwise invocations of
+    the same request.
     """
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
@@ -154,7 +158,7 @@ class SupportsARDiffusionPipeline(Protocol):
         session_id: str,
         state: ARDiffusionKVState,
     ) -> AbstractContextManager[None]:
-        """Bind ``state`` to model execution for one request."""
+        """Bind ``state`` to model execution for one runner invocation."""
         ...
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
