@@ -45,6 +45,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     evaluate.add_argument("--judge-model", required=True)
     evaluate.add_argument("--judge-api-key", default="EMPTY")
     evaluate.add_argument("--judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
+    evaluate.add_argument(
+        "--judge-frame-overflow",
+        choices=("error", "reduce"),
+        default="error",
+        help="On explicit judge context overflow: fail (default), or retry image-frame calls with fewer frames.",
+    )
     evaluate.add_argument("--judge-fps", type=int, default=2)
     evaluate.add_argument("--window-size", type=float, default=10.0)
     evaluate.add_argument("--allow-invalid-clock", action="store_true")
@@ -110,6 +116,7 @@ def run(args: argparse.Namespace) -> int:
             judge,
             judge_fps=args.judge_fps,
             judge_video_mode=args.judge_video_mode,
+            judge_frame_overflow=args.judge_frame_overflow,
             window_size=args.window_size,
             allow_invalid_clock=args.allow_invalid_clock,
         )
