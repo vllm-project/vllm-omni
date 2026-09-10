@@ -428,8 +428,7 @@ def test_transformer_declares_token_aligned_ulysses_sp_plan() -> None:
     assert set(plan["sp_prepare"]) == {0, 1, 2, 3, 4}
     assert plan["sp_prepare"][0].split_dim == 1
     assert plan["sp_prepare"][1].split_dim == 1
-    assert plan["sp_prepare"][2].split_dim == 0
-    assert plan["sp_prepare"][2].expected_dims == 1
+    assert plan["sp_prepare"][2].split_dim == 1
     assert plan["sp_prepare"][3].split_dim == 0
     assert plan["sp_prepare"][4].split_dim == 0
     assert plan["sp_output_gather"].gather_dim == 1
@@ -702,31 +701,37 @@ def test_official_default_shapes_match_public_safetensors_header_fixture() -> No
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_framewise_modulation_matches_dense_tokens_across_frame_boundaries(monkeypatch, dtype):
+def test_timestep_expansion_only_runs_with_ulysses(monkeypatch, dtype):
     module = attention_tests._load_module()
     hidden = torch.randn(2, 12, 4).to(dtype)
     camera = torch.randn_like(hidden)
-    table = torch.randn(2, 3, 6, 4)
+    table = torch.randn(2, 3, 6, 4).to(dtype)
     rotary = (torch.randn(12, 2), torch.randn(12, 2))
     prepare = module._LingBotSPPrepare()
-    assert prepare(hidden, camera, table, rotary)[2] is None
+    assert prepare(hidden, camera, table, rotary)[2] is table
     monkeypatch.setattr(module, "get_sp_group", lambda: SimpleNamespace(ulysses_world_size=2))
-    indices = prepare(hidden, camera, table, rotary)[2]
-    assert indices.dtype == torch.int32 and indices.tolist() == [0] * 4 + [1] * 4 + [2] * 4
-    assert indices.numel() == hidden.shape[1]
-    assert indices.untyped_storage().nbytes() == indices.numel() * indices.element_size()
-    scale, shift = table[:, :, 0], table[:, :, 1]
-    dense_scale = scale.repeat_interleave(4, dim=1)
-    dense_shift = shift.repeat_interleave(4, dim=1)
-    for bias in (None, shift):
-        expected = hidden * dense_scale
-        if bias is not None:
-            expected = expected + dense_shift
-        broadcast = module._apply_framewise_affine(hidden, scale, bias)
-        # Six-token shards cut through the middle of a frame.
-        shards = [
-            module._apply_framewise_affine(part, scale, bias, ids)
-            for part, ids in zip(hidden.chunk(2, dim=1), indices.chunk(2), strict=True)
-        ]
-        torch.testing.assert_close(broadcast, expected, rtol=0, atol=0)
-        torch.testing.assert_close(torch.cat(shards, dim=1), expected, rtol=0, atol=0)
+    expanded = prepare(hidden, camera, table, rotary)[2]
+    assert expanded.shape == (2, 12, 6, 4)
+    torch.testing.assert_close(expanded, table.repeat_interleave(4, dim=1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_frame_broadcast_matches_token_expanded_modulation(monkeypatch, dtype):
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_frames_per_block=3, sliding_window_num_frames=6).to(dtype)
+    inputs = (
+        torch.randn(1, 36, 3, 4, 4).to(dtype),
+        torch.tensor([1.0]),
+        torch.randn(1, 3, 6).to(dtype),
+        torch.randn(1, 384, 3, 4, 4).to(dtype),
+    )
+    cache_args = dict(batch_size=1, latent_height=4, latent_width=4, device=torch.device("cpu"), dtype=dtype)
+    cache_a, cache_b = model.allocate_cache(**cache_args), model.allocate_cache(**cache_args)
+    broadcast = model(*inputs, cache=cache_a, start_frame=0, update_cache=True)
+    # Change only preparation; attention stays SP1 to isolate the representation change.
+    monkeypatch.setattr(module, "get_sp_group", lambda: SimpleNamespace(ulysses_world_size=2))
+    expanded = model(*inputs, cache=cache_b, start_frame=0, update_cache=True)
+    torch.testing.assert_close(broadcast, expanded, rtol=0, atol=0)
+    for a, b in zip(cache_a.self_attention, cache_b.self_attention, strict=True):
+        torch.testing.assert_close(a.key, b.key, rtol=0, atol=0)
+        torch.testing.assert_close(a.value, b.value, rtol=0, atol=0)
