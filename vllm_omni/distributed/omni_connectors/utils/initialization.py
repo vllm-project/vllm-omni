@@ -45,7 +45,7 @@ ORCHESTRATOR_PORT_OFFSET = 200
 ConnectorPurpose = Literal["request_forwarding", "kv_transfer", "orchestrator"]
 
 
-def connector_zmq_port(
+def compute_connector_zmq_port(
     base_port: int,
     *,
     purpose: ConnectorPurpose,
@@ -97,19 +97,29 @@ def resolve_connector_spec(
     if spec.name not in TRANSFER_ENGINE_CONNECTOR_NAMES:
         return ConnectorSpec(name=spec.name, extra=extra)
 
-    base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
-    from_stage = int(extra.get("from_stage", stage_id))
-    resolved_port = connector_zmq_port(
-        base_port,
-        purpose=purpose,
-        from_stage=from_stage,
-        local_rank=local_rank,
-        replica_id=replica_id,
-    )
+    resolved_port = None
+    if role != "receiver" or "sender_zmq_port" not in extra:
+        resolved_port = compute_connector_zmq_port(
+            expand_env_int(extra.get("zmq_port", 50051), "zmq_port"),
+            purpose=purpose,
+            from_stage=int(extra.get("from_stage", stage_id)),
+            local_rank=local_rank,
+            replica_id=replica_id,
+        )
     if role == "receiver":
         extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
-        extra["sender_zmq_port"] = resolved_port
+        extra.setdefault("sender_zmq_port", resolved_port)
         extra.pop("zmq_port", None)
+        outgoing = extra.get("outgoing")
+        if spec.name == "NixlConnector" and isinstance(outgoing, dict):
+            extra["zmq_port"] = compute_connector_zmq_port(
+                expand_env_int(outgoing.get("zmq_port", 50051), "zmq_port"),
+                purpose=purpose,
+                from_stage=int(outgoing.get("from_stage", stage_id)),
+                local_rank=local_rank,
+                replica_id=replica_id,
+            )
+            extra["host"] = outgoing.get("host", "auto")
     else:
         extra["zmq_port"] = resolved_port
     return ConnectorSpec(name=spec.name, extra=extra)

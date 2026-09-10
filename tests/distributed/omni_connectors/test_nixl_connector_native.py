@@ -29,7 +29,7 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _producer(port: int, ready: Any, consumed: Any, result: Any) -> None:
+def _producer(port: int, ready: Any, consumed: Any, result: Any, claimed: Any, proceed: Any, wire: Any) -> None:
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
     current_omni_platform.set_device(0)
@@ -45,11 +45,23 @@ def _producer(port: int, ready: Any, consumed: Any, result: Any) -> None:
         payload = OmniPayloadStruct(
             hidden_states=HiddenStatesStruct(output=torch.arange(8, dtype=torch.float32, device="cuda:0")),
             meta=MetaStruct(token_role_ids=torch.tensor([1, 2, 3], dtype=torch.int64, device="cpu")),
+            kv_metadata={"empty": torch.empty((2, 0, 3), device="cuda:0")},
             request_id="native-smoke",
         )
         success, size, metadata = connector.put("0", "1", "native-smoke", payload)
         result.put(("put", success, size, metadata["kind"] if metadata else None))
+        wire.put(metadata)
         ready.set()
+        if not claimed.wait(timeout=30):
+            raise TimeoutError("consumer did not claim source")
+        pending = connector._pending["native-smoke"]
+        pending.deadline = 0
+        connector._cleanup_expired_pending()
+        connector.cleanup("native-smoke")
+        assert connector._pending["native-smoke"] is pending
+        assert pending.claims and connector._registered_descs
+        result.put(("source_retained", len(pending.claims)))
+        proceed.set()
         if not consumed.wait(timeout=30):
             raise TimeoutError("consumer did not complete the native NIXL transfer")
         deadline = time.monotonic() + 10
@@ -63,7 +75,9 @@ def _producer(port: int, ready: Any, consumed: Any, result: Any) -> None:
         connector.close()
 
 
-def _consumer(port: int, ready: Any, consumed: Any, result: Any) -> None:
+def _consumer(
+    port: int, ready: Any, consumed: Any, result: Any, claimed: Any, proceed: Any, wire: Any, direct: bool
+) -> None:
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
     if not ready.wait(timeout=30):
@@ -79,6 +93,18 @@ def _consumer(port: int, ready: Any, consumed: Any, result: Any) -> None:
         }
     )
     try:
+        original_wait = connector._wait_for_transfer
+        states = []
+
+        def wait(handle, key):
+            states.append(connector._agent.check_xfer_state(handle))
+            claimed.set()
+            if not proceed.wait(timeout=30):
+                raise TimeoutError("producer did not verify active ownership")
+            original_wait(handle, key)
+
+        connector._wait_for_transfer = wait
+        metadata = wire.get(timeout=5)
         received = None
         deadline = time.monotonic() + 30
         while received is None and time.monotonic() < deadline:
@@ -86,13 +112,16 @@ def _consumer(port: int, ready: Any, consumed: Any, result: Any) -> None:
                 "0",
                 "1",
                 "native-smoke",
-                {"source_host": "127.0.0.1", "source_port": port},
+                metadata if direct else {"source_host": "127.0.0.1", "source_port": port},
             )
         if received is None:
             raise TimeoutError("native NIXL transfer did not complete")
         payload, size = received
         hidden = payload["hidden_states"]["output"]
         token_roles = payload["meta"]["token_role_ids"]
+        empty = payload["kv_metadata"]["empty"]
+        assert empty.shape == (2, 0, 3) and str(empty.device) == "cuda:1"
+        result.put(("native_states", states))
         result.put(
             (
                 "get",
@@ -116,14 +145,18 @@ def _consumer(port: int, ready: Any, consumed: Any, result: Any) -> None:
 
 
 @pytest.mark.skipif(not _native_nixl_available(), reason="requires NIXL and at least two CUDA devices")
-def test_native_two_process_structured_mixed_device_transfer():
+@pytest.mark.parametrize("direct", [False, True])
+def test_native_two_process_structured_mixed_device_transfer(direct):
     context = mp.get_context("spawn")
     ready = context.Event()
     consumed = context.Event()
+    claimed = context.Event()
+    proceed = context.Event()
+    wire = context.Queue()
     result = context.Queue()
     port = _free_port()
-    producer = context.Process(target=_producer, args=(port, ready, consumed, result))
-    consumer = context.Process(target=_consumer, args=(port, ready, consumed, result))
+    producer = context.Process(target=_producer, args=(port, ready, consumed, result, claimed, proceed, wire))
+    consumer = context.Process(target=_consumer, args=(port, ready, consumed, result, claimed, proceed, wire, direct))
 
     producer.start()
     consumer.start()
@@ -134,7 +167,8 @@ def test_native_two_process_structured_mixed_device_transfer():
     if consumer.is_alive():
         consumer.terminate()
 
-    records = [result.get(timeout=5) for _ in range(3)]
+    records = [result.get(timeout=5) for _ in range(5)]
+    print("Native ownership records:", records)
     assert producer.exitcode == 0, records
     assert consumer.exitcode == 0, records
     assert records[0][0] == "put"
@@ -151,3 +185,4 @@ def test_native_two_process_structured_mixed_device_transfer():
     )
     assert get_record[6:] == ([1, 2, 3], "torch.int64", [3], "cuda:1")
     assert next(record for record in records if record[0] == "cleanup") == ("cleanup", 0, 0)
+    assert next(record for record in records if record[0] == "source_retained") == ("source_retained", 1)

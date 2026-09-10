@@ -2971,6 +2971,7 @@ class Orchestrator:
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
                 )
+                request.payload_sender_info = self._build_payload_sender_info(next_stage_id - 1, request_id=request_id)
                 request.external_req_id = request.request_id
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(

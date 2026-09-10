@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import sys
@@ -29,13 +30,17 @@ _INIT_AGENT = "NIXL_INIT_AGENT"
 _TENSOR_MARKER = "__nixl_tensor_index__"
 _TUPLE_MARKER = "__nixl_tuple__"
 
-# Handshake control-plane messages. A ``put`` payload is only readable once the
-# consumer knows the producer's NIXL agent metadata and memory descriptors, so a
-# consumer that was not handed that metadata out-of-band asks for it here.
+# Handshake control-plane messages. Consumers claim connector-managed payloads
+# before READ, even with out-of-band metadata, and acknowledge completion here.
 _GET_META_MSG = b"nixl_get_meta"
 _XFER_DONE_MSG = b"nixl_xfer_done"
 _META_NOT_FOUND = b"nixl_meta_not_found"
 _ACK = b"nixl_ack"
+
+# NIXL has no remote READ cancellation primitive. A closed producer with an
+# abandoned claim must keep both its agent and allocations alive until process
+# exit; dropping the last Python reference is not a safe cancellation policy.
+_RETAINED_PRODUCERS: set[Any] = set()
 
 
 @dataclass
@@ -45,6 +50,8 @@ class _DeferredTransfer:
     dlists: list[Any] = field(default_factory=list)
     handles: list[Any] = field(default_factory=list)
     remote_agent: Any = None
+    source_key: str | None = None
+    source_metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -52,6 +59,8 @@ class _PendingPayload:
     tensors: list[torch.Tensor]
     registrations: list[Any]
     deadline: float
+    generation: str = field(default_factory=lambda: uuid.uuid4().hex)
+    claims: set[str] = field(default_factory=set)
 
 
 class NixlConnector(OmniConnectorBase):
@@ -64,13 +73,12 @@ class NixlConnector(OmniConnectorBase):
     and moved through the same NIXL path.
 
     A NIXL READ needs the producer's agent metadata and memory descriptors,
-    which ``put`` returns to its caller. Callers that can forward that
-    dictionary to the consumer (for example the diffusion stage handle) keep
-    working unchanged. Callers that cannot -- notably the generic stage payload
-    path, which drops the ``put`` metadata and invokes ``get`` with
-    ``metadata=None`` -- rely on the ZMQ handshake enabled by setting
-    ``zmq_port``: the producer serves its metadata from a ROUTER socket and the
-    consumer fetches it by key.
+    which ``put`` returns to its caller. Consumers use the ZMQ control plane to
+    claim connector-managed payloads before READ and acknowledge completion,
+    including when metadata is forwarded directly. Producers without a fixed
+    ``zmq_port`` use an ephemeral listener advertised in that metadata. Callers
+    passing ``metadata=None`` need a configured or request-specific producer
+    endpoint to fetch and claim metadata by key.
     """
 
     supports_raw_data: bool = True
@@ -142,7 +150,7 @@ class NixlConnector(OmniConnectorBase):
         self._init_handshake()
         self._lease_wakeup = threading.Event()
         self._lease_thread: threading.Thread | None = None
-        if self._role != "receiver":
+        if self._serving_handshake:
             self._lease_thread = threading.Thread(
                 target=self._lease_reaper_loop,
                 name="nixl-lease-reaper",
@@ -161,15 +169,18 @@ class NixlConnector(OmniConnectorBase):
             self._transfer_thread.start()
 
     def _init_handshake(self) -> None:
-        """Set up the ZMQ control plane used when ``get`` receives no metadata.
+        """Set up the ZMQ metadata and payload-ownership control plane.
 
-        The handshake stays off unless ``zmq_port`` is configured, so
-        deployments that forward the ``put`` metadata themselves keep their
-        current behaviour and open no extra sockets.
+        Producers listen on a configured or ephemeral port, including for
+        directly forwarded metadata. Receive-only connectors dial the producer;
+        intermediate stages can also listen for their outgoing payloads.
         """
         role = self.config.get("role")
         self._role = str(role).lower() if role else None
-        self._zmq_port = self.config.get("zmq_port")
+        # Even out-of-band metadata needs an atomic claim before READ. An
+        # ephemeral listener supplies that ownership channel when no fixed
+        # data-plane metadata port was configured.
+        self._zmq_port = self.config.get("zmq_port", 0 if self._role != "receiver" else None)
         self._sender_host = self.config.get("sender_host")
         self._sender_zmq_port = self.config.get("sender_zmq_port")
         self._handshake_timeout_ms = int(self.config.get("handshake_timeout_ms", 5000))
@@ -193,7 +204,7 @@ class NixlConnector(OmniConnectorBase):
 
         self._zmq_ctx = zmq.Context()
         # A receiver only dials out, so it never needs a port of its own.
-        if self._zmq_port is None or self._role == "receiver":
+        if self._zmq_port is None:
             return
 
         host_value = str(self.config.get("host", "auto"))
@@ -222,7 +233,7 @@ class NixlConnector(OmniConnectorBase):
         put_key: str,
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
-        if self._closed:
+        if self._closed or getattr(self, "_closing", False):
             raise RuntimeError("Cannot put data: NixlConnector is closed")
 
         try:
@@ -244,6 +255,9 @@ class NixlConnector(OmniConnectorBase):
 
             grouped_tensors: dict[str, list[tuple[int, torch.Tensor]]] = {}
             for tensor_index, tensor in enumerate(tensors):
+                # Preserve spec/skeleton slots, but never register empty DMA regions.
+                if tensor.numel() == 0:
+                    continue
                 memory_type = self._resolve_memory_type(tensor)
                 grouped_tensors.setdefault(memory_type, []).append((tensor_index, tensor))
 
@@ -282,15 +296,23 @@ class NixlConnector(OmniConnectorBase):
             if self._serving_handshake:
                 metadata["sender_host"] = self.host
                 metadata["sender_zmq_port"] = self._zmq_port
-            previous = self._take_pending(put_key)
-            if previous is not None:
-                self._release_pending(previous)
             with self._state_lock:
-                self._pending[put_key] = _PendingPayload(
+                previous = self._pending.get(put_key)
+                if previous is not None and previous.claims:
+                    for descs in registered_descs:
+                        self._safe_call(self._agent.deregister_memory, descs)
+                        self._registered_descs.remove(descs)
+                    raise RuntimeError(f"Cannot replace claimed NIXL payload {put_key}")
+                previous = self._take_pending(put_key)
+                if previous is not None:
+                    self._release_pending(previous)
+                pending = _PendingPayload(
                     tensors=tensors,
                     registrations=registered_descs,
                     deadline=time.monotonic() + self._lease_seconds,
                 )
+                metadata["generation"] = pending.generation
+                self._pending[put_key] = pending
                 if self._serving_handshake:
                     self._published[put_key] = metadata
             self._lease_wakeup.set()
@@ -310,27 +332,31 @@ class NixlConnector(OmniConnectorBase):
         get_key: str,
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
-        if self._closed:
+        if self._closed or getattr(self, "_closing", False):
             raise RuntimeError("Cannot get data: NixlConnector is closed")
 
         remote_agent = None
         local_reg_descs_list = []
         dlist_handles = []
         xfer_handles = []
+        source_metadata = None
         try:
             metadata = self._resolve_metadata(get_key, metadata)
             if not isinstance(metadata, dict) or metadata.get("schema_version") != _SCHEMA_VERSION:
                 logger.error("NixlConnector get has invalid metadata for %s", get_key)
                 return None
 
+            source_metadata = metadata
+
             tensor_specs = metadata.get("tensor_specs")
             if not isinstance(tensor_specs, list):
                 raise RuntimeError(f"Invalid NIXL metadata for {get_key}: missing tensor_specs")
-            descriptor_groups = self._validated_descriptor_groups(metadata, len(tensor_specs))
+            descriptor_groups = self._validated_descriptor_groups(metadata, tensor_specs)
 
             local_tensors = [self._allocate_tensor_from_spec(spec, metadata.get("kind")) for spec in tensor_specs]
-            remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
-            self._remote_agents.append(remote_agent)
+            if descriptor_groups:
+                remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
+                self._remote_agents.append(remote_agent)
             for descriptor_group in descriptor_groups:
                 remote_memory_type = descriptor_group["memory_type"]
                 indexed_regions = list(
@@ -384,7 +410,6 @@ class NixlConnector(OmniConnectorBase):
                 payload = self._restore_tensor_leaves(skeleton, local_tensors[1:])
             else:
                 payload = local_tensors[0] if len(local_tensors) == 1 else local_tensors
-            self._notify_transfer_done(get_key, metadata)
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
             logger.debug("NixlConnector get %s->%s key=%s size=%d", from_stage, to_stage, get_key, size)
@@ -398,6 +423,8 @@ class NixlConnector(OmniConnectorBase):
                         dlists=dlist_handles,
                         handles=xfer_handles,
                         remote_agent=remote_agent,
+                        source_key=get_key,
+                        source_metadata=source_metadata,
                     )
                 )
                 local_tensors = []
@@ -405,6 +432,7 @@ class NixlConnector(OmniConnectorBase):
                 dlist_handles = []
                 xfer_handles = []
                 remote_agent = None
+                source_metadata = None
             self._metrics["errors"] += 1
             logger.error("NixlConnector get failed for %s", get_key, exc_info=True)
             return None
@@ -419,6 +447,8 @@ class NixlConnector(OmniConnectorBase):
                     self._remote_agents.remove(remote_agent)
             for local_reg_descs in local_reg_descs_list:
                 self._safe_call(self._agent.deregister_memory, local_reg_descs)
+            if source_metadata is not None:
+                self._notify_transfer_done(get_key, source_metadata)
 
     def cleanup(self, request_id: str) -> None:
         pending = self._take_pending(request_id)
@@ -438,6 +468,8 @@ class NixlConnector(OmniConnectorBase):
             pending = self._pending.get(request_id)
             if pending is None or (expected is not None and pending is not expected):
                 return None
+            if pending.claims:
+                return None
             self._published.pop(request_id, None)
             return self._pending.pop(request_id)
 
@@ -445,6 +477,18 @@ class NixlConnector(OmniConnectorBase):
         if self._closed:
             return
         self._closed = True
+        # Stop accepting puts/gets, but keep serving completion ACKs for outstanding
+        # remote READs. A later close() call can finish teardown once drained.
+        for request_id in list(self._pending):
+            self.cleanup(request_id)
+        with self._state_lock:
+            if any(pending.claims for pending in self._pending.values()):
+                _RETAINED_PRODUCERS.add(self)
+                self._closed = False
+                self._closing = True
+                logger.warning("NIXL close deferred: remote READ claims still own source allocations")
+                return
+        _RETAINED_PRODUCERS.discard(self)
         self._stop_event.set()
         self._lease_wakeup.set()
         self._transfer_wakeup.set()
@@ -518,11 +562,13 @@ class NixlConnector(OmniConnectorBase):
     def _resolve_metadata(self, get_key: str, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
         """Return complete NIXL transfer metadata for ``get_key``.
 
-        Callers that forwarded the ``put`` metadata are served directly; the
-        remaining cases fall back to the handshake, either at the endpoint
-        named in a partial metadata dict or at the configured default producer.
+        Connector-managed metadata, including directly forwarded ``put`` results,
+        requires a handshake claim at the supplied or configured producer endpoint.
+        Only legacy externally owned metadata without a generation bypasses it.
         """
-        if isinstance(metadata, dict) and metadata.get("schema_version") == _SCHEMA_VERSION:
+        direct = isinstance(metadata, dict) and metadata.get("schema_version") == _SCHEMA_VERSION
+        if direct and "generation" not in metadata:
+            # Legacy externally owned metadata has no connector-managed lease.
             return metadata
 
         endpoint = self._metadata_endpoint(metadata)
@@ -538,23 +584,26 @@ class NixlConnector(OmniConnectorBase):
             )
             return None
         if self._zmq_ctx is None:
-            logger.error(
-                "NixlConnector get(%s) needs the handshake but no ZMQ context was created; "
-                "set zmq_port or sender_host in the connector config.",
-                get_key,
-            )
-            return None
+            with self._state_lock:
+                if self._zmq_ctx is None:
+                    self._zmq_ctx = zmq.Context()
 
+        if direct:
+            return self._query_metadata_at(get_key, *endpoint, generation=metadata["generation"])
         return self._query_metadata_at(get_key, *endpoint)
 
-    def _query_metadata_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
+    def _query_metadata_at(
+        self, get_key: str, host: str, port: int, *, generation: str | None = None
+    ) -> dict[str, Any] | None:
         """Fetch transfer metadata for ``get_key`` from a producer's ROUTER socket.
 
         Each call performs one bounded query so a missing key cannot starve
         other requests in the shared receive loop. The caller retries later.
         """
         zmq_addr = f"tcp://{host}:{port}"
-        request = _GET_META_MSG + msgspec.msgpack.encode({"key": get_key})
+        request = _GET_META_MSG + msgspec.msgpack.encode(
+            {"key": get_key, "generation": generation, "claim_id": uuid.uuid4().hex}
+        )
         sock = self._get_req_socket(zmq_addr, self._metadata_query_timeout_ms)
         try:
             sock.send(request)
@@ -580,7 +629,12 @@ class NixlConnector(OmniConnectorBase):
         zmq_addr = f"tcp://{host}:{port}"
         sock = self._get_req_socket(zmq_addr)
         try:
-            sock.send(_XFER_DONE_MSG + msgspec.msgpack.encode({"key": get_key}))
+            sock.send(
+                _XFER_DONE_MSG
+                + msgspec.msgpack.encode(
+                    {"key": get_key, "generation": metadata.get("generation"), "claim_id": metadata.get("claim_id")}
+                )
+            )
             sock.recv()
         except Exception:
             self._invalidate_req_socket(zmq_addr)
@@ -589,7 +643,10 @@ class NixlConnector(OmniConnectorBase):
     def _handshake_listener_loop(self) -> None:
         router = self._zmq_ctx.socket(zmq.ROUTER)
         try:
-            router.bind(f"tcp://{self.host}:{self._zmq_port}")
+            if self._zmq_port == 0:
+                self._zmq_port = router.bind_to_random_port(f"tcp://{self.host}")
+            else:
+                router.bind(f"tcp://{self.host}:{self._zmq_port}")
         except zmq.ZMQError as exc:
             logger.error("NixlConnector handshake bind failed on %s:%s: %s", self.host, self._zmq_port, exc)
             self._bind_error = exc
@@ -617,13 +674,39 @@ class NixlConnector(OmniConnectorBase):
 
     def _handle_handshake_message(self, payload: bytes) -> bytes:
         if payload.startswith(_GET_META_MSG):
-            key = msgspec.msgpack.decode(payload[len(_GET_META_MSG) :]).get("key")
+            request = msgspec.msgpack.decode(payload[len(_GET_META_MSG) :])
+            key = request.get("key")
+            claim = request.get("claim_id")
             with self._state_lock:
+                pending = self._pending.get(key)
                 metadata = self._published.get(key)
-            return _META_NOT_FOUND if metadata is None else msgspec.msgpack.encode(metadata)
+                if (
+                    pending is None
+                    or metadata is None
+                    or not claim
+                    or request.get("generation") not in (None, pending.generation)
+                    or (not pending.claims and time.monotonic() >= pending.deadline)
+                    or self._closed
+                    or getattr(self, "_closing", False)
+                ):
+                    return _META_NOT_FOUND
+                # Publish ownership before descriptors can leave this lock.
+                # Failed/lost replies retain the claim conservatively.
+                reply = msgspec.msgpack.encode({**metadata, "claim_id": claim})
+                pending.claims.add(claim)
+                return reply
         if payload.startswith(_XFER_DONE_MSG):
-            key = msgspec.msgpack.decode(payload[len(_XFER_DONE_MSG) :]).get("key")
-            self.cleanup(key)
+            request = msgspec.msgpack.decode(payload[len(_XFER_DONE_MSG) :])
+            key = request.get("key")
+            with self._state_lock:
+                pending = self._pending.get(key)
+                if (
+                    pending is not None
+                    and request.get("generation") == pending.generation
+                    and request.get("claim_id") in pending.claims
+                ):
+                    pending.claims.remove(request["claim_id"])
+                    self.cleanup(key)
             return _ACK
         logger.warning("NixlConnector handshake received an unknown message")
         return _META_NOT_FOUND
@@ -680,7 +763,7 @@ class NixlConnector(OmniConnectorBase):
 
     def _transfers_may_be_active(self, handles: list[Any]) -> bool:
         try:
-            return any(self._agent.check_xfer_state(handle) == "PROC" for handle in handles)
+            return any(self._agent.check_xfer_state(handle) not in {"DONE", "ERR"} for handle in handles)
         except Exception:
             return True
 
@@ -690,14 +773,12 @@ class NixlConnector(OmniConnectorBase):
             expired = [
                 (key, pending, sum(t.numel() * t.element_size() for t in pending.tensors))
                 for key, pending in self._pending.items()
-                if now >= pending.deadline
+                if not pending.claims and now >= pending.deadline
             ]
         for request_id, pending, size in expired:
             logger.warning(
                 "NixlConnector lease expired for request %s after %.0fs; its %d bytes are "
-                "being reclaimed while a consumer may still read them, which yields "
-                "corrupt data. Raise VLLM_OMNI_NIXL_LEASE_S above the maximum "
-                "producer-to-consumer queueing delay.",
+                "unclaimed and can safely be reclaimed.",
                 request_id,
                 self._lease_seconds,
                 size,
@@ -710,7 +791,9 @@ class NixlConnector(OmniConnectorBase):
         while not self._stop_event.is_set():
             now = time.monotonic()
             with self._state_lock:
-                next_deadline = min((pending.deadline for pending in self._pending.values()), default=None)
+                next_deadline = min(
+                    (pending.deadline for pending in self._pending.values() if not pending.claims), default=None
+                )
             if next_deadline is None:
                 timeout = None
             else:
@@ -740,7 +823,7 @@ class NixlConnector(OmniConnectorBase):
             except Exception:
                 logger.debug("Failed to poll deferred NIXL transfer", exc_info=True)
                 continue
-            if any(state == "PROC" for state in states):
+            if any(state not in {"DONE", "ERR"} for state in states):
                 continue
             self._release_deferred_transfer(transfer)
             if (
@@ -750,6 +833,9 @@ class NixlConnector(OmniConnectorBase):
                 and transfer.remote_agent is None
             ):
                 transfer.tensors.clear()
+                if transfer.source_metadata is not None:
+                    self._notify_transfer_done(transfer.source_key, transfer.source_metadata)
+                    transfer.source_metadata = None
                 with self._state_lock:
                     if transfer in self._deferred_transfers:
                         self._deferred_transfers.remove(transfer)
@@ -787,9 +873,26 @@ class NixlConnector(OmniConnectorBase):
         return "VRAM"
 
     @staticmethod
-    def _validated_descriptor_groups(metadata: dict[str, Any], tensor_count: int) -> list[dict[str, Any]]:
+    def _validated_descriptor_groups(
+        metadata: dict[str, Any], tensor_specs: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        # Derive emptiness from shape/dtype rather than the advertised size.
+        sizes = []
+        for spec in tensor_specs:
+            if not isinstance(spec, dict):
+                raise RuntimeError("Invalid NIXL metadata: tensor spec must be a mapping")
+            shape = spec.get("shape")
+            if not isinstance(shape, list) or any(type(dim) is not int or dim < 0 for dim in shape):
+                raise RuntimeError("Invalid NIXL metadata: invalid tensor shape")
+            dtype = getattr(torch, str(spec.get("dtype", "")).removeprefix("torch."), None)
+            if not isinstance(dtype, torch.dtype):
+                raise RuntimeError("Invalid NIXL metadata: invalid tensor dtype")
+            size = math.prod(shape) * dtype.itemsize
+            if type(spec.get("size")) is not int or spec["size"] != size:
+                raise RuntimeError("Invalid NIXL metadata: tensor size does not match shape/dtype")
+            sizes.append(size)
         groups = metadata.get("descriptor_groups")
-        if not isinstance(groups, list) or not groups:
+        if not isinstance(groups, list):
             raise RuntimeError("Invalid NIXL metadata: missing descriptor_groups")
 
         seen_indices = []
@@ -800,11 +903,28 @@ class NixlConnector(OmniConnectorBase):
             regions = group.get("regions")
             if not isinstance(indices, list) or not isinstance(regions, list) or len(indices) != len(regions):
                 raise RuntimeError("Invalid NIXL metadata: tensor_indices and regions must have equal lengths")
+            if not indices:
+                raise RuntimeError("Invalid NIXL metadata: empty descriptor group")
             if not group.get("memory_type"):
                 raise RuntimeError("Invalid NIXL metadata: descriptor group is missing memory_type")
+            if any(type(index) is not int or not 0 <= index < len(sizes) for index in indices):
+                raise RuntimeError("Invalid NIXL metadata: tensor indices must form an exact partition")
+            for index, region in zip(indices, regions, strict=True):
+                if (
+                    not isinstance(region, (list, tuple))
+                    or len(region) not in (3, 4)
+                    or type(region[0]) is not int
+                    or region[0] <= 0
+                    or type(region[1]) is not int
+                    or region[1] <= 0
+                    or region[1] != sizes[index]
+                    or type(region[2]) is not int
+                    or region[2] < 0
+                ):
+                    raise RuntimeError("Invalid NIXL metadata: invalid tensor region or byte size")
             seen_indices.extend(indices)
 
-        if sorted(seen_indices) != list(range(tensor_count)):
+        if sorted(seen_indices) != [index for index, size in enumerate(sizes) if size > 0]:
             raise RuntimeError("Invalid NIXL metadata: tensor indices must form an exact partition")
         return groups
 

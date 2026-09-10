@@ -16,7 +16,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .initialization import connector_zmq_port
+from .initialization import compute_connector_zmq_port
 
 logger = init_logger(__name__)
 
@@ -123,7 +123,7 @@ def kv_zmq_port(
 
     """
     replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
-    return connector_zmq_port(
+    return compute_connector_zmq_port(
         base_port,
         purpose="kv_transfer",
         from_stage=from_stage,

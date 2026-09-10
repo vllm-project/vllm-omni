@@ -8,6 +8,7 @@ NIXL itself is stubbed out, so these tests exercise the ZMQ control plane and
 the payload normalisation rather than any actual RDMA transfer.
 """
 
+import ctypes
 import sys
 import time
 import types
@@ -22,6 +23,251 @@ from vllm_omni.data_entry_keys import HiddenStatesStruct, MetaStruct, OmniPayloa
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
 PORT = 47431
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_three_stage_incoming_and_outgoing_endpoints(nixl_connector_cls, async_chunk):
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(name="NixlConnector", extra={"host": "127.0.0.1", "zmq_port": PORT}),
+            ("1", "2"): ConnectorSpec(name="NixlConnector", extra={"host": "127.0.0.1", "zmq_port": PORT + 10}),
+        }
+    )
+    connectors = []
+    try:
+        for stage in range(3):
+            spec = get_stage_connector_spec(config, stage, async_chunk)
+            resolved = resolve_connector_spec(ConnectorSpec(**spec), stage_id=stage, role=spec["extra"]["role"])
+            connectors.append(nixl_connector_cls(resolved.extra))
+        first, middle, last = connectors
+        assert middle._sender_zmq_port == PORT
+        assert middle._serving_handshake
+        assert middle._zmq_port == PORT + 11
+        first.put("0", "1", "incoming", torch.ones(1))
+        assert middle._resolve_metadata("incoming", None) is not None
+        middle.put("1", "2", "outgoing", torch.ones(1))
+        assert last._resolve_metadata("outgoing", None) is not None
+    finally:
+        for connector in reversed(connectors):
+            for pending in connector._pending.values():
+                pending.claims.clear()  # No DMA in this metadata-only probe.
+            connector.close()
+
+
+@pytest.mark.parametrize("name", ["NixlConnector", "MooncakeTransferEngineConnector"])
+def test_explicit_sender_port_is_not_derived(name):
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
+
+    spec = ConnectorSpec(name=name, extra={"sender_zmq_port": 55000, "from_stage": 0})
+    resolved = resolve_connector_spec(spec, stage_id=1, role="receiver", replica_id=3, local_rank=2)
+    assert resolved.extra["sender_zmq_port"] == 55000
+    assert spec.extra == {"sender_zmq_port": 55000, "from_stage": 0}
+    spec.extra["zmq_port"] = "${UNUSED_NIXL_BASE_PORT}"
+    assert resolve_connector_spec(spec, stage_id=1, role="receiver").extra["sender_zmq_port"] == 55000
+
+
+def test_middle_stage_advertises_its_outgoing_replica_endpoint():
+    from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 1
+    client.replica_id = 3
+    client.vllm_config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {
+                    "role": "receiver",
+                    "host": "10.0.0.1",
+                    "zmq_port": 47000,
+                    "from_stage": 0,
+                    "outgoing": {"host": "10.0.0.2", "zmq_port": 48000, "from_stage": 1},
+                },
+            }
+        )
+    )
+    assert client._build_payload_sender_info() == {"host": "10.0.0.2", "zmq_port": 51073}
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_claimed_source_survives_expiry_and_cleanup(producer, consumer, direct):
+    _, _, metadata = producer.put("0", "1", "claimed", torch.ones(1))
+    resolved = consumer._resolve_metadata("claimed", metadata if direct else None)
+    pending = producer._pending["claimed"]
+    pending.deadline = 0
+    producer._cleanup_expired_pending()
+    assert producer._pending.get("claimed") is pending
+    producer.cleanup("claimed")
+    assert producer._pending.get("claimed") is pending
+    assert producer._agent.registered
+    consumer._notify_transfer_done("claimed", resolved)
+    consumer._notify_transfer_done("claimed", resolved)
+    assert producer._pending == {}
+    assert producer._agent.registered == []
+
+
+def test_claims_are_generation_scoped_and_duplicate_ack_cannot_release_sibling(producer, consumer):
+    _, _, original = producer.put("0", "1", "owners", torch.ones(1))
+    first = consumer._resolve_metadata("owners", original)
+    second = consumer._resolve_metadata("owners", original)
+    assert first["claim_id"] != second["claim_id"]
+    assert not producer.put("0", "1", "owners", torch.zeros(1))[0]
+    consumer._notify_transfer_done("owners", first)
+    consumer._notify_transfer_done("owners", first)
+    assert len(producer._pending["owners"].claims) == 1
+    consumer._notify_transfer_done("owners", second)
+    assert not producer._pending
+    producer.put("0", "1", "owners", torch.zeros(1))
+    consumer._notify_transfer_done("owners", second)
+    assert "owners" in producer._pending
+    assert consumer._resolve_metadata("owners", original) is None
+
+
+@pytest.mark.parametrize("get_metadata", [None, {"schema_version": 1, "tensor_specs": [], "descriptor_groups": []}])
+def test_abandoned_claim_survives_close_and_late_completion(producer, consumer, get_metadata):
+    _, _, metadata = producer.put("0", "1", "abandoned", torch.ones(1))
+    claimed = consumer._resolve_metadata("abandoned", metadata)
+    producer._pending["abandoned"].deadline = 0
+    producer.close()
+    assert producer._closing and not producer._closed
+    assert producer._agent.registered
+    assert producer._listener_thread.is_alive()
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.put("0", "1", "new", torch.ones(1))
+    metrics = dict(producer._metrics)
+    with pytest.raises(RuntimeError, match="Cannot get data: NixlConnector is closed"):
+        producer.get("0", "1", "new", get_metadata)
+    assert producer._metrics == metrics
+    assert producer._pending["abandoned"].claims == {claimed["claim_id"]}
+    assert consumer._resolve_metadata("abandoned", metadata) is None
+    consumer._notify_transfer_done("abandoned", claimed)
+    assert not producer._pending
+    assert not producer._agent.registered
+    assert producer._listener_thread.is_alive()
+    producer.close()
+    assert not producer._agent.registered
+    assert producer._closed
+
+
+@pytest.fixture
+def copying_native_agent(consumer, monkeypatch):
+    """Strict fake descriptors and actual CPU copies; not native NIXL evidence."""
+    calls = []
+
+    def descriptors(regions, memory_type):
+        assert regions and all(region[0] > 0 and region[1] > 0 for region in regions)
+        return regions
+
+    def prepare(operation, local, local_ids, remote, remote_ids):
+        assert operation == "READ"
+        assert local_ids == remote_ids == list(range(len(local)))
+        return list(zip(local, remote, strict=True))
+
+    def transfer(pairs):
+        calls.append(pairs)
+        for destination, source in pairs:
+            assert destination[1] == source[1] > 0
+            ctypes.memmove(destination[0], source[0], source[1])
+
+    agent = consumer._agent
+    monkeypatch.setattr(agent, "add_remote_agent", lambda metadata: "producer", raising=False)
+    monkeypatch.setattr(agent, "get_xfer_descs", descriptors, raising=False)
+    monkeypatch.setattr(agent, "prep_xfer_dlist", lambda agent, descs: descs, raising=False)
+    monkeypatch.setattr(agent, "make_prepped_xfer", prepare, raising=False)
+    monkeypatch.setattr(agent, "transfer", transfer, raising=False)
+    monkeypatch.setattr(agent, "check_xfer_state", lambda handle: "DONE", raising=False)
+    for method in ("release_xfer_handle", "release_dlist_handle", "remove_remote_agent"):
+        monkeypatch.setattr(agent, method, lambda handle: None, raising=False)
+    return calls
+
+
+@pytest.mark.parametrize("case", ["empty", "all_empty", "mixed", "scalar", "structured_empty", "structured_mixed"])
+def test_zero_byte_leaves_roundtrip_without_native_descriptors(producer, consumer, copying_native_agent, case):
+    empty = torch.empty((2, 0, 3), dtype=torch.float64)
+    other = torch.empty((0,), dtype=torch.int64)
+    scalar = torch.tensor(7)
+    vector = torch.arange(6, dtype=torch.float32)
+    payload = {
+        "empty": empty,
+        "all_empty": [empty, other],
+        "mixed": [empty, scalar, other, vector],
+        "scalar": scalar,
+        "structured_empty": {"leaves": (empty, [other]), "label": "empty"},
+        "structured_mixed": {"leaves": (empty, [scalar, other, vector]), "label": "mixed"},
+    }[case]
+    ok, size, metadata = producer.put("0", "1", "empty-slots", payload)
+    assert ok
+    indices = [index for group in metadata["descriptor_groups"] for index in group["tensor_indices"]]
+    assert sorted(indices) == [i for i, spec in enumerate(metadata["tensor_specs"]) if spec["size"]]
+    actual, received_size = consumer.get("0", "1", "empty-slots", metadata)
+    if isinstance(payload, dict):
+        assert actual["label"] == payload["label"]
+        torch.testing.assert_close(actual["leaves"], payload["leaves"], rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(actual, payload, rtol=0, atol=0)
+    assert size == received_size
+    if case in ("empty", "all_empty"):
+        assert not copying_native_agent
+    assert not producer._pending and not producer._agent.registered
+    assert not consumer._agent.registered
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("outcome", ["done", "error", "timeout", "unknown"])
+def test_read_ownership_through_terminal_and_deferred_paths(
+    producer, consumer, copying_native_agent, monkeypatch, direct, outcome
+):
+    import threading
+
+    _, _, metadata = producer.put("0", "1", "active-read", torch.ones(2))
+    entered, proceed = threading.Event(), threading.Event()
+    state = ["PROC"]
+    monkeypatch.setattr(consumer._agent, "check_xfer_state", lambda handle: state[0])
+
+    def wait(handle, key):
+        entered.set()
+        assert proceed.wait(5)
+        if outcome == "done":
+            state[0] = "DONE"
+        elif outcome == "error":
+            state[0] = "ERR"
+            raise RuntimeError("terminal error")
+        else:
+            if outcome == "unknown":
+                state[0] = "UNKNOWN"
+            raise TimeoutError("still owned")
+
+    monkeypatch.setattr(consumer, "_wait_for_transfer", wait)
+    worker = threading.Thread(target=consumer.get, args=("0", "1", "active-read", metadata if direct else None))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        pending = producer._pending["active-read"]
+        pending.deadline = 0
+        producer._cleanup_expired_pending()
+        producer.cleanup("active-read")
+        assert producer._pending["active-read"] is pending
+        assert producer._agent.registered
+    finally:
+        proceed.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    if outcome in ("timeout", "unknown"):
+        assert producer._agent.registered
+        assert consumer._deferred_transfers
+        consumer._reap_deferred_transfers()
+        assert producer._agent.registered
+        state[0] = "DONE"
+        deadline = time.monotonic() + 5
+        while producer._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert not producer._pending
+    assert not producer._agent.registered
 
 
 class _FakeNixlAgent:
@@ -75,6 +321,16 @@ def nixl_connector_cls(monkeypatch):
 def producer(nixl_connector_cls):
     connector = nixl_connector_cls({"role": "sender", "host": "127.0.0.1", "zmq_port": PORT})
     yield connector
+    # These control-plane tests do not submit DMA. Explicitly complete claims
+    # made by metadata-only probes before tearing down the shared port.
+    for key, pending in list(connector._pending.items()):
+        for claim in list(pending.claims):
+            from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _XFER_DONE_MSG
+
+            connector._handle_handshake_message(
+                _XFER_DONE_MSG
+                + msgspec.msgpack.encode({"key": key, "generation": pending.generation, "claim_id": claim})
+            )
     connector.close()
 
 
@@ -105,14 +361,15 @@ def test_handshake_serves_metadata_when_caller_has_none(producer, consumer):
 
     # msgpack has no tuple type, so region descriptors arrive as lists; get()
     # re-tuples them before handing them to NIXL.
+    assert resolved.pop("claim_id")
     assert resolved == msgspec.msgpack.decode(msgspec.msgpack.encode(published))
     assert [tuple(region) for group in resolved["descriptor_groups"] for region in group["regions"]] == [
         region for group in published["descriptor_groups"] for region in group["regions"]
     ]
 
 
-def test_metadata_passed_by_caller_skips_the_handshake(consumer):
-    """The diffusion path forwards put()'s metadata and must not need a socket."""
+def test_legacy_metadata_without_generation_skips_the_handshake(consumer):
+    """Externally owned metadata without a generation needs no ownership claim."""
     direct = {"schema_version": 1, "kind": "tensors", "tensor_specs": []}
 
     assert consumer._resolve_metadata("req-2", direct) is direct
@@ -158,6 +415,7 @@ def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     _, _, metadata = producer.put("0", "1", "req-3", torch.arange(4, dtype=torch.float32))
     assert producer._pending and producer._agent.registered
 
+    metadata = consumer._resolve_metadata("req-3", metadata)
     consumer._notify_transfer_done("req-3", metadata)
 
     assert producer._pending == {}
@@ -165,13 +423,14 @@ def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     assert producer._agent.registered == []
 
 
-def test_handshake_stays_off_without_configuration(nixl_connector_cls):
+def test_direct_metadata_has_ephemeral_ownership_endpoint(nixl_connector_cls):
     connector = nixl_connector_cls({})
     try:
-        assert connector._zmq_ctx is None
-        assert connector._listener_thread is None
+        assert connector._zmq_ctx is not None
+        assert connector._listener_thread is not None
         _, _, metadata = connector.put("0", "1", "req-4", torch.zeros(2))
-        assert "sender_host" not in metadata
+        assert metadata["sender_host"]
+        assert metadata["sender_zmq_port"] > 0
     finally:
         connector.close()
 
@@ -458,7 +717,9 @@ def test_descriptor_groups_require_exact_tensor_index_partition(nixl_connector_c
     }
 
     with pytest.raises(RuntimeError, match="exact partition"):
-        nixl_connector_cls._validated_descriptor_groups(metadata, 2)
+        nixl_connector_cls._validated_descriptor_groups(
+            metadata, [{"shape": [1], "dtype": "torch.float32", "size": 4}] * 2
+        )
 
 
 def test_receive_device_ignores_the_producer_index(nixl_connector_cls):
