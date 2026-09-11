@@ -644,6 +644,7 @@ def test_pure_ulysses_parallel_config_is_supported() -> None:
         {"ring_degree": 2},  # Isolate each clause from the SP-size mismatch.
         {"allgather_degree": 2},
         {"ulysses_mode": "advanced_uaa"},
+        {"ulysses_a2a_permute": True},
         {"ulysses_degree": None},  # Missing degree must not imply pure Ulysses.
     ],
 )
