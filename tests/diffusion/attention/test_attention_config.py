@@ -907,6 +907,9 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
                 forward=lambda *args: pytest.fail("unexpected SDPA fallback"),
             ),
             _assert_metadata_compatible=lambda metadata: None,
+            # No metadata here, so no mask can need rerouting; the stub only has to
+            # answer the question ``_run_local_attention`` now asks before dispatch.
+            _mask_needs_sdpa=lambda metadata: False,
             _has_custom_attention=False,
             _scheduler_paged_kv=False,
             paged_kv_cache_role=None,

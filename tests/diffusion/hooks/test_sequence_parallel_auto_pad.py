@@ -34,7 +34,7 @@ INDIVISIBLE_SEQ_LEN = 5  # 5 % 2 != 0, so the auto-pad branch runs
 
 class _MaskCapableBackend:
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
         return True
 
     @staticmethod
@@ -46,7 +46,7 @@ class _MaskBlindBackend:
     """Stands in for SAGE_ATTN / RAINFUSION_ATTN / TRTLLM_ATTN."""
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
         return False
 
     @staticmethod
@@ -95,10 +95,13 @@ def auto_pad(monkeypatch):
         def _selector(**kwargs):
             """Record that the selector ran, and with which arguments."""
             selector_calls.append(kwargs)
-            return backend, None
+            return backend
 
+        # ``get_attn_backend_for_capability``, not ``get_attn_backend_for_role``: auto-pad
+        # has no ``head_size`` to offer, so it uses the capability-only selector, which
+        # returns the backend class bare rather than a ``(backend, head_size)`` pair.
         monkeypatch.setattr(
-            "vllm_omni.diffusion.attention.selector.get_attn_backend_for_role",
+            "vllm_omni.diffusion.attention.selector.get_attn_backend_for_capability",
             _selector,
         )
         # Taken by the already-divisible early return; the real one needs a live SP group.
@@ -180,7 +183,7 @@ def test_guard_is_called_not_merely_referenced(auto_pad):
 
     class _NeverCalled(_MaskBlindBackend):
         @classmethod
-        def supports_attention_mask(cls):  # noqa: ANN206 - deliberately not a bool subclass
+        def supports_attention_mask(cls, attention_spec=None):  # noqa: ANN206 - deliberately not a bool subclass
             raise AssertionError("supports_attention_mask must be called, not inspected")
 
     with pytest.raises(AssertionError, match="must be called"):
