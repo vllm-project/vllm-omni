@@ -70,6 +70,17 @@ retain floating-point transport. See the
 [transport guide](../../docs/user_guide/diffusion/device_side_video_postprocess.md)
 for precision and memory fallback behavior.
 
+For compatible serialized ModelOpt FP8/NVFP4 Dreams artifacts, the inherited
+`cosmos3_mixed_precision` policy is evaluated separately for each four-step
+denoising chunk. Clean-frame KV commits (including the initial conditioning
+frame) use the final step's precision. Generation precision resets after every
+chunk or commit, including failures; the reasoner follows its independent policy.
+BF16 artifacts do not enable this schedule. The upstream default of three first
+and three last A16 steps covers all four Dreams steps. For example, setting
+`first_steps=1` and `last_steps=1` selects A16/native/native/A16 per chunk.
+See the [ModelOpt schedule documentation](../../docs/user_guide/quantization/modelopt.md#cosmos3-mixed-precision-schedule)
+for checkpoint requirements and runtime configuration.
+
 Checkpoint identity, hash, domain map, and normalizer data are deliberately not
 template defaults: they must be read from `transformer/config.json`. Startup
 rejects a deploy override that contradicts those embedded artifact fields.

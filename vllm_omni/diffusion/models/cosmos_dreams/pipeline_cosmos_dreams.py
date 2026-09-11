@@ -815,21 +815,28 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         domain_ids: torch.Tensor,
         null_action: bool,
     ) -> None:
-        self._transformer_forward(
-            state,
-            latent.to(self.dtype),
-            torch.zeros(1, device=self.device, dtype=torch.float32),
-            geometry=geometry,
-            text_kv=text_kv,
-            real_text_kv_len=real_text_kv_len,
-            frame_start=frame_idx,
-            fps=fps,
-            action_latents=action,
-            action_domain_ids=domain_ids,
-            condition_vision=True,
-            null_action_frame_indexes=(0,) if null_action else (),
-            commit_current=True,
-        )
+        # Clean t=0 cache writes use the final denoising step's policy. Select
+        # it explicitly for both the initial conditioning frame and generated
+        # frames; neither should depend on a preceding forward's precision.
+        try:
+            self._set_mixed_precision_step(self._distilled_num_steps - 1, self._distilled_num_steps)
+            self._transformer_forward(
+                state,
+                latent.to(self.dtype),
+                torch.zeros(1, device=self.device, dtype=torch.float32),
+                geometry=geometry,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                frame_start=frame_idx,
+                fps=fps,
+                action_latents=action,
+                action_domain_ids=domain_ids,
+                condition_vision=True,
+                null_action_frame_indexes=(0,) if null_action else (),
+                commit_current=True,
+            )
+        finally:
+            self._reset_mixed_precision()
 
     def _denormalize_vae_latents(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.to(device=self.device, dtype=self.vae.dtype)
@@ -905,23 +912,28 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         generator: torch.Generator,
     ) -> torch.Tensor:
         """Run one state-aware chunk with the inherited distilled scheduler."""
-        self._set_timesteps(
-            self._distilled_num_steps,
-            device=initial_noise.device,
-            shift=1.0,
-        )
-        latents = initial_noise.float()
-        for timestep in self.scheduler.timesteps:
-            model_timestep = timestep.expand(latents.shape[0])
-            velocity = velocity_fn(latents, model_timestep)
-            latents = self.scheduler.step(
-                velocity,
-                timestep,
-                latents,
-                generator=generator,
-                return_dict=False,
-            )[0]
-        return latents
+        try:
+            self._set_timesteps(
+                self._distilled_num_steps,
+                device=initial_noise.device,
+                shift=1.0,
+            )
+            latents = initial_noise.float()
+            timesteps = self.scheduler.timesteps
+            for step_index, timestep in enumerate(timesteps):
+                self._set_mixed_precision_step(step_index, len(timesteps))
+                model_timestep = timestep.expand(latents.shape[0])
+                velocity = velocity_fn(latents, model_timestep)
+                latents = self.scheduler.step(
+                    velocity,
+                    timestep,
+                    latents,
+                    generator=generator,
+                    return_dict=False,
+                )[0]
+            return latents
+        finally:
+            self._reset_mixed_precision()
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
