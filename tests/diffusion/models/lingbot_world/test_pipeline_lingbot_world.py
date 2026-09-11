@@ -126,8 +126,6 @@ class _RecordingTransformer(nn.Module):
             sink_size=3,
         )
         self.blocks = nn.ModuleList([nn.Identity(), nn.Identity()])
-        for block in self.blocks:
-            block.self_attn = SimpleNamespace(num_local_heads=2, head_dim=4)
         self.calls: list[dict] = []
         self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
@@ -387,6 +385,9 @@ def _od_config(**overrides):
         "parallel_config": SimpleNamespace(
             pipeline_parallel_size=1,
             sequence_parallel_size=1,
+            ulysses_degree=1,
+            ring_degree=1,
+            allgather_degree=1,
             cfg_parallel_size=1,
             vae_patch_parallel_size=1,
             use_hsdp=False,
@@ -438,15 +439,15 @@ def test_pipeline_respects_loader_managed_component_placement(offload_field: str
     assert getattr(pipeline.vae, "to_calls", []) == []
 
 
-def test_ar_diffusion_capability_uses_fixed_tp_local_lingbot_geometry() -> None:
+def test_ar_diffusion_capability_uses_transformer_local_head_geometry() -> None:
     module = _load_pipeline_module()
-    module.get_tensor_model_parallel_world_size = lambda: 1
     pipeline = _pipeline(module)
-
+    # Use the constructed head count even when the config describes a different geometry.
+    pipeline.transformer.blocks[0].self_attn = SimpleNamespace(num_sp_heads=1)
     spec = pipeline.ar_diffusion_kv_cache_spec()
 
     assert spec.num_layers == 2
-    assert spec.num_kv_heads == 2
+    assert spec.num_kv_heads == 1
     assert spec.head_size == 4
     assert spec.tokens_per_frame == 1
     assert spec.frames_per_block == 3
@@ -604,7 +605,6 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     ("field", "value", "feature"),
     [
         ("pipeline_parallel_size", 2, "pipeline parallelism"),
-        ("sequence_parallel_size", 2, "sequence parallelism"),
         ("cfg_parallel_size", 2, "CFG parallelism"),
         ("vae_patch_parallel_size", 2, "VAE parallelism"),
         ("use_hsdp", True, "HSDP"),
@@ -619,6 +619,43 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
     with pytest.raises(NotImplementedError, match=feature):
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
 
+    assert module._loader_state.prefetch_calls == []
+
+
+def test_pure_ulysses_parallel_config_is_supported() -> None:
+    module = _load_pipeline_module()
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = 2
+    parallel_config.ulysses_degree = 2
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
+
+    assert pipeline.transformer is not None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sequence_parallel_size": 4, "ring_degree": 2},  # Normalized hybrid.
+        {"ulysses_degree": 1, "allgather_degree": 2},  # Normalized AllGather-KV.
+        {"ring_degree": 2},  # Isolate each clause from the SP-size mismatch.
+        {"allgather_degree": 2},
+        {"ulysses_mode": "advanced_uaa"},
+        {"ulysses_a2a_permute": True},
+        {"ulysses_degree": None},  # Missing degree must not imply pure Ulysses.
+    ],
+)
+def test_unsupported_sp_config_fails_before_component_loading(overrides):
+    module = _load_pipeline_module()
+    config = _od_config().parallel_config
+    config.sequence_parallel_size = config.ulysses_degree = 2
+    for name, value in overrides.items():
+        if value is None:
+            delattr(config, name)
+        else:
+            setattr(config, name, value)
+    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=config))
     assert module._loader_state.prefetch_calls == []
 
 

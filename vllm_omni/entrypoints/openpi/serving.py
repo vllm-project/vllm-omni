@@ -148,16 +148,32 @@ class ServingRealtimeRobotOpenPI:
         `AsyncOmni.generate()` and routed to the diffusion stage.
         """
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.entrypoints.openai.stage_params import (
+            clone_sampling_params,
+            get_default_sampling_params_list,
+        )
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        # An optional integer ``seed`` in the inference message becomes the engine request's
-        # ``sampling_params.seed``; omitted, ``OmniDiffusionRequest`` assigns a random one.
+        # The engine applies stage default_sampling_params only to requests
+        # that carry no explicit params; this endpoint always passes explicit
+        # params, so start from a clone of the diffusion stage's defaults
+        # (e.g. a policy deploy yaml's ``extra_args``) and layer the OpenPI
+        # protocol fields on top.
         seed = obs.pop("seed", None)
-        extra_args = {
-            "reset": reset,
-            "session_id": session_id,
-            "robot_obs": obs,
-        }
+        sampling_params = OmniDiffusionSamplingParams()
+        for default_params in get_default_sampling_params_list(self.engine_client):
+            if isinstance(default_params, OmniDiffusionSamplingParams):
+                sampling_params = clone_sampling_params(default_params)
+                break
+
+        extra_args = sampling_params.extra_args or {}
+        extra_args.update(
+            {
+                "reset": reset,
+                "session_id": session_id,
+                "robot_obs": obs,
+            }
+        )
 
         prompt = obs.get("prompt", "")
         sampling_params = OmniDiffusionSamplingParams(

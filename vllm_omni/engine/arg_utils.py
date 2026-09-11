@@ -381,9 +381,9 @@ class OmniEngineArgs(EngineArgs):
                 if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
-                        from huggingface_hub import snapshot_download
+                        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                        local_dir = snapshot_download(
+                        local_dir = hf_api().snapshot_download(
                             model_path,
                             allow_patterns=[
                                 f"{tokenizer_subfolder}/tokenizer*",
@@ -443,8 +443,8 @@ class OmniEngineArgs(EngineArgs):
 @dataclass
 class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
     @classmethod
-    def add_cli_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        parser = AsyncEngineArgs.add_cli_args(parser)
+    def add_cli_args(cls, parser: argparse.ArgumentParser, async_args_only: bool = False) -> argparse.ArgumentParser:
+        parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=async_args_only)
         parser = OmniEngineArgs._add_omni_specific_args(parser)
         return parser
 
@@ -566,11 +566,13 @@ class OrchestratorArgs:
     diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
+    video_output_transport: dict[str, object] | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
     diffusion_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage

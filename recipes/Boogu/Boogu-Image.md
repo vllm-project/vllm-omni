@@ -152,7 +152,7 @@ The following configuration was validated:
 - vLLM-Omni version or commit: Use a commit that contains TorchAO FP8
   checkpoint loading for diffusion models
 - TorchAO version: 0.17.0
-- `kernels` / `kernels-data`: 0.15.2 / 0.16.1
+- `kernels` / `kernels-data`: 0.16.1 / matching kernels-data
 
 #### Command
 

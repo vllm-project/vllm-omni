@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -61,6 +61,10 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
             return self.tiled_decode(z, return_dict=return_dict)
 
         return self._decode_temporal(z, return_dict=return_dict)
+
+    # Chunks are published straight from the decoder, clamped to the
+    # checkpoint's output range.
+    chunk_value_range: ClassVar[tuple[float, float]] = (-1.0, 1.0)
 
     @apply_forward_hook
     def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared scaffolding for OmniOpenAIServingChat unit tests.
 
 Provides factories for a minimal serving-chat instance, chat requests, and
@@ -8,11 +9,11 @@ OmniRequestOutput objects, plus SSE stream collection/parsing utilities.
 import json
 from unittest.mock import MagicMock
 
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponseStreamChoice,
 )
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.outputs import CompletionOutput, RequestOutput
 

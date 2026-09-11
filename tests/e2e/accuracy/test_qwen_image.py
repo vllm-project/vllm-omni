@@ -34,11 +34,7 @@ TRUE_CFG_SCALE = 4.0
 SEED = 42
 SSIM_THRESHOLD = 0.94
 # With --fa-deterministic, H100 nightlies stably land near SSIM 0.958 / PSNR 27.8
-# vs Diffusers (see #5734 / #5963), so the primary gates are 0.94 / 27.0.
-# The SDPA-matched fallback (hub kernel unavailable for the image's torch)
-# landed at SSIM 0.9687 in build 2954 — keep a slightly tighter SSIM gate for
-# that path only.
-SSIM_THRESHOLD_SDPA_FALLBACK = 0.96
+# vs Diffusers on the FA3 hub path (see #5734 / #5963 / #6971).
 PSNR_THRESHOLD = 27.0
 
 MODEL_2512_ID = "Qwen/Qwen-Image-2512"
@@ -65,44 +61,6 @@ MEAN_ABS_DIFF_THRESHOLD_2512 = 3e-2
 P99_ABS_DIFF_THRESHOLD_2512 = 4e-1
 
 
-_FLASH_ATTN3_HUB_AVAILABLE: bool | None = None
-
-
-def _flash_attn3_hub_available() -> bool:
-    """Whether kernels-community/flash-attn3 has a build for this torch/CUDA.
-
-    The hub repo only ships prebuilt variants for specific torch versions;
-    a base-image torch bump can outrun it (build 2952 failed with "Cannot
-    find a build variant for this system"). When it is unavailable, both
-    sides of the comparison fall back to torch SDPA together — the test
-    compares implementations, so the attention math must stay matched.
-    """
-    global _FLASH_ATTN3_HUB_AVAILABLE
-    if _FLASH_ATTN3_HUB_AVAILABLE is None:
-        try:
-            from kernels import get_kernel
-
-            get_kernel("kernels-community/flash-attn3")
-            _FLASH_ATTN3_HUB_AVAILABLE = True
-        except Exception as exc:
-            print(f"kernels-community/flash-attn3 unavailable ({exc}); using matched torch SDPA on both sides.")
-            _FLASH_ATTN3_HUB_AVAILABLE = False
-    return _FLASH_ATTN3_HUB_AVAILABLE
-
-
-def _omni_server_env() -> dict[str, str] | None:
-    if _flash_attn3_hub_available():
-        return None
-    return {"DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA"}
-
-
-def _set_reference_attention_backend(pipe: DiffusionPipeline) -> None:
-    if _flash_attn3_hub_available():
-        pipe.transformer.set_attention_backend("_flash_3_hub")
-    else:
-        pipe.transformer.set_attention_backend("native")
-
-
 def _model_name() -> str:
     return os.environ.get(MODEL_ENV_VAR, MODEL_ID)
 
@@ -115,7 +73,22 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
+_OMNI_FA3_HUB_BACKEND = "FLASH_ATTN_3_HUB"
+_OMNI_FA3_HUB_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_FA3_HUB_BACKEND}
+
+
+def _assert_omni_fa3_hub_resolves() -> None:
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(_OMNI_FA3_HUB_BACKEND, head_size=128)
+    expected = DiffusionAttentionBackendEnum.FLASH_ATTN_3_HUB.get_path()
+    assert path == expected, path
+    print(f"Resolved Omni attention backend: {_OMNI_FA3_HUB_BACKEND} -> {path}")
+
+
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
+    _assert_omni_fa3_hub_resolves()
     server_args = [
         "--num-gpus",
         "1",
@@ -124,8 +97,10 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
         "--init-timeout",
         "900",
         "--fa-deterministic",
+        "--diffusion-attention-backend",
+        _OMNI_FA3_HUB_BACKEND,
     ]
-    with OmniServer(model, server_args, use_omni=True, env_dict=_omni_server_env()) as omni_server:
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -161,7 +136,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        _set_reference_attention_backend(pipe)
+        pipe.transformer.set_attention_backend("_flash_3_hub")
         generator = torch.Generator(device="cuda").manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT,
@@ -186,8 +161,18 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    server_args = ["--num-gpus", "1", "--stage-init-timeout", "300", "--init-timeout", "900"]
-    with OmniServer(model, server_args, use_omni=True, env_dict=_omni_server_env()) as omni_server:
+    _assert_omni_fa3_hub_resolves()
+    server_args = [
+        "--num-gpus",
+        "1",
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+        "--diffusion-attention-backend",
+        _OMNI_FA3_HUB_BACKEND,
+    ]
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -223,7 +208,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        _set_reference_attention_backend(pipe)
+        pipe.transformer.set_attention_backend("_flash_3_hub")
         generator = torch.Generator(device="cuda").manual_seed(SEED_2512)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT_2512,
@@ -262,7 +247,7 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
         diffusers_image=diffusers_output,
         width=WIDTH,
         height=HEIGHT,
-        ssim_threshold=SSIM_THRESHOLD if _flash_attn3_hub_available() else SSIM_THRESHOLD_SDPA_FALLBACK,
+        ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
     )
 
