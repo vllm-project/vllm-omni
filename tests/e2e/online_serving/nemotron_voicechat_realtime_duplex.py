@@ -215,7 +215,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     client.events.count("response.function_call_arguments.done") > 0
                     if args.expect_function_call
                     else (
-                        client.events.count("response.audio.delta") >= args.minimum_audio_chunks
+                        client.events.count("response.output_audio.delta") >= args.minimum_audio_chunks
                         and (
                             args.allow_incomplete_response
                             or client.events.count("response.done") > completed_responses_at_commit
@@ -279,10 +279,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     transcript = "".join(
                         str(event.get("delta", ""))
                         for event in later
-                        if event.get("type") == "response.audio_transcript.delta"
+                        if event.get("type") == "response.output_audio_transcript.delta"
                     ).lower()
                     return (
-                        any(event.get("type") == "response.audio.delta" for event in later)
+                        any(event.get("type") == "response.output_audio.delta" for event in later)
                         and any(event.get("type") == "response.done" for event in later)
                         and (args.expected_post_tool_text is None or args.expected_post_tool_text.lower() in transcript)
                     )
@@ -297,7 +297,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 await asyncio.sleep(args.drain_s)
 
         audio = client.events.audio_bytes()
-        audio_events = _events(client, "response.audio.delta")
+        audio_events = _events(client, "response.output_audio.delta")
         rates = {event.get("sample_rate_hz") for event in audio_events}
         if not args.expect_function_call and audio and rates != {OUTPUT_SAMPLE_RATE_HZ}:
             raise AssertionError(f"unexpected output sample rates: {rates}")

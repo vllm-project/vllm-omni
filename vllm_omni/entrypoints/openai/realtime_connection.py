@@ -176,7 +176,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     sent_audio = True
                     await self.send_json(
                         {
-                            "type": "response.audio.delta",
+                            "type": "response.output_audio.delta",
                             "audio": self._pcm16_b64(chunk),
                             "format": "pcm16",
                             "sample_rate_hz": sample_rate,
@@ -194,7 +194,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             await self.send(TranscriptionDone(text=full_text, usage=usage))
 
             if sent_audio:
-                await self.send_json({"type": "response.audio.done", "has_audio": True})
+                await self.send_json({"type": "response.output_audio.done", "has_audio": True})
                 audio_done_sent = True
         except Exception as e:
             logger.exception("Error in generation: %s", e)
@@ -213,9 +213,9 @@ class RealtimeConnection(VllmRealtimeConnection):
             # Always send terminal event so clients don't hang forever.
             if self._is_connected and not audio_done_sent:
                 try:
-                    await self.send_json({"type": "response.audio.done", "has_audio": sent_audio})
+                    await self.send_json({"type": "response.output_audio.done", "has_audio": sent_audio})
                 except Exception:
-                    logger.exception("Failed to send response.audio.done")
+                    logger.exception("Failed to send response.output_audio.done")
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
 

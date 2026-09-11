@@ -71,6 +71,16 @@ def _nonneg_finite_float(value: str) -> float:
     return parsed
 
 
+def _json_object(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return parsed
+
+
 def _ensure_vllm_platform():
     """Ensure vLLM's current_platform is valid before arg parsing.
 
@@ -670,6 +680,14 @@ class OmniServeCommand(CLISubcommand):
             "Calibration mode: add '\"mag_calibrate\": true'",
         )
         omni_config_group.add_argument(
+            "--video-output-transport",
+            type=_json_object,
+            default=None,
+            help=(
+                "JSON object configuring video output preparation, for example '{\"enable_device_postprocess\": true}'."
+            ),
+        )
+        omni_config_group.add_argument(
             "--enable-cache-dit-summary",
             action="store_true",
             help="Enable cache-dit summary logging after diffusion forward passes.",
@@ -707,6 +725,13 @@ class OmniServeCommand(CLISubcommand):
             dest="enable_multithread_weight_load",
             default=True,
             help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
+        )
+        omni_config_group.add_argument(
+            "--enable-broadcast-weight-load",
+            action="store_true",
+            dest="enable_broadcast_weight_load",
+            default=False,
+            help="Enable Rank-0 shared weight broadcast across workers for HSDP (default: disabled).",
         )
         omni_config_group.add_argument(
             "--num-weight-load-threads",
@@ -912,6 +937,15 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Disable Cosmos3 text/video safety guardrails for this server.",
         )
+        omni_config_group.add_argument(
+            "--robot-openpi-idle-timeout",
+            type=_nonneg_finite_float,
+            default=30.0,
+            help=(
+                "Seconds the /v1/realtime/robot/openpi endpoint waits for the next request "
+                "before closing an idle WebSocket (default: 30). Set to 0 to disable the timeout."
+            ),
+        )
 
         # Enable diffusion pipeline profiling
         omni_config_group.add_argument(
@@ -993,6 +1027,8 @@ def run_headless(args: TrackingNamespace) -> None:
 
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
+    # This controls only the API-process WebSocket and is not a stage-engine option.
+    args_dict.pop("robot_openpi_idle_timeout", None)
     # This CLI-only negative alias is consumed below when selecting the
     # launcher log_stats value; it is not a per-stage config override.
     args_dict.pop("disable_log_stats", None)

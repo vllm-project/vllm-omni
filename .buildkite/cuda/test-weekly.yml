@@ -29,36 +29,42 @@ steps:
     steps:
 
       - label: "Reliability Test · qwen3-omni"
+        source_file_dependencies: omni_qwen3_omni_reliability
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · wan22"
+        source_file_dependencies: diffusion_wan22_reliability
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · hunyuan-image"
+        source_file_dependencies: diffusion_hunyuan_image3_reliability
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
         mirror_hardwares: h100_4
 
       - label: "Reliability Test · Invalid parameters · H100 · Single-GPU"
+        source_file_dependencies: reliability_invalid_param_h100
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_1"
         mirror_hardwares: h100_1
 
       - label: "Reliability Test · Invalid parameters · H100 · 2-GPU"
+        source_file_dependencies: reliability_invalid_param_h100
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_2"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · Invalid parameters · L4"
+        source_file_dependencies: reliability_invalid_param_l4
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
@@ -70,6 +76,7 @@ steps:
     steps:
 
       - label: ":full_moon: Omni · Perf Test · vLLM Text"
+        source_file_dependencies: omni_qwen3_omni_perf
         key: weekly-omni-performance-vllm-text
         timeout_in_minutes: 180
         commands:
@@ -96,6 +103,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · Perf Test · Multi-Replica"
+        source_file_dependencies: omni_qwen3_omni_perf
         key: weekly-omni-performance-multi-replicas
         timeout_in_minutes: 180
         commands:
@@ -221,21 +229,262 @@ steps:
             --run-level "full_model"
         mirror_hardwares: l4_4
 
-      - label: "Diffusion · H100 · Single-GPU"
-        timeout_in_minutes: 150
+      # Split the old shared H100 Single-GPU sweep: one pytest process collected
+      # every slow+cards_1 diffusion file and exceeded 150 minutes.
+      - label: "Diffusion · Qwen-Image · H100 · Single-GPU"
+        timeout_in_minutes: 120
         commands:
           - >-
             pytest -sv
-            tests/e2e/ -m "slow and diffusion and H100 and cards_1"
+            tests/e2e/online_serving/test_qwen_image_edit.py
+            tests/e2e/online_serving/test_qwen_image_edit_expansion.py
+            tests/e2e/online_serving/test_qwen_image_layered.py
+            tests/e2e/online_serving/test_qwen_image_layered_expansion.py
+            tests/e2e/accuracy/test_qwen_image_edit.py
+            tests/e2e/accuracy/test_qwen_image_layered.py
+            -m "slow and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1
 
-      - label: "Diffusion · H100 · 2-GPU"
+      - label: "Diffusion · Wan2.1 VACE · H100 · Single-GPU"
         timeout_in_minutes: 90
         commands:
           - >-
             pytest -sv
-            tests/e2e/ -m "slow and diffusion and H100 and cards_2"
+            tests/e2e/online_serving/test_wan_2_1_vace_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · LongCat · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_longcat_image_expansion.py
+            tests/e2e/online_serving/test_longcat_image_edit_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Bagel · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_bagel.py
+            tests/e2e/online_serving/test_bagel_expansion.py
+            tests/e2e/offline_inference/test_bagel.py
+            tests/e2e/offline_inference/test_bagel_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Boogu · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_boogu_image.py
+            tests/e2e/online_serving/test_boogu_image_edit.py
+            tests/e2e/online_serving/test_boogu_image_expansion.py
+            tests/e2e/online_serving/test_boogu_image_edit_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Flux · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_flux_2_dev_expansion.py
+            tests/e2e/offline_inference/test_flux1_schnell_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · LTX · H100 · Single-GPU"
+        timeout_in_minutes: 120
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_ltx.py
+            tests/e2e/online_serving/test_ltx25.py
+            tests/e2e/accuracy/ltx/test_ltx_official_similarity.py
+            tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Krea2 · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_krea2_expansion.py
+            tests/e2e/offline_inference/test_krea2_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · HiDream-I1 · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_hidream_i1_full_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · SANA-Video · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_sana_video_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · SenseNova-U1 · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/offline_inference/test_sensenova_u1_expansion.py
+            tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py
+            tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · MammothModa2 · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/offline_inference/test_mammoth_moda2_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Helios · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/accuracy/test_video_streaming_output_similarity.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      # Split the old shared H100 2-GPU sweep: one pytest process collected every
+      # slow+cards_2 diffusion file and exceeded 90 minutes.
+      - label: "Diffusion · Qwen-Image · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_qwen_image_edit_expansion.py
+            tests/e2e/online_serving/test_qwen_image_layered_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · Wan2.1 VACE · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_wan_2_1_vace_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · LongCat · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_longcat_image_expansion.py
+            tests/e2e/online_serving/test_longcat_image_edit_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · Bagel · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_bagel_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · Boogu · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_boogu_image_expansion.py
+            tests/e2e/online_serving/test_boogu_image_edit_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · Flux · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_flux_2_dev_expansion.py
+            tests/e2e/offline_inference/test_flux1_kontext_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · GLM-Image · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_glm_image_expansion.py
+            tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · LTX · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_ltx.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · Krea2 · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/offline_inference/test_krea2_expansion.py
+            -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · DreamZero · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_dreamzero_expansion.py
+            tests/e2e/accuracy/test_dreamzero.py
+            -m "slow and diffusion and H100 and cards_2"
             --run-level "full_model"
         mirror_hardwares: h100_2
 
@@ -246,4 +495,33 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and diffusion and H100 and cards_4"
             --run-level "full_model"
+            --ignore=tests/e2e/online_serving/test_magi2.py
+        mirror_hardwares: h100_4
+
+      # Dedicated: HiDream-O1 accuracy needs a long TP2 run; the shared H100
+      # 2-GPU sweep is only 90 minutes.
+      - label: "Diffusion · HiDream-O1-Image Accuracy · H100 · 2-GPU"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m "slow and diffusion and cuda and H100 and cards_2" --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      # Dedicated: Boogu CFG-parallel size 3 needs 3 GPUs; weekly has no H100 3-GPU sweep.
+      - label: "Diffusion · Boogu Edit CFG · H100 · 3-GPU"
+        timeout_in_minutes: 120
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_boogu_image_edit_expansion.py
+            -k "test_double_guidance_cfg_parallel and cfg_parallel_3_full"
+            -m "slow and diffusion and cuda and H100 and cards_3"
+            --run-level "full_model"
+        mirror_hardwares: h100_3
+
+      # Dedicated: MAGI-2 Preview serving smoke needs ~30 min server init; the
+      # shared H100 4-GPU sweep is only 90 minutes.
+      - label: "Diffusion · MAGI-2 Preview Serving Smoke · H100 · 4-GPU"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_magi2.py -m "slow and diffusion and cuda and H100 and cards_4" --run-level "full_model"
         mirror_hardwares: h100_4

@@ -6,14 +6,14 @@
 This client:
 1) Reads a local WAV file (must be mono, 16-bit PCM, 16kHz),
 2) Streams PCM16 chunks to /v1/realtime with OpenAI-style events,
-3) Receives response.audio.*, response.output_text.*, and transcript events,
+3) Receives response.output_audio.*, response.output_text.*, and transcript events,
 4) Saves synthesized audio to an output WAV file and optional text file.
 
-By default each ``response.audio.delta`` is treated as an **incremental PCM**
+By default each ``response.output_audio.delta`` is treated as an **incremental PCM**
 chunk and all chunks are concatenated into the final ``--output-wav``.
 
 Optional debugging: pass ``--delta-dump-dir DIR`` to write every
-``response.audio.delta`` payload as ``delta_000001.wav``, ``delta_000002.wav``, …
+``response.output_audio.delta`` payload as ``delta_000001.wav``, ``delta_000002.wav``, …
 
 Usage:
   python openai_realtime_client.py \
@@ -187,7 +187,7 @@ async def run_client(
             if event_type == "session.created":
                 continue
 
-            if event_type == "response.audio.delta":
+            if event_type == "response.output_audio.delta":
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
                     output_sample_rate = sr
@@ -223,11 +223,11 @@ async def run_client(
                     print(f"{log_prefix}text usage: {usage}")
                 continue
 
-            if event_type == "response.audio_transcript.done":
+            if event_type == "response.output_audio_transcript.done":
                 final_audio_transcript = event.get("transcript", "")
                 continue
 
-            if event_type == "response.audio.done":
+            if event_type == "response.output_audio.done":
                 if not server_vad:
                     break
                 continue
@@ -339,7 +339,7 @@ def main() -> None:
         "--delta-dump-dir",
         type=Path,
         default=None,
-        help="If set, each response.audio.delta is saved as delta_NNNNNN.wav under this directory",
+        help="If set, each response.output_audio.delta is saved as delta_NNNNNN.wav under this directory",
     )
     parser.add_argument(
         "--server-vad",
