@@ -482,7 +482,7 @@ def test_ltx_t2a_registry_and_postprocess_entries():
         "LTX2TextToAudioPipeline",
     )
     assert _DIFFUSION_POST_PROCESS_FUNCS["LTX2TextToAudioPipeline"] == "get_ltx2_audio_post_process_func"
-    assert "LTX2TextToAudioPipeline" not in _NO_CACHE_ACCELERATION
+    assert "LTX2TextToAudioPipeline" in _NO_CACHE_ACCELERATION
 
 
 def test_ltx_t2a_weight_source_filters_video_tensors_before_materialization(tmp_path, monkeypatch):
