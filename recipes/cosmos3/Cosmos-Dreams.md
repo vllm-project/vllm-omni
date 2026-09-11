@@ -60,6 +60,16 @@ The default is eager, batch size one, 720×1280, one resident session, and a
 96-latent-frame window. Each request resolves an aligned canvas and selects a
 matching paged KV pool; the maximum permitted geometry is validated at load.
 
+Decoded video supports the shared device-side transport optimization. Add
+`video_output_transport: {enable_device_postprocess: true}` to the diffusion
+stage to convert `output_type="np"` video to uint8 before GPU-to-host transfer.
+The optimization is opt-in and preserves typed tick session/chunk/event metadata.
+Latent output retains its existing path. Requests with video guardrails enabled
+retain the Cosmos3 postprocessor; frame interpolation and non-NumPy presentation
+retain floating-point transport. See the
+[transport guide](../../docs/user_guide/diffusion/device_side_video_postprocess.md)
+for precision and memory fallback behavior.
+
 Checkpoint identity, hash, domain map, and normalizer data are deliberately not
 template defaults: they must be read from `transformer/config.json`. Startup
 rejects a deploy override that contradicts those embedded artifact fields.

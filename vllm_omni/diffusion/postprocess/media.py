@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 
 from vllm_omni.diffusion.media import (
@@ -28,7 +29,7 @@ def finalize_diffusion_media(
         raise ValueError("Diffusion media reached the engine before transport preparation")
 
     video = media.video
-    metadata: dict[str, object] = {}
+    metadata = deepcopy(media.metadata)
     consumers = video.constraints.pending_float_consumers
     if FloatVideoConsumer.FRAME_INTERPOLATION in consumers:
         if video.spec.encoding is not VideoTensorEncoding.NORMALIZED_FLOAT:
@@ -58,7 +59,7 @@ def finalize_diffusion_media(
             tensor=interpolated,
             constraints=VideoTransportConstraints(pending_float_consumers=frozenset(consumers)),
         )
-        metadata["video"] = {"video_fps_multiplier": multiplier}
+        metadata["video"] = {**metadata.get("video", {}), "video_fps_multiplier": multiplier}
 
     if consumers:
         names = sorted(consumer.value for consumer in consumers)

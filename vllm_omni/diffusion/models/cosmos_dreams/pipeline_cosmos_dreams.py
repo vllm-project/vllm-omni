@@ -14,6 +14,14 @@ from typing import Any, ClassVar
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.models.cosmos3.action import load_action_tensor, pad_action_to_dim
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     Cosmos3OmniDiffusersPipeline,
@@ -56,6 +64,7 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -850,6 +859,44 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- Generation --------------------------------------------------------
 
+    def _build_output(
+        self,
+        value: torch.Tensor,
+        *,
+        sampling_params: OmniDiffusionSamplingParams,
+        typed_tick: ARDiffusionTickRequest | None,
+        stage_durations: dict[str, float],
+    ) -> DiffusionOutput:
+        from vllm_omni.diffusion.models.cosmos3.guardrails import is_guardrails_enabled
+
+        metadata = {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(typed_tick).to_dict()} if typed_tick else {}
+        # The legacy Cosmos3 postprocessor owns video guardrails. Keep that
+        # route whenever they are enabled, and keep latents out of the decoded
+        # RGB contract. Distributed VAE non-owner placeholders are not video.
+        if (
+            sampling_params.output_type != "latent"
+            and value.ndim == 5
+            and not is_guardrails_enabled(self.od_config, sampling_params)
+        ):
+            return DiffusionOutput(
+                media=DiffusionMediaOutput(
+                    video=VideoMediaOutput(
+                        tensor=value,
+                        spec=VideoTensorSpec(
+                            layout=VideoTensorLayout.BCTHW,
+                            encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                            value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                        ),
+                    ),
+                    metadata=metadata,
+                ),
+                stage_durations=stage_durations,
+            )
+        output: dict[str, Any] = {"video": value}
+        if typed_tick is not None:
+            output = {"payload": output, "metadata": metadata}
+        return DiffusionOutput(output=output, stage_durations=stage_durations)
+
     def _denoise_chunk(
         self,
         velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
@@ -1253,15 +1300,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if measure_tick_latency:
             self._sync_for_tick_timing(True)
             tick_durations["tick_model_total_s"] = time.perf_counter() - tick_total_started
-        output: dict[str, Any] = {"video": output_value}
-        if typed_tick is not None:
-            output = {
-                "payload": output,
-                "metadata": {
-                    "ar_diffusion": ARDiffusionChunkMetadata.from_tick(typed_tick).to_dict(),
-                },
-            }
-        result = DiffusionOutput(output=output, stage_durations=tick_durations)
+        result = self._build_output(
+            output_value,
+            sampling_params=sp,
+            typed_tick=typed_tick,
+            stage_durations=tick_durations,
+        )
         if close_session and self._ar_diffusion_kv_state is None:
             self._drop_session(session_id)
         return result
