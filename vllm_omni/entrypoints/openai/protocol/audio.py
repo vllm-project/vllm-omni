@@ -1,14 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+
+# Bound int request fields to avoid overflow issues.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 _MAX_EMBEDDING_DIM = 8192
 
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
 DEFAULT_AUDIO_FORMAT: str = "wav"
+SpeechSampleRate = Annotated[int, Field(gt=0)]
 
 
 def _normalize_ref_audio_value(value):
@@ -74,6 +81,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         description="Instructions for voice style/emotion (maps to 'instruct' for Qwen3-TTS)",
     )
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = Field(
+        default=None,
+        description="Target sample rate of the returned audio. If omitted, use the model's native sample rate.",
+    )
     speed: float | None = Field(
         default=1.0,
         ge=0.25,
@@ -142,18 +153,21 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     max_new_tokens: int | None = Field(
         default=None,
+        ge=1,
+        le=_INT64_MAX,
         description="Maximum tokens to generate",
     )
     seed: int | None = Field(
         default=None,
-        ge=0,
-        le=2**63 - 1,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
         description="Random seed for reproducible generation. When set, ensures "
         "deterministic output for the same input text and seed value.",
     )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
+        le=_INT64_MAX,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
     non_streaming_mode: bool | None = Field(
@@ -339,6 +353,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     input: str = Field(
         description="Text prompt describing the audio to generate",
     )
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, v):
+        if not v or not v.strip():
+            raise ValueError("input cannot be empty")
+        return v
+
     model: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
@@ -349,6 +371,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     stream_format: Literal["sse", "audio"] | None = "audio"
     audio_length: float | None = Field(
         default=None,
+        gt=0,
         description="Audio length in seconds",
     )
     audio_start: float | None = Field(
@@ -361,14 +384,20 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     )
     guidance_scale: float | None = Field(
         default=None,
+        ge=0,
+        le=1000,
         description="Guidance scale for diffusion models",
     )
     num_inference_steps: int | None = Field(
         default=None,
+        ge=1,
+        le=1000,
         description="Number of inference steps",
     )
     seed: int | None = Field(
         default=None,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
         description="Random seed for reproducibility",
     )
 
@@ -383,6 +412,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
 class CreateAudio(BaseModel):
     audio_tensor: np.ndarray
     sample_rate: int = 24000
+    output_sample_rate: int | None = None
     response_format: str = "wav"
     speed: float = 1.0
     base64_encode: bool = True
@@ -407,14 +437,15 @@ class SpeechBatchItem(BaseModel):
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] | None = None
+    sample_rate: SpeechSampleRate | None = None
     speed: float | None = Field(default=None, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
-    max_new_tokens: int | None = None
-    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
 
 
@@ -427,14 +458,15 @@ class BatchSpeechRequest(BaseModel):
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = None
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
-    max_new_tokens: int | None = None
-    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
 
 
@@ -517,10 +549,11 @@ class StreamingSpeechSessionConfig(BaseModel):
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
-    max_new_tokens: int | None = Field(default=None, ge=1)
+    max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
+        le=_INT64_MAX,
         description="Initial chunk size for reduced TTFA. Overrides the deploy config for this session.",
     )
     non_streaming_mode: bool | None = Field(
@@ -554,6 +587,22 @@ class StreamingSpeechSessionConfig(BaseModel):
             "base64-encoded PCM plus aligned word timestamps. Requires the server to be "
             "launched with --forced-aligner. When false, audio is sent as raw binary "
             "frames (existing behavior)."
+        ),
+    )
+    seed: int | None = Field(
+        default=None,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
+        description="Random seed forwarded to /v1/audio/speech for this session.",
+    )
+    split_granularity: Literal["none", "sentence", "clause"] = Field(
+        default="none",
+        description=(
+            "How incoming input.text is segmented before TTS. 'none' (default) "
+            "buffers until input.done and runs one request, matching the "
+            "long-form timbre-continuity path. 'sentence' emits a request at "
+            "each sentence boundary (Latin .!? plus CJK/Indic/Arabic marks). "
+            "'clause' also splits on commas/semicolons for lower TTFA."
         ),
     )
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
@@ -131,11 +131,20 @@ class TestCreateDefaultDiffusion:
 
     def test_dtype_serialized_as_string(self):
         stages = StageConfigFactory.create_default_diffusion({"dtype": torch.float16, "model": "x"})
-        assert stages[0]["engine_args"]["dtype"] == "torch.float16"
+        assert stages[0]["engine_args"]["dtype"] == "float16"
 
     def test_cache_backend_defaults_to_none(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["engine_args"]["cache_backend"] == "none"
+
+    def test_explicit_none_cache_backend_canonicalizes_to_none(self):
+        """Regression for #7032: ``cache_backend=None`` (e.g. an example CLI default)
+        must reach the pipeline as the canonical ``"none"`` string."""
+        od = _roundtrip_diffusion_config(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
+
+        od = OmniDiffusionConfig.from_kwargs(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
 
     def test_single_gpu_default_devices(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
@@ -149,10 +158,18 @@ class TestCreateDefaultDiffusion:
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
 
-    def test_diffusion_kv_mode_roundtrip(self):
-        od = _roundtrip_diffusion_config(model="x", diffusion_kv_mode="paged_scheduler")
+    def test_diffusion_kv_mode_roundtrip(self, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=2,
+        )
 
         assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+        assert od.diffusion_kv_max_rows_per_request == 2
 
     def test_diffusion_kv_sizing_fields_roundtrip(self, monkeypatch):
         monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)

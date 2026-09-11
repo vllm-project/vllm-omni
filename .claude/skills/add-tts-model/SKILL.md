@@ -345,8 +345,8 @@ Heavier scenarios in the same file use **`advanced_model` only** (streaming, ext
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_clone_en_non_streaming_001(omni_server, openai_client) -> None:
-    openai_client.send_audio_speech_request({...})
+def test_voice_clone_en_non_streaming_001(omni_server, online_client) -> None:
+    online_client.send_audio_speech_request({...})
 ```
 
 **L4 consolidation:** Prefer parametrized `OmniServerParams` rows (`default`, `async_chunk`, feature flags) in one expansion module rather than many merge-only files ([#1832](https://github.com/vllm-project/vllm-omni/issues/1832)).
@@ -363,8 +363,8 @@ def test_voice_clone_en_non_streaming_001(omni_server, openai_client) -> None:
 
 | Path | Fixture | Call |
 |------|---------|------|
-| Online `/v1/*` | `openai_client` | `openai_client.send_*_request(request_config)` |
-| Offline inference | `omni_runner_handler` | `omni_runner_handler.send_*_request(request_config)` |
+| Online `/v1/*` | `online_client` | `online_client.send_*_request(request_config)` |
+| Offline inference | `offline_client` | `offline_client.send_*_request(request_config)` |
 
 1. **Grep `runtime.py` first** — reuse `send_omni_request`, `send_diffusion_request`, `send_audio_speech_request` (online + offline Qwen-style TTS), `send_single_stage_tts_request` (Coqui XTTS / MOSS-TTS-Nano offline), etc.
 2. **No matching helper** → add `send_<feature>_request` (or `send_<route>_http_request` for negative/dfx) in **`runtime.py`** with general `assert_*` bundled inside, **then** call it from the test.
@@ -396,7 +396,7 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
   `/health` return non-200 until you're actually ready.
 - **Mark tests per the CI Levels table** — baseline smoke: `core_model` + `advanced_model`; heavier cases: `advanced_model` only; L4 expansion: `full_model`
 - **No per-model helper modules** — do not create `tests/helpers/{slug}.py`; keep constants and `request_config` payloads in the test file
-- **Online and offline e2e go through `runtime.py`** — `openai_client.send_audio_speech_request` (online); `omni_runner_handler.send_audio_speech_request` (Qwen-style offline) or `send_single_stage_tts_request` (single-stage offline). Add a new `send_*_request` in `runtime.py` when none fits; do not embed `omni.generate` or HTTP in tests
+- **Online and offline e2e go through `runtime.py`** — `online_client.send_audio_speech_request` (online); `offline_client.send_audio_speech_request` (Qwen-style offline) or `send_single_stage_tts_request` (single-stage offline). Add a new `send_*_request` in `runtime.py` when none fits; do not embed `omni.generate` or HTTP in tests
 
 ## Phase 4: Async Chunk (Streaming)
 
@@ -499,6 +499,13 @@ Common pre-commit failures, recovery commands for missing sign-off, and the
 full `pre-commit run` invocation for a TTS model:
 [references/precommit-dco.md](references/precommit-dco.md).
 
+## Documentation and recipe
+
+Follow the [`add-recipe` skill](../add-recipe/SKILL.md) to add or update the
+in-repository model-family recipe, the `recipes/README.md` index, the supported
+models table, TTS example documentation, and the speech API contract using
+validated evidence.
+
 ## Integration Checklist
 
 Use this checklist when integrating a new TTS model:
@@ -543,6 +550,7 @@ Use this checklist when integrating a new TTS model:
 - [ ] Buildkite entries match level: `test-ready.yml` / `test-merge.yml` or nightly TTS job / `test-nightly.yml`
 - [ ] Gradio demo working
 - [ ] Documentation added (offline + online docs, nav, supported models)
+- [ ] In-repository recipe and `recipes/README.md` row added via the `add-recipe` skill
 
 ### Phase 4: Async Chunk
 - [ ] Pipeline declares the async handoff processor

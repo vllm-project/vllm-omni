@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: N803, E741
 """Mixture-of-Tokens (MoT) RMS Normalization layer.
 
@@ -81,6 +84,17 @@ class MoTRMSNorm(CustomOp):
             head_norm=self.head_norm,
             eps=self.variance_epsilon,
         )
+
+    # ------------------------------------------------------------------
+    # NPU fast-path (not implemented yet; reserved for future optimization)
+    # ------------------------------------------------------------------
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        text_indices: torch.Tensor | None = None,
+        vae_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward_native(x, text_indices, vae_indices)
 
     # ------------------------------------------------------------------
     # Helpers

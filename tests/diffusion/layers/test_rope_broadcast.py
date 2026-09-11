@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shape broadcasting regression tests for RotaryEmbedding.forward_native.
 
@@ -16,7 +16,11 @@ import types
 import pytest
 import torch
 
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_mindiesd
+from vllm_omni.diffusion.layers.rope import (
+    RotaryEmbedding,
+    RotaryEmbeddingWan,
+    apply_rotary_emb_mindiesd,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -226,7 +230,7 @@ class TestRotaryEmbeddingNativeShapeRegression:
     def test_wan_forward_native_unchanged(self) -> None:
         """RotaryEmbeddingWan.forward_native still uses its own implementation
         (unflatten + stack + flatten) and should not crash with 3D cos/sin."""
-        from vllm_omni.diffusion.models.wan2_2.rope import RotaryEmbeddingWan
+        from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 
         rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
         B, S, H, D = 2, 16, 8, 64
@@ -237,6 +241,25 @@ class TestRotaryEmbeddingNativeShapeRegression:
         output = rope.forward_native(x, cos, sin)
         assert output.shape == x.shape
         assert not torch.isnan(output).any()
+
+
+def test_cuda_paths_fall_back_without_vendored_rotary_kernel() -> None:
+    """Source/CPU installs need not contain the wheel-vendored CUDA kernel."""
+    x = torch.randn(1, 5, 2, 8)
+
+    rope = RotaryEmbedding(is_neox_style=True)
+    rope.apply_rotary_emb_vllm_flash_attn = None
+    output = rope.forward_cuda(x, torch.randn(5, 4), torch.randn(5, 4))
+    assert output.shape == x.shape
+
+    wan_rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    wan_rope.apply_rotary_emb_vllm_flash_attn = None
+    output = wan_rope.forward_cuda(
+        x,
+        torch.randn(1, 5, 1, 4),
+        torch.randn(1, 5, 1, 4),
+    )
+    assert output.shape == x.shape
 
 
 def test_mindie_full_dim_rope_keeps_h3_cos_sin_layout(monkeypatch: pytest.MonkeyPatch) -> None:

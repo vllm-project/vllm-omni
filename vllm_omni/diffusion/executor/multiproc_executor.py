@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -10,7 +13,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
 
@@ -23,6 +26,11 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.offloader.config import (
+    TEXT_ENCODER_COMPONENT,
+    any_selected_component_uses_allgather,
+    resolve_offload,
+)
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
@@ -37,6 +45,7 @@ _DEQUEUE_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
 _WORKER_SHUTDOWN_GRACE_S = 15.0
 _WORKER_TERMINATE_GRACE_S = 5.0
+_WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
 
 
@@ -44,11 +53,28 @@ def _is_empty_dp_prompt(prompt: object) -> bool:
     """Return whether a DP request has no usable text prompt."""
     if prompt is None:
         return True
-    if isinstance(prompt, str):
+    if isinstance(prompt, (str, list, tuple)):
         return not prompt
-    if isinstance(prompt, dict) and "prompt" in prompt:
-        return not prompt["prompt"]
+    if isinstance(prompt, dict):
+        return (
+            not prompt.get("prompt")
+            and not prompt.get("prompt_token_ids")
+            and not prompt.get("prompt_ids")
+            and prompt.get("prompt_embeds") is None
+        )
     return False
+
+
+def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
+    """Describe precomputed embeddings that change encoder forward counts."""
+    if not isinstance(prompt, dict):
+        return False, False
+    return prompt.get("prompt_embeds") is not None, prompt.get("negative_prompt_embeds") is not None
+
+
+def _uses_text_encoder_allgather(config: object) -> bool:
+    resolved = resolve_offload(config)
+    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
 
 
 @dataclass
@@ -58,33 +84,61 @@ class _ExecutorShutdownCleaner:
     broadcast_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __call__(self) -> None:
         """Clean up background resources."""
+        # The worker monitor and an explicit shutdown may race. A retry must
+        # not signal/join the same Process objects while cleanup is in flight.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._cleanup()
+        finally:
+            self._lock.release()
+
+    def _cleanup(self) -> None:
         if self.broadcast_mq is not None:
             try:
                 for _ in range(self.num_workers):
                     self.broadcast_mq.enqueue(SHUTDOWN_MESSAGE, timeout=1.0)
 
-                self.broadcast_mq = None
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
+            finally:
+                self.broadcast_mq = None
 
         if self.processes:
-            join_deadline = time.monotonic() + _WORKER_SHUTDOWN_GRACE_S
-            for proc in self.processes:
-                if not proc.is_alive():
-                    continue
-                proc.join(max(0.0, join_deadline - time.monotonic()))
-
             alive = [proc for proc in self.processes if proc.is_alive()]
-            for proc in alive:
-                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
-                proc.terminate()
+            for action, grace in (
+                (None, _WORKER_SHUTDOWN_GRACE_S),
+                ("terminate", _WORKER_TERMINATE_GRACE_S),
+                ("kill", _WORKER_KILL_GRACE_S),
+            ):
+                if not alive:
+                    break
+                if action is not None:
+                    for proc in alive:
+                        try:
+                            logger.warning("Calling %s on diffusion worker %s (pid=%s)", action, proc.name, proc.pid)
+                            getattr(proc, action)()
+                        except OSError:
+                            logger.exception("Failed to %s diffusion worker %s (pid=%s)", action, proc.name, proc.pid)
 
-            terminate_deadline = time.monotonic() + _WORKER_TERMINATE_GRACE_S
-            for proc in alive:
-                proc.join(max(0.0, terminate_deadline - time.monotonic()))
+                deadline = time.monotonic() + grace
+                for proc in alive:
+                    try:
+                        proc.join(max(0.0, deadline - time.monotonic()))
+                    except OSError:
+                        logger.exception("Failed to join diffusion worker %s (pid=%s)", proc.name, proc.pid)
+                alive = [proc for proc in alive if proc.is_alive()]
+
+            self.processes = alive
+            if alive:
+                logger.error(
+                    "Diffusion worker cleanup incomplete after kill: %s; retaining processes for shutdown retry",
+                    [(proc.name, proc.pid) for proc in alive],
+                )
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
@@ -471,16 +525,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # request and Diffusion KV metadata inseparable.
         # All ranks reply (unique_reply_rank=None) so we collect dp_size
         # responses and match by dp_rank.
-        if (
-            len(new_reqs) > 1
-            and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            and getattr(self.od_config, "dlo_use_allgather", True)
-        ):
+        if len(new_reqs) > 1 and any_selected_component_uses_allgather(self.od_config):
             # Reuse the request scheduler's complete compatibility key. DLO
             # AllGather requires every DP rank to execute the same collective
             # schedule, including shape, CFG, denoise steps, output count,
-            # and LoRA settings. Two default (None) step counts are valid and
-            # resolve identically inside the same pipeline.
+            # and LoRA settings.
             compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
@@ -498,6 +547,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     "share identical extra_args. Different extra_args can change "
                     "the forward schedule and cause AllGather deadlock."
                 )
+            if _uses_text_encoder_allgather(self.od_config):
+                encoder_signatures = {_text_encoder_input_signature(nr.req.prompt) for nr in new_reqs}
+                if len(encoder_signatures) > 1:
+                    raise ValueError(
+                        "DLO text_encoder AllGather requires every concurrent request "
+                        "to provide the same positive/negative prompt embedding fields."
+                    )
             empty_prompt_ids = [nr.request_id for nr in new_reqs if _is_empty_dp_prompt(nr.req.prompt)]
             if empty_prompt_ids:
                 raise ValueError(
@@ -547,11 +603,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
+                allgather_active = any_selected_component_uses_allgather(self.od_config)
+                timeout_options: dict[str, Any] = {}
+                if allgather_active:
+                    timeout_options["timeout"] = _DLO_DP_WAVE_TIMEOUT_S
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,
                     unique_reply_rank=0,
                     exec_all_ranks=True,
+                    **timeout_options,
                 )
                 if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
                     runner_outputs.append(
@@ -575,6 +636,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 else:
                     raise RuntimeError(f"Unexpected response type: {type(result)!r}")
             except Exception as exc:
+                if isinstance(exc, TimeoutError):
+                    self._fail_closed_on_dp_wave_timeout(exc)
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
@@ -605,11 +668,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
         dp_size = getattr(parallel_config, "data_parallel_size", 1)
-        if (
-            dp_size > 1
-            and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            and getattr(self.od_config, "dlo_use_allgather", True)
-        ):
+        if dp_size > 1 and any_selected_component_uses_allgather(self.od_config):
             # DLO DP uses one independent request per DP replica.  It is not a
             # fused pipeline request batch, so models such as MiniMax-H3 do not
             # need to advertise supports_request_batch=True.
@@ -979,8 +1038,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def shutdown(self) -> None:
         self._closed = True
         self._pump_stop.set()
+        cleaner = self._shutdown_cleaner
         try:
-            self._finalizer()
+            if self._finalizer.alive:
+                self._finalizer()
+            elif cleaner is not None:
+                cleaner()
         finally:
             pump_threads = getattr(self, "_result_pump_threads", [])
             for thread in pump_threads:
@@ -1004,5 +1067,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
-            self._shutdown_cleaner = None
-            self._processes = []
+            self._processes = (cleaner.processes or []) if cleaner is not None else []
+            if not self._processes:
+                self._shutdown_cleaner = None

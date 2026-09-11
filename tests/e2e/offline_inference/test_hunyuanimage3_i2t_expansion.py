@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Smoke test for HunyuanImage-3.0 Image-to-Text (I2T) pipeline."""
 
 from collections.abc import Generator
 
 import pytest
-import torch
 from PIL import Image
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
@@ -44,7 +44,7 @@ EXPECTED_PREFIX_TOKEN_IDS: list[int] = [
 # Decoded form, kept only for human-readable assertion messages.
 EXPECTED_PREFIX_TEXT = "The image is a solid, uniform green color with no variations, objects, or details present. It"
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
 @pytest.fixture(scope="module")
@@ -57,7 +57,7 @@ def omni() -> Generator[Omni, None, None]:
         yield runner.omni
 
 
-@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs.")
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
 def test_i2t_generates_text(omni: Omni) -> None:
     """Verify I2T output's first 20 token IDs match the HF greedy baseline."""
     # Solid-color image keeps the input self-contained and reproducible.

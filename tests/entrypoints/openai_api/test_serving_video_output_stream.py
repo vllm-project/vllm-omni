@@ -47,7 +47,13 @@ def _build_test_app(
     engine_client.abort = mocker.AsyncMock()
     engine_client.submit_interaction_async = mocker.AsyncMock()
     engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams()]
-    engine_client.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    engine_client.stage_configs = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            final_output=True,
+            final_output_type="video",
+        )
+    ]
     engine_client.generate = mock_generate
 
     class FakeStreamingVideoEncoder:
@@ -71,10 +77,6 @@ def _build_test_app(
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.create_streaming_video_encoder",
         encoder_factory,
-    )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video_output_stream.get_stage_type",
-        return_value="diffusion",
     )
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
@@ -398,7 +400,13 @@ def _build_handler_for_async_tests(
     engine_client.abort = mocker.AsyncMock()
     engine_client.submit_interaction_async = mocker.AsyncMock()
     engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams()]
-    engine_client.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    engine_client.stage_configs = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            final_output=True,
+            final_output_type="video",
+        )
+    ]
     engine_client.generate = mock_generate
 
     chunks = streaming_chunks or [(b"mp4-chunk-0", True)]
@@ -420,10 +428,6 @@ def _build_handler_for_async_tests(
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.create_streaming_video_encoder",
         encoder_factory,
-    )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video_output_stream.get_stage_type",
-        return_value="diffusion",
     )
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -8,7 +9,9 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -26,6 +29,22 @@ class _StubTextEncoder(nn.Module):
     @property
     def dtype(self) -> torch.dtype:
         return torch.float32
+
+
+class _StubVaeConfig:
+    latents_mean = [0.0, 0.0, 0.0, 0.0]
+    latents_std = [1.0, 1.0, 1.0, 1.0]
+    z_dim = 4
+
+
+class _StubVae(nn.Module):
+    dtype = torch.float32
+    config = _StubVaeConfig()
+
+    def decode(self, latents, return_dict=False):
+        del return_dict
+        batch, _, frames, height, width = latents.shape
+        return (torch.zeros(batch, 3, frames, height, width),)
 
 
 class _StubScheduler:
@@ -73,6 +92,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.transformer = _StubTransformer()
     pipeline.transformer_2 = None
     pipeline.text_encoder = _StubTextEncoder()
+    pipeline.vae = _StubVae()
     pipeline.transformer_config = SimpleNamespace(patch_size=(1, 2, 2), in_channels=4, out_channels=4)
     pipeline.scheduler = _StubScheduler([9, 5])
     pipeline.od_config = SimpleNamespace(flow_shift=5.0)
@@ -82,6 +102,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.vae_scale_factor_spatial = 8
     pipeline.boundary_ratio = 0.875
     pipeline.expand_timesteps = False
+    pipeline.is_dmd = False
     pipeline._guidance_scale = None
     pipeline._guidance_scale_2 = None
     pipeline._num_timesteps = None
@@ -94,7 +115,7 @@ def _make_pipeline() -> Wan22Pipeline:
 
 
 def _make_sampling(**overrides):
-    values = {
+    values: dict[str, object] = {
         "height": None,
         "width": None,
         "num_frames": 1,
@@ -224,6 +245,99 @@ def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
     torch.testing.assert_close(outputs[1].output, latents_b)
 
 
+def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
+    pipeline = _make_pipeline()
+
+    def _fake_diffuse(
+        *,
+        latents,
+        timesteps,
+        prompt_embeds,
+        negative_prompt_embeds,
+        guidance_low,
+        guidance_high,
+        boundary_timestep,
+        dtype,
+        attention_kwargs,
+        latent_condition,
+        first_frame_mask,
+        generator,
+    ):
+        del (
+            timesteps,
+            prompt_embeds,
+            negative_prompt_embeds,
+            guidance_low,
+            guidance_high,
+            boundary_timestep,
+            dtype,
+            attention_kwargs,
+            latent_condition,
+            first_frame_mask,
+            generator,
+        )
+        return torch.zeros_like(latents)
+
+    pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type="np",
+                ),
+            )
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 1
+    assert outputs[0].output is None
+    assert outputs[0].media is not None
+    assert outputs[0].media.prepared_for_transport is False
+    assert outputs[0].media.video.tensor.shape == (1, 3, 1, 8, 8)
+    assert outputs[0].media.video.spec.layout is VideoTensorLayout.BCTHW
+    assert outputs[0].media.video.spec.encoding is VideoTensorEncoding.NORMALIZED_FLOAT
+    assert outputs[0].media.video.spec.value_range is VideoValueRange.NEGATIVE_ONE_TO_ONE
+
+
+def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
+    # Distributed VAE decode uses broadcast_result=False, so non-owner ranks get
+    # an empty placeholder instead of the full video. Wrapping that as typed media
+    # would fail split_diffusion_output_by_request's batch check on every non-owner
+    # rank, so the pipeline must keep the placeholder on the legacy output field.
+    pipeline = _make_pipeline()
+    pipeline.vae.decode = lambda latents, return_dict=False: (torch.empty(0),)  # type: ignore[assignment]
+    pipeline.diffuse = lambda **kwargs: torch.zeros_like(kwargs["latents"])  # type: ignore[method-assign]
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type="np",
+                ),
+            )
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 1
+    assert outputs[0].media is None
+    assert outputs[0].output is not None
+    assert outputs[0].output.numel() == 0
+
+
 def test_forward_batches_precomputed_prompt_embeddings() -> None:
     pipeline = _make_pipeline()
     diffuse_call = {}
@@ -338,3 +452,125 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+class _StubDMDScheduler:
+    def __init__(self) -> None:
+        self.predict_clean_calls: list[tuple[float, float, float]] = []
+        self.add_noise_calls: list[tuple[float, float, float]] = []
+
+    def predict_clean(self, model_output, sample, timestep):
+        self.predict_clean_calls.append((float(model_output.mean()), float(sample.mean()), float(timestep)))
+        return sample - model_output
+
+    def add_noise(self, clean_sample, noise, timestep):
+        self.add_noise_calls.append((float(clean_sample.mean()), float(noise.mean()), float(timestep)))
+        return clean_sample + 10.0
+
+
+def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    pipeline.scheduler = _StubDMDScheduler()
+    latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
+    timesteps = torch.tensor([1000.0, 757.0, 522.0])
+
+    pipeline.predict_noise_maybe_with_cfg = lambda **kwargs: torch.ones_like(latents)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.randn_tensor",
+        lambda *args, **kwargs: torch.full(args[0], 2.0, dtype=kwargs["dtype"]),
+    )
+
+    result = pipeline.diffuse(
+        latents=latents,
+        timesteps=timesteps,
+        prompt_embeds=torch.zeros(1, 8),
+        negative_prompt_embeds=None,
+        guidance_low=1.0,
+        guidance_high=1.0,
+        boundary_timestep=None,
+        dtype=torch.float32,
+        attention_kwargs={},
+        generator=torch.Generator(device="cpu").manual_seed(1),
+    )
+
+    assert pipeline.scheduler.predict_clean_calls == [
+        (1.0, 0.0, 1000.0),
+        (1.0, 9.0, 757.0),
+        (1.0, 18.0, 522.0),
+    ]
+    assert pipeline.scheduler.add_noise_calls == [
+        (-1.0, 2.0, 757.0),
+        (8.0, 2.0, 522.0),
+    ]
+    torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def _make_gate_loading_pipeline():
+    pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
+    nn.Module.__init__(pipeline)
+    gate = WanSelfAttention.__new__(WanSelfAttention)
+    nn.Module.__init__(gate)
+    gate.to_gate_compress = nn.Linear(1, 1)
+    pipeline.gate_holder = gate
+    return pipeline, gate
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        ("pipeline_wan2_2", "Wan22Pipeline"),
+        ("pipeline_wan2_2_i2v", "Wan22I2VPipeline"),
+        ("pipeline_wan2_2_s2v", "Wan22S2VPipeline"),
+        ("pipeline_wan2_2_vace", "Wan22VACEPipeline"),
+    ],
+)
+def test_wan_pipeline_loaders_share_optional_gate_cleanup(monkeypatch, module_name, class_name) -> None:
+    module = importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}")
+    pipeline_cls = getattr(module, class_name)
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    expected = {"loaded"}
+
+    def fake_loader(model, weights):
+        assert model is pipeline
+        assert list(weights) == [("weight", torch.ones(1))]
+        return expected
+
+    monkeypatch.setattr(module, "load_wan_weights_with_optional_gate", fake_loader)
+
+    assert pipeline_cls.load_weights(pipeline, iter((("weight", torch.ones(1)),))) is expected
+
+
+def test_load_weights_removes_unloaded_vsa_gate(monkeypatch) -> None:
+    pipeline, gate = _make_gate_loading_pipeline()
+
+    class _Loader:
+        def __init__(self, model):
+            del model
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.AutoWeightsLoader", _Loader)
+    pipeline.load_weights(iter((("other.weight", torch.ones(1)),)))
+
+    assert pipeline.has_gate_compress_weights is False
+    assert gate.to_gate_compress is None
+
+
+def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
+    pipeline, gate = _make_gate_loading_pipeline()
+    original_gate = gate.to_gate_compress
+
+    class _Loader:
+        def __init__(self, model):
+            del model
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.AutoWeightsLoader", _Loader)
+    pipeline.load_weights(iter((("gate_holder.to_gate_compress.weight", torch.ones(1)),)))
+
+    assert pipeline.has_gate_compress_weights is True
+    assert gate.to_gate_compress is original_gate

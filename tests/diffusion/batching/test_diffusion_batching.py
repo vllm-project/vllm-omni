@@ -7,7 +7,7 @@ End-to-end test for diffusion batching via AsyncOmni.
 This test fires multiple concurrent ``AsyncOmni.generate()`` calls for a
 diffusion model and validates that every caller receives its correct
 individual result.  When the underlying diffusion stage is configured with
-``batch_size > 1`` (via stage config or ``StageDiffusionClient``), the
+``max_num_seqs > 1``, the
 requests will be batched internally.
 
 Even without explicit batching config this test is useful for verifying
@@ -260,7 +260,7 @@ async def compare_single_vs_parallel(
 ) -> None:
     """Run the same prompts sequentially then in parallel and print a comparison."""
 
-    omni = AsyncOmni(model=model, diffusion_batch_size=batch_size)
+    omni = AsyncOmni(model=model, max_num_seqs=batch_size)
     try:
         await warmup(omni, WARMUP_PROMPTS)
         single_time = await run_single(omni, prompts)
@@ -288,7 +288,7 @@ async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> 
         await compare_single_vs_parallel(model, prompts, batch_size=batch_size)
         return
 
-    omni = AsyncOmni(model=model, diffusion_batch_size=batch_size)
+    omni = AsyncOmni(model=model, max_num_seqs=batch_size)
     try:
         await warmup(omni, WARMUP_PROMPTS)
 
@@ -389,7 +389,7 @@ def test_diffusion_batching_async_concurrent(model_name: str):
     fired via asyncio.gather. Each request_id must appear in the results."""
 
     async def _inner():
-        omni = AsyncOmni(model=model_name, diffusion_batch_size=1)
+        omni = AsyncOmni(model=model_name, max_num_seqs=1)
         try:
             prompts = TEST_PROMPTS[:4]
             sp = _default_sampling_params()
@@ -430,7 +430,7 @@ def test_diffusion_batching_list_prompt_rejected(model_name: str):
     """
 
     async def _inner():
-        omni = AsyncOmni(model=model_name, diffusion_batch_size=4)
+        omni = AsyncOmni(model=model_name, max_num_seqs=4)
         try:
             prompts = TEST_PROMPTS[:4]
             sp = _default_sampling_params()
@@ -524,7 +524,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="E2E diffusion concurrent benchmark / validation")
     parser.add_argument("--model", type=str, required=True, help="Model name or path")
     parser.add_argument("--num-prompts", type=int, default=8, help="Number of prompts to run")
-    parser.add_argument("--batch-size", type=int, default=1, help="Diffusion batch size (1 = no batching)")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Scheduler in-flight width (--max-num-seqs)",
+    )
     parser.add_argument(
         "--mode",
         choices=["batch", "single", "compare", "validate"],

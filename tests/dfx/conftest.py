@@ -105,7 +105,7 @@ def create_unique_server_pytest_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
 ) -> list[Any]:
-    """Like :func:`create_unique_server_params`, but wrap each row in ``pytest.param`` with JSON marks."""
+    """Like :func:`_create_unique_server_params`, but wrap each row in ``pytest.param`` with JSON marks."""
     marks_by_name = _marks_by_test_name(configs)
     return [
         pytest.param(
@@ -113,7 +113,7 @@ def create_unique_server_pytest_params(
             marks=marks_by_name.get(row[0], []),
             id=row[0],
         )
-        for row in create_unique_server_params(configs, stage_configs_dir)
+        for row in _create_unique_server_params(configs, stage_configs_dir)
     ]
 
 
@@ -150,7 +150,7 @@ def create_paired_omni_benchmark_pytest_params(
     """Paired params for ``run_benchmark.py`` (omni/tts)."""
     mapping = create_test_parameter_mapping(configs)
     marks_by_name = _marks_by_test_name(configs)
-    server_entries = [(row, row[0]) for row in create_unique_server_params(configs, stage_configs_dir)]
+    server_entries = [(row, row[0]) for row in _create_unique_server_params(configs, stage_configs_dir)]
     params_by_test_name = {
         test_name: get_benchmark_params_for_server(test_name, mapping) for _, test_name in server_entries
     }
@@ -232,7 +232,7 @@ def _build_serve_args(serve_args: Any) -> list[str]:
     return args
 
 
-def create_unique_server_params(
+def _create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
 ) -> list[tuple[str, str, str | None, str | None, tuple[str, ...], bool]]:
@@ -311,7 +311,7 @@ def create_reliability_omni_server_params(
     configs: list[dict[str, Any]], stage_configs_dir: Path
 ) -> list[OmniServerParams]:
     adjusted_configs = configs_with_platform_stage_configs(configs)
-    unique_params = create_unique_server_params(adjusted_configs, stage_configs_dir)
+    unique_params = _create_unique_server_params(adjusted_configs, stage_configs_dir)
     server_args_by_name = extract_server_args_by_test_name(adjusted_configs)
     return [
         OmniServerParams(

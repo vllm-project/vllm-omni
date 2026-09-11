@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from math import gcd
 from threading import Lock
@@ -10,7 +11,6 @@ import numpy as np
 import onnxruntime
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from scipy.signal import resample_poly
 from transformers import Qwen2Config
 from transformers.feature_extraction_utils import BatchFeature
@@ -25,7 +25,6 @@ from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -35,9 +34,11 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
@@ -51,6 +52,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -107,7 +109,45 @@ class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
         )
 
 
-class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModalProcessingInfo]):
+class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModalProcessingInfo]):
+    def apply(self, inputs: ProcessorInputs, timing_ctx):
+        tokenizer = self.info.get_tokenizer()
+        prompt_text = tokenizer.decode(inputs.prompt, skip_special_tokens=False)
+        config = self.info.ctx.get_hf_config()
+        model_dir = self.info.ctx.model_config.model
+        self._ensure_cached_runtime_components(model_dir, config)
+
+        text_token, text_token_len = extract_text_token(
+            prompt_text,
+            self.tokenizer,
+            config.allowed_special,
+        )
+        if inputs.mm_data_items.get_all_counts().get("audio", 0):
+            reference_text = inputs.hf_processor_mm_kwargs.get("prompt_text")
+            if not isinstance(reference_text, str):
+                raise ValueError(f"prompt text is None : {reference_text}")
+            prompt_text_token, prompt_text_token_len = extract_text_token(
+                reference_text,
+                self.tokenizer,
+                config.allowed_special,
+            )
+            text_token, _ = concat_text_with_prompt_ids(
+                text_token,
+                text_token_len,
+                prompt_text_token,
+                prompt_text_token_len,
+            )
+
+        inputs = replace(
+            inputs,
+            prompt=text_token.reshape(-1).tolist(),
+            hf_processor_mm_kwargs={
+                **inputs.hf_processor_mm_kwargs,
+                self._OMNI_PROMPT_TEXT_KEY: prompt_text,
+            },
+        )
+        return super().apply(inputs, timing_ctx)
+
     def _ensure_cached_runtime_components(self, model_dir: str, config: CosyVoice3Config) -> None:
         cached_model_dir = getattr(self, "_cached_model_dir", None)
         if cached_model_dir == model_dir:
@@ -136,7 +176,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         """Build the per-model runtime components once (cached process-wide)."""
         # If model_dir is an HF repo ID (not a local path), resolve to cache.
         if not os.path.isdir(model_dir):
-            model_dir = snapshot_download(model_dir)
+            model_dir = hf_api().snapshot_download(model_dir)
 
         tokenizer = get_qwen_tokenizer(
             token_path=os.path.join(model_dir, config.qwen_pretrain_path),
@@ -375,15 +415,6 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             "embedding": MultiModalFieldConfig.batched("audio"),
         }
 
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
-
     def _get_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
@@ -462,7 +493,7 @@ class CosyVoice3Model(
         self.model_stage = vllm_config.model_config.model_stage
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
-            model_dir = snapshot_download(model_dir)
+            model_dir = hf_api().snapshot_download(model_dir)
         self.model_dir = model_dir
         self.model = None
         if self.model_stage == "cosyvoice3_talker":
@@ -566,8 +597,8 @@ class CosyVoice3Model(
         return float(value)
 
     @staticmethod
-    def _multinomial_sample(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-        return torch.multinomial(probs, 1, replacement=True, generator=generator).reshape(())
+    def _random_sample_one(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        return random_sample(probs.unsqueeze(0), {} if generator is None else {0: generator}).reshape(())
 
     @classmethod
     def _nucleus_sample_one(
@@ -602,7 +633,7 @@ class CosyVoice3Model(
         # First token always passes (cum_before[0] = 0 < top_p for any top_p > 0),
         # so ``weights`` is guaranteed to have at least one nonzero entry. The
         # final ``.item()`` is the ONLY D2H sync per call.
-        sample_idx = torch.multinomial(weights, 1, replacement=True, generator=generator)
+        sample_idx = cls._random_sample_one(weights, generator=generator)
         return int(sorted_idx[sample_idx].item())
 
     @classmethod
@@ -632,9 +663,14 @@ class CosyVoice3Model(
             rep_num = int((recent == top_id).sum().item())
             if rep_num >= win_size * tau_r:
                 weighted_scores = weighted_scores.clone()
+                original_score = weighted_scores[top_id].clone()
                 weighted_scores[top_id] = float("-inf")
-                fallback_probs = weighted_scores.softmax(dim=0)
-                top_id = int(cls._multinomial_sample(fallback_probs, generator=generator).item())
+                weighted_scores[top_id] = torch.where(
+                    torch.isfinite(weighted_scores).any(),
+                    weighted_scores[top_id],
+                    original_score,
+                )
+                top_id = int(cls._random_sample_one(weighted_scores.softmax(dim=0), generator=generator).item())
         return top_id
 
     def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
@@ -677,6 +713,10 @@ class CosyVoice3Model(
             logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
             logits = processor.apply(logits)
+        finite_logits = torch.isfinite(logits)
+        if not finite_logits.any(dim=-1).all().item():
+            raise ValueError("CosyVoice3 sampling received a row with no finite logits")
+        logits.masked_fill_(~finite_logits, float("-inf"))
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))
@@ -908,7 +948,7 @@ class CosyVoice3Model(
         repo = getattr(self.config, "flow_estimator_onnx_repo", None)
         if repo:
             try:
-                fetched_dir = snapshot_download(repo, allow_patterns=[fp16_name])
+                fetched_dir = hf_api().snapshot_download(repo, allow_patterns=[fp16_name])
                 fetched = os.path.join(fetched_dir, fp16_name)
                 if os.path.exists(fetched):
                     return fetched

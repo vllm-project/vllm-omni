@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for HSDP (Hybrid Sharded Data Parallel) configuration and utilities."""
 
 import gc
-import os
-import socket
 
 import pytest
 import torch
@@ -12,7 +10,9 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh, DTensor
 
+from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.distributed import hsdp as hsdp_module
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
     _unshardable_parameters,
@@ -37,35 +37,17 @@ class _PackedModel(nn.Module):
         self.root_weight = nn.Parameter(torch.ones(2))
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @pytest.fixture(scope="module")
 def cpu_process_group():
     if dist.is_initialized():
         yield
         return
 
-    master_port = _find_free_port()
-    os.environ.update(
-        {
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(master_port),
-        }
-    )
-    dist.init_process_group("gloo", rank=0, world_size=1)
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
     try:
         yield
     finally:
         dist.destroy_process_group()
-        for key in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"):
-            os.environ.pop(key, None)
         gc.collect()
 
 
@@ -90,6 +72,52 @@ def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
     assert model.block.input_global_scale is input_global_scale
     assert not isinstance(model.block.packed_weight, DTensor)
     assert not isinstance(model.block.input_global_scale, DTensor)
+
+
+def test_hsdp_resolves_nested_ignored_module_and_preserves_mixed_dtypes(
+    cpu_process_group,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Group:
+        world_size = 1
+        rank_in_group = 0
+        device_group = dist.group.WORLD
+
+    class MixedDtypeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.Module()
+            self.layers.sharded = nn.Linear(2, 2, dtype=torch.bfloat16)
+            self.layers.ignored = nn.Linear(2, 2, dtype=torch.float32)
+            self._hsdp_shard_conditions = [lambda name, _module: name == "layers.sharded"]
+            self._hsdp_ignored_modules = ["layers.ignored"]
+            self._hsdp_preserve_parameter_dtypes = True
+
+    group = Group()
+    monkeypatch.setattr(hsdp_module, "get_world_group", lambda: group)
+    monkeypatch.setattr(
+        hsdp_module,
+        "_create_hsdp_mesh",
+        lambda **_kwargs: DeviceMesh("cpu", [0]),
+    )
+
+    model = MixedDtypeModel()
+    ignored_weight = model.layers.ignored.weight
+    hsdp_module.apply_hsdp_to_model(
+        model,
+        HSDPInferenceConfig(
+            enabled=True,
+            hsdp_shard_size=1,
+            param_dtype=torch.float16,
+        ),
+        target_device=torch.device("cpu"),
+    )
+
+    assert model.layers.ignored.weight is ignored_weight
+    assert not isinstance(model.layers.ignored.weight, DTensor)
+    assert model.layers.ignored.weight.dtype == torch.float32
+    assert isinstance(model.layers.sharded.weight, DTensor)
+    assert model.layers.sharded.weight.dtype == torch.bfloat16
 
 
 class TestHSDPInferenceConfig:

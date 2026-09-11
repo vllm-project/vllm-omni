@@ -1,92 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Wan-specific rotary positional embedding layers."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Wan S2V rotary positional embedding layers."""
 
 import torch
 
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_mindiesd
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
-
-
-class RotaryEmbeddingWan(RotaryEmbedding):
-    """
-    rotary positional embedding for Wan.
-    interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
-           of 1st half and 2nd half (GPT-NeoX style).
-    """
-
-    def __init__(self, is_neox_style: bool = False, half_head_dim: bool = False) -> None:
-        super().__init__(is_neox_style=is_neox_style)
-        self.half_head_dim = half_head_dim
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
-
-        if cos.dim() > 2:
-            cos = cos.reshape(-1, cos.shape[-1])
-            sin = sin.reshape(-1, sin.shape[-1])
-
-        return apply_rotary_emb(
-            x,
-            cos,
-            sin,
-            interleaved=self.interleaved,
-        )
-
-    def forward_hip(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.apply_rotary_emb_flash_attn is None:
-            return self.forward_native(x, cos, sin)
-
-        if cos.dim() > 2:
-            cos = cos.reshape(-1, cos.shape[-1])
-            sin = sin.reshape(-1, sin.shape[-1])
-
-        return self.apply_rotary_emb_flash_attn(
-            x,
-            cos,
-            sin,
-            interleaved=self.interleaved,
-        )
-
-    def forward_npu(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.has_mindie:
-            if cos.dim() > 2:
-                cos = cos.reshape(-1, cos.shape[-1])
-                sin = sin.reshape(-1, sin.shape[-1])
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
-        else:
-            return self.forward_native(x, cos, sin)
-
-    def forward_native(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
-        rotated = torch.stack(
-            (
-                x1 * cos - x2 * sin,
-                x1 * sin + x2 * cos,
-            ),
-            dim=-1,
-        )
-        return rotated.flatten(-2, -1).to(x.dtype)
 
 
 class WanS2VRotaryPosEmbed(torch.nn.Module):

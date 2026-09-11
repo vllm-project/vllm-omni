@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 import copy
 import inspect
+import os
 import queue
 import threading
 import time
@@ -28,8 +29,9 @@ from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
+    uses_diffusers_adapter,
 )
-from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
@@ -39,11 +41,13 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
     normalize_diffusion_postprocess_output,
 )
+from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -55,13 +59,61 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics.utils import (
+    diffusion_scheduler_waiting_metrics,
+    extract_diffusion_denoise_ms,
+    extract_diffusion_vae_decode_ms,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+_ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
+_ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
+
+
+def _async_output_timeout() -> float:
+    """Seconds to wait for one step's background D2H/SHM copy.
+
+    The copy itself finishes in milliseconds, but it is queued behind the GPU
+    work for that step, so the wall-clock wait tracks step time — a single-GPU
+    box legitimately runs tens of seconds per step on large shapes. A tight
+    bound therefore does not catch a hung engine (worker death and a dead
+    result pump are surfaced by the worker monitor and ``check_health``); it
+    only aborts renders that are still making progress, throwing away the
+    denoise that already completed. The default matches
+    ``_DLO_DP_WAVE_TIMEOUT_S`` in the same subsystem.
+
+    Resolved here rather than at import so a malformed value degrades to the
+    default instead of raising on the request path: this runs inside
+    ``step_streaming``/``add_req_and_wait_for_response``, where a typo in the
+    environment must not start failing generations.
+    """
+    raw = os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV)
+    if raw is None:
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring %s=%r: not a number. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    if timeout <= 0:
+        logger.warning_once(
+            "Ignoring %s=%r: must be positive. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    return timeout
+
 
 __all__ = [
     "DiffusionEngine",
@@ -108,8 +160,14 @@ def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) ->
 
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
-    if model_cls is None:
-        model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+    if model_cls is not None:
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    if uses_diffusers_adapter(od_config):
+        model_cls = DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "supports_request_batch", False))
@@ -125,11 +183,7 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
     parallel_config = getattr(od_config, "parallel_config", None)
     dp_size = getattr(parallel_config, "data_parallel_size", 1)
-    return (
-        dp_size > 1
-        and getattr(od_config, "enable_distributed_layerwise_offload", False)
-        and getattr(od_config, "dlo_use_allgather", True)
-    )
+    return dp_size > 1 and any_selected_component_uses_allgather(od_config)
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -331,6 +385,9 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        # Copied onto the existing output metrics payload so queue monitoring
+        # reuses the normal diffusion result path without additional IPC.
+        self._scheduler_num_waiting_reqs = 0
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -383,40 +440,66 @@ class DiffusionEngine:
         generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
+            output_ready_wait_time = 0.0
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
+                output_ready_wait_start_time = time.perf_counter()
                 fut = self.executor.wait_output_ready(output.async_output_id)
+                timeout = _async_output_timeout()
                 try:
-                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
                 except (TimeoutError, asyncio.TimeoutError):
                     describe = getattr(self.executor, "describe_pending_state", None)
                     logger.error(
-                        "Timed out after %.0fs waiting for async output; executor state: %s",
-                        _ASYNC_OUTPUT_TIMEOUT,
+                        "Timed out after %.1fs waiting for async output; set %s to a larger value "
+                        "to allow slower steps. Executor state: %s",
+                        timeout,
+                        _ASYNC_OUTPUT_TIMEOUT_ENV,
                         describe(output.async_output_id) if describe else "unavailable",
                     )
                     raise
+                output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
             postprocess_start_time = time.perf_counter()
-            formatted_outputs = self.postprocess_output(request, output)
+            scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
+            try:
+                formatted_outputs = self.postprocess_output(request, output)
+            except Exception as exc:
+                # Preserve the latest scheduler snapshot across terminal
+                # abort/error paths, which do not produce formatted outputs.
+                setattr(exc, "diffusion_metrics", scheduler_metrics)
+                raise
             postprocess_time = time.perf_counter() - postprocess_start_time
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
                 "DiffusionEngine.step_streaming breakdown: preprocess=%.2f ms, "
-                "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+                "add_req_and_wait=%.2f ms, output_ready_wait=%.2f ms, "
+                "postprocess=%.2f ms, total=%.2f ms",
                 preprocess_time * 1000,
                 exec_total_time * 1000,
+                output_ready_wait_time * 1000,
                 postprocess_time * 1000,
                 step_total_ms,
             )
             for request_output in formatted_outputs:
-                request_output.metrics.update(
-                    {
-                        "preprocess_time_ms": preprocess_time * 1000,
-                        "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-                        "diffusion_engine_total_time_ms": step_total_ms,
-                        "postprocess_time_ms": postprocess_time * 1000,
-                    }
-                )
+                metrics_update = {
+                    "preprocess_time_ms": preprocess_time * 1000,
+                    "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "output_ready_wait_time_ms": output_ready_wait_time * 1000,
+                    "postprocess_time_ms": postprocess_time * 1000,
+                    **scheduler_metrics,
+                }
+                if request.scheduler_queue_wait_ms is not None:
+                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
+                vae_decode_ms = extract_diffusion_vae_decode_ms(output)
+                if vae_decode_ms is not None:
+                    metrics_update["vae_decode_time_ms"] = vae_decode_ms
+                forward_ms = extract_diffusion_denoise_ms(output)
+                if forward_ms is not None:
+                    metrics_update["forward_time_ms"] = forward_ms
+                kv_recv_ms = getattr(output, "kv_recv_ms", 0.0)
+                if kv_recv_ms > 0:
+                    metrics_update["kv_recv_time_ms"] = kv_recv_ms
+                request_output.metrics.update(metrics_update)
             yield formatted_outputs
 
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
@@ -452,26 +535,33 @@ class DiffusionEngine:
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
-        if output.output is None:
-            logger.warning("Output is None, returning empty OmniRequestOutput")
-            return format_empty_diffusion_outputs(request, finished=output.finished)
-
-        # When CPU offload is enabled, move output to CPU before
-        # post-processing to avoid device OOM — model weights may still
-        # reside on the device and leave no headroom for intermediates.
-        output_data = output.output
-        if self.od_config.enable_cpu_offload:
-            output_data = _move_tensor_tree_to_cpu(output_data)
-
-        if self.post_process_func is not None:
-            # Some video pipelines need request-level controls during
-            # postprocess (for example worker-side frame interpolation).
-            postprocess_kwargs: dict[str, object] = {}
-            if self._post_process_accepts_sampling_params:
-                postprocess_kwargs["sampling_params"] = request.sampling_params
-            outputs = self.post_process_func(output_data, **postprocess_kwargs)
+        if output.media is not None:
+            if output.output is not None:
+                raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+            media = output.media.to_cpu() if self.od_config.enable_cpu_offload else output.media
+            output_data = media.video.tensor
+            outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
         else:
-            outputs = output_data
+            if output.output is None:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+                return format_empty_diffusion_outputs(request, finished=output.finished)
+
+            # When CPU offload is enabled, move output to CPU before
+            # post-processing to avoid device OOM — model weights may still
+            # reside on the device and leave no headroom for intermediates.
+            output_data = output.output
+            if self.od_config.enable_cpu_offload:
+                output_data = _move_tensor_tree_to_cpu(output_data)
+
+            if self.post_process_func is not None:
+                # Some video pipelines need request-level controls during
+                # postprocess (for example worker-side frame interpolation).
+                postprocess_kwargs: dict[str, object] = {}
+                if self._post_process_accepts_sampling_params:
+                    postprocess_kwargs["sampling_params"] = request.sampling_params
+                outputs = self.post_process_func(output_data, **postprocess_kwargs)
+            else:
+                outputs = output_data
 
         postprocess_output = normalize_diffusion_postprocess_output(outputs)
 
@@ -507,6 +597,7 @@ class DiffusionEngine:
                 self._wait_for_admission_if_needed_locked()
 
                 sched_output = self.scheduler.schedule()
+                self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
             if sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
@@ -634,12 +725,25 @@ class DiffusionEngine:
             if not task.future.done():
                 task.future.set_exception(exc)
 
+    def _remove_diffusion_kv_requests(self, request_ids: Iterable[str]) -> None:
+        """Clear terminal Worker rows while Scheduler owns the allocations."""
+
+        od_config = getattr(self, "od_config", None)
+        if od_config is None or not is_scheduler_paged_kv_mode(
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        ):
+            return
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        if unique_request_ids:
+            self.executor.remove_diffusion_kv_requests(unique_request_ids)
+
     def _emit_finished_outputs(
         self,
         finished_ids: set[str],
         runner_output: BaseRunnerOutput | None = None,
         missing_result_error: str = "Diffusion execution finished without a final output",
     ) -> None:
+        self._remove_diffusion_kv_requests(finished_ids)
         for rid in finished_ids:
             if runner_output is not None:
                 _output = runner_output.get_request_output(rid)
@@ -658,6 +762,8 @@ class DiffusionEngine:
         if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
             self._emit_finished_outputs(finished_ids, runner_output)
             return
+
+        self._remove_diffusion_kv_requests(finished_ids)
 
         delivered_finished_req_ids: set[str] = set()
 
@@ -852,6 +958,7 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
                 if sched_output.is_empty:
                     if target_request_id in sched_output.finished_req_ids:
+                        self._remove_diffusion_kv_requests([target_request_id])
                         return self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
@@ -881,6 +988,7 @@ class DiffusionEngine:
                 if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
+                    self._remove_diffusion_kv_requests([target_request_id])
                     req_output = runner_output.get_request_output(target_request_id)
                     output = self._finalize_finished_request(
                         target_request_id,
@@ -889,7 +997,7 @@ class DiffusionEngine:
                     )
                     if output.async_output_id:
                         fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                        output = fut.result(timeout=_async_output_timeout())
                     return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
@@ -915,33 +1023,12 @@ class DiffusionEngine:
                 raise RuntimeError(f"Could not {action} profiler: {e}") from e
 
     def run_startup_warmup(self) -> None:
-        dlo_use_allgather = getattr(self.od_config, "dlo_use_allgather", True)
-        # Skip dummy run when AllGather is used with more than 1 rank,
-        # because the dummy run sends only 1 request but AllGather requires
-        # all ranks to participate simultaneously.  This covers both DP > 1
-        # and SP > 1 (where dp_size is derived from sp_size in OffloadConfig).
-        pc = getattr(self.od_config, "parallel_config", None)
-        dp_size = getattr(pc, "data_parallel_size", 1) if pc else 1
-        sp_size = getattr(pc, "sequence_parallel_size", 1) if pc else 1
-        effective_shard_size = max(dp_size, sp_size)
-        skip_dummy = (
-            getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            and dlo_use_allgather
-            and effective_shard_size > 1
-        )
-        if skip_dummy:
-            logger.info(
-                "Skipping dummy run (dist_offload with AllGather, dp_size=%d, sp_size=%d)",
-                dp_size,
-                sp_size,
-            )
-            return
         try:
             self._dummy_run()
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
             self.close()
-            raise e
+            raise
 
     def _make_dummy_request(
         self,
@@ -950,13 +1037,16 @@ class DiffusionEngine:
         width: int,
         guidance_scale: float,
         num_image_inputs: int = 1,
+        num_inference_steps: int = 1,
     ) -> OmniDiffusionRequest | None:
-        """Build a one-step model request for startup profiling or warmup."""
-
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
+        """Build a minimal model request for startup profiling or warmup."""
+        prompt = OmniTextPrompt(prompt="dummy run")
+        model_class_name = self.od_config.model_class_name
+        if model_class_name is None:
+            raise RuntimeError("Dummy request requires a resolved model_class_name")
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:
-            color_format = image_color_format(self.od_config.model_class_name)
+            color_format = image_color_format(model_class_name)
             images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
             prompt.setdefault("multi_modal_data", {})["image"] = images[0] if len(images) == 1 else images
 
@@ -964,7 +1054,7 @@ class DiffusionEngine:
             audio_sr = 16000
             prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
-        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
         if num_frames <= 0:
             return None
         return OmniDiffusionRequest(
@@ -973,7 +1063,7 @@ class DiffusionEngine:
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=1,
+                num_inference_steps=num_inference_steps,
                 num_frames=num_frames,
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
@@ -1004,11 +1094,14 @@ class DiffusionEngine:
             is not DiffusionKVCacheMode.PAGED_SCHEDULER
         ):
             return None
+        model_class_name = self.od_config.model_class_name
+        if model_class_name is None:
+            raise RuntimeError("Diffusion KV profiling requires a resolved model_class_name")
         request = self._make_dummy_request(
             height=1024,
             width=1024,
             guidance_scale=5.0,
-            num_image_inputs=get_dummy_run_num_image_inputs(self.od_config.model_class_name),
+            num_image_inputs=get_dummy_run_num_image_inputs(model_class_name),
         )
         if request is None:
             raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
@@ -1044,6 +1137,11 @@ class DiffusionEngine:
             height=512,
             width=512,
             guidance_scale=0.0,
+            # Dummy warmup must exercise at least one denoising iteration in
+            # every execution mode. Some pipelines (for example BAGEL) perform
+            # ``num_inference_steps - 1`` scheduler updates and reject an empty
+            # one-step schedule.
+            num_inference_steps=2,
         )
         if req is None:
             logger.info("Skipping dummy warmup run (num_frames=0)")
@@ -1232,8 +1330,11 @@ class DiffusionEngine:
 
     def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        request_ids = list(dict.fromkeys(request_ids))
 
-        for request_id in dict.fromkeys(request_ids):
+        self._remove_diffusion_kv_requests(request_ids)
+
+        for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
 

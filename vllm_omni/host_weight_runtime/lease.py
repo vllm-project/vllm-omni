@@ -140,4 +140,60 @@ class HostWeightLease:
             self.close()
 
 
-__all__ = ["HostWeightLease", "LeaseProvenance", "MappedHostRegion"]
+class HostWeightLeaseCarrier:
+    """Process-local, single-take ownership carrier for a host-weight lease.
+
+    The loader creates the carrier after a restore transaction has committed.
+    The runner/backend takes the lease exactly once before starting any
+    asynchronous transport work.  If setup fails before that handoff, closing
+    the carrier releases the loader-owned lease.
+    """
+
+    def __init__(self, lease: HostWeightLease) -> None:
+        if not isinstance(lease, HostWeightLease):
+            raise TypeError("HostWeightLeaseCarrier requires one HostWeightLease")
+        if lease.closed:
+            raise ValueError("cannot carry a closed HostWeightLease")
+        self._lease: HostWeightLease | None = lease
+        self._taken = False
+        self._lock = threading.RLock()
+
+    @property
+    def taken(self) -> bool:
+        with self._lock:
+            return self._taken
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._lease is None or self._lease.closed
+
+    def take(self) -> HostWeightLease:
+        """Transfer the lease to the transport owner exactly once."""
+        with self._lock:
+            if self._taken:
+                raise RuntimeError("HostWeightLeaseCarrier was already taken")
+            lease = self._lease
+            if lease is None or lease.closed:
+                raise RuntimeError("HostWeightLeaseCarrier does not own an open lease")
+            self._lease = None
+            self._taken = True
+            return lease
+
+    def close(self) -> None:
+        """Close the lease if ownership has not been transferred."""
+        with self._lock:
+            lease = self._lease
+            self._lease = None
+        if lease is not None:
+            lease.close()
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> NoReturn:
+        raise TypeError("HostWeightLeaseCarrier is process-local and cannot be serialized")
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
+
+
+__all__ = ["HostWeightLease", "HostWeightLeaseCarrier", "LeaseProvenance", "MappedHostRegion"]

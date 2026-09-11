@@ -705,6 +705,10 @@ class DuplexEARTTS(nn.Module):
         generation_config=None,
         ignore_eos_flag_stop=True,
         request_id=None,
+        current_subword_embed=None,
+        cache_position=None,
+        attention_mask=None,
+        position_ids=None,
     ):
         """
         Runs a single autoregressive prediction step to infer audio codec codes.
@@ -756,6 +760,20 @@ class DuplexEARTTS(nn.Module):
         # request_id is only used by vLLM backend — skip for native PyTorch inference
         if request_id is not None:
             inputs["request_id"] = request_id
+        # Fast-path extras (see RVQEARTTSModel.forward): a precomputed subword
+        # embedding bypasses the CAS encoder (host-sync free); cache_position
+        # enables StaticCache decoding; an explicit (4D) attention_mask and
+        # position_ids keep the mask and RoPE fully tensor-driven, which CUDA
+        # graph capture requires (the HF-derived paths read python-int cache
+        # lengths that would be baked into the captured graph).
+        if current_subword_embed is not None:
+            inputs["subword_embeds"] = current_subword_embed
+        if cache_position is not None:
+            inputs["cache_position"] = cache_position
+        if attention_mask is not None:
+            inputs["attention_mask"] = attention_mask
+        if position_ids is not None:
+            inputs["position_ids"] = position_ids
 
         outputs = self.tts_model(**inputs)
 

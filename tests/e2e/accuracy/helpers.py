@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
 import re
@@ -7,14 +10,15 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from base64 import b64decode, b64encode
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from fractions import Fraction
 from hashlib import sha1
 from io import BytesIO
 from mimetypes import guess_type
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -35,11 +39,14 @@ class IdentityFtfy:
 
 def apply_ftfy_mock(*, wan_i2v_module: Any | None = None) -> None:
     """Mock ftfy library for test cases in the main process"""
-    if wan_i2v_module is None:
-        from diffusers.pipelines.wan import pipeline_wan_i2v as wan_i2v_module
+    module: Any = wan_i2v_module
+    if module is None:
+        from diffusers.pipelines.wan import pipeline_wan_i2v as wan_pipeline
 
-    if not hasattr(wan_i2v_module, "ftfy"):
-        wan_i2v_module.ftfy = IdentityFtfy()
+        module = wan_pipeline
+
+    if not hasattr(module, "ftfy"):
+        module.ftfy = IdentityFtfy()
         print("ftfy (text encoding sanitizer) is not installed. Using mock ftfy implementation (identity function)")
     else:
         print("ftfy (text encoding sanitizer) is installed. Using actual ftfy implementation.")
@@ -73,6 +80,59 @@ def model_output_dir(parent_dir: Path, model: str) -> Path:
     path = parent_dir / safe_model_name
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+DEFAULT_DEVICE_PROFILE = "default"
+
+
+@dataclass(frozen=True, slots=True)
+class SimilarityThresholds:
+    """SSIM/PSNR floors for accuracy comparisons."""
+
+    ssim: float
+    psnr: float
+
+
+def resolve_device_profile(
+    device_name: str | None = None,
+    *,
+    profiles: Mapping[str, Any],
+) -> str:
+    """Map a device marketing name to a key in *profiles*.
+
+    When *device_name* is omitted, uses ``current_omni_platform.get_device_name()``.
+    Non-``default`` keys are matched as substrings; unmatched devices use ``default``.
+    """
+    if device_name is None:
+        try:
+            from vllm_omni.platforms import current_omni_platform
+
+            device_name = current_omni_platform.get_device_name()
+        except Exception:
+            return DEFAULT_DEVICE_PROFILE
+
+    if not device_name:
+        return DEFAULT_DEVICE_PROFILE
+
+    for profile in profiles:
+        if profile == DEFAULT_DEVICE_PROFILE:
+            continue
+        if profile in device_name:
+            return profile
+    return DEFAULT_DEVICE_PROFILE
+
+
+def resolve_similarity_thresholds(
+    table: Mapping[str, SimilarityThresholds],
+    device_profile: str | None = None,
+    *,
+    device_name: str | None = None,
+) -> SimilarityThresholds:
+    """Pick SSIM/PSNR thresholds from *table* for the current (or given) device profile."""
+    if DEFAULT_DEVICE_PROFILE not in table:
+        raise ValueError("threshold table must include a 'default' entry")
+    profile = device_profile or resolve_device_profile(device_name, profiles=table)
+    return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
 
 
 _SSIM_RE = re.compile(r"All:(?P<score>[0-9.]+)")
@@ -118,6 +178,7 @@ def probe_binary(binary: str, *, test_name: str = "video similarity e2e test") -
     resolved = shutil.which(binary)
     if resolved is None:
         pytest.skip(f"{binary} is required for {test_name}.")
+    assert resolved is not None
     return resolved
 
 
@@ -235,7 +296,7 @@ def video_artifact_dir(result_root: Path, source: str) -> Path:
 
 
 def send_video_request_with_timeout(
-    openai_client,
+    online_client,
     request_config: dict[str, Any],
     *,
     timeout_seconds: int,
@@ -266,7 +327,7 @@ def send_video_request_with_timeout(
             normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
 
     start_time = time.perf_counter()
-    create_url = openai_client._build_url("/v1/videos")
+    create_url = online_client._build_url("/v1/videos")
     response = requests.post(
         create_url,
         data=normalized_form_data,
@@ -280,8 +341,8 @@ def send_video_request_with_timeout(
         raise requests.HTTPError(f"{exc}; response body: {response.text}", response=response) from exc
     job_data = response.json()
     video_id = job_data["id"]
-    openai_client._wait_until_video_completed(video_id, timeout_seconds=timeout_seconds)
-    video_content = openai_client._download_video_content(video_id)
+    online_client._wait_until_video_completed(video_id, timeout_seconds=timeout_seconds)
+    video_content = online_client._download_video_content(video_id)
     print(f"online_video_e2e_latency_s={time.perf_counter() - start_time:.3f}")
     return video_content
 
@@ -571,11 +632,11 @@ class SemanticSimilarityScorer:
                 raise ImportError("FlagEmbedding not installed. Install with: pip install FlagEmbedding")
         return self._text_model
 
-    def text_similarity(self, text1: str, text2: str) -> float:
+    def text_similarity(self, text1: str, text2: str) -> dict[str, float | int]:
         """
         Compute semantic similarity between two texts using BGE-M3
         """
-        results = {}
+        results: dict[str, float | int] = {}
         # 1. Text prefix matching (maximum matching character length)
         match_count = 0
         for char_vllm, char_ref in zip(text1, text2):
@@ -653,7 +714,7 @@ def dreamzero_cfg_parallel_size() -> int:
 
 
 def _dreamzero_parity_vllm_env() -> dict[str, str]:
-    from tests.helpers.env import pick_least_used_device_indices
+    from tests.helpers.clean import pick_least_used_device_indices
     from tests.helpers.runtime import get_open_port
 
     parallel_size = dreamzero_cfg_parallel_size()
@@ -683,8 +744,9 @@ def dreamzero_parity_vllm_params(model: str | None = None):
     ]
     if parallel_size > 1:
         server_args.extend(["--cfg-parallel-size", str(parallel_size)])
+    resolved_model = model or os.environ.get("VLLM_DREAMZERO_MODEL") or _DREAMZERO_DEFAULT_MODEL
     return OmniServerParams(
-        model=model or os.environ.get("VLLM_DREAMZERO_MODEL", _DREAMZERO_DEFAULT_MODEL),
+        model=resolved_model,
         stage_config_path=get_deploy_config_path("dreamzero_tp1_cfg2.yaml"),
         server_args=server_args,
         env_dict=_dreamzero_parity_vllm_env(),
@@ -725,9 +787,9 @@ def dreamzero_parity_vllm_client(
 def _dreamzero_create_openpi_vllm_client(host: str, port: int) -> Any:
     from openpi_client import msgpack_numpy
 
-    _, WebsocketClientPolicy = load_dreamzero_upstream_modules()
+    _, websocket_client_policy_cls = load_dreamzero_upstream_modules()
 
-    class _OpenPIWebsocketClientPolicy(WebsocketClientPolicy):
+    class _OpenPIWebsocketClientPolicy(websocket_client_policy_cls):  # type: ignore[misc, valid-type]
         def __init__(
             self,
             host: str = "127.0.0.1",
@@ -869,7 +931,7 @@ class _DreamZeroParityServer(ABC):
         self.port = get_open_port() if port is None else port
         self.ready_timeout_s = ready_timeout_s
         self.proc: subprocess.Popen[str] | None = None
-        self._log_file = None
+        self._log_file: IO[str] | None = None
 
     @abstractmethod
     def _build_argv(self) -> list[str]:
@@ -932,7 +994,7 @@ class DreamZeroUpstreamServer(_DreamZeroParityServer):
         ]
 
     def _build_env(self) -> dict[str, str]:
-        from tests.helpers.env import pick_least_used_device_indices
+        from tests.helpers.clean import pick_least_used_device_indices
 
         dreamzero_repo, _ = require_dreamzero_parity_env()
         env = os.environ.copy()

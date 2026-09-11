@@ -12,6 +12,8 @@ from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
@@ -73,6 +75,15 @@ class StepBatchSamplingParamsKey:
     # because model acceleration hooks are shared by the whole worker batch.
     quality: str | None = None
 
+    # Step-mode engines can admit a model-specific full-forward fallback. Do
+    # not mix it with state-driven denoising in one scheduler wave.
+    use_step_execution: bool = True
+
+    # Pipeline-specific structure populated during preprocessing. This keeps
+    # model-owned settings that must be homogeneous (for example BAGEL CFG
+    # scales and renormalization) out of the generic sampling-params schema.
+    condition_key: tuple[Any, ...] | None = None
+
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
@@ -108,6 +119,7 @@ class RequestBatchSamplingParamsKey:
     guidance_scale: float = 0.0
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
+    guidance_scale_2_provided: bool = False
     guidance_rescale: float = 0.0
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
@@ -157,6 +169,7 @@ class SchedulerRequestState:
     diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
+    queued_at: float = 0.0
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)
@@ -241,6 +254,9 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
+    # Opaque metadata emitted by a future Scheduler-role connector. PR0 keeps
+    # the input port but does not build or consume it.
+    kv_connector_metadata: KVConnectorMetadata | None = None
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

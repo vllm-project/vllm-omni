@@ -1,3 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import subprocess
+import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,8 +11,10 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    _token2wav_sdpa_context,
     plan_token2wav_encode_slices,
     relpos_encode_token_budget,
 )
@@ -52,6 +60,9 @@ class _FakeEstimator(nn.Module):
         self.blocks = [_FakeBlock()]
         self.cfg_batches: list[int] = []
         self.speaker_order: list[list[float]] = []
+        self.attention_cache_dtypes: list[torch.dtype | None] = []
+        self.register_buffer("att_cache_buffer", torch.ones(1), persistent=False)
+        self.register_buffer("cnn_cache_buffer", torch.ones(1), persistent=False)
 
     def t_embedder(self, time):
         return time[:, None]
@@ -66,7 +77,8 @@ class _FakeEstimator(nn.Module):
         cnn_out,
         att_out,
     ):
-        del time, mask, cnn_cache, att_cache
+        del time, mask, cnn_cache
+        self.attention_cache_dtypes.append(att_cache.dtype if isinstance(att_cache, torch.Tensor) else None)
         self.cfg_batches.append(inputs.shape[0])
         self.speaker_order.append(inputs[:, 2, 0].tolist())
         marker = inputs[:, 1, 0]
@@ -100,15 +112,16 @@ class _FakeHiFT(nn.Module):
         super().__init__()
         self.calls: list[int] = []
 
-    def forward(self, mel, source):
+    def forward(self, batch, device):
+        mel = batch["speech_feat"].transpose(1, 2).to(device)
+        return self.inference(mel, mel.new_zeros((mel.shape[0], 1, 0)))
+
+    def inference(self, mel, source):
         del source
         self.calls.append(mel.shape[0])
         speech = mel[:, 0].repeat_interleave(3, dim=1)
         generated_source = speech[:, None]
         return speech, generated_source
-
-    def inference(self, mel, source):
-        return self.forward(mel, source)
 
 
 class _FakeToken2Wav:
@@ -140,13 +153,14 @@ class _FakeToken2Wav:
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1):
+def _config(minimum: int = 1, initial: int = 0):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
             stage_connector_config={
                 "extra": {
                     "code2wav_min_batch_size": minimum,
+                    "code2wav_initial_batch_size": initial,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
                 }
@@ -155,12 +169,43 @@ def _config(minimum: int = 1):
     )
 
 
-def _model():
+def _model(initial: int = 0, minimum: int = 1):
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav)
-    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    _enable_fake_ragged_kernel(backend)
+    model = MiniCPMO45Code2Wav(vllm_config=_config(minimum=minimum, initial=initial))
     model.backend = backend
     return model, token2wav
+
+
+def _enable_fake_ragged_kernel(adapter: BatchedToken2Wav) -> None:
+    """Keep fake-model tests focused on ragged grouping and row mapping."""
+    estimator = adapter.flow.decoder.estimator
+    estimator.in_proj = nn.Identity()
+
+    def fake_ragged_kernel(
+        estimator,
+        estimator_input,
+        time_embedding,
+        attn_mask,
+        cnn_cache,
+        att_cache,
+        cnn_cache_buffer,
+        att_cache_buffer,
+        valid_lengths,
+    ):
+        del valid_lengths
+        return estimator.blocks_forward_chunk(
+            estimator_input,
+            time_embedding,
+            attn_mask,
+            cnn_cache,
+            att_cache,
+            cnn_cache_buffer,
+            att_cache_buffer,
+        )
+
+    adapter._blocks_forward_chunk_ragged = fake_ragged_kernel  # type: ignore[method-assign]
 
 
 def _info(
@@ -256,6 +301,400 @@ def test_decode_batch_splits_overlong_prefill_inside_relpos_budget():
     assert audios[0].numel() > 0
 
 
+def test_ragged_overlong_prefill_uses_relpos_safe_exact_slices():
+    token2wav = _FakeToken2Wav()
+    token2wav.flow.encoder.pre_lookahead_layer = SimpleNamespace(pre_lookahead_len=3)
+    adapter = BatchedToken2Wav(token2wav)
+    _enable_fake_ragged_kernel(adapter)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 2)
+    setup_encodes = len(token2wav.flow.encoder.calls)
+    adapter._max_encode_token_frames = lambda _states: 4
+
+    tokens = [
+        torch.arange(10, dtype=torch.long),
+        torch.arange(4, dtype=torch.long),
+    ]
+    last_chunks = [True, False]
+    audios, next_states = adapter.decode_ragged_batch(
+        tokens,
+        prompt,
+        states,
+        last_chunks=last_chunks,
+    )
+
+    assert token2wav.flow.encoder.calls[setup_encodes:] == [1, 1, 1, 1]
+    assert token2wav.flow.encoder.last_chunk_calls[setup_encodes:] == [False, False, True, False]
+    assert len(audios) == len(next_states) == 2
+    assert all(audio.numel() > 0 for audio in audios)
+
+    for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
+        reference_token2wav = _FakeToken2Wav()
+        reference_token2wav.flow.encoder.pre_lookahead_layer = SimpleNamespace(pre_lookahead_len=3)
+        reference_adapter = BatchedToken2Wav(reference_token2wav)
+        reference_prompt = reference_adapter.prepare_prompt("shared", "/fake/prompt.wav")
+        reference_states = reference_adapter.setup_batch(reference_prompt, 1)
+        reference_adapter._max_encode_token_frames = lambda _states: 4
+        reference_audio, reference_state = reference_adapter.decode_batch(
+            row_tokens.unsqueeze(0),
+            reference_prompt,
+            reference_states,
+            last_chunk=last_chunk,
+        )
+        torch.testing.assert_close(audios[row], reference_audio[0])
+        for cache_name, expected in reference_state[0].flow_cache.items():
+            torch.testing.assert_close(
+                next_states[row].flow_cache[cache_name],
+                expected,
+            )
+        for cache_name, expected in reference_state[0].hift_cache.items():
+            torch.testing.assert_close(
+                next_states[row].hift_cache[cache_name],
+                expected,
+            )
+
+
+def test_ragged_diffusion_batches_eight_rows_and_preserves_exact_results():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    _enable_fake_ragged_kernel(adapter)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 8)
+    token2wav.flow.encoder.calls.clear()
+    token2wav.flow.decoder.estimator.cfg_batches.clear()
+    token2wav.hift.calls.clear()
+    tokens = [
+        *(torch.tensor([10 + row, 11 + row, 12 + row]) for row in range(6)),
+        torch.tensor([20, 21]),
+        torch.tensor([30, 31]),
+    ]
+    last_chunks = [False] * 6 + [True, True]
+
+    audios, next_states = adapter.decode_ragged_batch(
+        tokens,
+        prompt,
+        states,
+        last_chunks=last_chunks,
+    )
+
+    assert token2wav.flow.encoder.calls == [6, 2]
+    assert token2wav.flow.decoder.estimator.cfg_batches == [16, 16]
+    assert token2wav.hift.calls == [6, 2]
+    assert len(audios) == len(next_states) == 8
+
+    for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
+        reference_adapter = BatchedToken2Wav(_FakeToken2Wav())
+        reference_prompt = reference_adapter.prepare_prompt("shared", "/fake/prompt.wav")
+        reference_states = reference_adapter.setup_batch(reference_prompt, 1)
+        reference_audio, reference_state = reference_adapter.decode_batch(
+            row_tokens.unsqueeze(0),
+            reference_prompt,
+            reference_states,
+            last_chunk=last_chunk,
+        )
+        torch.testing.assert_close(audios[row], reference_audio[0])
+        for cache_name, expected in reference_state[0].flow_cache.items():
+            torch.testing.assert_close(
+                next_states[row].flow_cache[cache_name],
+                expected,
+            )
+        for cache_name, expected in reference_state[0].hift_cache.items():
+            torch.testing.assert_close(
+                next_states[row].hift_cache[cache_name],
+                expected,
+            )
+
+
+def test_npu_patch_preserves_ragged_estimator_contract():
+    script = r"""
+import torch
+
+from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
+    _FakeToken2Wav,
+    _enable_fake_ragged_kernel,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+import vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav as npu_patch
+
+
+class _FailGraphRunner:
+    def run(self, *args, **kwargs):
+        raise AssertionError("ragged decode must bypass the exact-shape NPU Graph")
+
+
+npu_patch.apply_minicpmo_4_5_code2wav_patch()
+adapter = BatchedToken2Wav(_FakeToken2Wav())
+_enable_fake_ragged_kernel(adapter)
+prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+states = adapter.setup_batch(prompt, 2)
+npu_patch._backend_graph_runners[adapter] = _FailGraphRunner()
+audios, next_states = adapter.decode_ragged_batch(
+    [
+        torch.tensor([10, 11, 12]),
+        torch.tensor([20, 21]),
+    ],
+    prompt,
+    states,
+    last_chunks=[False, True],
+)
+assert len(audios) == len(next_states) == 2
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[4],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_decode_cfm_enters_platform_sdpa_context(monkeypatch):
+    entered: list[str] = []
+
+    @contextmanager
+    def recording_context():
+        entered.append("enter")
+        yield
+        entered.append("exit")
+
+    monkeypatch.setattr(
+        batched_token2wav_module,
+        "_token2wav_sdpa_context",
+        lambda _device: recording_context(),
+    )
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    _enable_fake_ragged_kernel(adapter)
+    adapter._decode_cfm(
+        torch.ones((2, 1, 2)),
+        torch.ones((2, 1)),
+        torch.zeros((2, 1, 2)),
+        cnn_cache=None,
+        att_cache=None,
+        valid_lengths=[2, 1],
+    )
+
+    assert entered == ["enter", "exit"]
+
+
+def test_ragged_decode_bypasses_exact_shape_accelerators():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    _enable_fake_ragged_kernel(adapter)
+
+    class ForbiddenAccelerator:
+        def replay(self, *args):
+            pytest.fail("ragged decode must not use the exact-shape CFM graph")
+
+        def step(self, **kwargs):
+            pytest.fail("ragged decode must not use the exact-shape TensorRT stepper")
+
+    accelerator = ForbiddenAccelerator()
+    adapter._cfm_graph_wrapper = accelerator
+    adapter._trt_stepper = accelerator
+    adapter._decode_cfm(
+        torch.ones((2, 1, 2)),
+        torch.ones((2, 1)),
+        torch.zeros((2, 1, 2)),
+        cnn_cache=None,
+        att_cache=None,
+        valid_lengths=[2, 1],
+    )
+
+
+def test_ragged_decode_fails_when_estimator_has_no_ragged_kernel():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+
+    with pytest.raises(
+        RuntimeError,
+        match=r'"reason":"ragged_kernel_unavailable"',
+    ):
+        adapter._decode_cfm(
+            torch.ones((2, 1, 2)),
+            torch.ones((2, 1)),
+            torch.zeros((2, 1, 2)),
+            cnn_cache=None,
+            att_cache=None,
+            valid_lengths=[2, 1],
+        )
+
+
+def test_cfm_graph_receives_bfloat16_cache_in_compute_dtype():
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), bfloat16_attention_cache=True)
+    seen_dtypes: list[torch.dtype] = []
+
+    class RecordingGraph:
+        def replay(self, estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out):
+            del time_embedding, cnn_cache
+            seen_dtypes.append(att_cache.dtype)
+            return estimator_input[:, :1], cnn_out, att_out
+
+    adapter._cfm_graph_wrapper = RecordingGraph()
+    adapter._estimator_step(
+        adapter.flow.decoder.estimator,
+        x=torch.ones((2, 1, 2)),
+        mu=torch.ones((2, 1, 2)),
+        time=torch.zeros(2),
+        speakers=torch.ones((2, 1)),
+        cond=torch.zeros((2, 1, 2)),
+        cnn_cache=torch.zeros((1, 2, 2, 1)),
+        att_cache=torch.zeros((1, 2, 1, 1, 2), dtype=torch.bfloat16),
+    )
+
+    assert seen_dtypes == [torch.float32]
+
+
+def test_npu_sdpa_context_uses_platform_patch(monkeypatch):
+    entered: list[str] = []
+
+    @contextmanager
+    def recording_context():
+        entered.append("enter")
+        yield
+        entered.append("exit")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.models.step_audio2_token2wav",
+        SimpleNamespace(npu_token2wav_sdpa_context=recording_context),
+    )
+    with _token2wav_sdpa_context(SimpleNamespace(type="npu")):
+        assert entered == ["enter"]
+
+    assert entered == ["enter", "exit"]
+
+
+def test_ragged_outputs_fail_closed_on_middle_hole():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 3)
+    audios: list[torch.Tensor | None] = [
+        torch.zeros(1),
+        None,
+        torch.ones(1),
+    ]
+    next_states = [states[0], None, states[2]]
+
+    with pytest.raises(
+        RuntimeError,
+        match=r'"reason":"incomplete_ragged_output","audio_rows":\[1\],"state_rows":\[1\]',
+    ):
+        adapter._require_complete_ragged_outputs(audios, next_states)
+
+
+@pytest.mark.parametrize(
+    "bfloat16_attention_cache",
+    [False, True],
+    ids=["fp32-cache", "bf16-cache"],
+)
+def test_ragged_dit_two_step_decode_matches_per_row_exact_decode(
+    bfloat16_attention_cache: bool,
+):
+    from cosyvoice2.flow.decoder_dit import DiT
+
+    torch.manual_seed(17)
+    template = DiT(
+        in_channels=4,
+        out_channels=1,
+        depth=2,
+        num_heads=2,
+        head_dim=2,
+        hidden_size=4,
+    ).eval()
+    template_state = {name: value.detach().clone() for name, value in template.state_dict().items()}
+    rand_noise = torch.randn(1, 1, 32)
+
+    def make_adapter() -> BatchedToken2Wav:
+        token2wav = _FakeToken2Wav()
+        estimator = DiT(
+            in_channels=4,
+            out_channels=1,
+            depth=2,
+            num_heads=2,
+            head_dim=2,
+            hidden_size=4,
+        ).eval()
+        estimator.load_state_dict(template_state)
+        token2wav.flow.decoder.estimator = estimator
+        token2wav.flow.decoder.rand_noise = rand_noise.clone()
+        return BatchedToken2Wav(
+            token2wav,
+            bfloat16_attention_cache=bfloat16_attention_cache,
+        )
+
+    ragged_adapter = make_adapter()
+    ragged_prompt = ragged_adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    ragged_states = ragged_adapter.setup_batch(ragged_prompt, 2)
+
+    exact_adapters = [make_adapter(), make_adapter()]
+    exact_prompts = [adapter.prepare_prompt("shared", "/fake/prompt.wav") for adapter in exact_adapters]
+    exact_states = [
+        adapter.setup_batch(prompt, 1) for adapter, prompt in zip(exact_adapters, exact_prompts, strict=True)
+    ]
+    tolerance = (2e-2, 2e-3) if bfloat16_attention_cache else (1e-5, 1e-6)
+    steps = [
+        (
+            [torch.tensor([10, 11, 12]), torch.tensor([20, 21, 22])],
+            [False, True],
+        ),
+        (
+            [torch.tensor([13, 14]), torch.tensor([22, 23, 24])],
+            [True, True],
+        ),
+    ]
+    first_step_history_width: int | None = None
+
+    for step, (tokens, last_chunks) in enumerate(steps):
+        if step == 1:
+            assert first_step_history_width is not None
+            assert all(
+                int(state.flow_cache["estimator_att_cache"].shape[4]) == first_step_history_width
+                for state in ragged_states
+            )
+        ragged_audios, ragged_states = ragged_adapter.decode_ragged_batch(
+            tokens,
+            ragged_prompt,
+            ragged_states,
+            last_chunks=last_chunks,
+        )
+        for row, (adapter, prompt) in enumerate(zip(exact_adapters, exact_prompts, strict=True)):
+            exact_audios, exact_states[row] = adapter.decode_batch(
+                tokens[row].unsqueeze(0),
+                prompt,
+                exact_states[row],
+                last_chunk=last_chunks[row],
+            )
+            torch.testing.assert_close(
+                ragged_audios[row],
+                exact_audios[0],
+                rtol=tolerance[0],
+                atol=tolerance[1],
+            )
+            for cache_name, expected in exact_states[row][0].flow_cache.items():
+                actual = ragged_states[row].flow_cache[cache_name]
+                assert actual.dtype == expected.dtype
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    rtol=tolerance[0],
+                    atol=tolerance[1],
+                )
+            for cache_name, expected in exact_states[row][0].hift_cache.items():
+                torch.testing.assert_close(
+                    ragged_states[row].hift_cache[cache_name],
+                    expected,
+                    rtol=tolerance[0],
+                    atol=tolerance[1],
+                )
+
+        estimator_att = ragged_states[0].flow_cache["estimator_att_cache"]
+        assert estimator_att.shape[4] > 0
+        if step == 0:
+            first_step_history_width = int(estimator_att.shape[4])
+        else:
+            assert first_step_history_width is not None
+            assert int(estimator_att.shape[4]) > first_step_history_width
+
+
 def test_fade_in_out_limits_overlap_to_available_previous_audio():
     speech = torch.arange(6, dtype=torch.float32).reshape(1, -1)
     previous = torch.full((1, 3), 2.0)
@@ -293,6 +732,69 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
             round_tripped["estimator_att_cache"],
             original.flow_cache["estimator_att_cache"],
         )
+
+
+def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, bfloat16_attention_cache=True)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 2)
+
+    assert all(state.flow_cache["estimator_att_cache"].dtype == torch.bfloat16 for state in states)
+    assert (
+        states[0].flow_cache["estimator_att_cache"].data_ptr() != states[1].flow_cache["estimator_att_cache"].data_ptr()
+    )
+
+    stacked = adapter._stack_flow_cache(states)
+    assert stacked["estimator_att_cache"].dtype == torch.bfloat16
+    restored = adapter._split_flow_cache(stacked, 2)
+    for original, round_tripped in zip(states, restored, strict=True):
+        assert round_tripped["estimator_att_cache"].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            round_tripped["estimator_att_cache"],
+            original.flow_cache["estimator_att_cache"],
+        )
+
+    _, next_states = adapter.decode_batch(
+        torch.tensor([[10, 11], [20, 21]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+    assert all(state.flow_cache["estimator_att_cache"].dtype == torch.bfloat16 for state in next_states)
+    assert token2wav.flow.decoder.estimator.attention_cache_dtypes[-2:] == [torch.float32, torch.float32]
+
+
+def test_bfloat16_estimator_attention_cache_materializes_each_timestep():
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), bfloat16_attention_cache=True)
+
+    _, estimator_cnn, estimator_att = adapter._decode_cfm(
+        torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
+        torch.ones((2, 1)),
+        torch.zeros((2, 1, 2)),
+        cnn_cache=None,
+        att_cache=None,
+    )
+
+    assert estimator_cnn.dtype == torch.float32
+    assert estimator_att.dtype == torch.bfloat16
+    assert estimator_att.shape[:3] == (2, 1, 4)
+
+
+def test_float32_estimator_attention_cache_materializes_each_timestep():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+
+    _, estimator_cnn, estimator_att = adapter._decode_cfm(
+        torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
+        torch.ones((2, 1)),
+        torch.zeros((2, 1, 2)),
+        cnn_cache=None,
+        att_cache=None,
+    )
+
+    assert estimator_cnn.dtype == torch.float32
+    assert estimator_att.dtype == torch.float32
+    assert estimator_att.shape[:3] == (2, 1, 4)
 
 
 def test_model_preserves_output_slots_and_prefers_runtime_codes():
@@ -384,6 +886,28 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
 
     assert output.multimodal_outputs["model_outputs"][0].numel() > 0
     assert "duplex" in model._states
+
+
+def test_initial_empty_segment_markers_respect_initial_batch_limit():
+    model, token2wav = _model(initial=2)
+    names = ["a", "b", "c", "d", "e"]
+    boundaries = []
+    for name in names:
+        boundary = _info(name, 0, [])
+        boundary["meta"].update(
+            {
+                "code_flat_numel": 0,
+                "tts_is_last_chunk": True,
+                "turn_end": False,
+            }
+        )
+        boundaries.append(boundary)
+
+    output = _forward(model, boundaries)
+
+    assert token2wav.flow.encoder.calls == [2, 2, 1]
+    assert [audio.numel() for audio in output.multimodal_outputs["model_outputs"]] == [0] * len(names)
+    assert set(model._states) == set(names)
 
 
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
@@ -647,11 +1171,56 @@ def test_singleton_and_mixed_shape_buckets_use_same_batched_backend_without_fall
     assert token2wav.hift.calls[-2:] == [1, 1]
 
 
+def test_initial_batch_limit_allows_later_full_batch():
+    model, token2wav = _model(initial=4)
+    names = [f"request-{index}" for index in range(8)]
+
+    for chunk_seq in (0, 1):
+        infos = [_info(name, chunk_seq, [1, 2]) for name in names]
+        _forward(model, infos)
+        assert token2wav.hift.calls[-2:] == [4, 4]
+
+    token2wav.hift.calls.clear()
+    _forward(model, [_info(name, 2, [1, 2]) for name in names])
+    assert token2wav.hift.calls == [8]
+
+
+def test_initial_batch_partition_preserves_minimum():
+    model, token2wav = _model(initial=4, minimum=3)
+    names = [f"request-{index}" for index in range(6)]
+
+    _forward(model, [_info(name, 0, [1, 2]) for name in names])
+
+    assert token2wav.hift.calls == [3, 3]
+
+
+def test_initial_batch_partition_rejects_impossible_remainder():
+    model, _ = _model(initial=4, minimum=3)
+    names = [f"request-{index}" for index in range(5)]
+
+    with pytest.raises(RuntimeError, match="initial_batch_partition_below_minimum"):
+        _forward(model, [_info(name, 0, [1, 2]) for name in names])
+
+
+@pytest.mark.parametrize("chunk_seqs", [[0, 2, 2, 2], [0, 0, 0, 2]])
+def test_initial_steady_partition_rejects_undersized_wave(chunk_seqs):
+    model, _ = _model(initial=4, minimum=3)
+    bucket = [SimpleNamespace(chunk_seq=chunk_seq) for chunk_seq in chunk_seqs]
+
+    with pytest.raises(RuntimeError, match="decode_wave_below_minimum"):
+        list(model._iter_decode_batches([bucket]))
+
+
 def test_backend_failure_does_not_commit_any_request_state(monkeypatch):
     model, _ = _model()
     _forward(
         model,
-        [_info(name, 0, [index + 1, index + 2]) for index, name in enumerate(("a", "b", "c", "d"))],
+        [
+            _info("a", 0, [1, 2], cache_epoch=0),
+            _info("b", 0, [2, 3], cache_epoch=0),
+            _info("c", 0, [3, 4], cache_epoch=1),
+            _info("d", 0, [4, 5], cache_epoch=1),
+        ],
     )
     before = dict(model._states)
     original = model.backend.decode_batch
@@ -671,8 +1240,8 @@ def test_backend_failure_does_not_commit_any_request_state(monkeypatch):
             [
                 _info("a", 1, [5, 6]),
                 _info("b", 1, [7, 8]),
-                _info("c", 1, [9, 10, 11]),
-                _info("d", 1, [12, 13, 14]),
+                _info("c", 1, [9, 10], cache_epoch=1),
+                _info("d", 1, [12, 13], cache_epoch=1),
             ],
         )
     assert call_count == 2

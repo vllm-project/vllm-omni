@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.27.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.28.0
 FROM ${BASE_IMAGE} AS base
 
 # Declare a variable to know if we want to use the nightly build or the stable build.
@@ -10,7 +10,7 @@ FROM ${BASE_IMAGE} AS base
 #    we should swap over to use stable release ASAP.
 #    We should avoid relying on custom commits.
 ARG USE_NIGHTLY_BUILD=0
-ARG VLLM_VERSION_OR_COMMIT_HASH=v0.27.0
+ARG VLLM_VERSION_OR_COMMIT_HASH=v0.28.0
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 

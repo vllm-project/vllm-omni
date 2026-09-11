@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import sys
+from contextlib import contextmanager
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
+from typing import Any, TypeVar
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -12,7 +14,24 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+_ItemT = TypeVar("_ItemT")
+_ResultT = TypeVar("_ResultT")
+
+
+def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _ResultT:
+    items.append(item)
+    return result
+
+
+def _turbo_spec(filename: str) -> TurboSpec:
+    """Build the spec a loaded artifact of this name would carry."""
+    spec = parse_turbo_filename(filename)
+    assert spec is not None
+    return spec
 
 
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
@@ -29,6 +48,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace()
+    pipeline.text_encoder = object()
     cache_spec = object()
     quality_plan = SimpleNamespace(cache_dit=cache_spec)
     pipeline._quality_policy = Mock()
@@ -47,7 +67,8 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
         return torch.zeros(1), torch.zeros(1)
 
     pipeline.diffuse = diffuse
-    pipeline.decode = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    decoded_audio = torch.zeros(1)
+    pipeline.decode = Mock(return_value=(torch.zeros(1, 3, 1, 1, 1), decoded_audio))
     sampling = OmniDiffusionSamplingParams(
         quality="high",
         width=1344,
@@ -76,7 +97,9 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
         num_inference_steps=50,
         extra_args={"task": "t2va", "aspect_ratio": "16:9"},
     )
-    assert output.output == pipeline.decode.return_value
+    assert output.output[0].shape == (1, 1, 1, 1, 3)
+    assert output.output[0].dtype == torch.uint8
+    assert output.output[1] is decoded_audio
 
 
 def test_pipeline_import_registry_and_component_discovery():
@@ -101,6 +124,40 @@ def test_pipeline_import_registry_and_component_discovery():
     assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
 
 
+def test_encoder_free_stage_skips_text_encoder_during_dlo_discovery():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(1, 1)
+    pipeline.video_vae = torch.nn.Linear(1, 1)
+    pipeline.audio_vae = torch.nn.Linear(1, 1)
+    pipeline.text_encoder = None
+    pipeline._dit_modules = ["transformer"]
+    pipeline._encoder_modules = []
+    pipeline._vae_modules = ["video_vae", "audio_vae"]
+
+    discovered = ModuleDiscovery.discover(pipeline)
+
+    assert discovered.dit_names == ["transformer"]
+    assert discovered.encoder_names == []
+    assert discovered.vae_names == ["video_vae", "audio_vae"]
+
+
+def test_encoder_free_stage_skips_missing_component_during_dlo_registration():
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    cache = Mock()
+    video_vae = Mock()
+    audio_vae = Mock()
+
+    pipeline_module._register_dlo_component_cache(cache, None, video_vae, audio_vae)
+
+    video_vae.set_omni_component_cache.assert_called_once_with(cache)
+    audio_vae.set_omni_component_cache.assert_called_once_with(cache)
+
+
 def _write_partition_index(path, *, partition, tasks):
     path.mkdir(parents=True)
     (path / "model_index.json").write_text(
@@ -120,9 +177,9 @@ def _write_partition_index(path, *, partition, tasks):
 
 
 def test_modular_diffusers_index_is_resolved_generically(tmp_path):
+    from vllm_omni.config.resolver import resolve_omni_config
     from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
     from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
-    from vllm_omni.entrypoints.utils import resolve_model_config_path
 
     (tmp_path / "modular_model_index.json").write_text(
         json.dumps(
@@ -136,7 +193,16 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
 
     assert is_diffusion_model(str(tmp_path))
     assert resolve_model_class_name(str(tmp_path)) == "MiniMaxH3ModularPipeline"
-    assert resolve_model_config_path(str(tmp_path)) is None
+    resolved = resolve_omni_config(
+        str(tmp_path),
+        trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides=None,
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    assert resolved.config_path is None
+    assert resolved.stage_by_id(0).engine_args.model_class_name == "MiniMaxH3ModularPipeline"
 
     config = OmniDiffusionConfig(model=str(tmp_path))
     config.enrich_config()
@@ -185,6 +251,7 @@ def test_startup_task_rejects_unsupported_value():
 
 def test_combined_task_inference_and_transformer_routing():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.errors import OmniClientError
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -196,6 +263,12 @@ def test_combined_task_inference_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    fl2v_spec = _turbo_spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors")
+    ref2v_spec = _turbo_spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
+    assert pipeline._resolve_task("fl2va", {"image": object()}, turbo_spec=fl2v_spec) == "fl2va"
+    with pytest.raises(OmniClientError, match="serves"):
+        pipeline._resolve_task("ref2va", {}, turbo_spec=fl2v_spec)
+    assert pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=ref2v_spec) == "ref2va"
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task(None, {"image": object()}) == "ref2va"
@@ -214,14 +287,16 @@ def test_combined_task_inference_and_transformer_routing():
         "component_partition",
         "source_partitions",
         "expected_tasks",
+        "load_text_encoder",
     ),
     [
-        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}),
-        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}),
-        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
+        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}, True),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}, True),
+        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}, True),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}, False),
     ],
 )
-def test_pipeline_loads_task_selected_dits_and_shared_components_once(
+def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     monkeypatch,
     tmp_path,
     task_type,
@@ -230,6 +305,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     component_partition,
     source_partitions,
     expected_tasks,
+    load_text_encoder,
 ):
     from vllm_omni.diffusion.data import (
         DiffusionParallelConfig,
@@ -260,7 +336,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
         ):
             (tmp_path / partition_name / component).mkdir()
 
-    created = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
+    created: dict[str, list[Any]] = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
 
     class FakeModule(torch.nn.Module):
         def __init__(self, *args, **kwargs):
@@ -278,15 +354,15 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
 
         return create
 
-    tokenizer_calls = []
-    processor_calls = []
+    tokenizer_calls: list[Any] = []
+    processor_calls: list[Any] = []
     tokenizer_cls = Mock(spec=pipeline_module.Qwen2TokenizerFast)
-    tokenizer_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
-        tokenizer_calls.append((args, kwargs)) or object()
+    tokenizer_cls.from_pretrained.side_effect = lambda *args, **kwargs: _append_and_return(
+        tokenizer_calls, (args, kwargs), object()
     )
     processor_cls = Mock(spec=pipeline_module.Qwen3VLProcessor)
-    processor_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
-        processor_calls.append((args, kwargs)) or object()
+    processor_cls.from_pretrained.side_effect = lambda *args, **kwargs: _append_and_return(
+        processor_calls, (args, kwargs), object()
     )
     monkeypatch.setattr(pipeline_module, "MiniMaxH3DiTModel", FakeDiT)
     monkeypatch.setattr(
@@ -341,6 +417,11 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
         revision=None,
         task_type=task_type,
         quantization_config=None,
+        model_loaded={
+            "transformer": True,
+            "vae": True,
+            "text_encoder": load_text_encoder,
+        },
         parallel_config=DiffusionParallelConfig(
             cfg_parallel_size=1,
             text_encoder_tp_size=1,
@@ -352,34 +433,54 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     assert pipeline.supported_tasks == expected_tasks
     assert len(created["dit"]) == expected_dits
     component_path = tmp_path / component_partition
-    assert created["text_encoder"] == [str(component_path / "text_encoder")]
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
-    assert len(tokenizer_calls) == 1
-    assert len(processor_calls) == 1
     expected_dit_modules = ["transformer", "transformers_ref"] if expected_dits == 2 else ["transformer"]
     assert pipeline._dit_modules == expected_dit_modules
     assert hasattr(pipeline, "transformers_ref") is (expected_dits == 2)
+    if load_text_encoder:
+        assert created["text_encoder"] == [str(component_path / "text_encoder")]
+        assert len(tokenizer_calls) == 1
+        assert len(processor_calls) == 1
+        assert pipeline.text_encoder is not None
+        assert pipeline.tokenizer is not None
+        assert pipeline.processor is not None
+        assert pipeline._encoder_modules == ["text_encoder"]
+        assert pipeline.text_encoder_tp_size == 1
+    else:
+        assert created["text_encoder"] == []
+        assert tokenizer_calls == []
+        assert processor_calls == []
+        assert pipeline.text_encoder is None
+        assert pipeline.tokenizer is None
+        assert pipeline.processor is None
+        assert pipeline._encoder_modules == []
+        assert pipeline.text_encoder_tp_size == 0
+        assert pipeline.text_encoder_group is None
     if expected_partition == "ref2va":
         assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
     assert [source.model_or_path for source in pipeline.weights_sources] == [
         *(str(tmp_path / partition_name) for partition_name in source_partitions),
-        str(component_path),
+        *((str(component_path),) if load_text_encoder else ()),
     ]
     assert [source.subfolder for source in pipeline.weights_sources] == [
         *("transformer" for _ in source_partitions),
-        "text_encoder",
+        *(("text_encoder",) if load_text_encoder else ()),
     ]
     expected_prefixes = ["transformer."]
     if expected_dits == 2:
         expected_prefixes.append("transformers_ref.")
-    expected_prefixes.append("text_encoder.")
+    if load_text_encoder:
+        expected_prefixes.append("text_encoder.")
     assert [source.prefix for source in pipeline.weights_sources] == expected_prefixes
-    expected_patterns = (
-        pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS
-        if expected_partition == "combined"
-        else pipeline_module.MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[expected_partition]
-    )
+    if load_text_encoder:
+        expected_patterns = (
+            pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS
+            if expected_partition == "combined"
+            else pipeline_module.MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[expected_partition]
+        )
+    else:
+        expected_patterns = pipeline_module.MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS[expected_partition]
     assert download_calls == [
         {
             "model_name_or_path": "MiniMaxAI/MiniMax-H3",
@@ -436,6 +537,10 @@ def test_dlo_offload_plan_includes_token_refiner():
 
     assert MiniMaxH3Pipeline._offload_plan.offload_submodules == {"token_refiner": "blocks"}
     assert MiniMaxH3Pipeline._offload_plan.resident_dit_paths == frozenset({"transformer"})
+    assert MiniMaxH3Pipeline._offload_plan.encoder_component_types == {"text_encoder": "text_encoder"}
+    assert MiniMaxH3Pipeline._offload_plan.encoder_block_attrs == {
+        "text_encoder": ("vision.blocks", "text_model.layers")
+    }
 
 
 def test_joint_postprocess_is_multiprocessing_picklable():
@@ -445,16 +550,39 @@ def test_joint_postprocess_is_multiprocessing_picklable():
 
     postprocess = get_minimax_h3_post_process_func(SimpleNamespace())
     postprocess = ForkingPickler.loads(ForkingPickler.dumps(postprocess))
-    video = torch.linspace(0, 1, 2 * 3 * 2 * 4 * 5).reshape(2, 3, 2, 4, 5)
+    # decode() hands over quantised frames already laid out as (B, T, H, W, C).
+    video = torch.arange(2 * 2 * 4 * 5 * 3, dtype=torch.uint8).reshape(2, 2, 4, 5, 3)
     audio = torch.arange(12, dtype=torch.float32).reshape(1, 2, 6)
 
     result = postprocess((video, audio), output_type="np")
 
     assert isinstance(result["video"], list)
+    assert result["video"][0].dtype == np.uint8
     assert result["video"][0].shape == (2, 4, 5, 3)
+    np.testing.assert_array_equal(result["video"][0], video[0].numpy())
     np.testing.assert_array_equal(result["audio"], audio.numpy())
     assert result["audio_sample_rate"] == 32000
     assert result["fps"] == 24
+
+
+def test_joint_video_output_is_quantized_before_transfer():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+        _prepare_minimax_h3_video_output,
+    )
+
+    video = torch.linspace(-0.1, 1.1, 2 * 3 * 2 * 4 * 5, dtype=torch.float64).reshape(2, 3, 2, 4, 5)
+    expected = torch.round(video.float().clamp(0, 1) * 255).to(torch.uint8).permute(0, 2, 3, 4, 1)
+    prepared = _prepare_minimax_h3_video_output(video)
+
+    assert prepared.dtype == torch.uint8
+    assert prepared.is_contiguous()
+    assert prepared.shape == (2, 2, 4, 5, 3)
+    torch.testing.assert_close(prepared, expected, rtol=0, atol=0)
+
+    result = _minimax_h3_post_process((prepared, torch.zeros(1, 2, 6)))
+    assert result["video"][0].dtype == np.uint8
+    np.testing.assert_array_equal(result["video"][0], expected[0].numpy())
 
 
 def test_cfg_parallel_is_rejected_for_distilled_checkpoint():
@@ -524,7 +652,7 @@ def test_base_schedule_overrides_the_uniform_sigma_positions():
 @pytest.mark.parametrize(
     "base_schedule",
     [
-        [0.9, 0.5, 0.0],
+        [1.5, 0.5, 0.0],
         [1.0, 0.5, 0.1],
         [1.0, 0.5, 0.5, 0.0],
         [1.0],
@@ -562,6 +690,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace()
+    pipeline.text_encoder = Mock()
     pipeline._base_schedule_by_partition = schedules
     pipeline._quality_policy = Mock()
     pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
@@ -578,7 +707,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
         return torch.zeros(1), torch.zeros(1)
 
     pipeline.diffuse = diffuse
-    pipeline.decode = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    pipeline.decode = Mock(return_value=(torch.zeros(1, 3, 1, 1, 1), torch.zeros(1)))
     return pipeline
 
 
@@ -626,7 +755,7 @@ def test_partially_constructed_pipeline_falls_back_to_the_uniform_schedule():
 
 
 def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
-    diffuse_calls = []
+    diffuse_calls: list[dict[str, Any]] = []
     base_schedule = [1.0, 0.7, 0.4, 0.15, 0.0]
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": base_schedule, "ref2va": None})
 
@@ -643,7 +772,7 @@ def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
 
 
 def test_distilled_forward_accepts_the_matching_explicit_step_count():
-    diffuse_calls = []
+    diffuse_calls: list[dict[str, Any]] = []
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
 
     pipeline.forward(_t2va_batch(num_inference_steps=4))
@@ -713,11 +842,17 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     )
 
     assert output.shape == q.shape
-    assert attention.attention.metadata.attn_mask is None
-    assert attention.attention.metadata.extra["valid_kv_length"] == 5
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
 
 
 def test_packed_attention_skips_mask_for_packed_mask_free_backend():
+    from vllm_omni.diffusion.attention.backends.abstract import (
+        VideoTokenLayout,
+        VideoTokenSpan,
+    )
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
     )
@@ -744,6 +879,10 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     torch.nn.Module.__init__(attention)
     attention.attention = FakeAttention()
     q = torch.randn(8, 2, 4)
+    video_layout = VideoTokenLayout(
+        used_len=5,
+        video_spans=(VideoTokenSpan(start=3, latent_grid=(1, 1, 2), role="target"),),
+    )
 
     attention._run_packed_attention(
         q,
@@ -752,11 +891,27 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
         cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
         max_seqlen=5,
         packed_total=8,
+        video_layout=video_layout,
+        vsa_prefix_segments=(1, 2),
+        gate_compress=torch.ones_like(q),
     )
 
-    assert attention.attention.metadata.attn_mask is None
-    assert attention.attention.metadata.extra["valid_kv_length"] == 5
-    assert attention.attention.metadata.extra["npu_attn_varlen"] is True
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+    assert metadata.extra["npu_attn_varlen"] is True
+    assert metadata.video_layout is video_layout
+    assert metadata.extra["vsa_h3_prefix_segments"] == (1, 2)
+    assert "vsa_h3_video_shape" not in metadata.extra
+    assert "vsa_h3_target_start" not in metadata.extra
+    assert metadata.extra["gate_compress"].shape == (1, *q.shape)
+    packed_padding = metadata.packed_padding
+    assert packed_padding is not None
+    assert packed_padding.q_length == 5
+    assert packed_padding.kv_length == 5
+    assert packed_padding.cu_seqlens_q.tolist() == [0, 5]
+    assert packed_padding.cu_seqlens_k.tolist() == [0, 5]
 
 
 def test_packed_attention_keeps_padding_mask_for_other_backends():
@@ -796,10 +951,88 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
         packed_total=8,
     )
 
+    metadata = attention.attention.metadata
+    assert metadata is not None
     assert torch.equal(
-        attention.attention.metadata.attn_mask,
+        metadata.attn_mask,
         torch.tensor([[True, True, True, True, True, False, False, False]]),
     )
+
+
+def _fake_packed_attention(
+    backend_name: str,
+    *,
+    prefix_kv_slicing: bool = False,
+    supports_multi_doc: bool = False,
+):
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeBackend:
+        supports_prefix_kv_slicing = prefix_kv_slicing
+
+        @staticmethod
+        def get_name() -> str:
+            return backend_name
+
+        @classmethod
+        def supports_multi_doc_packed_varlen(cls) -> bool:
+            return supports_multi_doc
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = FakeBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    return attention
+
+
+def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():
+    """A batch's valid rows are block-diagonal, so no prefix can describe them."""
+    attention = _fake_packed_attention("FLASH_ATTN", supports_multi_doc=True)
+    q = torch.randn(12, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        # Two requests: rows + padding tail each.
+        cu_seqlens=torch.tensor([0, 5, 6, 11, 12], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=12,
+        num_requests=2,
+    )
+
+    assert attention.attention.metadata.attn_mask is None
+    assert attention.attention.metadata.extra["valid_kv_length"] == 12
+
+
+@pytest.mark.parametrize("backend_name", ["TORCH_SDPA", "FLASH_ATTN"])
+def test_packed_attention_rejects_backends_without_multi_doc_capability(backend_name):
+    """Backend names alone must not allow cross-request attention."""
+    attention = _fake_packed_attention(backend_name, supports_multi_doc=False)
+    q = torch.randn(12, 2, 4)
+
+    with pytest.raises(ValueError, match=backend_name):
+        attention._run_packed_attention(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 5, 6, 11, 12], dtype=torch.int32),
+            max_seqlen=5,
+            packed_total=12,
+            num_requests=2,
+        )
 
 
 def test_reference_image_resize_contract():
@@ -863,6 +1096,80 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
 
 
+def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+
+    class FakeEncoderGroup:
+        rank_in_group = 0
+        world_size = 2
+
+        def all_reduce(self, tensor):
+            del tensor
+
+    config = SimpleNamespace(
+        hidden_size=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=2,
+        rms_norm_eps=1e-6,
+    )
+    with (
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        attention = encoder_module.MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
+    # This CPU contract test only needs projection shapes and head reshaping.
+    # Avoid dispatching platform-specific norm and linear kernels (for example,
+    # rocm_unquantized_gemm when the test suite is collected on ROCm).
+    attention.q_norm = nn.Identity()
+    attention.k_norm = nn.Identity()
+    with torch.no_grad():
+        attention.qkv_proj.weight.zero_()
+    attention.o_proj = nn.Linear(
+        attention.qkv_proj.local_num_heads * attention.head_dim,
+        config.hidden_size,
+        bias=False,
+    )
+    attn_call: dict[str, object] = {}
+
+    def fake_attention(query, key, value):
+        attn_call.update(query_shape=query.shape, key_shape=key.shape, value_shape=value.shape)
+        return query
+
+    monkeypatch.setattr(encoder_module, "_scaled_dot_product_attention", fake_attention)
+    hidden_states = torch.randn(1, 3, config.hidden_size)
+    cos = torch.ones(1, 3, config.head_dim)
+    sin = torch.zeros_like(cos)
+
+    output = attention(hidden_states, (cos, sin))
+
+    assert attn_call["query_shape"] == (1, config.num_attention_heads // 2, 3, config.head_dim)
+    assert attn_call["key_shape"] == (1, config.num_key_value_heads // 2, 3, config.head_dim)
+    assert attn_call["value_shape"] == (1, config.num_key_value_heads // 2, 3, config.head_dim)
+    assert output.shape == hidden_states.shape
+
+
+def test_text_attention_sdpa_helper_preserves_expanded_kv_fallback(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+
+    sdpa_call: dict[str, object] = {}
+
+    def fake_sdpa(query, key, value, **kwargs):
+        sdpa_call.update(query_shape=query.shape, key_shape=key.shape, value_shape=value.shape, kwargs=kwargs)
+        return query
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
+    output = encoder_module._scaled_dot_product_attention(
+        torch.randn(1, 4, 3, 8),
+        torch.randn(1, 2, 3, 8),
+        torch.randn(1, 2, 3, 8),
+    )
+
+    assert sdpa_call["query_shape"] == sdpa_call["key_shape"] == sdpa_call["value_shape"] == (1, 4, 3, 8)
+    assert sdpa_call["kwargs"] == {"dropout_p": 0.0, "is_causal": True}
+    assert output.shape == (1, 4, 3, 8)
+
+
 def test_encoder_forward_uses_hook_compatible_encode_entrypoint():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
@@ -920,7 +1227,7 @@ def test_encoder_forward_forwards_video_inputs():
 
 
 def test_reference_video_shape_uses_h3_adapt_shape_policy():
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         _reference_video_shape,
     )
 
@@ -931,6 +1238,12 @@ def test_reference_video_shape_uses_h3_adapt_shape_policy():
 def test_text_encoder_stub_constructs_without_group_or_weights():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        MiniMaxH3Pipeline,
+    )
+    from vllm_omni.diffusion.offloader.component_utils import (
+        get_encoder_block_groups,
     )
 
     encoder = MiniMaxH3Qwen3VLEncoder(
@@ -944,6 +1257,25 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
     # The stub has no parameters, so it never contributes to the runner's
     # strict missing-parameter check on non-encoder ranks.
     assert list(encoder.named_parameters()) == []
+    assert (
+        get_encoder_block_groups(
+            encoder,
+            "text_encoder",
+            MiniMaxH3Pipeline._offload_plan,
+            strict=True,
+        )
+        == []
+    )
+
+    # An arbitrary empty module is not silently treated as a distributed
+    # stub; explicit plans still validate their declared paths.
+    with pytest.raises(ValueError, match=r"text_encoder\.vision\.blocks was not found"):
+        get_encoder_block_groups(
+            nn.Module(),
+            "text_encoder",
+            MiniMaxH3Pipeline._offload_plan,
+            strict=True,
+        )
 
 
 def test_global_quant_config_is_shared_by_dit_and_encoder():
@@ -1050,10 +1382,38 @@ def test_model_offload_uses_hooked_text_encoder_call():
 
 
 @pytest.mark.parametrize(
-    "offload_flag",
-    ["enable_layerwise_offload", "enable_distributed_layerwise_offload"],
+    ("enable_layerwise", "enable_distributed"),
+    [(True, False), (False, True)],
 )
-def test_layerwise_offload_releases_text_encoder(offload_flag):
+def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise, enable_distributed):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config=None,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=enable_layerwise,
+        enable_distributed_layerwise_offload=enable_distributed,
+    )
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+
+    vae = Mock()
+    with pipeline._component_on_device(vae):
+        pass
+    vae.load_to_device.assert_called_once_with()
+    vae.offload_to_cpu.assert_called_once_with()
+
+
+def test_layerwise_encoder_selection_releases_text_encoder():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1062,8 +1422,11 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["text_encoder"],
+        },
     )
-    setattr(pipeline.od_config, offload_flag, True)
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
     pipeline.text_encoder.encode_ids.return_value = expected
@@ -1075,7 +1438,7 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
     pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
 
 
-def test_distributed_layerwise_offload_releases_text_encoder():
+def test_layerwise_dit_only_keeps_text_encoder_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1083,7 +1446,8 @@ def test_distributed_layerwise_offload_releases_text_encoder():
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=True,
+        enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={"mode": "layer", "components": ["dit"]},
     )
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
@@ -1093,25 +1457,30 @@ def test_distributed_layerwise_offload_releases_text_encoder():
 
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
-    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_not_called()
 
 
-def test_distributed_layerwise_offload_stages_vae_component():
+def test_dit_encoder_selection_keeps_vae_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=True,
+        enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit", "text_encoder"],
+        },
     )
     component = Mock()
 
     with pipeline._component_on_device(component):
-        component.load_to_device.assert_called_once_with()
-        component.offload_to_cpu.assert_not_called()
+        pass
 
-    component.offload_to_cpu.assert_called_once_with()
+    component.load_to_device.assert_not_called()
+    component.offload_to_cpu.assert_not_called()
 
 
 def test_distributed_layerwise_resident_blocks_are_stage_scoped():
@@ -1160,57 +1529,6 @@ def test_distributed_layerwise_resident_blocks_can_be_skipped():
     controller.offload_resident_layers.assert_not_called()
 
 
-def test_encoder_layerwise_offload_keeps_tp_blocks_rank_local(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3.encoder import (
-        MiniMaxH3Qwen3VLEncoder,
-    )
-
-    class Stack(torch.nn.Module):
-        def __init__(self, count):
-            super().__init__()
-            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
-
-    class TextStack(torch.nn.Module):
-        def __init__(self, count):
-            super().__init__()
-            self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
-
-    hooks = []
-
-    def fake_apply(block, next_block, device, stream, pin_memory):
-        hook = SimpleNamespace(
-            block=block,
-            next_block=next_block,
-            device=device,
-            stream=stream,
-            pin_memory=pin_memory,
-            _prev_hook=None,
-            offload_layer=Mock(),
-        )
-        hooks.append(hook)
-        return hook
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.offloader.layerwise_backend.apply_block_hook",
-        fake_apply,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.platforms.current_omni_platform.Stream",
-        Mock(return_value="copy-stream"),
-    )
-    encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
-    torch.nn.Module.__init__(encoder)
-    encoder.device_target = torch.device("cpu")
-    encoder.vision = Stack(2)
-    encoder.text_model = TextStack(3)
-
-    encoder.enable_omni_layerwise_offload(pin_memory=False)
-
-    assert len(hooks) == 5
-    assert all(hook._prev_hook is not None for hook in hooks)
-    assert all(hook.device == torch.device("cpu") for hook in hooks)
-
-
 def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
@@ -1240,6 +1558,97 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     )
 
     assert next(video_vae.parameters()).dtype == torch.float32
+
+
+def test_keyframe_encode_pins_and_restores_cudnn_settings():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        _minimax_h3_keyframe_encode_context,
+    )
+
+    cudnn = torch.backends.cudnn
+    original = (
+        cudnn.enabled,
+        cudnn.benchmark,
+        cudnn.deterministic,
+        cudnn.allow_tf32,
+    )
+    try:
+        cudnn.enabled = False
+        cudnn.benchmark = True
+        cudnn.deterministic = False
+        cudnn.allow_tf32 = False
+
+        with _minimax_h3_keyframe_encode_context(torch.device("cuda")):
+            assert cudnn.enabled
+            assert not cudnn.benchmark
+            assert cudnn.deterministic
+            assert cudnn.allow_tf32
+
+        assert not cudnn.enabled
+        assert cudnn.benchmark
+        assert not cudnn.deterministic
+        assert not cudnn.allow_tf32
+    finally:
+        (
+            cudnn.enabled,
+            cudnn.benchmark,
+            cudnn.deterministic,
+            cudnn.allow_tf32,
+        ) = original
+
+
+@pytest.mark.parametrize("fail_encode", [False, True])
+def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    events = []
+    input_image = Image.new("RGB", (32, 32))
+
+    @contextmanager
+    def track_context(device):
+        assert device == torch.device("cpu")
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.parallel_tiling = True
+
+        def encode_images(self, image, *, use_fp16_latent):
+            assert events == ["enter"]
+            assert image is input_image
+            assert use_fp16_latent
+            events.append("encode")
+            if fail_encode:
+                raise RuntimeError("encode failed")
+            return [torch.ones(1, 1, 2, 2)]
+
+    video_vae = object.__new__(vae_module.MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(video_vae)
+    video_vae.model = FakeModel()
+    video_vae.config_dict = {
+        "latent_channels": 1,
+        "latents_mean": [0.0],
+        "latents_std": [1.0],
+    }
+    monkeypatch.setattr(vae_module, "_minimax_h3_keyframe_encode_context", track_context)
+
+    if fail_encode:
+        with pytest.raises(RuntimeError, match="encode failed"):
+            video_vae.encode_image(input_image)
+    else:
+        rows = video_vae.encode_image(input_image)
+        torch.testing.assert_close(rows, torch.ones(1, 4))
+
+    assert events == ["enter", "encode", "exit"]
+    assert video_vae.model.parallel_tiling
 
 
 def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
@@ -1484,12 +1893,12 @@ def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_ti
         "audio_codecs": (),
         "file_size": 1024,
     }
-    transcode_calls = []
+    transcode_calls: list[Any] = []
     monkeypatch.setattr(reference_video_module, "_probe_video", lambda _path: metadata)
     monkeypatch.setattr(
         reference_video_module,
         "_transcode_reference_video",
-        lambda source, **kwargs: transcode_calls.append((source, kwargs)) or "prepared.mp4",
+        lambda source, **kwargs: _append_and_return(transcode_calls, (source, kwargs), "prepared.mp4"),
     )
 
     prepared = reference_video_module.prepare_reference_videos(
@@ -1506,11 +1915,90 @@ def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_ti
     assert transcode_calls[0][1]["target_frame_count"] == 209
 
 
+def test_ref2va_transcode_zero_frame_count_keeps_video_stream(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        reference_video_module.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    reference_video_module._transcode_reference_video(
+        "input.mp4",
+        target_width=768,
+        target_height=448,
+        target_frame_count=0,
+        workdir=str(tmp_path),
+        duration_seconds=4.0,
+    )
+
+    assert "-frames:v" not in commands[0]
+
+
+def test_prepared_reference_video_descriptor_round_trip(tmp_path):
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
+        deserialize_prepared_reference_videos,
+        serialize_prepared_reference_videos,
+    )
+
+    item = {
+        "original_path": str(tmp_path / "source.mp4"),
+        "prepared_path": str(tmp_path / "prepared.mp4"),
+        "input_has_audio": True,
+        "width": 1344,
+        "height": 768,
+        "start_time_seconds": 0.0,
+        "duration_seconds": 5.2,
+        "audio_duration_seconds": 5.2,
+    }
+
+    descriptor = serialize_prepared_reference_videos([item], str(tmp_path))
+
+    assert deserialize_prepared_reference_videos(descriptor) == (str(tmp_path), [item])
+
+
+def test_prepared_reference_video_descriptor_rejects_unknown_fields():
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
+        deserialize_prepared_reference_videos,
+    )
+
+    with pytest.raises(ValueError, match="invalid MiniMax H3 prepared-reference-video descriptor"):
+        deserialize_prepared_reference_videos('{"artifact_dir":"/tmp","videos":[{"path":"x"}]}')
+
+
+def test_stage_one_reuses_existing_prepared_reference_video(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _reuse_prepared_reference_videos,
+    )
+
+    prepared_path = tmp_path / "prepared.mp4"
+    prepared_path.touch()
+    prepared = [{"prepared_path": str(prepared_path)}]
+
+    assert _reuse_prepared_reference_videos(prepared, expected_count=1) is prepared
+
+
+def test_stage_one_rejects_invalid_prepared_reference_video(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _reuse_prepared_reference_videos,
+    )
+
+    with pytest.raises(ValueError, match="count does not match"):
+        _reuse_prepared_reference_videos([], expected_count=1)
+    with pytest.raises(ValueError, match="prepared reference video is unavailable"):
+        _reuse_prepared_reference_videos(
+            [{"prepared_path": str(tmp_path / "missing.mp4")}],
+            expected_count=1,
+        )
+
+
 def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
     decoded = np.arange(3 * 2 * 2 * 3, dtype=np.uint8).reshape(3, 2, 2, 3)
-    decode_calls = []
+    decode_calls: list[Any] = []
     monkeypatch.setattr(
         reference_video_module,
         "_probe_video",
@@ -1523,7 +2011,7 @@ def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     monkeypatch.setattr(
         reference_video_module,
         "_decode_video_frames_ffmpeg",
-        lambda path, **kwargs: decode_calls.append((path, kwargs)) or decoded,
+        lambda path, **kwargs: _append_and_return(decode_calls, (path, kwargs), decoded),
     )
 
     sampled = reference_video_module.sample_reference_video_frames("prepared.mp4")
@@ -1584,7 +2072,7 @@ def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
     expected = np.zeros((2, 2, 3, 3), dtype=np.uint8)
-    decode_calls = []
+    decode_calls: list[Any] = []
     monkeypatch.setitem(sys.modules, "decord", None)
     monkeypatch.setattr(
         reference_video_module,
@@ -1598,7 +2086,7 @@ def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
     monkeypatch.setattr(
         reference_video_module,
         "_decode_video_frames_ffmpeg",
-        lambda path, **kwargs: decode_calls.append((path, kwargs)) or expected,
+        lambda path, **kwargs: _append_and_return(decode_calls, (path, kwargs), expected),
     )
 
     actual = reference_video_module.load_video_frames("prepared.mp4")
@@ -1638,7 +2126,7 @@ def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
 def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
-    calls = []
+    calls: list[Any] = []
     probe = {
         "streams": [
             {
@@ -1656,7 +2144,11 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
     monkeypatch.setattr(
         reference_video_module.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs)) or SimpleNamespace(stdout=json.dumps(probe)),
+        lambda command, **kwargs: _append_and_return(
+            calls,
+            (command, kwargs),
+            SimpleNamespace(stdout=json.dumps(probe)),
+        ),
     )
 
     metadata = reference_video_module._probe_video("prepared.mp4")
@@ -1669,7 +2161,7 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
 def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
-    calls = []
+    calls: list[Any] = []
     stream = {
         "codec_type": "video",
         "width": 4,
@@ -1689,8 +2181,11 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     monkeypatch.setattr(
         reference_video_module.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs))
-        or SimpleNamespace(stdout=json.dumps(first_probe if len(calls) == 1 else second_probe)),
+        lambda command, **kwargs: _append_and_return(
+            calls,
+            (command, kwargs),
+            SimpleNamespace(stdout=json.dumps(first_probe if not calls else second_probe)),
+        ),
     )
 
     metadata = reference_video_module._probe_video("prepared.mp4")
@@ -1750,12 +2245,16 @@ def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_p
             "file_size": 1024,
         },
     }
-    transcode_calls = []
+    transcode_calls: list[Any] = []
     monkeypatch.setattr(reference_video_module, "_probe_video", lambda path: metadata[str(path)])
     monkeypatch.setattr(
         reference_video_module,
         "_transcode_reference_video",
-        lambda source, **kwargs: transcode_calls.append((source, kwargs)) or f"{source}.prepared.mp4",
+        lambda source, **kwargs: _append_and_return(
+            transcode_calls,
+            (source, kwargs),
+            f"{source}.prepared.mp4",
+        ),
     )
 
     prepared = reference_video_module.prepare_reference_videos(
@@ -1934,7 +2433,7 @@ def test_g4_reference_image_file_format_and_size_contract(tmp_path):
 
 
 def test_g4_standalone_audio_duration_and_total_duration_contract():
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         validate_reference_audio_waveforms,
     )
 
@@ -1954,6 +2453,56 @@ def test_g4_standalone_audio_duration_and_total_duration_contract():
                 (torch.zeros(1, 8 * sample_rate), sample_rate),
             ]
         )
+
+
+def test_ref2va_video_soundtrack_does_not_consume_standalone_audio_budget():
+    from PIL import Image
+
+    from vllm_omni.diffusion.cache.cachedit.runtime import RequestScopedCacheDiTRuntime
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "ref2va"
+    pipeline.supported_tasks = frozenset({"ref2va"})
+    pipeline.device = torch.device("cpu")
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline._resolve_sigma_positions = Mock(return_value=(None, 50))
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(None)
+    pipeline._cache_dit_runtime = Mock(spec=RequestScopedCacheDiTRuntime)
+    pipeline.text_encoder = object()
+    pipeline.encode_prompt = Mock(return_value=(torch.ones(1, 2), torch.ones(1, dtype=torch.long)))
+    pipeline._prepare_reference_videos = Mock(return_value=[{"input_has_audio": True}])
+    pipeline._encode_visual_conditions = Mock(return_value=(torch.ones(1, 96), [(1, 16, 16), (17, 48, 84)]))
+    # A 2.35-second video soundtrack and a 15-second standalone reference
+    # each satisfy their modality's separate 15-second duration budget.
+    embedded = torch.full((188, 32), 1.0)
+    standalone = torch.full((1200, 32), 2.0)
+    pipeline._encode_reference_audio_conditions = Mock(return_value=(embedded, [94], standalone, [600]))
+    sampling = OmniDiffusionSamplingParams(
+        width=1344,
+        height=768,
+        fps=24,
+        num_inference_steps=50,
+        extra_args={"task": "ref2va", "duration": 15.0},
+    )
+
+    context = pipeline._prepare_request_inputs(
+        prompt="A person carrying books down a street",
+        multi_modal_data={
+            "image": Image.new("RGB", (256, 256)),
+            "video": ["reference.mp4"],
+            "audio": (torch.zeros(1, 15 * 16000), 16000),
+        },
+        sampling=sampling,
+    )
+
+    assert context["audio_condition_lengths"] == [94, 600]
+    assert [block["kind"] for block in context["ref_blocks"]] == ["image", "video_audio", "audio"]
+    torch.testing.assert_close(context["audio_condition"], torch.cat([embedded, standalone]))
 
 
 def test_ref2va_audio_duration_validation_precedes_rank_branch(monkeypatch):
@@ -2009,7 +2558,7 @@ def test_ref2va_standalone_audio_condition_is_bounded_to_output_duration():
     ],
 )
 def test_g4_reference_video_metadata_validation(field, value, message, tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3.reference_video import (
+    from vllm_omni.model_executor.models.minimax_h3.reference_video import (
         _validate_reference_video_metadata,
     )
 

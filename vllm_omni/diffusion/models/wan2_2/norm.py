@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Wan-specific normalization layers."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Normalization layer used by the Wan VAE patch."""
 
 import torch
 import torch.nn as nn
@@ -62,12 +62,6 @@ class RMSNormVAE(CustomOp):
         if self.bias is not None:
             out = out + self.bias
         return out
-
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x)
 
     def forward_native(
         self,

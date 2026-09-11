@@ -494,7 +494,7 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window,
+            window=self._get_stft_window(x),
             return_complex=True,
         )
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
@@ -509,9 +509,14 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window,
+            window=self._get_stft_window(magnitude),
         )
         return inverse_transform
+
+    def _get_stft_window(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.stft_window.device != tensor.device:
+            self.stft_window = self.stft_window.to(tensor.device)
+        return self.stft_window
 
     def _decode_pre_istft(
         self,

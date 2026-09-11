@@ -4,6 +4,7 @@ from typing import Literal
 import pytest
 
 from vllm_omni.engine.messages import (
+    AbortResultMessage,
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
@@ -90,6 +91,19 @@ def test_rpc_result_router_does_not_broadcast_uncorrelated_nonfatal_errors():
     source.put(_generic_result("active"))
 
     assert waiter.get(timeout=1).correlation_id == "active"
+    router.close()
+
+
+def test_rpc_result_router_routes_abort_results_by_correlation_id():
+    source: queue.Queue = queue.Queue()
+    router = RpcResultRouter(source)
+    waiter = router.register(("abort", "abort-42"))
+
+    source.put(AbortResultMessage(rpc_id="abort-42", success=True))
+
+    result = waiter.get(timeout=1)
+    assert isinstance(result, AbortResultMessage)
+    assert result.rpc_id == "abort-42"
     router.close()
 
 
