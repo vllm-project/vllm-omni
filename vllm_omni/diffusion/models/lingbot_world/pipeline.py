@@ -574,10 +574,6 @@ class LingBotWorldCausalDMDPipeline(
         latent_height = self._ar_height // spatial
         latent_width = self._ar_width // spatial
         tokens_per_frame = (latent_height // patch_height) * (latent_width // patch_width)
-        parallel_config = self.od_config.parallel_config
-        tp_size = getattr(parallel_config, "tensor_parallel_size", 1)
-        ulysses_degree = getattr(parallel_config, "ulysses_degree", 1) or 1
-        num_tp_heads = int(self.transformer.config.num_attention_heads) // tp_size
         total_window_frames = (
             int(self.transformer.config.local_attn_size)
             if int(self.transformer.config.local_attn_size) != -1
@@ -598,7 +594,7 @@ class LingBotWorldCausalDMDPipeline(
         )
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
-            num_kv_heads=num_tp_heads // ulysses_degree,
+            num_kv_heads=int(self.transformer.blocks[0].self_attn.num_sp_heads),
             head_size=int(self.transformer.config.attention_head_dim),
             tokens_per_frame=tokens_per_frame,
             frames_per_block=int(self.transformer.config.num_frames_per_block),

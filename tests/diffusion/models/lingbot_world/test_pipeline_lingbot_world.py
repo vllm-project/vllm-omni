@@ -439,18 +439,15 @@ def test_pipeline_respects_loader_managed_component_placement(offload_field: str
     assert getattr(pipeline.vae, "to_calls", []) == []
 
 
-@pytest.mark.parametrize(("tp_size", "sp_size"), [(1, 1), (2, 1), (1, 2), (2, 2)])
-def test_ar_diffusion_capability_uses_config_local_head_geometry(tp_size, sp_size) -> None:
+def test_ar_diffusion_capability_uses_transformer_local_head_geometry() -> None:
     module = _load_pipeline_module()
-    config = _od_config()
-    config.parallel_config.tensor_parallel_size = tp_size
-    config.parallel_config.sequence_parallel_size = config.parallel_config.ulysses_degree = sp_size
-    pipeline = _pipeline(module, od_config=config)
-    pipeline.transformer.config.num_attention_heads = 8
+    pipeline = _pipeline(module)
+    # Use the constructed head count even when the config describes a different geometry.
+    pipeline.transformer.blocks[0].self_attn = SimpleNamespace(num_sp_heads=1)
     spec = pipeline.ar_diffusion_kv_cache_spec()
 
     assert spec.num_layers == 2
-    assert spec.num_kv_heads == 8 // tp_size // sp_size
+    assert spec.num_kv_heads == 1
     assert spec.head_size == 4
     assert spec.tokens_per_frame == 1
     assert spec.frames_per_block == 3
