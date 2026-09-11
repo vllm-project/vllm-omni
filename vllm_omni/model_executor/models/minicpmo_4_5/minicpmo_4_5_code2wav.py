@@ -58,10 +58,19 @@ def _scalar(value: Any, default: Any = None) -> Any:
 
 
 _REF_TARGET_SAMPLE_RATE = 24000
+# Default reference window. Mirrors the shipped prompt asset
+# (``assets/HT_ref_audio.wav`` is 6.016s) so runtime references land on the
+# same frame count the model was prompted with; overridable per deployment
+# via ``ref_audio_max_seconds``.
 _REF_MAX_SECONDS = 6.0
 
 
-def _normalize_reference(ref_audio: Any, sample_rate_hz: int) -> tuple[torch.Tensor, int]:
+def _normalize_reference(
+    ref_audio: Any,
+    sample_rate_hz: int,
+    *,
+    max_seconds: float = _REF_MAX_SECONDS,
+) -> tuple[torch.Tensor, int]:
     """Normalize a per-request reference waveform onto a shared grid.
 
     MiniCPM-o streaming uses the reference-audio length as the CFM attention
@@ -69,10 +78,17 @@ def _normalize_reference(ref_audio: Any, sample_rate_hz: int) -> tuple[torch.Ten
     L0, which explodes the CFM CUDA-graph cache key space (see #6628). Fold
     every reference onto the same sample rate and a fixed length (truncate
     long ones, zero-pad short ones) so L0 becomes one constant value.
+
+    Long references are truncated to ``max_seconds`` with a warning: the
+    window matches the shipped default prompt length, but callers serving
+    longer enrollment clips should raise ``ref_audio_max_seconds`` (larger
+    windows enlarge the CFM attention cache, see ``_cfm_pad_frames``).
     """
     tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
     if tensor.dim() > 1:
         # (channels, samples) -> mono; plain reshape(-1) would interleave.
+        # Upstream stage input processors already flatten to 1-D, so this is
+        # a guard for non-standard callers rather than the common path.
         tensor = tensor.mean(dim=0)
     waveform = tensor.reshape(-1).cpu().contiguous()
     if waveform.numel() == 0:
@@ -92,13 +108,19 @@ def _normalize_reference(ref_audio: Any, sample_rate_hz: int) -> tuple[torch.Ten
                 .view(-1)
                 .contiguous()
             )
-    max_samples = int(_REF_MAX_SECONDS * _REF_TARGET_SAMPLE_RATE)
+    max_samples = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
     if waveform.numel() > max_samples:
+        logger.warning(
+            "Reference audio is %.2fs, truncating to the %.2fs window (set ``ref_audio_max_seconds`` to keep more).",
+            waveform.numel() / _REF_TARGET_SAMPLE_RATE,
+            max_seconds,
+        )
         waveform = waveform[:max_samples].contiguous()
     elif waveform.numel() < max_samples:
         # Zero-pad short references to the fixed length so every request
-        # shares one L0 (reference frame count). Trailing silence has minimal
-        # style impact for voice cloning; verified via E3 quality regression.
+        # shares one L0 (reference frame count). The window matches the
+        # shipped prompt length, and trailing silence has minimal style
+        # impact for voice cloning (verified via E3 WER/SIM regression).
         waveform = torch.nn.functional.pad(waveform, (0, max_samples - waveform.numel()))
     return waveform, _REF_TARGET_SAMPLE_RATE
 
@@ -229,6 +251,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
         }
+        self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
+        if self._ref_max_seconds <= 0:
+            raise ValueError("MiniCPM-o Code2Wav ref_audio_max_seconds must be > 0")
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -269,7 +294,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         sample_rate_hz = int(_scalar(sample_rate, 0))
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
-        waveform, sample_rate_hz = _normalize_reference(ref_audio, sample_rate_hz)
+        waveform, sample_rate_hz = _normalize_reference(
+            ref_audio,
+            sample_rate_hz,
+            max_seconds=self._ref_max_seconds,
+        )
         if waveform.numel() == 0:
             raise _batch_error("empty_ref_audio")
         if not bool(torch.isfinite(waveform).all().item()):

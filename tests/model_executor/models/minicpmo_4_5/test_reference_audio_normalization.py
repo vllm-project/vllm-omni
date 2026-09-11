@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Unit tests for the reference-audio normalization grid (S1b).
+"""Unit tests for the reference-audio normalization grid.
 
 Every request's reference audio is folded onto one sample rate and one fixed
 length so the CFM attention cache origin (L0) is a single constant; that is
@@ -8,6 +8,8 @@ what collapsed the CFM CUDA-graph key space back from 58 shapes to a handful
 and cut the capture storm behind the #6628 regression. These tests pin the
 pure math so future edits cannot silently widen L0 again.
 """
+
+import logging
 
 import pytest
 import torch
@@ -96,3 +98,23 @@ def test_empty_reference_stays_empty():
     waveform, sr = _normalize_reference(torch.zeros(0), TARGET)
     assert waveform.numel() == 0
     assert sr == TARGET
+
+
+def test_window_length_is_configurable():
+    """Deployments can widen the window via ``ref_audio_max_seconds``."""
+    samples_5s = torch.arange(5 * TARGET, dtype=torch.float32)
+    waveform, sr = _normalize_reference(samples_5s, TARGET, max_seconds=3.0)
+    assert sr == TARGET
+    assert waveform.numel() == 3 * TARGET
+    # A longer window keeps the whole 5s clip instead of truncating it.
+    waveform, _ = _normalize_reference(samples_5s, TARGET, max_seconds=8.0)
+    assert waveform.numel() == 8 * TARGET
+    assert torch.equal(waveform[: 5 * TARGET], samples_5s)
+
+
+def test_truncation_emits_warning(caplog):
+    """Silent truncation would hide a user-visible behavior change."""
+    samples_7s = torch.arange(7 * TARGET, dtype=torch.float32)
+    with caplog.at_level(logging.WARNING):
+        _normalize_reference(samples_7s, TARGET)
+    assert any("truncating" in record.getMessage() for record in caplog.records)

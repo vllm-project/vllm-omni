@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Unit tests for the CFM mel-frame bucketing decision (FIX2).
+"""Unit tests for the CFM mel-frame bucketing decision.
 
 Steady-state chunk lengths vary per request; without bucketing every length
 becomes its own CUDA-graph capture shape (428 captures / 13 flushes in the
@@ -76,3 +76,51 @@ def test_padding_never_overflows_noise_buffer():
 def test_padding_applies_with_cache_offset_when_it_fits():
     # offset 50 + mel 50 + pad 14 = 114 <= 200 -> pad stands.
     assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=200, bucket_frames=16, ragged=False) == 14
+
+
+def test_cache_width_advances_on_bucket_grid():
+    """The cache width must keep advancing in bucket-sized steps.
+
+    ``_decode_cfm`` reads the next call's cache offset back from the cached
+    width, and that width is part of the CUDA-graph key, so every steady-state
+    step has to land on the same grid for the capture shapes to collapse.
+    """
+    bucket, l0 = 16, 304
+    width = l0
+    for _ in range(20):
+        pad = _cfm_pad_frames(
+            mel_frames=50,
+            offset=width,
+            noise_capacity=30000,
+            bucket_frames=bucket,
+            ragged=False,
+        )
+        assert pad == 14
+        width += 50 + pad
+    assert width == l0 + 20 * 64
+    assert (width - l0) % bucket == 0
+
+
+def test_minute_long_utterance_stays_within_noise_capacity():
+    """Cumulative cache growth must keep realistic utterances runnable.
+
+    Bucketing folds the padding frames into the cache width, so the cache
+    grows faster than the real frame count. Assert the shipped settings still
+    carry a minute-long utterance (60 padded chunks) without falling back or
+    overflowing the decoder's noise buffer.
+    """
+    bucket, noise_capacity, l0 = 16, 30000, 304
+    width, chunks = l0, 0
+    for _ in range(60):
+        pad = _cfm_pad_frames(
+            mel_frames=50,
+            offset=width,
+            noise_capacity=noise_capacity,
+            bucket_frames=bucket,
+            ragged=False,
+        )
+        assert pad > 0, "bucketing must stay active, not silently fall back"
+        width += 50 + pad
+        chunks += 1
+    assert chunks == 60
+    assert width <= noise_capacity
