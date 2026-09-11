@@ -44,6 +44,7 @@ from PIL import Image
 from pydantic import ValidationError
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.media_time_pacer import MediaTimePacer
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest, VideoParams
@@ -67,6 +68,10 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionPayloadValue
 
 logger = init_logger(__name__)
+
+_PACING_PARAM = "pace_to_media_time"
+_PACING_LEAD_PARAM = "pacing_lead_seconds"
+_PACING_MAX_LAG_PARAM = "pacing_max_lag_seconds"
 
 _DEFAULT_STALL_TIMEOUT = 60.0
 _DEFAULT_START_TIMEOUT = 10.0
@@ -471,6 +476,7 @@ class OmniStreamingVideoOutputHandler:
             fps=output_fps,
             video_codec_options=video_codec_options,
         )
+        pacer = self._build_pacer(request, output_fps)
         completed = False
         try:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
@@ -480,13 +486,22 @@ class OmniStreamingVideoOutputHandler:
                 for video in videos:
                     chunk = encoder.encode(video)
                     if chunk:
+                        num_frames = self._num_video_frames(video)
+                        if pacer is not None:
+                            # Held here rather than in handle_session so the
+                            # trailer, which carries no media time, is never
+                            # paced, and so the wait happens before the encoded
+                            # bytes are handed to the transport.
+                            delay = pacer.delay_before_release(num_frames)
+                            if delay > 0:
+                                await asyncio.sleep(delay)
                         yield (
                             chunk,
                             self._build_chunk_metadata(
                                 request_id=request_id,
                                 kind="media",
                                 byte_length=len(chunk),
-                                num_frames=self._num_video_frames(video),
+                                num_frames=num_frames,
                                 stream_metadata=self._extract_stream_metadata(result),
                             ),
                         )
@@ -507,6 +522,28 @@ class OmniStreamingVideoOutputHandler:
         finally:
             if not completed:
                 encoder.close()
+
+    @staticmethod
+    def _build_pacer(request: VideoGenerationRequest, output_fps: float) -> MediaTimePacer | None:
+        """Build this session's release schedule, or ``None`` to send as produced.
+
+        Off unless asked for. Turning it on changes when an existing client
+        receives its bytes, which is the sort of thing that should be a decision
+        rather than an upgrade.
+        """
+        extra = request.extra_params if isinstance(request.extra_params, dict) else {}
+        if not extra.get(_PACING_PARAM):
+            return None
+        try:
+            lead = float(extra.get(_PACING_LEAD_PARAM, 0.0))
+            max_lag_raw = extra.get(_PACING_MAX_LAG_PARAM, 5.0)
+            max_lag = None if max_lag_raw is None else float(max_lag_raw)
+            return MediaTimePacer(output_fps, lead_seconds=lead, max_lag_seconds=max_lag)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Invalid media-time pacing parameters: {error}",
+            ) from error
 
     async def _build_prompt_and_sampling_params(
         self,
