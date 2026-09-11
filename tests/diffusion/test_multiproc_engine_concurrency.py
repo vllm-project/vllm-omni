@@ -4,8 +4,10 @@
 import asyncio
 import multiprocessing as mp
 import queue
+import signal
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -254,8 +256,11 @@ class TestRequestModeDispatch:
         executor.od_config = SimpleNamespace(
             step_execution=False,
             parallel_config=SimpleNamespace(data_parallel_size=2),
-            enable_distributed_layerwise_offload=True,
-            dlo_use_allgather=True,
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            },
         )
         executor.execute_request = Mock(return_value="dlo-dp")
         executor.collective_rpc = Mock()
@@ -358,7 +363,7 @@ class TestRequestModeDispatch:
         for rank, result_mq in enumerate(executor._result_mqs):
             assert result_mq.dequeue.call_count == (1 if rank in expected_primary_ranks else 0)
 
-    @pytest.mark.parametrize("empty_prompt", ["", {"prompt": ""}])
+    @pytest.mark.parametrize("empty_prompt", ["", [], {}, {"prompt": ""}])
     def test_dlo_dp_rejects_empty_prompt_before_worker_dispatch(self, empty_prompt):
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
@@ -372,6 +377,71 @@ class TestRequestModeDispatch:
         scheduler_output.scheduled_new_reqs[0].req.prompt = empty_prompt
 
         with pytest.raises(ValueError, match="non-empty prompt"):
+            executor.execute_request(scheduler_output)
+
+        executor.collective_rpc.assert_not_called()
+
+    def test_dlo_dp_accepts_precomputed_embeddings_without_prompt_text(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["text_encoder"],
+                "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+            },
+        )
+        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req in scheduler_output.scheduled_new_reqs:
+            new_req.req.prompt = {"prompt": "", "prompt_embeds": object()}
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            [1, 2],
+            {"type": "token", "prompt_token_ids": [1, 2]},
+            {"prompt_ids": [1, 2], "prompt_mask": object()},
+        ],
+    )
+    def test_dlo_dp_accepts_tokenized_prompts(self, prompt):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req in scheduler_output.scheduled_new_reqs:
+            new_req.req.prompt = prompt
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+
+    def test_text_encoder_allgather_rejects_mismatched_embedding_paths(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["text_encoder"],
+                "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+            },
+        )
+        executor.collective_rpc = Mock()
+        scheduler_output = _make_sched_output("A", "B")
+        scheduler_output.scheduled_new_reqs[1].req.prompt = {"prompt_embeds": object()}
+
+        with pytest.raises(ValueError, match="same positive/negative prompt embedding fields"):
             executor.execute_request(scheduler_output)
 
         executor.collective_rpc.assert_not_called()
@@ -392,24 +462,6 @@ class TestRequestModeDispatch:
             executor.execute_request(invalid_wave)
 
         result = executor.execute_request(_make_sched_output("A", "B"))
-
-        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
-        executor.collective_rpc.assert_called_once()
-
-    def test_dlo_dp_allows_shared_default_denoise_steps(self):
-        executor, _, _ = _make_executor(num_gpus=2)
-        executor.od_config = SimpleNamespace(
-            step_execution=False,
-            parallel_config=SimpleNamespace(data_parallel_size=2),
-            enable_distributed_layerwise_offload=True,
-            dlo_use_allgather=True,
-        )
-        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
-        scheduler_output = _make_sched_output("A", "B")
-        for new_req in scheduler_output.scheduled_new_reqs:
-            new_req.req.sampling_params.num_inference_steps = None
-
-        result = executor.execute_request(scheduler_output)
 
         assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
         executor.collective_rpc.assert_called_once()
@@ -495,6 +547,28 @@ class TestRequestModeDispatch:
         assert all("timed out" in output.result.error for output in result.runner_outputs)
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
         assert isinstance(executor._fail_closed_on_dp_wave_timeout.call_args.args[0], TimeoutError)
+
+    def test_single_allgather_request_times_out_and_fails_closed(self):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            },
+        )
+        executor.collective_rpc = Mock(side_effect=TimeoutError("timed out"))
+        executor._fail_closed_on_dp_wave_timeout = Mock()
+
+        result = executor.execute_request(_make_sched_output("A"))
+
+        assert result.runner_outputs[0].result.error == "timed out"
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
 
 # ───────────────── concurrent collective RPC ─────────────────
@@ -848,6 +922,50 @@ class TestWorkerProcRpcRankStatus:
         gc_collect.assert_called_once_with()
         mock_platform.empty_cache.assert_called_once_with()
 
+    def test_execute_rpc_drops_the_result_on_ranks_that_will_not_reply(self):
+        """A rank that will not reply must not hand its output back.
+
+        The busy loop binds the returned object to a local that outlives the
+        RPC, so a device-resident result -- for diffusion, a whole decoded
+        video -- would occupy accelerator memory on every non-reply rank until
+        the next request replaces it.
+        """
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 1,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is False
+        assert result is None, "a non-reply rank must not keep the output alive"
+
+    def test_execute_rpc_still_returns_the_result_on_the_replying_rank(self):
+        """The rank that owns the reply keeps returning the same object."""
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is True
+        assert result is payload
+
     def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
         proc = self._make_worker_proc()
 
@@ -1171,7 +1289,6 @@ class TestStageDiffusionClientErrorPropagation:
                 metadata,
                 "tcp://req",
                 "tcp://resp",
-                batch_size=1,
             )
 
     @pytest.mark.asyncio
@@ -1215,6 +1332,7 @@ class TestExecutorShutdownCleaner:
         class FakeProcess:
             def __init__(self, name):
                 self.name = name
+                self.pid = 123
                 self.alive = True
                 self.terminated = False
                 self.join_timeouts = []
@@ -1242,6 +1360,132 @@ class TestExecutorShutdownCleaner:
         assert second.join_timeouts == [5.0, 1.0]
         assert first.terminated and second.terminated
         assert not first.is_alive() and not second.is_alive()
+
+    @pytest.mark.parametrize("cooperative", [False, True])
+    def test_real_workers_exit_and_are_reaped(self, monkeypatch, cooperative):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        ctx = mp.get_context("fork")
+        ready, stop = ctx.Event(), ctx.Event()
+
+        def run_worker():
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            ready.set()
+            stop.wait()
+
+        dead = ctx.Process(target=lambda: None)
+        worker = ctx.Process(target=run_worker)
+        monkeypatch.setattr(executor_module, "_WORKER_SHUTDOWN_GRACE_S", 0.2)
+        monkeypatch.setattr(executor_module, "_WORKER_TERMINATE_GRACE_S", 0.1)
+        monkeypatch.setattr(executor_module, "_WORKER_KILL_GRACE_S", 5.0, raising=False)
+        dead.start()
+        worker.start()
+        try:
+            dead.join(5)
+            assert not dead.is_alive()
+            assert ready.wait(5), "worker did not install its signal handler"
+            mq = Mock()
+            if cooperative:
+                mq.enqueue.side_effect = lambda *args, **kwargs: stop.set()
+            else:
+                mq.enqueue.side_effect = OSError("shutdown queue unavailable")
+            cleaner = executor_module._ExecutorShutdownCleaner(mq, 2, [dead, worker])
+
+            cleaner()
+
+            assert not worker.is_alive()
+            assert worker.exitcode == (0 if cooperative else -signal.SIGKILL)
+            assert cleaner.processes == []
+            assert cleaner.broadcast_mq is None
+            cleaner()
+        finally:
+            for proc in (dead, worker):
+                if proc.is_alive():
+                    proc.kill()
+                proc.join(5)
+                proc.close()
+
+    @pytest.mark.parametrize("failed_action", ["terminate", "kill"])
+    def test_kill_phase_shares_deadline_and_continues_after_os_errors(self, monkeypatch, failed_action):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        first, second = Mock(pid=101), Mock(pid=102)
+        first.name, second.name = "first", "second"
+        for proc in (first, second):
+            proc.is_alive.side_effect = [True, True, True, False]
+        getattr(first, failed_action).side_effect = OSError("signal failed")
+        first.join.side_effect = [OSError("join failed"), None, None]
+        monotonic = Mock(side_effect=[100, 100, 110, 120, 120, 124, 130, 130, 134])
+        monkeypatch.setattr(executor_module, "time", SimpleNamespace(monotonic=monotonic))
+        cleaner = executor_module._ExecutorShutdownCleaner(processes=[first, second])
+
+        cleaner()
+
+        first.kill.assert_called_once()
+        second.kill.assert_called_once()
+        assert [call.args[0] for call in first.join.call_args_list] == [15, 5, 5]
+        assert [call.args[0] for call in second.join.call_args_list] == [5, 1, 1]
+        assert cleaner.processes == []
+
+    def test_executor_retains_survivor_for_explicit_shutdown_retry(self, monkeypatch):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        survivor = Mock(pid=123)
+        survivor.name = "surviving-worker"
+        survivor.is_alive.return_value = True
+        cleaner = executor_module._ExecutorShutdownCleaner(processes=[survivor])
+        executor, _, _ = _make_executor()
+        executor._shutdown_cleaner = cleaner
+        executor._processes = [survivor]
+        executor._finalizer = weakref.finalize(executor, cleaner)
+        executor._pump_stop = threading.Event()
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._output_futures = {}
+        executor._batch_split_map = {}
+        log_error = Mock()
+        monkeypatch.setattr(executor_module.logger, "error", log_error)
+
+        executor.shutdown()
+
+        assert not executor._finalizer.alive
+        assert executor._shutdown_cleaner is cleaner
+        assert executor._processes == [survivor]
+        log_error.assert_called_once()
+        assert log_error.call_args.args[1] == [("surviving-worker", 123)]
+        survivor.is_alive.return_value = False
+
+        executor.shutdown()
+        executor.shutdown()
+
+        assert executor._shutdown_cleaner is None
+        assert executor._processes == []
+
+    def test_concurrent_cleanup_does_not_repeat_process_operations(self):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        joining, release = threading.Event(), threading.Event()
+        proc = Mock(pid=123)
+        proc.is_alive.return_value = True
+
+        def join(timeout):
+            joining.set()
+            assert release.wait(5)
+            proc.is_alive.return_value = False
+
+        proc.join.side_effect = join
+        cleaner = executor_module._ExecutorShutdownCleaner(processes=[proc])
+        thread = threading.Thread(target=cleaner)
+        thread.start()
+        try:
+            assert joining.wait(5)
+            cleaner()
+            proc.join.assert_called_once()
+        finally:
+            release.set()
+            thread.join(5)
+        assert not thread.is_alive()
+        assert cleaner.processes == []
 
 
 # ───────── monitor thread & death sentinel integration tests ─────────
@@ -1291,7 +1535,7 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._result_mq = None
         executor._shutdown_cleaner = None
         # Use a no-op so shutdown() doesn't crash on None resources.
-        executor._finalizer = lambda: None
+        executor._finalizer = weakref.finalize(executor, lambda: None)
         # ------------------------------------------------------------------
         # Attributes added by remove_bubble_v2 (async D2H); shutdown() iterates
         # over them, so they need to exist even when constructed via __new__.
@@ -1326,7 +1570,7 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._broadcast_mq = None
         executor._result_mq = None
         executor._shutdown_cleaner = None
-        executor._finalizer = lambda: None
+        executor._finalizer = weakref.finalize(executor, lambda: None)
 
         proc = _make_short_lived_process()
         executor._processes = [proc]

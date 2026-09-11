@@ -238,13 +238,10 @@ steps:
       grade: Blocking
       timeout_in_minutes: 50
       commands:
-        - |
-          timeout 40m bash -c '
-            export VLLM_LOGGING_LEVEL=DEBUG
-            export VLLM_WORKER_MULTIPROC_METHOD=spawn
-            export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-            pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-          '
+        - export VLLM_LOGGING_LEVEL=DEBUG
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+        - timeout 40m pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m "advanced_model and cuda" --run-level "advanced_model"
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs

@@ -68,6 +68,7 @@ from vllm_omni.diffusion.models.schedulers.scheduling_flow_match_euler_discrete 
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -137,6 +138,7 @@ from .utils import (
     ensure_gripper_array,
     extract_robolab_image,
     extract_robolab_prompt_image,
+    get_robolab_domain_id,
     lazy_action_transform_pipeline,
     make_robolab_action_postprocess_inputs,
     next_robolab_seed,
@@ -934,6 +936,12 @@ class Cosmos3OmniDiffusersPipeline(
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        resolved_offload = resolve_offload(od_config)
+        if resolved_offload.public is not None and resolved_offload.strategy is OffloadStrategy.MODEL_LEVEL:
+            raise ValueError(
+                "Cosmos3 model offload uses reasoner/generator topology and does "
+                "not support the dit/text_encoder component selector"
+            )
         self.device = get_local_device()
         self.dtype = od_config.dtype
 
@@ -1068,7 +1076,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._guidance_scale = None
         self._num_timesteps = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
-        self._robolab_transform = None
+        self._robolab_transforms: dict[bool, Any] = {}
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
         # this pipeline. Tells the sequential-CFG loop to keep paired
@@ -1086,6 +1094,7 @@ class Cosmos3OmniDiffusersPipeline(
         device: torch.device,
         pin_memory: bool = True,
         use_hsdp: bool = False,
+        offload_components: frozenset[str] | None = None,
     ) -> None:
         """Enable Cosmos3 component-level model offload.
 
@@ -1094,6 +1103,11 @@ class Cosmos3OmniDiffusersPipeline(
         mutual-exclusion swaps.  The VAE stays resident on GPU like the generic
         model-level offloader.
         """
+        if offload_components is not None:
+            raise ValueError(
+                "Cosmos3 model offload uses reasoner/generator topology and does not support "
+                "the dit/text_encoder offload_components selector"
+            )
         self.vae.to(device, non_blocking=True)
         if isinstance(self._sound_tokenizer, nn.Module):
             self._sound_tokenizer.to(device)
@@ -1381,11 +1395,18 @@ class Cosmos3OmniDiffusersPipeline(
             return val
         return default
 
-    def _get_robolab_transform(self):
-        if self._robolab_transform is None:
+    def _get_robolab_transform(self, *, format_prompt_as_json: bool = False):
+        transforms = getattr(self, "_robolab_transforms", None)
+        if transforms is None:
+            transforms = {}
+            self._robolab_transforms = transforms
+        if format_prompt_as_json not in transforms:
             action_dim = int(getattr(self.transformer, "action_dim", 64))
-            self._robolab_transform = lazy_action_transform_pipeline(action_dim)
-        return self._robolab_transform
+            transforms[format_prompt_as_json] = lazy_action_transform_pipeline(
+                action_dim,
+                format_prompt_as_json=format_prompt_as_json,
+            )
+        return transforms[format_prompt_as_json]
 
     def _build_robolab_policy_inputs(
         self,
@@ -1430,7 +1451,8 @@ class Cosmos3OmniDiffusersPipeline(
         resolution = str(extra_param("resolution", ROBOLAB_DEFAULT_RESOLUTION))
         fps = float(extra_param("conditioning_fps", ROBOLAB_DEFAULT_CONDITIONING_FPS))
         domain_name = str(extra_param("domain_name", ROBOLAB_DEFAULT_DOMAIN_NAME))
-        domain_id = resolve_domain_id(domain_name=domain_name, require_explicit=True)
+        domain_id = get_robolab_domain_id(domain_name)
+        format_prompt_as_json = self._truthy(extra_param("format_prompt_as_json", False))
 
         if use_state and history_length < 1:
             raise ValueError("RoboLab history_length must be >= 1 when use_state is true.")
@@ -1493,7 +1515,9 @@ class Cosmos3OmniDiffusersPipeline(
             "action": action,
             # Cosmos Framework consumes this as an integer conditioning bucket.
             "conditioning_fps": torch.tensor(fps, dtype=torch.long),
-            "mode": ACTION_MODE_POLICY,
+            # Cosmos Framework 1.2 renamed the internal policy transform mode to
+            # ``wam``. The public vLLM action_mode remains ``policy``.
+            "mode": "wam",
             "domain_id": torch.tensor(domain_id, dtype=torch.long),
             "viewpoint": "concat_view",
             "additional_view_description": ROBOLAB_CONCAT_VIEW_DESCRIPTION,
@@ -1501,7 +1525,9 @@ class Cosmos3OmniDiffusersPipeline(
         if history_action is not None:
             sample["history_action"] = history_action
 
-        sample = self._get_robolab_transform()(sample, resolution)
+        sample = self._get_robolab_transform(format_prompt_as_json=format_prompt_as_json)(sample, resolution)
+        if isinstance(sample.get("ai_caption"), dict):
+            sample["ai_caption"] = json.dumps(sample["ai_caption"])
         sequence_plan = sample["sequence_plan"]
         video_tensor = sample["video"].float() / 127.5 - 1.0
         raw_action_dim_tensor = sample.get("raw_action_dim")
@@ -1808,6 +1834,16 @@ class Cosmos3OmniDiffusersPipeline(
     @property
     def num_timesteps(self):
         return self._num_timesteps
+
+    def _set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+        setter = getattr(self.transformer, "set_mixed_precision_step", None)
+        if setter is not None:
+            setter(step_index, num_steps)
+
+    def _reset_mixed_precision(self) -> None:
+        resetter = getattr(self.transformer, "reset_mixed_precision", None)
+        if resetter is not None:
+            resetter()
 
     @staticmethod
     def _distilled_unsupported_error(detail: str) -> ValueError:
@@ -2223,7 +2259,7 @@ class Cosmos3OmniDiffusersPipeline(
         if prompt_suffix:
             prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
         if _is_rank_zero():
-            logger.info("Final prompt: '%s'", prompt)
+            logger.debug("Final prompt: '%s'", prompt)
 
         if negative_metadata_mode == "none":
             negative_dur_tmpl = None
@@ -2806,7 +2842,8 @@ class Cosmos3OmniDiffusersPipeline(
                 # Each CFG-parallel rank runs exactly one branch (rank 0 -> cond,
                 # else uncond), so session keying loads/stores only this rank's branch.
                 cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     # Outside the interval, scale=1 makes the combined output equal
                     # the cond branch. Every rank remains on the same iteration and
@@ -2845,7 +2882,8 @@ class Cosmos3OmniDiffusersPipeline(
                 uncond_cache: tuple = (None, None)
                 keep_uncond_for_cache = self._cache_requires_paired_cfg()
 
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     cfg_active = _cfg_active_at(t)
 
@@ -2899,7 +2937,8 @@ class Cosmos3OmniDiffusersPipeline(
             else:
                 # No CFG: a single cond branch per step. Bespoke (state None) keeps
                 # using the transformer-instance cache exactly as before.
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     self._kv_load_und(kv_state, is_negative=False)
                     noise_pred = self.transformer(
@@ -2915,6 +2954,7 @@ class Cosmos3OmniDiffusersPipeline(
                         self._kv_capture_und(kv_state, is_negative=False)
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
         finally:
+            self._reset_mixed_precision()
             # Cosmos3 currently receives a unique request_id rather than a
             # reusable rollout session id. Retaining its state would only pin
             # K/V buffers on device after this generation finishes.
@@ -3099,7 +3139,8 @@ class Cosmos3OmniDiffusersPipeline(
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
         try:
-            for t in self.progress_bar(timesteps):
+            for step_index, t in enumerate(self.progress_bar(timesteps)):
+                self._set_mixed_precision_step(step_index, len(timesteps))
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
@@ -3211,9 +3252,50 @@ class Cosmos3OmniDiffusersPipeline(
                 )[0]
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
         finally:
+            self._reset_mixed_precision()
             self._cosmos3_branch_caches = None
             self.transformer.reset_cache()
         return latents
+
+    def _transfer_vae_executor(self) -> Any | None:
+        """Return the active distributed VAE executor, if any."""
+        executor = getattr(self.vae, "distributed_executor", None)
+        is_distributed_enabled = getattr(self.vae, "is_distributed_enabled", None)
+        if executor is None or not callable(is_distributed_enabled) or not is_distributed_enabled():
+            return None
+        return executor
+
+    def _sync_transfer_overlap(
+        self,
+        output_video: torch.Tensor,
+        *,
+        overlap_frames: int,
+        reference_video: torch.Tensor,
+        vae_executor: Any | None,
+    ) -> torch.Tensor | None:
+        """Broadcast only the decoded frames needed to condition the next chunk."""
+        if overlap_frames <= 0:
+            return None
+
+        is_output_rank = vae_executor is None or vae_executor.rank == 0
+        if is_output_rank:
+            overlap = output_video[:, :, -overlap_frames:].contiguous()
+        else:
+            overlap = torch.empty(
+                (
+                    reference_video.shape[0],
+                    reference_video.shape[1],
+                    overlap_frames,
+                    reference_video.shape[3],
+                    reference_video.shape[4],
+                ),
+                device=self.device,
+                dtype=self.vae.dtype,
+            )
+
+        if vae_executor is not None:
+            overlap = vae_executor.broadcast_tensor(overlap)
+        return overlap
 
     def _forward_transfer(
         self,
@@ -3354,6 +3436,8 @@ class Cosmos3OmniDiffusersPipeline(
         output_chunks: list[torch.Tensor] = []
         control_chunks_per_hint: dict[str, list[torch.Tensor]] = {key: [] for key in per_hint_frames}
         previous_output: torch.Tensor | None = None
+        vae_executor = self._transfer_vae_executor()
+        is_output_rank = vae_executor is None or vae_executor.rank == 0
 
         for chunk_id in range(num_chunks):
             start_frame = chunk_id * stride
@@ -3448,16 +3532,31 @@ class Cosmos3OmniDiffusersPipeline(
                 generator=generator,
             )
             output_video = self._decode_latents(latents).clamp(-1, 1)
-            previous_output = output_video
+            if chunk_id + 1 < num_chunks:
+                previous_output = self._sync_transfer_overlap(
+                    output_video,
+                    overlap_frames=min(transfer_config.num_conditional_frames, chunk_frames),
+                    reference_video=target_norm,
+                    vae_executor=vae_executor,
+                )
 
-            if chunk_id == 0:
-                output_chunks.append(output_video)
-                for key, control in control_norms.items():
-                    control_chunks_per_hint[key].append(control)
-            else:
-                output_chunks.append(output_video[:, :, current_conditional_frames:])
-                for key, control in control_norms.items():
-                    control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
+            if is_output_rank:
+                if chunk_id == 0:
+                    output_chunks.append(output_video)
+                    for key, control in control_norms.items():
+                        control_chunks_per_hint[key].append(control)
+                else:
+                    output_chunks.append(output_video[:, :, current_conditional_frames:])
+                    for key, control in control_norms.items():
+                        control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
+
+        if not is_output_rank:
+            return DiffusionOutput(
+                output={
+                    "payload": {"video": output_video},
+                    "metadata": {"video": {"fps": frame_rate}},
+                },
+            )
 
         full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
         full_controls = {

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end smoke test for LingBot-World v2 generation."""
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ _OMNI_RUNNER_PARAM = (
 )
 
 pytestmark = [
-    pytest.mark.slow,
+    pytest.mark.full_model,
     pytest.mark.diffusion,
     pytest.mark.skipif(
         not _HAS_INPUT_ASSETS,
@@ -62,7 +62,6 @@ def test_lingbot_world_v2_tp1_one_block(omni_runner_handler: OmniRunnerHandler) 
                 height=480,
                 width=832,
                 num_frames=9,
-                num_inference_steps=4,
                 max_sequence_length=512,
                 seed=42,
                 fps=16,
