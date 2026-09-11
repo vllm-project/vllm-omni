@@ -1,5 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-# Kimi-Audio non-streaming deployment placeholder, not a runnable configuration.
-# Add deployment settings after the stage implementations and pipeline exist.
+# Initial non-streaming configuration; GPU startup and memory sizing are unverified.
+# Inputs currently come from prepare_kimi_audio_inputs (resolved 16 kHz audio).
+async_chunk: false
+trust_remote_code: true
+dtype: bfloat16
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    tokenizer_mode: kimi_audio
+    enforce_eager: true
+    async_scheduling: false
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.65
+    default_sampling_params:
+      temperature: 0.0
+      top_k: 5
+      top_p: 1.0
+      repetition_penalty: 1.0
+      max_tokens: 4096
+      extra_args:
+        kimi_audio: {}
+
+  - stage_id: 1
+    devices: "0"
+    enforce_eager: true
+    async_scheduling: false
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.15
+    engine_extras:
+      skip_tokenizer_init: true
+    default_sampling_params:
+      temperature: 0.0

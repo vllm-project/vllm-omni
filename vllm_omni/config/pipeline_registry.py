@@ -71,6 +71,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
 from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_PIPELINE,
 )
+from vllm_omni.model_executor.models.kimi_audio.pipeline import KIMI_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
@@ -138,6 +139,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
     "qwen3_omni_moe_thinker_only": QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
+    "kimi_audio": KIMI_AUDIO_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "covo_audio": COVO_AUDIO_PIPELINE,

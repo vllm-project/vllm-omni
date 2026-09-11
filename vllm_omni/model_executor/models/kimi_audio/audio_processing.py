@@ -143,6 +143,7 @@ def prepare_kimi_audio_inputs(
     wire = msgspec.to_builtins(serialize_payload(payload))
     return {
         "prompt_token_ids": layout.audio_token_ids,
+        "modalities": ["text", "audio"] if output_type == "both" else ["text"],
         "model_intermediate_buffer": {"kimi_audio_input": wire},
         # Placeholder IDs alone omit text and audio content. Salt the KV cache
         # with the complete conditioning, including resolved waveform bytes.

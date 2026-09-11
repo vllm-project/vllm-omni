@@ -24,6 +24,8 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
     and include the tokenizer's msg_end in stage-0 stop_token_ids.
     """
     params = sampling_params_list[0]
+    if not params.detokenize or not params.include_stop_str_in_output:
+        raise ValueError("Kimi-Audio requires detokenize=True and include_stop_str_in_output=True")
     unsupported = [
         name
         for name in (

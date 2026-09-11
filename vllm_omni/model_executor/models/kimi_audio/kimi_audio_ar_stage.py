@@ -240,8 +240,8 @@ class KimiAudioARStage(torch.nn.Module):
     """Own both output branches and load all three input/model checkpoints.
 
     Decoder layers use vLLM's Qwen2 implementation and follow Kimi's shared
-    trunk and text/audio branches. This class is not yet registered as a
-    runnable model. Pipeline parallel partitioning is pending.
+    trunk and text/audio branches. This is stage 0 of the Kimi-Audio pipeline;
+    pipeline parallel partitioning is pending.
 
     ``additional_config["kimi_audio"]["glm_tokenizer_path"]`` can point to an
     existing local GLM snapshot; otherwise loading resolves the pinned source.
@@ -433,7 +433,7 @@ class KimiAudioARStage(torch.nn.Module):
         # that snapshot; a later batch gets a new mapping. Per-request lists
         # prevent token-span slicing from confusing batch rows with prefill.
         outputs = {
-            "ids": {"output": [torch.empty(0, dtype=torch.long) for _ in context]},
+            "ids": {"output": [[] for _ in context]},
             "codes": {"audio": [torch.empty(0, dtype=torch.long) for _ in context]},
             "meta": {"finished": [torch.tensor(False) for _ in context]},
         }
@@ -536,7 +536,7 @@ class KimiAudioARStage(torch.nn.Module):
             # blanks. Audio stays in the LLM vocabulary here; the downstream
             # adapter will filter control tokens and remove kimia_token_offset.
             if not result.text_finished and result.text_token < self.config.kimia_token_offset:
-                outputs["ids"]["output"][row] = torch.tensor([result.text_token], dtype=torch.long)
+                outputs["ids"]["output"][row] = [result.text_token]
             if state["output_type"] == "both" and generated > self.config.kimia_mimo_audiodelaytokens:
                 outputs["codes"]["audio"][row] = torch.tensor([result.audio_token], dtype=torch.long)
             outputs["meta"]["finished"][row] = torch.tensor(state["finished"])

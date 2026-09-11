@@ -20,7 +20,9 @@ from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.request import RequestStatus
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from tests.model_executor.models.kimi_audio.runtime import registered_model_runtime as registered_model_runtime
 from vllm_omni.model_executor.models.kimi_audio.audio_processing import prepare_kimi_audio_inputs
+from vllm_omni.model_executor.models.kimi_audio.kimi_audio import KimiAudioForConditionalGeneration
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio_ar_stage import KimiAudioARStage
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioPromptBuilder, KimiAudioSpecialTokens
 from vllm_omni.model_executor.models.kimi_audio.sampling import KimiAudioSamplingParams, sample_kimi_audio_step
@@ -38,10 +40,10 @@ CODE = REFERENCE["input_config"]["audio_token_offset"] + 17
 class RequestSteps:
     """Supply bounded scheduled spans to the actual eager runner methods."""
 
-    def __init__(self, stage):
-        self.stage = stage
+    def __init__(self, model):
+        stage = self.stage = model.model
         self.runner = object.__new__(GPUARModelRunner)
-        self.runner.model = stage
+        self.runner.model = model
         self.runner.requests = {}
         self.runner.model_intermediate_buffer = {}
         self.runner.model_config = stage.vllm_config.model_config
@@ -68,6 +70,7 @@ class RequestSteps:
         # prompt_transform_func before the native admission EOS update.
         params = params.clone()
         params.stop_token_ids = [SPECIAL.msg_end]
+        params.include_stop_str_in_output = True
         params.all_stop_token_ids.add(SPECIAL.msg_end)
         prepared = prepare_kimi_audio_request(prepared, [params])
         # The native Kimi tokenizer currently exposes 151644 as EOS. Resolve
@@ -141,7 +144,7 @@ class RequestSteps:
                 _omni_max_tokens=req.max_tokens,
             )
             scheduled = torch.tensor((req.prompt_token_ids + req.output_token_ids)[offset : offset + count])
-            _, embeddings[rid], update = self.stage.preprocess(scheduled, None, **info)
+            _, embeddings[rid], update = runner.model.preprocess(scheduled, None, **info)
             runner._update_intermediate_buffer(rid, update)
             rows = torch.zeros(count, 2 * self.stage.config.hidden_size)
             rows[-1, text_column] = rows[-1, self.stage.config.hidden_size + audio_column] = 1
@@ -152,10 +155,10 @@ class RequestSteps:
             assert kwargs["sampling_extra_args"] == [
                 runner.requests[rid].sampling_params.extra_args or {} for rid in order
             ]
-        output = self.stage.make_omni_output(torch.cat(hidden), **kwargs)
+        output = runner.model.make_omni_output(torch.cat(hidden), **kwargs)
         packed, mm = runner.extract_multimodal_outputs(output)
         selected = packed[torch.tensor(runner.query_start_loc.cpu[1:] - 1)]
-        logits = self.stage.compute_logits(selected, runner.input_batch.sampling_metadata)
+        logits = runner.model.compute_logits(selected, runner.input_batch.sampling_metadata)
         expected_text = torch.nn.functional.linear(selected[:, :4], self.stage.lm_head.weight)[
             :, : self.stage.config.vocab_size
         ]
@@ -203,7 +206,7 @@ class RequestSteps:
 
 
 @pytest.fixture
-def steps(monkeypatch):
+def steps(monkeypatch, registered_model_runtime):
     stage = KimiAudioARStage.__new__(KimiAudioARStage)
     torch.nn.Module.__init__(stage)
     stage.config = SimpleNamespace(
@@ -213,8 +216,10 @@ def steps(monkeypatch):
         kimia_token_offset=152064,
         eos_token_ids=[151644, SPECIAL.msg_end],
     )
-    stage.vllm_config = SimpleNamespace(
+    stage.vllm_config = registered_model_runtime(
         model_config=SimpleNamespace(
+            model_stage="kimi_audio_ar",
+            hf_config=stage.config,
             max_model_len=8192,
             has_sampling_extra_args=True,
             engine_output_type="text",
@@ -242,7 +247,17 @@ def steps(monkeypatch):
                 apply=lambda layer, hidden, bias=None: torch.nn.functional.linear(hidden, layer.weight, bias)
             )
             setattr(stage, name, head)
-    return RequestSteps(stage.eval())
+
+    # Substitute only stage construction; the unified entry exposes the real
+    # preprocess/output/sample methods to the actual eager runner dispatch.
+    def initialize_heads(self, *, vllm_config, prefix):
+        self.__dict__.update(stage.__dict__)
+        self.vllm_config = vllm_config
+        self.config = vllm_config.model_config.hf_config
+
+    monkeypatch.setattr(KimiAudioARStage, "__init__", initialize_heads)
+    model = KimiAudioForConditionalGeneration(vllm_config=stage.vllm_config)
+    return RequestSteps(model.eval())
 
 
 @torch.inference_mode()
@@ -435,7 +450,9 @@ def test_admission_stop_contract_and_no_parameter_mutation():
     prompt = prepare_kimi_audio_inputs(
         [{"role": "user", "message_type": "text", "content": "你好"}], builder, output_type="both"
     )
-    params = SamplingParams(temperature=0, stop_token_ids=[SPECIAL.msg_end], extra_args={"kimi_audio": {}})
+    params = SamplingParams(
+        temperature=0, stop_token_ids=[SPECIAL.msg_end], include_stop_str_in_output=True, extra_args={"kimi_audio": {}}
+    )
     before = params.clone()
     admitted = prepare_kimi_audio_request(prompt, [params])
     assert params == before
@@ -443,7 +460,9 @@ def test_admission_stop_contract_and_no_parameter_mutation():
     assert admitted["model_intermediate_buffer"]["kimi_audio_request_validated"] is True
     for stop_ids in ([], [WORD], [SPECIAL.msg_end, SPECIAL.kimia_text_blank]):
         with pytest.raises(ValueError, match="stop_token_ids"):
-            prepare_kimi_audio_request(prompt, [SamplingParams(stop_token_ids=stop_ids)])
+            prepare_kimi_audio_request(
+                prompt, [SamplingParams(stop_token_ids=stop_ids, include_stop_str_in_output=True)]
+            )
 
 
 def test_missing_extra_args_channel_fails_explicitly(steps):

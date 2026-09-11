@@ -19,6 +19,8 @@ from vllm.model_executor import model_loader
 from vllm.model_executor.layers import layernorm, vocab_parallel_embedding
 from vllm.model_executor.models import qwen2
 
+from tests.model_executor.models.kimi_audio.runtime import registered_model_runtime as registered_model_runtime
+from vllm_omni.model_executor.models.kimi_audio.kimi_audio import KimiAudioForConditionalGeneration
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio_ar_stage import KimiAudioARStage, KimiAudioInputEncoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.omni]
@@ -26,7 +28,7 @@ MANIFEST = Path(__file__).parent / "fixtures/ar_checkpoint_manifest.json"
 
 
 @pytest.fixture
-def ar_runtime(monkeypatch, tmp_path):
+def ar_runtime(monkeypatch, tmp_path, registered_model_runtime):
     manifest = json.loads(MANIFEST.read_text())
     config = Qwen2Config(**manifest["config"])
     # Keep the official 28 + 6 layers and branch point; shrink only widths.
@@ -40,8 +42,8 @@ def ar_runtime(monkeypatch, tmp_path):
     config.kimia_audio_output_vocab = 17
     config.kimia_text_output_vocab = 23
     runtime = SimpleNamespace(constructions=[], loads=[], downloads=[], local_path=str(tmp_path))
-    runtime.config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=config),
+    runtime.config = registered_model_runtime(
+        model_config=SimpleNamespace(hf_config=config, model_stage="kimi_audio_ar"),
         quant_config=None,
         cache_config=object(),
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
@@ -151,23 +153,31 @@ def ar_runtime(monkeypatch, tmp_path):
 
 def test_complete_dual_stream_checkpoint_and_input_ownership(ar_runtime):
     runtime = ar_runtime
-    stage = KimiAudioARStage(vllm_config=runtime.config, prefix="ar")
+    model = KimiAudioForConditionalGeneration(vllm_config=runtime.config, prefix="ar")
+    stage = model.model
+    assert isinstance(stage, KimiAudioARStage)
+    assert stage.vllm_config is not runtime.config
+    assert stage.config.architectures == ["KimiAudioARStage"]
+    assert runtime.config.model_config.model_arch == "KimiAudioForConditionalGeneration"
+    assert runtime.config.model_config.hf_config.architectures != ["KimiAudioARStage"]
     assert runtime.loads == runtime.downloads == []
     assert list(stage.input_encoder.parameters()) == []
     assert len(stage.layers) == 28 and stage.branch_layer == 21 and len(stage.mimo_layers) == 6
     prefixes = [prefix for prefix, _, _ in runtime.constructions]
     assert len(prefixes) == len(set(prefixes)) == 34
-    assert prefixes[0] == "ar.layers.0" and prefixes[-1] == "ar.mimo_layers.5"
+    assert prefixes[0] == "ar.model.layers.0" and prefixes[-1] == "ar.model.mimo_layers.5"
     assert all(config.rope_parameters["rope_theta"] == 1e6 for _, config, _ in runtime.constructions)
     assert all(cache is runtime.config.cache_config for _, _, cache in runtime.constructions)
 
-    loaded = stage.load_weights(iter(runtime.weights.items()))
-    model_loader.DefaultModelLoader.track_weights_loading(None, stage, loaded)
-    assert loaded == set(dict(stage.named_parameters()))
+    loaded = model.load_weights(iter(runtime.weights.items()))
+    model_loader.DefaultModelLoader.track_weights_loading(None, model, loaded)
+    assert loaded == set(dict(model.named_parameters()))
     assert [kind for kind, _ in runtime.loads] == ["glm", "whisper"]
     assert runtime.loads[0][1] == runtime.local_path
     assert runtime.downloads == []
-    assert stage.input_encoder.prefix == "ar.input_encoder"
+    assert stage.input_encoder.prefix == "ar.model.input_encoder"
+    ids = torch.tensor([1, 2])
+    torch.testing.assert_close(model.embed_input_ids(ids), stage.embed_tokens(ids))
     for name in ("lm_head", "mimo_output"):
         torch.testing.assert_close(getattr(stage, name).weight, runtime.weights[f"{name}.weight"])
     assert stage.lm_head.weight is not stage.mimo_output.weight

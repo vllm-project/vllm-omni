@@ -12,8 +12,10 @@ import pytest
 import torch
 from vllm.model_executor import model_loader
 
+from tests.model_executor.models.kimi_audio.runtime import registered_model_runtime as registered_model_runtime
 from vllm_omni.model_executor.models.kimi_audio.audio_processing import prepare_kimi_audio_inputs
 from vllm_omni.model_executor.models.kimi_audio.detokenizer import PrefixStreamingFlowMatchingDetokenizer
+from vllm_omni.model_executor.models.kimi_audio.kimi_audio import KimiAudioForConditionalGeneration
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio_decoder import KimiAudioDecoder
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioPromptBuilder, KimiAudioSpecialTokens
 from vllm_omni.model_executor.stage_input_processors.kimi_audio import kimi_audio_to_decoder
@@ -49,7 +51,7 @@ class RecordingAcoustics:
 
 
 @pytest.fixture
-def runtime(monkeypatch, tmp_path):
+def runtime(monkeypatch, tmp_path, registered_model_runtime):
     acoustic = RecordingAcoustics()
     loads, downloads = [], []
 
@@ -65,12 +67,17 @@ def runtime(monkeypatch, tmp_path):
     weights = ModuleType("vllm_omni.model_executor.model_loader.weight_utils")
     weights.download_weights_from_hf_specific = download
     monkeypatch.setitem(sys.modules, weights.__name__, weights)
-    config = SimpleNamespace(
+    config = registered_model_runtime(
         model_config=SimpleNamespace(
+            model_stage="kimi_audio_decoder",
             model=str(tmp_path),
             revision="fixture-revision",
             async_chunk=False,
-            hf_config=SimpleNamespace(vocab_size=OFFSET + VOCAB, kimia_token_offset=OFFSET),
+            hf_config=SimpleNamespace(
+                vocab_size=OFFSET + VOCAB,
+                kimia_token_offset=OFFSET,
+                architectures=["MoonshotKimiaForCausalLM"],
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
         device_config=SimpleNamespace(device=torch.device("cpu")),
@@ -84,15 +91,23 @@ def runtime(monkeypatch, tmp_path):
 def test_acoustic_load_is_lazy_scoped_and_registered(runtime, remote):
     if remote:
         runtime.config.model_config.model = "moonshotai/Kimi-Audio-7B-Instruct"
-    stage = KimiAudioDecoder(vllm_config=runtime.config)
+    model = KimiAudioForConditionalGeneration(vllm_config=runtime.config)
+    stage = model.model
+    assert isinstance(stage, KimiAudioDecoder)
+    assert stage.vllm_config is not runtime.config
+    assert stage.vllm_config.model_config.hf_config.architectures == ["KimiAudioDecoder"]
+    assert runtime.config.model_config.hf_config.architectures == ["MoonshotKimiaForCausalLM"]
     assert stage.detokenizer is None and not runtime.loads and not runtime.downloads
+    assert model.requires_raw_input_tokens and not model.has_preprocess
+    assert not hasattr(model, "sample") and not hasattr(model, "make_omni_output")
 
     def root_llm_weights():
         pytest.fail("Audio decoding must not read the root LLM weights")
         yield
 
-    loaded = stage.load_weights(root_llm_weights())
-    model_loader.DefaultModelLoader.track_weights_loading(None, stage, loaded)
+    loaded = model.load_weights(root_llm_weights())
+    model_loader.DefaultModelLoader.track_weights_loading(None, model, loaded)
+    assert loaded == set(dict(model.named_parameters()))
     assert len(runtime.loads) == 1
     assert stage.speech_model is runtime.acoustic.semantic_fm.speech_model
     assert stage.vocoder is runtime.acoustic.vocoder.vocoder
@@ -107,7 +122,7 @@ def test_acoustic_load_is_lazy_scoped_and_registered(runtime, remote):
             "vocoder/config.json",
             "vocoder/model.pt",
         }
-    stage.load_weights(root_llm_weights())
+    model.load_weights(root_llm_weights())
     assert len(runtime.loads) == 1
 
 
@@ -146,7 +161,7 @@ def test_ar_conversion_roundtrip_and_complete_request_decode(runtime, finish_rea
     assert inputs[1]["prompt_token_ids"] == [0]
     assert inputs[1]["model_intermediate_buffer"]["codes"]["audio"] == []
     assert inputs[0]["prompt_token_ids"] == requests[0]
-    stage = KimiAudioDecoder(vllm_config=runtime.config)
+    stage = KimiAudioForConditionalGeneration(vllm_config=runtime.config)
     stage.load_weights(iter(()))
     counts = [len(item["prompt_token_ids"]) for item in inputs]
     ids = torch.tensor([code for item in inputs for code in item["prompt_token_ids"]])
