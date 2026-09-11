@@ -273,3 +273,77 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
     seq_length_expand = lengths.unsqueeze(-1)
     mask = seq_range_expand >= seq_length_expand
     return mask
+
+
+def subsequent_chunk_mask(
+    size: int,
+    chunk_size: int,
+    num_left_chunks: int = -1,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Create chunk-wise causal mask ``(size, size)`` for streaming DiT/encoder.
+
+    Aligned with CosyVoice3_split ``cosyvoice/utils/mask.py``.
+    ``True`` means the query position may attend to that key position.
+
+    Example (size=4, chunk_size=2)::
+
+        [[1, 1, 0, 0],
+         [1, 1, 0, 0],
+         [1, 1, 1, 1],
+         [1, 1, 1, 1]]
+    """
+    del num_left_chunks  # CosyVoice ONNX-friendly impl does not use left-chunk limit.
+    pos_idx = torch.arange(size, device=device)
+    block_value = (torch.div(pos_idx, chunk_size, rounding_mode="trunc") + 1) * chunk_size
+    return pos_idx.unsqueeze(0) < block_value.unsqueeze(1)
+
+
+def add_optional_chunk_mask(
+    xs: torch.Tensor,
+    masks: torch.Tensor,
+    use_dynamic_chunk: bool,
+    use_dynamic_left_chunk: bool,
+    decoding_chunk_size: int,
+    static_chunk_size: int,
+    num_decoding_left_chunks: int,
+    enable_full_context: bool = True,
+) -> torch.Tensor:
+    """Apply optional chunk / pad mask for CosyVoice DiT attention.
+
+    Aligned with CosyVoice3_split ``add_optional_chunk_mask``.
+    Inference path used by CosyVoice3 DiT:
+
+    - ``streaming=True`` → ``static_chunk_size > 0`` chunk mask
+    - ``streaming=False`` → ``static_chunk_size=0`` → pad mask only
+    """
+    del use_dynamic_left_chunk  # unused on CosyVoice3 DiT inference path
+    if use_dynamic_chunk:
+        max_len = xs.size(1)
+        if decoding_chunk_size < 0:
+            chunk_size = max_len
+            num_left_chunks = -1
+        elif decoding_chunk_size > 0:
+            chunk_size = decoding_chunk_size
+            num_left_chunks = num_decoding_left_chunks
+        else:
+            chunk_size = torch.randint(1, max_len, (1,)).item()
+            num_left_chunks = -1
+            if chunk_size > max_len // 2 and enable_full_context:
+                chunk_size = max_len
+            else:
+                chunk_size = chunk_size % 25 + 1
+        chunk_masks = subsequent_chunk_mask(xs.size(1), chunk_size, num_left_chunks, xs.device)
+        chunk_masks = chunk_masks.unsqueeze(0)
+        chunk_masks = masks & chunk_masks
+    elif static_chunk_size > 0:
+        chunk_masks = subsequent_chunk_mask(xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device)
+        chunk_masks = chunk_masks.unsqueeze(0)
+        chunk_masks = masks & chunk_masks
+    else:
+        chunk_masks = masks
+    assert chunk_masks.dtype == torch.bool
+    if (chunk_masks.sum(dim=-1) == 0).sum().item() != 0:
+        logger.warning("chunk_masks all-false at some timestep; forcing True so positions stay valid")
+        chunk_masks[chunk_masks.sum(dim=-1) == 0] = True
+    return chunk_masks
