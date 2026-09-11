@@ -367,6 +367,8 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         # histories themselves belong to the runner's per-request buffers.
         self._sampling_context = None
         self._audio_logits = None
+        self._pp_request_ids = ()
+        self._pp_feedback = None
         if config.use_whisper_feature:
             # Preserve official VQAdaptor indices, SiLU, and LayerNorm epsilon.
             self.vq_adaptor = (
@@ -457,14 +459,21 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         return torch.cat((hidden_states, mimo_hidden_states), dim=-1)
 
     def make_omni_output(
-        self, model_outputs: torch.Tensor | IntermediateTensors, **kwargs: Any
-    ) -> "OmniOutput | IntermediateTensors":
+        self, model_outputs: torch.Tensor | tuple[torch.Tensor, ...], **kwargs: Any
+    ) -> "OmniOutput | tuple[IntermediateTensors]":
         """Bind request context outside the compiled/CUDA-graph forward."""
         from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-        if isinstance(model_outputs, IntermediateTensors):
-            return model_outputs
         infos = kwargs.get("model_intermediate_buffer")
+        if isinstance(model_outputs, tuple):
+            keys = ["hidden_states", "residual"]
+            if self.end_layer > self.branch_layer:
+                keys += ["mimo_hidden_states", "mimo_residual"]
+            carrier = IntermediateTensors(dict(zip(keys, model_outputs, strict=True)))
+            self._exchange_pipeline_state([info["kimi_audio_generation"] for info in infos])
+            # The unchanged runner unwraps tuple[0] for real execution, then
+            # hands this native IntermediateTensors to the PP worker transport.
+            return (carrier,)
         if not infos:
             return OmniOutput(text_hidden_states=model_outputs)
         if self._sampling_context is not None:
@@ -609,51 +618,77 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
             outputs["meta"]["finished"][row] = torch.tensor(state["finished"])
             if rng_state is not None:
                 state["rng_state"] = rng_state
+        if get_pp_group().world_size > 1:
+            self._exchange_pipeline_state([state for state, _, _, _ in context])
         return SamplerOutput(
             sampled_token_ids=torch.tensor(scheduler_tokens, device=logits.device, dtype=torch.int32).reshape(-1, 1),
             logprobs_tensors=None,
         )
 
-    def sync_pipeline_state(self, *, req_ids: list[str], model_intermediate_buffer: dict[str, dict]) -> None:
-        """Return accepted dual-stream IDs to input ranks after PP sampling.
+    def _exchange_pipeline_state(self, states: list[dict]) -> None:
+        """Post a receive after forward, or publish after last-rank sampling.
 
-        The scheduler transports only blank/end IDs. Broadcast one accepted
-        step per request using the PP group's CPU metadata channel, preserving
-        request identity if local batch rows differ. Histories remain owned by
-        runner request buffers; RNG and sampling stay on the last rank.
+        Non-last ranks must return without waiting so the worker can send the
+        current activations. The last rank can only sample AFTER those sends.
+        Use the existing PP CPU group, independently of CUDA activation traffic.
         """
         pp = get_pp_group()
-        if pp.world_size == 1:
-            return
-        updates = None
+        # All PP ranks execute the same scheduled request set. Canonical order
+        # keeps the small tensor independent of each rank's local batch rows.
+        requests = sorted(zip(self._pp_request_ids, states, strict=True))
+        if not requests or self._pp_feedback is not None:
+            raise RuntimeError("Kimi-Audio PP requires one matched forward/sampling exchange per batch")
         if pp.is_last_rank:
-            updates = {}
-            for req_id in req_ids:
-                state = model_intermediate_buffer[req_id]["kimi_audio_generation"]
+            rows = []
+            for _, state in requests:
                 count = len(state["scheduler_history"])
-                updates[req_id] = (
-                    count,
-                    state["text_history"][-1] if count else None,
-                    state["audio_history"][-1] if count else None,
-                    state["scheduler_history"][-1] if count else None,
-                    state["text_finished"],
-                    state["finished"],
+                rows.append(
+                    [
+                        count,
+                        state["text_history"][-1] if count else 0,
+                        state["audio_history"][-1] if count else 0,
+                        state["scheduler_history"][-1] if count else 0,
+                        state["text_finished"],
+                        state["finished"],
+                    ]
                 )
-        updates = pp.broadcast_object(updates, src=pp.world_size - 1)
+            updates = torch.tensor(rows, dtype=torch.int64, device="cpu")
+        else:
+            updates = torch.empty((len(requests), 6), dtype=torch.int64, device="cpu")
+        work = torch.distributed.broadcast(updates, src=pp.ranks[-1], group=pp.cpu_group, async_op=True)
+        self._pp_request_ids = ()
         if pp.is_last_rank:
+            work.wait()
+        else:
+            self._pp_feedback = (work, updates, requests)
+
+    def preprocess_batch(self, *, req_ids: list[str], model_intermediate_buffer: dict[str, dict], **kwargs) -> None:
+        """Apply the previous accepted pair before constructing the next input.
+
+        One outstanding CPU transfer holds references to its original request
+        states, not copies of histories or RNG. Removed/replaced requests are
+        ignored; the next real batch drains the transfer even after an idle gap.
+        Dummy forwards never post transfers or create request context.
+        """
+        if get_pp_group().world_size == 1:
             return
-        if set(updates) != set(req_ids):
-            raise ValueError("Kimi-Audio PP ranks have different sampling requests")
-        for req_id, (count, text, audio, scheduler_token, text_finished, finished) in updates.items():
-            state = model_intermediate_buffer[req_id]["kimi_audio_generation"]
-            local_count = len(state["scheduler_history"])
-            if count == local_count + 1:
-                state["text_history"].append(text)
-                state["audio_history"].append(audio)
-                state["scheduler_history"].append(scheduler_token)
-            elif count != local_count:
-                raise ValueError("Kimi-Audio PP dual-stream history is out of sync")
-            state["text_finished"], state["finished"] = text_finished, finished
+        if self._pp_feedback is not None:
+            work, updates, requests = self._pp_feedback
+            work.wait()
+            self._pp_feedback = None
+            for (req_id, state), row in zip(requests, updates.tolist(), strict=True):
+                if model_intermediate_buffer.get(req_id, {}).get("kimi_audio_generation") is not state:
+                    continue
+                count, text, audio, scheduler_token, text_finished, finished = row
+                local_count = len(state["scheduler_history"])
+                if count == local_count + 1:
+                    state["text_history"].append(text)
+                    state["audio_history"].append(audio)
+                    state["scheduler_history"].append(scheduler_token)
+                elif count != local_count:
+                    raise ValueError("Kimi-Audio PP dual-stream history is out of sync")
+                state["text_finished"], state["finished"] = bool(text_finished), bool(finished)
+        self._pp_request_ids = tuple(req_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         from vllm.model_executor.models.qwen2 import Qwen2Model

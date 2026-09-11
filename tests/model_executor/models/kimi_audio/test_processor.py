@@ -18,39 +18,27 @@ from tests.model_executor.models.kimi_audio.runtime import kimi_mm_processor as 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.omni]
 
 
-def test_pp_encoder_profile_runs_only_on_input_rank(monkeypatch, cpu_pp_group):
+def test_native_profile_honors_model_encoder_skip(cpu_pp_group):
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
-    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
-    runner.supports_mm_inputs = True
-    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
     seen = []
-
-    def profile(owner):
-        seen.append(owner.supports_mm_inputs)
-
-    monkeypatch.setattr(GPUModelRunner, "profile_run", profile)
-    runner.profile_run()
-    cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = False, True
-    runner.profile_run()
-    assert seen == [True, False]
-    assert runner.supports_mm_inputs
-    # Encoder-decoder models retain their existing profiling path.
-    runner.model_config.is_encoder_decoder = True
-    runner.profile_run()
-    assert seen[-1] is True
-
-    def fail(owner):
-        assert not owner.supports_mm_inputs
-        raise RuntimeError("profile failed")
-
-    runner.model_config.is_encoder_decoder = False
-    monkeypatch.setattr(GPUModelRunner, "profile_run", fail)
-    with pytest.raises(RuntimeError, match="profile failed"):
-        runner.profile_run()
-    assert runner.supports_mm_inputs
+    runner = SimpleNamespace(
+        supports_mm_inputs=True,
+        model_config=SimpleNamespace(multimodal_config=SimpleNamespace(skip_mm_profiling=True)),
+        max_num_tokens=2,
+        is_pooling_model=False,
+        encoder_cache={},
+        _dummy_run=lambda *args, **kwargs: (seen.append("backbone") or torch.zeros(2, 4), torch.zeros(1, 4)),
+        _dummy_sampler_run=lambda hidden: seen.append("heads"),
+        _sync_device=lambda: None,
+    )
+    # No encoder or MM budget: any attempted encoder profiling fails. The
+    # actual native profile_run must still warm up the backbone on each rank.
+    cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = False, False
+    GPUModelRunner.profile_run(runner)
+    cpu_pp_group.is_last_rank = True
+    GPUModelRunner.profile_run(runner)
+    assert seen == ["backbone", "backbone", "heads"]
 
 
 def test_partial_processor_cache_preserves_audio_order_and_history_mode(kimi_mm_processor):

@@ -23,7 +23,9 @@ from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.sequence import IntermediateTensors
 
 from tests.model_executor.models.kimi_audio.runtime import cpu_pp_group as cpu_pp_group
+from vllm_omni.model_executor.models.kimi_audio.kimi_audio import KimiAudioForConditionalGeneration
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio_ar_stage import KimiAudioARStage
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.omni]
 REFERENCE = Path(__file__).parent / "fixtures/ar_forward_reference.safetensors"
@@ -151,7 +153,7 @@ def test_forward_requires_prepared_dual_stream_embeddings(forward_fixture):
 
 @pytest.mark.parametrize("partitions", [(14, 14), (22, 6), (20, 4, 4), (21, 1, 3, 3), (23, 5)])
 @torch.inference_mode()
-def test_pp_cuts_preserve_both_official_branches(forward_fixture, cpu_pp_group, partitions):
+def test_pp_cuts_preserve_both_official_branches(forward_fixture, cpu_pp_group, partitions, monkeypatch):
     reference, tensors = forward_fixture
     ranks, start = [], 0
     for rank, count in enumerate(partitions):
@@ -186,16 +188,31 @@ def test_pp_cuts_preserve_both_official_branches(forward_fixture, cpu_pp_group, 
                     incoming[key].copy_(value)
             else:
                 incoming = None
-            carriers = stage(
+            entry = KimiAudioForConditionalGeneration.__new__(KimiAudioForConditionalGeneration)
+            torch.nn.Module.__init__(entry)
+            entry.model = stage
+            runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+            runner.model = entry
+            output = entry(
                 None,
                 tensors[f"{case}.positions"],
                 intermediate_tensors=incoming,
                 inputs_embeds=tensors[f"{case}.inputs"].clone() if rank == 0 else None,
             )
             if rank < len(ranks) - 1:
+                # Unmodified warmup reads a plain tensor; every carrier remains
+                # a flat tensor output, suitable for native graph weak refs.
+                hidden, _ = runner.extract_multimodal_outputs(output)
+                assert all(isinstance(t, torch.Tensor) for t in output)
+                assert hidden[torch.tensor([len(hidden) - 1])].shape == (1, stage.config.hidden_size)
+                posted = []
+                monkeypatch.setattr(stage, "_exchange_pipeline_state", lambda states: posted.append(states))
+                packed = stage.make_omni_output(output, model_intermediate_buffer=[{"kimi_audio_generation": {}}])
+                carriers, _ = runner.extract_multimodal_outputs(packed)
                 assert isinstance(carriers, IntermediateTensors)
-                # Intermediate ranks must not bind a sampler context.
-                assert stage.make_omni_output(carriers, model_intermediate_buffer=[{}]) is carriers
+                assert posted == [[{}]]
+            else:
+                carriers = output
         text, audio = carriers.chunk(2, dim=-1)
         torch.testing.assert_close(text, tensors[f"{case}.text"], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(audio, tensors[f"{case}.audio"], rtol=1e-5, atol=1e-6)

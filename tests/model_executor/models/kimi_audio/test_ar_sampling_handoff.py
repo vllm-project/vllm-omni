@@ -132,6 +132,7 @@ class RequestSteps:
             sampling_metadata=metadata,
             update_async_output_token_ids=lambda: None,
         )
+        runner._maybe_run_batch_preprocess(order, torch.device("cpu"))
         embeddings, hidden = {}, []
         for rid, (offset, count), (text_column, audio_column) in zip(order, spans, columns, strict=True):
             req = runner.requests[rid]
@@ -146,7 +147,10 @@ class RequestSteps:
                 _omni_max_tokens=req.max_tokens,
             )
             scheduled = torch.tensor((req.prompt_token_ids + req.output_token_ids)[offset : offset + count])
-            _, embeddings[rid], update = runner.model.preprocess(scheduled, None, **info)
+            from vllm.distributed import get_pp_group
+
+            input_embeds = None if get_pp_group().is_first_rank else torch.empty(count, self.stage.config.hidden_size)
+            _, embeddings[rid], update = runner.model.preprocess(scheduled, input_embeds, **info)
             runner._update_intermediate_buffer(rid, update)
             rows = torch.zeros(count, 2 * self.stage.config.hidden_size)
             rows[-1, text_column] = rows[-1, self.stage.config.hidden_size + audio_column] = 1
@@ -229,6 +233,7 @@ def steps(monkeypatch, registered_model_runtime):
         )
     )
     stage._sampling_context = stage._audio_logits = None
+    stage._pp_feedback, stage._pp_request_ids = None, ()
     stage.embed_tokens = torch.nn.Embedding(stage.config.vocab_size, 4)
     monkeypatch.setattr(logits_processor, "get_current_vllm_config", lambda: SimpleNamespace(model_config=None))
     stage.logits_processor = logits_processor.LogitsProcessor(stage.config.vocab_size)
@@ -490,91 +495,80 @@ def test_missing_extra_args_channel_fails_explicitly(steps):
 
 
 @torch.inference_mode()
-def test_pp_feedback_preserves_request_identity_and_next_input(steps, cpu_pp_group):
+def test_pp_feedback_uses_existing_hooks_and_preserves_next_input(steps, cpu_pp_group, monkeypatch):
     a = steps.add("a", "both", SamplingParams(temperature=0, max_tokens=2, seed=7))
     b = steps.add("b", "text", SamplingParams(temperature=0, max_tokens=8), text="你好")
     pa, pb = len(a.prompt_token_ids), len(b.prompt_token_ids)
-    # Both ranks initialize metadata even for a partial prefill.
     steps.step(["a", "b"], [(0, 1), (0, 1)], [(1, 0), (2, 0)])
     first_buffer = copy.deepcopy(steps.runner.model_intermediate_buffer)
-    sent = None
+    first_model = copy.deepcopy(steps.stage)
+    first_model.end_layer, first_model.branch_layer = 22, 21
+    pending = []
+    cpu_pp_group.world_size, cpu_pp_group.ranks, cpu_pp_group.cpu_group = 2, [0, 1], object()
 
-    def broadcast(update, src):
-        nonlocal sent
-        assert src == 1
-        if update is not None:
-            sent = copy.deepcopy(update)
-        return copy.deepcopy(sent)
+    def broadcast(tensor, *, src, group, async_op):
+        assert src == 1 and group is cpu_pp_group.cpu_group and async_op
+        if not cpu_pp_group.is_last_rank:
+            record = {"tensor": tensor, "delivered": False, "waited": False}
+            pending.append(record)
+        else:
+            record = pending[-1]
+            assert not record["waited"]  # receiving must not block activation delivery
+            record["tensor"].copy_(tensor)
+            record["delivered"] = True
 
-    cpu_pp_group.broadcast_object = broadcast
+        def wait():
+            assert record["delivered"]
+            record["waited"] = True
+
+        return SimpleNamespace(wait=wait)
+
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
     for spans in ([(1, pa - 1), (1, 1)], [(pa, 1), (2, pb - 2)]):
-        # Existing fixture exercises real Kimi sampling with synthetic heads.
-        cpu_pp_group.world_size = 1
-        cpu_pp_group.is_first_rank = cpu_pp_group.is_last_rank = True
-        steps.step(["a", "b"], spans, [(1, 0), (2, 0)])
-        cpu_pp_group.world_size = 2
-        cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = False, True
-        steps.runner.model.sync_pipeline_state(
-            req_ids=["a", "b"], model_intermediate_buffer=steps.runner.model_intermediate_buffer
-        )
         cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = True, False
-        steps.runner.model.sync_pipeline_state(req_ids=["b", "a"], model_intermediate_buffer=first_buffer)
-        # Replaying a feedback payload must not duplicate accepted tokens.
-        steps.runner.model.sync_pipeline_state(req_ids=["a", "b"], model_intermediate_buffer=first_buffer)
+        first_model.preprocess_batch(req_ids=["b", "a"], model_intermediate_buffer=first_buffer)
+        first_model.make_omni_output(
+            (torch.zeros(2, 4),) * 4,
+            model_intermediate_buffer=[first_buffer[rid] for rid in ("b", "a")],
+        )
+        assert not pending[-1]["waited"]
+        # Last-rank sample publishes through the model, with no runner hook.
+        cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = False, True
+        steps.step(["a", "b"], spans, [(1, 0), (2, 0)])
+        cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = True, False
+        first_model.preprocess_batch(req_ids=["a", "b"], model_intermediate_buffer=first_buffer)
+        # Draining twice cannot append the same accepted pair twice.
+        first_model.preprocess_batch(req_ids=["b", "a"], model_intermediate_buffer=first_buffer)
+        assert first_model._pp_feedback is None
         for rid in ("a", "b"):
-            first = first_buffer[rid]["kimi_audio_generation"]
-            last = steps.state(rid)
+            first, last = first_buffer[rid]["kimi_audio_generation"], steps.state(rid)
             for key in ("text_history", "audio_history", "scheduler_history", "text_finished", "finished"):
                 assert first[key] == last[key]
         if not first_buffer["a"]["kimi_audio_generation"]["finished"]:
             state = steps.state("a")
             info = dict(first_buffer["a"], _omni_is_prefill=False, _omni_num_computed_tokens=pa)
-            _, embedding, _ = steps.stage.preprocess(torch.tensor([state["scheduler_history"][-1]]), None, **info)
-            expected = steps.stage.embed_tokens(torch.tensor([state["text_history"][-1]]))
-            expected += steps.stage.embed_tokens(torch.tensor([state["audio_history"][-1]]))
+            _, embedding, _ = first_model.preprocess(torch.tensor([state["scheduler_history"][-1]]), None, **info)
+            expected = first_model.embed_tokens(torch.tensor([state["text_history"][-1]]))
+            expected += first_model.embed_tokens(torch.tensor([state["audio_history"][-1]]))
             torch.testing.assert_close(embedding, expected)
     assert first_buffer["a"]["kimi_audio_generation"]["finished"]
     assert len(first_buffer["b"]["kimi_audio_generation"]["scheduler_history"]) == 1
-    sent["a"] = (100, *sent["a"][1:])
+
+    # A request can disappear or be replaced while its transfer finishes.
+    # Never apply its result to another incarnation with the same request ID.
+    old = [(rid, first_buffer[rid]["kimi_audio_generation"]) for rid in ("a", "b")]
+    fresh = copy.deepcopy(first_buffer["b"])
+    first_buffer.pop("a")
+    first_buffer["b"] = fresh
+    before = copy.deepcopy(first_buffer)
+    first_model._pp_feedback = (SimpleNamespace(wait=lambda: None), torch.full((2, 6), 100), old)
+    first_model.preprocess_batch(req_ids=["b"], model_intermediate_buffer=first_buffer)
+    assert first_buffer == before
+    assert first_model._pp_feedback is None
+    first_model._pp_feedback = (
+        SimpleNamespace(wait=lambda: None),
+        torch.full((1, 6), 100),
+        [("b", fresh["kimi_audio_generation"])],
+    )
     with pytest.raises(ValueError, match="out of sync"):
-        steps.runner.model.sync_pipeline_state(req_ids=["a", "b"], model_intermediate_buffer=first_buffer)
-
-
-def test_pp_runner_syncs_after_sampling_and_skips_idle_calls(steps, cpu_pp_group):
-    runner = steps.runner
-    events = []
-    runner.model.sync_pipeline_state = lambda **kwargs: events.append(("sync", kwargs["req_ids"]))
-    runner.input_batch = SimpleNamespace(req_ids=["request"])
-    runner.use_async_scheduling = False
-    runner.attach_omni_connector_output = lambda output: output
-    runner.kv_connector_output = None
-    runner.execute_model_state = None
-    cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = True, False
-    # No forward (e.g. a cleanup-only scheduler step) must not join a collective.
-    runner.sample_tokens(None)
-    assert events == []
-    runner._pp_model_state_pending = True
-    runner.sample_tokens(None)
-    assert events == [("sync", ["request"])]
-    runner.sample_tokens(None)
-    assert len(events) == 1
-
-    cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = False, True
-    runner.execute_model_state = (SimpleNamespace(),) + (None,) * 11
-
-    def sample(*args):
-        events.append(("sample", None))
-        return SimpleNamespace(sampled_token_ids=torch.tensor([[1]]))
-
-    class AfterSyncError(Exception):
-        pass
-
-    def stop_after_sync(*args):
-        raise AfterSyncError
-
-    runner._sample = sample
-    runner._update_states_after_model_execute = stop_after_sync
-    # Stop at the boundary under test; output building has separate coverage.
-    with pytest.raises(AfterSyncError):
-        runner.sample_tokens(None)
-    assert events[-2:] == [("sample", None), ("sync", ["request"])]
+        first_model.preprocess_batch(req_ids=["b"], model_intermediate_buffer=first_buffer)

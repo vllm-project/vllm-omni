@@ -4,7 +4,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -45,6 +45,11 @@ class CPUModelRuntime:
         )
         for name, value in defaults.items():
             self.model_config.__dict__.setdefault(name, value)
+        if not hasattr(self.model_config, "multimodal_config"):
+            self.model_config.multimodal_config = SimpleNamespace(skip_mm_profiling=False)
+            self.model_config.get_multimodal_config = MethodType(
+                lambda config: config.multimodal_config, self.model_config
+            )
 
 
 @pytest.fixture
@@ -64,11 +69,11 @@ def cpu_pp_group(monkeypatch):
     import vllm.distributed.parallel_state as parallel_state
     import vllm.model_executor.offloader as offloader
 
-    from vllm_omni.model_executor.models.kimi_audio import kimi_audio_ar_stage
+    from vllm_omni.model_executor.models.kimi_audio import kimi_audio, kimi_audio_ar_stage
 
     group = SimpleNamespace(world_size=1, rank_in_group=0, is_first_rank=True, is_last_rank=True)
     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
-    for module in (distributed, parallel_state, kimi_audio_ar_stage):
+    for module in (distributed, parallel_state, kimi_audio, kimi_audio_ar_stage):
         monkeypatch.setattr(module, "get_pp_group", lambda: group)
     monkeypatch.setattr(offloader, "get_offloader", lambda: SimpleNamespace(wrap_modules=list))
     return group

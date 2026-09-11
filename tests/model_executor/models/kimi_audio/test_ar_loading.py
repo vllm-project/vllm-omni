@@ -249,8 +249,11 @@ def test_pp_weights_belong_to_one_rank(ar_runtime, cpu_pp_group, monkeypatch):
     for rank, bounds in enumerate(expected_bounds):
         cpu_pp_group.rank_in_group = rank
         cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = rank == 0, rank == 2
+        runtime.config.model_config.multimodal_config.skip_mm_profiling = False
         model = KimiAudioForConditionalGeneration(vllm_config=runtime.config)
         stage = model.model
+        assert runtime.config.model_config.multimodal_config.skip_mm_profiling == (rank != 0)
+        assert stage.vllm_config.model_config.multimodal_config.skip_mm_profiling == (rank != 0)
         assert supports_pp(model)
         assert (stage.start_layer, stage.end_layer, stage.mimo_start_layer, stage.mimo_end_layer) == bounds
         assert isinstance(stage.embed_tokens, PPMissingLayer) == (rank != 0)

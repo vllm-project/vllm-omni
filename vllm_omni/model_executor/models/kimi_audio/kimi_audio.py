@@ -8,14 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
+from vllm.distributed import get_pp_group
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.sequence import IntermediateTensors
 
 from .processor import KimiAudioDummyInputsBuilder, KimiAudioMultiModalProcessor, KimiAudioProcessingInfo
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.sequence import IntermediateTensors
     from vllm.v1.sample.metadata import SamplingMetadata
 
     from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -45,6 +46,10 @@ class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
         model_prefix = maybe_prefix(prefix, "model")
 
         if self.model_stage == "kimi_audio_ar":
+            if not get_pp_group().is_first_rank:
+                # Only the input rank owns audio encoders. Set the worker's
+                # config before registry construction copies it for the child.
+                vllm_config.model_config.get_multimodal_config().skip_mm_profiling = True
             self.model = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=model_prefix,
@@ -63,9 +68,9 @@ class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
             ):
                 setattr(self, name, getattr(self.model, name))
             self.preprocess = self.model.preprocess
+            self.preprocess_batch = self.model.preprocess_batch
             self.make_omni_output = self.model.make_omni_output
             self.sample = self.model.sample
-            self.sync_pipeline_state = self.model.sync_pipeline_state
         elif self.model_stage == "kimi_audio_decoder":
             self.model = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -113,14 +118,21 @@ class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
         intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> "torch.Tensor | OmniOutput | IntermediateTensors":
-        return self.model(
+    ) -> "torch.Tensor | OmniOutput | tuple[torch.Tensor, ...]":
+        output = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
+        if isinstance(output, IntermediateTensors):
+            # The existing Omni warmup extracts the first tensor of a tuple.
+            # Keep every PP carrier as a flat tensor output, including under
+            # CUDA-graph replay. make_omni_output restores the native carrier
+            # outside forward, only for actual request execution.
+            return tuple(output.tensors.values())
+        return output
 
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: "SamplingMetadata | None" = None
