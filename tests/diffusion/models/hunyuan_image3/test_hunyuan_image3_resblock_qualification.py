@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -69,6 +71,31 @@ _CASES = (
 
 def _load_fused_op_modules() -> tuple[ModuleType, ...]:
     return tuple(importlib.import_module(name) for name in _FUSED_OP_MODULE_NAMES)
+
+
+@contextmanager
+def _strict_fp32_math(dtype: torch.dtype) -> Iterator[None]:
+    """Disable TF32 only while checking strict FP32 backend equivalence.
+
+    The NVIDIA block intentionally selects deterministic cuDNN convolution
+    algorithms while the native block uses the process defaults. On Ampere,
+    those paths can accumulate TF32 convolutions differently by roughly 1e-4,
+    obscuring the approximately 1e-6 difference from the fused normalization
+    kernels that this test is intended to qualify.
+    """
+    if dtype is not torch.float32:
+        yield
+        return
+
+    old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -173,7 +200,7 @@ def test_native_and_nvidia_resblocks_match(case: BlockCase, dtype: torch.dtype) 
     native, nvidia = _make_blocks(case, dtype)
     x, emb = _make_inputs(case, dtype)
 
-    with torch.inference_mode():
+    with _strict_fp32_math(dtype), torch.inference_mode():
         native_output = native(x, emb)
         nvidia_output = nvidia(x, emb)
         skip_output = native.skip_connection(x)

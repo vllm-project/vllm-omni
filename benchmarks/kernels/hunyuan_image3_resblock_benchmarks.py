@@ -8,6 +8,8 @@ import importlib
 import json
 import statistics
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
@@ -87,6 +89,24 @@ def _load_runtime_types() -> tuple[type[torch.nn.Module], type[torch.nn.Module],
 
 def _load_fused_op_modules() -> tuple[ModuleType, ...]:
     return tuple(importlib.import_module(name) for name in _FUSED_OP_MODULE_NAMES)
+
+
+@contextmanager
+def _strict_fp32_math(dtype: torch.dtype) -> Iterator[None]:
+    """Disable TF32 only for the strict output-equivalence check."""
+    if dtype is not torch.float32:
+        yield
+        return
+
+    old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
 
 
 def _require_triton_fused_ops() -> None:
@@ -220,12 +240,20 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
     native, nvidia, current_omni_platform = _make_blocks(case, dtype)
     x, emb = _make_inputs(case, dtype)
 
-    with torch.inference_mode():
-        native_output = native(x, emb)
-        nvidia_output = nvidia(x, emb)
+    timing_matmul_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    timing_cudnn_allow_tf32 = torch.backends.cudnn.allow_tf32
+    with _strict_fp32_math(dtype):
+        with torch.inference_mode():
+            native_output = native(x, emb)
+            nvidia_output = nvidia(x, emb)
     rtol, atol = _TOLERANCES[dtype]
     torch.testing.assert_close(nvidia_output, native_output, rtol=rtol, atol=atol)
     abs_diff = (nvidia_output.float() - native_output.float()).abs()
+
+    if torch.backends.cuda.matmul.allow_tf32 is not timing_matmul_allow_tf32:
+        raise RuntimeError("FP32 matmul policy was not restored before timing")
+    if torch.backends.cudnn.allow_tf32 is not timing_cudnn_allow_tf32:
+        raise RuntimeError("cuDNN TF32 policy was not restored before timing")
 
     timings = {"native": [], "nvidia": []}
     for sample_index in range(args.samples):
@@ -268,6 +296,9 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
         "samples": args.samples,
         "rtol": rtol,
         "atol": atol,
+        "correctness_tf32_disabled": dtype is torch.float32,
+        "timing_matmul_allow_tf32": timing_matmul_allow_tf32,
+        "timing_cudnn_allow_tf32": timing_cudnn_allow_tf32,
         "max_abs_diff": abs_diff.max().item(),
         "mean_abs_diff": abs_diff.mean().item(),
         "native_ms": native_summary,
