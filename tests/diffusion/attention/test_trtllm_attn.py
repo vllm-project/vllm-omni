@@ -13,7 +13,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
     PackedPaddingMetadata,
 )
-from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionImpl
+from vllm_omni.diffusion.attention.backends.trtllm_attn import (
+    TrtllmAttentionBackend,
+    TrtllmAttentionImpl,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
@@ -46,6 +49,10 @@ def _packed_padding(cu_seqlens_q, cu_seqlens_k, q_length, kv_length):
         cu_seqlens_q=cu_seqlens_q[:2],
         cu_seqlens_k=cu_seqlens_k[:2],
     )
+
+
+def test_backend_does_not_support_allgather_kv():
+    assert TrtllmAttentionBackend.supports_allgather_kv is False
 
 
 def test_skip_config_pure_resolution():

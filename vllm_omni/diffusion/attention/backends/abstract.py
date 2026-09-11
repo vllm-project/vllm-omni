@@ -14,6 +14,9 @@ class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
     accept_output_buffer: bool = False
+    # Whether the backend accepts local Q with globally gathered K/V, as used
+    # by AllGather-KV sequence parallelism.
+    supports_allgather_kv: bool = True
     supports_piecewise_spans: bool = False
     # A backend that supports this capability can consume the opaque paged-KV
     # context prepared by the diffusion Worker data plane.  Keeping the

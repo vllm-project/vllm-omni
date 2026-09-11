@@ -168,6 +168,7 @@ def _workspace_bytes() -> int:
 
 class TrtllmAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_allgather_kv: bool = False
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
