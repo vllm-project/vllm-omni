@@ -181,6 +181,8 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "refiner_packed_seq_params",
         "video_token_layout",
         "rope_table",
+        "control_rows",
+        "control_context_scale",
     }
 )
 
@@ -1180,6 +1182,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 for i in range(arch.num_layers)
             ]
         )
+        self.controlnet = None
+        if getattr(od_config, "controlnet_model_path", None):
+            from .controlnet import MiniMaxH3ControlNet
+
+            self.controlnet = MiniMaxH3ControlNet(arch)
         self.sp_prepare = MiniMaxH3SPPrepare()
         self.local_sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
@@ -1538,7 +1545,35 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_rope,
                 block_combined,
             )
-        for block in self.blocks:
+        control_rows = kwargs.get("control_rows")
+        control_scale = float(kwargs.get("control_context_scale", 1.0))
+        if not math.isfinite(control_scale) or control_scale < 0:
+            raise ValueError("control_context_scale must be finite and nonnegative")
+        hints = {}
+        if control_rows is not None and control_scale != 0:
+            if self.controlnet is None:
+                raise ValueError("Control request requires --controlnet-model-path")
+            if local_len != seq_len or hidden.shape[0] != seq_len or num_requests != 1:
+                raise ValueError("H3 control supports a single request without sequence parallelism")
+            # VideoX-Fun's control forward rounds the shared timestep embedding
+            # to the packed-stream dtype BEFORE AdaLN's SiLU. Both the control
+            # and main blocks, including the final head, consume this same
+            # embedding. Preserve Omni's FP32 baseline when control is bypassed.
+            t_emb = t_emb.to(hidden.dtype)
+            hints = self.controlnet(
+                hidden,
+                control_rows,
+                img_pos.to(device),
+                audio_pos.to(device),
+                t_emb=t_emb,
+                combined_indices=block_combined,
+                rope_table=block_rope,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=seq_len,
+                num_requests=num_requests,
+            )
+        for block_index, block in enumerate(self.blocks):
             hidden = block(
                 hidden,
                 t_emb=t_emb,
@@ -1551,6 +1586,8 @@ class MiniMaxH3DiTModel(nn.Module):
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
             )
+            if block_index in hints:
+                hidden = hidden + hints.pop(block_index) * control_scale
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
             video_logits, audio_logits = self.final_layer(

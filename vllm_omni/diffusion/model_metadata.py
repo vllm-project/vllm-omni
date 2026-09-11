@@ -46,6 +46,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
@@ -60,6 +61,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         final_output_type="video",
         attention_mask_free=True,
     ),

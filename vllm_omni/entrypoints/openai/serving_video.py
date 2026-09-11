@@ -30,7 +30,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
@@ -203,6 +203,48 @@ class OmniOpenAIServingVideo:
             get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
         )
         return capability is True or metadata_capability
+
+    @property
+    def is_minimax_h3(self) -> bool:
+        config = self._resolve_diffusion_od_config()
+        architectures = {getattr(config, "model_class_name", None)}
+        for stage in self.stage_configs or ():
+            get = stage.get if isinstance(stage, Mapping) else lambda key: getattr(stage, key, None)
+            engine_args = get("engine_args") or {}
+            architectures.add(get("model_arch"))
+            architectures.add(
+                engine_args.get("model_class_name")
+                if isinstance(engine_args, Mapping)
+                else getattr(engine_args, "model_class_name", None)
+            )
+        return bool(architectures & {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"})
+
+    @property
+    def controlnet_configured(self) -> bool:
+        """Whether the active model was started with a control checkpoint."""
+        config = self._resolve_diffusion_od_config()
+        if config is not None and hasattr(config, "controlnet_model_path"):
+            return bool(config.controlnet_model_path)
+        # Out-of-process clients expose only an architecture/capability view.
+        # Read the actual stage projection in that case, never request extras.
+        stages = self.stage_configs
+        if stages is None:
+            stages = getattr(self._engine_client, "stage_configs", None)
+        for stage in stages or []:
+            if get_stage_type(stage) != "diffusion":
+                continue
+            get = stage.get if isinstance(stage, Mapping) else lambda key: getattr(stage, key, None)
+            projection = get("diffusion_config")
+            if projection is None:
+                projection = get("engine_args") or {}
+            project_get = (
+                projection.get if isinstance(projection, Mapping) else lambda key: getattr(projection, key, None)
+            )
+            architecture = project_get("model_class_name") or get("model_arch")
+            if architecture not in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
+                return False
+            return bool(project_get("controlnet_model_path"))
+        return False
 
     @property
     def supported_control_upload_types(self) -> frozenset[str]:

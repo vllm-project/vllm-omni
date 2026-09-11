@@ -467,6 +467,12 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--controlnet-model-path",
+            type=str,
+            default=None,
+            help="Local original MiniMax H3 Fun ControlNet Union safetensors checkpoint.",
+        )
+        omni_config_group.add_argument(
             "--lora-path",
             type=str,
             nargs="+",
