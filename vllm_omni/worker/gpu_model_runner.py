@@ -842,7 +842,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             return None
 
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
+    def extract_multimodal_outputs(
+        self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput | IntermediateTensors
+    ) -> tuple[torch.Tensor | IntermediateTensors, dict | None]:
         if (
             hasattr(self.model, "have_multimodal_outputs")
             and self.model.have_multimodal_outputs
@@ -851,7 +853,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
 
-        elif isinstance(hidden_states, torch.Tensor):
+        elif isinstance(hidden_states, (torch.Tensor, IntermediateTensors)):
             text_hidden_states = hidden_states
             multimodal_outputs = {}
         elif isinstance(hidden_states, list) or isinstance(hidden_states, tuple):
@@ -860,6 +862,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         else:
             raise ValueError(f"Invalid hidden states type: {type(hidden_states)}")
         return text_hidden_states, multimodal_outputs
+
+    def profile_run(self) -> None:
+        # Decoder-only MM inputs are encoded on the first PP rank, as in
+        # _preprocess. Later ranks may not own any encoder weights at all.
+        supports_mm_inputs = self.supports_mm_inputs
+        if not get_pp_group().is_first_rank and not self.model_config.is_encoder_decoder:
+            self.supports_mm_inputs = False
+        try:
+            super().profile_run()
+        finally:
+            self.supports_mm_inputs = supports_mm_inputs
 
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Models loaded with load_format=dummy (e.g. MossTTSNano) may
@@ -1227,6 +1240,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
+        if isinstance(hidden_states, IntermediateTensors):
+            # Use the local carrier for non-last PP warmup. Only the last
+            # rank profiles the output heads/sampler.
+            hidden_states = hidden_states["hidden_states"]
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(hidden_states.device, non_blocking=True)
         return hidden_states, hidden_states[logit_indices_device]

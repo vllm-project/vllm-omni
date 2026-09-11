@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
+from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
+from vllm.multimodal import MULTIMODAL_REGISTRY
+
+from .processor import KimiAudioDummyInputsBuilder, KimiAudioMultiModalProcessor, KimiAudioProcessingInfo
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -17,7 +21,10 @@ if TYPE_CHECKING:
     from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 
-class KimiAudioForConditionalGeneration(nn.Module):
+@MULTIMODAL_REGISTRY.register_processor(
+    KimiAudioMultiModalProcessor, info=KimiAudioProcessingInfo, dummy_inputs=KimiAudioDummyInputsBuilder
+)
+class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
     """Construct only this worker's stage and expose its framework interfaces.
 
     The pipeline owns stage ordering and transport. The selected model owns
@@ -58,6 +65,7 @@ class KimiAudioForConditionalGeneration(nn.Module):
             self.preprocess = self.model.preprocess
             self.make_omni_output = self.model.make_omni_output
             self.sample = self.model.sample
+            self.sync_pipeline_state = self.model.sync_pipeline_state
         elif self.model_stage == "kimi_audio_decoder":
             self.model = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -72,11 +80,31 @@ class KimiAudioForConditionalGeneration(nn.Module):
 
         self.has_preprocess = self.model.has_preprocess
 
-    def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        """Framework embedding hook; AR's dual-stream fusion stays in preprocess."""
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> None:
+        # The message builder supplies token spans, not textual placeholders.
+        return None
+
+    def get_language_model(self) -> nn.Module:
+        return self.model
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> "IntermediateTensors":
+        # The acoustic stage still rejects PP > 1 during construction.
+        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
+
+    def embed_multimodal(self, **kwargs: Any):
         if self.model_stage == "kimi_audio_ar":
-            return self.model.embed_tokens(input_ids)
-        return self.model.embed_input_ids(input_ids, **kwargs)
+            return self.model.embed_multimodal(**kwargs)
+        return []
+
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, multimodal_embeddings=None, *, is_multimodal: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.model_stage == "kimi_audio_ar":
+            return self.model.embed_input_ids(input_ids, multimodal_embeddings, is_multimodal=is_multimodal)
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
@@ -85,7 +113,7 @@ class KimiAudioForConditionalGeneration(nn.Module):
         intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> "torch.Tensor | OmniOutput":
+    ) -> "torch.Tensor | OmniOutput | IntermediateTensors":
         return self.model(
             input_ids=input_ids,
             positions=positions,

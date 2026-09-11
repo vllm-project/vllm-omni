@@ -19,6 +19,7 @@ from vllm.model_executor import model_loader
 from vllm.model_executor.layers import layernorm, vocab_parallel_embedding
 from vllm.model_executor.models import qwen2
 
+from tests.model_executor.models.kimi_audio.runtime import cpu_pp_group as cpu_pp_group
 from tests.model_executor.models.kimi_audio.runtime import registered_model_runtime as registered_model_runtime
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio import KimiAudioForConditionalGeneration
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio_ar_stage import KimiAudioARStage, KimiAudioInputEncoder
@@ -230,3 +231,42 @@ def test_dual_stream_rejects_single_stream_prefix_hashing(ar_runtime):
     with pytest.raises(ValueError, match="enable_prefix_caching=False"):
         KimiAudioARStage(vllm_config=ar_runtime.config)
     assert ar_runtime.constructions == ar_runtime.loads == ar_runtime.downloads == []
+
+
+def test_pp_weights_belong_to_one_rank(ar_runtime, cpu_pp_group, monkeypatch):
+    from vllm.model_executor.models.interfaces import supports_pp
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    runtime = ar_runtime
+    cpu_pp_group.world_size = 3
+    runtime.config.parallel_config.pipeline_parallel_size = 3
+    runtime.config.parallel_config.distributed_executor_backend = "mp"
+    runtime.config.scheduler_config = SimpleNamespace(async_scheduling=False)
+    runtime.config.compilation_config = SimpleNamespace(pass_config=SimpleNamespace(enable_sp=False))
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "22,3,3")
+    owned = set()
+    expected_bounds = [(0, 22, 0, 0), (22, 25, 0, 3), (25, 28, 3, 6)]
+    for rank, bounds in enumerate(expected_bounds):
+        cpu_pp_group.rank_in_group = rank
+        cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = rank == 0, rank == 2
+        model = KimiAudioForConditionalGeneration(vllm_config=runtime.config)
+        stage = model.model
+        assert supports_pp(model)
+        assert (stage.start_layer, stage.end_layer, stage.mimo_start_layer, stage.mimo_end_layer) == bounds
+        assert isinstance(stage.embed_tokens, PPMissingLayer) == (rank != 0)
+        assert isinstance(stage.input_encoder, PPMissingLayer) == (rank != 0)
+        assert isinstance(stage.vq_adaptor, PPMissingLayer) == (rank != 0)
+        assert isinstance(stage.lm_head, PPMissingLayer) == (rank != 2)
+        assert isinstance(stage.mimo_output, PPMissingLayer) == (rank != 2)
+        loaded = model.load_weights(iter(runtime.weights.items()))
+        model_loader.DefaultModelLoader.track_weights_loading(None, model, loaded)
+        assert loaded == set(dict(model.named_parameters()))
+        assert not owned.intersection(loaded)
+        owned.update(loaded)
+    assert [kind for kind, _ in runtime.loads] == ["glm", "whisper"]
+    assert len(runtime.constructions) == 34
+    cpu_pp_group.world_size, cpu_pp_group.rank_in_group = 1, 0
+    cpu_pp_group.is_first_rank = cpu_pp_group.is_last_rank = True
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION")
+    whole = KimiAudioForConditionalGeneration(vllm_config=runtime.config)
+    assert owned == whole.load_weights(iter(runtime.weights.items()))

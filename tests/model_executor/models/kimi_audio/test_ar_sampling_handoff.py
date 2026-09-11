@@ -7,6 +7,7 @@ methods and scheduler stop checks execute here. Heads and hidden states are synt
 this does not start a GPU worker, attention kernels or an end-to-end engine.
 """
 
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.request import RequestStatus
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from tests.model_executor.models.kimi_audio.runtime import cpu_pp_group as cpu_pp_group
 from tests.model_executor.models.kimi_audio.runtime import registered_model_runtime as registered_model_runtime
 from vllm_omni.model_executor.models.kimi_audio.audio_processing import prepare_kimi_audio_inputs
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio import KimiAudioForConditionalGeneration
@@ -261,6 +263,20 @@ def steps(monkeypatch, registered_model_runtime):
 
 
 @torch.inference_mode()
+def test_profile_logits_do_not_leave_a_handoff_before_real_sampling(steps):
+    model, stage = steps.runner.model, steps.stage
+    for _ in range(2):
+        hidden = torch.rand(2, 2 * stage.config.hidden_size)
+        output = model.make_omni_output(hidden)
+        assert not output.multimodal_outputs
+        assert model.compute_logits(output.text_hidden_states).shape == (2, stage.config.vocab_size)
+        assert stage._sampling_context is None and stage._audio_logits is None
+    request = steps.add("after-profile", "text", SamplingParams(temperature=0, max_tokens=3))
+    steps.step(["after-profile"], [(0, len(request.prompt_token_ids))], [(1, 0)])
+    assert len(steps.runner.model_intermediate_buffer["after-profile"]["kimi_audio_generation"]["text_history"]) == 1
+
+
+@torch.inference_mode()
 def test_mixed_prefill_reorder_replay_and_native_stop(steps):
     a = steps.add("a", "both", SamplingParams(temperature=0, max_tokens=30, seed=7))
     b = steps.add("b", "text", SamplingParams(temperature=0, max_tokens=30), text="你好")
@@ -471,3 +487,94 @@ def test_missing_extra_args_channel_fails_explicitly(steps):
     with pytest.raises(ValueError, match="sampling_extra_args"):
         steps.step(["unconfigured"], [(0, len(req.prompt_token_ids))], [(1, 0)])
     assert not steps.state("unconfigured")["text_history"]
+
+
+@torch.inference_mode()
+def test_pp_feedback_preserves_request_identity_and_next_input(steps, cpu_pp_group):
+    a = steps.add("a", "both", SamplingParams(temperature=0, max_tokens=2, seed=7))
+    b = steps.add("b", "text", SamplingParams(temperature=0, max_tokens=8), text="你好")
+    pa, pb = len(a.prompt_token_ids), len(b.prompt_token_ids)
+    # Both ranks initialize metadata even for a partial prefill.
+    steps.step(["a", "b"], [(0, 1), (0, 1)], [(1, 0), (2, 0)])
+    first_buffer = copy.deepcopy(steps.runner.model_intermediate_buffer)
+    sent = None
+
+    def broadcast(update, src):
+        nonlocal sent
+        assert src == 1
+        if update is not None:
+            sent = copy.deepcopy(update)
+        return copy.deepcopy(sent)
+
+    cpu_pp_group.broadcast_object = broadcast
+    for spans in ([(1, pa - 1), (1, 1)], [(pa, 1), (2, pb - 2)]):
+        # Existing fixture exercises real Kimi sampling with synthetic heads.
+        cpu_pp_group.world_size = 1
+        cpu_pp_group.is_first_rank = cpu_pp_group.is_last_rank = True
+        steps.step(["a", "b"], spans, [(1, 0), (2, 0)])
+        cpu_pp_group.world_size = 2
+        cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = False, True
+        steps.runner.model.sync_pipeline_state(
+            req_ids=["a", "b"], model_intermediate_buffer=steps.runner.model_intermediate_buffer
+        )
+        cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = True, False
+        steps.runner.model.sync_pipeline_state(req_ids=["b", "a"], model_intermediate_buffer=first_buffer)
+        # Replaying a feedback payload must not duplicate accepted tokens.
+        steps.runner.model.sync_pipeline_state(req_ids=["a", "b"], model_intermediate_buffer=first_buffer)
+        for rid in ("a", "b"):
+            first = first_buffer[rid]["kimi_audio_generation"]
+            last = steps.state(rid)
+            for key in ("text_history", "audio_history", "scheduler_history", "text_finished", "finished"):
+                assert first[key] == last[key]
+        if not first_buffer["a"]["kimi_audio_generation"]["finished"]:
+            state = steps.state("a")
+            info = dict(first_buffer["a"], _omni_is_prefill=False, _omni_num_computed_tokens=pa)
+            _, embedding, _ = steps.stage.preprocess(torch.tensor([state["scheduler_history"][-1]]), None, **info)
+            expected = steps.stage.embed_tokens(torch.tensor([state["text_history"][-1]]))
+            expected += steps.stage.embed_tokens(torch.tensor([state["audio_history"][-1]]))
+            torch.testing.assert_close(embedding, expected)
+    assert first_buffer["a"]["kimi_audio_generation"]["finished"]
+    assert len(first_buffer["b"]["kimi_audio_generation"]["scheduler_history"]) == 1
+    sent["a"] = (100, *sent["a"][1:])
+    with pytest.raises(ValueError, match="out of sync"):
+        steps.runner.model.sync_pipeline_state(req_ids=["a", "b"], model_intermediate_buffer=first_buffer)
+
+
+def test_pp_runner_syncs_after_sampling_and_skips_idle_calls(steps, cpu_pp_group):
+    runner = steps.runner
+    events = []
+    runner.model.sync_pipeline_state = lambda **kwargs: events.append(("sync", kwargs["req_ids"]))
+    runner.input_batch = SimpleNamespace(req_ids=["request"])
+    runner.use_async_scheduling = False
+    runner.attach_omni_connector_output = lambda output: output
+    runner.kv_connector_output = None
+    runner.execute_model_state = None
+    cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = True, False
+    # No forward (e.g. a cleanup-only scheduler step) must not join a collective.
+    runner.sample_tokens(None)
+    assert events == []
+    runner._pp_model_state_pending = True
+    runner.sample_tokens(None)
+    assert events == [("sync", ["request"])]
+    runner.sample_tokens(None)
+    assert len(events) == 1
+
+    cpu_pp_group.is_first_rank, cpu_pp_group.is_last_rank = False, True
+    runner.execute_model_state = (SimpleNamespace(),) + (None,) * 11
+
+    def sample(*args):
+        events.append(("sample", None))
+        return SimpleNamespace(sampled_token_ids=torch.tensor([[1]]))
+
+    class AfterSyncError(Exception):
+        pass
+
+    def stop_after_sync(*args):
+        raise AfterSyncError
+
+    runner._sample = sample
+    runner._update_states_after_model_execute = stop_after_sync
+    # Stop at the boundary under test; output building has separate coverage.
+    with pytest.raises(AfterSyncError):
+        runner.sample_tokens(None)
+    assert events[-2:] == [("sample", None), ("sync", ["request"])]

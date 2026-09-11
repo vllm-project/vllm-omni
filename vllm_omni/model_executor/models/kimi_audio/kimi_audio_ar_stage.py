@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Kimi-Audio dual-stream AR forward, weight loading, and input encoding.
-
-Worker registration and downstream audio output are still pending.
-"""
+"""Kimi-Audio dual-stream AR forward, weight loading, and input encoding."""
 
 from collections.abc import Iterable
 from pathlib import Path
@@ -12,6 +9,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from vllm.distributed import get_pp_group
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.sequence import IntermediateTensors
 
 from .audio_processing import CHUNK_SAMPLES, SAMPLE_RATE, SAMPLES_PER_TOKEN, KimiAudioWhisperInputs
 from .prompt import KimiAudioEncodedAudio, KimiAudioSpecialTokens
@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from transformers import WhisperFeatureExtractor
     from vllm.config import VllmConfig
     from vllm.model_executor.models.kimi_audio import KimiAudioWhisperEncoder
-    from vllm.sequence import IntermediateTensors
     from vllm.v1.outputs import SamplerOutput
     from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -236,12 +235,12 @@ class KimiAudioInputEncoder(torch.nn.Module):
         return KimiAudioEncodedAudio(codes=codes, continuous_features=continuous_features)
 
 
-class KimiAudioARStage(torch.nn.Module):
+class KimiAudioARStage(torch.nn.Module, SupportsPP):
     """Own both output branches and load all three input/model checkpoints.
 
     Decoder layers use vLLM's Qwen2 implementation and follow Kimi's shared
-    trunk and text/audio branches. This is stage 0 of the Kimi-Audio pipeline;
-    pipeline parallel partitioning is pending.
+    trunk and text/audio branches. PP partitions the 28 decoder depths: after
+    the shared trunk, each depth owns both its text and audio decoder layer.
 
     ``additional_config["kimi_audio"]["glm_tokenizer_path"]`` can point to an
     existing local GLM snapshot; otherwise loading resolves the pinned source.
@@ -269,10 +268,17 @@ class KimiAudioARStage(torch.nn.Module):
         from vllm.model_executor.layers.logits_processor import LogitsProcessor
         from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
         from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
-        from vllm.model_executor.models.utils import maybe_prefix
+        from vllm.model_executor.models.utils import PPMissingLayer, make_layers, maybe_prefix
+        from vllm.model_executor.offloader import get_offloader
 
-        if vllm_config.parallel_config.pipeline_parallel_size != 1:
-            raise ValueError("Kimi-Audio dual-stream pipeline parallel partitioning is not implemented")
+        pp = get_pp_group()
+        if pp.world_size > 1:
+            if vllm_config.scheduler_config.async_scheduling:
+                raise ValueError("Kimi-Audio PP currently requires async_scheduling=False")
+            if vllm_config.parallel_config.distributed_executor_backend != "mp":
+                raise ValueError("Kimi-Audio PP currently requires distributed_executor_backend='mp'")
+            if vllm_config.compilation_config.pass_config.enable_sp:
+                raise ValueError("Kimi-Audio dual-stream PP does not support sequence parallel residuals")
         if getattr(vllm_config, "speculative_config", None) is not None:
             raise ValueError("Kimi-Audio dual-stream speculative decoding is not implemented")
         if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
@@ -289,49 +295,72 @@ class KimiAudioARStage(torch.nn.Module):
             raise ValueError("Kimi-Audio requires a valid shared branch point and audio decoder layers")
         if config.tie_word_embeddings:
             raise ValueError("Kimi-Audio expects separate embedding, text head, and audio head weights")
+        if config.kimia_mimo_layers != config.num_hidden_layers - self.branch_layer - 1:
+            raise ValueError("Kimi-Audio requires matching text/audio branch depths")
 
         # Normalize the original HF config to Qwen2's current RoPE fields without
         # changing the Kimi config held by the worker.
         decoder_config = Qwen2Config(**config.to_dict())
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+            if pp.is_first_rank
+            else PPMissingLayer()
         )
-        self.layers = torch.nn.ModuleList(
-            Qwen2DecoderLayer(
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: Qwen2DecoderLayer(
                 config=decoder_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, f"layers.{index}"),
-            )
-            for index in range(config.num_hidden_layers)
+                prefix=prefix,
+            ),
+            prefix=maybe_prefix(prefix, "layers"),
         )
+        if self.start_layer == self.end_layer:
+            raise ValueError("Kimi-Audio PP requires at least one decoder depth per rank")
+        self.mimo_start_layer = max(0, self.start_layer - self.branch_layer - 1)
+        self.mimo_end_layer = max(0, self.end_layer - self.branch_layer - 1)
         self.mimo_layers = torch.nn.ModuleList(
-            Qwen2DecoderLayer(
-                config=decoder_config,
-                cache_config=vllm_config.cache_config,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, f"mimo_layers.{index}"),
+            [PPMissingLayer() for _ in range(self.mimo_start_layer)]
+            + get_offloader().wrap_modules(
+                Qwen2DecoderLayer(
+                    config=decoder_config,
+                    cache_config=vllm_config.cache_config,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, f"mimo_layers.{index}"),
+                )
+                for index in range(self.mimo_start_layer, self.mimo_end_layer)
             )
-            for index in range(config.kimia_mimo_layers)
+            + [PPMissingLayer() for _ in range(self.mimo_end_layer, config.kimia_mimo_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mimo_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if pp.is_last_rank else PPMissingLayer()
+        self.mimo_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if pp.is_last_rank else PPMissingLayer()
         # Both checkpoint heads span the FULL vocabulary. Official inference
         # also samples their full logits; do not slice by *_output_vocab.
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
+        self.lm_head = (
+            ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if pp.is_last_rank
+            else PPMissingLayer()
         )
-        self.mimo_output = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "mimo_output"),
+        self.mimo_output = (
+            ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "mimo_output"),
+            )
+            if pp.is_last_rank
+            else PPMissingLayer()
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         # Ephemeral handoff for ONE execute_model -> sample_tokens call. The
@@ -340,16 +369,32 @@ class KimiAudioARStage(torch.nn.Module):
         self._audio_logits = None
         if config.use_whisper_feature:
             # Preserve official VQAdaptor indices, SiLU, and LayerNorm epsilon.
-            self.vq_adaptor = torch.nn.Sequential(
-                torch.nn.Linear(config.kimia_adaptor_input_dim, config.hidden_size),
-                torch.nn.SiLU(),
-                torch.nn.Dropout(0.0),
-                torch.nn.Linear(config.hidden_size, config.hidden_size),
-                torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps),
+            self.vq_adaptor = (
+                torch.nn.Sequential(
+                    torch.nn.Linear(config.kimia_adaptor_input_dim, config.hidden_size),
+                    torch.nn.SiLU(),
+                    torch.nn.Dropout(0.0),
+                    torch.nn.Linear(config.hidden_size, config.hidden_size),
+                    torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps),
+                )
+                if pp.is_first_rank
+                else PPMissingLayer()
             )
-        self.input_encoder = KimiAudioInputEncoder(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "input_encoder")
+        self.input_encoder = (
+            KimiAudioInputEncoder(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "input_encoder"))
+            if pp.is_first_rank
+            else PPMissingLayer()
         )
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        from vllm.model_executor.models.utils import make_empty_intermediate_tensors_factory
+
+        keys = ["hidden_states", "residual"]
+        if self.start_layer > self.branch_layer:
+            keys += ["mimo_hidden_states", "mimo_residual"]
+        return make_empty_intermediate_tensors_factory(keys, self.config.hidden_size)(batch_size, dtype, device)
 
     def forward(
         self,
@@ -358,7 +403,7 @@ class KimiAudioARStage(torch.nn.Module):
         intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors:
         """Run the shared trunk and both branches on already-fused embeddings.
 
         Return [num_tokens, 2 * hidden_size], ordered [text | audio], so the
@@ -366,22 +411,29 @@ class KimiAudioARStage(torch.nn.Module):
         Each vLLM attention layer owns its framework-managed KV-cache binding;
         this method neither creates a cache nor runs a generation loop.
         """
-        if intermediate_tensors is not None:
-            raise ValueError("Kimi-Audio dual-stream pipeline parallel partitioning is not implemented")
-        if inputs_embeds is None:
-            raise ValueError("Kimi-Audio forward requires fused text/audio inputs_embeds from preprocess")
+        pp = get_pp_group()
+        mimo_hidden_states = mimo_residual = None
+        if pp.is_first_rank:
+            if inputs_embeds is None:
+                raise ValueError("Kimi-Audio forward requires fused text/audio inputs_embeds from preprocess")
+            hidden_states, residual = inputs_embeds, None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+            if self.start_layer > self.branch_layer:
+                mimo_hidden_states = intermediate_tensors["mimo_hidden_states"]
+                mimo_residual = intermediate_tensors["mimo_residual"]
         if (
-            inputs_embeds.ndim != 2
-            or inputs_embeds.shape[1] != self.config.hidden_size
+            hidden_states.ndim != 2
+            or hidden_states.shape[1] != self.config.hidden_size
             or positions.ndim != 1
-            or positions.shape[0] != inputs_embeds.shape[0]
+            or positions.shape[0] != hidden_states.shape[0]
         ):
             raise ValueError("Kimi-Audio expects [num_tokens, hidden_size] embeddings and matching 1D positions")
 
-        hidden_states = inputs_embeds
-        residual = None
-        mimo_hidden_states = mimo_residual = None
-        for index, layer in enumerate(self.layers):
+        for index in range(self.start_layer, self.end_layer):
+            layer = self.layers[index]
             hidden_states, residual = layer(positions, hidden_states, residual)
             if index == self.branch_layer:
                 # The official model clones the completed layer output here.
@@ -390,17 +442,28 @@ class KimiAudioARStage(torch.nn.Module):
                 mimo_hidden_states = hidden_states.clone()
                 mimo_residual = residual.clone()
 
+        for index in range(self.mimo_start_layer, self.mimo_end_layer):
+            layer = self.mimo_layers[index]
+            assert mimo_hidden_states is not None and mimo_residual is not None
+            mimo_hidden_states, mimo_residual = layer(positions, mimo_hidden_states, mimo_residual)
+        if not pp.is_last_rank:
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if mimo_hidden_states is not None:
+                tensors.update(mimo_hidden_states=mimo_hidden_states, mimo_residual=mimo_residual)
+            return IntermediateTensors(tensors)
         hidden_states, _ = self.norm(hidden_states, residual)
         assert mimo_hidden_states is not None and mimo_residual is not None
-        for layer in self.mimo_layers:
-            mimo_hidden_states, mimo_residual = layer(positions, mimo_hidden_states, mimo_residual)
         mimo_hidden_states, _ = self.mimo_norm(mimo_hidden_states, mimo_residual)
         return torch.cat((hidden_states, mimo_hidden_states), dim=-1)
 
-    def make_omni_output(self, model_outputs: torch.Tensor, **kwargs: Any) -> "OmniOutput":
+    def make_omni_output(
+        self, model_outputs: torch.Tensor | IntermediateTensors, **kwargs: Any
+    ) -> "OmniOutput | IntermediateTensors":
         """Bind request context outside the compiled/CUDA-graph forward."""
         from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+        if isinstance(model_outputs, IntermediateTensors):
+            return model_outputs
         infos = kwargs.get("model_intermediate_buffer")
         if not infos:
             return OmniOutput(text_hidden_states=model_outputs)
@@ -458,7 +521,11 @@ class KimiAudioARStage(torch.nn.Module):
         if text_logits is None or audio_logits is None:
             self._sampling_context = None
             return None
-        self._audio_logits = audio_logits
+        # Native sampler profiling calls compute_logits without a request
+        # handoff and uses its own sampler. Exercise both heads for peak memory,
+        # but do not leave audio logits pending for the first real request.
+        if self._sampling_context is not None:
+            self._audio_logits = audio_logits
         return text_logits
 
     def sample(self, logits: torch.Tensor, sampling_metadata: "SamplingMetadata") -> "SamplerOutput":
@@ -547,6 +614,47 @@ class KimiAudioARStage(torch.nn.Module):
             logprobs_tensors=None,
         )
 
+    def sync_pipeline_state(self, *, req_ids: list[str], model_intermediate_buffer: dict[str, dict]) -> None:
+        """Return accepted dual-stream IDs to input ranks after PP sampling.
+
+        The scheduler transports only blank/end IDs. Broadcast one accepted
+        step per request using the PP group's CPU metadata channel, preserving
+        request identity if local batch rows differ. Histories remain owned by
+        runner request buffers; RNG and sampling stay on the last rank.
+        """
+        pp = get_pp_group()
+        if pp.world_size == 1:
+            return
+        updates = None
+        if pp.is_last_rank:
+            updates = {}
+            for req_id in req_ids:
+                state = model_intermediate_buffer[req_id]["kimi_audio_generation"]
+                count = len(state["scheduler_history"])
+                updates[req_id] = (
+                    count,
+                    state["text_history"][-1] if count else None,
+                    state["audio_history"][-1] if count else None,
+                    state["scheduler_history"][-1] if count else None,
+                    state["text_finished"],
+                    state["finished"],
+                )
+        updates = pp.broadcast_object(updates, src=pp.world_size - 1)
+        if pp.is_last_rank:
+            return
+        if set(updates) != set(req_ids):
+            raise ValueError("Kimi-Audio PP ranks have different sampling requests")
+        for req_id, (count, text, audio, scheduler_token, text_finished, finished) in updates.items():
+            state = model_intermediate_buffer[req_id]["kimi_audio_generation"]
+            local_count = len(state["scheduler_history"])
+            if count == local_count + 1:
+                state["text_history"].append(text)
+                state["audio_history"].append(audio)
+                state["scheduler_history"].append(scheduler_token)
+            elif count != local_count:
+                raise ValueError("Kimi-Audio PP dual-stream history is out of sync")
+            state["text_finished"], state["finished"] = text_finished, finished
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         from vllm.model_executor.models.qwen2 import Qwen2Model
         from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -558,6 +666,8 @@ class KimiAudioARStage(torch.nn.Module):
             orig_to_new_suffix={".rotary_emb.inv_freq": None},
         )
         loaded = AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
+        if not get_pp_group().is_first_rank:
+            return loaded
 
         settings = self.vllm_config.additional_config.get("kimi_audio", {})
         tokenizer_path = settings.get("glm_tokenizer_path")
@@ -579,18 +689,57 @@ class KimiAudioARStage(torch.nn.Module):
         return loaded
 
     @torch.inference_mode()
+    def embed_multimodal(self, **kwargs: Any) -> list[torch.Tensor]:
+        """Encode actual audio items for the framework's encoder cache."""
+        waveforms = kwargs.get("kimi_waveform", [])
+        features = kwargs.get("kimi_whisper_features", [])
+        lengths = kwargs.get("kimi_whisper_lengths", [])
+        embeddings = []
+        for waveform, mel, token_lengths in zip(waveforms, features, lengths, strict=True):
+            whisper = KimiAudioWhisperInputs(mel, tuple(token_lengths.tolist())) if token_lengths.numel() else None
+            encoded = self.input_encoder.encode_audio(
+                waveform.numpy(), sampling_rate=SAMPLE_RATE, whisper_inputs=whisper
+            )
+            count = (waveform.numel() - 1) // SAMPLES_PER_TOKEN + 1
+            if len(encoded.codes) != count:
+                raise ValueError("Kimi-Audio encoder output does not fill its reserved token span")
+            if any(not 0 <= code < self.config.vocab_size - self.config.kimia_token_offset for code in encoded.codes):
+                raise ValueError("Expected raw GLM codebook IDs before applying the Kimi offset")
+            codes = torch.tensor(encoded.codes, device=self.embed_tokens.weight.device, dtype=torch.long)
+            audio = self.embed_tokens(codes + self.config.kimia_token_offset)
+            if whisper is not None:
+                if encoded.continuous_features is None or encoded.continuous_features.shape != (
+                    count,
+                    self.config.kimia_adaptor_input_dim,
+                ):
+                    raise ValueError("Kimi-Audio continuous features do not match the audio span")
+                continuous = encoded.continuous_features.to(device=audio.device, dtype=audio.dtype)
+                audio = (audio + self.vq_adaptor(continuous)) * audio.new_tensor(2.0).sqrt()
+            embeddings.append(audio)
+        return embeddings
+
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, multimodal_embeddings=None, *, is_multimodal: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        inputs_embeds = self.embed_tokens(input_ids)
+        if multimodal_embeddings is not None and len(multimodal_embeddings):
+            inputs_embeds = _merge_multimodal_embeddings(inputs_embeds, multimodal_embeddings, is_multimodal)
+        return inputs_embeds
+
+    @torch.inference_mode()
     def preprocess(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Prepare a scheduled span from prompt embeddings or accepted dual IDs.
+        """Add aligned text to native audio embeddings, or replay accepted IDs.
 
-        Full embeddings are cached in the runner's per-request buffer, never
-        on the model instance. Absolute scheduler offsets also handle replay
-        and one-token prefill tails. Replay can cross from the prompt into
-        already generated tokens without advancing either stream's history.
+        The framework owns audio embedding caching and scheduled slices.
+        Absolute offsets also handle one-token prefill tails and replay across
+        the prompt/generation boundary without advancing either history.
         """
         import msgspec
 
@@ -607,68 +756,23 @@ class KimiAudioARStage(torch.nn.Module):
         if input_ids.ndim != 1 or not 0 <= offset < end <= prompt_len + generated_len:
             raise ValueError("Invalid Kimi-Audio scheduled input span")
 
-        cached_embeds = info_dict.get("embed", {}).get("prefill")
-        cached_ids = info_dict.get("ids", {}).get("prompt")
+        payload = info_dict.get("kimi_audio_prompt")
         update = {}
-        if cached_embeds is None and cached_ids is None:
+        if payload is None:
             wire = info_dict.get("kimi_audio_input")
             if wire is None:
                 raise ValueError("Missing Kimi-Audio prepared input; use prepare_kimi_audio_inputs")
             payload = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
-            audio_ids = list(payload["audio_token_ids"])
+            audio_ids = payload["audio_token_ids"]
             text_ids = payload["text_token_ids"]
-            continuous = payload["is_continuous_mask"]
-            if not len(audio_ids) == len(text_ids) == len(continuous) == prompt_len:
+            if not len(audio_ids) == len(text_ids) == prompt_len:
                 raise ValueError("Kimi-Audio prepared input length differs from the scheduled prompt")
-            if input_ids.tolist() != audio_ids[offset:end]:
-                raise ValueError("Kimi-Audio scheduled IDs do not match the prepared prompt")
-
-            features = []
             last_end = 0
-            for index, start, stop in payload["audio_spans"]:
+            for _, start, stop in payload["audio_spans"]:
                 if not last_end <= start < stop <= prompt_len:
                     raise ValueError("Invalid or overlapping Kimi-Audio audio spans")
                 last_end = stop
-                whisper_inputs = None
-                if f"whisper_features_{index}" in payload:
-                    whisper_inputs = KimiAudioWhisperInputs(
-                        payload[f"whisper_features_{index}"], tuple(payload[f"whisper_lengths_{index}"])
-                    )
-                if continuous[start:stop] != [whisper_inputs is not None] * (stop - start):
-                    raise ValueError("Kimi-Audio continuous mask does not match the audio span")
-                encoded = self.input_encoder.encode_audio(
-                    payload[f"waveform_{index}"].numpy(), sampling_rate=SAMPLE_RATE, whisper_inputs=whisper_inputs
-                )
-                if len(encoded.codes) != stop - start:
-                    raise ValueError("Kimi-Audio encoder output does not fill its reserved token span")
-                if any(
-                    not 0 <= code < self.config.vocab_size - self.config.kimia_token_offset for code in encoded.codes
-                ):
-                    raise ValueError("Expected raw GLM codebook IDs before applying the Kimi offset")
-                audio_ids[start:stop] = [code + self.config.kimia_token_offset for code in encoded.codes]
-                if whisper_inputs is not None:
-                    if encoded.continuous_features is None:
-                        raise ValueError("Missing Kimi-Audio continuous features")
-                    features.append(encoded.continuous_features)
-
-            device = input_ids.device
-            audio_embeds = self.embed_tokens(torch.tensor(audio_ids, device=device, dtype=torch.long))
-            if features:
-                mask = torch.tensor(continuous, device=device, dtype=torch.bool)
-                whisper = torch.cat(features).to(device=device, dtype=audio_embeds.dtype)
-                if whisper.shape != (sum(continuous), self.config.kimia_adaptor_input_dim):
-                    raise ValueError("Kimi-Audio continuous features do not match the prompt mask")
-                # Official fusion: only continuous audio positions receive the
-                # projected Whisper feature and sqrt(2); then add text embeds.
-                audio_embeds[mask] = (audio_embeds[mask] + self.vq_adaptor(whisper)) * audio_embeds.new_tensor(
-                    2.0
-                ).sqrt()
-            elif any(continuous):
-                raise ValueError("Kimi-Audio continuous positions have no features")
-            full_embeds = audio_embeds + self.embed_tokens(torch.tensor(text_ids, device=device, dtype=torch.long))
-            cached_embeds = full_embeds.detach().to("cpu").contiguous()
-            cached_ids = audio_ids
-            update = {"embed": {"prefill": cached_embeds}, "ids": {"prompt": cached_ids}}
+            update["kimi_audio_prompt"] = payload
             if generation is None:
                 KimiAudioSpecialTokens(**payload["special_tokens"])
                 if any(not 0 <= value < self.config.vocab_size for value in payload["special_tokens"].values()):
@@ -689,23 +793,34 @@ class KimiAudioARStage(torch.nn.Module):
                 }
                 update["kimi_audio_generation"] = generation
 
-        if (
-            not isinstance(cached_embeds, torch.Tensor)
-            or cached_embeds.shape != (prompt_len, self.config.hidden_size)
-            or not isinstance(cached_ids, list)
-            or len(cached_ids) != prompt_len
-        ):
-            raise ValueError("Incomplete Kimi-Audio prefill cache")
         if generation is None or not (
             len(generation["text_history"]) == len(generation["audio_history"]) == len(generation["scheduler_history"])
         ):
             raise ValueError("Incomplete Kimi-Audio dual-stream history")
 
+        if not get_pp_group().is_first_rank:
+            # Other PP ranks consume hidden states, but still initialize their
+            # request metadata. Only the last rank owns sampling/RNG state.
+            assert input_embeds is not None
+            return input_ids, input_embeds, update
+
         ids, embeds = [], []
         if offset < prompt_len:
             stop = min(end, prompt_len)
-            ids.extend(cached_ids[offset:stop])
-            embeds.append(cached_embeds[offset:stop].to(device=input_ids.device))
+            prompt_ids = payload["audio_token_ids"][offset:stop]
+            if input_ids[: stop - offset].tolist() != prompt_ids:
+                raise ValueError("Kimi-Audio scheduled IDs do not match the prepared prompt")
+            # With audio disabled, Omni may pass an uninitialized embedding
+            # buffer to preprocess. Text-only prompts need no MM cache values.
+            if input_embeds is None or not payload["audio_spans"]:
+                if any(start < stop and span_end > offset for _, start, span_end in payload["audio_spans"]):
+                    raise ValueError("Kimi-Audio audio spans require native multimodal embeddings")
+                audio = self.embed_tokens(input_ids[: stop - offset])
+            else:
+                audio = input_embeds[: stop - offset]
+            text = torch.tensor(payload["text_token_ids"][offset:stop], device=input_ids.device, dtype=torch.long)
+            ids.extend(prompt_ids)
+            embeds.append(audio + self.embed_tokens(text))
         if end > prompt_len:
             start, stop = max(0, offset - prompt_len), end - prompt_len
             scheduled = input_ids[max(0, prompt_len - offset) :].tolist()

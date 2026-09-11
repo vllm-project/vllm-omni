@@ -1288,6 +1288,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    self._pp_model_state_pending = True
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -1994,6 +1995,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
+        sync_pipeline_state = getattr(self.model, "sync_pipeline_state", None)
 
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
@@ -2001,6 +2003,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
+            pp_state_pending = getattr(self, "_pp_model_state_pending", False)
+            self._pp_model_state_pending = False
+            if pp_state_pending and callable(sync_pipeline_state):
+                sync_pipeline_state(
+                    req_ids=self.input_batch.req_ids, model_intermediate_buffer=self.model_intermediate_buffer
+                )
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             return self.attach_omni_connector_output(
@@ -2048,6 +2056,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # All PP ranks participate after forward transport has completed.
+        # Models with coupled output streams can return their accepted state
+        # to input ranks without changing the scheduler's token representation.
+        if callable(sync_pipeline_state):
+            sync_pipeline_state(
+                req_ids=self.input_batch.req_ids, model_intermediate_buffer=self.model_intermediate_buffer
+            )
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         self._draft_token_ids = None

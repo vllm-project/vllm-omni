@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU request transport and prefill boundaries, with substituted encoders.
 
-Official prompt fixtures supply expected IDs/positions. Real HF mel extraction,
-Omni payload serialization, and the AR preprocess method execute here. Neural
-audio encoding and the distributed AR network are not exercised by this file.
+Official prompt fixtures supply expected IDs/positions. HF mel extraction,
+native MM processing/embedding merge, Omni layout serialization and AR
+preprocess execute here. Neural encoders and GPU scheduling are substituted.
 """
 
 import copy
@@ -18,7 +18,10 @@ import numpy as np
 import pytest
 import torch
 from transformers import WhisperFeatureExtractor
+from vllm.multimodal.processing import ProcessorInputs, TimingContext
 
+from tests.model_executor.models.kimi_audio.runtime import cpu_pp_group as cpu_pp_group
+from tests.model_executor.models.kimi_audio.runtime import kimi_mm_processor as kimi_mm_processor
 from vllm_omni.model_executor.models.kimi_audio.audio_processing import prepare_kimi_audio_inputs
 from vllm_omni.model_executor.models.kimi_audio.kimi_audio_ar_stage import KimiAudioARStage, KimiAudioInputEncoder
 from vllm_omni.model_executor.models.kimi_audio.prompt import (
@@ -32,12 +35,13 @@ REFERENCE = json.loads((Path(__file__).parent / "fixtures/prompt_reference.json"
 
 
 @pytest.fixture
-def handoff_runtime(monkeypatch):
+def handoff_runtime(monkeypatch, kimi_mm_processor):
     config = REFERENCE["input_config"]
     builder = KimiAudioPromptBuilder(
         REFERENCE["text_tokens"].__getitem__, KimiAudioSpecialTokens.from_vocab(REFERENCE["special_tokens"]), **config
     )
     runtime = SimpleNamespace(builder=builder, extractor=WhisperFeatureExtractor(feature_size=128), calls=[])
+    runtime.processor = kimi_mm_processor(offset=config["audio_token_offset"])
     # AR construction/loading is tested separately. Here CPU embeddings and a
     # small linear projection make the stream fusion independently inspectable.
     stage = KimiAudioARStage.__new__(KimiAudioARStage)
@@ -101,22 +105,47 @@ def test_request_roundtrip_and_chunked_prefill_match_official_layout(handoff_run
     )
     assert runtime.calls == []
     assert messages == case["messages"]
-    # Generic dict IPC has no tensor type annotations. The complete request
-    # must survive plain MessagePack without any custom object/pickle support.
-    restored = msgspec.msgpack.decode(msgspec.msgpack.encode(prepared))
-    assert restored == prepared
+    # Only layout/state uses the Omni dict IPC boundary. Audio fields pass
+    # through native MM processing and batching before worker-side encoding.
+    restored = msgspec.msgpack.decode(msgspec.msgpack.encode(prepared["model_intermediate_buffer"]))
+    assert restored == prepared["model_intermediate_buffer"]
     for waveform in audios.values():
         waveform[:] = -99  # queued bytes and cache salt must be independent
-    info = restored["model_intermediate_buffer"]
+    info = restored
+    processor = runtime.processor
+    processed = processor.apply(
+        ProcessorInputs(
+            prepared["prompt_token_ids"], processor.info.parse_mm_data(prepared.get("multi_modal_data", {}))
+        ),
+        TimingContext(enabled=False),
+    )
+    assert processed["prompt_token_ids"] == prepared["prompt_token_ids"]
+    ranges = processed["mm_placeholders"].get("audio", [])
+    with torch.inference_mode():
+        audio_embeddings = runtime.stage.embed_multimodal(**processed["mm_kwargs"].get_data())
     size = len(prepared["prompt_token_ids"])
     placeholders = torch.tensor(prepared["prompt_token_ids"])
     boundaries = sorted({0, 1, size - 1, size})
     chunks = list(zip(boundaries, boundaries[1:]))
     actual_ids, actual_embeds = [], []
+
+    def scheduled_embeddings(start, end):
+        # Supply the cached encoder slices selected by a scheduled span. The
+        # actual processor ranges and native embedding merge execute here;
+        # this CPU test does not construct a scheduler or GPU encoder cache.
+        mask = torch.zeros(end - start, dtype=torch.bool)
+        slices = []
+        for pos, embedding in zip(ranges, audio_embeddings, strict=True):
+            left, right = max(start, pos.offset), min(end, pos.offset + pos.length)
+            if left < right:
+                mask[left - start : right - start] = True
+                slices.append(embedding[left - pos.offset : right - pos.offset])
+        return runtime.stage.embed_input_ids(placeholders[start:end], slices, is_multimodal=mask)
+
     for start, end in chunks:
         ids, embeds, update = runtime.stage.preprocess(
             placeholders[start:end],
-            None,
+            scheduled_embeddings(start, end),
             **info,
             _omni_is_prefill=True,
             _omni_num_computed_tokens=start,
@@ -125,7 +154,10 @@ def test_request_roundtrip_and_chunked_prefill_match_official_layout(handoff_run
         info.update(update)
         actual_ids.extend(ids.tolist())
         actual_embeds.append(embeds)
-    assert actual_ids == case["audio_token_ids"]
+    # Scheduler IDs remain placeholders; actual code embeddings are in the
+    # native MM cache and must match the official fully fused prompt below.
+    assert actual_ids == prepared["prompt_token_ids"]
+    assert "embed" not in info and "ids" not in info
     assert len(runtime.calls) == len(audios)
     assert [whisper is not None for _, whisper in runtime.calls] == [
         message["message_type"] == "audio"
@@ -149,7 +181,7 @@ def test_request_roundtrip_and_chunked_prefill_match_official_layout(handoff_run
     # mutable advancing cursor; the encoders must not run a second time.
     _, replay, update = runtime.stage.preprocess(
         placeholders[:1],
-        None,
+        scheduled_embeddings(0, 1) if audios else torch.full((1, 4), float("nan")),
         **info,
         _omni_is_prefill=True,
         _omni_num_computed_tokens=0,
@@ -174,7 +206,15 @@ def test_cache_identity_covers_text_audio_and_request_ownership(handoff_runtime)
         messages, runtime.builder, audio_inputs={0: audio}, feature_extractor=runtime.extractor
     )
     assert first["prompt_token_ids"] == changed["prompt_token_ids"]
-    assert first["cache_salt"] == repeated["cache_salt"] != changed["cache_salt"]
+    processor = runtime.processor
+
+    def hashes(request):
+        return ProcessorInputs(
+            request["prompt_token_ids"], processor.info.parse_mm_data(request["multi_modal_data"])
+        ).get_mm_hashes(processor.info.model_id, "sha256")
+
+    assert first["cache_salt"] == repeated["cache_salt"] == changed["cache_salt"]
+    assert hashes(first) == hashes(repeated) != hashes(changed)
     # Same placeholder audio stream, different text conditioning.
     texts = [key for key, ids in REFERENCE["text_tokens"].items() if ids]
     pair = next(
