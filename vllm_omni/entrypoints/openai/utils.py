@@ -38,6 +38,33 @@ def get_stage_type(stage_cfg: Any) -> str:
     return getattr(stage_cfg, "stage_type", "llm")
 
 
+def is_image_generation_stage(stage_cfg: Any) -> bool:
+    """Return whether a stage produces the pipeline's final image output.
+
+    Covers both classical diffusion stages (``stage_type == "diffusion"``) and
+    generation-LLM stages that emit images (e.g. MammothModa2's DiT stage is
+    ``stage_type == "llm"`` with ``final_output_type == "image"``). Serving
+    endpoints use this so image routes accept either topology.
+    """
+    if get_stage_type(stage_cfg) == "diffusion":
+        return True
+    final_output_type = None
+    if isinstance(stage_cfg, dict):
+        final_output = stage_cfg.get("final_output", False)
+        final_output_type = stage_cfg.get("final_output_type")
+    elif hasattr(stage_cfg, "get"):
+        try:
+            final_output = stage_cfg.get("final_output", False)
+            final_output_type = stage_cfg.get("final_output_type")
+        except Exception:
+            final_output = getattr(stage_cfg, "final_output", False)
+            final_output_type = getattr(stage_cfg, "final_output_type", None)
+    else:
+        final_output = getattr(stage_cfg, "final_output", False)
+        final_output_type = getattr(stage_cfg, "final_output_type", None)
+    return bool(final_output) and final_output_type in {"image", "images"}
+
+
 def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
     """Return whether a pipeline declares a final video output stage."""
     for stage in stage_configs or ():

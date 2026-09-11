@@ -14,7 +14,7 @@ from diffusers.utils import numpy_to_pil
 
 from vllm_omni.diffusion.data import logger
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
-from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args, ar_grid_max_tokens
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -752,8 +752,9 @@ def main():
             if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
                 ar_width = int(prompt_info.get("ar_width", [0])[0])
                 ar_height = int(prompt_info.get("ar_height", [0])[0])
-                if ar_width > 0 and ar_height > 0:
-                    params.max_tokens = ar_height * (ar_width + 1) + 1
+                ar_grid_budget = ar_grid_max_tokens(ar_width, ar_height)
+                if ar_grid_budget is not None:
+                    params.max_tokens = ar_grid_budget
 
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]

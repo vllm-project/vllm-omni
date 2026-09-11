@@ -3,7 +3,7 @@ Offline inference regression tests: explicit CLI parallel-knob forwarding.
 
 Covers the argparse defaults -> ``build_parallel_knob_kwargs`` -> ``main()``'s
 ``omni_kwargs`` assembly in examples/offline_inference/text_to_image/text_to_image.py.
-Two invariants:
+Three invariants:
 
 1. The shipped argparse must default the parallel knobs to ``None`` so unset
    flags do not enter ``omni_kwargs`` and a deploy YAML value stays in effect.
@@ -11,9 +11,13 @@ Two invariants:
    ``--ulysses-degree 1``, ``--ulysses-mode strict``) must still be forwarded
    so they can override the deploy YAML, instead of being silently dropped
    (review feedback on PR #7293).
+3. The AR grid ``max_tokens`` budget must stay owned by the shared
+   ``ar_grid_max_tokens`` helper used by both this example and the online
+   serving path (review feedback on PR #7293).
 
 Both invariants are asserted against the real script (its ``parse_args()`` and
-its ``build_parallel_knob_kwargs``), not a re-implemented copy.
+its ``build_parallel_knob_kwargs``), not a re-implemented copy. Invariant 3 is
+asserted directly against ``ar_grid_max_tokens`` itself.
 """
 
 import sys
@@ -67,9 +71,7 @@ class TestParallelKnobForwarding:
             "ulysses_mode": "strict",
         }
 
-        args = _parse_real_args(
-            ["--ring-degree", "1", "--cfg-parallel-size", "1", "--vae-patch-parallel-size", "1"]
-        )
+        args = _parse_real_args(["--ring-degree", "1", "--cfg-parallel-size", "1", "--vae-patch-parallel-size", "1"])
         assert t2i.build_parallel_knob_kwargs(args) == {
             "ring_degree": 1,
             "cfg_parallel_size": 1,
@@ -81,11 +83,16 @@ class TestParallelKnobForwarding:
 
         args = _parse_real_args(
             [
-                "--ulysses-degree", "2",
-                "--ulysses-mode", "advanced_uaa",
-                "--ring-degree", "2",
-                "--cfg-parallel-size", "2",
-                "--vae-patch-parallel-size", "2",
+                "--ulysses-degree",
+                "2",
+                "--ulysses-mode",
+                "advanced_uaa",
+                "--ring-degree",
+                "2",
+                "--cfg-parallel-size",
+                "2",
+                "--vae-patch-parallel-size",
+                "2",
             ]
         )
         assert t2i.build_parallel_knob_kwargs(args) == {
@@ -103,3 +110,28 @@ class TestParallelKnobForwarding:
         parser = t2i.build_parser()
         defaults = {key: parser.get_default(key) for key in _KNOBS}
         assert defaults == {key: None for key in _KNOBS}
+
+
+class TestARGridMaxTokens:
+    """The AR grid budget formula must stay shared between serving and offline.
+
+    ``ar_grid_max_tokens`` (vllm_omni.diffusion.utils.param_utils) is the
+    single owner of the ``ar_height * (ar_width + 1) + 1`` contract used by
+    both the online serving path (serving_chat.py) and this example script,
+    so a grid-contract change cannot desynchronize one copy (review feedback
+    on PR #7293).
+    """
+
+    def test_grid_budget_matches_formula(self):
+        from vllm_omni.diffusion.utils.param_utils import ar_grid_max_tokens
+
+        assert ar_grid_max_tokens(64, 64) == 64 * 65 + 1
+        assert ar_grid_max_tokens(32, 48) == 48 * 33 + 1
+
+    def test_grid_budget_none_for_absent_or_invalid_grid(self):
+        from vllm_omni.diffusion.utils.param_utils import ar_grid_max_tokens
+
+        # Callers treat None as "keep the existing max_tokens default".
+        assert ar_grid_max_tokens(0, 0) is None
+        assert ar_grid_max_tokens(0, 64) is None
+        assert ar_grid_max_tokens(64, 0) is None

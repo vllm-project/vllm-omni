@@ -160,7 +160,7 @@ from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreami
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
-from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.utils import get_stage_type, is_image_generation_stage
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_SYNC_TIMEOUT_S,
     _cleanup_video_references,
@@ -1717,6 +1717,8 @@ async def generate_images(
                 extra_body["system_prompt"] = request.system_prompt
             if request.return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = request.return_stage_metrics
+            for extra_key, extra_value in (request.model_extra or {}).items():
+                extra_body.setdefault(extra_key, extra_value)
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
@@ -1977,18 +1979,18 @@ async def edit_images(
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
-        # Currently only have one diffusion stage.
-        diffusion_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
-        if not diffusion_stage_ids:
+        # Currently only have one image generation stage (diffusion or LLM-typed DiT).
+        image_stage_ids = [i for i, cfg in enumerate(stage_configs) if is_image_generation_stage(cfg)]
+        if not image_stage_ids:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                detail="No diffusion stage found in multi-stage pipeline.",
+                detail="No image generation stage found in multi-stage pipeline.",
             )
-        diffusion_stage_id = diffusion_stage_ids[0]
+        image_stage_id = image_stage_ids[0]
         apply_stage_default_sampling_params(
             default_sample_param,
             gen_params,
-            str(diffusion_stage_id),
+            str(image_stage_id),
         )
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
