@@ -2197,9 +2197,7 @@ def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
     )
 
     audio_events = [
-        payload
-        for payload in payloads
-        if payload["type"] in {"response.output_audio.delta", "response.output_audio.delta"}
+        payload for payload in payloads if payload["type"] in {"response.output_audio.delta", "response.audio.delta"}
     ]
     assert {payload["type"] for payload in audio_events} == {"response.output_audio.delta"}
     assert {payload["format"] for payload in audio_events} == {"pcm16"}
