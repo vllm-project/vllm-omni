@@ -129,6 +129,6 @@ sampling mechanisms.
 ## Status
 
 These examples describe the current input contract. Full server startup,
-pretrained output quality and concurrency have not been validated. Existing
-tests have not been updated for this contract. Cross-stage `async_chunk`
-streaming remains unimplemented.
+pretrained output quality and concurrency have not been validated. The retained
+CPU tests are component reference checks; offline/online E2E coverage remains
+pending. Cross-stage `async_chunk` streaming remains unimplemented.

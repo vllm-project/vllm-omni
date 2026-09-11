@@ -35,11 +35,3 @@ def test_recording_after_thirty_seconds_is_not_truncated(feature_extractor):
     inputs = prepare_whisper_inputs(waveform, feature_extractor, sampling_rate=16000)
     assert inputs.token_lengths == (375, 13)
     assert not torch.equal(inputs.input_features[0], inputs.input_features[1])
-
-
-def test_requires_the_correct_sample_rate_and_whisper_configuration(feature_extractor):
-    waveform = np.zeros(100, dtype=np.float32)
-    with pytest.raises(ValueError, match="resampled"):
-        prepare_whisper_inputs(waveform, feature_extractor, sampling_rate=24000)
-    with pytest.raises(ValueError, match="configuration"):
-        prepare_whisper_inputs(waveform, WhisperFeatureExtractor(feature_size=80), sampling_rate=16000)

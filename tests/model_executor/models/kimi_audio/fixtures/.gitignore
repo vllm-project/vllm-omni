@@ -1,6 +1,5 @@
 # Small reference data and synthetic weights needed by the CPU tests.
 !/prompt_reference.json
-!/ar_checkpoint_manifest.json
 !/glm_encoder_reference.safetensors
 !/ar_forward_reference.safetensors
 !/sampling_reference.json

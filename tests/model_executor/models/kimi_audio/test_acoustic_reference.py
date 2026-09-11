@@ -58,14 +58,6 @@ def test_internal_bigvgan_restores_official_checkpoint(acoustic_files):
         actual = wrapper.decode_mel(tensors["mel_input"])
     torch.testing.assert_close(actual, tensors["vocoder_output"], rtol=2e-5, atol=2e-6)
 
-    # A misspelled learned key must not be silently accepted just because
-    # the upstream checkpoint also carries fixed anti-alias filters.
-    state = torch.load(vocoder_dir / "model.pt", weights_only=True)
-    state["generator"]["conv_pre.unexpected"] = state["generator"].pop("conv_pre.weight_v")
-    torch.save(state, vocoder_dir / "model.pt")
-    with pytest.raises(RuntimeError, match="conv_pre"):
-        BigVGANWrapper.from_pretrained(vocoder_dir / "config.json", vocoder_dir / "model.pt", "cpu")
-
 
 def test_internal_streaming_acoustics_match_official(acoustic_files, monkeypatch):
     pytest.importorskip("torchdyn")

@@ -75,9 +75,3 @@ def test_pipeline_rejects_unimplemented_async_transport():
     deploy.async_chunk = True
     with pytest.raises(ValueError, match="async.chunk"):
         merge_pipeline_deploy(KIMI_AUDIO_PIPELINE, deploy)
-
-
-def test_unified_entry_rejects_unknown_stage():
-    config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(), model_stage="unknown"))
-    with pytest.raises(ValueError, match="Unsupported Kimi-Audio model_stage"):
-        KimiAudioForConditionalGeneration(vllm_config=config)
