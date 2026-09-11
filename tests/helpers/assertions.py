@@ -659,7 +659,11 @@ def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RA
     return float(np.mean(hnr_values)) if hnr_values else 0.0
 
 
-def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB) -> None:
+def _assert_pcm_int16_speech_hnr(
+    audio_bytes: bytes,
+    min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB,
+    sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ,
+) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
     min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
@@ -668,12 +672,16 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PC
     intrinsically around -2 dB) can pass a lower per-test threshold via
     request_config["min_hnr_db"] to keep the catastrophic-failure check
     while not gating CI on a model-intrinsic property.
+
+    ``sr`` must be the stream's real sample rate: the autocorrelation lag window
+    is derived from it, so a wrong rate detunes the 80-400 Hz pitch search and
+    understates HNR for models that do not decode at 24 kHz.
     """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
     assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    hnr = _compute_pcm_hnr_db(pcm_samples)
-    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB)")
+    hnr = _compute_pcm_hnr_db(pcm_samples, sr=sr)
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB, sr={sr})")
     assert hnr >= min_hnr_db, (
         f"Audio distortion detected: HNR={hnr:.2f} dB < {min_hnr_db} dB. "
         "Voice clone decoder may be losing ref_code speaker context on later chunks."
@@ -934,7 +942,15 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     if run_level in {"advanced_model", "full_model"}:
         if req_fmt == "pcm" and response.audio_bytes:
             min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
-            _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
+            # Raw PCM carries no header, so the HNR pitch search has to be told
+            # the rate. Defaulting to 24 kHz for a 44.1 kHz model shifts the
+            # search window to 147-735 Hz and misses the fundamental entirely,
+            # scoring clean speech ~1.9 dB lower than it is.
+            _assert_pcm_int16_speech_hnr(
+                response.audio_bytes,
+                min_hnr_db=min_hnr_db,
+                sr=int(request_config.get("expected_sample_rate") or _PCM_SPEECH_SAMPLE_RATE_HZ),
+            )
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:

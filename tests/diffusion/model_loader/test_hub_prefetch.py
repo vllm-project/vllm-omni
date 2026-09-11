@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
 
@@ -14,10 +14,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 def test_prefetch_subfolders_propagates_revision(monkeypatch):
     calls = []
 
-    def fake_snapshot_download(**kwargs):
+    def fake_snapshot_download(self, **kwargs):
         calls.append(kwargs)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(huggingface_hub.HfApi, "snapshot_download", fake_snapshot_download)
     monkeypatch.setattr(hub_prefetch, "_repo_prefetch_lock", lambda _model: contextlib.nullcontext())
 
     hub_prefetch.prefetch_subfolders(

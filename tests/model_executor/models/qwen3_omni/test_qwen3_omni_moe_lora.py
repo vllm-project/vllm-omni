@@ -113,7 +113,9 @@ def _save_peft_adapter(tmp_path: Path) -> Path:
     return adapter_dir
 
 
-def test_peft_expert_lora_loads_into_thinker(tmp_path: Path):
+def test_peft_expert_lora_loads_into_thinker(tmp_path: Path, monkeypatch):
+    # This CPU harness tests weight mapping, not CUDA pinned-memory allocation.
+    monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
     adapter_dir = _save_peft_adapter(tmp_path)
     peft_helper = PEFTHelper.from_local_dir(str(adapter_dir), max_position_embeddings=128)
     lora_model = LoRAModel.from_local_checkpoint(

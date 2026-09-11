@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Qwen3 Code Predictor -- optimized re-prefill, no KV cache.
 
 Shared by Qwen3-Omni and Qwen3-TTS talker models.
@@ -97,7 +100,11 @@ class _RotaryEmbedding(CustomOp):
             "head_dim",
             config.hidden_size // config.num_attention_heads,
         )
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_theta = rope_parameters.get(
+            "rope_theta",
+            getattr(config, "rope_theta", 10000.0),
+        )
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 

@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Higgs-Audio v2 serving adapter."""
 
+import asyncio
 from typing import TYPE_CHECKING, Any
+
+import numpy as np
+from vllm.inputs import tokens_input
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
@@ -12,6 +17,89 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class HiggsAudioV2Adapter(ARTTSAdapter):
+    @property
+    def engine_client(self):
+        return self.ctx.engine_client
+
+    async def _resolve_ref_audio(self, ref_audio: str):
+        return await self.ctx.server._resolve_ref_audio(ref_audio)
+
+    async def _build_higgs_audio_v2_params(self, request: "OpenAICreateSpeechRequest"):
+        """Build prompt_token_ids for higgs_audio_v2 via the upstream processor.
+
+        Plain-text path: runs ``build_plain_text_prompt`` and returns the
+        token-only prompt. Voice-clone path (``ref_audio`` + ``ref_text``):
+        resolves the reference clip via ``_resolve_ref_audio``, runs
+        ``build_voice_clone_prompt`` (which encodes the clip through HF's
+        ``HiggsAudioV2TokenizerModel`` loaded from the k2-fsa/OmniVoice
+        ``audio_tokenizer/`` subdirectory), and attaches the encoded
+        ``audio_input_ids`` + ``audio_input_ids_mask`` tensors via
+        ``additional_information`` so the talker substitutes them at the
+        prompt-side audio placeholders.
+        """
+        from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
+            build_plain_text_prompt,
+            build_voice_clone_prompt,
+            input_ids_to_python_list,
+        )
+
+        processor = await self._resolve_higgs_audio_v2_processor()
+
+        if request.ref_audio is None:
+            inputs = await asyncio.to_thread(build_plain_text_prompt, processor, request.input)
+            prompt_token_ids = input_ids_to_python_list(inputs)
+            return tokens_input(prompt_token_ids=prompt_token_ids)
+
+        wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+        wav = np.asarray(wav_list, dtype=np.float32)
+        out = await asyncio.to_thread(
+            build_voice_clone_prompt,
+            processor,
+            request.input,
+            wav,
+            int(sr),
+            request.ref_text or "",
+        )
+        prompt = tokens_input(prompt_token_ids=out["prompt_token_ids"])
+        # Pass tensors at the top level of additional_information (NOT list-
+        # wrapped). ``vllm_omni.data_entry_keys.serialize_payload`` routes
+        # bare ``torch.Tensor`` values through ``_serialize_tensor``; a list
+        # containing tensors would fall into the ``list_data`` field which
+        # msgspec cannot serialize and the tensors would be dropped over the
+        # process boundary (silent voice-clone failure).
+        prompt["additional_information"] = {
+            "audio_input_ids": out["audio_input_ids"],
+            "audio_input_ids_mask": out["audio_input_ids_mask"],
+        }
+        return prompt
+
+    async def _resolve_higgs_audio_v2_processor(self):
+        """Lazy-load the AutoProcessor for higgs_audio_v2 (once per serving instance)."""
+        cached = getattr(self, "_higgs_audio_v2_processor", None)
+        if cached is not None:
+            return cached
+
+        from transformers import AutoProcessor
+
+        model_path = None
+        for stage in self.engine_client.stage_configs:
+            model_path = getattr(getattr(stage, "engine_args", None), "model", None)
+            if model_path:
+                break
+        if model_path is None:
+            # Fallback: the orchestrator stores the served model id on the engine
+            # itself (set by AsyncOmniEngine.__init__). Stage-level engine_args
+            # may not surface ``model`` when the deploy yaml doesn't set it per
+            # stage (the CLI-passed model id is the single source of truth).
+            model_path = getattr(self.engine_client, "model", None)
+        if model_path is None:
+            raise RuntimeError("higgs_audio_v2 serving could not resolve the model path from the engine stage configs")
+        processor = AutoProcessor.from_pretrained(model_path)
+        self._higgs_audio_v2_processor = processor
+        return processor
+
+    # ---- higgs-audio v3 ----
+
     stage_keys = frozenset({"higgs_audio_v2"})
     name = "higgs_audio_v2"
 
@@ -91,7 +179,7 @@ class HiggsAudioV2Adapter(ARTTSAdapter):
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
         server = self.ctx.server
-        prompt = await server._build_higgs_audio_v2_params(request)
+        prompt = await self._build_higgs_audio_v2_params(request)
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:

@@ -47,6 +47,7 @@ EXCLUDED_MODELS = [
     "LongCatVideoAvatarPipeline",
     "BagelPipeline",
     "BooguImagePipeline",
+    "BooguImageTurboPipeline",
     "LancePipeline",
     "MingImagePipeline",
     "InternVLAA1Pipeline",

@@ -164,6 +164,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=FLOW_SHIFT)
         pipe.to("cuda")
+        _set_matched_attention_backend(pipe)
 
         _diffusers_dummy_run(pipe)
 

@@ -300,7 +300,8 @@ def test_single_stage_zimage_fp8_uses_less_memory():
     assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
+@pytest.mark.advanced_model
 def test_single_stage_qwen_image_fp8():
     """Qwen-Image (random weights) with FP8 generates valid images."""
     model = "riverclouds/qwen_image_random"

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VoxCPM2 AR talker — PagedAttention pipeline with per-request state.
 
 Architecture:
@@ -158,7 +158,7 @@ def build_voxcpm2_prompt(
     """Build a VoxCPM2 prefill prompt whose ``prompt_token_ids`` length matches
     the talker-side prefill length.
 
-    Used by both online serving (``serving_speech._build_voxcpm2_prompt``) and
+    Used by both online serving (``VoxCPM2Adapter._build_prompt``) and
     the offline example, so the talker-side length assertion never fires.
     """
     ids = split_multichar_chinese(tokenizer.encode(text, add_special_tokens=True), split_map)
@@ -2208,7 +2208,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         assert scaffold_len == tts_len, (
             f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
             "caller must pad prompt_token_ids to the full prefill length "
-            "(see serving_speech._build_voxcpm2_prompt or the offline example)."
+            "(see VoxCPM2Adapter._build_prompt or the offline example)."
         )
         enc_out = base_lm_out.unsqueeze(0)
 

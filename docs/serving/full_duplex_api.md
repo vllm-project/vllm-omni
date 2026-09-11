@@ -86,7 +86,7 @@ A typical `/v1/realtime?duplex=1` session follows this lifecycle:
 3. Send `input_audio_buffer.append` events while microphone audio arrives.
 4. Send `input_audio_buffer.commit` at a user-turn boundary when required by
    the model policy.
-5. Consume `response.created`, transcript deltas, `response.audio.delta`, and
+5. Consume `response.created`, transcript deltas, `response.output_audio.delta`, and
    `response.done` or `response.listen` events.
 6. Send `playback.ack` after audio has been played when the session advertises
    playback acknowledgement support.

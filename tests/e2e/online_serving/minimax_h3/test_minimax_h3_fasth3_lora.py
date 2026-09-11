@@ -21,7 +21,7 @@ from ._common import (
     post_sync,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.advanced_model, pytest.mark.diffusion, pytest.mark.slow]
+pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 H100_TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 

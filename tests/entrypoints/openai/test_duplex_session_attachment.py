@@ -78,7 +78,7 @@ def test_event_journal_sequences_acknowledges_and_replays_exact_payloads() -> No
     clock = _Clock()
     journal = DuplexEventJournal(max_bytes=4096, ttl_s=60.0, clock=clock)
 
-    first = journal.record({"type": "response.audio.delta", "delta": "AAAA"})
+    first = journal.record({"type": "response.output_audio.delta", "delta": "AAAA"})
     second = journal.record({"type": "response.done", "response_id": "resp-1"})
 
     assert first.sequence == 1

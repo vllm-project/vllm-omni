@@ -5,10 +5,12 @@ This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import argparse
+import functools
 import json
 import os
 import time
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import soundfile as sf
@@ -24,6 +26,20 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
+
+
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
+    return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 class QueryResult(NamedTuple):
@@ -378,11 +394,10 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
-    if profiler_enabled and hasattr(omni, "start_profile"):
+    profiler_enabled = args.profiler_config is not None
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
         omni.start_profile(stages=[0])
-    elif profiler_enabled:
-        print("[Warn] VLLM_TORCH_PROFILER_DIR is set, but current engine does not support profiler controls.")
     omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
@@ -418,7 +433,7 @@ def main(args):
             print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
         processed_count += 1
-        if profiler_enabled and hasattr(omni, "stop_profile") and processed_count >= total_requests:
+        if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
             omni.stop_profile()
@@ -475,6 +490,12 @@ def parse_args():
         type=int,
         default=300,
         help="Timeout for initializing stages in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     parser.add_argument(
         "--shm-threshold-bytes",

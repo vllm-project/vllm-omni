@@ -27,7 +27,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
@@ -109,7 +108,9 @@ def _resolve_model_path(model_path: str) -> str:
     """Resolve a HuggingFace model ID or local path to a local directory."""
     if os.path.isdir(model_path):
         return model_path
-    return snapshot_download(model_path)
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    return hf_api().snapshot_download(model_path)
 
 
 def _round_by_factor(number: float, factor: int) -> int:

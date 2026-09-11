@@ -101,6 +101,12 @@ sigmas and input latents.
 Ordinary two-stage uses layer-fused LoRA for an unquantized BF16 Transformer
 and automatically switches to dynamic LoRA when quantization is enabled.
 
+## Sequence Parallelism
+
+Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
+SP attention head counts must be divisible by `ulysses_degree`. Use each
+phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
+
 ## Serving
 
 Start either one-stage checkpoint:
@@ -335,9 +341,8 @@ bundled offline CLI do not currently expose `sigmas`.
   `--max-num-seqs 1`.
 - `--cfg-parallel-size` shards the complete LTX guidance plan, including STG,
   modality guidance, and rescale-compatible prediction gathering.
-- Sequence parallelism may pad audio latents. Pure Ulysses masks the padding;
-  Ring cannot, so audio length must be SP-divisible. Use `ring_degree=1` or a
-  divisible request shape.
+- Ulysses masks padded audio latents; video sequences must satisfy the
+  [sequence-parallel divisibility constraints](#sequence-parallelism).
 - Cache-DiT is one-stage only; multi-stage configurations are rejected.
 
 ## Operational Notes

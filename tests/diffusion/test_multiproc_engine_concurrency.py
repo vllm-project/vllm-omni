@@ -4,8 +4,10 @@
 import asyncio
 import multiprocessing as mp
 import queue
+import signal
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -1330,6 +1332,7 @@ class TestExecutorShutdownCleaner:
         class FakeProcess:
             def __init__(self, name):
                 self.name = name
+                self.pid = 123
                 self.alive = True
                 self.terminated = False
                 self.join_timeouts = []
@@ -1357,6 +1360,132 @@ class TestExecutorShutdownCleaner:
         assert second.join_timeouts == [5.0, 1.0]
         assert first.terminated and second.terminated
         assert not first.is_alive() and not second.is_alive()
+
+    @pytest.mark.parametrize("cooperative", [False, True])
+    def test_real_workers_exit_and_are_reaped(self, monkeypatch, cooperative):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        ctx = mp.get_context("fork")
+        ready, stop = ctx.Event(), ctx.Event()
+
+        def run_worker():
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            ready.set()
+            stop.wait()
+
+        dead = ctx.Process(target=lambda: None)
+        worker = ctx.Process(target=run_worker)
+        monkeypatch.setattr(executor_module, "_WORKER_SHUTDOWN_GRACE_S", 0.2)
+        monkeypatch.setattr(executor_module, "_WORKER_TERMINATE_GRACE_S", 0.1)
+        monkeypatch.setattr(executor_module, "_WORKER_KILL_GRACE_S", 5.0, raising=False)
+        dead.start()
+        worker.start()
+        try:
+            dead.join(5)
+            assert not dead.is_alive()
+            assert ready.wait(5), "worker did not install its signal handler"
+            mq = Mock()
+            if cooperative:
+                mq.enqueue.side_effect = lambda *args, **kwargs: stop.set()
+            else:
+                mq.enqueue.side_effect = OSError("shutdown queue unavailable")
+            cleaner = executor_module._ExecutorShutdownCleaner(mq, 2, [dead, worker])
+
+            cleaner()
+
+            assert not worker.is_alive()
+            assert worker.exitcode == (0 if cooperative else -signal.SIGKILL)
+            assert cleaner.processes == []
+            assert cleaner.broadcast_mq is None
+            cleaner()
+        finally:
+            for proc in (dead, worker):
+                if proc.is_alive():
+                    proc.kill()
+                proc.join(5)
+                proc.close()
+
+    @pytest.mark.parametrize("failed_action", ["terminate", "kill"])
+    def test_kill_phase_shares_deadline_and_continues_after_os_errors(self, monkeypatch, failed_action):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        first, second = Mock(pid=101), Mock(pid=102)
+        first.name, second.name = "first", "second"
+        for proc in (first, second):
+            proc.is_alive.side_effect = [True, True, True, False]
+        getattr(first, failed_action).side_effect = OSError("signal failed")
+        first.join.side_effect = [OSError("join failed"), None, None]
+        monotonic = Mock(side_effect=[100, 100, 110, 120, 120, 124, 130, 130, 134])
+        monkeypatch.setattr(executor_module, "time", SimpleNamespace(monotonic=monotonic))
+        cleaner = executor_module._ExecutorShutdownCleaner(processes=[first, second])
+
+        cleaner()
+
+        first.kill.assert_called_once()
+        second.kill.assert_called_once()
+        assert [call.args[0] for call in first.join.call_args_list] == [15, 5, 5]
+        assert [call.args[0] for call in second.join.call_args_list] == [5, 1, 1]
+        assert cleaner.processes == []
+
+    def test_executor_retains_survivor_for_explicit_shutdown_retry(self, monkeypatch):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        survivor = Mock(pid=123)
+        survivor.name = "surviving-worker"
+        survivor.is_alive.return_value = True
+        cleaner = executor_module._ExecutorShutdownCleaner(processes=[survivor])
+        executor, _, _ = _make_executor()
+        executor._shutdown_cleaner = cleaner
+        executor._processes = [survivor]
+        executor._finalizer = weakref.finalize(executor, cleaner)
+        executor._pump_stop = threading.Event()
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._output_futures = {}
+        executor._batch_split_map = {}
+        log_error = Mock()
+        monkeypatch.setattr(executor_module.logger, "error", log_error)
+
+        executor.shutdown()
+
+        assert not executor._finalizer.alive
+        assert executor._shutdown_cleaner is cleaner
+        assert executor._processes == [survivor]
+        log_error.assert_called_once()
+        assert log_error.call_args.args[1] == [("surviving-worker", 123)]
+        survivor.is_alive.return_value = False
+
+        executor.shutdown()
+        executor.shutdown()
+
+        assert executor._shutdown_cleaner is None
+        assert executor._processes == []
+
+    def test_concurrent_cleanup_does_not_repeat_process_operations(self):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        joining, release = threading.Event(), threading.Event()
+        proc = Mock(pid=123)
+        proc.is_alive.return_value = True
+
+        def join(timeout):
+            joining.set()
+            assert release.wait(5)
+            proc.is_alive.return_value = False
+
+        proc.join.side_effect = join
+        cleaner = executor_module._ExecutorShutdownCleaner(processes=[proc])
+        thread = threading.Thread(target=cleaner)
+        thread.start()
+        try:
+            assert joining.wait(5)
+            cleaner()
+            proc.join.assert_called_once()
+        finally:
+            release.set()
+            thread.join(5)
+        assert not thread.is_alive()
+        assert cleaner.processes == []
 
 
 # ───────── monitor thread & death sentinel integration tests ─────────
@@ -1406,7 +1535,7 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._result_mq = None
         executor._shutdown_cleaner = None
         # Use a no-op so shutdown() doesn't crash on None resources.
-        executor._finalizer = lambda: None
+        executor._finalizer = weakref.finalize(executor, lambda: None)
         # ------------------------------------------------------------------
         # Attributes added by remove_bubble_v2 (async D2H); shutdown() iterates
         # over them, so they need to exist even when constructed via __new__.
@@ -1441,7 +1570,7 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._broadcast_mq = None
         executor._result_mq = None
         executor._shutdown_cleaner = None
-        executor._finalizer = lambda: None
+        executor._finalizer = weakref.finalize(executor, lambda: None)
 
         proc = _make_short_lived_process()
         executor._processes = [proc]

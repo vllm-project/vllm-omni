@@ -215,6 +215,16 @@ def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_s
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
+@pytest.mark.parametrize("disabled", [True, False])
+def test_frontend_log_stats_flag_is_not_an_unowned_stage_argument(disabled):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    config = _from_pipeline_key("dots_tts", cli_overrides={"disable_log_stats": disabled})
+    assert config.stage_configs
+    engine_args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
+    assert "disable_log_stats" not in engine_args
+
+
 def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime_bridge():
     omni_config = _from_pipeline_key(
         "qwen3_tts",
@@ -259,6 +269,57 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
 
     with pytest.raises(ValueError, match=rf"no structured config owner: {unowned_field}"):
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
+def test_llm_additional_config_roundtrip_and_isolation(stage_id, monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    # Worker discovery requires hardware support; this test covers config transport.
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    additional_config = {"backend_options": {"enabled": True}}
+    pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=i, engine_extras={"additional_config": additional_config}) for i in (0, 2)]
+    )
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    stage = config.stage_by_id(stage_id)
+    assert stage.runtime_config.additional_config == additional_config
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == additional_config
+
+    engine_args["additional_config"]["backend_options"]["enabled"] = False
+    assert stage.runtime_config.additional_config["backend_options"]["enabled"] is True
+    stage.runtime_config.additional_config["backend_options"]["enabled"] = False
+    assert config.stage_by_id(2 if stage_id == 0 else 0).runtime_config.additional_config == additional_config
+    assert additional_config["backend_options"]["enabled"] is True
+
+
+@pytest.mark.parametrize("deploy_name", ["minicpmo_4_5", "minicpmo_4_5_2gpu", "minicpmo_4_5_3gpu"])
+def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_name):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
+    expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    assert stage.runtime_config.additional_config == expected
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == expected
+
+
+def test_diffusion_additional_config_keeps_diffusion_owner():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    additional_config = {"torchair_graph_config": {"enabled": True}}
+    stage = _from_pipeline_key("dreamzero", cli_overrides={"additional_config": additional_config}).stage_by_id(0)
+    assert stage.runtime_config.additional_config is None
+    assert stage.diffusion_config.additional_config == additional_config
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert engine_args["additional_config"] == additional_config
 
 
 @pytest.mark.parametrize(
@@ -532,6 +593,17 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 
+def test_joyai_code2wav_waits_for_full_payload():
+    config = _from_pipeline_key("joyai_vl_interaction")
+    talker = config.stage_by_id(1)
+    code2wav = config.stage_by_id(2)
+
+    assert talker.custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
+    assert code2wav.custom_process_input_func.endswith("talker2code2wav_token_only")
+    assert code2wav.connector_config.async_chunk is False
+    assert code2wav.model_config.requires_full_payload_input is True
+
+
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert not hasattr(BaseVllmOmniStageConfig, "from_stage_config")
     assert not hasattr(BaseVllmOmniStageConfig, "to_legacy_stage_config")
@@ -559,6 +631,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
 
 def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "additional_config",
         "distributed_executor_backend",
         "worker_cls",
         "devices",
@@ -641,6 +714,7 @@ def test_sub_config_fields_match_structured_scopes():
         "max_cudagraph_capture_size",
         "enable_flashinfer_autotune",
         "enable_multithread_weight_load",
+        "enable_broadcast_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
         # Per-stage checkpoint resolution for repos whose stages live in
@@ -1253,6 +1327,70 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
+def test_diffusion_config_none_values_preserve_dataclass_defaults():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    normalized = OmniDiffusionConfig.normalize_init_kwargs(
+        {
+            "lora_scale": None,
+            "enable_sleep_mode": None,
+            "diffusers_load_kwargs": None,
+        }
+    )
+
+    assert "lora_scale" not in normalized
+    assert "enable_sleep_mode" not in normalized
+    assert normalized["diffusers_load_kwargs"] == {}
+
+    config = OmniDiffusionConfig.from_kwargs(
+        lora_scale=None,
+        enable_sleep_mode=None,
+    )
+    assert config.lora_scale == 1.0
+    assert config.enable_sleep_mode is False
+
+
+@pytest.mark.parametrize(
+    ("canonical_key", "alias_key", "canonical_value", "alias_value"),
+    [
+        ("lora_scale", "static_lora_scale", 0.75, 0.25),
+        (
+            "quantization_config",
+            "diffusion_quantization_config",
+            {"method": "canonical"},
+            {"method": "diffusion-alias"},
+        ),
+        (
+            "quantization_config",
+            "quantization",
+            {"method": "canonical"},
+            "legacy-alias",
+        ),
+        ("diffusion_kv_cache_dtype", "kv_cache_dtype", "fp8", "fp16"),
+        ("diffusion_kv_cache_skip_steps", "kv_cache_skip_steps", "0-1", "2-3"),
+        ("diffusion_kv_cache_skip_layers", "kv_cache_skip_layers", "1-2", "3-4"),
+        ("streaming_output", "diffusion_streaming_output", False, True),
+    ],
+)
+def test_diffusion_alias_conflicts_prefer_canonical_key(
+    canonical_key,
+    alias_key,
+    canonical_value,
+    alias_value,
+):
+    from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+
+    normalized = normalize_omni_diffusion_kwargs(
+        {
+            canonical_key: canonical_value,
+            alias_key: alias_value,
+        }
+    )
+
+    assert normalized[canonical_key] == canonical_value
+    assert alias_key not in normalized
+
+
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path, monkeypatch):
     from vllm_omni.platforms import current_omni_platform
 
@@ -1403,6 +1541,61 @@ def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
 
     assert cfg.quantization_config is not None
     assert cfg.quantization_config.get_name() == "int8"
+
+
+def test_video_output_transport_mapping_is_normalized() -> None:
+    from vllm_omni.diffusion.data import VideoOutputTransportConfig
+
+    cfg = omni_config_module._DiffusionConfigProjection(
+        video_output_transport={"enable_device_postprocess": True},
+    )
+
+    assert isinstance(cfg.video_output_transport, VideoOutputTransportConfig)
+    assert cfg.video_output_transport.enable_device_postprocess is True
+
+
+def test_omni_diffusion_config_normalizes_video_output_transport_mapping() -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, VideoOutputTransportConfig
+
+    cfg = OmniDiffusionConfig(
+        model=None,
+        video_output_transport={"enable_device_postprocess": True},
+    )
+
+    assert isinstance(cfg.video_output_transport, VideoOutputTransportConfig)
+    assert cfg.video_output_transport.enable_device_postprocess is True
+
+
+def test_video_output_transport_rejects_non_boolean_flag() -> None:
+    from vllm_omni.diffusion.data import VideoOutputTransportConfig
+
+    with pytest.raises(TypeError, match="enable_device_postprocess must be a bool"):
+        VideoOutputTransportConfig(enable_device_postprocess="true")  # type: ignore[arg-type]
+
+
+def test_video_output_transport_survives_stage_override_filtering() -> None:
+    from vllm_omni.config.stage_config import build_stage_runtime_overrides, deploy_runtime_override_keys
+
+    transport = {"enable_device_postprocess": True}
+    overrides = build_stage_runtime_overrides(0, {"video_output_transport": transport})
+
+    assert "video_output_transport" in deploy_runtime_override_keys()
+    assert overrides["video_output_transport"] == transport
+
+
+def test_video_output_transport_reaches_default_diffusion_stage() -> None:
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    transport = {"enable_device_postprocess": True}
+    stages = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "model": "unused",
+            "model_class_name": "UnknownPipeline",
+            "video_output_transport": transport,
+        }
+    )
+
+    assert stages[0]["engine_args"]["video_output_transport"] == transport
 
 
 def test_compact_offload_config_reaches_terminal_config(monkeypatch):

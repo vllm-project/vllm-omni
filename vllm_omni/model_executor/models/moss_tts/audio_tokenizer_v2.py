@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -801,7 +804,16 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         else:
             attn_bias = None
 
-        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+        streaming_attention = getattr(self, "_streaming_attention", None)
+        if (
+            streaming_attention is not None
+            and attn_bias is not None
+            and q.dtype == torch.bfloat16
+            and q.shape[-1] == 64
+        ):
+            x = streaming_attention(q, k, v, attn_bias)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
         x = apply_weights_per_step(self.out_projs, self.weights_per_step_schedule, x, offset_cpu)
 

@@ -77,7 +77,6 @@ dev = [
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
-    "silero-vad==6.1", # Realtime server-VAD duplex E2E
 ]
 
 demo = [
@@ -87,9 +86,6 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
-server-vad = [
-    "silero-vad==6.1",
-]
 
 forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
@@ -165,7 +161,7 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni" = ["_version.py", "py.typed", "transformers_utils/chat_templates/*.jinja"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -287,6 +283,8 @@ markers = [
     "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: [hardware-resource] [npu] Tests that require A2 NPU",
     "A3: [hardware-resource] [npu] Tests that require A3 NPU",
+    "A5: [hardware-resource] [npu] Tests that require A5 NPU",
+    "310P: [hardware-resource] [npu] Tests that require 310P NPU",
     # Tag with [hardware-cards] for tests.helpers.mark.get_supported_card_counts().
     "cards_1: [hardware-cards] Tests that require 1 accelerator card",
     "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
@@ -378,3 +376,7 @@ ba = "ba"
 SER = "SER"
 # NumPy ndarray.flags.writeable (canonical flag name, not "writable").
 writeable = "writeable"
+# "convnet" abbreviates convolutional network. It appears in the vendored Fish
+# Speech DAC codec identifiers (convnet_type, transconvnet_type) and is not a
+# typo of "convent".
+convnet = "convnet"

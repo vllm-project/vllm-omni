@@ -2665,7 +2665,10 @@ async def test_duplex_reaper_loop_waits_between_ticks():
 
 
 @pytest.mark.asyncio
-async def test_duplex_reaper_loop_survives_one_cleanup_failure():
+@pytest.mark.parametrize("first_cleanup_delay", [0.0, 0.05], ids=["immediate", "delayed"])
+async def test_duplex_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: float) -> None:
+    recovered = asyncio.Event()
+
     class _Plane:
         def __init__(self) -> None:
             self.calls = 0
@@ -2673,7 +2676,9 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
         async def reap_expired(self) -> int:
             self.calls += 1
             if self.calls == 1:
+                await asyncio.sleep(first_cleanup_delay)
                 raise RuntimeError("transient cleanup failure")
+            recovered.set()
             return 0
 
     orchestrator = object.__new__(Orchestrator)
@@ -2682,11 +2687,13 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
     orchestrator._shutdown_event = asyncio.Event()
 
     task = asyncio.create_task(orchestrator._duplex_reaper_loop())
-    await asyncio.sleep(0.035)
-    orchestrator._shutdown_event.set()
-    await task
-
-    assert orchestrator.duplex_control_plane.calls >= 2
+    try:
+        # Wait for recovery itself, including when cleanup exceeds the old 35 ms window.
+        await asyncio.wait_for(recovered.wait(), timeout=5.0)
+        assert orchestrator.duplex_control_plane.calls >= 2
+    finally:
+        orchestrator._shutdown_event.set()
+        await asyncio.wait_for(task, timeout=5.0)
 
 
 @pytest.mark.asyncio

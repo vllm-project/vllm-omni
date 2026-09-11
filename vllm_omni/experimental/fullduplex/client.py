@@ -234,7 +234,7 @@ class RealtimeEventCollector:
         event_type = stored_event.get("type")
         if event_type == "response.created" and response_id and response_id not in self.response_ids:
             self.response_ids.append(response_id)
-        if event_type == "response.audio.delta":
+        if event_type == "response.output_audio.delta":
             delta = stored_event.get("delta") or stored_event.get("audio")
             if isinstance(delta, str) and response_id:
                 try:
@@ -263,7 +263,7 @@ class RealtimeEventCollector:
             if self.response_id(event) == response_id
             and event.get("type")
             in {
-                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
                 "response.output_text.delta",
                 "response.text.delta",
             }
@@ -322,7 +322,7 @@ class RealtimeEventCollector:
             if (
                 event.get("type")
                 in {
-                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
                     "response.output_text.delta",
                     "response.text.delta",
                 }
@@ -337,7 +337,7 @@ class RealtimeEventCollector:
             if isinstance(stage0, dict):
                 stage0_metrics = stage0
 
-            if event.get("type") != "response.audio.delta" or (
+            if event.get("type") != "response.output_audio.delta" or (
                 response_id is not None and event_response_id != response_id
             ):
                 continue

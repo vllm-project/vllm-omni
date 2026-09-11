@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""CUDA regression tests for LTX-2 BWE vocoder precision."""
+"""GPU regression tests for LTX-2 BWE vocoder precision."""
 
 import pytest
 import torch
@@ -14,10 +14,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 class _BWEConvVocoder(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        # Match the production LTX vocoder's conv_pre geometry. The previous
+        # single-channel 1x1 probe intermittently had no MIOpen algorithm.
         self.conv = torch.nn.Conv1d(
-            1,
-            1,
-            kernel_size=1,
+            128,
+            1024,
+            kernel_size=7,
+            padding=3,
             bias=False,
             device="cuda",
             dtype=torch.bfloat16,
@@ -33,12 +36,12 @@ class _BWEConvVocoder(torch.nn.Module):
         return output
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ltx_bwe_vocoder_runs_real_cuda_autocast_in_fp32():
     from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _run_ltx_vocoder
 
     vocoder = _BWEConvVocoder()
-    generated_mel = torch.ones((1, 1, 4), device="cuda", dtype=torch.bfloat16)
+    generated_mel = torch.ones((1, 128, 64), device="cuda", dtype=torch.bfloat16)
 
     output = _run_ltx_vocoder(vocoder, generated_mel)
 

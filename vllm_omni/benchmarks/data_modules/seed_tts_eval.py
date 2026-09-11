@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS WER aligned with Bytedance ``seed-tts-eval`` / ``run_wer.py``.
 
 Matches the published protocol (see Hugging Face dataset card and
@@ -329,7 +332,8 @@ def _ensure_utmos_jit_model() -> Any | None:
             return _utmos_jit_model
         try:
             import torch
-            from huggingface_hub import hf_hub_download
+
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
             repo = os.environ.get("SEED_TTS_UTMOS_HF_REPO", "balacoon/utmos").strip() or "balacoon/utmos"
             fname = os.environ.get("SEED_TTS_UTMOS_JIT_FILE", "utmos.jit").strip() or "utmos.jit"
@@ -338,7 +342,7 @@ def _ensure_utmos_jit_model() -> Any | None:
                 repo,
                 fname,
             )
-            path = hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
+            path = hf_api().hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
 
             # TODO The model weights in UTMOS must be loaded in cuda:0; otherwise, the model execution will fail.
             want = "cuda:0"
@@ -460,25 +464,33 @@ def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:
         return ""
     with _lock:
         assert _en_processor is not None and _en_model is not None and _device is not None
+        # Whisper's default feature extraction truncates at 30 seconds. Keep
+        # abnormal tails so WER evaluates the complete generated response.
+        long_audio = len(wav_f32) > 30 * 16000
+        processor_kwargs = {"truncation": False, "padding": "longest"} if long_audio else {}
         try:
             inputs = _en_processor(
                 wav_f32,
                 sampling_rate=16000,
                 return_tensors="pt",
                 return_attention_mask=True,
+                **processor_kwargs,
             )
         except TypeError:
-            inputs = _en_processor(wav_f32, sampling_rate=16000, return_tensors="pt")
+            inputs = _en_processor(wav_f32, sampling_rate=16000, return_tensors="pt", **processor_kwargs)
         input_features = inputs.input_features.to(_device)
         attention_mask = getattr(inputs, "attention_mask", None)
         if attention_mask is None and isinstance(inputs, dict):
             attention_mask = inputs.get("attention_mask")
         generate_kwargs: dict[str, Any] = {}
+        if long_audio:
+            generate_kwargs["return_timestamps"] = True
         if attention_mask is not None:
             generate_kwargs["attention_mask"] = attention_mask.to(_device)
         with torch.no_grad():
             try:
-                forced = _en_processor.get_decoder_prompt_ids(language="english", task="transcribe")
+                prompt_kwargs = {"no_timestamps": False} if long_audio else {}
+                forced = _en_processor.get_decoder_prompt_ids(language="english", task="transcribe", **prompt_kwargs)
                 predicted_ids = _en_model.generate(input_features, forced_decoder_ids=forced, **generate_kwargs)
             except Exception:
                 predicted_ids = _en_model.generate(
@@ -544,14 +556,13 @@ def _expand_seed_tts_turn_outputs(
         turn_pcm = getattr(output, "tts_turn_pcm_bytes", None)
         session_pcm = getattr(output, "tts_output_pcm_bytes", None)
         for turn_index, turn in enumerate(turns):
-            expanded_requests.append(
-                replace(
-                    request,
-                    prompt=turn.target_text,
-                    seed_tts_utterance_id=turn.utterance_id,
-                    seed_tts_turns=(),
-                )
+            turn_request = replace(
+                request,
+                seed_tts_utterance_id=turn.utterance_id,
+                seed_tts_turns=(),
             )
+            turn_request.prompt = turn.target_text
+            expanded_requests.append(turn_request)
             turn_output = copy(output)
             if isinstance(turn_pcm, list) and turn_index < len(turn_pcm):
                 turn_output.tts_output_pcm_bytes = turn_pcm[turn_index]

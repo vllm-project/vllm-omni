@@ -488,7 +488,8 @@ class TestLayerwiseComponentSelection:
         with pytest.raises(ValueError, match="Selected text encoder 'text_encoder_2' requires"):
             backend.enable(pipeline)
 
-        assert not pipeline.text_encoder._omni_layerwise_enabled
+        # The plan resolver rejects the topology before any encoder is hooked.
+        assert not getattr(pipeline.text_encoder, "_omni_layerwise_enabled", False)
 
     def test_default_selection_preserves_unplanned_auxiliaries(self, patched_offload_runtime):
         pipeline = _LegacyComponentPipeline()

@@ -457,5 +457,136 @@ def test_text_benchmark_still_reports_ttft(capsys):
     assert "Time to First Token" in out, "text benchmarks must keep TTFT"
 
 
+# ============================================================================
+# Suppress text metrics for pure image / video endpoints
+# ============================================================================
+
+
+def _make_image_output(prompt_len: int) -> MixRequestFuncOutput:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = prompt_len
+    output.output_tokens = 0
+    output.generated_text = ""
+    output.ttft = 0.0
+    output.text_latency = 0.0
+    output.latency = 2.5
+    output.start_time = 0.0
+    output.itl = []
+    output.image_count = 1
+    output.image_generation_time_ms = 2000.0
+    output.image_pixels = 1024 * 1024
+    output.input_audio_duration = 0.0
+    output.error = ""
+    return output
+
+
+def _make_video_output(prompt_len: int) -> MixRequestFuncOutput:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = prompt_len
+    output.output_tokens = 0
+    output.generated_text = ""
+    output.ttft = 0.0
+    output.text_latency = 0.0
+    output.latency = 5.0
+    output.start_time = 0.0
+    output.itl = []
+    output.video_duration = 2.0
+    output.video_frames = 48
+    output.video_generation_time_ms = 4000.0
+    output.video_rtf = 2.0
+    output.input_audio_duration = 0.0
+    output.error = ""
+    return output
+
+
+_MEDIA_PERCENTILE_METRICS = ["e2el", "ttft"]
+
+
+def test_pure_image_benchmark_omits_text_result(capsys):
+    """Pure image generation must not print Text Result or invent peak tok/s."""
+    outputs = [_make_image_output(64), _make_image_output(64)]
+
+    metrics, actual_output_lens = calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=5.0,
+        tokenizer=None,
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_MEDIA_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=5.0,
+    )
+
+    out = capsys.readouterr().out
+    assert actual_output_lens == [0, 0]
+    assert metrics.total_output == 0
+    assert metrics.max_output_tokens_per_s == 0.0
+    assert " Text Result " not in out
+    assert "Peak output token throughput" not in out
+    assert "Time to First Token" not in out
+    assert " Image Result " in out
+
+
+def test_pure_video_benchmark_omits_text_result(capsys):
+    """Pure video generation must not print Text Result or invent peak tok/s."""
+    outputs = [_make_video_output(63), _make_video_output(63)]
+
+    metrics, actual_output_lens = calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_MEDIA_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    out = capsys.readouterr().out
+    assert actual_output_lens == [0, 0]
+    assert metrics.total_output == 0
+    assert metrics.max_output_tokens_per_s == 0.0
+    assert " Text Result " not in out
+    assert "Peak output token throughput" not in out
+    assert "Time to First Token" not in out
+    assert " Video Result " in out
+
+
+def test_image_with_generated_text_still_reports_text_result(capsys):
+    """Image edits / AR text alongside images must keep Text Result."""
+    output = _make_image_output(64)
+    output.output_tokens = 8
+    output.generated_text = "revised caption"
+    output.ttft = 0.05
+    output.itl = [0.01] * 7
+
+    calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=3.0,
+        tokenizer=_EmptyAwareTokenizer(),
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_MEDIA_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=3.0,
+    )
+
+    out = capsys.readouterr().out
+    assert " Text Result " in out
+    assert "Time to First Token" in out
+    assert " Image Result " in out
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

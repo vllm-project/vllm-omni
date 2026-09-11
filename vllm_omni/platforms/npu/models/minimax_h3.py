@@ -100,7 +100,7 @@ def npu_swiglu_from_packed(gate_up: torch.Tensor) -> torch.Tensor:
 
 def _forward_minimax_h3_qwen3vl_text_mlp_npu(self: Any, x: torch.Tensor) -> torch.Tensor:
     """Run the Qwen3-VL MLP with one packed GEMM and fused SwiGLU."""
-    gate_up = F.linear(x, self.gate_up_proj.weight)
+    gate_up = self.gate_up_proj(x)
     return self.down_proj(npu_swiglu_from_packed(gate_up))
 
 

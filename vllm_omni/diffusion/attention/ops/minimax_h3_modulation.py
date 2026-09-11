@@ -7,6 +7,22 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
+# Ascend CANN limits the launch coreDim to uint16.
+_MAX_1D_GRID_SIZE = 65535
+
+
+def _iter_row_chunks(rows: int):
+    for row_offset in range(0, rows, _MAX_1D_GRID_SIZE):
+        yield row_offset, min(rows - row_offset, _MAX_1D_GRID_SIZE)
+
+
+def _launch_row_chunks(kernel, rows: int, device_type: str, *args, **kwargs) -> None:
+    if device_type != "npu":
+        kernel[(rows,)](*args, 0, **kwargs)
+        return
+    for row_offset, chunk_rows in _iter_row_chunks(rows):
+        kernel[(chunk_rows,)](*args, row_offset, **kwargs)
+
 
 @triton.jit
 def _indexed_scale_shift_kernel(
@@ -20,9 +36,10 @@ def _indexed_scale_shift_kernel(
     stride_shift_row,
     stride_scale_row,
     stride_indices,
+    row_offset,
     block_n: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0) + row_offset
     columns = tl.arange(0, block_n)
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
@@ -51,9 +68,10 @@ def _indexed_gate_kernel(
     stride_gate_row,
     stride_other_row,
     stride_indices,
+    row_offset,
     block_n: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0) + row_offset
     columns = tl.arange(0, block_n)
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
@@ -83,9 +101,10 @@ def _rms_norm_indexed_scale_shift_kernel(
     stride_shift_row,
     stride_scale_row,
     stride_indices,
+    row_offset,
     block_n: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0) + row_offset
     columns = tl.arange(0, block_n)
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
@@ -123,9 +142,10 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
     stride_shift_row,
     stride_scale_row,
     stride_indices,
+    row_offset,
     block_n: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0) + row_offset
     columns = tl.arange(0, block_n)
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
@@ -162,7 +182,10 @@ def indexed_scale_shift_(
     rows, hidden_size = x.shape
     if rows == 0:
         return x
-    _indexed_scale_shift_kernel[(rows,)](
+    _launch_row_chunks(
+        _indexed_scale_shift_kernel,
+        rows,
+        x.device.type,
         x,
         x,
         shift,
@@ -192,7 +215,10 @@ def indexed_gate(
     rows, hidden_size = x.shape
     if rows == 0:
         return output
-    _indexed_gate_kernel[(rows,)](
+    _launch_row_chunks(
+        _indexed_gate_kernel,
+        rows,
+        x.device.type,
         output,
         x,
         gate,
@@ -229,7 +255,10 @@ def rms_norm_indexed_scale_shift(
     output = torch.empty_like(x)
     rows, hidden_size = x.shape
     if rows:
-        _rms_norm_indexed_scale_shift_kernel[(rows,)](
+        _launch_row_chunks(
+            _rms_norm_indexed_scale_shift_kernel,
+            rows,
+            x.device.type,
             output,
             x,
             weight,
@@ -274,7 +303,10 @@ def indexed_gate_rms_norm_scale_shift(
     modulated_out = torch.empty_like(residual)
     rows, hidden_size = residual.shape
     if rows:
-        _indexed_gate_rms_norm_scale_shift_kernel[(rows,)](
+        _launch_row_chunks(
+            _indexed_gate_rms_norm_scale_shift_kernel,
+            rows,
+            residual.device.type,
             residual_out,
             modulated_out,
             residual,

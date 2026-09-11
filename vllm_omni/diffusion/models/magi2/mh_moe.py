@@ -21,7 +21,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -133,9 +133,10 @@ def torch_mh_moe_forward(
     return output
 
 
-_SWIGLU7_ALPHA = tl.constexpr(1.702)
-_SWIGLU7_LIMIT = tl.constexpr(7.0)
-_SWIGLU7_BIAS = tl.constexpr(1.0)
+# vLLM's no-Triton placeholder exposes ``tl.constexpr`` as ``None``.
+_SWIGLU7_ALPHA = tl.constexpr(1.702) if HAS_TRITON else 1.702
+_SWIGLU7_LIMIT = tl.constexpr(7.0) if HAS_TRITON else 7.0
+_SWIGLU7_BIAS = tl.constexpr(1.0) if HAS_TRITON else 1.0
 
 
 @triton.jit
@@ -198,7 +199,7 @@ def _mh_moe_kernel(
     block_t: tl.constexpr,
     block_dh: tl.constexpr,
     block_de: tl.constexpr,
-    acc_dtype: tl.constexpr = tl.float32,
+    acc_dtype: tl.constexpr,
     deterministic: tl.constexpr = False,
 ):
     tile_id = tl.program_id(0)

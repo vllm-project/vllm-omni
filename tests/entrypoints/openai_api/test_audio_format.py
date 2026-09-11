@@ -163,6 +163,8 @@ class TestStreamingAudioResampler:
 
         chunked = StreamingAudioResampler(24000, 8000)
         pieces = [chunked.process(chunk) for chunk in np.split(waveform, [137, 2048, 9001, 17003])]
+        # Bounded FIR history must own its data, not retain the last large chunk.
+        assert chunked._history.base is None
         pieces.append(chunked.process(np.empty(0), final=True))
         actual = np.concatenate(pieces)
 
@@ -193,9 +195,15 @@ class TestStreamingAudioResampler:
         output_rms = np.sqrt(np.mean(output[100:-100] ** 2))
         assert output_rms < input_rms * 0.01
 
-    def test_rejects_non_integer_downsampling_ratio(self):
-        with pytest.raises(ValueError, match="integer downsampling ratio"):
-            StreamingAudioResampler(24000, 16000)
+    def test_supports_rational_downsampling_ratio(self):
+        waveform = np.sin(np.linspace(0, 200 * np.pi, 24000, endpoint=False)).astype(np.float32)
+        resampler = StreamingAudioResampler(24000, 16000)
+
+        output = resampler.process(waveform, final=True)
+        reference = torchaudio.functional.resample(torch.from_numpy(waveform), 24000, 16000).numpy()
+
+        assert output.shape == (16000,)
+        np.testing.assert_allclose(output[100:-100], reference[100:-100], atol=2e-3, rtol=1e-3)
 
     def test_rejects_multichannel_audio(self):
         resampler = StreamingAudioResampler(24000, 8000)
@@ -240,7 +248,7 @@ class TestResolveAudioFormat:
         assert result == "pcm"
 
     def test_invalid_format_returns_error(self, serving_chat):
-        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
         request = self._make_request({"format": "aac", "voice": "alloy"})
         result = serving_chat._resolve_audio_format(request)
@@ -248,7 +256,7 @@ class TestResolveAudioFormat:
         assert "aac" in result.error.message
 
     def test_all_supported_formats_accepted(self, serving_chat):
-        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
         for fmt in SUPPORTED_CHAT_AUDIO_FORMATS:
             request = self._make_request({"format": fmt, "voice": "alloy"})

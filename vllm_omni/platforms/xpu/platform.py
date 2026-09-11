@@ -11,6 +11,7 @@ from vllm.platforms.xpu import XPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.xpu.patch import apply_patches
 
 logger = init_logger(__name__)
 
@@ -30,6 +31,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.XPU
+
+    def __init__(self):
+        super().__init__()
+        apply_patches()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:

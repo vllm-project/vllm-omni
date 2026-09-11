@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS 2.5 multilingual tiktoken vocabulary.
 
 The vocabulary layout mirrors the official IndexTTS 2.5 tokenizer: 58,836
@@ -234,9 +234,9 @@ def resolve_indextts25_tokenizer_file(
         return str(model_path)
 
     try:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        return hf_hub_download(repo_id=model_dir, filename=tokenizer_file)
+        return hf_api().hf_hub_download(repo_id=model_dir, filename=tokenizer_file)
     except Exception as exc:
         raise FileNotFoundError(
             f"Could not resolve IndexTTS 2.5 tokenizer {tokenizer_file!r} from {model_dir!r}"

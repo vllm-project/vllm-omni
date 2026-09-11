@@ -168,6 +168,26 @@ def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
             {"backend", "print_stage", "bot_task"},
         ),
         (
+            [
+                "--endpoint",
+                "/v1/images/edits",
+                "--image-edits-bot-task",
+                "think",
+            ],
+            {"bot_task": "think"},
+            {"endpoint", "bot_task"},
+        ),
+        (
+            [
+                "--backend",
+                "/v1/images/edits",
+                "--image-edits-bot-task",
+                "recaption",
+            ],
+            {"bot_task": "recaption"},
+            {"backend", "bot_task"},
+        ),
+        (
             ["--extra-body", '{"bot_task":"vanilla"}'],
             {"bot_task": "vanilla"},
             {"extra_body"},
@@ -182,6 +202,7 @@ def test_omni_args_parse_and_preprocess(
     parser = TrackingArgumentParser()
     parser.add_argument("--extra-body", type=json.loads, default=None)
     parser.add_argument("--backend", default="openai-chat-omni")
+    parser.add_argument("--endpoint", default="/v1/chat/completions")
     add_omni_args(parser)
 
     args = parser.parse_args(argv)
@@ -358,3 +379,17 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     )
     assert bench_requests
     assert all(url == expected_url for url in bench_requests), f"Unexpected target URLs: {bench_requests}"
+
+
+def test_omni_request_timeout_s_flag_defaults_and_parses() -> None:
+    parser = TrackingArgumentParser()
+    add_omni_args(parser)
+
+    args = parser.parse_args([])
+    assert args.omni_request_timeout_s is None
+
+    args = parser.parse_args(["--omni-request-timeout-s", "0"])
+    assert args.omni_request_timeout_s == 0.0
+
+    args = parser.parse_args(["--omni-request-timeout-s", "3600"])
+    assert args.omni_request_timeout_s == 3600.0

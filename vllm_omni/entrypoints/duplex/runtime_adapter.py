@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping
+from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any, Protocol
 
@@ -104,6 +105,104 @@ class ServingRuntimeSessionState(Protocol):
     def clear_committed_audio(self) -> int: ...
 
     def clear_continuation(self) -> None: ...
+
+
+class _TurnBasedPcmAppendBuffer:
+    """Empty native-audio buffer for chat-fallback sessions.
+
+    Turn-based sessions keep input audio in ``DuplexSession`` and never use
+    the model-native append path.  The runner still shares lifecycle and
+    cancellation code with native sessions, so it needs an inert buffer for
+    those common operations.
+    """
+
+    @property
+    def pending_byte_count(self) -> int:
+        return 0
+
+    def clear(self) -> None:
+        return None
+
+    def clear_force_listen(self) -> None:
+        return None
+
+    def has_pending(self) -> bool:
+        return False
+
+    def has_reserved(self) -> bool:
+        return False
+
+    def prepare_append(
+        self,
+        payload: dict[str, object],
+        *,
+        operation_id: str,
+        chunk_period_ms: int,
+        allow_emit: bool,
+    ) -> PcmAppendReservation | None:
+        del payload, operation_id, chunk_period_ms, allow_emit
+        raise RuntimeError("Model-native audio append is not enabled for this session")
+
+    def prepare_commit(
+        self,
+        *,
+        operation_id: str,
+        chunk_period_ms: int,
+    ) -> PcmAppendReservation:
+        del operation_id, chunk_period_ms
+        raise RuntimeError("Model-native audio append is not enabled for this session")
+
+    def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
+        del chunk_period_ms
+        return None
+
+
+@dataclass(slots=True)
+class TurnBasedServingSessionState:
+    """Runner-local state for sessions served through chat fallback."""
+
+    audio_buffer: PcmAppendBuffer = field(default_factory=_TurnBasedPcmAppendBuffer)
+    input_since_commit: bool = False
+    speech_since_commit: bool = False
+    native_context_locked: bool = False
+    committed_audio_payload: dict[str, object] | None = None
+    committed_audio_operation_id: str | None = None
+    committed_audio_reserved_bytes: int = 0
+    deferred_response_create: bool = False
+    deferred_precreate_response: bool = False
+    data_plane_task: asyncio.Task[None] | None = None
+    data_plane_restart_requested: bool = False
+    continuation_owner_id: str | None = None
+    continuation_units: int = 0
+    pending_silence_task: asyncio.Task[bool] | None = None
+    pending_silence_owner_id: str | None = None
+    silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
+
+    def retain_committed_audio(
+        self,
+        payload: dict[str, object],
+        *,
+        operation_id: str | None,
+        reserved_bytes: int = 0,
+    ) -> None:
+        self.committed_audio_payload = payload
+        self.committed_audio_operation_id = operation_id
+        self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+
+    def clear_committed_audio(self) -> int:
+        reserved_bytes = self.committed_audio_reserved_bytes
+        self.committed_audio_payload = None
+        self.committed_audio_operation_id = None
+        self.committed_audio_reserved_bytes = 0
+        self.deferred_response_create = False
+        self.deferred_precreate_response = False
+        return reserved_bytes
+
+    def clear_continuation(self) -> None:
+        self.continuation_owner_id = None
+        self.continuation_units = 0
+        self.pending_silence_task = None
+        self.pending_silence_owner_id = None
 
 
 class RuntimeDataPlane(Protocol):

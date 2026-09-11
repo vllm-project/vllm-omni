@@ -39,9 +39,9 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     """
     if Path(model_ref).is_dir():
         return model_ref
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+    return hf_api().snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:

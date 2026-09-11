@@ -66,7 +66,8 @@ The checkpoint keeps these verified contracts:
 - scheduler data-plane append over a resumable request;
 - stale epoch/turn/response fencing;
 - `/v1/duplex` and OpenAI Realtime projection;
-- optional OpenAI `server_vad` turn detection backed by per-session Silero VAD;
+- optional OpenAI `server_vad` turn detection backed by a process-shared Silero
+  model and per-session VAD state;
 - existing JoyVL behavior.
 
 The checkpoint does not claim:
@@ -605,11 +606,11 @@ scoped to one `response_id` unless stated otherwise.
 | Public event | Trigger and ordering | Cardinality |
 | --- | --- | --- |
 | `response.created` | First event for a visible assistant response; precedes its output-item, content-part, speak, text, and audio events. | Exactly once for every visible response. |
-| `response.speak` | The model selected speak; emitted after `response.created` and no later than the first `response.audio.delta`. It carries decision metadata, not transcript text. | At most once. |
-| `response.audio.delta` | Carries one ordered audio chunk. Every emitted audio delta is followed by a `response.audio_transcript.delta` for the same chunk. | Zero or more. |
-| `response.audio_transcript.delta` | Append-only transcript contribution paired with an audio delta; it may be empty for a text-less audio unit and must not repeat or overlap earlier text. | One per audio delta. |
-| `response.audio.done` | Closes the audio stream after its final delta and before response terminal events. It is omitted for a response with no audio or transcript. | At most once. |
-| `response.audio_transcript.done` | Contains the exact concatenation of all non-overlapping transcript deltas for the response. | At most once, and only for a non-empty transcript. |
+| `response.speak` | The model selected speak; emitted after `response.created` and no later than the first `response.output_audio.delta`. It carries decision metadata, not transcript text. | At most once. |
+| `response.output_audio.delta` | Carries one ordered audio chunk. Every emitted audio delta is followed by a `response.output_audio_transcript.delta` for the same chunk. | Zero or more. |
+| `response.output_audio_transcript.delta` | Append-only transcript contribution paired with an audio delta; it may be empty for a text-less audio unit and must not repeat or overlap earlier text. | One per audio delta. |
+| `response.output_audio.done` | Closes the audio stream after its final delta and before response terminal events. It is omitted for a response with no audio or transcript. | At most once. |
+| `response.output_audio_transcript.done` | Contains the exact concatenation of all non-overlapping transcript deltas for the response. | At most once, and only for a non-empty transcript. |
 | `response.output_item.done` / `conversation.item.done` | Finalize the assistant item after content-part terminal events and before `response.done`. | At most once each. |
 | `response.done` | Terminal event for a created response; follows audio, transcript, content-part, and item terminal events. | Exactly once for every created response that reaches a terminal state. |
 | `rate_limits.updated` | Compatibility event emitted immediately after `response.done`; the current payload has an empty rate-limit list. | Once per emitted `response.done`. |
@@ -624,8 +625,8 @@ response and never reuse that response ID for later model turns.
 
 Compatibility changes must update this table and its protocol contract tests in
 the same change. The golden transcript test requires joined
-`response.audio_transcript.delta` values to equal
-`response.audio_transcript.done.transcript`; response tests separately enforce
+`response.output_audio_transcript.delta` values to equal
+`response.output_audio_transcript.done.transcript`; response tests separately enforce
 at-most-once `response.speak` and terminal event cardinality.
 
 ### Session internal ledgers
@@ -652,7 +653,7 @@ EOS decisions advance the model conversation.
 
 Explicit Realtime clients may still use `input_audio_buffer.commit` to create a
 conversation item. The translator validates that wire input before producing a
-commit carrying `realtime_item_id`. Native auto-response may already have
+commit carrying `item_id`. Native auto-response may already have
 streamed those PCM samples into the runtime, so the runner accepts a validated
 commit even when no runtime-side chunk remains. A truly empty explicit buffer
 continues to return `input_audio_buffer_empty`.
@@ -677,8 +678,7 @@ multi-turn runtime evidence.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
-item". Silent overlap no longer discards earlier user PCM. A separate explicit
-`server_vad` policy is documented in the Realtime contract above.
+item". Silent overlap no longer discards earlier user PCM.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS

@@ -119,7 +119,7 @@ async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path
                 await websocket.send(
                     json.dumps(
                         {
-                            "type": "response.audio.delta",
+                            "type": "response.output_audio.delta",
                             "response_id": "r1",
                             "delta": base64.b64encode(b"\0\0" * 240).decode(),
                             "sample_rate_hz": 24_000,

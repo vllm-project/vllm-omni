@@ -140,6 +140,7 @@ class TestMetricKeys:
                 raise AssertionError("diffusion_engine_total_time_ms should be attached in step_streaming()")
 
         assert '"diffusion_engine_exec_time_ms": exec_total_time * 1000' in step_streaming_source
+        assert '"output_ready_wait_time_ms": output_ready_wait_time * 1000' in step_streaming_source
         # step_total_ms is no longer emitted as a metric (no family consumes
         # it); it lives only in the debug log breakdown below.
         assert '"diffusion_engine_total_time_ms"' not in step_streaming_source

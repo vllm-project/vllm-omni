@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -13,6 +13,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
 
@@ -30,6 +31,10 @@ class Gr00tN1d7Pipeline(nn.Module):
     vLLM-Omni owns the serving integration: OpenPI observations arrive through
     `sampling_params.extra_args["robot_obs"]`, this pipeline runs GR00T policy
     inference, and actions are returned through `DiffusionOutput.output["actions"]`.
+
+    The request's `seed` (materialised by the runner into `sampling_params.generator`)
+    draws the flow-matching noise, so repeating a request with the same seed reproduces
+    its action chunk.
     """
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
@@ -123,13 +128,43 @@ class Gr00tN1d7Pipeline(nn.Module):
             self.reset()
 
         policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
-        result = self.policy.get_action(policy_obs)
+        generator = _noise_generator(req.sampling_params, self.device)
+        result = self.policy.get_action(policy_obs, {"generator": generator} if generator is not None else None)
         actions = result[0] if isinstance(result, tuple) else result
         if not isinstance(actions, Mapping):
             return DiffusionOutput(error=f"GR00T policy returned {type(actions).__name__}; expected dict actions.")
         # Return actions via output.output (like the DreamZero OpenPI policy) so the engine's
         # empty-output guard passes.
         return DiffusionOutput(output={"actions": _to_float32_action_dict(actions)})
+
+
+def _noise_generator(sampling_params: OmniDiffusionSamplingParams, device: str) -> torch.Generator | None:
+    """Pick the generator that draws the action head's initial noise.
+
+    The runner materialises ``sampling_params.seed`` into ``sampling_params.generator`` on
+    the model device before every forward, and ``OmniDiffusionRequest`` assigns a random
+    seed when the caller omits one, so in serving the generator is always present. The
+    seed fallback serves callers that bypass the runner (direct use, unit tests). ``None``
+    leaves the action head on the global RNG, as upstream Isaac-GR00T runs. GR00T draws one
+    noise tensor per request, so a generator in any other form (for example a list of several
+    generators) is ignored with a warning and the seed fallback applies.
+    """
+    generator = sampling_params.generator
+    if isinstance(generator, list) and len(generator) == 1:
+        generator = generator[0]
+    if isinstance(generator, torch.Generator):
+        return generator
+    if generator is not None:
+        received = f"a list of {len(generator)} generators" if isinstance(generator, list) else type(generator).__name__
+        logger.warning(
+            "GR00T expects a single torch.Generator per request but got %s; ignoring it. The initial noise "
+            "falls back to sampling_params.seed=%s, or to the global RNG when that is None.",
+            received,
+            sampling_params.seed,
+        )
+    if sampling_params.seed is not None:
+        return torch.Generator(device=device).manual_seed(int(sampling_params.seed))
+    return None
 
 
 def _normalize_observation(robot_obs: Mapping[str, Any], *, language_key: str) -> dict[str, Any]:

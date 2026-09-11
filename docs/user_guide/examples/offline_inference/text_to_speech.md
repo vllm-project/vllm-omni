@@ -126,11 +126,7 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ## Fish Speech S2 Pro
 
 4B dual-AR text-to-speech model from FishAudio with the DAC codec at 44.1 kHz.
-
-### Prerequisites
-```bash
-pip install fish-speech
-```
+No extra packages are required; the DAC codec is vendored in vLLM-Omni.
 
 ### Quick start
 ```bash

@@ -356,7 +356,7 @@
       case 'response.speak':
         beginAssistant(responseId);
         break;
-      case 'response.audio.delta':
+      case 'response.output_audio.delta':
         currentResponseId = responseId || currentResponseId;
         assistantActive = true;
         setModel('Speaking');
@@ -364,13 +364,13 @@
           .then((decoded) => feedPlayback(decoded, responseId))
           .catch((error) => appendLog(`audio decode failed: ${error.message || error}`, true));
         break;
-      case 'response.audio.done':
+      case 'response.output_audio.done':
         requestPlaybackDrain(responseId);
         break;
-      case 'response.audio_transcript.delta':
+      case 'response.output_audio_transcript.delta':
         addTranscript('assistant', event.delta || '');
         break;
-      case 'response.audio_transcript.done':
+      case 'response.output_audio_transcript.done':
         finishTranscript('assistant', event.transcript || '');
         break;
       case 'conversation.item.input_audio_transcription.delta':

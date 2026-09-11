@@ -76,6 +76,29 @@ MEDIAN_IMAGE_GENERATION_MS = f"median_{IMAGE_GENERATION}_ms"
 STD_IMAGE_GENERATION_MS = f"std_{IMAGE_GENERATION}_ms"
 PERCENTILES_IMAGE_GENERATION_MS = f"percentiles_{IMAGE_GENERATION}_ms"
 
+VIDEO_DURATION = "video_duration"
+VIDEO_RTF = "video_rtf"
+VIDEO_GENERATION = "video_generation"
+VIDEO_GENERATION_TIME_MS = f"{VIDEO_GENERATION}_time_ms"
+VIDEO_FRAMES = "video_frames"
+TOTAL_VIDEO_DURATION_S = f"total_{VIDEO_DURATION}_s"
+TOTAL_VIDEO_FRAMES = f"total_{VIDEO_FRAMES}"
+VIDEO_THROUGHPUT = "video_throughput"
+MEAN_VIDEO_RTF = f"mean_{VIDEO_RTF}"
+MEDIAN_VIDEO_RTF = f"median_{VIDEO_RTF}"
+STD_VIDEO_RTF = f"std_{VIDEO_RTF}"
+PERCENTILES_VIDEO_RTF = f"percentiles_{VIDEO_RTF}"
+MEAN_VIDEO_GENERATION_MS = f"mean_{VIDEO_GENERATION}_ms"
+MEDIAN_VIDEO_GENERATION_MS = f"median_{VIDEO_GENERATION}_ms"
+STD_VIDEO_GENERATION_MS = f"std_{VIDEO_GENERATION}_ms"
+PERCENTILES_VIDEO_GENERATION_MS = f"percentiles_{VIDEO_GENERATION}_ms"
+
+PEAK_MEMORY_MB = "peak_memory_mb"
+MEAN_PEAK_MEMORY_MB = f"mean_{PEAK_MEMORY_MB}"
+MEDIAN_PEAK_MEMORY_MB = f"median_{PEAK_MEMORY_MB}"
+STD_PEAK_MEMORY_MB = f"std_{PEAK_MEMORY_MB}"
+PERCENTILES_PEAK_MEMORY_MB = f"percentiles_{PEAK_MEMORY_MB}"
+
 # Stage snapshot / StageBenchmarkMetrics field names.
 TOTAL_OUTPUT = "total_output"
 TTFTS = "ttfts"
@@ -138,6 +161,12 @@ AUDIO_UNDERRUN_S = METRIC_PREFIX + AUDIO_UNDERRUN + "_s"
 AUDIO_CONTINUITY_OK_METRIC = METRIC_PREFIX + AUDIO_CONTINUITY_OK
 AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
 
+# Realtime Server VAD serving metrics.
+REALTIME_VAD_ACTIVE_SESSIONS = METRIC_PREFIX + "realtime_vad_active_sessions"
+REALTIME_VAD_INFERENCE_LATENCY_S = METRIC_PREFIX + "realtime_vad_inference_latency_s"
+REALTIME_VAD_ENDPOINT_DELAY_S = METRIC_PREFIX + "realtime_vad_endpoint_delay_s"
+REALTIME_VAD_ERRORS = METRIC_PREFIX + "realtime_vad_errors"
+
 
 # ============================================================================
 # Diffusion family (per-stage + per-replica diffusion timing breakdowns)
@@ -166,7 +195,7 @@ STAGE_WAITING_REQUESTS = METRIC_PREFIX + "stage_waiting_requests"
 NUM_INFERENCE_STEPS = METRIC_PREFIX + "num_inference_steps"
 IMAGE_COUNT_METRIC = METRIC_PREFIX + IMAGE_COUNT
 IMAGE_PIXELS_METRIC = METRIC_PREFIX + IMAGE_PIXELS
-PEAK_MEMORY_MB = METRIC_PREFIX + "peak_memory_mb"
+PEAK_MEMORY_MB_METRIC = METRIC_PREFIX + "peak_memory_mb"
 REQUESTS_FAILED = METRIC_PREFIX + "requests_failed"
 KV_WAIT_S = METRIC_PREFIX + "kv_wait_s"
 DIFFUSION_FORWARD_S = METRIC_PREFIX + "diffusion_forward_s"

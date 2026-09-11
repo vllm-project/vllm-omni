@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 MODEL_ID = "HiDream-ai/HiDream-O1-Image"
 PROMPT = "A cat is sitting next to a sign that says 'HiDream-O1 vLLM-Omni'"

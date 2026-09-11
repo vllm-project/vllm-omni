@@ -2,6 +2,8 @@
 
 You may find information about contributing to vLLM-Omni on [Contributing](https://vllm-omni.readthedocs.io/en/latest/contributing/).
 
+AI-assisted contributions must follow the [AI Usage Policy](docs/contributing/README.md#ai-usage-policy), including disclosure, human review, and validation requirements.
+
 Local `pre-commit` gates (SPDX, forbidden imports, `torch.cuda`, shellcheck,
 mypy, test marks, TTS adapter ratchet, markdownlint, Buildkite schema, and
 how to extend allowlists) are documented in the

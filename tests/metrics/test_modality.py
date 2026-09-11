@@ -532,6 +532,7 @@ class TestDiffusionUnitConversion:
             metrics={
                 "preprocess_time_ms": 50.0,
                 "diffusion_engine_exec_time_ms": 1500.0,
+                "output_ready_wait_time_ms": 250.0,
                 "postprocess_time_ms": 20.0,
                 "vae_decode_time_ms": 300.0,
                 "forward_time_ms": 800.0,
@@ -545,6 +546,7 @@ class TestDiffusionUnitConversion:
         assert dict(aggregator.diffusion_metrics["req-units"]) == {
             "preprocess_time_s": pytest.approx(0.05),
             "diffusion_engine_exec_time_s": pytest.approx(1.5),
+            "output_ready_wait_time_s": pytest.approx(0.25),
             "postprocess_time_s": pytest.approx(0.02),
             "vae_decode_time_s": pytest.approx(0.3),
             "forward_time_s": pytest.approx(0.8),

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex (Nemotron-Labs-Audex-2B) TTS serving adapter."""
 
+import os
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
@@ -28,6 +30,30 @@ class AudexAdapter(ARTTSAdapter):
 
     stage_keys = frozenset({"audex_thinker", "audex_omni"})
     name = "audex"
+
+    def __init__(self, ctx) -> None:
+        super().__init__(ctx)
+        self._tokenizer = None
+
+    def _get_tokenizer(self):
+        """Load and cache the tokenizer used only by the Audex TTS adapter."""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+            stage = getattr(getattr(self.ctx.server._tts_stage, "engine_args", None), "model_stage", None)
+            profile, folder = (
+                ("full", "checkpoint_folder_full") if stage == "audex_omni" else ("tts", "checkpoint_folder_audiogen")
+            )
+            model_path = os.path.normpath(self.ctx.engine_client.model_config.model)
+            root = (
+                os.path.dirname(model_path)
+                if os.path.basename(model_path).startswith("checkpoint_folder")
+                else ensure_audex_snapshot(model_path, profile=profile)
+            )
+            self._tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
+        return self._tokenizer
 
     @classmethod
     def stage_serves_speech(cls, model_stage: str | None, all_stage_keys: frozenset[str]) -> bool:
@@ -102,7 +128,6 @@ class AudexAdapter(ARTTSAdapter):
         element of the engine's shared ``default_sampling_params_list`` —
         see ``_inject_audex_tta_args``).
         """
-        server = self.ctx.server
         import copy
 
         stage0_params = copy.deepcopy(stage0_params)
@@ -121,7 +146,7 @@ class AudexAdapter(ARTTSAdapter):
         cond_prompt = prompt.get("prompt") if isinstance(prompt, dict) else prompt
         if not isinstance(cond_prompt, str) or not cond_prompt:
             raise ValueError("Audex CFG requires the adapter-built text prompt")
-        null_prompt = build_null_prompt(cond_prompt, server._get_audex_tokenizer())
+        null_prompt = build_null_prompt(cond_prompt, self._get_tokenizer())
         extra_args.update(
             {
                 "cfg_scale": cfg_scale,

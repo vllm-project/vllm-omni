@@ -75,7 +75,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
-from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
+from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -1647,9 +1647,11 @@ class Orchestrator:
         stage_id: int,
         error: str,
         *,
+        status_code: int = HTTPStatus.BAD_REQUEST.value,
+        error_type: str = DEFAULT_CLIENT_ERROR_TYPE,
         close_duplex_sessions: bool = False,
     ) -> None:
-        """Fail one request with a non-fatal 400 (bad input, engine survives).
+        """Fail one request with a non-fatal client error (400 by default).
 
         The non-fatal counterpart of `_fail_request_dead_stage`: emits a
         client-error ErrorMessage (default `fatal=False`) so the engine keeps
@@ -1658,8 +1660,8 @@ class Orchestrator:
         await self.output_async_queue.put(
             ErrorMessage(
                 error=error,
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                error_type=DEFAULT_CLIENT_ERROR_TYPE,
+                status_code=status_code,
+                error_type=error_type,
                 request_id=req_id,
                 stage_id=stage_id,
             )
@@ -2073,6 +2075,8 @@ class Orchestrator:
                 )
                 if (
                     req_state.streaming.enabled
+                    # A failed forward may already have cleaned up this request.
+                    and self.request_states.get(req_id) is req_state
                     and finished
                     and not final_only_finished
                     and not self._is_duplex_session_request(req_state)
@@ -2734,6 +2738,16 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
+        except OmniClientError as exc:
+            await self._fail_request_client_error(
+                req_id,
+                next_logical,
+                str(exc),
+                status_code=exc.status_code,
+                error_type=exc.error_type,
+                close_duplex_sessions=self._is_duplex_session_request(req_state),
+            )
+            return
         except Exception as exc:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",

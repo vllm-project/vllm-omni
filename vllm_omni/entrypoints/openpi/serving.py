@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Serving layer for robot policy inference via `/v1/realtime/robot/openpi`.
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ActionOutput = np.ndarray | dict[str, np.ndarray]
+ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -148,16 +148,38 @@ class ServingRealtimeRobotOpenPI:
         `AsyncOmni.generate()` and routed to the diffusion stage.
         """
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.entrypoints.openai.stage_params import (
+            clone_sampling_params,
+            get_default_sampling_params_list,
+        )
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        extra_args = {
-            "reset": reset,
-            "session_id": session_id,
-            "robot_obs": obs,
-        }
+        # The engine applies stage default_sampling_params only to requests
+        # that carry no explicit params; this endpoint always passes explicit
+        # params, so start from a clone of the diffusion stage's defaults
+        # (e.g. a policy deploy yaml's ``extra_args``) and layer the OpenPI
+        # protocol fields on top.
+        seed = obs.pop("seed", None)
+        sampling_params = OmniDiffusionSamplingParams()
+        for default_params in get_default_sampling_params_list(self.engine_client):
+            if isinstance(default_params, OmniDiffusionSamplingParams):
+                sampling_params = clone_sampling_params(default_params)
+                break
+
+        extra_args = sampling_params.extra_args or {}
+        extra_args.update(
+            {
+                "reset": reset,
+                "session_id": session_id,
+                "robot_obs": obs,
+            }
+        )
 
         prompt = obs.get("prompt", "")
-        sampling_params = OmniDiffusionSamplingParams(extra_args=extra_args)
+        sampling_params = OmniDiffusionSamplingParams(
+            seed=int(seed) if seed is not None else None,
+            extra_args=extra_args,
+        )
         return OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,

@@ -11,7 +11,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -52,11 +52,13 @@ from vllm_omni.engine.stage_init_utils import (
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
+    device_overlap_group_keys,
     extract_legacy_stage_metadata,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
+    parse_physical_device_ids,
     prepare_engine_environment,
     release_device_locks,
     stage_runtime_env,
@@ -147,12 +149,9 @@ class StageRuntime:
         self.stage_pools: list[StagePool] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
-        # Serialize all LLM replica spawning + handshake across device groups
-        # to prevent ZMQ port-allocation races (get_engine_zmq_addresses) and
-        # CUDA-context conflicts when multiple engine core subprocesses
-        # initialize simultaneously on different GPUs.  Matches the old
-        # AsyncOmniEngine._initialize_llm_replica pattern which used a single
-        # ``llm_stage_launch_lock`` for all replicas.
+        # Serialize process spawning and process-global environment overlays.
+        # Readiness waits use per-device initialization protection so different
+        # device groups can initialize concurrently.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
 
@@ -446,9 +445,10 @@ class StageRuntime:
     ) -> dict[int, list[StagePoolClient | None]]:
         """Initialize all stage replicas.
 
-        Stages sharing the same GPU are initialized sequentially to avoid
-        memory profiling interference. Stages on different GPUs are
-        initialized in parallel.
+        Stages that share any physical GPU — including overlapping-but-unequal
+        sets such as ``{0,1}`` and ``{0}`` — initialize sequentially to avoid
+        memory profiling interference and same-process ``flock`` self-contention.
+        Stages on disjoint GPUs initialize in parallel.
         """
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
@@ -464,10 +464,7 @@ class StageRuntime:
             self._reject_unguardable_executors(stage_plans)
             self._run_stage_admission(stage_plans)
 
-        init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
-        for plan in stage_plans:
-            for replica in plan.replicas:
-                init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
+        init_groups = self._build_init_groups(stage_plans)
 
         def _init_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
             """Initialize replicas in one scheduling group sequentially."""
@@ -589,19 +586,8 @@ class StageRuntime:
                 # fails admission (fail-closed in check_admission).
                 return ADMISSION_EXEMPT
             resolved = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
-            if not resolved:
-                return None
-            ids: list[int] = []
-            for tok in str(resolved).split(","):
-                tok = tok.strip()
-                if not tok:
-                    continue
-                try:
-                    ids.append(int(tok))
-                except ValueError:
-                    # Non-integer visibility (UUID / MIG) can't be reasoned about.
-                    return None
-            return ids or None
+            parsed = parse_physical_device_ids(resolved)
+            return sorted(parsed) if parsed else None
 
         def _visible_ordinal(physical_id: int) -> int:
             """Translate a physical device id to this process's visible ordinal.
@@ -656,47 +642,58 @@ class StageRuntime:
             device_total_memory=_total_memory,
         )
 
-    def _replica_init_group_key(self, replica: ReplicaInitPlan) -> str:
-        """Return the scheduling group used during replica initialization.
+    def _build_init_groups(
+        self,
+        stage_plans: Sequence[LogicalStageInitPlan],
+    ) -> dict[str, list[tuple[int, ReplicaInitPlan]]]:
+        items = [(plan.stage_idx, replica) for plan in stage_plans for replica in plan.replicas]
+        groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
+        for key, item in zip(self._init_group_keys([replica for _, replica in items]), items, strict=True):
+            groups.setdefault(key, []).append(item)
+        return groups
 
-        Replicas sharing a group initialize sequentially; different groups
-        initialize in parallel threads. Local LLM replicas are keyed by their
-        **resolved canonical physical device set** so stages on different
-        physical GPUs land in different groups (parallel) while stages sharing a
-        device stay in one group (serialized, then further guarded by the
-        per-device ``LOCK_EX`` file lock). Keying on the raw ``runtime.devices``
-        config value instead would fail to parallelize logically-distinct stages
-        that map to different physical GPUs.
+    def _init_group_keys(self, replicas: Sequence[ReplicaInitPlan]) -> list[str]:
+        """One init-group key per replica: same key -> sequential, distinct -> parallel.
+
+        Diffusion, remote and parallel-stage-init replicas keep fixed per-replica
+        keys. Serial local LLM replicas are grouped by connected components of
+        their resolved physical-device overlap, so ``{0,1}`` and ``{0}`` share a
+        group and never re-``flock`` a device this process already holds.
         """
+        keys = [self._init_group_key_override(replica) for replica in replicas]
+        pending = [i for i, key in enumerate(keys) if key is None]
+        device_sets: list[frozenset[int] | None] = []
+        for i in pending:
+            replica = replicas[i]
+            physical = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
+            parsed = parse_physical_device_ids(physical)
+            if parsed is None:
+                logger.warning(
+                    "[stage_init] Stage-%s replica %s physical devices %r are not integer GPU ids; "
+                    "all serial LLM replicas will share one init group",
+                    replica.metadata.stage_id,
+                    replica.replica_id,
+                    physical,
+                )
+            device_sets.append(parsed)
+        for i, key in zip(pending, device_overlap_group_keys(device_sets), strict=True):
+            keys[i] = key
+        return cast(list[str], keys)
+
+    def _init_group_key_override(self, replica: ReplicaInitPlan) -> str | None:
+        """Key that bypasses device-overlap grouping, or ``None`` to use it."""
         if replica.launch_mode == "local" and replica.metadata.stage_type == "diffusion":
             # Local diffusion process spawning must stay on the orchestrator
             # thread. Keep all local diffusion replicas in one sequential group.
             return "inline:diffusion"
         if replica.launch_mode == "remote":
             return f"remote:{replica.metadata.stage_id}:{replica.replica_id}"
-
-        physical_devices = self._resolve_replica_physical_devices(
-            replica.metadata.stage_id,
-            replica.metadata.runtime_cfg,
-        )
         if self._parallel_stage_init:
             # Same-device concurrency is coordinated by the engine-core SH/EX
             # device locks + pre-launch admission, so give every replica its own
             # group to let them all initialize in parallel.
             return f"parallel:{replica.metadata.stage_id}:{replica.replica_id}"
-
-        runtime_cfg = replica.metadata.runtime_cfg or {}
-        raw_devices = (
-            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        )
-        if str(raw_devices) != str(physical_devices):
-            logger.debug(
-                "[stage_init] Stage-%s init-group key: raw devices=%s -> resolved physical=%s",
-                replica.metadata.stage_id,
-                raw_devices,
-                physical_devices,
-            )
-        return f"device:{physical_devices}"
+        return None
 
     def _initialize_replica(
         self,
@@ -778,43 +775,25 @@ class StageRuntime:
                 spawn_device_lock=self._spawn_device_lock,
                 omni_parallel_stage_init=self._parallel_stage_init,
             )
-            # G2 launch lock serializes engine-core *spawning* across replicas
-            # (ZMQ port-allocation races + simultaneous CUDA context init).
-            #   * Default path: hold it across the whole launch context manager,
-            #     whose __exit__ waits for READY — this serializes the full child
-            #     init (spawn + load + profile + KV + capture).
-            #   * Parallel path: hold it only around the spawn (__enter__); run
-            #     the READY-wait (__exit__) outside the lock so replicas init
-            #     concurrently, coordinated by the child SH/EX device locks.
-            if self._parallel_stage_init:
-                # The per-stage runtime.env overlay mutates os.environ
-                # (process-global), so it must be applied under the launch lock
-                # and only needs to cover the spawn (__enter__) — children
-                # inherit the env at spawn time; the READY-wait needs no env.
-                g2_start = time.perf_counter()
+            # Only process spawning and the runtime.env overlay need the global
+            # launch lock. The launch context's exit waits for READY: holding the
+            # lock there serializes model loading and compilation even across
+            # different GPUs. Default initialization keeps its per-device EX
+            # locks until READY; parallel_stage_init uses child phase locks.
+            g2_start = time.perf_counter()
+            with ExitStack() as launch_stack:
                 with self._replica_launch_lock:
-                    with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
-                        resources = launch_cm.__enter__()
-                g2_spawned = time.perf_counter()
-                launch_cm.__exit__(None, None, None)
-                logger.debug(
-                    "[stage_init] Stage-%s G2 spawn(locked)=%.3fs, READY(unlocked)=%.3fs",
-                    plan.metadata.stage_id,
-                    g2_spawned - g2_start,
-                    time.perf_counter() - g2_spawned,
-                )
-            else:
-                g2_start = time.perf_counter()
-                with self._replica_launch_lock, stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                     g2_locked = time.perf_counter()
-                    with launch_cm as resources:
-                        pass
-                logger.debug(
-                    "[stage_init] Stage-%s G2 launch-lock wait=%.3fs, spawn+READY=%.3fs",
-                    plan.metadata.stage_id,
-                    g2_locked - g2_start,
-                    time.perf_counter() - g2_locked,
-                )
+                    with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
+                        resources = launch_stack.enter_context(launch_cm)
+                g2_spawned = time.perf_counter()
+            logger.debug(
+                "[stage_init] Stage-%s G2 launch-lock wait=%.3fs, spawn=%.3fs, READY=%.3fs",
+                plan.metadata.stage_id,
+                g2_locked - g2_start,
+                g2_spawned - g2_locked,
+                time.perf_counter() - g2_spawned,
+            )
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:

@@ -35,6 +35,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.utils import make_attention_mask
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -1554,17 +1555,11 @@ class BooguImageTransformer2DModel(nn.Module):
         img_hidden_states = combined_img_hidden_states
 
         # Joint mask for [instruct + image].
-        max_seq_len = max(seq_lengths)
-        joint_attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
-        for i, seq_len in enumerate(seq_lengths):
-            joint_attention_mask[i, :seq_len] = True
+        joint_attention_mask = make_attention_mask(hidden_states, seq_lengths)
 
         # Dual-stream (double-stream) stage.
         if self.num_double_stream_layers > 0:
-            max_img_len = max(combined_img_seq_lengths)
-            img_attention_mask = hidden_states.new_zeros(batch_size, max_img_len, dtype=torch.bool)
-            for i, img_seq_len in enumerate(combined_img_seq_lengths):
-                img_attention_mask[i, :img_seq_len] = True
+            img_attention_mask = make_attention_mask(hidden_states, combined_img_seq_lengths)
 
             for layer in self.double_stream_layers:
                 img_hidden_states, instruct_hidden_states = layer(

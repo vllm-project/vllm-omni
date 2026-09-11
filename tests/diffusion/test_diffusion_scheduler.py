@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -10,8 +10,9 @@ import pytest
 import torch
 import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from pytest_mock import MockerFixture
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
+from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -104,7 +105,7 @@ def _initialize_paged_scheduler(
     )
     config = KVCacheConfig(
         num_blocks=num_blocks,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layer0"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, num_blocks, ["layer0"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)],
     )
     scheduler.initialize(

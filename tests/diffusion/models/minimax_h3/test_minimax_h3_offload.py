@@ -13,12 +13,14 @@ from PIL import Image
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def test_h3_profiler_targets_cover_aggregate_reference_encoders():
+def test_h3_profiler_targets_cover_reference_encoders_and_vae_decoders():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     targets = MiniMaxH3Pipeline._PROFILER_TARGETS
     assert "_encode_visual_conditions" in targets
     assert "_encode_reference_audio_conditions" in targets
+    assert "video_vae.decode_latent" in targets
+    assert "audio_vae.decode_latent" in targets
     assert "_encode_video_conditions" not in targets
     assert "_encode_video_audio_conditions" not in targets
     assert "_encode_audio_conditions" not in targets

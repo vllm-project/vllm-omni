@@ -683,6 +683,8 @@ class MiniMaxH3Pipeline(
         "_encode_reference_audio_conditions",
         "diffuse",
         "decode",
+        "video_vae.decode_latent",
+        "audio_vae.decode_latent",
         "prepare_encode",
         "denoise_step",
         "post_decode",
@@ -2456,8 +2458,9 @@ class MiniMaxH3Pipeline(
             if audio_lengths:
                 if any(length < 80 or length > 600 for length in audio_lengths):
                     raise OmniClientError("MiniMax H3 audio references must each be between 2 and 15 seconds")
-                if sum(audio_lengths) > 600:
-                    raise OmniClientError("MiniMax H3 audio references must be at most 15 seconds in total")
+                # Video soundtracks and standalone audio have separate
+                # 15-second budgets, validated before encoding. Do not merge
+                # those budgets when concatenating their conditioning rows.
                 if len(audio_lengths) == 1:
                     ref_audio_t = audio_lengths[0]
 

@@ -36,19 +36,13 @@ Other hardware and configurations are welcome as community validation lands.
 
 - OS: Linux
 - Python: 3.10+
-- Required package: `fish-speech` (for DAC codec)
 - CUDA 12.8
 - vLLM version: 0.19.0
 - vLLM-Omni version or commit: c93359bb354a6aa5c14d062430cb85b2c4db251e
 
-```bash
-# Install PortAudio dependency if missing (required by pyaudio which is a dependency of fish-speech)
-# For Ubuntu/Debian:
-if ! dpkg -l | grep -q libportaudio2; then
-    sudo apt-get update && sudo apt-get install -y libportaudio2 portaudio19-dev
-fi
-pip install fish-speech
-```
+No extra packages are required: the DAC codec architecture is vendored in
+vLLM-Omni (`vllm_omni/model_executor/models/fish_speech/dac_modules/`), so the
+model runs out of the box, including in the official Docker image.
 
 #### Kvcache attention fast path
 
@@ -129,7 +123,6 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 - OS: Linux
 - Python: 3.10+
-- Required package: `fish-speech` (for DAC codec)
 - CUDA 12.8
 - vLLM version: 0.19.0+
 

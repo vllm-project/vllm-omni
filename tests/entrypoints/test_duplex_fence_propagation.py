@@ -74,7 +74,7 @@ async def test_openai_handler_passes_current_session_fence_for_runtime_controls(
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
     session = DuplexSession(
         session_id="sid",
-        config=DuplexSessionConfig(),
+        config=DuplexSessionConfig(extra_body={"native_duplex": True}),
         epoch=1,
         turn_id=2,
     )
@@ -92,7 +92,7 @@ async def test_openai_handler_passes_current_session_fence_for_runtime_controls(
 async def test_runtime_signal_uses_fence_captured_before_session_turn_advances():
     engine = FenceRecordingEngine()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
-    session = DuplexSession(session_id="sid", config=DuplexSessionConfig())
+    session = DuplexSession(session_id="sid", config=DuplexSessionConfig(extra_body={"native_duplex": True}))
     captured_fence = DuplexFence("sid", epoch=0, turn_id=0)
     session.turn_id = 1
 
@@ -111,7 +111,7 @@ async def test_openai_handler_forwards_cancel_fence_through_async_omni_facade():
     app = object.__new__(AsyncOmni)
     app.engine = engine
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(app))
-    session = DuplexSession(session_id="sid-cancel", config=DuplexSessionConfig())
+    session = DuplexSession(session_id="sid-cancel", config=DuplexSessionConfig(extra_body={"native_duplex": True}))
     cancelled_fence = DuplexFence("sid-cancel", epoch=2, turn_id=3)
     next_fence = DuplexFence("sid-cancel", epoch=3, turn_id=3)
 

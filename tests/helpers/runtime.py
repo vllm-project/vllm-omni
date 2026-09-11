@@ -968,7 +968,6 @@ def iter_omni_server(
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--deploy-config", stage_config_path]
 
             with OmniServerStageCli(
                 model,

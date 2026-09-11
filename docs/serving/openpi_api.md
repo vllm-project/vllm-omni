@@ -64,7 +64,7 @@ connect
   <- msgpack(policy_server_config)
 
 infer
-  -> msgpack({"endpoint": "infer", "session_id": "...", ...observation})
+  -> msgpack({"endpoint": "infer", "session_id": "...", "seed": <optional int>, ...observation})
   <- msgpack(ndarray | dict[str, ndarray])
 
 reset
@@ -92,6 +92,12 @@ frames are not observation messages.
 - The policy pipeline owns observation transforms and persistent model state,
   normally keyed by `session_id`; the API layer forwards the raw observation
   dictionary.
+- An optional integer `seed` in an inference message becomes the engine
+  request's `sampling_params.seed`. A policy whose sampling consumes the
+  request generator (GR00T-N1.7) returns the same action chunk for the same
+  observation and seed. If omitted, the engine assigns a random per-request
+  seed, so unseeded inferences are independent of each other. The API layer
+  consumes `seed`; it is not forwarded inside the observation.
 
 ## Limits and Errors
 
