@@ -29,6 +29,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -153,10 +154,49 @@ class ErnieImagePipeline(
             self.pe_tokenizer = None
             self.use_pe = False
 
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, ErnieImageTransformer2DModel)
-        self.transformer = ErnieImageTransformer2DModel(
-            quant_config=od_config.quantization_config, **transformer_kwargs
-        )
+        # Transformer: NPU uses parallel_config+od_config, GPU uses get_transformer_config_kwargs+quant_config
+        if current_omni_platform.is_npu():
+            from pathlib import Path
+
+            import safetensors.torch
+
+            self.parallel_config = getattr(od_config, "parallel_config", None)
+            # Load transformer config from config.json
+            transformer_config_path = Path(model) / "transformer" / "config.json"
+            if transformer_config_path.exists():
+                with open(transformer_config_path) as f:
+                    tf_config_dict = json.load(f)
+            else:
+                tf_config_dict = {}
+
+            self.transformer = ErnieImageTransformer2DModel(
+                parallel_config=self.parallel_config,
+                od_config=od_config,
+                **tf_config_dict,  # Pass config params (hidden_size=4096, num_heads=32, etc.)
+            ).to(self._execution_device)
+
+            # CRITICAL: NPU must load weights in __init__, not in load_weights()
+            # Performance impact (1024x1024, 50 steps, SP=4):
+            #   - With __init__ loading: ~27s (normal)
+            #   - Without __init__ loading: ~34s (21% slower, +7s)
+            # Reason: load_weights() may be called repeatedly or has initialization overhead
+            # DO NOT remove this block unless verified with benchmark
+            transformer_path = Path(model) / "transformer"
+            weight_files = list(transformer_path.glob("*.safetensors"))
+            if weight_files:
+                weights_dict = {}
+                for weight_file in weight_files:
+                    file_weights = safetensors.torch.load_file(str(weight_file))
+                    file_weights = {k.replace("transformer.", ""): v for k, v in file_weights.items()}
+                    weights_dict.update(file_weights)
+                self.transformer.load_weights(weights_dict.items())
+            else:
+                logger.warning("No safetensors files found at %s", transformer_path)
+        else:
+            transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, ErnieImageTransformer2DModel)
+            self.transformer = ErnieImageTransformer2DModel(
+                quant_config=od_config.quantization_config, **transformer_kwargs
+            )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels)) if getattr(self, "vae", None) else 16
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
@@ -427,6 +467,8 @@ class ErnieImagePipeline(
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
+        # Allow caller to inject pre-generated latents (e.g. NPU SP) via sampling_params.
+        latents = getattr(req.sampling_params, "latents", None)
 
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -538,6 +580,23 @@ class ErnieImagePipeline(
 
         if output_type == "latent":
             return DiffusionOutput(output=latents)
+
+        return self._vae_decode(latents, device, output_type)
+
+    def _vae_decode(self, latents, device, output_type="pil"):
+        # NPU: SP rank 0 handling (only rank 0 decodes)
+        if current_omni_platform.is_npu():
+            sp_size = getattr(self.parallel_config, "sequence_parallel_size", None) or 1
+            if sp_size > 1:
+                import torch.distributed as dist
+
+                from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_rank, get_sp_group
+
+                sp_rank = get_sequence_parallel_rank()
+                dist.broadcast(latents, src=0, group=get_sp_group().device_group)
+
+                if sp_rank != 0:
+                    return DiffusionOutput(output=[], peak_memory_mb=0.0)
 
         bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(device)
         bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(device)
