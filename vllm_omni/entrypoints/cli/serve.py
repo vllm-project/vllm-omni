@@ -587,6 +587,15 @@ class OmniServeCommand(CLISubcommand):
             help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
         )
         omni_config_group.add_argument(
+            "--diffusion-compile-backend",
+            choices=["auto", "inductor", "mindiesd"],
+            default=None,
+            help=(
+                "Backend for generic diffusion compilation. 'auto' selects the platform-native "
+                "backend when available; 'mindiesd' requires a compatible static-shape NPU setup."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusion-compile-granularity",
             choices=["regional", "full"],
             default=None,
@@ -603,6 +612,15 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Use dynamic shapes for the selected generic diffusion compile scope. "
                 "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-compile-aclgraph",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable MindIE-SD ACLGraph capture/replay in addition to pattern compilation. "
+                "Disabled by default and used only by the NPU 'mindiesd' backend."
             ),
         )
         omni_config_group.add_argument(

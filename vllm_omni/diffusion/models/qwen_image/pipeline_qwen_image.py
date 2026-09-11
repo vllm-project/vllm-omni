@@ -32,6 +32,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
+    canonicalize_qwen_image_attention_mask,
 )
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
@@ -939,6 +940,12 @@ class QwenImagePipeline(
         t = input_batch.timesteps
         self._current_timestep = t
         self.transformer.do_true_cfg = input_batch.do_true_cfg
+        # Preserve request masks until InputBatch has padded and combined them.
+        # Cached batches retain the simplified value on later denoise steps.
+        input_batch.prompt_embeds_mask = canonicalize_qwen_image_attention_mask(input_batch.prompt_embeds_mask)
+        input_batch.negative_prompt_embeds_mask = canonicalize_qwen_image_attention_mask(
+            input_batch.negative_prompt_embeds_mask
+        )
 
         positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
             latents=input_batch.latents,

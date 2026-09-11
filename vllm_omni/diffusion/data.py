@@ -969,8 +969,12 @@ class OmniDiffusionConfig:
     enforce_eager: bool = False
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
+    diffusion_compile_backend: str = "auto"
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # Opt into MindIE-SD ACLGraph capture/replay in addition to pattern
+    # compilation. Kept disabled by default because it is process-global.
+    diffusion_compile_aclgraph: bool = False
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1199,6 +1203,11 @@ class OmniDiffusionConfig:
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
+        if self.diffusion_compile_backend not in {"auto", "inductor", "mindiesd"}:
+            raise ValueError(
+                "diffusion_compile_backend must be 'auto', 'inductor', or 'mindiesd', "
+                f"got {self.diffusion_compile_backend!r}"
+            )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1206,6 +1215,8 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if not isinstance(self.diffusion_compile_aclgraph, bool):
+            raise TypeError(f"diffusion_compile_aclgraph must be a bool, got {type(self.diffusion_compile_aclgraph)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")
