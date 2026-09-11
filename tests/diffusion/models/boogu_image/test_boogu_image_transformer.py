@@ -654,11 +654,12 @@ def _operand_ulp_bound(x, weight, cos, sin):
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_packed_rope_table_layout():
+def test_packed_rope_table_layout(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         _with_packed_rope_table,
     )
 
+    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
     torch.manual_seed(0)
     tokens = 2311  # above _FUSED_MIN_TOKENS
     cos, sin = _fused_rotary_pair(tokens)

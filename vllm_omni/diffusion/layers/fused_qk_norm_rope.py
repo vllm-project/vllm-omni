@@ -612,11 +612,11 @@ def fused_qk_norm_rope_min_tokens(default: int) -> int:
 
     Resolved at call time — consumers call this once per forward, not per
     attention site — so tests and operators can flip it without re-importing.
-    Raises ``ValueError`` if the variable holds anything but a non-negative
-    integer.
+    Unset or blank means the caller's default; anything else that is not a
+    non-negative integer raises ``ValueError``.
     """
     raw = envs.VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
     try:
         value = int(raw)

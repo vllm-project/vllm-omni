@@ -154,7 +154,7 @@ def test_fused_qk_norm_rope_half_split_general_dim():
 
 
 def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
-    """The op-level token-gate override: unset -> caller's default; a
+    """The op-level token-gate override: unset or blank -> caller's default; a
     non-negative integer string overrides it (``0`` = always fuse); anything
     else is rejected naming the variable."""
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope_min_tokens
@@ -162,6 +162,9 @@ def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
     env = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
     monkeypatch.delenv(env, raising=False)
     assert fused_qk_norm_rope_min_tokens(2048) == 2048
+    for blank in ("", "  "):
+        monkeypatch.setenv(env, blank)
+        assert fused_qk_norm_rope_min_tokens(2048) == 2048
     monkeypatch.setenv(env, "0")
     assert fused_qk_norm_rope_min_tokens(2048) == 0
     monkeypatch.setenv(env, "4096")
