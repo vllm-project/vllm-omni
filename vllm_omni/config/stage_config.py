@@ -309,14 +309,17 @@ class PipelineConfig:
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
-    # Optional model-owned duplex planner loaded by the stable engine runtime.
+    # Dotted path of the model's ``DuplexModelPlugin``. A pipeline is a duplex
+    # model iff this is set: ``vllm-omni serve`` then always runs it through
+    # ``DuplexOmni`` (duplex-only server) and the engine hosts one
+    # ``DuplexOrchestrator`` with the plugin loaded.
+    duplex_plugin: str | None = None
+    # Legacy duplex wiring of the models that are not ported to the plugin
+    # framework yet (PersonaPlex, Nemotron VoiceChat). Nothing reads them: a
+    # pipeline that only declares these is served turn-based. Each field goes
+    # away with the follow-up PR that ports its model to ``duplex_plugin``.
     duplex_runtime_extension: str | None = None
-    # Optional model-owned Serving adapter loaded only when the Realtime duplex
-    # endpoint is enabled. Generic OpenAI modules must not select a model.
     duplex_serving_adapter: str | None = None
-    # Explicitly enable the stable duplex control mechanism. This is separate
-    # from the optional model extension because turn-commit-only deployments
-    # do not require a model planner.
     duplex_control_enabled: bool = False
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
@@ -509,6 +512,12 @@ class DuplexSessionRuntimeConfig:
     max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
+    # Unread by the plugin framework. It used to bound the per-session
+    # completed-append table that made a retried append RPC submit once; the
+    # framework carries appends as one-way commands on the runner's ordered
+    # mailbox, so there is no client-visible retry to deduplicate. The field
+    # stays so the deploy configs of the models that are not ported yet still
+    # parse, and goes away with the PR that ports the last of them.
     completed_append_cache_size: int = 256
     server_vad_model_path: str | None = None
     # Startup warmup: run this many silent 80 ms-style frames through a

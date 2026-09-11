@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 
 class MiniCPMO45DuplexPolicy:
@@ -87,7 +90,7 @@ class MiniCPMO45DuplexPolicy:
     }
 
     @classmethod
-    def token_ids_from_tokenizer(cls, tokenizer: Any) -> dict[str, int]:
+    def token_ids_from_tokenizer(cls, tokenizer: PreTrainedTokenizerBase) -> dict[str, int]:
         convert = getattr(tokenizer, "convert_tokens_to_ids", None)
 
         def token_id(token: str) -> int:

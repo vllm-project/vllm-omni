@@ -674,7 +674,7 @@ def test_resolve_stage_configs_delegates_overrides_to_resolver(mocker):
         engine_args=SimpleNamespace(additional_config=additional_config),
     )
     resolve_config = mocker.patch(
-        "vllm_omni.engine.async_omni_engine.resolve_omni_config",
+        "vllm_omni.engine.omni_engine_base.resolve_omni_config",
         return_value=OmniConfigResolution(
             config_path="dummy.yaml",
             stage_configs=(fake_diffusion_stage,),

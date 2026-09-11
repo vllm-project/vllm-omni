@@ -17,6 +17,7 @@ Common `PipelineConfig` fields include:
 | ------- | ------------- |
 | `model_type` | Pipeline identifier used during model and config resolution. |
 | `default_deploy_config_name` | Bundled deploy YAML loaded when the user does not pass `deploy_config`. |
+| `duplex_plugin` | Dotted path of the model's `DuplexModelPlugin`. Set only for full-duplex models; it makes `vllm-omni serve` run the model through `DuplexOmni` (duplex-only server) and the engine host a `DuplexOrchestrator` with the plugin loaded. |
 | `model_arch` | Default Hugging Face architecture for the pipeline. |
 | `hf_architectures` | Architecture names used to identify checkpoints whose `model_type` is shared. |
 | `hf_config_predicate` | Optional predicate used to select between pipelines with otherwise identical HF metadata. |
@@ -52,7 +53,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | ------- | ------ | ---------- | --------- | ------------- |
 | `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
-| `session_mode` | str | optional | `"turn"` | Session behavior. MiniCPM-o 4.5 deploy YAMLs set `"duplex"` so `/v1/realtime` and chat share the same profile. |
+| `session_mode` | str | optional | `"turn"` | Session behavior. Duplex models (pipelines with a `duplex_plugin`, e.g. MiniCPM-o 4.5) set `"duplex"`; `vllm-omni serve` then runs the model duplex-only over `/v1/realtime?duplex=1`. |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
 | `duplex_session` | dict | optional | runtime defaults | Full-duplex session lifecycle, buffering, replay, and capacity limits. |
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |

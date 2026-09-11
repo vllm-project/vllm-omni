@@ -1,15 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterable, Sequence
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
@@ -24,6 +28,9 @@ logger = init_logger(__name__)
 
 class Omni(OmniBase):
     """Synchronous entrypoint for offline generation."""
+
+    def _create_engine(self, **engine_kwargs: Any) -> AsyncOmniEngine:
+        return AsyncOmniEngine(**engine_kwargs)
 
     def _maybe_force_final_only_for_llm_stages(
         self,

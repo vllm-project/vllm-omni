@@ -4,34 +4,31 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from vllm_omni.engine.duplex.plugin import DuplexModelSessionState
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import (
     MiniCPMO45PcmAppendBuffer,
 )
 
 
 @dataclass(slots=True)
-class MiniCPMO45ServingSessionState:
-    """Mutable serving state owned by one MiniCPM duplex session."""
+class MiniCPMO45ServingSessionState(DuplexModelSessionState):
+    """Mutable model-owned state of one MiniCPM duplex session (owned by the session runner)."""
 
     audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
     input_since_commit: bool = False
     speech_since_commit: bool = False
-    native_context_locked: bool = False
+    context_locked: bool = False
     committed_audio_payload: dict[str, object] | None = None
     committed_audio_operation_id: str | None = None
     committed_audio_reserved_bytes: int = 0
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
-    data_plane_task: asyncio.Task[None] | None = None
-    data_plane_restart_requested: bool = False
     continuation_owner_id: str | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
-    silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
 
     def retain_committed_audio(
         self,

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from vllm_omni.entrypoints.duplex.protocol import DuplexCapabilities
+from vllm_omni.engine.duplex.config import DuplexCapabilities
 
 
 def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
@@ -33,9 +33,7 @@ def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
         supports_audio_truncate=True,
         requires_model_runner_kv=True,
         requires_native_stage_role=True,
-        implementation_level="model_native_duplex",
         adapter_patterns=["scheduler_data_plane"],
-        input_modes=["append_audio_chunk"],
         signal_sources=["model_native", "client_event", "server_policy"],
         stage_handoff_transport="scheduler_data_plane",
         chunk_period_ms=1000,

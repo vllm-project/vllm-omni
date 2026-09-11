@@ -8,8 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from vllm_omni.engine.duplex.messages import DuplexFence
-
 
 class DuplexLeaseActivity(str, Enum):
     APPEND = "append"
@@ -111,19 +109,8 @@ class DuplexLeaseState:
         return True
 
 
-@dataclass(frozen=True)
-class DuplexSessionExpiry:
-    session_id: str
-    fence: DuplexFence
-    lease_generation: int
-    reason: str
-    submitted_request_ids: tuple[str, ...]
-    reserved_request_ids: tuple[str, ...]
-
-
 __all__ = [
     "DuplexLeaseActivity",
     "DuplexLeaseConfig",
     "DuplexLeaseState",
-    "DuplexSessionExpiry",
 ]

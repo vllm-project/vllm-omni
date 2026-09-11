@@ -117,8 +117,6 @@ class FakeAsyncOmniEngine:
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
         self.endpoint_restrictions = ()
-        self.duplex_session_config = None
-        self.duplex_serving_adapter_path = None
 
         self.output_q: queue.Queue[Any] = queue.Queue()
         self.submitted: list[dict[str, Any]] = []
@@ -181,7 +179,8 @@ class FakeAsyncOmniEngine:
 
 
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
     # Don't add random UUIDs to requests calling .generate since we usually
     # just want to check for present requests anyway, and would need to just

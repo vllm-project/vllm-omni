@@ -45,27 +45,62 @@ def test_isolated_import_ignores_conflicting_gpu_visibility(monkeypatch: pytest.
     _assert_isolated_import_succeeds("import vllm_omni.outputs")
 
 
-def test_stable_engine_imports_load_duplex_kernel_eagerly() -> None:
-    # The duplex kernel is imported eagerly by the stable engine modules.
-    # Model-specific duplex adapters must still load only via the
-    # dotted-string plugin paths, and the client-side vllm_omni.clients
-    # package must never enter the stable runtime import graph.
+def test_turn_based_stack_has_no_duplex_vocabulary() -> None:
+    # The generic bases and the turn-based siblings (AsyncOmni / AsyncOmniEngine /
+    # Orchestrator) carry no duplex code: importing them must not load the
+    # engine-side duplex package, the model plugins or the client library.
     _assert_isolated_import_succeeds("""
 import sys
 
 import vllm_omni.engine.async_omni_engine
+import vllm_omni.engine.omni_engine_base
 import vllm_omni.engine.orchestrator
 import vllm_omni.entrypoints.async_omni
+import vllm_omni.entrypoints.async_omni_base
+
+forbidden_prefixes = (
+    "vllm_omni.engine.duplex",
+    "vllm_omni.engine.duplex_omni_engine",
+    "vllm_omni.engine.duplex_orchestrator",
+    "vllm_omni.entrypoints.duplex",
+    "vllm_omni.entrypoints.duplex_omni",
+    "vllm_omni.clients",
+    "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
+    "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
+    "vllm_omni.model_executor.models.personaplex.duplex",
+)
+loaded = sorted(
+    name
+    for name in sys.modules
+    if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden_prefixes)
+)
+if loaded:
+    raise SystemExit("turn-based imports loaded duplex modules: " + ", ".join(loaded))
+""")
+
+
+def test_duplex_stack_loads_the_framework_but_not_the_model_plugins() -> None:
+    # The duplex siblings import the engine-side duplex framework eagerly;
+    # model plugins still load only through PipelineConfig.duplex_plugin, and
+    # the client-side package never enters the server import graph.
+    _assert_isolated_import_succeeds("""
+import sys
+
+import vllm_omni.engine.duplex_omni_engine
+import vllm_omni.engine.duplex_orchestrator
+import vllm_omni.entrypoints.duplex_omni
+import vllm_omni.entrypoints.duplex.serving
 
 expected_eager = (
-    "vllm_omni.engine.duplex.contracts",
-    "vllm_omni.engine.duplex.control_plane",
-    "vllm_omni.entrypoints.duplex_request_client",
-    "vllm_omni.outputs.duplex",
+    "vllm_omni.engine.duplex.commands",
+    "vllm_omni.engine.duplex.events",
+    "vllm_omni.engine.duplex.session",
+    "vllm_omni.engine.duplex.session_manager",
+    "vllm_omni.engine.duplex.plugin",
 )
 missing = sorted(name for name in expected_eager if name not in sys.modules)
 if missing:
-    raise SystemExit("duplex kernel modules not imported eagerly: " + ", ".join(missing))
+    raise SystemExit("duplex framework modules not imported eagerly: " + ", ".join(missing))
 
 forbidden_prefixes = (
     "vllm_omni.clients",
@@ -79,7 +114,7 @@ loaded = sorted(
     if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden_prefixes)
 )
 if loaded:
-    raise SystemExit("stable imports loaded plugin-only duplex modules: " + ", ".join(loaded))
+    raise SystemExit("duplex imports loaded plugin-only or client modules: " + ", ".join(loaded))
 """)
 
 
@@ -190,16 +225,20 @@ def test_engine_duplex_uses_canonical_contract_module_names() -> None:
     core_dir = REPO_ROOT / "vllm_omni" / "experimental" / "fullduplex" / "core"
 
     for name in (
+        "commands.py",
         "contracts.py",
+        "events.py",
         "lease.py",
         "messages.py",
+        "plugin.py",
         "session.py",
-        "control_plane.py",
-        "control_client.py",
-        "runtime.py",
+        "session_manager.py",
+        "session_runner.py",
         "intermediate.py",
     ):
         assert (engine_dir / name).is_file()
+    for removed in ("control_plane.py", "control_client.py", "runtime.py"):
+        assert not (engine_dir / removed).exists()
     # the duplex_ prefix is dropped inside the duplex package
     assert not (engine_dir / "duplex_session.py").exists()
     assert not (engine_dir / "duplex_lease.py").exists()

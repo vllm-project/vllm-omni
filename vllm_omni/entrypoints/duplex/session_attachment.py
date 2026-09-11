@@ -180,7 +180,6 @@ class DuplexEventJournal:
 @dataclass(frozen=True)
 class DuplexSessionAttachmentCreated:
     session_id: str
-    incarnation: int
     attachment_generation: int
     resume_token: ResumeToken = field(repr=False)
 
@@ -188,7 +187,6 @@ class DuplexSessionAttachmentCreated:
 @dataclass(frozen=True)
 class DuplexSessionResumeResult:
     session_id: str
-    incarnation: int
     attachment_generation: int
     resume_token: ResumeToken = field(repr=False)
     replay_entries: tuple[JournalEntry, ...] = ()
@@ -198,14 +196,12 @@ class DuplexSessionResumeResult:
 @dataclass
 class _DuplexSessionAttachmentState:
     session_id: str
-    incarnation: int
     credential: DuplexResumeCredential
     journal: DuplexEventJournal
     attachment: DuplexTransportAttachment | None
     attachment_generation: int
     outbound_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     recovery_token_digest: bytes | None = field(default=None, repr=False)
-    grace_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
 class DuplexSessionAttachmentRegistry:
@@ -214,18 +210,14 @@ class DuplexSessionAttachmentRegistry:
         *,
         replay_ttl_s: float,
         replay_max_bytes_per_session: int,
-        disconnect_grace_s: float = 30.0,
         clock: Callable[[], float] | None = None,
     ) -> None:
         if replay_ttl_s <= 0:
             raise ValueError("replay_ttl_s must be positive")
         if replay_max_bytes_per_session <= 0:
             raise ValueError("replay_max_bytes_per_session must be positive")
-        if disconnect_grace_s <= 0:
-            raise ValueError("disconnect_grace_s must be positive")
         self._replay_ttl_s = replay_ttl_s
         self._replay_max_bytes_per_session = replay_max_bytes_per_session
-        self._disconnect_grace_s = disconnect_grace_s
         self._clock = clock or time.monotonic
         self._sessions: dict[str, _DuplexSessionAttachmentState] = {}
         self._lock = asyncio.Lock()
@@ -237,7 +229,6 @@ class DuplexSessionAttachmentRegistry:
         self,
         session_id: str,
         *,
-        incarnation: int,
         send: Callable[[dict[str, object]], Awaitable[None]],
         close: Callable[[str], Awaitable[None]],
     ) -> DuplexSessionAttachmentCreated:
@@ -248,7 +239,6 @@ class DuplexSessionAttachmentRegistry:
             generation = 1
             self._sessions[session_id] = _DuplexSessionAttachmentState(
                 session_id=session_id,
-                incarnation=incarnation,
                 credential=DuplexResumeCredential.from_token(token),
                 journal=DuplexEventJournal(
                     max_bytes=self._replay_max_bytes_per_session,
@@ -264,7 +254,6 @@ class DuplexSessionAttachmentRegistry:
             )
             return DuplexSessionAttachmentCreated(
                 session_id=session_id,
-                incarnation=incarnation,
                 attachment_generation=generation,
                 resume_token=token,
             )
@@ -299,31 +288,25 @@ class DuplexSessionAttachmentRegistry:
         async with self._lock:
             return self._require(session_id).journal.acknowledge(sequence)
 
-    async def detach(
-        self,
-        session_id: str,
-        *,
-        attachment_generation: int,
-        on_grace_expired: Callable[[], Awaitable[None]] | None = None,
-    ) -> bool:
+    async def detach(self, session_id: str, *, attachment_generation: int | None = None) -> bool:
+        """Drop the current transport; the engine lease owns the disconnect grace.
+
+        ``attachment_generation`` names the connection asking to detach, so a
+        socket that already lost a takeover cannot detach the winner. ``None``
+        means "whichever connection is attached right now" and is for callers
+        that only know the session (the outbound pump, whose send just failed).
+
+        Returns whether this call is the one that detached: an already-detached
+        session answers ``False`` so a second disconnect signal for the same
+        socket cannot restart the engine's disconnect grace window.
+        """
         async with self._lock:
             state = self._sessions.get(session_id)
-            if state is None or state.attachment_generation != attachment_generation:
+            if state is None or state.attachment is None:
+                return False
+            if attachment_generation is not None and state.attachment_generation != attachment_generation:
                 return False
             state.attachment = None
-            if state.grace_task is not None:
-                state.grace_task.cancel()
-            state.grace_task = (
-                asyncio.create_task(
-                    self._run_disconnect_grace(
-                        state,
-                        attachment_generation=attachment_generation,
-                        callback=on_grace_expired,
-                    )
-                )
-                if on_grace_expired is not None
-                else None
-            )
             return True
 
     async def is_current_attachment(self, session_id: str, attachment_generation: int) -> bool:
@@ -339,25 +322,19 @@ class DuplexSessionAttachmentRegistry:
         self,
         session_id: str,
         *,
-        incarnation: int,
         resume_token: str,
         last_received_server_event_seq: int,
     ) -> None:
         """Validate transport credentials before any engine resume control."""
         async with self._lock:
             state = self._require(session_id)
-            self._validate_resume_identity(
-                state,
-                incarnation=incarnation,
-                resume_token=resume_token,
-            )
+            self._validate_resume_identity(state, resume_token=resume_token)
             state.journal.replay_after(last_received_server_event_seq)
 
     async def resume(
         self,
         session_id: str,
         *,
-        incarnation: int,
         resume_token: str,
         last_received_server_event_seq: int,
         send: Callable[[dict[str, object]], Awaitable[None]],
@@ -370,18 +347,11 @@ class DuplexSessionAttachmentRegistry:
             async with self._lock:
                 if self._sessions.get(session_id) is not state:
                     raise KeyError(f"unknown duplex attachment session: {session_id}")
-                used_recovery = self._validate_resume_identity(
-                    state,
-                    incarnation=incarnation,
-                    resume_token=resume_token,
-                )
+                used_recovery = self._validate_resume_identity(state, resume_token=resume_token)
                 replay_entries = state.journal.replay_after(last_received_server_event_seq)
                 accepted_token_digest = (
                     state.recovery_token_digest if used_recovery else bytes(state.credential.token_digest)
                 )
-                if state.grace_task is not None:
-                    state.grace_task.cancel()
-                    state.grace_task = None
                 state.recovery_token_digest = None
                 rotated_token = state.credential.rotate()
                 replaced = state.attachment
@@ -408,7 +378,6 @@ class DuplexSessionAttachmentRegistry:
                     raise
             return DuplexSessionResumeResult(
                 session_id=session_id,
-                incarnation=incarnation,
                 attachment_generation=attachment_generation,
                 resume_token=rotated_token,
                 replay_entries=replay_entries,
@@ -418,31 +387,7 @@ class DuplexSessionAttachmentRegistry:
     async def close(self, session_id: str) -> DuplexTransportAttachment | None:
         async with self._lock:
             state = self._sessions.pop(session_id, None)
-            if state is not None and state.grace_task is not None:
-                state.grace_task.cancel()
             return state.attachment if state is not None else None
-
-    async def _run_disconnect_grace(
-        self,
-        state: _DuplexSessionAttachmentState,
-        *,
-        attachment_generation: int,
-        callback: Callable[[], Awaitable[None]] | None,
-    ) -> None:
-        try:
-            await asyncio.sleep(self._disconnect_grace_s)
-        except asyncio.CancelledError:
-            return
-        async with self._lock:
-            if (
-                self._sessions.get(state.session_id) is not state
-                or state.attachment is not None
-                or state.attachment_generation != attachment_generation
-            ):
-                return
-            state.grace_task = None
-        if callback is not None:
-            await callback()
 
     def _require(self, session_id: str) -> _DuplexSessionAttachmentState:
         state = self._sessions.get(session_id)
@@ -451,14 +396,7 @@ class DuplexSessionAttachmentRegistry:
         return state
 
     @staticmethod
-    def _validate_resume_identity(
-        state: _DuplexSessionAttachmentState,
-        *,
-        incarnation: int,
-        resume_token: str,
-    ) -> bool:
-        if incarnation != state.incarnation:
-            raise ValueError(f"duplex attachment incarnation mismatch: expected {state.incarnation}, got {incarnation}")
+    def _validate_resume_identity(state: _DuplexSessionAttachmentState, *, resume_token: str) -> bool:
         if state.credential.verify(resume_token):
             return False
         recovery_digest = state.recovery_token_digest

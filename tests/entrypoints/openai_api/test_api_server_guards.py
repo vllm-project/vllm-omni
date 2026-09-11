@@ -912,7 +912,6 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
-    monkeypatch.setattr(api_server, "should_enable_duplex_endpoint", lambda *_a, **_k: False)
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args())

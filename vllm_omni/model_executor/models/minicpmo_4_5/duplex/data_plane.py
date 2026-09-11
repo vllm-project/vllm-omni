@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
+from vllm_omni.engine.duplex.plugin import DuplexDataPlane
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -44,6 +45,9 @@ class _TurnState:
 @dataclass(slots=True)
 class _RequestState:
     audio_offset: int = 0
+    #: A snapshot below ``audio_offset`` that has not been accepted as a restart
+    #: yet. See :meth:`MiniCPMO45DataPlaneSession.slice_cumulative_audio`.
+    audio_restart_candidate: int | None = None
     uses_segment_text_metadata: bool = False
     pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
@@ -53,7 +57,7 @@ class _RequestState:
         return self.turns.setdefault(turn_id, _TurnState())
 
 
-class MiniCPMO45DataPlaneSession:
+class MiniCPMO45DataPlaneSession(DuplexDataPlane):
     """MiniCPM output projector and request/turn cursor owner.
 
     The scheduler request owns cumulative Stage1 audio, while model turns own
@@ -487,13 +491,33 @@ class MiniCPMO45DataPlaneSession:
         prev_samples = state.audio_offset
         if prev_samples <= 0:
             state.audio_offset = num_samples
+            state.audio_restart_candidate = None
             return audio_data
         if num_samples == prev_samples:
             return None
         if num_samples < prev_samples:
+            # Below the cursor means one of two things, and they are not
+            # distinguishable from this snapshot alone: the producer restarted
+            # its buffer, or this is a unit that carries no cumulative audio at
+            # all (a continuation placeholder arrives as a single sample).
+            # Rewinding the cursor for the second case is expensive and silent:
+            # the next real snapshot is then sliced from ~0 and the whole
+            # session's audio goes out again as one delta. So defer the
+            # decision — hold the candidate and leave the cursor where it is.
+            candidate = state.audio_restart_candidate
+            if candidate is None or num_samples <= candidate:
+                state.audio_restart_candidate = num_samples
+                return audio_data
+            # A second below-cursor snapshot that grew from the first: the
+            # producer really did restart, and this is its delta.
             state.audio_offset = num_samples
-            return audio_data
-        state.audio_offset = num_samples
+            state.audio_restart_candidate = num_samples
+            prev_samples = candidate
+        else:
+            # Above the cursor: whatever the dip was, this stream never
+            # restarted, so it is sliced from the cursor as usual.
+            state.audio_restart_candidate = None
+            state.audio_offset = num_samples
         try:
             import torch
 

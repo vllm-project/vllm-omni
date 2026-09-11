@@ -15,8 +15,9 @@
 # so 4096 is the empirically-verified safe ceiling.
 pipeline: minicpmo_4_5
 async_chunk: true
-# Native full-duplex shares this profile with /v1/chat/completions. The default
-# duplex_session caps sessions at 1, matching Stage 0/1 max_num_seqs below.
+# session_mode: duplex makes vllm-omni serve run this model duplex-only
+# (/v1/realtime?duplex=1). The default duplex_session caps sessions at 1,
+# matching Stage 0/1 max_num_seqs below.
 session_mode: duplex
 active_stream_window: 1
 

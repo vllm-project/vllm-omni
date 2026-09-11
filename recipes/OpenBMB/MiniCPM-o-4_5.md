@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5
 
-> Online serving and offline inference for omni multimodal chat
+> Online full-duplex serving and offline inference for omni multimodal chat
 > (text / image / audio / video → text + 24 kHz speech)
 
 ## Summary
@@ -9,8 +9,10 @@
 - Model: [`openbmb/MiniCPM-o-4_5`](https://huggingface.co/openbmb/MiniCPM-o-4_5)
 - Task: Omni multimodal chat — accepts text / image / audio / video input;
   emits text and 24 kHz mono speech in the same response
-- Mode: Online serving via the OpenAI-compatible `/v1/chat/completions`
-  API (plus Gradio demo), and offline inference via `Omni.generate`
+- Mode: Online full-duplex serving over the OpenAI Realtime protocol
+  (`/v1/realtime?duplex=1`, alias `/v1/duplex`), and offline turn-based
+  inference via `Omni.generate`. A MiniCPM-o 4.5 server is duplex-only: it
+  does not serve `/v1/chat/completions` or the other turn-based HTTP routes.
 - Maintainer: [`@tc-mb`](https://github.com/tc-mb) (MiniCPM-V / MiniCPM-o team)
 
 ## When to use this recipe
@@ -18,9 +20,9 @@
 Use this recipe as a known-good starting point for serving
 `openbmb/MiniCPM-o-4_5` on vLLM-Omni. MiniCPM-o 4.5 is the omni member
 of the MiniCPM-o family — it runs a multimodal thinker, a streaming
-MiniCPMTTS codec talker, and a separate batched Code2Wav stage so a single
-`/v1/chat/completions` call can return text and 24 kHz speech in one
-shot. The recommended batching deploy isolates the Thinker on GPU 0 and
+MiniCPMTTS codec talker, and a separate batched Code2Wav stage, so a live
+duplex session streams text and 24 kHz speech while it keeps listening. The
+recommended batching deploy isolates the Thinker on GPU 0 and
 co-locates Talker and Code2Wav on GPU 1; 1-GPU, 3-GPU, and 8x4090 layouts are
 also provided.
 
@@ -36,8 +38,11 @@ also provided.
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
     - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
-- Online example + Gradio demo:
+- Online full-duplex examples (Realtime CLI demo, browser client,
+  barge-in client):
   [`examples/online_serving/minicpmo/`](../../examples/online_serving/minicpmo/)
+- Duplex API and Python client docs:
+  [`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md)
 - Offline end-to-end example:
   [`examples/offline_inference/minicpmo/`](../../examples/offline_inference/minicpmo/)
 - Pipeline / talker source:
@@ -179,69 +184,41 @@ as one aggregated chunk, so the table reports Stage 0 metrics.
 
 #### Verification
 
-**Quick smoke test (text-only output)**:
+**Health and model listing**:
 
 ```bash
-curl http://localhost:8099/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "openbmb/MiniCPM-o-4_5",
-        "messages": [{"role": "user", "content": "Briefly introduce yourself."}],
-        "modalities": ["text"]
-    }'
+curl http://localhost:8099/health
+curl http://localhost:8099/v1/models
 ```
 
-**Text + speech in one response** (the headline 4.5 feature). The model
-bridge conditions the Talker from the generated assistant span, so the
-generic serving layer does not inject MiniCPM-specific template defaults.
-`use_tts_template=true` remains supported when explicitly requested:
+**One duplex turn over the Realtime WebSocket** (text + speech stream back
+while the session keeps listening):
 
 ```bash
-curl http://localhost:8099/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "openbmb/MiniCPM-o-4_5",
-        "messages": [{"role": "user", "content": "Say hello, then introduce vLLM in one sentence."}],
-        "modalities": ["text", "audio"],
-        "chat_template_kwargs": {"use_tts_template": true}
-    }'
+python examples/online_serving/minicpmo/realtime_duplex_demo.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-wav /path/to/input_16k_mono_pcm16.wav \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
+    --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
 
-When using the OpenAI Python SDK, the same flag can also be sent as
-`extra_body={"chat_template_kwargs": {"use_tts_template": True}}`
-because the client merges `extra_body` into the request root.
+The demo prints transcript deltas as they arrive and saves the streamed
+24 kHz audio to WAV files. The same session shape is available from Python
+through `vllm_omni.clients.duplex.DuplexClient` (over the server) or
+`vllm_omni.clients.inline_duplex.InlineDuplexClient` (in-process, no server;
+`examples/online_serving/barge_in_client.py --inline`).
 
-Response carries text in one choice's `message.content` and base64 WAV
-in another choice's `message.audio.data` (24 kHz mono, see Notes). With
-`modalities: ["text", "audio"]` you typically get two `choices` entries
-(one text, one audio).
+**Barge-in**: `examples/online_serving/barge_in_client.py` plays a question,
+interrupts the answer with a second WAV and checks that the first response is
+cancelled and the second one is answered.
 
-**Streaming text + speech** (use `--stream`):
+**Turn-based generation** stays available offline
+(`examples/offline_inference/minicpmo/`, `Omni.generate`).
 
-```bash
-python examples/online_serving/minicpmo/openai_chat_completion_client_for_multimodal_generation.py \
-    --query-type text \
-    --prompt "Say hello, then introduce vLLM in one sentence." \
-    --port 8099 \
-    --stream
-```
-
-The client prints text deltas as they arrive and saves streamed audio chunks
-to WAV files.
-
-**Gradio demo (text + image + audio + video UI)**:
-
-```bash
-bash examples/online_serving/minicpmo/run_gradio_demo.sh
-# or run the python entry point directly:
-python examples/online_serving/minicpmo/gradio_demo.py \
-    --minicpmo45-api-base http://localhost:8099/v1 \
-    --minicpmo45-model openbmb/MiniCPM-o-4_5 \
-    --port 7862
-```
-
-Open `http://<host>:7862` and try a text prompt with the **"Generate
-speech output (TTS)"** checkbox on / off.
+The Daily-Omni numbers above were measured on the turn-based
+`/v1/chat/completions` route before the server became duplex-only; they still
+describe the three-stage pipeline's relative throughput.
 
 #### Notes
 
@@ -311,12 +288,10 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   A missing dep raises `ImportError` at first request with the same
   install hint instead of silently emitting empty audio.
 
-- **TTS conditioning**: the MiniCPM stage bridge can condition speech from
-  the generated assistant span without changing shared serving code.
-  `chat_template_kwargs.use_tts_template=true` remains supported when an
-  explicit `<|tts_bos|>` boundary is desired. For **curl**, put
-  `chat_template_kwargs` at the request root; the OpenAI Python SDK may use
-  `extra_body` because it flattens those fields into the root.
+- **TTS conditioning**: the MiniCPM stage bridge conditions speech from the
+  generated assistant span without changing shared serving code.
+  `use_tts_template=true` (offline `Omni.generate` chat template kwargs)
+  remains supported when an explicit `<|tts_bos|>` boundary is desired.
 
 - **Reference voice**: request audio is carried on the first codec chunk.
   Code2Wav owns the temporary prompt WAV and prompt-feature cache, and removes
@@ -326,9 +301,9 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   and defaults to deterministic seed 42. Stage-1 deploy sampling parameters
   control only vLLM's binary continue/stop token.
 
-- **Output audio**: 24 kHz mono WAV inside the OpenAI-style
-  `message.audio.data` (base64). The Gradio demo's WAV player decodes
-  this automatically.
+- **Output audio**: 24 kHz mono audio, streamed as base64
+  `response.audio.delta` events on the duplex session (WAV for offline
+  `Omni.generate`).
 
 - **Routing**: MiniCPM-o 4.5 and 2.6 both ship `architectures=
   ["MiniCPMO"]` in HF config; routing is disambiguated by
@@ -340,6 +315,3 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 - **Async chunking**: enabled in all deploy configs. Talker sends
   25-code chunks with three-code left context to Code2Wav through
   `SharedMemoryConnector`; terminal chunks flush held lookahead state.
-- **Response choices**: text and audio are separate choices. SDK clients
-  should select the choice whose `message.audio.data` is populated rather
-  than assuming `choices[0]` contains audio.

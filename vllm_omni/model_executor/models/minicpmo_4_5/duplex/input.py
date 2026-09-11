@@ -6,9 +6,11 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
+
+from vllm_omni.engine.duplex.plugin import PcmAppendBuffer, PcmAppendReservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +20,7 @@ class _PcmSpan:
     is_speech: bool
 
 
-class MiniCPMO45PcmAppendReservation:
+class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
     __slots__ = (
         "_active",
         "_force_listen",
@@ -74,7 +76,7 @@ class MiniCPMO45PcmAppendReservation:
         self._owner._rollback_reservation(self)
 
 
-def validate_native_ref_audio_config(session_config: dict[str, Any]) -> None:
+def validate_native_ref_audio_config(session_config: dict[str, object]) -> None:
     extra_body = session_config.get("extra_body")
     if not isinstance(extra_body, dict):
         extra_body = {}
@@ -84,7 +86,7 @@ def validate_native_ref_audio_config(session_config: dict[str, Any]) -> None:
         raise ValueError("native duplex ref_audio_path is not accepted; resolve ref_audio in serving first")
 
 
-def decode_native_ref_audio_from_config(session_config: dict[str, Any]) -> np.ndarray | None:
+def decode_native_ref_audio_from_config(session_config: dict[str, object]) -> NDArray[np.float32] | None:
     validate_native_ref_audio_config(session_config)
     extra_body = session_config.get("extra_body")
     if not isinstance(extra_body, dict):
@@ -106,7 +108,7 @@ def decode_native_ref_audio_from_config(session_config: dict[str, Any]) -> np.nd
     return np.frombuffer(raw, dtype="<f4").astype(np.float32, copy=True)
 
 
-class MiniCPMO45PcmAppendBuffer:
+class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     """Accumulates short native-duplex PCM chunks into model-sized appends."""
 
     def __init__(self) -> None:

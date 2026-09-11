@@ -145,15 +145,17 @@ interchangeably.
 | Incremental text input for speech synthesis | `WS /v1/audio/speech/stream` | Send text events and receive audio | [Streaming Text to Speech](speech_api.md#streaming-text-input-websocket) |
 | Live video understanding | `WS /v1/video/chat/stream` | Send video frames and receive text/audio | [Streaming Video Input](video_stream_api.md) |
 | Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_api.md) |
-| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` or `WS /v1/duplex` | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
+| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`) | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
 | Generated video chunks | `WS /v1/realtime/video` | Start a diffusion request and receive fragmented MP4 | [Streaming Video Output](streaming_video_output_api.md) |
 | Robot policy inference | `WS /v1/realtime/robot/openpi` | Send MessagePack observations and receive action arrays | [OpenPI Robot Policy](openpi_api.md) |
 
 All six routes are model- or configuration-dependent. In particular,
 `/v1/realtime` is not full duplex unless the client sets `duplex=1` and the
-deployment explicitly enables duplex sessions. Clients should also verify the
-duplex capability payload because the query-parameter form falls back to the
-ordinary realtime handler when duplex is unavailable.
+model is a duplex model (its pipeline declares a `duplex_plugin` and the
+deploy configuration sets `session_mode: duplex`). Such a server is
+duplex-only and does not serve the turn-based HTTP routes. Clients should
+also verify the duplex capability payload because the query-parameter form
+falls back to the ordinary realtime handler when duplex is unavailable.
 
 ## Related Endpoints
 

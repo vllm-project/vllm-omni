@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Unit tests for the public duplex client (fake transport, no server)."""
+"""Unit tests for the public duplex clients (fake transports, no server).
+
+``DuplexClient`` runs over a fake websocket; ``InlineDuplexClient`` over a
+fake ``DuplexOmni`` whose handle records typed commands and replays typed
+events. The demux / handshake tests that only need "feed a server event" are
+parameterized over both clients.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,8 @@ import asyncio
 import base64
 import json
 import wave
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -16,8 +24,11 @@ from vllm_omni.clients.duplex import (
     AudioFormat,
     ConnectionResumed,
     DuplexClient,
+    DuplexClientBase,
+    DuplexConnectionError,
     DuplexProtocolError,
     DuplexSessionClosedError,
+    ErrorEvent,
     EventCollector,
     ReconnectPolicy,
     SessionConfig,
@@ -31,17 +42,26 @@ from vllm_omni.clients.duplex import (
     summarize_session_request_metrics,
     write_pcm16_wav,
 )
+from vllm_omni.clients.inline_duplex import InlineDuplexClient
+from vllm_omni.engine.duplex import commands as duplex_commands
+from vllm_omni.engine.duplex import events as duplex_events
+from vllm_omni.engine.duplex.messages import DuplexSessionError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+SESSION_ID = "duplex-0123456789abcdef"
+# session.created is not journaled by the server, so it carries no server_event_seq.
 SESSION_CREATED = {
     "type": "session.created",
-    "session": {"session_id": "sess-1"},
-    "incarnation": 0,
+    "session": {"id": SESSION_ID, "model": "test-model"},
+    "attachment_generation": 1,
     "resume_token": "tok-1",
-    "server_event_seq": 1,
 }
-SESSION_CLOSED = {"type": "session.closed", "session_id": "sess-1", "server_event_seq": 99}
+SESSION_CLOSED = {"type": "session.closed", "session_id": SESSION_ID, "reason": "client_close", "server_event_seq": 99}
+
+
+# ---------------------------------------------------------------------------
+# Fake websocket transport
 
 
 class FakeSocket:
@@ -89,13 +109,138 @@ def make_client(*sockets: FakeSocket, **kwargs) -> tuple[DuplexClient, list[str]
 
 
 # ---------------------------------------------------------------------------
+# Fake DuplexOmni for the inline client
+
+
+class _WireEvent:
+    """A typed-event stand-in that renders a fixed wire payload."""
+
+    def __init__(self, raw: dict[str, object]) -> None:
+        self.raw = raw
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.raw.get("type") in {"session.closed", "session.expired"}
+
+    def to_realtime(self) -> dict[str, object]:
+        return dict(self.raw)
+
+
+class FakeInlineHandle:
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.closed = False
+        self.close_calls = 0
+        self.commands: list[duplex_commands.DuplexCommand] = []
+        self.consumer_active = False
+        self._outbox: asyncio.Queue = asyncio.Queue()
+
+    def deliver(self, event: Any) -> None:
+        self._outbox.put_nowait(event)
+
+    def feed(self, raw: dict[str, object]) -> None:
+        self.deliver(_WireEvent(raw))
+
+    async def submit(self, command: duplex_commands.DuplexCommand) -> None:
+        if self.closed:
+            raise DuplexSessionError("closed", code="session_closed", session_id=self.session_id)
+        self.commands.append(command)
+
+    async def events(self):
+        self.consumer_active = True
+        try:
+            while True:
+                event = await self._outbox.get()
+                yield event
+                if event.is_terminal:
+                    return
+        finally:
+            self.consumer_active = False
+
+    async def close(self, *, reason: str = "client_close", timeout: float | None = None) -> None:
+        self.close_calls += 1
+        if self.closed:
+            return
+        self.closed = True
+        self.deliver(duplex_events.SessionClosed(session_id=self.session_id, reason=reason))
+
+
+class FakeInlineOmni:
+    def __init__(self) -> None:
+        self.opened: list[dict[str, object]] = []
+        self.handles: list[FakeInlineHandle] = []
+
+    async def open_session(self, config: dict[str, object]) -> FakeInlineHandle:
+        self.opened.append(dict(config))
+        handle = FakeInlineHandle(SESSION_ID)
+        self.handles.append(handle)
+        handle.deliver(
+            duplex_events.SessionCreated(
+                session_id=SESSION_ID,
+                session={"id": SESSION_ID, "model": config.get("model")},
+            )
+        )
+        return handle
+
+
+def make_inline_client(**kwargs) -> tuple[InlineDuplexClient, FakeInlineOmni]:
+    omni = FakeInlineOmni()
+    kwargs.setdefault("handshake_timeout_s", 5.0)
+    return InlineDuplexClient(omni, model="test-model", **kwargs), omni
+
+
+# ---------------------------------------------------------------------------
+# One rig over both clients: ``feed`` a server event, drive ``client``
+
+
+class Rig:
+    def __init__(self, client: DuplexClientBase, feed: Callable[[dict[str, object]], None]) -> None:
+        self.client = client
+        self.feed = feed
+
+
+def _websocket_rig(*, handshake: dict[str, object] | None = SESSION_CREATED) -> Rig:
+    sock = FakeSocket()
+    if handshake is not None:
+        sock.feed(handshake)
+    client, _ = make_client(sock)
+    return Rig(client, sock.feed)
+
+
+def _inline_rig(*, handshake: dict[str, object] | None = SESSION_CREATED) -> Rig:
+    client, omni = make_inline_client()
+    original_open = omni.open_session
+
+    async def open_session(config: dict[str, object]) -> FakeInlineHandle:
+        handle = await original_open(config)
+        if handshake is not SESSION_CREATED:
+            # Replace the default session.created with the requested first event.
+            handle._outbox = asyncio.Queue()
+            if handshake is not None:
+                handle.feed(handshake)
+        return handle
+
+    omni.open_session = open_session  # type: ignore[method-assign]
+
+    def feed(raw: dict[str, object]) -> None:
+        omni.handles[-1].feed(raw)
+
+    return Rig(client, feed)
+
+
+@pytest.fixture(params=["websocket", "inline"])
+def make_rig(request: pytest.FixtureRequest) -> Callable[..., Rig]:
+    return _websocket_rig if request.param == "websocket" else _inline_rig
+
+
+# ---------------------------------------------------------------------------
 # SessionConfig
 
 
 def test_session_config_payload_defaults():
-    payload = SessionConfig().to_session_payload(model="m", session_id="s")
+    payload = SessionConfig().to_session_payload(model="m")
     assert payload["model"] == "m"
-    assert payload["session_id"] == "s"
+    assert "session_id" not in payload
     assert payload["modalities"] == ["audio", "text"]
     assert payload["input_audio_format"] == "pcm16"
     assert payload["output_audio_format"] == "pcm16"
@@ -137,19 +282,59 @@ def test_audio_format_math():
 
 
 # ---------------------------------------------------------------------------
-# Handshake and lifecycle
+# Handshake and lifecycle (both clients)
 
 
-async def test_handshake_adopts_session_and_acks():
+@pytest.mark.asyncio
+async def test_handshake_adopts_server_allocated_session_id(make_rig):
+    rig = make_rig()
+    async with rig.client as client:
+        assert client.session_id == SESSION_ID
+        assert client.session_info == {"id": SESSION_ID, "model": "test-model"}
+        rig.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+async def test_handshake_error_raises_protocol_error(make_rig):
+    rig = make_rig(handshake={"type": "error", "error": {"code": "unsupported_audio_format", "message": "bad"}})
+    with pytest.raises(DuplexProtocolError) as excinfo:
+        async with rig.client:
+            pass
+    assert excinfo.value.code == "unsupported_audio_format"
+
+
+@pytest.mark.asyncio
+async def test_session_expired_raises_from_event_stream(make_rig):
+    rig = make_rig()
+    async with rig.client as client:
+        rig.feed(
+            {"type": "session.expired", "session_id": SESSION_ID, "reason": "lease_expired", "server_event_seq": 2}
+        )
+        with pytest.raises(DuplexSessionClosedError) as excinfo:
+            async for _ in client.events():
+                pass
+        assert "lease_expired" in excinfo.value.reason
+
+
+# ---------------------------------------------------------------------------
+# Websocket transport specifics
+
+
+@pytest.mark.asyncio
+async def test_websocket_handshake_sends_session_update_and_acks_sequenced_events():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
     client, calls = make_client(sock)
     async with client:
-        assert client.session_id == "sess-1"
+        assert client.session_id == SESSION_ID
         assert client.resume_token == "tok-1"
         assert calls == ["ws://test-host:8099/v1/realtime?duplex=1&model=test-model&autostart=0"]
         assert sock.sent[0]["type"] == "session.update"
         assert sock.sent[0]["session"]["model"] == "test-model"
+        assert "session_id" not in sock.sent[0]["session"]
+        # session.created is unjournaled (no seq): nothing to ack yet.
+        assert _acks(sock) == []
+        sock.feed({"type": "response.listen", "server_event_seq": 1})
         await _drain(lambda: {"type": "session.event_ack", "server_event_seq": 1} in _acks(sock))
         close_task = asyncio.create_task(client.close())
         await _drain(lambda: "session.close" in sock.sent_types())
@@ -158,28 +343,7 @@ async def test_handshake_adopts_session_and_acks():
     assert "session.close" in sock.sent_types()
 
 
-async def test_handshake_error_raises_protocol_error():
-    sock = FakeSocket()
-    sock.feed({"type": "error", "error": {"code": "unsupported_audio_format", "message": "bad"}})
-    client, _ = make_client(sock)
-    with pytest.raises(DuplexProtocolError) as excinfo:
-        async with client:
-            pass
-    assert excinfo.value.code == "unsupported_audio_format"
-
-
-async def test_session_expired_raises_from_event_stream():
-    sock = FakeSocket()
-    sock.feed(SESSION_CREATED)
-    client, _ = make_client(sock)
-    async with client:
-        sock.feed({"type": "session.expired", "reason": "lease_expired", "server_event_seq": 2})
-        with pytest.raises(DuplexSessionClosedError) as excinfo:
-            async for _ in client.events():
-                pass
-        assert "lease_expired" in excinfo.value.reason
-
-
+@pytest.mark.asyncio
 async def test_resync_required_drops_resume_credential():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -187,7 +351,7 @@ async def test_resync_required_drops_resume_credential():
     async with client:
         assert client.resume_token == "tok-1"
         stream = client.events()
-        sock.feed({"type": "session.resync_required", "session_id": "sess-1", "server_event_seq": 2})
+        sock.feed({"type": "session.resync_required", "session_id": SESSION_ID, "server_event_seq": 2})
         async for event in stream:
             if event.type == "session.resync_required":
                 break
@@ -202,9 +366,10 @@ async def test_resync_required_drops_resume_credential():
 
 
 # ---------------------------------------------------------------------------
-# Input events
+# Input events (websocket wire shape)
 
 
+@pytest.mark.asyncio
 async def test_append_audio_tracks_cumulative_end_ms():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -224,6 +389,7 @@ async def test_append_audio_tracks_cumulative_end_ms():
         sock.feed(SESSION_CLOSED)
 
 
+@pytest.mark.asyncio
 async def test_append_audio_strips_video_frame_data_url_prefix():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -238,6 +404,7 @@ async def test_append_audio_strips_video_frame_data_url_prefix():
         sock.feed(SESSION_CLOSED)
 
 
+@pytest.mark.asyncio
 async def test_stream_pcm_chunking():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -249,6 +416,7 @@ async def test_stream_pcm_chunking():
         sock.feed(SESSION_CLOSED)
 
 
+@pytest.mark.asyncio
 async def test_interruption_primitives_send_documented_events():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -262,22 +430,21 @@ async def test_interruption_primitives_send_documented_events():
 
 
 # ---------------------------------------------------------------------------
-# Response demultiplexing
+# Response demultiplexing (both clients)
 
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-async def test_response_handle_flow():
-    sock = FakeSocket()
-    sock.feed(SESSION_CREATED)
+@pytest.mark.asyncio
+async def test_response_handle_flow(make_rig):
+    rig = make_rig()
     chunk = b"\x00\x01" * 2400  # 100 ms of pcm16 @ 24 kHz
-    client, _ = make_client(sock)
-    async with client:
-        sock.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
-        sock.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
-        sock.feed(
+    async with rig.client as client:
+        rig.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
+        rig.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
+        rig.feed(
             {
                 "type": "response.output_audio.delta",
                 "response_id": "resp-1",
@@ -286,7 +453,7 @@ async def test_response_handle_flow():
                 "server_event_seq": 4,
             }
         )
-        sock.feed(
+        rig.feed(
             {
                 "type": "response.output_audio_transcript.delta",
                 "response_id": "resp-1",
@@ -294,7 +461,7 @@ async def test_response_handle_flow():
                 "server_event_seq": 5,
             }
         )
-        sock.feed({"type": "response.done", "response_id": "resp-1", "server_event_seq": 6})
+        rig.feed({"type": "response.done", "response_id": "resp-1", "server_event_seq": 6})
 
         async for response in client.responses():
             chunks = [piece async for piece in response.audio()]
@@ -304,49 +471,46 @@ async def test_response_handle_flow():
             assert response.played_ms == pytest.approx(100.0)
             assert response.finished
             break
-        sock.feed(SESSION_CLOSED)
+        rig.feed(SESSION_CLOSED)
 
 
-async def test_listen_decision_yields_finished_silent_handle():
-    sock = FakeSocket()
-    sock.feed(SESSION_CREATED)
-    client, _ = make_client(sock)
-    async with client:
-        sock.feed({"type": "response.listen", "server_event_seq": 2})
+@pytest.mark.asyncio
+async def test_listen_decision_yields_finished_silent_handle(make_rig):
+    rig = make_rig()
+    async with rig.client as client:
+        rig.feed({"type": "response.listen", "server_event_seq": 2})
         async for response in client.responses():
             assert response.decision == "listen"
             assert response.finished
             assert [piece async for piece in response.audio()] == []
             break
-        sock.feed(SESSION_CLOSED)
+        rig.feed(SESSION_CLOSED)
 
 
-async def test_listen_terminates_active_response():
-    sock = FakeSocket()
-    sock.feed(SESSION_CREATED)
-    client, _ = make_client(sock)
-    async with client:
-        sock.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
-        sock.feed({"type": "response.listen", "response_id": "resp-1", "server_event_seq": 3})
+@pytest.mark.asyncio
+async def test_listen_terminates_active_response(make_rig):
+    rig = make_rig()
+    async with rig.client as client:
+        rig.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
+        rig.feed({"type": "response.listen", "response_id": "resp-1", "server_event_seq": 3})
         async for response in client.responses():
             await response.wait(timeout_s=5.0)
             assert response.decision == "listen"
             break
-        sock.feed(SESSION_CLOSED)
+        rig.feed(SESSION_CLOSED)
 
 
-async def test_id_less_listen_never_closes_an_in_flight_response():
+@pytest.mark.asyncio
+async def test_id_less_listen_never_closes_an_in_flight_response(make_rig):
     # An id-less listen is a standalone decision beat (e.g. a silence-skip
     # while a response streams); it must surface as its own finished handle
     # and leave the in-flight response to its real terminal.
-    sock = FakeSocket()
-    sock.feed(SESSION_CREATED)
-    client, _ = make_client(sock)
-    async with client:
-        sock.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
-        sock.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
-        sock.feed({"type": "response.listen", "server_event_seq": 4})
-        sock.feed({"type": "response.done", "response_id": "resp-1", "server_event_seq": 5})
+    rig = make_rig()
+    async with rig.client as client:
+        rig.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
+        rig.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
+        rig.feed({"type": "response.listen", "server_event_seq": 4})
+        rig.feed({"type": "response.done", "response_id": "resp-1", "server_event_seq": 5})
         seen: list[tuple[str | None, str | None, bool]] = []
         async for response in client.responses():
             await response.wait(timeout_s=5.0)
@@ -355,20 +519,19 @@ async def test_id_less_listen_never_closes_an_in_flight_response():
                 break
         assert ("resp-1", "speak", True) in seen
         assert (None, "listen", True) in seen
-        sock.feed(SESSION_CLOSED)
+        rig.feed(SESSION_CLOSED)
 
 
-async def test_terminal_listen_keeps_spoken_decision():
+@pytest.mark.asyncio
+async def test_terminal_listen_keeps_spoken_decision(make_rig):
     # A terminal listen after the response spoke is the model yielding the
     # turn; the handle must stay decision="speak" with its audio intact.
-    sock = FakeSocket()
-    sock.feed(SESSION_CREATED)
+    rig = make_rig()
     chunk = b"\x00\x01" * 2400
-    client, _ = make_client(sock)
-    async with client:
-        sock.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
-        sock.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
-        sock.feed(
+    async with rig.client as client:
+        rig.feed({"type": "response.created", "response": {"id": "resp-1"}, "server_event_seq": 2})
+        rig.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
+        rig.feed(
             {
                 "type": "response.output_audio.delta",
                 "response_id": "resp-1",
@@ -377,24 +540,23 @@ async def test_terminal_listen_keeps_spoken_decision():
                 "server_event_seq": 4,
             }
         )
-        sock.feed({"type": "response.listen", "response_id": "resp-1", "server_event_seq": 5})
+        rig.feed({"type": "response.listen", "response_id": "resp-1", "server_event_seq": 5})
         async for response in client.responses():
             chunks = [piece async for piece in response.audio()]
             assert chunks == [chunk]
             assert response.decision == "speak"
             assert response.finished
             break
-        sock.feed(SESSION_CLOSED)
+        rig.feed(SESSION_CLOSED)
 
 
-async def test_error_event_surfaces_on_response_path():
+@pytest.mark.asyncio
+async def test_error_event_surfaces_on_response_path(make_rig):
     # A rejected send produces no response; a consumer waiting in responses()
     # must see the rejection instead of waiting forever.
-    sock = FakeSocket()
-    sock.feed(SESSION_CREATED)
-    client, _ = make_client(sock)
-    async with client:
-        sock.feed(
+    rig = make_rig()
+    async with rig.client as client:
+        rig.feed(
             {
                 "type": "error",
                 "error": {"code": "input_audio_buffer_empty", "message": "empty commit"},
@@ -405,9 +567,10 @@ async def test_error_event_surfaces_on_response_path():
             async for _ in client.responses():
                 pass
         assert excinfo.value.code == "input_audio_buffer_empty"
-        sock.feed(SESSION_CLOSED)
+        rig.feed(SESSION_CLOSED)
 
 
+@pytest.mark.asyncio
 async def test_slow_audio_consumer_drops_oldest_instead_of_stalling():
     from vllm_omni.clients.duplex import AudioDelta, ResponseHandle
 
@@ -425,24 +588,24 @@ async def test_slow_audio_consumer_drops_oldest_instead_of_stalling():
 
 
 # ---------------------------------------------------------------------------
-# Resume
+# Resume (websocket only)
 
 
+@pytest.mark.asyncio
 async def test_resume_after_transport_drop():
     first = FakeSocket()
     first.feed(SESSION_CREATED)
     second = FakeSocket()
     # Mirror the real resume activation payload
     # (entrypoints/duplex/serving.py, activation_payload_factory): it carries
-    # no nested "session" object, only the identity fields.
+    # the identity fields plus the (empty) public session object.
     second.feed(
         {
             "type": "session.resumed",
-            "session_id": "sess-1",
-            "incarnation": 0,
-            "attachment_generation": 1,
+            "session_id": SESSION_ID,
+            "session": {},
+            "attachment_generation": 2,
             "resume_token": "tok-2",
-            "server_event_seq": 5,
         }
     )
     client, calls = make_client(
@@ -453,34 +616,39 @@ async def test_resume_after_transport_drop():
     async with client:
         stream = client.events()
 
-        async def take_two():
+        async def collect_until_resumed():
             seen = []
             async for event in stream:
                 seen.append(event)
-                if len(seen) == 2:
+                if isinstance(event, SessionResumed):
                     return seen
 
-        consumer = asyncio.create_task(take_two())
+        consumer = asyncio.create_task(collect_until_resumed())
         await asyncio.sleep(0)  # let the consumer subscribe before the drop
         await asyncio.sleep(0)
+        first.feed({"type": "response.listen", "server_event_seq": 7})
+        await _drain(lambda: {"type": "session.event_ack", "server_event_seq": 7} in _acks(first))
         first.feed(RuntimeError("transport dropped"))
         seen = await asyncio.wait_for(consumer, timeout=5.0)
-        assert isinstance(seen[0], ConnectionResumed)
-        assert isinstance(seen[1], SessionResumed)
+        assert [type(event) for event in seen[-2:]] == [ConnectionResumed, SessionResumed]
         assert client.resume_token == "tok-2"
+        # The superseded transport is closed, not leaked.
+        assert first.closed
         # The activation payload has no session object; the info captured at
         # the original handshake must survive the resume.
-        assert client.session_info == {"session_id": "sess-1"}
+        assert client.session_info == {"id": SESSION_ID, "model": "test-model"}
         assert len(calls) == 2
         resume = second.sent[0]
-        assert resume["type"] == "session.resume"
-        assert resume["session_id"] == "sess-1"
-        assert resume["incarnation"] == 0
-        assert resume["resume_token"] == "tok-1"
-        assert resume["last_received_server_event_seq"] == 1
+        assert resume == {
+            "type": "session.resume",
+            "session_id": SESSION_ID,
+            "resume_token": "tok-1",
+            "last_received_server_event_seq": 7,
+        }
         second.feed(SESSION_CLOSED)
 
 
+@pytest.mark.asyncio
 async def test_no_reconnect_policy_surfaces_closed():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -493,6 +661,7 @@ async def test_no_reconnect_policy_surfaces_closed():
                 pass
 
 
+@pytest.mark.asyncio
 async def test_heartbeat_survives_transient_send_failure():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -514,6 +683,7 @@ async def test_heartbeat_survives_transient_send_failure():
         sock.feed(SESSION_CLOSED)
 
 
+@pytest.mark.asyncio
 async def test_aexit_sends_session_close_on_error_path():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -534,6 +704,7 @@ def test_target_url_forces_autostart_off():
     assert query["autostart"] == ["0"]
 
 
+@pytest.mark.asyncio
 async def test_fatal_resume_error_gives_up():
     first = FakeSocket()
     first.feed(SESSION_CREATED)
@@ -551,6 +722,121 @@ async def test_fatal_resume_error_gives_up():
             async for _ in stream:
                 pass
         assert len(calls) == 2  # no retry after a fatal resume error
+
+
+# ---------------------------------------------------------------------------
+# Inline client over a fake DuplexOmni
+
+
+@pytest.mark.asyncio
+async def test_inline_handshake_opens_session_with_payload_and_adopts_id():
+    client, omni = make_inline_client(config=SessionConfig(ref_audio="data:audio/wav;base64,AAA="))
+    async with client:
+        assert omni.opened == [client.config.to_session_payload(model="test-model")]
+        assert omni.opened[0]["ref_audio"] == "data:audio/wav;base64,AAA="
+        assert client.session_id == SESSION_ID
+        handle = omni.handles[0]
+        # The session was opened with the full session object already; the
+        # base handshake's session.update must not be re-submitted as a patch
+        # (a ref_audio patch would be rejected by the runner).
+        assert handle.commands == []
+        await client.send({"type": "session.update", "session": {"instructions": "later"}})
+        assert [type(command) for command in handle.commands] == [duplex_commands.UpdateSession]
+        assert handle.commands[0].patch == {"instructions": "later"}
+
+
+@pytest.mark.asyncio
+async def test_inline_client_submits_typed_commands_in_order():
+    client, omni = make_inline_client()
+    async with client:
+        handle = omni.handles[0]
+        pcm = b"\x01\x00" * 1600
+        await client.append_audio(pcm, is_speech=True)
+        await client.commit(create_response=True)
+        await client.cancel_response("resp-1")
+        await client.ack_playback(120.9, response_id="resp-1")
+        assert [type(command) for command in handle.commands] == [
+            duplex_commands.AppendAudio,
+            duplex_commands.Commit,
+            duplex_commands.CancelResponse,
+            duplex_commands.AckPlayback,
+        ]
+        append, commit, cancel, ack = handle.commands
+        assert append.is_speech is True
+        assert append.audio_end_ms == 100
+        assert append.event_id
+        assert commit.final is True and commit.create_response is True
+        assert cancel.response_id == "resp-1"
+        assert ack.played_ms == 120 and ack.response_id == "resp-1"
+
+
+@pytest.mark.asyncio
+async def test_inline_session_close_maps_to_handle_close():
+    client, omni = make_inline_client()
+    async with client:
+        pass
+    handle = omni.handles[0]
+    assert handle.closed
+    assert handle.close_calls >= 1
+    assert not any(isinstance(command, duplex_commands.CloseSession) for command in handle.commands)
+    # The typed session.closed reached the client as the expected end.
+    with pytest.raises(DuplexSessionClosedError):
+        await client.send({"type": "session.heartbeat"})
+
+
+@pytest.mark.asyncio
+async def test_inline_client_forwards_heartbeats_and_drops_event_acks():
+    client, omni = make_inline_client()
+    async with client:
+        handle = omni.handles[0]
+        await client.send({"type": "session.heartbeat"})
+        await client.send({"type": "session.event_ack", "server_event_seq": 3})
+        # A heartbeat is a lease touch the engine must see; the ack is a journal concern.
+        assert [type(command).__name__ for command in handle.commands] == ["Heartbeat"]
+
+
+@pytest.mark.asyncio
+async def test_inline_malformed_payload_surfaces_as_error_event():
+    client, omni = make_inline_client()
+    async with client:
+        handle = omni.handles[0]
+        # Subscribe before sending: the translation error is dispatched inline.
+        first_event = asyncio.create_task(client.wait_for("error", timeout_s=5.0))
+        await asyncio.sleep(0)
+        event_id = await client.send({"type": "playback.ack"})  # played_ms missing
+        event = await first_event
+        assert isinstance(event, ErrorEvent)
+        assert event.code == "bad_event"
+        assert event.related_event_id == event_id
+        assert handle.commands == []
+        with pytest.raises(DuplexProtocolError) as excinfo:
+            async for _ in client.responses():
+                pass
+        assert excinfo.value.code == "bad_event"
+
+
+@pytest.mark.asyncio
+async def test_inline_teardown_cancels_pump_and_closes_handle():
+    client, omni = make_inline_client()
+    async with client:
+        handle = omni.handles[0]
+        await _drain(lambda: handle.consumer_active)
+        pump = client._pump_task
+        assert pump is not None and not pump.done()
+    assert pump.done()
+    assert not handle.consumer_active
+    assert handle.closed
+
+
+@pytest.mark.asyncio
+async def test_inline_send_after_handle_closed_raises_connection_error():
+    client, omni = make_inline_client()
+    async with client:
+        handle = omni.handles[0]
+        handle.closed = True  # the engine ended the session without an event yet
+        with pytest.raises(DuplexConnectionError, match="not open"):
+            await client.send({"type": "input_audio_buffer.clear"})
+        handle.closed = False
 
 
 # ---------------------------------------------------------------------------
@@ -600,8 +886,7 @@ def test_build_realtime_url_with_model_extra_query():
     url = build_realtime_url(
         "ws://localhost:8099/v1/realtime?custom=1",
         "openbmb/MiniCPM-o-4_5",
-        session_id="session-a",
-        extra_query={"native_duplex": "1"},
+        extra_query={"probe": "1"},
     )
 
     query = parse_qs(urlsplit(url).query)
@@ -609,8 +894,7 @@ def test_build_realtime_url_with_model_extra_query():
         "custom": ["1"],
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
-        "native_duplex": ["1"],
-        "session_id": ["session-a"],
+        "probe": ["1"],
     }
 
 
@@ -619,12 +903,11 @@ def test_build_realtime_url_resume_only_when_autostart_disabled():
         "ws://localhost:8099/v1/realtime?duplex=1",
         "openbmb/MiniCPM-o-4_5",
         autostart=False,
-        extra_query={"native_duplex": "1"},
     )
 
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
-    assert query["native_duplex"] == ["1"]
+    assert "session_id" not in query
 
 
 def test_event_collector_partitions_audio_by_response():
@@ -838,6 +1121,7 @@ def test_duplex_unit_boundary_and_residual_math():
     assert chunk_period_ms([{"type": "session.created", "session": {}}]) == 1000
 
 
+@pytest.mark.asyncio
 async def test_stream_pcm_sends_each_units_composite_beside_its_base_frame():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -860,16 +1144,16 @@ async def test_stream_pcm_sends_each_units_composite_beside_its_base_frame():
         sock.feed(SESSION_CLOSED)
 
 
-def test_build_realtime_url_native_duplex_flag_and_http_scheme():
-    url = build_realtime_url("http://localhost:8099/v1/realtime", None, native_duplex=None)
+def test_build_realtime_url_rewrites_http_scheme_and_rejects_others():
+    url = build_realtime_url("http://localhost:8099/v1/realtime", None)
     parts = urlsplit(url)
     assert parts.scheme == "ws"
     assert parse_qs(parts.query) == {"duplex": ["1"]}
 
-    url = build_realtime_url("https://host/v1/realtime", "m", native_duplex=False)
+    url = build_realtime_url("https://host/v1/realtime", "m", autostart=True)
     parts = urlsplit(url)
     assert parts.scheme == "wss"
-    assert parse_qs(parts.query)["native_duplex"] == ["0"]
+    assert parse_qs(parts.query) == {"duplex": ["1"], "model": ["m"], "autostart": ["1"]}
 
     with pytest.raises(ValueError):
         build_realtime_url("ftp://host/v1/realtime", "m")

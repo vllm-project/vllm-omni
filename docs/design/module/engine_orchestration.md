@@ -16,6 +16,7 @@ required_reviewers:
   - "@yenuo26"
   - "@NickCao"
 primary_code_paths:
+  - vllm_omni/engine/omni_engine_base.py
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/engine/async_engine_utils.py
   - vllm_omni/engine/orchestrator.py
@@ -28,8 +29,12 @@ related_code_paths:
   - vllm_omni/engine/stage_pool.py
   - vllm_omni/outputs/output_processor.py
   - vllm_omni/distributed/omni_coordinator/**
-  # Duplex kernel design is owned by ../fullduplex.md; listed here because the
-  # orchestrator hosts the duplex control plane.
+  # The duplex siblings (DuplexOmniEngine / DuplexOrchestrator) and the
+  # engine-resident session framework are owned by ../fullduplex.md; listed
+  # here because they fill the template seams of OmniEngineBase and
+  # OrchestratorBase.
+  - vllm_omni/engine/duplex_omni_engine.py
+  - vllm_omni/engine/duplex_orchestrator.py
   - vllm_omni/engine/duplex/**
 depends_on:
   - input_output_modality_contracts.md
@@ -48,6 +53,8 @@ validation_paths:
   - tests/engine/test_cfg_companion_lifecycle.py
   - tests/engine/test_rpc_result_router.py
   - tests/engine/duplex/**
+  - tests/engine/test_duplex_orchestrator.py
+  - tests/engine/test_duplex_omni_engine.py
   - tests/engine/test_duplex_import_boundary.py
 upstream_refs:
   - vllm.v1.engine.EngineCoreRequest

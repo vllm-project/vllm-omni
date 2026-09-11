@@ -21,7 +21,7 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[3]
+REPO_ROOT = SCRIPT_DIR.parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -40,6 +40,15 @@ def _ref_audio_data_url(path: str) -> str:
 
 def _url_with_model(*args, **kwargs) -> str:
     return _scenario_module()._url_with_model(*args, **kwargs)
+
+
+def _created_session_id(created: dict[str, object]) -> str:
+    """The server-allocated session id announced by ``session.created``."""
+    session = created.get("session")
+    session_id = session.get("id") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("session.created omitted the server-allocated session id")
+    return session_id
 
 
 async def run_demo(args):
@@ -217,7 +226,6 @@ async def _open_admission_session(
         args.url,
         args.model,
         autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=session_id,
     )
     ws = await websockets.connect(url, max_size=64 * 1024 * 1024)
     await ws.send(
@@ -225,10 +233,8 @@ async def _open_admission_session(
             {
                 "type": "session.update",
                 "session": {
-                    "session_id": session_id,
                     "model": args.model,
                     "modalities": ["audio", "text"],
-                    "extra_body": {"native_duplex": True},
                     **({"ref_audio": _ref_audio_data_url(args.ref_audio)} if getattr(args, "ref_audio", None) else {}),
                 },
             }
@@ -255,12 +261,10 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
         for index in range(limit):
             accepted.append(await _open_admission_session(args, f"{prefix}-accepted-{index}"))
 
-        overflow_id = f"{prefix}-overflow"
         overflow_url = _url_with_model(
             args.url,
             args.model,
             autostart=False if getattr(args, "ref_audio", None) else None,
-            session_id=overflow_id,
         )
         async with websockets.connect(overflow_url, max_size=64 * 1024 * 1024) as overflow:
             await overflow.send(
@@ -268,10 +272,8 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
                     {
                         "type": "session.update",
                         "session": {
-                            "session_id": overflow_id,
                             "model": args.model,
                             "modalities": ["audio", "text"],
-                            "extra_body": {"native_duplex": True},
                             **(
                                 {"ref_audio": _ref_audio_data_url(args.ref_audio)}
                                 if getattr(args, "ref_audio", None)
@@ -326,7 +328,6 @@ async def _resume_probe(
         args.url,
         args.model,
         autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=session_id,
     )
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as first:
         await first.send(
@@ -334,10 +335,8 @@ async def _resume_probe(
                 {
                     "type": "session.update",
                     "session": {
-                        "session_id": session_id,
                         "model": args.model,
                         "modalities": ["audio", "text"],
-                        "extra_body": {"native_duplex": True},
                         **(
                             {"ref_audio": _ref_audio_data_url(args.ref_audio)}
                             if getattr(args, "ref_audio", None)
@@ -348,10 +347,10 @@ async def _resume_probe(
             )
         )
         created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
+        session_id = _created_session_id(created)
         token = created.get("resume_token")
-        incarnation = created.get("incarnation")
         generation = created.get("attachment_generation")
-        if not isinstance(token, str) or not isinstance(incarnation, int):
+        if not isinstance(token, str):
             raise RuntimeError("session.created omitted resumable credentials")
         last_seq = max(_server_event_sequences(first_events), default=0)
 
@@ -366,7 +365,6 @@ async def _resume_probe(
                 {
                     "type": "session.resume",
                     "session_id": session_id,
-                    "incarnation": incarnation,
                     "resume_token": token,
                     "last_received_server_event_seq": last_seq,
                 }
@@ -429,7 +427,6 @@ async def _takeover_probe(
         args.url,
         args.model,
         autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=session_id,
     )
     first = await websockets.connect(url, max_size=64 * 1024 * 1024)
     second = None
@@ -439,10 +436,8 @@ async def _takeover_probe(
                 {
                     "type": "session.update",
                     "session": {
-                        "session_id": session_id,
                         "model": args.model,
                         "modalities": ["audio", "text"],
-                        "extra_body": {"native_duplex": True},
                         **(
                             {"ref_audio": _ref_audio_data_url(args.ref_audio)}
                             if getattr(args, "ref_audio", None)
@@ -453,10 +448,10 @@ async def _takeover_probe(
             )
         )
         created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
+        session_id = _created_session_id(created)
         token = created.get("resume_token")
-        incarnation = created.get("incarnation")
         generation = created.get("attachment_generation")
-        if not isinstance(token, str) or not isinstance(incarnation, int) or not isinstance(generation, int):
+        if not isinstance(token, str) or not isinstance(generation, int):
             raise RuntimeError("session.created omitted takeover credentials")
         last_seq = max(_server_event_sequences(first_events), default=0)
 
@@ -466,7 +461,6 @@ async def _takeover_probe(
                 {
                     "type": "session.resume",
                     "session_id": session_id,
-                    "incarnation": incarnation,
                     "resume_token": token,
                     "last_received_server_event_seq": last_seq,
                 }
