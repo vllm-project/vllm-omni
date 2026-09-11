@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Online serving tests for ``Qwen/Qwen-Image`` (text-to-image).
@@ -24,7 +24,7 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -61,7 +61,7 @@ def _get_default_case(model: str):
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
-def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
     """Default Qwen-Image T2I smoke (single ``default`` server config)."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
     request_config = {
@@ -76,14 +76,14 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
             "seed": 42,
         },
     }
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
-def test_batch_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+def test_batch_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
     """Concurrent T2I: one ``request_config`` dict per prompt (``send_diffusion_request`` list mode)."""
     request_config = [
         {
@@ -100,4 +100,4 @@ def test_batch_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) 
         }
         for prompt in TEST_PROMPTS
     ]
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

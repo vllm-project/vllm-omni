@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OpenAI-compatible protocol definitions for image generation.
 
@@ -20,6 +20,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
+
+# Bound int request fields to avoid overflow issues.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 _IMAGE_FILE_METADATA = {
     "jpg": ("jpg", "image/jpeg"),
@@ -144,7 +148,7 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    seed: int | None = Field(default=None, ge=_INT64_MIN, le=_INT64_MAX, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
@@ -170,6 +174,10 @@ class ImageGenerationRequest(BaseModel):
     output_format: str | None = Field(
         default=None,
         description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
+    )
+    return_stage_metrics: bool | None = Field(
+        default=None,
+        description="Return stage metrics for benchmark clients.",
     )
 
 

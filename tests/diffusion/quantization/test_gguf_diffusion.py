@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end tests for GGUF quantization on diffusion models.
 
 Validates that GGUF-quantized diffusion models generate valid images and
@@ -19,8 +19,8 @@ import numpy as np
 import pytest
 import torch
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput

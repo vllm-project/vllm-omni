@@ -118,6 +118,21 @@ On Atlas 800I A3 (64 GB HBM per device) the combined service does not fit at
 above) or HSDP — see
 [§ Memory and attention optimizations](#memory-and-attention-optimizations-a3).
 
+### CPU MP4 response encoding (Atlas A2)
+
+Non-streaming MP4 responses use one public automatic encoder. It checks the
+runtime frame shape, common dtype, and RGB channel-plane contiguity for every
+request; compatible inputs use direct planar PyAV frames, while unsupported
+inputs fall back to the legacy muxer before opening the PyAV container. No CLI
+flag, model declaration, or user configuration is required. Streaming fMP4
+output remains on its existing incremental path.
+
+Current performance and correctness validation is limited to one Atlas A2 host
+with 8x Ascend 910B4-1 NPUs, the `FL2VA`/`t2va` partition, one request at a
+time, 1344x768 at 24 fps, and 5, 8.7, and 15 second requests. This optimization
+only changes CPU MP4 response encoding; it does not change DiT execution or
+stage 0.
+
 ### Optional optimizations
 
 Two independent optimizations may be enabled on top of the configuration

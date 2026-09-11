@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Single source of truth for vLLM-Omni Prometheus + bench CLI metric naming.
 
 Consumed by:
@@ -61,6 +64,7 @@ IMAGE_COUNT = "image_count"
 IMAGE_GENERATION = "image_generation"
 IMAGE_GENERATION_TIME_MS = f"{IMAGE_GENERATION}_time_ms"
 IMAGE_PIXELS = "image_pixels"
+DIFFUSION_SCHEDULER_WAITING_KEY = "scheduler_num_waiting_reqs"
 TOTAL_IMAGES = "total_images"
 IMAGE_THROUGHPUT = "image_throughput"
 AVERAGE_PIXELS_PER_IMAGE = "average_pixels_per_image"
@@ -71,6 +75,29 @@ MEAN_IMAGE_GENERATION_MS = f"mean_{IMAGE_GENERATION}_ms"
 MEDIAN_IMAGE_GENERATION_MS = f"median_{IMAGE_GENERATION}_ms"
 STD_IMAGE_GENERATION_MS = f"std_{IMAGE_GENERATION}_ms"
 PERCENTILES_IMAGE_GENERATION_MS = f"percentiles_{IMAGE_GENERATION}_ms"
+
+VIDEO_DURATION = "video_duration"
+VIDEO_RTF = "video_rtf"
+VIDEO_GENERATION = "video_generation"
+VIDEO_GENERATION_TIME_MS = f"{VIDEO_GENERATION}_time_ms"
+VIDEO_FRAMES = "video_frames"
+TOTAL_VIDEO_DURATION_S = f"total_{VIDEO_DURATION}_s"
+TOTAL_VIDEO_FRAMES = f"total_{VIDEO_FRAMES}"
+VIDEO_THROUGHPUT = "video_throughput"
+MEAN_VIDEO_RTF = f"mean_{VIDEO_RTF}"
+MEDIAN_VIDEO_RTF = f"median_{VIDEO_RTF}"
+STD_VIDEO_RTF = f"std_{VIDEO_RTF}"
+PERCENTILES_VIDEO_RTF = f"percentiles_{VIDEO_RTF}"
+MEAN_VIDEO_GENERATION_MS = f"mean_{VIDEO_GENERATION}_ms"
+MEDIAN_VIDEO_GENERATION_MS = f"median_{VIDEO_GENERATION}_ms"
+STD_VIDEO_GENERATION_MS = f"std_{VIDEO_GENERATION}_ms"
+PERCENTILES_VIDEO_GENERATION_MS = f"percentiles_{VIDEO_GENERATION}_ms"
+
+PEAK_MEMORY_MB = "peak_memory_mb"
+MEAN_PEAK_MEMORY_MB = f"mean_{PEAK_MEMORY_MB}"
+MEDIAN_PEAK_MEMORY_MB = f"median_{PEAK_MEMORY_MB}"
+STD_PEAK_MEMORY_MB = f"std_{PEAK_MEMORY_MB}"
+PERCENTILES_PEAK_MEMORY_MB = f"percentiles_{PEAK_MEMORY_MB}"
 
 # Stage snapshot / StageBenchmarkMetrics field names.
 TOTAL_OUTPUT = "total_output"
@@ -91,6 +118,7 @@ POSTPROCESS_TIME_MS = f"{POSTPROCESS_TIME}_ms"
 POSTPROCESS_TIMES_MS = f"{POSTPROCESS_TIME}s_ms"
 OUTPUT_UNIT_COUNT = "output_unit_count"
 SERVING_TIME_TO_FIRST_OUTPUT_MS = "serving_time_to_first_output_ms"
+IMAGE_TIME_TO_FIRST_OUTPUT_MS = "image_time_to_first_output_ms"
 SERVING_TIME_TO_FIRST_OUTPUTS_MS = "serving_time_to_first_outputs_ms"
 TIME_PER_OUTPUT_UNIT_MS = "time_per_output_unit_ms"
 TIME_PER_OUTPUT_UNITS_MS = "time_per_output_units_ms"
@@ -133,6 +161,12 @@ AUDIO_UNDERRUN_S = METRIC_PREFIX + AUDIO_UNDERRUN + "_s"
 AUDIO_CONTINUITY_OK_METRIC = METRIC_PREFIX + AUDIO_CONTINUITY_OK
 AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
 
+# Realtime Server VAD serving metrics.
+REALTIME_VAD_ACTIVE_SESSIONS = METRIC_PREFIX + "realtime_vad_active_sessions"
+REALTIME_VAD_INFERENCE_LATENCY_S = METRIC_PREFIX + "realtime_vad_inference_latency_s"
+REALTIME_VAD_ENDPOINT_DELAY_S = METRIC_PREFIX + "realtime_vad_endpoint_delay_s"
+REALTIME_VAD_ERRORS = METRIC_PREFIX + "realtime_vad_errors"
+
 
 # ============================================================================
 # Diffusion family (per-stage + per-replica diffusion timing breakdowns)
@@ -153,6 +187,30 @@ TRANSFER_IN_FLIGHT_S = METRIC_PREFIX + "transfer_in_flight_s"
 
 
 # ============================================================================
+# Image / diffusion service-level families
+# ============================================================================
+STAGE_GEN_TIME_S = METRIC_PREFIX + "stage_gen_time_s"
+REQUEST_QUEUE_WAIT_S = METRIC_PREFIX + "request_queue_wait_s"
+STAGE_WAITING_REQUESTS = METRIC_PREFIX + "stage_waiting_requests"
+NUM_INFERENCE_STEPS = METRIC_PREFIX + "num_inference_steps"
+IMAGE_COUNT_METRIC = METRIC_PREFIX + IMAGE_COUNT
+IMAGE_PIXELS_METRIC = METRIC_PREFIX + IMAGE_PIXELS
+PEAK_MEMORY_MB_METRIC = METRIC_PREFIX + "peak_memory_mb"
+REQUESTS_FAILED = METRIC_PREFIX + "requests_failed"
+KV_WAIT_S = METRIC_PREFIX + "kv_wait_s"
+DIFFUSION_FORWARD_S = METRIC_PREFIX + "diffusion_forward_s"
+DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
+DIFFUSION_EXEC_PER_STEP_S = METRIC_PREFIX + "diffusion_exec_per_step_s"
+DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
+DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
+VAE_DECODE_S = METRIC_PREFIX + "vae_decode_s"
+DENOISE_STEP_LATENCY_S = METRIC_PREFIX + DENOISE_STEP_LATENCY + "_s"
+DIFFUSION_KV_LOAD_S = METRIC_PREFIX + "diffusion_kv_load_s"
+IMAGE_TTFP_S = METRIC_PREFIX + "image_ttfp_s"
+STAGE_IN_QUEUE_S = METRIC_PREFIX + "stage_in_queue_s"
+
+
+# ============================================================================
 # Label sets
 # ============================================================================
 PIPELINE_LABELS = ("model_name",)
@@ -162,6 +220,11 @@ SUCCESS_LABELS = ("model_name", "finished_reason")
 # OmniPrometheusStatLogger wrap which relabels upstream ``engine`` into
 # ``stage`` + ``replica``.
 STAGE_LABELS = ("model_name", "stage", "replica")
+
+STAGE_GEN_TIME_LABELS = ("model_name", "stage", "stage_type")
+DIFFUSION_LABELS = ("model_name", "stage")
+FAILED_LABELS = ("model_name", "reason")
+KV_WAIT_LABELS = ("model_name", "connector_type")
 
 # Audio continuity Counter carries an extra ``threshold_ms`` label so multiple
 # threshold buckets can be tracked simultaneously. The ``_ms`` suffix names a
@@ -309,16 +372,6 @@ def compute_audio_frames(
     if pcm_nbytes <= 0 or frame_width <= 0:
         return 0
     return pcm_nbytes // frame_width
-
-
-def compute_denoise_step_latency(stage_gen_time: float, num_inference_steps: int) -> float:
-    """Mean denoise step latency = image stage generation time / step count.
-
-    The returned value uses the same time unit as ``stage_gen_time``.
-    """
-    if num_inference_steps <= 0:
-        return 0.0
-    return stage_gen_time / float(num_inference_steps)
 
 
 # ============================================================================

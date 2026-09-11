@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Task-specific conditioning shared by LTX model versions."""
 
@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
+
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import wrap_methods_by_paths
 
 from . import ltx2_latents as latent_ops
 from .ltx2_guidance import euler_step_from_velocity
@@ -392,6 +394,8 @@ class LTXI2VConditioningMixin:
             vae_scale_factor=self.vae_spatial_compression_ratio,
             resample="bilinear",
         )
+        if getattr(self, "enable_diffusion_pipeline_profiler", False):
+            wrap_methods_by_paths(self, ["video_processor.postprocess_video"])
 
     @staticmethod
     def _resolve_single_prompt_image(raw_image: Any) -> Any:
@@ -502,10 +506,12 @@ class LTXI2VConditioningMixin:
         init_latents = torch.cat(init_latents, dim=0).to(dtype=dtype)
         if num_videos_per_prompt > 1:
             init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
+        latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
         return latent_ops.normalize_latents(
             init_latents,
-            self.vae.latents_mean,
-            self.vae.latents_std,
+            latents_mean,
+            latents_std,
+            scaling_factor,
         )
 
     @staticmethod
@@ -570,11 +576,12 @@ class LTXI2VConditioningMixin:
                     )
                 conditioning_mask = latents.new_zeros(mask_shape)
                 conditioning_mask[:, :, 0] = 1.0
+                latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
                 latents = latent_ops.normalize_latents(
                     latents,
-                    self.vae.latents_mean,
-                    self.vae.latents_std,
-                    self.vae.config.scaling_factor,
+                    latents_mean,
+                    latents_std,
+                    scaling_factor,
                 )
                 clean_latents = latents
                 if image is not None:

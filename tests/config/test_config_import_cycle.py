@@ -66,6 +66,8 @@ def test_npu_platform_defers_minimax_h3_encoder_patch() -> None:
     runtime_src = src[runtime_start:]
     assert "apply_minimax_h3_qwen3vl_patch" not in init_src
     assert "apply_minimax_h3_qwen3vl_patch" in runtime_src
+    assert "apply_minimax_h3_qwen3vl_sdpa_patch" not in init_src
+    assert "apply_minimax_h3_qwen3vl_sdpa_patch" in runtime_src
     assert "apply_minimax_h3_qwen3vl_swiglu_patch" in runtime_src
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for error propagation paths within the Orchestrator.
 
 Covers:
@@ -16,7 +16,9 @@ from types import SimpleNamespace
 
 import janus
 import pytest
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.serial_utils import MsgpackEncoder
 
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
@@ -25,13 +27,22 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    cleanup_request_artifact_dirs,
+)
 from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.stage_input_processors import (
+    joyai_vl_interaction as joyai_bridge,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 from .test_orchestrator import (
     FakeOutputProcessor,
+    FakeRunningCounter,
     FakeStageClient,
     OrchestratorFixture,
     _build_harness,
@@ -39,15 +50,26 @@ from .test_orchestrator import (
     _build_stage_pools,
     _engine_core_outputs,
     _enqueue_add_request,
+    _get_output_message,
     _wait_for,
 )
+
+
+def test_request_artifact_cleanup_is_idempotent(tmp_path):
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "prepared.mp4").touch()
+
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+
+    assert not artifact_dir.exists()
+
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _sampling_params(max_tokens: int = 4):
-    from vllm.sampling_params import SamplingParams
-
     return SamplingParams(max_tokens=max_tokens)
 
 
@@ -186,6 +208,45 @@ class _UnavailableDiffusionStageClient(FakeStageClient):
 
     async def add_request_async(self, *args, **kwargs) -> None:
         raise StageUnavailableError(f"stage {self.stage_id} has no live replica")
+
+
+class _OverflowOnEncodeStageClient(FakeStageClient):
+    """Msgpack-encodes the request's sampling params on dispatch, as the real
+    StageEngineCoreClient does. We use this to make sure overflow sampling params
+    do not break the orchestrator."""
+
+    async def add_request_async(self, request, *args, **kwargs) -> None:
+        MsgpackEncoder().encode(request.sampling_params)
+        await super().add_request_async(request, *args, **kwargs)  # unreachable
+
+
+@pytest.mark.asyncio
+async def test_encode_overflow_should_fail_request_not_loop(orchestrator_factory) -> None:
+    """Regression test for over-range seed handling."""
+    stage0 = _OverflowOnEncodeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory([stage0])
+
+    # seed > 2**63-1 cannot be msgpack-serialized -> the malicious input under test.
+    overflow_params = SamplingParams(seed=2**70)
+
+    await _enqueue_add_request(
+        orchestrator_fixture,
+        request_id="req-overflow",
+        prompt=SimpleNamespace(
+            request_id="req-overflow",
+            prompt_token_ids=[1, 2],
+            sampling_params=overflow_params,
+        ),
+        original_prompt={"prompt": "hi"},
+        sampling_params_list=[overflow_params],
+        final_stage_id=0,
+    )
+
+    error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-overflow")
+    assert error_msg.fatal is False
+    assert error_msg.status_code == 400
+    assert orchestrator_fixture.thread.is_alive()
+    assert "req-overflow" not in orchestrator_fixture.orchestrator.request_states
 
 
 @pytest.mark.asyncio
@@ -878,6 +939,169 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
     finally:
         orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_driven", [False, True], ids=["legacy", "event-driven"])
+@pytest.mark.parametrize("first_speaker", ["Ryan", "not-a-real-speaker"])
+async def test_joyai_tts_request_validation_keeps_orchestrator_running(
+    orchestrator_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    first_speaker: str,
+    event_driven: bool,
+) -> None:
+    """Check that the same orchestrator can handle the next valid request."""
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", "1" if event_driven else "0")
+
+    # Use a fixed token count so the test does not need tokenizer files.
+    class FakeTokenizer:
+        def encode(self, _text: str, *, add_special_tokens: bool) -> list[int]:
+            return list(range(12))
+
+    talker_model_config = SimpleNamespace(
+        max_model_len=64,
+        hf_config=SimpleNamespace(
+            talker_config=SimpleNamespace(spk_id={"vivian": 0, "ryan": 1}, codec_language_id={}, spk_is_dialect={})
+        ),
+    )
+    monkeypatch.setattr(joyai_bridge, "cached_tokenizer_from_config", lambda _: FakeTokenizer())
+
+    # Use the real bridge so speaker validation is part of the test.
+    class JoyAITalkerStage(FakeStageClient):
+        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+            self.bridge_inputs = joyai_bridge.joyai_action_to_tts(
+                source_outputs, prompt, self.requires_multimodal_data, target_model_config=talker_model_config
+            )
+            return self.bridge_inputs
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = JoyAITalkerStage(stage_type="llm", final_output=True)
+    stage0_processor, stage1_processor = FakeOutputProcessor(), FakeOutputProcessor()
+    fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[stage0_processor, stage1_processor],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=talker_model_config),
+        ],
+    )
+    counter = FakeRunningCounter()
+    fixture.orchestrator._running_counter = counter
+    # With a valid speaker, task_type should be changed from Base to CustomVoice.
+    # An unknown speaker should cause a request error.
+    first_info = {"tts_task_type": "Base", "speaker": "Vivian", "tts_speaker": first_speaker}
+    talker_submissions = 0
+    # Send both requests to the same orchestrator. The second uses the default Vivian voice.
+    for index, (request_id, info) in enumerate((("first", first_info), ("good", {})), start=1):
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            original_prompt={"additional_information": info},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == index and counter.value == 1)
+        stage0_processor.request_outputs = [_build_request_output(request_id, text="</response> Hello.")]
+        stage0.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-raw", float(index)))
+
+        if request_id == "first" and first_speaker == "not-a-real-speaker":
+            # Reject this request before Talker runs, while keeping the engine alive.
+            error = await _wait_for_error_message(fixture, request_id=request_id)
+            assert error.status_code == 400 and error.error_type == "BadRequestError"
+            assert error.fatal is False and error.stage_id == 1
+            assert "not-a-real-speaker" in error.error
+            assert stage1.add_request_calls == []
+        else:
+            talker_submissions += 1
+            await _wait_for(lambda: len(stage1.add_request_calls) == talker_submissions or fixture.result_future.done())
+            assert not fixture.result_future.done()
+            assert stage1.add_request_calls[-1][0].request_id == request_id
+            metadata = stage1.bridge_inputs[0]["additional_information"]
+            assert metadata["task_type"] == ["CustomVoice"]
+            assert metadata["speaker"] == [first_speaker if request_id == "first" else "Vivian"]
+            # Finish the valid request and check its final output.
+            stage1_processor.request_outputs = [_build_request_output(request_id, text="Completed.")]
+            stage1.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-talker", float(index)))
+            output = await _get_output_message(fixture)
+            assert output.request_id == request_id and output.stage_id == 1
+            assert output.finished is True
+            assert output.engine_outputs.outputs[0].text == "Completed."
+
+        # Wait for full cleanup before sending the next request.
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states and counter.value == 0)
+        assert all(pool.get_bound_replica_id(request_id) is None for pool in fixture.orchestrator.stage_pools)
+        assert fixture.thread.is_alive() and not fixture.result_future.done()
+
+
+@pytest.mark.asyncio
+async def test_streaming_input_processor_client_error_does_not_forward_terminal_update() -> None:
+    """Do not send a second update after the first one fails and clears the request."""
+    processor_calls = []
+
+    class FailingStage(FakeStageClient):
+        def process_engine_inputs(self, *args, **kwargs):
+            processor_calls.append((args, kwargs))
+            raise OmniClientError("Input rejected")
+
+    orchestrator, queues = _build_bare_orchestrator(
+        _build_stage_pools([[FakeStageClient()], [FailingStage(final_output=True)]])
+    )
+    state = OrchestratorRequestState(
+        request_id="bad-stream",
+        prompt={"prompt_token_ids": [1]},
+        sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.CUMULATIVE), _sampling_params()],
+        final_stage_id=1,
+    )
+    state.streaming.enabled = True
+    assert state.duplex_identity is None
+    orchestrator.request_states[state.request_id] = state
+    try:
+        await orchestrator._route_output(0, 0, _build_request_output(state.request_id), state, stage_metrics=None)
+
+        assert len(processor_calls) == 1
+        error = queues[1].sync_q.get_nowait()
+        assert isinstance(error, ErrorMessage)
+        assert error.request_id == state.request_id
+        assert error.stage_id == 1
+        assert error.status_code == 400
+        assert error.fatal is False
+        assert queues[1].sync_q.empty()
+        assert state.request_id not in orchestrator.request_states
+        assert all(pool.get_bound_replica_id(state.request_id) is None for pool in orchestrator.stage_pools)
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_duplex_input_processor_failure_is_request_scoped(orchestrator_factory, monkeypatch) -> None:
+    class FailingStage(FakeStageClient):
+        def process_engine_inputs(self, *_args, **_kwargs):
+            raise ValueError("No latent or hidden_states found in thinker output")
+
+    fixture = orchestrator_factory(
+        [FakeStageClient(stage_type="llm"), FailingStage(stage_type="llm", final_output=True)]
+    )
+    state = OrchestratorRequestState(
+        request_id="bad",
+        prompt=SimpleNamespace(request_id="bad", prompt_token_ids=[1]),
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        duplex_identity=SimpleNamespace(),
+    )
+
+    async def no_cleanup(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(fixture.orchestrator, "_cleanup_request_ids", no_cleanup)
+    try:
+        await fixture.orchestrator._forward_to_next_stage_unguarded("bad", 0, _build_request_output("raw"), state)
+        error = await _wait_for_error_message(fixture, request_id="bad")
+        assert error.fatal is False
+    finally:
+        fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        fixture.thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

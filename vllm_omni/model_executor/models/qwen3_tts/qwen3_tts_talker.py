@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
@@ -27,6 +30,7 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_qwen3_tts_profile,
 )
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
@@ -527,7 +531,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tensors = load_validated_profile_tensors(
                 profile,
                 expected_model_type="qwen3_tts",
-                qwen3_embedding_dim=expected_dim,
+                validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
+                    profile,
+                    tensors,
+                    expected_embedding_dim=expected_dim,
+                ),
             )
             if tensors is None:
                 continue
@@ -1095,10 +1103,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             subfolder="speech_tokenizer",
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
-        enc_loaded = AutoWeightsLoader(
-            self,
-            skip_prefixes=["decoder."],
-        ).load_weights(subfolder_weights)
+        enc_loaded = AutoWeightsLoader(self).load_weights(
+            subfolder_weights, mapper=WeightsMapper(orig_to_new_prefix={"decoder.": None})
+        )
         loaded |= enc_loaded
 
         # AutoWeightsLoader only loads parameters; the encoder's VQ

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E tests for Voxtral TTS online serving.
 
@@ -31,9 +31,9 @@ pytestmark = [
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-def test_speech_english_basic(omni_server, openai_client) -> None:
+def test_speech_english_basic(omni_server, online_client) -> None:
     """Test basic English TTS generation."""
-    openai_client.send_audio_speech_request(
+    online_client.send_audio_speech_request(
         {
             "model": omni_server.model,
             "input": "how are you",
@@ -47,9 +47,9 @@ def test_speech_english_basic(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
-def test_speech_english_streaming(omni_server, openai_client) -> None:
+def test_speech_english_streaming(omni_server, online_client) -> None:
     """Test basic streaming English TTS generation (PCM via streaming API)."""
-    openai_client.send_audio_speech_request(
+    online_client.send_audio_speech_request(
         {
             "model": omni_server.model,
             "input": "Hello, how are you?",
@@ -65,11 +65,11 @@ def test_speech_english_streaming(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_speech_different_voices(omni_server, openai_client) -> None:
+def test_speech_different_voices(omni_server, online_client) -> None:
     """Test TTS with different voice presets."""
     voices = ["casual_female", "neutral_male"]
     for voice in voices:
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Testing voice selection.",
@@ -82,11 +82,11 @@ def test_speech_different_voices(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_speech_speed(omni_server, openai_client) -> None:
+def test_speech_speed(omni_server, online_client) -> None:
     """Request with speed parameters."""
     speeds = [0.5, 1, 1.5, 2, 2.5]
     for speed in speeds:
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "The boy was there when the sun rose.",
@@ -100,7 +100,7 @@ def test_speech_speed(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_speech_instructions(omni_server, openai_client) -> None:
+def test_speech_instructions(omni_server, online_client) -> None:
     """Request with instructions parameters."""
     instructions = [
         "Speak formally",
@@ -109,7 +109,7 @@ def test_speech_instructions(omni_server, openai_client) -> None:
         "Speak with a chirpy happy voice",
     ]
     for instruction in instructions:
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "The boy was there when the sun rose.",
@@ -134,11 +134,11 @@ def test_speech_instructions(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_speech_response_formats(omni_server, openai_client) -> None:
+def test_speech_response_formats(omni_server, online_client) -> None:
     """Test TTS with different response formats."""
     response_formats = ["wav", "mp3"]
     for response_format in response_formats:
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Testing various response formats.",
@@ -151,7 +151,7 @@ def test_speech_response_formats(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_speech_batches(omni_server, openai_client) -> None:
+def test_speech_batches(omni_server, online_client) -> None:
     """Test TTS batches."""
     items = [
         {"input": "The birch canoe slid on the smooth planks."},
@@ -161,7 +161,7 @@ def test_speech_batches(omni_server, openai_client) -> None:
         {"input": "Rice is often served in round bowls."},
     ]
 
-    openai_client.send_audio_speech_batch_http_request(
+    online_client.send_audio_speech_batch_http_request(
         {
             "json": {
                 "model": omni_server.model,

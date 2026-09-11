@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation.
@@ -17,15 +17,18 @@ from vllm_omni.config.stage_config import (
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
+MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
-    duplex_runtime_extension=("vllm_omni.experimental.fullduplex.minicpmo45.runtime.MiniCPMO45DuplexRuntimeExtension"),
+    duplex_runtime_extension=(
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime.MiniCPMO45DuplexRuntimeExtension"
+    ),
     duplex_serving_adapter=(
-        "vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
     ),
     duplex_control_enabled=True,
     # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
@@ -80,6 +83,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             model_arch="MiniCPMO45Code2Wav",
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )

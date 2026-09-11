@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # vllm-omni customized version
 # Based on: https://github.com/vllm-project/ci-infra/blob/main/buildkite/bootstrap-amd.sh
 # Last synced: 2025-12-15
@@ -6,7 +9,12 @@
 
 set -euo pipefail
 
+# The bootstrap runs from the repository root; ShellCheck does not follow
+# sourced files unless invoked with -x.
+# shellcheck disable=SC1091
 source .buildkite/common/scripts/resolve_skip_ci.sh
+
+AMD_SUITE_SELECTOR=".buildkite/amd/scripts/select_test_suites.py"
 
 if [[ -z "${RUN_ALL:-}" ]]; then
     RUN_ALL=0
@@ -24,31 +32,20 @@ if [[ -z "${AMD_MIRROR_HW:-}" ]]; then
     AMD_MIRROR_HW="amdproduction"
 fi
 
-fail_fast() {
-    DISABLE_LABEL="ci-no-fail-fast"
-    # If BUILDKITE_PULL_REQUEST != "false", then we check the PR labels using curl and jq
-    if [ "$BUILDKITE_PULL_REQUEST" != "false" ]; then
-        PR_LABELS=$(curl -s "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" | jq -r '.labels[].name')
-        if [[ $PR_LABELS == *"$DISABLE_LABEL"* ]]; then
-            echo false
-        else
-            echo true
-        fi
-    else
-        echo false  # not a PR or BUILDKITE_PULL_REQUEST not set
+PR_LABELS=""
+# Explicit debug suites do not depend on PR labels.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -z "${DEBUG_TEST_YAML:-}" ]]; then
+    if ! PR_LABELS=$(curl -fsSL \
+        "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" \
+        | jq -r '.labels[].name'); then
+        echo "ERROR: Could not read PR labels; refusing to select an incorrect AMD test tier." >&2
+        exit 1
     fi
-}
+fi
 
-check_run_all_label() {
-    RUN_ALL_LABEL="ready-run-all-tests"
-    # If BUILDKITE_PULL_REQUEST != "false", then we check the PR labels using curl and jq
-    if [ "$BUILDKITE_PULL_REQUEST" != "false" ]; then
-        PR_LABELS=$(curl -s "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" | jq -r '.labels[].name')
-        if [[ $PR_LABELS == *"$RUN_ALL_LABEL"* ]]; then
-            echo true
-        else
-            echo false
-        fi
+fail_fast() {
+    if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
+        echo true
     else
         echo false  # not a PR or BUILDKITE_PULL_REQUEST not set
     fi
@@ -58,11 +55,64 @@ if [[ -z "${COV_ENABLED:-}" ]]; then
     COV_ENABLED=0
 fi
 
+resolve_test_specs() {
+    local selected_specs
+    if ! selected_specs=$(python3 "$AMD_SUITE_SELECTOR" \
+        --branch "$BUILDKITE_BRANCH" \
+        --labels "$PR_LABELS" \
+        --debug-test-yaml "${DEBUG_TEST_YAML:-}"); then
+        exit 1
+    fi
+
+    TEST_SPECS=()
+    while IFS= read -r suite_spec; do
+        [[ -z "$suite_spec" ]] && continue
+        TEST_SPECS+=("$suite_spec")
+    done <<< "$selected_specs"
+}
+
+filter_test_specs_by_skip_ci() {
+    local suite_spec level decision
+    local skip_all=0
+    local -a runnable_specs=()
+
+    for suite_spec in "${TEST_SPECS[@]}"; do
+        case "$suite_spec" in
+            READY_TESTS:*) level="l2" ;;
+            MERGE_TESTS:*) level="l3" ;;
+            *)
+                echo "ERROR: unknown AMD test suite spec '$suite_spec'" >&2
+                exit 1
+                ;;
+        esac
+
+        if decision=$(python3 "$SKIP_CI_PY" gate amd "$level"); then
+            echo "Skipping AMD $level suite due to $decision decision."
+            [[ "$decision" == "skip-all" ]] && skip_all=1
+        else
+            runnable_specs+=("$suite_spec")
+        fi
+    done
+
+    TEST_SPECS=("${runnable_specs[@]}")
+    if [[ ${#TEST_SPECS[@]} -eq 0 ]]; then
+        if [[ $skip_all -eq 1 ]]; then
+            buildkite-agent annotate \
+                ":memo: CI skipped — docs or pytest skip-mark changes only" \
+                --style "info" 2>/dev/null || true
+        fi
+        echo "No AMD L2/L3 suites remain after skip-ci filtering."
+        exit 0
+    fi
+}
+
 upload_pipeline() {
     echo "Uploading pipeline..."
     # Install minijinja
     ls .buildkite || buildkite-agent annotate --style error 'Please merge upstream main branch for buildkite CI'
     curl -sSfL https://github.com/mitsuhiko/minijinja/releases/download/2.3.1/minijinja-cli-installer.sh | sh
+    # Installed by the minijinja bootstrap above and only present on the CI agent.
+    # shellcheck disable=SC1091
     source /var/lib/buildkite-agent/.cargo/env
 
     if [[ $BUILDKITE_PIPELINE_SLUG == "fastcheck" ]]; then
@@ -76,7 +126,7 @@ upload_pipeline() {
     # (WIP) Use pipeline generator instead of jinja template
     if [ -e ".buildkite/amd/pipeline_generator/pipeline_generator.py" ]; then
         python -m pip install click pydantic
-        python .buildkite/amd/pipeline_generator/pipeline_generator.py --run_all=$RUN_ALL --list_file_diff="$LIST_FILE_DIFF" --nightly="$NIGHTLY" --mirror_hw="$AMD_MIRROR_HW"
+        python .buildkite/amd/pipeline_generator/pipeline_generator.py --run_all="$RUN_ALL" --list_file_diff="$LIST_FILE_DIFF" --nightly="$NIGHTLY" --mirror_hw="$AMD_MIRROR_HW"
         buildkite-agent pipeline upload .buildkite/amd/pipeline.yaml
         exit 0
     fi
@@ -89,28 +139,46 @@ upload_pipeline() {
 
     cd .buildkite/amd
 
-    # Select test definition file: merge suite for main, ready suite for PRs.
-    # For debugging, DEBUG_TEST_YAML can override the selection — accepts
-    # "merge" or "ready" (case-insensitive).
-    if [[ -n "${DEBUG_TEST_YAML:-}" ]]; then
-        case "${DEBUG_TEST_YAML,,}" in
-            merge)
-                TEST_YAML="test-amd-merge.yml"
-                ;;
-            ready)
-                TEST_YAML="test-amd-ready.yml"
-                ;;
-            *)
-                echo "ERROR: DEBUG_TEST_YAML must be 'merge' or 'ready', got '$DEBUG_TEST_YAML'" >&2
-                exit 1
-                ;;
-        esac
-        echo "DEBUG_TEST_YAML override: using $TEST_YAML"
-    elif [[ $BUILDKITE_BRANCH == "main" ]]; then
-        TEST_YAML="test-amd-merge.yml"
+    # Multiple label-selected or debug-selected suites share one image build.
+    if [[ ${#TEST_SPECS[@]} -eq 1 ]]; then
+        TEST_YAML="${TEST_SPECS[0]#*:}"
     else
-        TEST_YAML="test-amd-ready.yml"
+        TEST_YAML=$(mktemp "${TMPDIR:-/tmp}/amd-selected-tests.XXXXXX.yml")
+        python - "$TEST_YAML" "${TEST_SPECS[@]}" <<'PY'
+import sys
+
+import yaml
+
+
+output_path, *suite_specs = sys.argv[1:]
+combined = {"env": {}, "steps": []}
+
+for suite_spec in suite_specs:
+    group_name, input_path = suite_spec.split(":", 1)
+    with open(input_path, encoding="utf-8") as test_file:
+        suite = yaml.safe_load(test_file)
+
+    for name, value in (suite.get("env") or {}).items():
+        previous = combined["env"].get(name, value)
+        if previous != value:
+            raise ValueError(
+                f"Conflicting environment value for {name}: {previous!r} != {value!r}"
+            )
+        combined["env"][name] = value
+
+    suite_steps = []
+    for entry in suite.get("steps") or []:
+        if "group" in entry:
+            suite_steps.extend(entry.get("steps") or [])
+        else:
+            suite_steps.append(entry)
+    combined["steps"].append({"group": group_name, "steps": suite_steps})
+
+with open(output_path, "w", encoding="utf-8") as output_file:
+    yaml.safe_dump(combined, output_file, sort_keys=False)
+PY
     fi
+    echo "AMD test suites: ${TEST_SPECS[*]}"
 
     (
         set -x
@@ -130,19 +198,20 @@ upload_pipeline() {
             > pipeline.yaml
     )
     cat pipeline.yaml
+    if [[ "$TEST_YAML" == "${TMPDIR:-/tmp}/amd-selected-tests."*.yml ]]; then
+        rm -f -- "$TEST_YAML"
+    fi
     buildkite-agent artifact upload pipeline.yaml
     buildkite-agent pipeline upload pipeline.yaml
     exit 0
 }
 
 get_diff() {
-    $(git add .)
-    echo $(git diff --name-only --diff-filter=ACMDR $(git merge-base origin/main HEAD))
+    git diff --name-only --diff-filter=ACMDR "$(git merge-base origin/main HEAD)"
 }
 
 get_diff_main() {
-    $(git add .)
-    echo $(git diff --name-only --diff-filter=ACMDR HEAD~1)
+    git diff --name-only --diff-filter=ACMDR HEAD~1
 }
 
 file_diff=$(get_diff)
@@ -150,12 +219,10 @@ if [[ $BUILDKITE_BRANCH == "main" ]]; then
     file_diff=$(get_diff_main)
 fi
 
-# Early exit: unified skip-ci (docs / skip marks) and CI-yaml-only level targeting.
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    gate_bootstrap_ci amd l3
-else
-    gate_bootstrap_ci amd l2
-fi
+# Resolve PR tier labels before skip-ci so ready and merge suites can be
+# filtered independently for CI-YAML-only changes.
+resolve_test_specs
+filter_test_specs_by_skip_ci
 
 patterns=(
     "docker/Dockerfile"
@@ -181,7 +248,7 @@ for file in $file_diff; do
     # First check if file matches any pattern
     matches_pattern=0
     for pattern in "${patterns[@]}"; do
-        if [[ $file == $pattern* ]] || [[ $file == $pattern ]]; then
+        if [[ $file == "$pattern"* ]] || [[ $file == "$pattern" ]]; then
             matches_pattern=1
             break
         fi
@@ -191,7 +258,7 @@ for file in $file_diff; do
     if [[ $matches_pattern -eq 1 ]]; then
         matches_ignore=0
         for ignore in "${ignore_patterns[@]}"; do
-            if [[ $file == $ignore* ]] || [[ $file == $ignore ]]; then
+            if [[ $file == "$ignore"* ]] || [[ $file == "$ignore" ]]; then
                 matches_ignore=1
                 break
             fi
@@ -204,14 +271,6 @@ for file in $file_diff; do
         fi
     fi
 done
-
-# Check for ready-run-all-tests label
-LABEL_RUN_ALL=$(check_run_all_label)
-if [[ $LABEL_RUN_ALL == true ]]; then
-    RUN_ALL=1
-    NIGHTLY=1
-    echo "Found 'ready-run-all-tests' label. Running all tests including optional tests."
-fi
 
 # Decide whether to use precompiled wheels
 # Relies on existing patterns array as a basis.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.openai.session_attachment import (
+from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexEventJournal,
     DuplexJournalGapError,
     DuplexJournalOverflowError,
@@ -43,7 +43,7 @@ def test_resume_credential_uses_256_bit_token_digest_and_redacted_repr(monkeypat
     credential = DuplexResumeCredential.from_token(token)
     calls = []
 
-    import vllm_omni.experimental.fullduplex.openai.session_attachment as attachment_module
+    import vllm_omni.entrypoints.duplex.session_attachment as attachment_module
 
     original_compare = attachment_module.hmac.compare_digest
 
@@ -78,7 +78,7 @@ def test_event_journal_sequences_acknowledges_and_replays_exact_payloads() -> No
     clock = _Clock()
     journal = DuplexEventJournal(max_bytes=4096, ttl_s=60.0, clock=clock)
 
-    first = journal.record({"type": "response.audio.delta", "delta": "AAAA"})
+    first = journal.record({"type": "response.output_audio.delta", "delta": "AAAA"})
     second = journal.record({"type": "response.done", "response_id": "resp-1"})
 
     assert first.sequence == 1

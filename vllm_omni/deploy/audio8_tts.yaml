@@ -1,0 +1,80 @@
+# Audio8 TTS Preview 0.6B deploy: async-chunk streaming slow_ar -> codec_decoder.
+# Model: Audio8/Audio8-TTS-Preview-0.6b (model_type = "arktts").
+#
+# trust_remote_code is deliberately OFF: the checkpoint ships an `auto_map`, and
+# transformers prefers remote code over registered classes when it is enabled,
+# which would bypass vllm-omni's Audio8TTSConfig (the Qwen2-shaped view that
+# Qwen2Model needs). The tokenizer is a plain PreTrainedTokenizerFast and needs
+# no remote code either.
+async_chunk: true
+enable_chunked_prefill: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      # ~21.5 Hz codec; 25 frames ~= 1.16 s of audio.
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+      initial_codec_chunk_frames: 4
+      # float32 keeps the Snake activations / weight-normed convs clean.
+      audio8_tts_codec_dtype: float32
+
+stages:
+  - stage_id: 0
+    # >= 4 so concurrent requests pipeline; a default of 1 starves the codec
+    # window and produces audible gaps under load.
+    #
+    # Measured on 1x H20 (20 prompts, mean audio 4.5 s): at client concurrency 8,
+    # raising this to 8 buys +27% throughput and 4.5x lower first-packet latency
+    # (1124 ms -> 247 ms) at the cost of a 0.22 s worst-case buffer deficit in
+    # 1 of 20 requests. 4 is the default because every measured point here had
+    # zero underrun; see examples/online_serving/text_to_speech/README.md.
+    max_num_seqs: 4
+    # 0.6B weights + a 2048-token KV cache need very little: sized for a small
+    # slice of the GPU so the codec stage and other tenants still fit.
+    gpu_memory_utilization: 0.2
+    enforce_eager: false
+    trust_remote_code: false
+    enable_prefix_caching: false
+    async_scheduling: false
+    # The checkpoint's max_seq_len is 2048 packed text+audio positions; with
+    # chunked prefill off, max_num_batched_tokens must be >= max_model_len.
+    max_model_len: 2048
+    max_num_batched_tokens: 2048
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      # generation_config.json of the released checkpoint.
+      temperature: 0.7
+      top_k: 50
+      top_p: 0.9
+      max_tokens: 1024
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 1
+    # The codec is ~1.4 GB of weights plus per-chunk activations.
+    gpu_memory_utilization: 0.1
+    enforce_eager: true
+    trust_remote_code: false
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_model_len: 2048
+    max_num_batched_tokens: 2048
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

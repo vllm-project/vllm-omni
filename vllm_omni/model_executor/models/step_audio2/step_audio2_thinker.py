@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Step-Audio2 Thinker - Stage 1 LLM for Audio Understanding
 
@@ -13,13 +16,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
-import librosa  # noqa: TID251
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessorMixin
 from vllm.config import VllmConfig
 from vllm.inputs import MultiModalDataDict
@@ -52,6 +55,7 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_TOKEN_CONFIG,
     STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID,
 )
+from vllm_omni.utils.audio import mel_filter_bank
 
 if TYPE_CHECKING:
     pass
@@ -65,7 +69,7 @@ if TYPE_CHECKING:
 def _mel_filters(n_mels: int) -> torch.Tensor:
     """Generate mel filter banks"""
     assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-    return torch.from_numpy(librosa.filters.mel(sr=16000, n_fft=400, n_mels=n_mels))
+    return mel_filter_bank(sr=16000, n_fft=400, n_mels=n_mels)
 
 
 def _normalize_audio(audio: Any) -> torch.Tensor:
@@ -503,6 +507,10 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
         audio_token = getattr(processor, "audio_token", "<audio_patch>")
+        audio_token_ids = self.info.get_tokenizer().encode(
+            audio_token,
+            add_special_tokens=False,
+        )
 
         audio_items = mm_items.get("audio", [])
         num_audio_items = len(audio_items) if audio_items else 0
@@ -548,27 +556,22 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=audio_token_ids,
                 replacement=get_replacement_audio,
             )
         ]
 
-    def _call_hf_processor(
+    def _preprocess_hf_mm_data(
         self,
-        prompt: str,
         mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object] | None = None,
-        tok_kwargs: Mapping[str, object] | None = None,
-        **_: object,
-    ):
-        """Call HF processor and post-process outputs"""
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
+            mm_data,
+            hf_processor_mm_kwargs,
+        )
         mm_data = dict(mm_data)
         audios = mm_data.pop("audios", [])
-
-        mm_kwargs = mm_kwargs or {}
-        tok_kwargs = tok_kwargs or {}
-
-        # CRITICAL: Ensure audios is ALWAYS a list to prevent string iteration
         if audios:
             if isinstance(audios, str):
                 mm_data["audio"] = [audios]
@@ -576,20 +579,24 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
                 mm_data["audio"] = audios
             else:
                 mm_data["audio"] = [audios]
+        return mm_data, hf_processor_mm_kwargs
 
-        hf_inputs = super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
+    def _postprocess_hf_mm_data(
+        self,
+        mm_data: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
+    ) -> BatchFeature:
+        processed_data = super()._postprocess_hf_mm_data(
+            mm_data,
+            hf_processor_mm_kwargs,
+            processed_data,
         )
-
-        if "audio_mels" not in hf_inputs:
-            hf_inputs["audio_mels"] = torch.empty((0, 128, 0))
-        if "audio_lens" not in hf_inputs:
-            hf_inputs["audio_lens"] = torch.tensor([], dtype=torch.int32)
-
-        return hf_inputs
+        if "audio_mels" not in processed_data:
+            processed_data["audio_mels"] = torch.empty((0, 128, 0))
+        if "audio_lens" not in processed_data:
+            processed_data["audio_lens"] = torch.tensor([], dtype=torch.int32)
+        return processed_data
 
 
 # ============================================================================

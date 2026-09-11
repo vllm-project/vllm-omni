@@ -1,47 +1,52 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model specific tests for CacheDiT enablement.
 """
 
 import ast
-import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
+from vllm.distributed import parallel_state
 
 import vllm_omni.diffusion.cache.cachedit as cd_backend
 import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, CacheDiTBackend, cache_summary
-from vllm_omni.diffusion.data import DiffusionCacheConfig
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.platforms import current_omni_platform
 
-# NOTE: We patch DreamID Omni's modules here with mocks so that we can import and inspect
-# the class even though the dependency may not be set up correctly; this is ok for these
-# tests because we just inspect it and never initialize the model.
-for mod in ("dreamid_omni", "dreamid_omni.modules", "dreamid_omni.modules.model"):
-    sys.modules.setdefault(mod, Mock())
-# isort: split
-from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel as DreamIdOmniModel  # noqa: E402
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SEPARATE_CFG_TRANSFORMERS = [
-    DreamIdOmniModel,
     HeliosTransformer3DModel,
     LongCatImageTransformer2DModel,
     Cosmos3VFMTransformer,
 ]
 
 SAMPLE_CACHE_CONFIG = DiffusionCacheConfig()
+
+
+@contextmanager
+def _force_torch_sdpa():
+    """Pin TORCH_SDPA so CPU shape tests do not pick CUDA-only backends (FA3)."""
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
+    with set_current_diffusion_config(od_config):
+        yield
 
 
 def test_custom_cache_dit_enablers_are_registered_explicitly():
@@ -54,11 +59,24 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
         "Cosmos3OmniDiffusersPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Cosmos3OmniPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Krea2Pipeline": cd_model_specific.enable_cache_for_krea2,
+        "Magi2Pipeline": cd_model_specific.enable_cache_for_magi2,
     }
 
     with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):
         cd_model_specific.register_custom_dit_enablers()
         assert cd_backend.CUSTOM_DIT_ENABLERS == expected_enablers
+
+
+@pytest.fixture()
+def init_fake_tp_group(mocker):
+    """Provide a fake TP group so vLLM linear layers can be instantiated."""
+    mock_tp = mocker.MagicMock()
+    mock_tp.world_size = 1
+    mock_tp.rank_in_group = 0
+    old = parallel_state._TP
+    parallel_state._TP = mock_tp
+    yield
+    parallel_state._TP = old
 
 
 def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
@@ -73,12 +91,50 @@ def test_cosmos3_aliases_use_cosmos3_custom_cache_dit_enabler(pipeline_name: str
     assert cd_backend.CUSTOM_DIT_ENABLERS[pipeline_name] is cd_model_specific.enable_cache_for_cosmos3
 
 
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.enable_cache_for_dit")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
+def test_magi2_cache_dit_targets_only_nested_repeated_layers(mock_block_adapter, mock_enable_cache):
+    pipeline = Mock()
+    transformer_block = pipeline.transformer.block
+    layers = torch.nn.ModuleList([torch.nn.Identity()])
+    transformer_block.layers = layers
+    adapter = mock_block_adapter.return_value
+    refresh = Mock()
+    mock_enable_cache.return_value = refresh
+
+    result = cd_model_specific.enable_cache_for_magi2(pipeline, SAMPLE_CACHE_CONFIG)
+
+    mock_block_adapter.assert_called_once()
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    assert adapter_kwargs["transformer"] is transformer_block
+    assert adapter_kwargs["blocks"] == [layers]
+    assert adapter_kwargs["has_separate_cfg"] is False
+    assert adapter_kwargs["check_forward_pattern"] is True
+    assert result.refresh is refresh
+    assert result.targets == (adapter,)
+    get_transformer = mock_enable_cache.call_args.kwargs["get_pipeline_transformer"]
+    assert get_transformer(pipeline) is transformer_block
+
+
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit.summary")
+@patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter.is_cached", return_value=True)
+def test_cache_summary_uses_custom_nested_targets(mock_is_cached, mock_summary):
+    target = object()
+    pipeline = Mock(_cache_dit_targets=(target,))
+
+    cd_backend.cache_summary(pipeline, details=True)
+
+    mock_is_cached.assert_called_once_with(target)
+    mock_summary.assert_called_once_with(target, details=True)
+
+
 def test_cachedit_public_api_is_explicit():
     assert set(cd_backend.__all__) == {
         "BagelCachedAdapter",
         "CUSTOM_DIT_ENABLERS",
         "CacheDiTAdapterConfig",
         "CacheDiTBackend",
+        "CacheDiTEnableResult",
         "CacheDiTConfig",
         "CacheDiTRequestSpec",
         "RequestScopedCacheDiTRuntime",
@@ -110,7 +166,9 @@ def test_cachedit_consumers_use_package_api():
 
             for module in modules:
                 if module == legacy_module or module.startswith(internal_prefix):
-                    invalid_imports.append(f"{source_path.relative_to(package_root)}:{node.lineno}: {module}")
+                    invalid_imports.append(
+                        f"{source_path.relative_to(package_root)}:{getattr(node, 'lineno', '?')}: {module}"
+                    )
 
     assert not invalid_imports, "Cache-DiT consumers must use the package API:\n" + "\n".join(invalid_imports)
 
@@ -194,7 +252,7 @@ def test_cosmos3_cache_dit_wraps_gen_layers(mock_cache_dit, mock_block_adapter):
     current_omni_platform.is_rocm(),
     reason="vLLM ROCm custom ops lack CPU fallback",
 )
-def test_ltx2_cache_dit_receives_audio_as_encoder(init_fake_tp_group):
+def test_ltx2_cache_dit_receives_audio_as_encoder(init_fake_tp_group, request: pytest.FixtureRequest):
     """CacheDiT Pattern_0 treats the second positional arg as encoder_hidden_states,
     which is a collision for one of the kwargs in LTX2 since we treat the audio
     hidden states as encoder_hidden_states.
@@ -208,22 +266,23 @@ def test_ltx2_cache_dit_receives_audio_as_encoder(init_fake_tp_group):
     text_in = torch.full((1, seq_len, 16), 3.0)
     audio_text_in = torch.full((1, seq_len, 16), 4.0)
 
-    model = LTX2VideoTransformer3DModel(
-        in_channels=16,
-        out_channels=16,
-        patch_size=1,
-        patch_size_t=1,
-        num_attention_heads=2,
-        attention_head_dim=8,
-        cross_attention_dim=16,
-        audio_in_channels=16,
-        audio_out_channels=16,
-        audio_num_attention_heads=2,
-        audio_attention_head_dim=8,
-        audio_cross_attention_dim=16,
-        num_layers=2,
-        caption_channels=16,
-    )
+    with _force_torch_sdpa():
+        model = LTX2VideoTransformer3DModel(
+            in_channels=16,
+            out_channels=16,
+            patch_size=1,
+            patch_size_t=1,
+            num_attention_heads=2,
+            attention_head_dim=8,
+            cross_attention_dim=16,
+            audio_in_channels=16,
+            audio_out_channels=16,
+            audio_num_attention_heads=2,
+            audio_attention_head_dim=8,
+            audio_cross_attention_dim=16,
+            num_layers=2,
+            caption_channels=16,
+        )
 
     # NOTE: This is currently using the LTX2 custom enabler, but the custom
     # enablers will be consolidated after
@@ -233,6 +292,7 @@ def test_ltx2_cache_dit_receives_audio_as_encoder(init_fake_tp_group):
     pipeline.transformer = model
     backend = CacheDiTBackend(DiffusionCacheConfig())
     backend.enable(pipeline)
+    request.addfinalizer(lambda: backend.disable(pipeline))
     backend.refresh(pipeline, num_inference_steps=5)
 
     # Wrap call_Fn_blocks in CacheDiT so that we can verify the
