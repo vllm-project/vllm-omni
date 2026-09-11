@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MOSS-TTS talker logits processing."""
 
 from __future__ import annotations
@@ -84,12 +84,16 @@ def test_moss_tts_local_keeps_fixed_shape_rows_and_routes_stop_logits() -> None:
     # Keeping this row avoids CUDA boolean-index shape discovery; the
     # talker2codec raw async-chunk processor drops all-pad rows on CPU.
     torch.testing.assert_close(audio[1], stopped)
+    assert isinstance(model._batch_should_continue, torch.Tensor)
     assert model._batch_should_continue.tolist() == [True, False]
 
     logits = model.compute_logits(torch.randn(4, 8))
 
     assert logits is not None
-    assert logits.argmax(dim=-1).tolist() == [2, 2, 2, 3]
+    # compute_logits now returns (N, 1) forced token ids directly; the
+    # generic vocab-wide sampler is bypassed via prefer_model_sampler.
+    assert logits.squeeze(-1).tolist() == [2, 2, 2, 3]
+    assert model.sample(logits, None).sampled_token_ids.squeeze(-1).tolist() == [2, 2, 2, 3]
 
 
 def test_moss_tts_local_single_token_prefill_does_not_advance_audio() -> None:

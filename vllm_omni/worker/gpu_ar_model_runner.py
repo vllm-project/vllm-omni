@@ -570,6 +570,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def _capture_talker_mtp_graphs(self) -> None:
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        from vllm.compilation.wrapper import _compilation_context
 
         if not self.has_talker_mtp or not isinstance(self.talker_mtp, CUDAGraphWrapper):
             return
@@ -584,7 +585,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         set_cudagraph_capturing_enabled(True)
         try:
-            with torch.inference_mode(), graph_capture(device=self.device):
+            # Standalone local decoders use torch.compile outside the backbone
+            # wrapper. Give their batch/stride specializations the same cache
+            # limits as backbone compilation; restore limits after capture.
+            with _compilation_context(), torch.inference_mode(), graph_capture(device=self.device):
                 for bsz in capture_sizes:
                     _, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
                         num_tokens=bsz,

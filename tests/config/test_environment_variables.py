@@ -167,7 +167,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         EnvironmentVariableCategory.PUBLIC_OMNI: 24,
         EnvironmentVariableCategory.INHERITED_VLLM: 20,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 27,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 61,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 60,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 20,
         EnvironmentVariableCategory.INTERNAL: 2,
     }
@@ -181,7 +181,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         ModelEnvironmentVariableDisposition.PROMOTE: 37,
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 6,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
-        ModelEnvironmentVariableDisposition.INTERNALIZE: 13,
+        ModelEnvironmentVariableDisposition.INTERNALIZE: 12,
         ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 5,
     }
 
@@ -248,7 +248,6 @@ def test_environment_scanner_covers_indirection_aliases_membership_and_casing():
             "VLLM_VIDEO_AUDIO_DELTA_MODE",
         },
         "model_executor/models/mimo_audio/mimo_audio.py": {"model_stage"},
-        "model_executor/models/moss_tts/modeling_moss_tts_local_depth.py": {"MOSS_TTS_DEBUG_STOP"},
         "distributed/ray_utils/utils.py": {"RAY_RAYLET_PID"},
     }
     for relative_path, expected in expected_by_path.items():

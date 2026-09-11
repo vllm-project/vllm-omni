@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
@@ -38,6 +39,14 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
+
+
+def _split_codec_audio(audio, lengths: dict[int, int], samples_per_frame: int) -> dict[int, torch.Tensor]:
+    out: dict[int, torch.Tensor] = {}
+    for row, (slot, frames) in enumerate(lengths.items()):
+        row_audio = audio[row, ..., : frames * samples_per_frame]
+        out[slot] = row_audio.contiguous() if row_audio.dtype == torch.float32 else row_audio.float()
+    return out
 
 
 class _MossCodecStreamSession:
@@ -70,6 +79,15 @@ class _MossCodecStreamSession:
             device=self._device,
             dtype=torch.long,
         )
+        self._slot_ids_dev = torch.empty(self._total_state_capacity, dtype=torch.long, device=self._device)
+        if self._device.type == "cuda":
+            self._slot_ids_pin = torch.empty(self._total_state_capacity, dtype=torch.long, pin_memory=True)
+            self._slot_ids_pin_np = self._slot_ids_pin.numpy()
+        else:
+            self._slot_ids_pin = None
+            self._slot_ids_pin_np = None
+        self._codes_dev: torch.Tensor | None = None
+        self._codes_pin: torch.Tensor | None = None
         self._samples_per_frame = int(codec.downsample_rate)
         initialize_state_pool = getattr(codec, "initialize_decoder_state_pool", None)
         if not callable(initialize_state_pool):
@@ -107,6 +125,90 @@ class _MossCodecStreamSession:
         self._leased_slots.remove(slot)
         self._free_stream_slots.append(slot)
 
+    def _device_slot_ids(self, slots: list[int]) -> torch.Tensor:
+        """Build slot IDs without a pageable-host-to-device synchronization.
+
+        ``torch.tensor(slots, device="cuda")`` stages the Python list through
+        pageable host memory. PyTorch must synchronize the CUDA stream before
+        that temporary can be released, which serialized every streaming codec
+        batch. Contiguous batches read straight out of the resident ID table;
+        arbitrary sets are staged once through a pinned buffer and handed to
+        the device with a single non-blocking copy. Staging is reused across
+        steps; every consumer runs on the same stream, so later overwrite is
+        stream-ordered after the earlier use.
+        """
+        n = len(slots)
+        if self._device.type != "cuda":
+            return torch.tensor(slots, device=self._device, dtype=torch.long)
+        if n == 0:
+            return self._state_slot_ids[:0]
+        start = slots[0]
+        if all(slot == start + row for row, slot in enumerate(slots)):
+            return self._state_slot_ids[start : start + n]
+        if self._slot_ids_pin is not None:
+            self._slot_ids_pin_np[:n] = slots
+            dev = self._slot_ids_dev[:n]
+            dev.copy_(self._slot_ids_pin[:n], non_blocking=True)
+            return dev
+        return torch.stack([self._state_slot_ids[slot] for slot in slots])
+
+    def _stage_codes(
+        self,
+        slot_codes: dict[int, torch.Tensor],
+        slots: list[int],
+        lengths: dict[int, int],
+        step_t: int,
+        padded_slots: set[int],
+    ) -> torch.Tensor:
+        """Assemble (n_vq, B, T) codes; one kernel for CUDA inputs, one async
+        H2D for CPU inputs.
+
+        The steady-state payload already arrives as CUDA tensors, so per-row
+        ``.to(device)`` calls are no-ops and a single ``torch.stack`` gather is
+        optimal. CPU payloads (e.g. late-joining rows) previously took B
+        pageable host copies per step, each synchronizing the stream; they now
+        assemble into a resident pinned block and cross once, non-blocking.
+        Staging is stream-ordered: every consumer runs on the decode stream, so
+        a later overwrite cannot race an earlier read. Padded terminal rows get
+        zero fill, matching the previous ``F.pad`` semantics.
+        """
+        first = slot_codes[slots[0]]
+        if self._device.type != "cuda" or first.device.type != "cpu":
+            return torch.stack(
+                [
+                    F.pad(slot_codes[slot].to(device=self._device, dtype=torch.long), (0, step_t - lengths[slot]))
+                    if slot in padded_slots
+                    else slot_codes[slot].to(device=self._device, dtype=torch.long)
+                    for slot in slots
+                ],
+                dim=1,
+            )
+        n = len(slots)
+        need = self._n_vq * n * step_t
+        buf = self._codes_dev
+        pin = self._codes_pin
+        if buf is None or buf.numel() < need:
+            # Rare growth (first steady-chunk step); allocate with headroom.
+            self._codes_t_hint = max(getattr(self, "_codes_t_hint", 15), step_t)
+            cap_elems = self._n_vq * self._total_state_capacity * self._codes_t_hint
+            buf = torch.empty(cap_elems, dtype=torch.long, device=self._device)
+            pin = torch.empty(cap_elems, dtype=torch.long, pin_memory=True)
+            self._codes_dev = buf
+            self._codes_pin = pin
+            self._codes_pin_np = pin.numpy()
+        pin_view = self._codes_pin_np[:need].reshape(self._n_vq, n, step_t)
+        for row, slot in enumerate(slots):
+            codes = slot_codes[slot]
+            if codes.dtype != torch.long:
+                codes = codes.to(torch.long)
+            t = lengths[slot]
+            pin_view[:, row, :t] = codes.numpy()
+            if slot in padded_slots and t < step_t:
+                pin_view[:, row, t:] = 0
+        dev_view = buf[:need].view(self._n_vq, n, step_t)
+        dev_view.copy_(self._codes_pin[:need].view(self._n_vq, n, step_t), non_blocking=True)
+        return dev_view
+
     def _reset_slot_ids(self, slot_ids: torch.Tensor) -> None:
         reset_streaming_slots = getattr(self._codec, "reset_decoder_state_slots", None)
         if not callable(reset_streaming_slots):
@@ -133,37 +235,63 @@ class _MossCodecStreamSession:
                 close_state_pool()
         self._closed = True
 
+    def terminal_graph_frame_size(self, frames: int) -> int:
+        """Only merge tails when every batch bucket has the same padded graph.
+
+        This preserves the graph the tail would have used before merging.
+        In particular, one-frame tails retain their exact one-frame graph.
+        """
+        wrapper = self._cudagraph_wrapper
+        if wrapper is None:
+            return frames
+        target = wrapper._select_frame_size(frames, allow_padding=True)
+        if (
+            target is not None
+            and wrapper.batch_sizes
+            and max(wrapper.batch_sizes) >= self._state_capacity
+            and all((b, target) in wrapper.graphs for b in wrapper.batch_sizes)
+        ):
+            return target
+        return frames
+
     @torch.no_grad()
     def step(
         self,
         slot_codes: dict[int, torch.Tensor],
         *,
         terminal_slots: set[int] | None = None,
+        pad_to_frames: int | None = None,
     ) -> dict[int, torch.Tensor]:
         if not slot_codes:
             return {}
         terminal_slots = terminal_slots or set()
         if not terminal_slots.issubset(slot_codes):
             raise ValueError("terminal_slots must be a subset of the decode batch slots.")
-        step_t = max(int(codes.shape[1]) for codes in slot_codes.values())
-        if any(int(codes.shape[1]) != step_t and slot not in terminal_slots for slot, codes in slot_codes.items()):
-            raise ValueError("Only terminal codec rows may be padded to a larger step length")
+        lengths = {slot: int(codes.shape[1]) for slot, codes in slot_codes.items()}
+        step_lengths = set(lengths.values())
+        step_t = int(pad_to_frames) if pad_to_frames is not None else max(step_lengths)
+        padded_slots = {slot for slot, length in lengths.items() if length < step_t}
+        if step_t <= 0 or any(length > step_t for length in lengths.values()):
+            raise ValueError("Invalid codec padded frame length.")
+        if not padded_slots.issubset(terminal_slots):
+            raise ValueError("Only terminal codec rows may be padded.")
         slots = list(slot_codes)
         if any(slot not in self._leased_slots for slot in slots):
             raise RuntimeError(f"Streaming decode references an unleased state slot: {slots}")
-        codes_step = torch.stack(
-            [
-                torch.nn.functional.pad(
-                    slot_codes[slot].to(device=self._device, dtype=torch.long),
-                    (0, step_t - int(slot_codes[slot].shape[1])),
-                )
-                if int(slot_codes[slot].shape[1]) != step_t
-                else slot_codes[slot].to(device=self._device, dtype=torch.long)
-                for slot in slots
-            ],
-            dim=1,
-        )
-        state_slot_ids = torch.tensor(slots, device=self._device, dtype=torch.long)
+        device = self._device
+        if device.type == "cuda":
+            codes_step = self._stage_codes(slot_codes, slots, lengths, step_t, padded_slots)
+        else:
+            codes_step = torch.stack(
+                [
+                    F.pad(slot_codes[slot].to(device=device, dtype=torch.long), (0, step_t - lengths[slot]))
+                    if slot in padded_slots
+                    else slot_codes[slot].to(device=device, dtype=torch.long)
+                    for slot in slots
+                ],
+                dim=1,
+            )
+        state_slot_ids = self._device_slot_ids(slots)
 
         graph_output: tuple[torch.Tensor, torch.Tensor, int] | None = None
         if self._cudagraph_wrapper is not None:
@@ -177,6 +305,8 @@ class _MossCodecStreamSession:
             )
 
         used_cudagraph = graph_output is not None
+        if pad_to_frames is not None and padded_slots and not used_cudagraph:
+            raise RuntimeError("Merged codec tails require the originally selected padded CUDA graph.")
         if used_cudagraph:
             audio_tensor, _, actual_batch_size = graph_output
             audio_tensor = audio_tensor[:actual_batch_size]
@@ -200,15 +330,15 @@ class _MossCodecStreamSession:
 
         if terminal_slots:
             terminal_rows = [row for row, slot in enumerate(slots) if slot in terminal_slots]
-            terminal_slot_ids = state_slot_ids if len(terminal_rows) == len(slots) else state_slot_ids[terminal_rows]
+            terminal_slot_ids = (
+                state_slot_ids
+                if len(terminal_rows) == len(slots)
+                else self._device_slot_ids([slots[row] for row in terminal_rows])
+            )
             self._reset_slot_ids(terminal_slot_ids)
 
         audio = audio_tensor.detach().to("cpu", torch.float32)
-        out: dict[int, torch.Tensor] = {}
-        for row, slot in enumerate(slots):
-            audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
-            out[slot] = audio[row, ..., :audio_length].contiguous()
-        return out
+        return _split_codec_audio(audio, lengths, self._samples_per_frame)
 
 
 class MossTTSCodecDecoder(nn.Module):
@@ -268,6 +398,7 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_max_step_frames: int = self._stream_chunk_frames or 100
         self._stream_req_slots: dict[str, int] = {}
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
+        self._codec_batch_io = True
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
         self._streaming_graph_frame_sizes = sorted(
             {frames for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames) if frames > 0}
@@ -373,6 +504,9 @@ class MossTTSCodecDecoder(nn.Module):
             )
         if real_token_count < input_token_count:
             ids_flat = ids_flat[:real_token_count]
+        if self._codec_batch_io:
+            # The old loop launched one identical clamp per request segment.
+            ids_flat = ids_flat.to(device=device).clamp_(0, int(self._codec.config.codebook_size) - 1)
 
         num_req = len(token_counts)
         if len(info_list) < num_req:
@@ -413,7 +547,8 @@ class MossTTSCodecDecoder(nn.Module):
             # processor de-delays and drops pad rows before forwarding here, but
             # clamp as a defensive guard against any edge-case leakage.
             codebook_size = self._codec.config.codebook_size
-            codes_nq_t = codes_nq_t.clamp_(0, int(codebook_size) - 1)
+            if not self._codec_batch_io:
+                codes_nq_t = codes_nq_t.clamp_(0, int(codebook_size) - 1)
 
             left_ctx = meta.get("left_context_size", 0)
             if isinstance(left_ctx, (list, tuple)):
@@ -525,8 +660,6 @@ class MossTTSCodecDecoder(nn.Module):
         outputs: dict[int, torch.Tensor] = {}
         grouped: dict[int, list[tuple[int, str, int, torch.Tensor, bool]]] = {}
         max_step_frames = max(1, int(self._stream_max_step_frames))
-        graph = session._cudagraph_wrapper
-        coalesce_tails = graph is not None and max(graph.batch_sizes, default=0) >= self._stream_state_capacity
 
         for output_index, request_id, codes_nq_t, finished in items:
             slot = self._stream_req_slots.get(request_id)
@@ -557,18 +690,19 @@ class MossTTSCodecDecoder(nn.Module):
                     )
                 continue
 
-            frame_count = int(codes_nq_t.shape[1])
-            # Only combine tails that already used the same padded graph.
-            # Preserve exact-size graphs (including T=1) and the eager path.
-            group_frames = frame_count
-            if coalesce_tails and finished:
-                group_frames = graph._select_frame_size(frame_count, allow_padding=True) or frame_count
+            group_frames = int(codes_nq_t.shape[1])
+            if self._codec_batch_io and finished:
+                group_frames = session.terminal_graph_frame_size(group_frames)
             grouped.setdefault(group_frames, []).append((output_index, request_id, slot, codes_nq_t, finished))
 
-        for group in grouped.values():
+        for group_frames, group in grouped.items():
             plan = {slot: codes_nq_t for _, _, slot, codes_nq_t, _ in group}
             terminal_slots = {slot for _, _, slot, _, finished in group if finished}
-            decoded = session.step(plan, terminal_slots=terminal_slots)
+            decoded = session.step(
+                plan,
+                terminal_slots=terminal_slots,
+                pad_to_frames=group_frames if self._codec_batch_io else None,
+            )
             for output_index, request_id, slot, _, finished in group:
                 wav = decoded.get(slot)
                 if wav is not None:

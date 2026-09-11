@@ -62,13 +62,15 @@ def test_only_existing_compatible_graph_buckets_are_coalesced(mocker, graph_capa
         if graph_capacity is None
         else SimpleNamespace(
             batch_sizes=[1, graph_capacity],
+            graphs={(b, t): object() for b in [1, graph_capacity] for t in [1, 8, 15]},
             _select_frame_size=lambda size, allow_padding: next((b for b in [1, 8, 15] if b >= size), None),
-            decode=lambda *args, **kwargs: None,
+            decode=lambda codes, *args, **kwargs: (codes.sum(0).float().cumsum(-1)[:, None], None, codes.shape[1]),
         )
     )
     step = mocker.spy(s, "step")
     decoder = object.__new__(MossTTSCodecDecoder)
     nn.Module.__init__(decoder)
+    decoder._codec_batch_io = True
     decoder._stream_max_step_frames = 15
     decoder._stream_state_capacity = 8
     decoder._stream_req_slots = {}

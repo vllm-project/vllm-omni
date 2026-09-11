@@ -62,8 +62,11 @@ _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 
 _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
+        "allowed_local_media_path",
+        "allowed_media_domains",
         "async_chunk",
         "disable_log_stats",
+        "media_io_kwargs",
         "model",
         "omni",
         "output_modalities",

@@ -21,6 +21,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
@@ -1267,10 +1268,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
       text-channel input to ``audio_assistant_slot_token_id`` regardless of
       what ``text_lm_head`` would predict, because
       ``local_text_head_mode == "binary"`` for this checkpoint.
-      ``compute_logits`` therefore synthesises a one-hot logit row
-      (Realtime-style), forced to ``audio_assistant_slot_token_id`` while
-      continuing or ``im_end_token_id`` once the local transformer's binary
-      head decides to stop.
+      ``compute_logits`` therefore returns per-request forced token ids
+      directly (Realtime-style), forced to ``audio_assistant_slot_token_id``
+      while continuing or ``im_end_token_id`` once the local transformer's
+      binary head decides to stop; ``sample()`` then bypasses the generic
+      vocab-wide top-k/top-p sampler.
     * Per-step audio generation runs ``MossTTSLocalDepthTransformer``
       (1-layer GPT2-style local transformer, interleaved RoPE, ``n_vq=12``
       codebooks -- structurally different from Realtime's Qwen3-style
@@ -1282,6 +1284,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    # The text token is already forced by the local binary continue/stop head.
+    # Bypass the generic top-k/top-p sampler, which otherwise fills and scans
+    # (B, 151936) logits even though exactly one entry is finite per row.
+    prefer_model_sampler: bool = True
+    model_sampler_skips_logit_bias: bool = True
+    # The forced-token sampler never consults per-request output token history;
+    # do not rebuild (and host-sync) it on every stage-0 step.
+    skips_model_sampler_output_token_history: bool = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -1382,13 +1392,15 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         hidden_states: torch.Tensor | OmniOutput,
         sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor | None:
-        """Synthesise a one-hot text logit row per request.
+        """Build the already-determined next text token for each request.
 
         The text channel is never freely generated here: the upstream
         reference hardcodes it to ``audio_assistant_slot_token_id`` while
         audio frames keep coming, and only emits ``im_end_token_id`` once the
         local transformer's binary head decides to stop (see class
-        docstring for why the real ``text_lm_head`` is bypassed).
+        docstring for why the real ``text_lm_head`` is bypassed). Returning
+        (B, 1) forced tokens instead of (B, vocab_size) one-hot logits lets
+        the runner skip filling and scanning the full vocabulary per step.
         """
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -1396,14 +1408,19 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             return None
 
         num_rows = hidden_states.shape[0]
-        logits = hidden_states.new_full((num_rows, self.text_vocab_size), float("-inf"))
+        forced_tokens = torch.full(
+            (num_rows, 1),
+            self.audio_assistant_slot_token_id,
+            device=hidden_states.device,
+            dtype=torch.int32,
+        )
 
         states = self._batch_state or []
         batch_continue_mask = self._batch_should_continue
         if isinstance(batch_continue_mask, torch.Tensor) and batch_continue_mask.numel() > 0:
             should_by_req = batch_continue_mask.reshape(-1)
-            if should_by_req.device != logits.device or should_by_req.dtype != torch.bool:
-                should_by_req = should_by_req.to(device=logits.device, dtype=torch.bool)
+            if should_by_req.device != forced_tokens.device or should_by_req.dtype != torch.bool:
+                should_by_req = should_by_req.to(device=forced_tokens.device, dtype=torch.bool)
             if int(should_by_req.numel()) == num_rows:
                 should_continue = should_by_req
             else:
@@ -1419,17 +1436,17 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                         continue
                     row_req_indices.extend([req_idx] * max(0, row_end - row_start))
                 if row_req_indices:
-                    req_t = torch.tensor(row_req_indices, device=logits.device, dtype=torch.long)
+                    req_t = torch.tensor(row_req_indices, device=forced_tokens.device, dtype=torch.long)
                     should_continue = should_by_req.index_select(0, req_t)
                 else:
-                    should_continue = torch.ones((num_rows,), device=logits.device, dtype=torch.bool)
+                    should_continue = torch.ones((num_rows,), device=forced_tokens.device, dtype=torch.bool)
             if int(should_continue.numel()) != num_rows:
-                should_continue = torch.ones((num_rows,), device=logits.device, dtype=torch.bool)
-            zeros = logits.new_zeros((num_rows,))
-            neg_inf = logits.new_full((num_rows,), float("-inf"))
-            logits[:, self.audio_assistant_slot_token_id] = torch.where(should_continue, zeros, neg_inf)
-            logits[:, self.im_end_token_id] = torch.where(should_continue, neg_inf, zeros)
-            return logits
+                should_continue = torch.ones((num_rows,), device=forced_tokens.device, dtype=torch.bool)
+            return torch.where(
+                should_continue.unsqueeze(1),
+                forced_tokens,
+                torch.full_like(forced_tokens, self.im_end_token_id),
+            )
 
         for state, row_start, row_end in _iter_state_row_spans(
             states,
@@ -1446,12 +1463,20 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                         self.im_end_token_id,
                     )
                 state["_forced_im_end_count"] = forced_im_end_count + 1
-                logits[row_start:row_end, self.im_end_token_id] = 0.0
-            else:
-                logits[row_start:row_end, self.audio_assistant_slot_token_id] = 0.0
-        if not states:
-            logits[:, self.audio_assistant_slot_token_id] = 0.0
-        return logits
+                forced_tokens[row_start:row_end] = self.im_end_token_id
+        return forced_tokens
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        """Return the forced-token payload without generic sampling."""
+        del sampling_metadata
+        return SamplerOutput(
+            sampled_token_ids=logits.to(dtype=torch.int32),
+            logprobs_tensors=None,
+        )
 
     # ------------------------------------------------------------------
     # Embedding (text + audio codebooks, additive)
@@ -1768,6 +1793,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
 
+        # Derived first-layer tables must be built after embedding/attention
+        # weights are loaded and before any CUDA graph captures their storage.
+        self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
         if not self.vllm_config.model_config.enforce_eager:
             self.local_transformer.setup_compile()
 

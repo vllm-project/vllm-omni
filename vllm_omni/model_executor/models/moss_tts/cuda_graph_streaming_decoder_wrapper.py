@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -51,6 +54,25 @@ class _MossStreamingDecodeCompileAdapter(nn.Module):
         return self.codec.decode_streaming_tensors(codes, codes_lengths, state_slot_ids, valid_rows)
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "codes": {1: "batch", 2: "frames"},
+        "codes_lengths": {0: "batch"},
+        "state_slot_ids": {0: "batch"},
+        "valid_rows": {0: "batch"},
+    }
+)
+class _MossOpaquePackedKVStreamingDecodeCompileAdapter(nn.Module):
+    """Native attention with bit-preserving fused KV packing; separate AOT key."""
+
+    def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:
+        super().__init__()
+        self.codec = codec
+
+    def forward(self, codes, codes_lengths, state_slot_ids, valid_rows):
+        return self.codec.decode_streaming_tensors(codes, codes_lengths, state_slot_ids, valid_rows)
+
+
 @dataclass
 class _CapturedStreamingDecodeGraph:
     graph: CUDAGraph
@@ -95,8 +117,14 @@ class CUDAGraphStreamingDecoderWrapper:
         compile_config.compilation_config = copy.copy(vllm_config.compilation_config)
         compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compile_config.compilation_config.static_forward_context = {}
+        # pack_ring_kv is unconditional on CUDA: a cached AOT artifact may
+        # bypass Python forward, so register its custom-op schema before vLLM
+        # attempts to deserialize that graph.
+        from . import codec_kernels  # noqa: F401
+
+        adapter: type[nn.Module] = _MossOpaquePackedKVStreamingDecodeCompileAdapter
         with set_current_vllm_config(compile_config):
-            self._compiled_decode: nn.Module | None = _MossStreamingDecodeCompileAdapter(
+            self._compiled_decode: nn.Module | None = adapter(
                 codec,
                 vllm_config=compile_config,
             )

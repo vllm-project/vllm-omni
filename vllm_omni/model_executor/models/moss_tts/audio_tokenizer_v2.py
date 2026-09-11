@@ -500,6 +500,7 @@ class RingKVCache:
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.capacity = capacity
+        self._use_kv_pack = True  # unconditionally packed on CUDA; legacy scatter stays for CPU
         self.cache = torch.zeros(
             (2, batch_size, num_heads, capacity, dim_per_head),
             device=device,
@@ -537,17 +538,19 @@ class RingKVCache:
             slots = execution_context.state_slot_ids
             valid_rows = execution_context.valid_rows
             end_offset = self.end_offset.index_select(0, slots)
-            row_cache = self.cache.index_select(1, slots)
+            if self._use_kv_pack and k.is_cuda:
+                from .codec_kernels import pack_ring_kv
 
-            indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
-            indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
-            scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
-            row_cache[0].scatter_(2, scatter_indexes, k)
-            row_cache[1].scatter_(2, scatter_indexes, v)
-            # Live and graph-padding rows always map to distinct slots. The
-            # latter map only to scratch state, so this write cannot corrupt a
-            # request even though dense graph operators still execute it.
-            self.cache.index_copy_(1, slots, row_cache)
+                row_cache = pack_ring_kv(k, v, self.cache, self.end_offset, slots)
+            else:
+                row_cache = self.cache.index_select(1, slots)
+                indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+                indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
+                scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
+                row_cache[0].scatter_(2, scatter_indexes, k)
+                row_cache[1].scatter_(2, scatter_indexes, v)
+                # Live and graph-padding rows always map to distinct slots.
+                self.cache.index_copy_(1, slots, row_cache)
 
             cache_indexes = torch.arange(self.capacity, device=end_offset.device, dtype=torch.long)
             last_offset = end_offset.view(-1, 1) + T - 1
@@ -785,22 +788,63 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         projected = apply_weights_per_step(self.in_projs, self.weights_per_step_schedule, query, offset_cpu)
         dim_per_head = self.embed_dim // self.num_heads
-        projected = projected.reshape(B, T, 3, self.num_heads, dim_per_head).permute(2, 0, 3, 1, 4)
-        q, k, v = projected[0], projected[1], projected[2]
+        use_explicit_qkv = (
+            execution_context is not None
+            and self.rope is not None
+            and dim_per_head <= 128
+            and dim_per_head % 2 == 0
+            and projected.is_cuda
+            and projected.dtype in (torch.bfloat16, torch.float16)
+        )
+        if use_explicit_qkv:
+            from .codec_fused_ops import codec_rope_unpack_qkv
 
-        if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+            q, k, v = codec_rope_unpack_qkv(
+                projected.view(B, T, 3, self.num_heads, dim_per_head),
+                offset,
+                self.rope.max_period,
+            )
+        else:
+            projected = projected.reshape(B, T, 3, self.num_heads, dim_per_head).permute(2, 0, 3, 1, 4)
+            q, k, v = projected[0], projected[1], projected[2]
 
+            if self.rope:
+                q, k = self.rope(q, k, offset, time_before_heads=False)
+
+        use_explicit_mask = (
+            execution_context is not None
+            and state is not None
+            and state.kv_cache is not None
+            and state.kv_cache._use_kv_pack
+            and self.causal
+            and q.is_cuda
+            and q.dtype in (torch.bfloat16, torch.float16)
+        )
+        if use_explicit_mask:
+            # Gather pre-advance ring end offsets; complete() advances them.
+            end_offset = state.kv_cache.end_offset.index_select(0, execution_context.state_slot_ids)
         k, v, pos_k = self._complete_kv(k, v, execution_context)
         pos_k = pos_k[:, None]
 
         if self.causal:
-            pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
-            delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
-            attn_bias = attn_bias[:, None]
+            if use_explicit_mask:
+                from .codec_fused_ops import codec_causal_mask
+
+                attn_bias = codec_causal_mask(
+                    end_offset,
+                    offset,
+                    execution_context.valid_rows,
+                    T,
+                    state.kv_cache.capacity,
+                    self.context or 0,
+                )
+            else:
+                pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
         else:
             attn_bias = None
 
