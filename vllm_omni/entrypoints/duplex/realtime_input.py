@@ -443,12 +443,14 @@ class RealtimeInputTranslator(RealtimeStateOwner):
                 if self._input_audio_buffer_had_non_speech:
                     self._input_audio_buffer_had_non_speech = False
                     self._active_input_item_id = None
-                    return {
+                    payload = {
                         "type": "input_audio_buffer.commit",
                         "final": event.get("final", True),
-                        "response_create": False,
                         "is_speech": False,
                     }
+                    if "response_create" in event:
+                        payload["response_create"] = bool(event["response_create"])
+                    return payload
                 await self._send_realtime_payload(
                     self._realtime_error_payload(
                         "input_audio_buffer_empty",
@@ -467,8 +469,9 @@ class RealtimeInputTranslator(RealtimeStateOwner):
                 "type": "input_audio_buffer.commit",
                 "final": event.get("final", True),
                 "item_id": item_id,
-                "response_create": bool(event.get("response_create", False)),
             }
+            if "response_create" in event:
+                payload["response_create"] = bool(event["response_create"])
             if transcript:
                 payload["transcript"] = transcript
             return payload
@@ -1450,8 +1453,9 @@ class RealtimeInputTranslator(RealtimeStateOwner):
                 "type": "input_audio_buffer.commit",
                 "final": True,
                 "item_id": item_id,
-                "response_create": False,
             }
+            if "response_create" in event:
+                commit_payload["response_create"] = bool(event["response_create"])
             if transcript:
                 commit_payload["transcript"] = transcript
             self._pending_outbound.put_nowait(commit_payload)

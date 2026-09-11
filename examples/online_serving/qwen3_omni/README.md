@@ -259,12 +259,21 @@ cd examples/online_serving/qwen3_omni
 ####  Send request via python
 
 ```bash
-python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type use_image --port 8091 --host "localhost"
+python ../openai_chat_completion_client_for_multimodal_generation.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type use_image --port 8091 --host "localhost"
 ```
 
-#### Realtime WebSocket client (`openai_realtime_client.py`)
+#### Turn-based duplex WebSocket client (`openai_realtime_client.py`)
 
-[`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, streams a local WAV as **PCM16 mono @ 16 kHz** in fixed-size chunks, and receives **`response.audio.*`**, **`response.output_text.*`**, and transcript events. By default it uses explicit `input_audio_buffer.commit`; pass **`--server-vad`** to let the server detect speech endpoints and commit the turn automatically. The client concatenates audio deltas and writes **`--output-wav`** (model output is typically **24 kHz**). Optional **`--delta-dump-dir`** saves each delta as `delta_000001.wav`, … for debugging.
+Start the turn-based duplex deployment from the bundled overlay:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --omni \
+  --port 8091 \
+  --deploy-config ../../../vllm_omni/deploy/qwen3_omni_duplex.yaml
+```
+
+[`openai_realtime_client.py`](./openai_realtime_client.py) is a raw websocket event client. It connects to **`ws://<host>:<port>/v1/duplex`**, streams a local WAV as **PCM16 mono @ 16 kHz** in fixed-size chunks, and consumes native **`response.output_audio.delta`**, **`response.text.delta`**, and **`response.done`** events. It does not expose the `DuplexClient` response-handle API. By default it uses explicit `input_audio_buffer.commit`; pass **`--server-vad`** to let the server detect speech endpoints and commit the turn automatically. The client concatenates audio deltas and writes **`--output-wav`** (model output is typically **24 kHz**). Optional **`--delta-dump-dir`** saves each delta as `delta_000001.wav`, … for debugging.
 
 Streaming input works well for translation-style use cases; if the Thinker runs while input is still incomplete, consider limiting **`max_tokens`** in your session / server defaults to avoid over-generation.
 
@@ -278,7 +287,7 @@ pip install websockets
 
 ```bash
 python openai_realtime_client.py \
-  --url ws://localhost:8091/v1/realtime \
+  --url ws://localhost:8091/v1/duplex \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --input-wav /path/to/input_16k_mono.wav \
   --output-wav realtime_output.wav \
@@ -290,14 +299,14 @@ python openai_realtime_client.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--url` | `ws://localhost:8091/v1/realtime` | Full WebSocket URL including path |
-| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (sent in `session.update`) |
+| `--url` | `ws://localhost:8091/v1/duplex` | Full WebSocket URL including path |
+| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (sent in `session.create`) |
 | `--input-wav` | *(required)* | Input WAV: mono, 16-bit PCM, **16 kHz** |
 | `--output-wav` | `realtime_output.wav` | Output path for concatenated reply audio |
 | `--output-text` | *(optional)* | If set, write final transcription text to this path |
 | `--chunk-ms` | `200` | Size of each uploaded audio chunk (milliseconds of audio) |
 | `--send-delay-ms` | `0` | Delay between chunk sends (simulate realtime upload) |
-| `--delta-dump-dir` | *(optional)* | Directory to write per-`response.audio.delta` WAV files |
+| `--delta-dump-dir` | *(optional)* | Directory to write per-`response.output_audio.delta` WAV files |
 | `--server-vad` | disabled | Enable server-side Silero VAD instead of sending explicit commits |
 | `--num-requests` | `1` | Number of sequential sessions (see `--concurrency`) |
 | `--concurrency` | `1` | Max concurrent WebSocket sessions when `--num-requests` > 1 |
@@ -309,10 +318,10 @@ duplex_session:
   server_vad_model_path: /models/silero_vad.onnx
 ```
 
-Start from the bundled Qwen3-Omni deployment YAML, add the fields above at the top level, and serve that complete configuration:
+Start from the bundled Qwen3-Omni duplex deployment YAML, add the fields above at the top level, and serve that complete configuration:
 
 ```bash
-cp vllm_omni/deploy/qwen3_omni_moe.yaml /path/to/qwen3_omni_server_vad.yaml
+cp ../../../vllm_omni/deploy/qwen3_omni_duplex.yaml /path/to/qwen3_omni_server_vad.yaml
 # Edit /path/to/qwen3_omni_server_vad.yaml and add duplex_session.
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --omni \
@@ -320,9 +329,10 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --deploy-config /path/to/qwen3_omni_server_vad.yaml
 ```
 
-Keep Qwen's default `session_mode: turn`; `duplex_session` enables the Realtime handler without changing scheduler
-semantics. Bare `/v1/realtime` selects that handler. The client uses `?duplex=0` only for the existing non-Server-VAD
-wire flow; `?duplex=1` remains a supported compatibility alias.
+The duplex overlay sets `session_mode: duplex`; `/v1/duplex` selects the native
+turn-based duplex protocol. The client sends raw `session.create` and
+`input_audio_buffer.*` events, with Server VAD controlling when the committed
+turn is started when `--server-vad` is enabled.
 
 The Python client supports the following command-line arguments:
 
@@ -338,7 +348,7 @@ The Python client supports the following command-line arguments:
 For example, to use a local video file with custom prompt:
 
 ```bash
-python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py \
+python ../openai_chat_completion_client_for_multimodal_generation.py \
     --query-type use_video \
     --video-path /path/to/your/video.mp4 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
@@ -398,7 +408,7 @@ echo "$response" | jq -r '.choices[1].message.audio.data' | base64 -d > output.w
 ### Using Python client
 
 ```bash
-python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py \
+python ../openai_chat_completion_client_for_multimodal_generation.py \
     --query-type use_image \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --modalities text
@@ -467,7 +477,7 @@ curl http://localhost:8091/v1/chat/completions \
 Use the `--speaker` argument when generating audio:
 
 ```bash
-python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py \
+python ../openai_chat_completion_client_for_multimodal_generation.py \
     --query-type use_image \
     --modalities audio \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
@@ -498,7 +508,7 @@ Supported speaker names depend on the model (e.g. `Ethan`, `Chelsie`, `Aiden`). 
 ## Streaming Output
 If you want to enable streaming output, please set the argument as below. The final output will be obtained just after generated by corresponding stage. We support both text streaming output and audio streaming output. Other modalities can output normally.
 ```bash
-python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py \
+python ../openai_chat_completion_client_for_multimodal_generation.py \
     --query-type use_image \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --stream

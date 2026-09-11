@@ -778,7 +778,15 @@ async def test_native_realtime_protocol_audio_commit_requires_non_empty_buffer()
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_audio_commit_does_not_auto_create_response():
+@pytest.mark.parametrize(
+    ("response_create", "expected_response_create"),
+    [(None, None), (False, False), (True, True)],
+    ids=["omitted", "false", "true"],
+)
+async def test_native_realtime_protocol_audio_commit_preserves_response_create(
+    response_create: bool | None,
+    expected_response_create: bool | None,
+):
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -792,11 +800,17 @@ async def test_native_realtime_protocol_audio_commit_does_not_auto_create_respon
     append_event = json.loads(await protocol.receive_internal_event_text(ws))
     assert append_event["type"] == "input_audio_buffer.append"
 
-    ws.put({"type": "input_audio_buffer.commit", "final": True})
+    commit = {"type": "input_audio_buffer.commit", "final": True}
+    if response_create is not None:
+        commit["response_create"] = response_create
+    ws.put(commit)
     commit_event = json.loads(await protocol.receive_internal_event_text(ws))
 
     assert commit_event["type"] == "input_audio_buffer.commit"
-    assert commit_event["response_create"] is False
+    if expected_response_create is None:
+        assert "response_create" not in commit_event
+    else:
+        assert commit_event["response_create"] is expected_response_create
 
 
 @pytest.mark.asyncio
@@ -820,6 +834,7 @@ async def test_realtime_commit_ack_preserves_next_turn(complete_item: bool):
             }
         )
         first_commit = json.loads(await protocol.receive_internal_event_text(ws))
+        assert "response_create" not in first_commit
     else:
         await protocol._to_duplex_event(append)
         first_commit = await protocol._to_duplex_event({"type": "input_audio_buffer.commit"})
@@ -862,6 +877,7 @@ async def test_realtime_silence_commit_does_not_reuse_speech_item(pending_next_t
     await protocol._to_duplex_event({**append, "audio": base64.b64encode(bytes(4)).decode()})
     silence_commit = await protocol._to_duplex_event({"type": "input_audio_buffer.commit"})
     assert silence_commit is not None and silence_commit["is_speech"] is False
+    assert "response_create" not in silence_commit
     if pending_next_turn:
         await protocol._to_duplex_event(append)
         next_commit = await protocol._to_duplex_event({"type": "input_audio_buffer.commit"})
@@ -1202,6 +1218,49 @@ async def test_realtime_session_update_preserves_tools_and_metadata():
     assert runtime_config is not None
     assert runtime_config["extra_body"]["realtime_tools"] == [{"type": "function", "name": "lookup"}]
     assert runtime_config["extra_body"]["realtime_metadata"] == {"demo": "yes"}
+
+
+@pytest.mark.asyncio
+async def test_turn_based_session_update_does_not_require_runtime_adapter():
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_session_create("sid-adapterless-update"))
+    ws.put(
+        {
+            "type": "turn.signal",
+            "event": "session.update",
+            "payload": {"extra_body": {"auto_commit_silence_ms": 300}},
+        }
+    )
+    ws.put({"type": "session.close"})
+
+    await handler.handle_session(ws)
+
+    assert "session.updated" in ws.sent_types()
+    assert not any(message.get("type") == "error" for message in ws.sent)
+
+
+def test_disabled_serving_runtime_adapter_skips_session_update_validation():
+    validation_calls: list[object] = []
+    handler = OmniDuplexSessionHandler(chat_service=TurnBasedFakeChatService(FakeEngineClient()))
+    handler._serving_runtime_adapter = SimpleNamespace(
+        is_enabled=lambda config: False,
+        validate_client_extra_body=lambda extra_body: validation_calls.append(extra_body),
+    )
+    session = DuplexSession(session_id="sid-disabled-adapter", config=DuplexSessionConfig())
+
+    assert (
+        handler._runtime_session_update_error(
+            session,
+            {"extra_body": {"private_runtime_key": True}},
+        )
+        is None
+    )
+    assert validation_calls == []
 
 
 @pytest.mark.asyncio
@@ -2439,6 +2498,46 @@ def test_native_audio_text_marks_are_normalized_to_session_cumulative_offsets():
     assert marks == [{"text_chars": 8, "audio_end_ms": 1000}]
 
 
+@pytest.mark.asyncio
+async def test_duplex_chat_audio_stream_accumulates_audio_durations():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-chat-audio-duration",
+        config=DuplexSessionConfig(response_format="pcm16"),
+    )
+    response_id = session.begin_response()
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(data: dict[str, Any]) -> None:
+        sent.append(data)
+
+    def pcm_base64(duration_ms: int) -> str:
+        frames = 16_000 * duration_ms // 1000
+        return base64.b64encode(b"\0\0" * frames).decode("ascii")
+
+    for audio in (pcm_base64(500), pcm_base64(500)):
+        await handler._emit_chat_payload(
+            session,
+            {
+                "modality": "audio",
+                "sample_rate_hz": 16_000,
+                "choices": [{"delta": {"content": audio}}],
+            },
+            session.epoch,
+            response_id,
+            send_json,
+        )
+
+    assert session.playback.generated_ms == 1000
+    assert session.playback.sent_ms == 1000
+    assert sent[0]["audio_duration_ms"] == 500
+    assert sent[1]["audio_duration_ms"] == 1000
+
+
 def test_duplex_session_playback_commit_uses_multi_delta_audio_text_marks():
     session = DuplexSession(
         session_id="sid-marks",
@@ -2455,6 +2554,32 @@ def test_duplex_session_playback_commit_uses_multi_delta_audio_text_marks():
 
     assert committed == {"role": "assistant", "content": "hello wo"}
     assert session.history == (committed,)
+
+
+def test_serving_adapter_auto_respond_on_commit_supports_callable_and_boolean():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+        serving_runtime_adapter=PersonaPlexServingRuntimeAdapter(lambda *_: None),
+    )
+    session = DuplexSession(session_id="sid-commit-hook", config=DuplexSessionConfig())
+    state = object()
+    calls: list[tuple[str, object]] = []
+
+    def hook(session_id: str, session_state: object) -> bool:
+        calls.append((session_id, session_state))
+        return False
+
+    handler._serving_runtime_adapter = SimpleNamespace(
+        auto_respond_on_commit=hook,
+        session_state=lambda session_id: state,
+    )
+    assert handler._serving_adapter_auto_respond_on_commit(session) is False
+    assert calls == [(session.session_id, state)]
+
+    handler._serving_runtime_adapter = SimpleNamespace(auto_respond_on_commit=True)
+    assert handler._serving_adapter_auto_respond_on_commit(session) is True
 
 
 def test_duplex_session_preserves_response_history_order_when_user_item_arrives_during_generation():
@@ -5097,7 +5222,9 @@ async def test_duplex_chat_stage_metrics_use_latest_streaming_snapshot():
     await handler._run_response(session, send_json)
 
     audio_deltas = [event for event in sent if event.get("type") == "response.output_audio.delta"]
-    done = next(event for event in sent if event.get("type") == "response.done")
+    done_events = [event for event in sent if event.get("type") == "response.done"]
+    assert len(done_events) == 1
+    done = done_events[0]
     assert all("vllm_omni" not in event for event in audio_deltas)
     assert done["vllm_omni"]["stage_metrics"]["0"] == {
         "num_tokens_out": 3,
@@ -5120,15 +5247,18 @@ async def test_duplex_chat_rejects_unknown_output_modality():
     async def send_json(data: dict[str, Any]) -> None:
         sent.append(data)
 
-    await handler._emit_chat_payload(
-        session,
-        {
-            "modality": "video",
-            "choices": [{"delta": {"content": "not-text"}}],
-        },
-        session.epoch,
-        response_id,
-        send_json,
+    assert (
+        await handler._emit_chat_payload(
+            session,
+            {
+                "modality": "video",
+                "choices": [{"delta": {"content": "not-text"}}],
+            },
+            session.epoch,
+            response_id,
+            send_json,
+        )
+        == "unsupported_response_modality"
     )
 
     assert sent == [
@@ -5142,6 +5272,170 @@ async def test_duplex_chat_rejects_unknown_output_modality():
         }
     ]
     assert session.assistant_text_buffer == ()
+
+
+@pytest.mark.asyncio
+async def test_duplex_chat_stream_projection_error_terminates_response_as_failed():
+    class UnsupportedModalityChatService(FakeChatService):
+        async def create_chat_completion(self, request, raw_request=None):
+            del request, raw_request
+
+            async def _gen():
+                yield f"data: {json.dumps({'modality': 'video', 'choices': [{'delta': {'content': 'not-video'}}]})}\n\n"
+
+            return _gen()
+
+    session = DuplexSession(session_id="sid-chat-stream-error", config=DuplexSessionConfig())
+    handler = OmniDuplexSessionHandler(
+        chat_service=UnsupportedModalityChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(data: dict[str, Any]) -> None:
+        sent.append(data)
+
+    await handler._run_response(session, send_json)
+
+    assert [event["type"] for event in sent] == ["response.created", "error", "response.done"]
+    created, error, done = sent
+    assert error == {
+        "type": "error",
+        "session_id": session.session_id,
+        "response_id": created["response_id"],
+        "epoch": created["epoch"],
+        "code": "unsupported_response_modality",
+        "error": "Unsupported chat response modality: video",
+    }
+    assert done["session_id"] == session.session_id
+    assert done["response_id"] == created["response_id"]
+    assert done["epoch"] == created["epoch"]
+    assert done["committed"] is False
+    assert done["status"] == "failed"
+    assert done["status_details"] == {"type": "failed", "reason": "unsupported_response_modality"}
+    assert done["playback"] == session.playback.as_dict()
+    assert session.active_response_id is None
+
+
+@pytest.mark.asyncio
+async def test_duplex_chat_stream_backend_error_terminates_without_committing_partial_text():
+    class BackendErrorChatService(FakeChatService):
+        async def create_chat_completion(self, request, raw_request=None):
+            del request, raw_request
+
+            async def _gen():
+                yield 'data: {"modality":"text","choices":[{"delta":{"content":"partial"}}]}\n\n'
+                yield 'data: {"error":{"message":"backend failed","type":"server_error","code":500}}\n\n'
+                yield "data: [DONE]\n\n"
+
+            return _gen()
+
+    session = DuplexSession(session_id="sid-chat-stream-backend-error", config=DuplexSessionConfig())
+    handler = OmniDuplexSessionHandler(
+        chat_service=BackendErrorChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(data: dict[str, Any]) -> None:
+        sent.append(data)
+
+    await handler._run_response(session, send_json)
+
+    assert [event["type"] for event in sent] == [
+        "response.created",
+        "response.text.delta",
+        "error",
+        "response.done",
+    ]
+    created, _, error, done = sent
+    assert error == {
+        "type": "error",
+        "session_id": session.session_id,
+        "response_id": created["response_id"],
+        "epoch": created["epoch"],
+        "code": "server_error",
+        "error": "backend failed",
+    }
+    assert done["session_id"] == session.session_id
+    assert done["response_id"] == created["response_id"]
+    assert done["epoch"] == created["epoch"]
+    assert done["committed"] is False
+    assert done["status"] == "failed"
+    assert done["status_details"] == {"type": "failed", "reason": "server_error"}
+    assert done["playback"] == session.playback.as_dict()
+    assert session.history == ()
+    assert session.active_response_id is None
+
+
+@pytest.mark.asyncio
+async def test_duplex_chat_stale_exception_does_not_emit_failed_response_done():
+    session = DuplexSession(session_id="sid-chat-stale-exception", config=DuplexSessionConfig())
+
+    class StaleExceptionChatService(FakeChatService):
+        async def create_chat_completion(self, request, raw_request=None):
+            del request, raw_request
+            session.barge_in()
+            raise RuntimeError("stale backend failure")
+
+    handler = OmniDuplexSessionHandler(
+        chat_service=StaleExceptionChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(data: dict[str, Any]) -> None:
+        sent.append(data)
+
+    await handler._run_response(session, send_json)
+
+    assert [event["type"] for event in sent] == ["response.created", "error"]
+    assert sent[-1]["code"] == "response_error"
+    assert session.active_response_id is None
+
+
+@pytest.mark.asyncio
+async def test_duplex_session_capacity_releases_after_first_session_closes():
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+        duplex_session_config=DuplexSessionRuntimeConfig(max_sessions=1),
+    )
+    first_ready = asyncio.Event()
+
+    def on_first_send(_ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") == "session.created":
+            first_ready.set()
+
+    first = TimedWebSocket(on_send=on_first_send, receive_timeout_s=10)
+    first.put(_session_create("sid-capacity-first"))
+    first_task = asyncio.create_task(handler.handle_session(first))
+    await asyncio.wait_for(first_ready.wait(), timeout=1)
+    assert handler._registry.active_count() == 1
+
+    second = TimedWebSocket(receive_timeout_s=0.1)
+    second.put(_session_create("sid-capacity-second"))
+    await handler.handle_session(second)
+
+    assert second.sent_types() == ["error"]
+    assert second.sent[0]["code"] == "duplex_session_capacity_exhausted"
+    assert second.sent[0]["error"] == "Duplex session capacity exhausted (max_sessions=1)"
+    assert handler._registry.active_count() == 1
+
+    first.put({"type": "session.close"})
+    await asyncio.wait_for(first_task, timeout=1)
+    assert handler._registry.active_count() == 0
+
+    third = TimedWebSocket(receive_timeout_s=0.1)
+    third.put(_session_create("sid-capacity-third"))
+    third.put({"type": "session.close"})
+    await handler.handle_session(third)
+
+    assert "session.created" in third.sent_types()
 
 
 @pytest.mark.asyncio

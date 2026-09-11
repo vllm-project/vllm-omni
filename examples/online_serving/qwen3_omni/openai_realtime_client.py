@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Realtime client for vLLM-Omni /v1/realtime (audio + text events).
+"""Raw websocket client for vLLM-Omni /v1/duplex (audio + text events).
 
 This client:
 1) Reads a local WAV file (must be mono, 16-bit PCM, 16kHz),
-2) Streams PCM16 chunks to /v1/realtime with OpenAI-style events,
-3) Receives response.audio.*, response.output_text.*, and transcript events,
+2) Streams PCM16 chunks to /v1/duplex with native duplex events,
+3) Receives response.output_audio.delta, response.text.delta, and response.done,
 4) Saves synthesized audio to an output WAV file and optional text file.
 
-By default each ``response.audio.delta`` is treated as an **incremental PCM**
+By default each ``response.output_audio.delta`` is treated as an **incremental PCM**
 chunk and all chunks are concatenated into the final ``--output-wav``.
 
 Optional debugging: pass ``--delta-dump-dir DIR`` to write every
-``response.audio.delta`` payload as ``delta_000001.wav``, ``delta_000002.wav``, …
+``response.output_audio.delta`` payload as ``delta_000001.wav``, ``delta_000002.wav``, …
 
 Usage:
   python openai_realtime_client.py \
-      --url ws://localhost:8091/v1/realtime \
+      --url ws://localhost:8091/v1/duplex \
       --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
       --input-wav input_16k_mono.wav \
       --output-wav realtime_output.wav \
@@ -75,11 +75,9 @@ def _write_wav_pcm16(path: Path, pcm16_bytes: bytes, sample_rate_hz: int) -> Non
         wf.writeframes(pcm16_bytes)
 
 
-def _with_realtime_route(url: str, *, server_vad: bool) -> str:
+def _with_duplex_route(url: str) -> str:
     parts = urlsplit(url)
     query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "duplex"]
-    if not server_vad:
-        query.append(("duplex", "0"))
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
@@ -111,41 +109,36 @@ async def run_client(
     if delta_dump_dir is not None:
         delta_dump_dir.mkdir(parents=True, exist_ok=True)
 
-    # Keep the CLI mode authoritative even if the input URL already contains
-    # an explicit duplex query parameter.
-    url = _with_realtime_route(url, server_vad=server_vad)
+    # The native duplex route does not use the Realtime compatibility query.
+    url = _with_duplex_route(url)
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
-        # 1) Validate model.
+        # 1) Open a native duplex session.
+        session_config: dict[str, object] = {
+            "model": model,
+            "modalities": ["text", "audio"],
+            # Native duplex audio deltas are raw PCM, which can be concatenated
+            # directly into the output WAV and per-delta debug files.
+            "response_format": "pcm",
+        }
         if server_vad:
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "model": model,
-                    "audio": {
-                        "input": {
-                            "format": {"type": "audio/pcm", "rate": 16_000},
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 500,
-                                "create_response": True,
-                                "interrupt_response": False,
-                            },
-                        }
-                    },
-                },
+            session_config["turn_detection"] = {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500,
+                "create_response": True,
+                "interrupt_response": False,
             }
-        else:
-            # Preserve the existing non-duplex wire format.
-            session_update = {"type": "session.update", "model": model}
-        await ws.send(json.dumps(session_update))
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.create",
+                    "session": session_config,
+                }
+            )
+        )
 
-        # 2) Preserve the legacy explicit-commit flow unless Server VAD owns endpointing.
-        if not server_vad:
-            await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
-
-        # 3) Stream audio chunks.
+        # 2) Stream audio chunks.
         for i in range(0, len(pcm16), chunk_bytes):
             chunk = pcm16[i : i + chunk_bytes]
             await ws.send(
@@ -159,7 +152,7 @@ async def run_client(
             if send_delay_ms > 0:
                 await asyncio.sleep(send_delay_ms / 1000.0)
 
-        # 4) Finalize the turn explicitly, or append silence for Server VAD endpointing.
+        # 3) Finalize the turn explicitly, or append silence for Server VAD endpointing.
         if server_vad:
             trailing_silence = bytes(16_000 * 2)
             for i in range(0, len(trailing_silence), chunk_bytes):
@@ -174,7 +167,7 @@ async def run_client(
         else:
             await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
 
-        # 5) Receive server events until audio done.
+        # 4) Receive server events until response.done.
         while True:
             message = await ws.recv()
             if isinstance(message, bytes):
@@ -187,11 +180,11 @@ async def run_client(
             if event_type == "session.created":
                 continue
 
-            if event_type == "response.audio.delta":
+            if event_type in {"response.output_audio.delta", "response.audio.delta"}:
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
                     output_sample_rate = sr
-                audio_b64 = event.get("delta" if server_vad else "audio", "")
+                audio_b64 = event.get("audio") or event.get("delta", "")
                 if audio_b64:
                     pcm_delta = base64.b64decode(audio_b64)
                     incremental_pcm_parts.append(pcm_delta)
@@ -205,7 +198,7 @@ async def run_client(
                         )
                 continue
 
-            if event_type in {"response.output_text.delta", "transcription.delta"}:
+            if event_type in {"response.text.delta", "response.output_text.delta", "transcription.delta"}:
                 delta = event.get("delta", "")
                 if delta:
                     text_chunks.append(delta)
@@ -227,12 +220,7 @@ async def run_client(
                 final_audio_transcript = event.get("transcript", "")
                 continue
 
-            if event_type == "response.audio.done":
-                if not server_vad:
-                    break
-                continue
-
-            if event_type == "response.done" and server_vad:
+            if event_type in {"response.audio.done", "response.done"}:
                 break
 
             if event_type == "error":
@@ -313,12 +301,12 @@ async def run_clients_concurrent(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Realtime audio/text client for vLLM-Omni")
-    parser.add_argument("--url", default="ws://localhost:8091/v1/realtime", help="WebSocket URL")
+    parser = argparse.ArgumentParser(description="Raw duplex audio/text client for vLLM-Omni")
+    parser.add_argument("--url", default="ws://localhost:8091/v1/duplex", help="WebSocket URL")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        help="Model name for session.update",
+        help="Model name for session.create",
     )
     parser.add_argument("--input-wav", required=True, type=Path, help="Input WAV (mono, PCM16, 16kHz)")
     parser.add_argument("--output-wav", default=Path("realtime_output.wav"), type=Path, help="Output WAV path")
@@ -339,7 +327,7 @@ def main() -> None:
         "--delta-dump-dir",
         type=Path,
         default=None,
-        help="If set, each response.audio.delta is saved as delta_NNNNNN.wav under this directory",
+        help="If set, each response.output_audio.delta is saved as delta_NNNNNN.wav under this directory",
     )
     parser.add_argument(
         "--server-vad",

@@ -993,6 +993,7 @@ class OmniDuplexSessionHandler(
         runtime_config: dict[str, object] = {}
         if runtime_adapter is not None:
             try:
+                runtime_adapter.validate_client_extra_body(config.extra_body)
                 runtime_config = await runtime_adapter.prepare_runtime_config(
                     config,
                     model_config=getattr(self._chat_service, "model_config", None),
@@ -1004,11 +1005,31 @@ class OmniDuplexSessionHandler(
                 await send_json({"type": "error", "error": str(exc), "code": "unsupported_ref_audio_path"})
                 return None
         session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
+        runtime_capabilities = (
+            runtime_adapter.capabilities(max_sessions=self._duplex_session_config.max_sessions)
+            if runtime_adapter is not None
+            else None
+        )
+        serving_managed_admission = runtime_capabilities is None or (
+            getattr(runtime_capabilities, "session_admission_mode", "serving_managed") == "serving_managed"
+        )
+        max_sessions = self._duplex_session_config.max_sessions
+        if (
+            serving_managed_admission
+            and self._registry.active_count() >= max_sessions
+            and (session_id is None or self._registry.get(session_id) is None)
+        ):
+            await send_json(
+                {
+                    "type": "error",
+                    "error": f"Duplex session capacity exhausted (max_sessions={max_sessions})",
+                    "code": "duplex_session_capacity_exhausted",
+                }
+            )
+            return None
         session = self._registry.create(config=config, session_id=session_id)
         if runtime_adapter is not None:
-            session.replace_capabilities(
-                runtime_adapter.capabilities(max_sessions=self._duplex_session_config.max_sessions)
-            )
+            session.replace_capabilities(runtime_capabilities)
             session.replace_runtime_config(runtime_config)
         session_payload = event.get("session")
         self._resolve_server_vad_defaults(
@@ -1226,7 +1247,7 @@ class OmniDuplexSessionHandler(
         session: DuplexSession,
         payload: dict[str, object],
     ) -> dict[str, object] | None:
-        if not self._uses_native_input_append(session):
+        if not self._uses_serving_runtime_adapter(session.config):
             return None
         try:
             self._require_serving_runtime_adapter().validate_client_extra_body(payload.get("extra_body"))
@@ -1244,7 +1265,7 @@ class OmniDuplexSessionHandler(
         session: DuplexSession,
         candidate_config: DuplexSessionConfig,
     ) -> dict[str, object]:
-        if not self._uses_native_input_append(session):
+        if not self._uses_serving_runtime_adapter(candidate_config):
             return dict(session.runtime_config)
         return self._require_serving_runtime_adapter().runtime_config_for_update(
             candidate_config,
