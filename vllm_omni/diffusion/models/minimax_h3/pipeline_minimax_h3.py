@@ -524,6 +524,8 @@ class MiniMaxH3Pipeline(
         "_encode_local_media",
         "diffuse",
         "decode",
+        "video_vae.decode_latent",
+        "audio_vae.decode_latent",
         "prepare_encode",
         "denoise_step",
         "post_decode",

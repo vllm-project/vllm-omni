@@ -28,10 +28,15 @@ def test_h3_full_pipeline_profiler_includes_local_encoding():
         "_encode_local_media",
         "diffuse",
         "decode",
+        "video_vae.decode_latent",
+        "audio_vae.decode_latent",
         "prepare_encode",
         "denoise_step",
         "post_decode",
     ]
+    assert "_encode_video_conditions" not in targets
+    assert "_encode_video_audio_conditions" not in targets
+    assert "_encode_audio_conditions" not in targets
 
 
 @pytest.mark.parametrize("load_text_encoder", [True, False])

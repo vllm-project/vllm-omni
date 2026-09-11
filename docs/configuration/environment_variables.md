@@ -97,12 +97,13 @@ full-payload transport, not the native vLLM paged KV connector.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
-| `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; connector default `3600` | Producer payload registration lease; connector construction | A non-empty value overrides connector `lease_seconds`; unset or empty uses the connector setting/default. Non-float values raise `ValueError`; range and finiteness are not validated. | Experimental operational control |
-| `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; connector default `300` | Receiver transfer-completion wait; connector construction | A non-empty value overrides connector `transfer_timeout_s`; unset or empty uses the connector setting/default. Non-float values raise `ValueError`; range and finiteness are not validated. | Experimental operational control |
+| `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; connector default `3600` | Unclaimed producer payload expiry; connector construction | A non-empty value overrides connector `lease_seconds`; unset or empty uses the connector setting/default. Non-float values raise `ValueError`; range and finiteness are not validated. Claimed READ allocations never expire by time. | Experimental operational control |
+| `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; connector default `300` | Receiver transfer-completion wait; connector construction | A non-empty value overrides connector `transfer_timeout_s`; unset or empty uses the connector setting/default. Non-float values raise `ValueError`; range and finiteness are not validated. Timeout does not cancel DMA or release active allocations. | Experimental operational control |
 
-Set a positive, finite lease longer than the maximum consumer queueing delay
-plus transfer time. Lease expiry can deregister an unread producer payload;
-it is not a safe cancellation mechanism for an active transfer. See the
+Set a positive, finite lease longer than the maximum consumer queueing delay.
+Lease expiry can deregister an unclaimed producer payload, but claimed READ
+allocations remain retained until safe completion; time is not a cancellation
+mechanism for an active transfer. See the
 [NIXL connector](../design/feature/omni_connectors/nixl_connector.md) for ownership
 and timeout behavior.
 
@@ -167,7 +168,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.28 environment-variable reference](https://docs.vllm.ai/en/v0.28.0/configuration/env_vars.html)
+the [vLLM 0.29 environment-variable reference](https://docs.vllm.ai/en/v0.29.0/configuration/env_vars.html)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 

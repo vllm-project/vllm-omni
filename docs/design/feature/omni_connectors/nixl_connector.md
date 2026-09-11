@@ -13,8 +13,9 @@ Uses vLLM's `NixlWrapper` (`vllm.distributed.nixl_utils`) to register the produc
 tensors and let the consumer pull them with a NIXL `READ`.
 
 - Data Plane: NIXL agent-to-agent `READ`, GPU-to-GPU where the backend allows it.
-- Control Plane: either the caller forwards the metadata returned by `put()`, or --
-  when `zmq_port` is set -- a ZMQ ROUTER socket serves it to the consumer by key.
+- Control Plane: a ZMQ ROUTER socket atomically claims the source allocation before
+  returning descriptors. Forwarded `put()` metadata includes the generation and
+  endpoint; the consumer claims that generation before submitting any READ.
 
 Transfer metadata uses schema version 1. Tensor descriptors are grouped by NIXL
 memory type (`DRAM`, `VRAM`, and so on), while each descriptor retains its global
@@ -67,8 +68,8 @@ stages:
 Parameters:
 
 - `host`: address the producer binds its handshake socket to (`"auto"` to detect).
-- `zmq_port`: handshake port. Omit it when the pipeline forwards `put()`'s metadata
-  itself, in which case no socket is opened. The value in the deploy YAML is a
+- `zmq_port`: handshake port. If a producer omits it, an ephemeral port is opened
+  for ownership claims and returned in `put()` metadata. The value in the deploy YAML is a
   base port. Purpose, replica, rank, and producer-stage offsets are added centrally,
   so colocated connectors and tensor-parallel workers receive distinct endpoints
   without one config entry per rank.
@@ -76,6 +77,9 @@ Parameters:
   handshake endpoint. Only needed when the consumer cannot learn it from metadata.
   In replicated deployments, the producer endpoint is carried with each request and
   selected at `get()` time; it is not mutable connector-wide state.
+  Explicit sender ports are preserved, not recomputed using the receiver replica.
+  Intermediate NIXL stages retain their incoming receiver configuration and a
+  separate outgoing bind configuration, so one worker can receive and publish.
 - `backends`: NIXL backends to register memory with. Defaults to `["UCX"]`.
 - `receive_device`: forces where received tensors land. By default the consumer
   keeps the producer's device *type* but uses its own current device of that type.
@@ -83,13 +87,34 @@ Parameters:
   and `VRAM` for accelerator tensors.
 - `lease_seconds`: how long a `put()` payload stays registered while waiting to be
   read (default 3600). The consumer reports completion, so this only bounds payloads
-  nobody ever reads. An internal reaper releases expired registrations.
+  nobody has claimed. An internal reaper releases only unclaimed registrations.
   `VLLM_OMNI_NIXL_LEASE_S` overrides it.
 - `transfer_timeout_s`: how long a `get()` waits for its `READ` to complete
   (default 300). NIXL 1.3 has no transfer cancellation API, so a timed-out transfer's
   buffers and registrations remain owned by the connector until NIXL reports a
   terminal state; `close()` waits for that state before releasing them.
   `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
+
+### Source ownership and failure limits
+
+Claims and expiry use the same lock. Completion identifies both a payload
+generation and a unique READ claim; duplicate or stale ACKs cannot release a
+different reader or replacement payload. Replacing a claimed key is rejected.
+Terminal errors also release claims; timeout, unknown status, and active sibling
+transfers retain the complete destination bundle and source claim until terminal.
+Zero-element tensors retain their shape/dtype/skeleton positions but never create
+DMA descriptors or registrations.
+
+A lost metadata response, lost completion ACK, or abandoned consumer can retain a
+claim indefinitely. NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
+`cleanup()` frees those allocations. Producer `close()` rejects new work and
+retains its agent, listener and claimed allocations; a later `close()` finishes
+teardown after claims drain. Permanently abandoned claims remain until process
+exit. This favors memory safety over bounded shutdown/memory usage. Only trusted
+peers may access this unauthenticated control plane. Both endpoints must use the
+claim-aware protocol; rolling compatibility with older GET_META clients is not
+provided. Legacy externally-owned metadata without a generation is accepted only
+under the caller's lifetime guarantee, not managed as a leased allocation here.
 
 ## Validation
 

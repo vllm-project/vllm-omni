@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1588,6 +1589,104 @@ class TestRankAwareHandshakePort(unittest.TestCase):
         extra = {"zmq_port": "${MISSING_PORT_VAR}", "stage_id": 0, "role": "sender"}
         with self.assertRaises(ValueError):
             self._resolve("NixlConnector", extra)
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (
+            {"role": "sender", "from_stage": 2, "zmq_port": 50071},
+            {"zmq_port": 52153},
+        ),
+        (
+            {"role": "receiver", "from_stage": 1, "zmq_port": 50071, "host": "producer"},
+            {"sender_zmq_port": 52152, "sender_host": "producer"},
+        ),
+        (
+            {
+                "role": "receiver",
+                "from_stage": 1,
+                "zmq_port": 50071,
+                "sender_zmq_port": 49000,
+                "sender_host": "bound-producer",
+                "outgoing": {"from_stage": 2, "zmq_port": 51071, "host": "local-worker"},
+            },
+            {"sender_zmq_port": 49000, "sender_host": "bound-producer", "zmq_port": 53153, "host": "local-worker"},
+        ),
+    ],
+)
+def test_split_runtime_factory_resolves_nixl_endpoints(extra, expected):
+    """The runner must pass the resolved spec, not the raw config, to the factory."""
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_runtime as runtime
+
+    original = deepcopy(extra)
+    config = SimpleNamespace(stage_id=2, stage_connector_config={"name": "NixlConnector", "extra": extra})
+    with (
+        patch.object(runtime, "get_local_tp_rank", return_value=2, create=True),
+        patch.object(runtime, "get_omni_replica_id", return_value=2, create=True),
+        patch.object(runtime.OmniConnectorFactory, "create_connector") as factory,
+    ):
+        assert MixinHost._create_connector(config) is factory.return_value
+
+    spec = factory.call_args.args[0]
+    assert spec.name == "NixlConnector"
+    assert spec.extra["stage_id"] == 2
+    for key, value in expected.items():
+        assert spec.extra[key] == value
+    if extra["role"] == "receiver" and "outgoing" not in extra:
+        assert "zmq_port" not in spec.extra
+    assert extra == original
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_split_payload_endpoint_retry_cleanup_and_reuse(async_chunk):
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=async_chunk))
+    host._stage_id = 1
+    host._omni_connector = MagicMock()
+    host._omni_connector.get.return_value = None
+    first = _make_request("req-1", "ext-req-1")
+    first.payload_sender_info = {"host": "producer-a", "zmq_port": "50051"}
+    second = _make_request("req-2", "ext-req-2")
+    second.payload_sender_info = {"host": "producer-b", "zmq_port": 51051}
+
+    try:
+        host.register_chunk_recv(first)
+        host.register_chunk_recv(second)
+        for req_id in ("req-1", "req-2", "req-1"):
+            assert not host._poll_single_request(req_id)
+        assert host._omni_connector.get.call_args_list == [
+            unittest.mock.call("0", "1", "ext-req-1_0_0", {"source_host": "producer-a", "source_port": 50051}),
+            unittest.mock.call("0", "1", "ext-req-2_0_0", {"source_host": "producer-b", "source_port": 51051}),
+            unittest.mock.call("0", "1", "ext-req-1_0_0", {"source_host": "producer-a", "source_port": 50051}),
+        ]
+        host.cleanup_finished_request("req-1")
+        assert "req-1" not in host._pending_load_reqs
+        assert host._pending_load_reqs["req-2"] is second
+        host.register_chunk_recv(_make_request("req-1", "reused"))
+        assert not host._poll_single_request("req-1")
+        host._omni_connector.get.assert_called_with("0", "1", "reused_0_0")
+    finally:
+        host.shutdown_omni_connectors()
+
+
+@pytest.mark.parametrize("method", ["_recv_full_payload_result", "_recv_async_chunk_result"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_split_payload_sender_metadata_respects_tp_leader(method, rank):
+    host = MixinHost()
+    connector = MagicMock()
+    metadata = {"source_host": "producer", "source_port": 50051}
+    with (
+        patch.object(host, "_get_local_tp_group", return_value=_FakeTPGroup(world_size=2, rank_in_group=rank)),
+        patch.object(host, "is_data_transfer_rank", return_value=rank == 0),
+    ):
+        result = getattr(host, method)(connector, "0", "1", "req_0_0", metadata)
+    if rank == 0:
+        connector.get.assert_called_once_with("0", "1", "req_0_0", metadata)
+        assert result is connector.get.return_value
+    else:
+        connector.get.assert_not_called()
+        assert result is None
 
 
 class _FailingConnector:
