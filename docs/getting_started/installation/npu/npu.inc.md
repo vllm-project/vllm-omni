@@ -10,25 +10,25 @@ The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built
 === "A2"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.29.0
     ```
 
 === "A3"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0-a3
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.29.0-a3
     ```
 
 === "A5"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0-a5
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.29.0-a5
     ```
 
 === "310P (Experimental)"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0-310p
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.29.0-310p
     ```
 
 ```bash
@@ -53,7 +53,7 @@ docker run --rm \
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone -b v0.28.0 https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.29.0 https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e . --no-build-isolation
 # or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
@@ -71,10 +71,10 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 
 # --8<-- [start:installation-main]
 
-You can also install vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. Use the aligned vLLM-Ascend v0.28.0 image described above, and check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest vLLM-Omni commit on NPU.
+You can also install vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. Use the aligned vLLM-Ascend v0.29.0 image described above, and check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest vLLM-Omni commit on NPU.
 
 ```bash
-# Inside the vLLM-Ascend v0.28.0 container, install vLLM-Omni from main
+# Inside the vLLM-Ascend v0.29.0 container, install vLLM-Omni from main
 cd /vllm-workspace
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
@@ -103,7 +103,7 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 === "A2"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0
+    export IMAGE=quay.io/ascend/vllm-omni:v0.29.0
     docker run --rm \
         --name vllm-omni-a2 \
         --shm-size=64g \
@@ -127,7 +127,7 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 === "A3"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0-a3
+    export IMAGE=quay.io/ascend/vllm-omni:v0.29.0-a3
     docker run --rm \
         --name vllm-omni-a3 \
         --shm-size=64g \
@@ -151,7 +151,7 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 === "A5"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0-a5
+    export IMAGE=quay.io/ascend/vllm-omni:v0.29.0-a5
     docker run --rm \
         --name vllm-omni-a5 \
         --shm-size=64g \
@@ -175,7 +175,7 @@ Here's an example deployment command that has been verified on 4 x NPUs:
 === "310P (Experimental)"
 
     ```bash
-    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0-310p
+    export IMAGE=quay.io/ascend/vllm-omni:v0.29.0-310p
     docker run --rm \
         --name vllm-omni-310p \
         --shm-size=64g \
