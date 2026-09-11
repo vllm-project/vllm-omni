@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
+from types import ModuleType
 
 import pytest
 import torch
@@ -36,6 +38,10 @@ _TOLERANCES = {
     torch.float16: (5e-3, 5e-3),
     torch.bfloat16: (2e-2, 2e-2),
 }
+_FUSED_OP_MODULE_NAMES = (
+    "vllm_omni.model_executor.models.common.ops.fused_group_norm_silu",
+    "vllm_omni.model_executor.models.common.ops.fused_adaptive_group_norm_silu",
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,19 @@ _CASES = (
     BlockCase("production_down_branch", 1, 128, 128, 32, 32, down=True),
     BlockCase("production_up_branch", 1, 128, 128, 16, 16, up=True),
 )
+
+
+def _load_fused_op_modules() -> tuple[ModuleType, ...]:
+    return tuple(importlib.import_module(name) for name in _FUSED_OP_MODULE_NAMES)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _require_triton_fused_ops() -> None:
+    unavailable = [module.__name__ for module in _load_fused_op_modules() if not getattr(module, "HAS_TRITON", False)]
+    assert unavailable == [], (
+        "HunyuanImage3 NVIDIA ResBlock qualification must execute the Triton "
+        f"implementations, but fallback is active for: {', '.join(unavailable)}"
+    )
 
 
 def _constructor_kwargs(case: BlockCase, dtype: torch.dtype) -> dict[str, object]:

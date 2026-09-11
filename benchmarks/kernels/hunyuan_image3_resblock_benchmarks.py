@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import statistics
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import ModuleType
 
 import torch
 
@@ -23,6 +25,10 @@ _TOLERANCES = {
     torch.float16: (5e-3, 5e-3),
     torch.bfloat16: (2e-2, 2e-2),
 }
+_FUSED_OP_MODULE_NAMES = (
+    "vllm_omni.model_executor.models.common.ops.fused_group_norm_silu",
+    "vllm_omni.model_executor.models.common.ops.fused_adaptive_group_norm_silu",
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,19 @@ def _load_runtime_types() -> tuple[type[torch.nn.Module], type[torch.nn.Module],
     return NativeResBlock, NvidiaResBlock, current_omni_platform
 
 
+def _load_fused_op_modules() -> tuple[ModuleType, ...]:
+    return tuple(importlib.import_module(name) for name in _FUSED_OP_MODULE_NAMES)
+
+
+def _require_triton_fused_ops() -> None:
+    unavailable = [module.__name__ for module in _load_fused_op_modules() if not getattr(module, "HAS_TRITON", False)]
+    if unavailable:
+        raise RuntimeError(
+            "HunyuanImage3 NVIDIA ResBlock benchmark must execute the Triton "
+            f"implementations, but fallback is active for: {', '.join(unavailable)}"
+        )
+
+
 def _constructor_kwargs(case: BlockCase, dtype: torch.dtype) -> dict[str, object]:
     return {
         "in_channels": case.in_channels,
@@ -119,6 +138,7 @@ def _make_blocks(
     NativeResBlock, NvidiaResBlock, current_omni_platform = _load_runtime_types()
     if not current_omni_platform.is_cuda():
         raise RuntimeError("HunyuanImage3 NVIDIA ResBlock benchmark requires CUDA")
+    _require_triton_fused_ops()
 
     kwargs = _constructor_kwargs(case, dtype)
     native = NativeResBlock(**kwargs).eval()
@@ -235,6 +255,7 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
         "gpu": current_omni_platform.get_device_name(),
         "torch_version": torch.__version__,
         "accelerator_version": current_omni_platform.get_device_version(),
+        "triton_fused_ops": True,
         "dtype": args.dtype,
         "case": args.case,
         "case_config": asdict(case),
