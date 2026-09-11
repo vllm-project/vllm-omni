@@ -57,3 +57,20 @@ cross-stage routing.
 
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
+
+### Hardware-specific block qualification
+
+When a model selects native and vendor implementations of the same block,
+qualify the extension seam before changing selection policy:
+
+1. Load the same nontrivial state dict strictly into both implementations.
+2. Exercise identity and channel-changing skip paths plus production mode
+   branches.
+3. Compare shape, dtype, and values with declared per-dtype tolerances.
+4. Assert that the normal platform entry selects the intended class and that
+   accelerated operations actually execute.
+5. Restore process-global backend state after successful and failing calls.
+6. Report block timings separately from model and request timings.
+
+Block qualification does not replace checkpoint loading, generated-output
+quality, or request-level validation through the normal model entry.
