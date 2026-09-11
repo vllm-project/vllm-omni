@@ -8,7 +8,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,9 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
 @dataclass
@@ -127,6 +130,35 @@ def _projection_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
 
+# Scale tensors a quantized checkpoint carries alongside each packed weight.
+_QUANT_SCALE_SUFFIXES = ("weight_scale", "weight_scale_2", "input_scale", "weight_global_scale", "input_global_scale")
+
+
+def _missing_parameter_message(checkpoint_name: str, name: str, params: dict[str, torch.Tensor]) -> str:
+    """Explain an unmatched checkpoint tensor, naming the likely cause.
+
+    A quantized checkpoint whose exclusion list did not match this model's
+    module prefixes produces exactly one symptom: the layer was built
+    unquantized, so it has a ``weight`` but none of the scale parameters the
+    checkpoint ships. Say that outright instead of reporting a bare unknown
+    name, because the fix (aligning the exclusion list root with the module
+    tree) is not guessable from the tensor name alone.
+    """
+    for suffix in _QUANT_SCALE_SUFFIXES:
+        if not name.endswith(f".{suffix}"):
+            continue
+        module = name[: -len(suffix) - 1]
+        if f"{module}.weight" in params:
+            return (
+                f"{checkpoint_name} is a quantization scale for {module}, but that layer was built "
+                "without a quantization method. Either the checkpoint's quantization_config was not "
+                "picked up, or its exclusion list does not match this model's module prefixes, which "
+                "are rooted at the transformer itself (blocks.N.…, head, patch_embedding)."
+            )
+        break
+    return f"Unexpected LingBot model weight name: {checkpoint_name}"
+
+
 class LingBotSelfAttention(nn.Module):
     """Block-causal self-attention over retained history and one full chunk."""
 
@@ -136,6 +168,7 @@ class LingBotSelfAttention(nn.Module):
         num_heads: int,
         *,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -149,14 +182,44 @@ class LingBotSelfAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=self.head_dim,
-            total_num_heads=num_heads,
-            bias=True,
-            prefix=_projection_prefix(prefix, "qkv"),
-        )
-        self.num_local_heads = self.qkv.num_heads
+
+        # Q/K/V are fused into one GEMM only when the weights are not
+        # quantized. A ModelOpt NVFP4 checkpoint stores one global weight
+        # scale per projection, and vLLM's fused path keeps a single scalar
+        # ``alpha`` for the merged layer, resolving the three by taking their
+        # maximum. Because each projection's FP8 block scales were normalised
+        # by *its own* global scale -- every one of them saturates at 448.0 --
+        # substituting another projection's scale rescales that projection's
+        # whole output. On the public LingBot NVFP4 export the three differ by
+        # up to 3.5x, so fusing would not degrade the model, it would break it.
+        # Keeping them separate also matches how the checkpoint is stored.
+        self.fused_qkv = quant_config is None
+        if self.fused_qkv:
+            self.qkv = QKVParallelLinear(
+                hidden_size=dim,
+                head_size=self.head_dim,
+                total_num_heads=num_heads,
+                bias=True,
+                quant_config=quant_config,
+                prefix=_projection_prefix(prefix, "qkv"),
+            )
+            self.num_local_heads = self.qkv.num_heads
+        else:
+            for name in ("q", "k", "v"):
+                setattr(
+                    self,
+                    name,
+                    ColumnParallelLinear(
+                        dim,
+                        dim,
+                        bias=True,
+                        gather_output=False,
+                        return_bias=False,
+                        quant_config=quant_config,
+                        prefix=_projection_prefix(prefix, name),
+                    ),
+                )
+            self.num_local_heads = num_heads // tp_size
         self.tp_inner_dim = self.num_local_heads * self.head_dim
         self.o = RowParallelLinear(
             dim,
@@ -164,6 +227,7 @@ class LingBotSelfAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "o"),
         )
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
@@ -274,8 +338,11 @@ class LingBotSelfAttention(nn.Module):
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
-        qkv, _ = self.qkv(hidden_states)
-        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        if self.fused_qkv:
+            qkv, _ = self.qkv(hidden_states)
+            query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        else:
+            query, key, value = self.q(hidden_states), self.k(hidden_states), self.v(hidden_states)
         query = self.norm_q(query)
         key = self.norm_k(key)
 
@@ -359,6 +426,7 @@ class LingBotCrossAttention(nn.Module):
         num_heads: int,
         *,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -381,6 +449,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "q"),
         )
         self.k = ColumnParallelLinear(
@@ -389,6 +458,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "k"),
         )
         self.v = ColumnParallelLinear(
@@ -397,6 +467,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "v"),
         )
         self.o = RowParallelLinear(
@@ -405,6 +476,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "o"),
         )
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
@@ -466,6 +538,7 @@ class LingBotAttentionBlock(nn.Module):
         ffn_dim: int | None = None,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -476,12 +549,14 @@ class LingBotAttentionBlock(nn.Module):
             dim,
             num_heads,
             eps=eps,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "self_attn"),
         )
         self.cross_attn = LingBotCrossAttention(
             dim,
             num_heads,
             eps=eps,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cross_attn"),
         )
         self.norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -493,6 +568,7 @@ class LingBotAttentionBlock(nn.Module):
                 bias=True,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
                 prefix=_projection_prefix(prefix, "ffn.0"),
             ),
             nn.GELU(approximate="tanh"),
@@ -502,16 +578,22 @@ class LingBotAttentionBlock(nn.Module):
                 bias=True,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
                 prefix=_projection_prefix(prefix, "ffn.2"),
             ),
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / math.sqrt(dim))
+        # The camera-conditioning projections stay in the quant dispatch path so
+        # that a checkpoint which *does* quantize them still loads; every public
+        # LingBot World NVFP4 export so far lists them in ``ignore``, in which
+        # case the dispatch resolves back to an unquantized method.
         self.cam_injector_layer1 = ColumnParallelLinear(
             dim,
             dim,
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cam_injector_layer1"),
         )
         self.cam_injector_layer2 = RowParallelLinear(
@@ -520,8 +602,11 @@ class LingBotAttentionBlock(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cam_injector_layer2"),
         )
+        # cam_scale/cam_shift produce precision-sensitive modulation values and
+        # are plain ``nn.Linear``; they never enter the quant dispatch path.
         self.cam_scale_layer = nn.Linear(dim, dim)
         self.cam_shift_layer = nn.Linear(dim, dim)
 
@@ -701,7 +786,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         num_frames_per_block: int = 3,
         sliding_window_num_frames: int = 18,
         local_attn_size: int = -1,
-        quant_config: object | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -731,10 +816,6 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         ):
             if field_value is not None:
                 raise ValueError(f"{field_name} must be None because LingBot World v2 has no image embedding path.")
-        if quant_config is not None:
-            raise RuntimeError(
-                "quant_config is not supported by the LingBot World transformer; construct the unquantized model."
-            )
 
         dim = num_attention_heads * attention_head_dim
         self.dim = dim
@@ -774,6 +855,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer1"),
         )
         self.c2ws_hidden_states_layer2 = RowParallelLinear(
@@ -782,6 +864,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer2"),
         )
         self.text_embedding = nn.Sequential(
@@ -806,6 +889,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     ffn_dim=ffn_dim,
                     cross_attn_norm=cross_attn_norm,
                     eps=eps,
+                    quant_config=quant_config,
                     prefix=_projection_prefix(prefix, f"blocks.{index}"),
                 )
                 for index in range(num_layers)
@@ -831,7 +915,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         cls,
         config: dict[str, Any],
         *,
-        quant_config: Any | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> Self:
         checkpoint_contract = {
@@ -868,6 +952,10 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             actual = kwargs.get(name, expected)
             if actual != expected:
                 raise ValueError(f"LingBot checkpoint config {name} must be {expected!r}, got {actual!r}.")
+        if "quantization_config" in config:
+            from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+            quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
         return cls(**kwargs, quant_config=quant_config, prefix=prefix)
 
     def allocate_cache(
@@ -1172,7 +1260,9 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
 
         params = dict(self.named_parameters())
         loaded: set[str] = set()
-        qkv_mapping = (("q", "q"), ("k", "k"), ("v", "v"))
+        # Only rewrite Q/K/V into a fused parameter when one was actually
+        # built; a quantized model keeps the checkpoint's own three.
+        qkv_mapping = (("q", "q"), ("k", "k"), ("v", "v")) if self.blocks[0].self_attn.fused_qkv else ()
         for checkpoint_name, loaded_weight in weights:
             name = checkpoint_name
             shard_id = None
@@ -1183,7 +1273,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     shard_id = projection_shard
                     break
             if name not in params:
-                raise KeyError(f"Unexpected LingBot model weight name: {checkpoint_name}")
+                raise KeyError(_missing_parameter_message(checkpoint_name, name, params))
             param = params[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             if shard_id is None:

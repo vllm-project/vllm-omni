@@ -32,6 +32,7 @@ def _tiny_model(
     num_layers: int = 2,
     num_frames_per_block: int = 1,
     sliding_window_num_frames: int = 3,
+    quant_config=None,
 ):
     return module.CausalLingBotWorldTransformer3DModel(
         patch_size=(1, 2, 2),
@@ -50,6 +51,7 @@ def _tiny_model(
         num_frames_per_block=num_frames_per_block,
         sliding_window_num_frames=sliding_window_num_frames,
         local_attn_size=-1,
+        quant_config=quant_config,
     )
 
 
@@ -463,11 +465,144 @@ def test_constructor_rejects_non_null_image_embedding_fields(field: str) -> None
         module.CausalLingBotWorldTransformer3DModel(**{field: 4})
 
 
-def test_constructor_rejects_unsupported_quantization_with_runtime_error() -> None:
+def _quantizable_projections(model) -> dict[str, object]:
+    """Map every projection that reached the quant dispatch to its config.
+
+    Keyed by the prefix the projection presented, which is the string a
+    checkpoint's exclusion list is matched against.
+    """
+    return {module.quant_prefix: module.quant_config for module in model.modules() if hasattr(module, "quant_prefix")}
+
+
+def test_quant_config_reaches_every_parallel_linear_with_checkpoint_rooted_prefixes() -> None:
+    module = attention_tests._load_module()
+    quant_config = object()
+
+    model = _tiny_model(module, num_layers=2, quant_config=quant_config)
+    presented = _quantizable_projections(model)
+
+    per_block = {
+        # Q/K/V stay separate under quantization; see the fused_qkv comment.
+        "self_attn.q",
+        "self_attn.k",
+        "self_attn.v",
+        "self_attn.o",
+        "cross_attn.q",
+        "cross_attn.k",
+        "cross_attn.v",
+        "cross_attn.o",
+        "ffn.0",
+        "ffn.2",
+        "cam_injector_layer1",
+        "cam_injector_layer2",
+    }
+    expected = {"c2ws_hidden_states_layer1", "c2ws_hidden_states_layer2"} | {
+        f"blocks.{index}.{name}" for index in range(2) for name in per_block
+    }
+    assert set(presented) == expected
+    # A prefix appearing twice would mean two modules collide in an exclusion
+    # list; the dict would silently hide that, so count the modules too.
+    assert sum(1 for m in model.modules() if hasattr(m, "quant_prefix")) == len(expected)
+    assert all(config is quant_config for config in presented.values())
+
+
+def test_quantized_self_attention_keeps_q_k_and_v_separate() -> None:
+    """Fusing them would break a ModelOpt NVFP4 checkpoint, not just degrade it.
+
+    Each projection's FP8 block scales are normalised by its own global weight
+    scale -- all three saturate at 448.0 in the public export -- while vLLM's
+    fused path carries one scalar alpha and resolves the three globals by
+    taking their maximum. On that checkpoint they differ by up to 3.5x, so two
+    of the three projections would dequantize to the wrong magnitude.
+    """
     module = attention_tests._load_module()
 
-    with pytest.raises(RuntimeError, match="quant_config.*not supported"):
-        module.CausalLingBotWorldTransformer3DModel(quant_config=object())
+    quantized = _tiny_model(module, num_layers=1, quant_config=object())
+    unquantized = _tiny_model(module, num_layers=1)
+
+    assert quantized.blocks[0].self_attn.fused_qkv is False
+    assert not hasattr(quantized.blocks[0].self_attn, "qkv")
+    for name in ("q", "k", "v"):
+        assert hasattr(quantized.blocks[0].self_attn, name)
+
+    # The unquantized path is unchanged: fusion is still the default.
+    assert unquantized.blocks[0].self_attn.fused_qkv is True
+    assert hasattr(unquantized.blocks[0].self_attn, "qkv")
+
+
+def test_a_quantized_model_loads_q_k_v_under_their_checkpoint_names() -> None:
+    """The fused rename must not fire when there is no fused parameter."""
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, quant_config=object())
+
+    names = dict(model.named_parameters())
+    assert "blocks.0.self_attn.q.weight" in names
+    assert "blocks.0.self_attn.qkv.weight" not in names
+
+    loaded = model.load_weights(
+        [("blocks.0.self_attn.q.weight", torch.zeros_like(names["blocks.0.self_attn.q.weight"]))]
+    )
+    assert "blocks.0.self_attn.q.weight" in loaded
+
+
+def test_precision_sensitive_projections_stay_out_of_the_quant_dispatch() -> None:
+    module = attention_tests._load_module()
+
+    model = _tiny_model(module, num_layers=2, quant_config=object())
+    presented = set(_quantizable_projections(model))
+
+    # Modulation, embedding and head projections produce precision-sensitive
+    # values, are plain ``nn.Linear``, and must never reach a quant method.
+    for name in ("cam_scale_layer", "cam_shift_layer", "head", "text_embedding", "time_embedding", "time_projection"):
+        assert not any(prefix.endswith(name) or f".{name}." in prefix for prefix in presented), name
+
+
+def test_an_unquantized_model_hands_no_projection_a_quant_config() -> None:
+    module = attention_tests._load_module()
+
+    model = _tiny_model(module, num_layers=1)
+
+    assert set(_quantizable_projections(model))
+    assert all(config is None for config in _quantizable_projections(model).values())
+
+
+def test_orphaned_quantization_scale_reports_the_exclusion_mismatch() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1)
+
+    # An unquantized build receiving a scale tensor is the exact symptom of an
+    # exclusion list whose root does not match the module prefixes.
+    with pytest.raises(KeyError, match="without a quantization method"):
+        model.load_weights([("blocks.0.ffn.0.weight_scale", torch.zeros(1))])
+
+    with pytest.raises(KeyError, match="Unexpected LingBot model weight name"):
+        model.load_weights([("blocks.0.nonexistent.weight", torch.zeros(1))])
+
+
+def test_from_config_adopts_the_quantization_config_declared_by_the_checkpoint() -> None:
+    module = attention_tests._load_module()
+
+    class ConfigProbe(module.CausalLingBotWorldTransformer3DModel):
+        def __init__(self, **kwargs) -> None:
+            self.received_kwargs = kwargs
+
+    disk_quant_config = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    built = object()
+    calls: list[tuple] = []
+
+    import vllm_omni.quantization.factory as factory
+
+    original = factory.resolve_quant_config_from_disk
+    factory.resolve_quant_config_from_disk = lambda active, disk: (calls.append((active, disk)), built)[1]
+    try:
+        probe = ConfigProbe.from_config(
+            {"_class_name": "CausalLingBotWorldTransformer3DModel", "quantization_config": disk_quant_config}
+        )
+    finally:
+        factory.resolve_quant_config_from_disk = original
+
+    assert calls == [(None, disk_quant_config)]
+    assert probe.received_kwargs["quant_config"] is built
 
 
 def test_from_config_accepts_diffusers_metadata_and_normalizes_patch_size() -> None:
