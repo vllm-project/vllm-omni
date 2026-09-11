@@ -515,7 +515,7 @@ class HiDreamO1ImageTransformer(nn.Module):
     @property
     def supports_piecewise_attention(self) -> bool:
         return all(
-            layer.self_attn.attn.attn_backend.supports_piecewise_spans for layer in self.model.language_model.layers
+            layer.self_attn.attn.attn_backend.supports_piecewise_spans() for layer in self.model.language_model.layers
         )
 
     def forward(

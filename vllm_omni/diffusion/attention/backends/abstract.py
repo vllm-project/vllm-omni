@@ -14,7 +14,6 @@ class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
     accept_output_buffer: bool = False
-    supports_piecewise_spans: bool = False
     # A backend that supports this capability can consume the opaque paged-KV
     # context prepared by the diffusion Worker data plane.  Keeping the
     # capability on the backend class prevents a paged request from silently
@@ -24,6 +23,35 @@ class AttentionBackend(ABC):
     # tensors instead of materializing a padding mask. Models may use this to
     # avoid a slower masked-attention plan when tail padding is not semantic.
     supports_prefix_kv_slicing: bool = False
+
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        """Whether this backend consumes ``AttentionMetadata.full_attn_spans``.
+
+        When True, a model with a mixed causal/full pattern may pass spans and
+        skip materializing the quadratic ``attn_mask``. Backends whose span
+        support is platform-dependent must consult ``current_omni_platform``:
+        this is a capability of the ``forward_*`` that actually runs, not of
+        the backend as a whole, and declaring True on a platform whose forward
+        ignores the spans makes every layer run unmasked dense attention with
+        no error and no warning.
+        """
+        return False
+
+    @classmethod
+    def supports_dense_attention_mask(cls) -> bool:
+        """Whether this backend honors a ``[B, H|1, Sq, Skv]`` attn_mask.
+
+        ``supports_attention_mask`` only promises that *some* mask is read;
+        several kernels accept just a 2D ``[B, Skv]`` padding mask and have no
+        way to express an arbitrary per-query-key pattern. ``Attention``
+        reroutes a >2D mask to SDPA rather than let such a backend drop or
+        reject it. "Honors" includes an equivalent route -- the flash backends
+        answer True on CUDA because ``full_attn_spans`` carries the pattern into
+        ``piecewise_attn`` there. Platform-dependent implementations must
+        consult ``current_omni_platform``.
+        """
+        return cls.supports_attention_mask()
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
