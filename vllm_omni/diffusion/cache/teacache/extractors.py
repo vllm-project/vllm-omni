@@ -199,7 +199,7 @@ def extract_qwen_context(
     hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
     image_rotary_emb = (vid_freqs, txt_freqs)
 
-    timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    timestep = torch.as_tensor(timestep, device=hidden_states.device, dtype=hidden_states.dtype)
 
     # Call modulate_index_prepare instead of handling timestep directly.
     # For zero_cond_t=False: timestep unchanged, modulate_index=None.
@@ -618,6 +618,8 @@ def extract_flux2_klein_context(
     # ============================================================================
     dtype = hidden_states.dtype
 
+    if encoder_hidden_states is None:
+        raise ValueError("Flux2Klein requires encoder_hidden_states")
     num_txt_tokens = encoder_hidden_states.shape[1]
 
     timestep = timestep.to(dtype=dtype) * 1000

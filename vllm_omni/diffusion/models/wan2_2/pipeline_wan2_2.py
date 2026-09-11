@@ -26,6 +26,14 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -156,9 +164,9 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     else:
         # Try to download config from HF Hub
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/config.json",
             )
@@ -364,9 +372,9 @@ class Wan22Pipeline(
         else:
             # For remote models, download and read model_index.json
             try:
-                from huggingface_hub import hf_hub_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                model_index_path = hf_hub_download(repo_id=model, filename="model_index.json")
+                model_index_path = hf_api().hf_hub_download(repo_id=model, filename="model_index.json")
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
@@ -907,6 +915,7 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
+        media = None
         if output_type == "latent":
             output = latents
         else:
@@ -920,7 +929,27 @@ class Wan22Pipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            decoded = self.vae.decode(latents, return_dict=False)[0]
+            # Distributed VAE decode uses broadcast_result=False, so only the
+            # output-owning rank receives the full [B, C, T, H, W] video; other
+            # ranks get an empty placeholder. Emit typed media only from the
+            # owning rank and keep the placeholder on the legacy output field, so
+            # the media batch-dimension check in split_diffusion_output_by_request
+            # does not trip on every non-owner rank.
+            if decoded.dim() == 5:
+                output = None
+                media = DiffusionMediaOutput(
+                    video=VideoMediaOutput(
+                        tensor=decoded,
+                        spec=VideoTensorSpec(
+                            layout=VideoTensorLayout.BCTHW,
+                            encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                            value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                        ),
+                    )
+                )
+            else:
+                output = decoded
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -947,6 +976,7 @@ class Wan22Pipeline(
         return split_diffusion_output_by_request(
             DiffusionOutput(
                 output=output,
+                media=media,
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             ),
             req,

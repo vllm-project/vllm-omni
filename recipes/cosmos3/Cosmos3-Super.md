@@ -125,11 +125,11 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
 #### Notes
 
 - **Measured (2x B300, bf16, guardrails off, diffusion cache off, official 2-GPU config above):**
-  - T2I 1024², 50 steps → **~6 s**
-  - T2V 1280×720, 189 frames, 35 steps → **~197 s**
-  - I2V 1280×720, 189 frames, 35 steps → **~200 s**
-  - T2V + sound (189 frames, 35 steps) → **~198 s**, output muxes **AAC 48 kHz stereo**
-  - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
+    - T2I 1024², 50 steps → **~6 s**
+    - T2V 1280×720, 189 frames, 35 steps → **~197 s**
+    - I2V 1280×720, 189 frames, 35 steps → **~200 s**
+    - T2V + sound (189 frames, 35 steps) → **~198 s**, output muxes **AAC 48 kHz stereo**
+    - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
 - **Memory:** ~61.5 GiB per GPU when sharded across 2 GPUs (HSDP shard 2); repo ~135 GB on disk.
 - Same generation defaults, supported sizes, V2V reference-video controls
   (`condition_frame_indexes_vision`, `condition_video_keep`), and
