@@ -1212,6 +1212,169 @@ def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
         loader.load_model(load_device="cpu")
 
 
+def test_dlo_allgather_allows_unquantized_host_fallback():
+    """Host-loaded unquantized fallback layers are plain contiguous bf16 —
+    the same runtime layout DLO already shards on the ordinary path — so the
+    allowlist must not reject them."""
+    from vllm_omni.quantization.int8_config import UnquantizedHostLinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(UnquantizedHostLinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
+
+
+def test_dlo_load_model_keeps_host_fallback_on_cpu_through_post_load_sweep(monkeypatch, mocker):
+    """Through load_model(): DLO + online quant must build the model inside
+    load_unquantizable_fallback_on_cpu(), and the over-wide fallback weight
+    must survive the post-load sweep (the _process_weights_after_loading pass
+    plus model.to("cpu")) as the same host tensor it was loaded into — never
+    bounced to the accelerator."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.quantization import int8_config
+    from vllm_omni.quantization.int8_config import (
+        NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
+        DiffusionInt8Config,
+        NPUInt8OnlineLinearMethod,
+        UnquantizedHostLinearMethod,
+    )
+
+    # Same stand-in as TestHostFallbackLoading: the eager fallback delegates to
+    # UnquantizedLinearMethod, which reads the TP group.
+    mock_group = mocker.Mock()
+    mock_group.rank_in_group = 0
+    mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+    mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0)
+    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
+    od_config = _make_dlo_online_quant_config()
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+
+    out_features = NPU_QUANT_MATMUL_MAX_OUT_FEATURES + 1
+    built_with_ctx: list[bool] = []
+
+    def copy_loader(param, loaded_weight, *args, **kwargs):
+        param.data.copy_(loaded_weight)
+
+    def build_model(*_args, **_kwargs):
+        built_with_ctx.append(int8_config._LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get())
+        quant_config = DiffusionInt8Config(is_checkpoint_int8_serialized=False, activation_scheme="dynamic")
+        method = NPUInt8OnlineLinearMethod(quant_config)
+        layer = nn.Module()
+        layer.quant_method = method
+        method.create_weights(
+            layer,
+            input_size_per_partition=8,
+            output_partition_sizes=[out_features],
+            input_size=8,
+            output_size=out_features,
+            params_dtype=torch.bfloat16,
+            weight_loader=copy_loader,
+        )
+        model = nn.Module()
+        model.transformer = layer
+        return model
+
+    def load_weights(_model, **_kwargs):
+        layer = _model.transformer
+        loaded = torch.arange(out_features * 8, dtype=torch.float32).reshape(out_features, 8).to(torch.bfloat16)
+        layer.weight.weight_loader(layer.weight, loaded)
+
+    loader._init_from_load_format = build_model  # type: ignore[method-assign]
+    loader.load_weights = load_weights  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(
+            None,
+            "online quantization requires the ordinary loader",
+        ),
+    )
+    # Diffusion DiT models have no vLLM Attention layers, so the upstream
+    # layerwise finalize is a no-op here; stub it to keep the real
+    # _process_weights_after_loading sweep CPU-only.
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.layerwise.finalize_layerwise_processing",
+        lambda *_args, **_kwargs: None,
+    )
+
+    model = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    # Construction ran inside load_unquantizable_fallback_on_cpu(), so the
+    # over-wide layer took the host-loading fallback...
+    assert built_with_ctx == [True]
+    assert type(model.transformer.quant_method) is UnquantizedHostLinearMethod
+    # ...and the real post-load sweep skipped it via the fully-loaded flag and
+    # model.to("cpu") left the loaded host tensor untouched.
+    assert model.transformer._already_called_process_weights_after_loading
+    assert model.transformer.weight.device.type == "cpu"
+    expected = torch.arange(out_features * 8, dtype=torch.float32).reshape(out_features, 8).to(torch.bfloat16)
+    assert torch.equal(model.transformer.weight, expected)
+
+
+@pytest.mark.parametrize(("offload_after_quant", "ctx_expected"), [(True, True), (False, False)])
+def test_hsdp_enters_host_fallback_context_only_when_offloading_after_quant(mocker, offload_after_quant, ctx_expected):
+    """The HSDP path must apply the same host-fallback bound as the ordinary
+    path: with a quant config it initializes on the accelerator, so the
+    load_unquantizable_fallback_on_cpu() context is what keeps over-wide
+    fallback weights off the device before sharding."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+    from vllm_omni.quantization import int8_config
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader.quant_config = object()
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    ctx_seen: list[bool] = []
+
+    def build_model(*_args, **_kwargs):
+        ctx_seen.append(int8_config._LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get())
+        return model
+
+    loader._init_from_load_format = build_model  # type: ignore[method-assign]
+    loader.load_weights = lambda _model: None  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: None  # type: ignore[method-assign]
+    mocker.patch.object(
+        loader_mod.ModuleDiscovery,
+        "discover",
+        return_value=PipelineModules(
+            dits=[model.transformer],
+            dit_names=["transformer"],
+            vaes=[],
+            encoders=[],
+            encoder_names=[],
+            resident_modules=[],
+            resident_names=[],
+        ),
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.quantization.hsdp_fp8.prepare_fp8_layers_for_fsdp",
+        side_effect=lambda _model: None,
+    )
+    mocker.patch.object(
+        loader_mod,
+        "apply_hsdp_to_model",
+        side_effect=lambda *_args, **_kwargs: None,
+    )
+
+    loader._load_model_with_hsdp(torch.device("cpu"), offload_after_quant=offload_after_quant)
+
+    assert ctx_seen == [ctx_expected]
+
+
 def test_dlo_allgather_online_mxfp8_uses_ordinary_loader(monkeypatch):
     mxfp8_config = pytest.importorskip("vllm_omni.quantization.mxfp8_config")
     NPUMxfp8OnlineLinearMethod = mxfp8_config.NPUMxfp8OnlineLinearMethod
