@@ -7,6 +7,18 @@ from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, St
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.kimi_audio"
 
+
+def register_kimi_audio_renderer():
+    """Register the Omni renderer while retaining vLLM's existing tokenizer."""
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers.registry import TokenizerRegistry
+
+    TokenizerRegistry.register("kimi_audio_omni", "vllm.tokenizers.kimi_audio", "KimiAudioTokenizer")
+    RENDERER_REGISTRY.register(
+        "kimi_audio_omni", "vllm_omni.model_executor.models.kimi_audio.renderer", "KimiAudioRenderer"
+    )
+
+
 KIMI_AUDIO_PIPELINE = PipelineConfig(
     model_type="kimi_audio",
     model_arch="KimiAudioForConditionalGeneration",

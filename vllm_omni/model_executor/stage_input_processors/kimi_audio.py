@@ -3,6 +3,7 @@
 
 """Kimi-Audio request admission and complete AR-to-decoder input conversion."""
 
+import hashlib
 from collections.abc import Sequence
 from typing import Any
 
@@ -11,21 +12,37 @@ import torch
 
 from vllm_omni.data_entry_keys import deserialize_payload
 from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioSpecialTokens
 from vllm_omni.model_executor.models.kimi_audio.sampling import KimiAudioSamplingParams
 
 
 def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Sequence[Any]) -> dict[str, Any]:
-    """Validate stage-0 settings through Omni's existing prompt_transform_func.
+    """Validate stage-0 inputs through Omni's existing prompt_transform_func.
 
-    Call after prepare_kimi_audio_inputs and after resolving stage sampling
-    defaults, before native input processing. No SamplingParams object crosses
-    into the model buffer. Registration must also enable sampling_extra_args
-    and include the tokenizer's msg_end in stage-0 stop_token_ids.
+    Chat arrives after rendering; offline and speech prompts are not yet native
+    EngineInputs. Both carry the same model buffer and resolved stage sampling
+    settings. Finalize the layout/cache identity here, after HTTP prompt extras
+    and before constructing the engine request. Never rebuild either stream.
     """
+    if not isinstance(prompt, dict):
+        raise OmniClientError("Kimi-Audio requires rendered chat or prepared token inputs")
+    info = prompt.get("model_intermediate_buffer")
+    if not isinstance(info, dict) or "kimi_audio_input" not in info:
+        raise OmniClientError("Kimi-Audio input is missing; use the Kimi chat renderer or prepare_kimi_audio_inputs")
+    additional_info = prompt.get("additional_information")
+    if additional_info is None:
+        additional_info = {}
+    if not isinstance(additional_info, dict) or any(not isinstance(key, str) for key in additional_info):
+        raise OmniClientError("Kimi-Audio additional_information must be a dictionary with string keys")
+    if any(key.startswith("kimi_audio_") for key in additional_info):
+        raise OmniClientError("Kimi-Audio internal request state cannot be supplied through additional_information")
+
     params = sampling_params_list[0]
+    if params.n != 1:
+        raise OmniClientError("Kimi-Audio currently requires one completion per request")
     if not params.detokenize or not params.include_stop_str_in_output:
-        raise ValueError("Kimi-Audio requires detokenize=True and include_stop_str_in_output=True")
+        raise OmniClientError("Kimi-Audio requires detokenize=True and include_stop_str_in_output=True")
     unsupported = [
         name
         for name in (
@@ -52,30 +69,43 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
     if params.top_p != 1.0:
         unsupported.append("top_p")
     if unsupported:
-        raise ValueError(f"Kimi-Audio sampling does not yet support: {', '.join(unsupported)}")
+        raise OmniClientError(f"Kimi-Audio sampling does not yet support: {', '.join(unsupported)}")
 
     overrides = (params.extra_args or {}).get("kimi_audio", {})
     if not isinstance(overrides, dict):
-        raise ValueError("SamplingParams.extra_args.kimi_audio must be a parameter dictionary")
+        raise OmniClientError("SamplingParams.extra_args.kimi_audio must be a parameter dictionary")
     values = dict(
         text_temperature=params.temperature,
         text_top_k=params.top_k,
         text_repetition_penalty=params.repetition_penalty,
     )
     values.update(overrides)
-    KimiAudioSamplingParams(**values)
+    try:
+        KimiAudioSamplingParams(**values)
+    except (TypeError, ValueError) as exc:
+        raise OmniClientError(str(exc)) from None
 
-    info = prompt["model_intermediate_buffer"]
     payload = deserialize_payload(msgspec.convert(info["kimi_audio_input"], AdditionalInformationPayload))
     special = KimiAudioSpecialTokens(**payload["special_tokens"])
     # Only blanks are returned to the scheduler before completion, then one
     # msg_end. True text/audio IDs stay in the model's two histories, so the
     # native tokenizer's different EOS cannot prematurely end either stream.
     if set(params.stop_token_ids or ()) != {special.msg_end}:
-        raise ValueError(f"Kimi-Audio requires stop_token_ids=[{special.msg_end}]; custom stops are not supported")
+        raise OmniClientError(f"Kimi-Audio requires stop_token_ids=[{special.msg_end}]; custom stops are not supported")
     if params.eos_token_id == special.kimia_text_blank:
-        raise ValueError("Kimi-Audio scheduler blank must not be the tokenizer EOS")
-    return {**prompt, "model_intermediate_buffer": {**info, "kimi_audio_request_validated": True}}
+        raise OmniClientError("Kimi-Audio scheduler blank must not be the tokenizer EOS")
+    # Public chat preprocessing may supply a caller cache_salt after rendering.
+    # Combine it with the full layout instead of letting it replace the text
+    # stream and task identity absent from scheduler-side placeholder IDs.
+    caller_salt = prompt.get("cache_salt")
+    if caller_salt is not None and not isinstance(caller_salt, str):
+        raise OmniClientError("Kimi-Audio cache_salt must be a string")
+    cache_salt = hashlib.sha256(msgspec.msgpack.encode((info["kimi_audio_input"], caller_salt))).hexdigest()
+    return {
+        **prompt,
+        "cache_salt": cache_salt,
+        "model_intermediate_buffer": {**info, "kimi_audio_request_validated": True},
+    }
 
 
 def kimi_audio_to_decoder(
@@ -91,7 +121,10 @@ def kimi_audio_to_decoder(
     wire = prompt["model_intermediate_buffer"]["kimi_audio_input"]
     config = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
     if config["output_type"] != "both":
-        raise ValueError("Kimi-Audio text-only requests must finish on stage 0")
+        raise OmniClientError(
+            "Kimi-Audio output_type='text' cannot feed the audio decoder; "
+            "use output_type='both' for audio output or select only the text stage"
+        )
     offset, vocab_size = config["audio_token_offset"], config["audio_vocab_size"]
     inputs = []
     for source in source_outputs:

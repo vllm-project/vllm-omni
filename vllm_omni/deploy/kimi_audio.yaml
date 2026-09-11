@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Initial non-streaming configuration; GPU startup and memory sizing are unverified.
-# Inputs currently come from prepare_kimi_audio_inputs (resolved 16 kHz audio).
+# Offline inputs use prepare_kimi_audio_inputs. The speech adapter reuses this
+# preparation for instructed reading; the renderer prepares multimodal chat.
 async_chunk: false
 trust_remote_code: true
 dtype: bfloat16
@@ -11,7 +12,7 @@ enable_prefix_caching: false
 stages:
   - stage_id: 0
     devices: "0"
-    tokenizer_mode: kimi_audio
+    tokenizer_mode: kimi_audio_omni
     enforce_eager: true
     async_scheduling: false
     max_num_seqs: 1

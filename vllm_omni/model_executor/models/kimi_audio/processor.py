@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Native multimodal registration for Kimi's prepared, aligned audio inputs."""
+"""Cached audio preprocessing for Kimi's prepared, aligned token prompts."""
 
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
@@ -24,11 +24,13 @@ from .audio_processing import SAMPLE_RATE, SAMPLES_PER_TOKEN, prepare_whisper_in
 
 class KimiAudioDataParser(MultiModalDataParser):
     def _parse_audio_data(self, data):
-        # Each actual audio item includes its own optional Whisper features.
-        # Keeping the mode with the waveform also makes processor-cache hits
-        # distinguish input audio from GLM-only audio-text history.
+        # Hash the encoding mode together with the waveform, before feature
+        # extraction, to distinguish input audio from GLM-only history.
         if not isinstance(data, list) or not all(
-            isinstance(item, dict) and set(item) == {"waveform", "whisper_features", "whisper_lengths"} for item in data
+            isinstance(item, dict)
+            and set(item) == {"waveform", "use_whisper"}
+            and isinstance(item["use_whisper"], bool)
+            for item in data
         ):
             raise ValueError("Kimi-Audio requires audio items from prepare_kimi_audio_inputs")
         return ProcessorBatchItems(data, "audio") if data else None
@@ -62,16 +64,8 @@ class KimiAudioDummyInputsBuilder(BaseDummyInputsBuilder[KimiAudioProcessingInfo
         waveform = np.zeros(seq_len * SAMPLES_PER_TOKEN, dtype=np.float32)
         item = {
             "waveform": torch.from_numpy(waveform),
-            "whisper_features": torch.empty(0, 128, 3000),
-            "whisper_lengths": torch.empty(0, dtype=torch.long),
+            "use_whisper": bool(self.info.get_hf_config().use_whisper_feature),
         }
-        if self.info.get_hf_config().use_whisper_feature:
-            from vllm.transformers_utils.processor import cached_feature_extractor_from_config
-
-            extractor = cached_feature_extractor_from_config(self.info.ctx.model_config, subfolder="whisper-large-v3")
-            whisper = prepare_whisper_inputs(waveform, extractor, sampling_rate=SAMPLE_RATE)
-            item["whisper_features"] = whisper.input_features
-            item["whisper_lengths"] = torch.tensor(whisper.token_lengths, dtype=torch.long)
         return {"audio": [item] * count}
 
     def get_dummy_processor_inputs(
@@ -112,13 +106,33 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # CPU feature extraction and prompt construction already ran together
-        # in prepare_kimi_audio_inputs. Keep the original per-item tensors.
+        # With processor caching enabled, audios contains only cache misses.
+        # Each item is self-contained; its index need not match the conversation.
+        if mm_kwargs:
+            raise ValueError("Kimi-Audio does not support multimodal processor overrides")
         data: dict[str, Any] = {"input_ids": [self.info.get_tokenizer().encode(prompt, **tok_kwargs)]}
-        audios = cast(list[dict[str, torch.Tensor]], mm_data.get("audios", []))
+        audios = cast(list[dict[str, Any]], mm_data.get("audios", []))
         if audios:
-            for key in ("waveform", "whisper_features", "whisper_lengths"):
-                data[f"kimi_{key}"] = [item[key] for item in audios]
+            data.update(
+                kimi_waveform=[item["waveform"] for item in audios],
+                kimi_whisper_features=[],
+                kimi_whisper_lengths=[],
+            )
+            extractor = None
+            for item in audios:
+                if item["use_whisper"]:
+                    if extractor is None:
+                        from vllm.transformers_utils.processor import cached_feature_extractor_from_config
+
+                        extractor = cached_feature_extractor_from_config(
+                            self.info.ctx.model_config, subfolder="whisper-large-v3"
+                        )
+                    whisper = prepare_whisper_inputs(item["waveform"].numpy(), extractor, sampling_rate=SAMPLE_RATE)
+                    data["kimi_whisper_features"].append(whisper.input_features)
+                    data["kimi_whisper_lengths"].append(torch.tensor(whisper.token_lengths, dtype=torch.long))
+                else:
+                    data["kimi_whisper_features"].append(torch.empty(0, 128, 3000))
+                    data["kimi_whisper_lengths"].append(torch.empty(0, dtype=torch.long))
         return BatchFeature(data)
 
     def _get_mm_fields_config(

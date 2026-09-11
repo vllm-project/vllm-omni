@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Whisper preprocessing used by Kimi-Audio inputs.
+"""Kimi-Audio prompt preparation and processor-side Whisper preprocessing.
 
 Waveforms arrive as mono 16 kHz audio from the framework's media input path.
-The feature extractor is injected; encoder weights and execution stay in the
-model worker. GLM encoding consumes the original waveform separately.
+The multimodal processor supplies the feature extractor; encoder weights and
+execution stay in the model worker. GLM consumes the original waveform.
 """
 
-import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Literal
@@ -78,17 +77,18 @@ def prepare_kimi_audio_inputs(
     *,
     audio_inputs: Mapping[int, np.ndarray] | None = None,
     sampling_rate: int = SAMPLE_RATE,
-    feature_extractor: WhisperFeatureExtractor | None = None,
     output_type: Literal["text", "both"] = "text",
     add_assistant_start_msg: bool = True,
 ) -> "OmniTokensPrompt":
     """Prepare one engine request from messages and framework-resolved audio.
 
+    This is the shared model-side input path for offline and serving callers.
     Audio is keyed by ORIGINAL message index and must already be mono 16 kHz.
-    The CPU builder reserves the exact number of GLM slots from duration; it
-    does not execute encoders. Native multimodal processing schedules audio
-    encoding; AR ``preprocess`` adds the aligned text stream. Resource
-    URLs/paths are never sent to the worker.
+    The CPU builder reserves the exact number of GLM slots from duration.
+    It sends waveforms and their encoding mode to the multimodal processor,
+    which extracts Whisper features within the framework's processor cache.
+    Encoders run in the worker; AR ``preprocess`` adds the aligned text stream.
+    Resource URLs/paths are never sent to the worker.
     """
     from vllm_omni.data_entry_keys import serialize_payload
 
@@ -115,17 +115,11 @@ def prepare_kimi_audio_inputs(
         # Own the samples before entering the native multimodal processor/cache.
         item = {
             "waveform": torch.from_numpy(np.array(waveform, dtype=np.float32, copy=True)),
-            "whisper_features": torch.empty(0, 128, 3000),
-            "whisper_lengths": torch.empty(0, dtype=torch.long),
+            "use_whisper": messages[index]["message_type"] == "audio",
         }
         num_codes = (waveform.size - 1) // SAMPLES_PER_TOKEN + 1
         features = None
-        if messages[index]["message_type"] == "audio":
-            if feature_extractor is None:
-                raise ValueError("Audio messages require the Whisper feature extractor")
-            whisper = prepare_whisper_inputs(waveform, feature_extractor, sampling_rate=sampling_rate)
-            item["whisper_features"] = whisper.input_features
-            item["whisper_lengths"] = torch.tensor(whisper.token_lengths, dtype=torch.long)
+        if item["use_whisper"]:
             # Only the shape is needed to apply the existing message rules.
             # These meta features never enter the request or model execution.
             features = torch.empty(num_codes, prompt_builder.continuous_feature_size, device="meta")
@@ -144,14 +138,11 @@ def prepare_kimi_audio_inputs(
         audio_spans=[[index, start, end] for index, (start, end) in layout.audio_spans.items()],
     )
     # Only the dual-stream layout crosses Omni's request-buffer boundary.
-    # Waveforms/mels use native MM fields, transport and encoder caching.
+    # Waveforms and encoding modes enter native MM processing and caching.
     wire = msgspec.to_builtins(serialize_payload(payload))
     return {
         "prompt_token_ids": layout.audio_token_ids,
         **({"multi_modal_data": {"audio": mm_audio}} if mm_audio else {}),
         "modalities": ["text", "audio"] if output_type == "both" else ["text"],
         "model_intermediate_buffer": {"kimi_audio_input": wire},
-        # Native MM hashes cover audio content. The salt adds text and layout,
-        # which are absent from the scheduler's audio-stream placeholder IDs.
-        "cache_salt": hashlib.sha256(msgspec.msgpack.encode(wire)).hexdigest(),
     }
