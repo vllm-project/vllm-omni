@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.model_executor.stage_input_processors.auk import DUMP_DIR_ENV, encoder2dit
+from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -186,33 +186,3 @@ class TestKnobPropagation:
         knobs = out["additional_information"]["auk"]
         assert knobs["gen_seconds"] is None
         assert knobs["has_audio"] is False
-
-
-class TestDebugDump:
-    def test_off_by_default(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv(DUMP_DIR_ENV, raising=False)
-        encoder2dit([_request_output(_payload(torch.zeros(3, HIDDEN)))], _prompt())
-        assert list(tmp_path.iterdir()) == []
-
-    def test_dump_written_when_set(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv(DUMP_DIR_ENV, str(tmp_path / "dumps"))
-        cond = torch.arange(6, dtype=torch.float32).reshape(3, 2)
-        prompt = _prompt(gen_seconds=4.0)
-        encoder2dit([_request_output(_payload(cond), request_id="req-7")], prompt)
-
-        saved = torch.load(tmp_path / "dumps" / "req-7.pt", weights_only=False)
-        assert torch.equal(saved["text_cond"], cond)
-        assert saved["request_id"] == "req-7"
-        assert saved["prompt"] == prompt["prompt"]
-
-    def test_missing_request_id_still_dumps(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv(DUMP_DIR_ENV, str(tmp_path))
-        encoder2dit([_request_output(_payload(torch.zeros(2, HIDDEN)))], _prompt())
-        assert (tmp_path / "unknown.pt").is_file()
-
-    def test_unwritable_dir_does_not_fail_the_request(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
-        blocker = tmp_path / "blocked"
-        blocker.write_text("not a directory")
-        monkeypatch.setenv(DUMP_DIR_ENV, str(blocker))
-        out = encoder2dit([_request_output(_payload(torch.zeros(2, HIDDEN)))], _prompt())
-        assert out["prompt_embeds"].shape == (2, HIDDEN)

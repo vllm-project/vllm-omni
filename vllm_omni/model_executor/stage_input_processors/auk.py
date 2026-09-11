@@ -4,9 +4,7 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -29,10 +27,6 @@ _FALLBACK_KEYS = ("hidden_states.output", "text_cond")
 # Per-request knobs the prompt carries for stage 1. nfe/cfg/seed are not here:
 # they ride the stage-1 OmniDiffusionSamplingParams instead.
 _AUK_KNOBS = ("gen_seconds", "sway", "t_grid", "vae_sample")
-
-# Set to a directory to save each received condition for the stage-0 fusion
-# parity test. Off unless the variable is set.
-DUMP_DIR_ENV = "AUK_DEBUG_DUMP_DIR"
 
 
 def _as_dict(prompt: Any) -> dict[str, Any]:
@@ -145,7 +139,6 @@ def encoder2dit(
         knobs["has_audio"],
         knobs["gen_seconds"],
     )
-    _maybe_dump(prompt_embeds, getattr(ar_output, "request_id", None), original.get("prompt"))
 
     return {
         "prompt": "",
@@ -153,17 +146,3 @@ def encoder2dit(
         "multi_modal_data": mm_data,
         "additional_information": {"auk": knobs},
     }
-
-
-def _maybe_dump(text_cond: torch.Tensor, request_id: Any, prompt: Any) -> None:
-    """Save the received condition when AUK_DEBUG_DUMP_DIR is set."""
-    dump_dir = os.environ.get(DUMP_DIR_ENV)
-    if not dump_dir:
-        return
-    name = str(request_id) if request_id else "unknown"
-    path = Path(dump_dir)
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        torch.save({"text_cond": text_cond, "request_id": request_id, "prompt": prompt}, path / f"{name}.pt")
-    except OSError:
-        logger.warning("[encoder2dit] could not write the %s dump for request %s", DUMP_DIR_ENV, name)
