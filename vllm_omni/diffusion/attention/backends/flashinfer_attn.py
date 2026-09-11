@@ -194,6 +194,22 @@ class FlashInferAttentionImpl(AttentionImpl):
             raise ValueError(f"Unsupported {option_name}={dtype}; expected one of: {choices}")
         return dtype
 
+    @torch.compiler.disable
+    @staticmethod
+    def _extract_scalar(scalar_tensor: torch.Tensor):
+        return scalar_tensor.item()
+
+    @staticmethod
+    def _per_tensor_quantize(
+        tensor: torch.Tensor,
+        to_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, float]:
+        if torch.finfo(to_dtype).bits == 8:
+            scale_tensor = tensor.abs().amax().float().clamp_min(1e-6) / torch.finfo(to_dtype).max
+            tensor = (tensor * torch.reciprocal(scale_tensor).to(tensor.dtype)).to(to_dtype)
+            return tensor, FlashInferAttentionImpl._extract_scalar(scale_tensor)
+        return tensor.to(to_dtype), 1.0
+
     @staticmethod
     def _pack_mask_for_flashinfer(
         attn_mask: torch.Tensor, batch_size: int, qo_len: int, kv_len: int
@@ -311,11 +327,9 @@ class FlashInferAttentionImpl(AttentionImpl):
         q = query.reshape(batch_size * qo_len, num_q_heads, head_dim_qk)
         k = key.reshape(batch_size * kv_len, num_kv_heads, head_dim_k)
         v = value.reshape(batch_size * kv_len, num_kv_heads, head_dim_vo)
-        if self.dtype_qk is not None:
-            q = q.to(self.dtype_qk)
-            k = k.to(self.dtype_qk)
-        if self.dtype_vo is not None:
-            v = v.to(self.dtype_vo)
+        q, q_scale = self._per_tensor_quantize(q, self.dtype_qk or q.dtype)
+        k, k_scale = self._per_tensor_quantize(k, self.dtype_qk or k.dtype)
+        v, v_scale = self._per_tensor_quantize(v, self.dtype_vo or v.dtype)
 
         flat_mask = None
         if custom_mask is not None:
@@ -343,7 +357,7 @@ class FlashInferAttentionImpl(AttentionImpl):
             ),
             flat_mask,
         )
-        out = self._run_wrapper(q, k, v)
+        out = self._run_wrapper(q, k, v, q_scale, k_scale, v_scale)
         out = out.reshape(batch_size, qo_len, num_q_heads, head_dim_vo)
         return out.to(query.dtype) if out.dtype != query.dtype else out
 
@@ -353,8 +367,28 @@ class FlashInferAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        q_scale: float,
+        k_scale: float,
+        v_scale: float,
     ) -> torch.Tensor:
-        return self._wrapper.run(query, key, value)
+        try:
+            return self._wrapper.run(
+                query,
+                key,
+                value,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        except NotImplementedError as _:
+            # Older FlashInfer does not route scales for CuTeDSL backends.
+            # Apply some scales manually.
+            if q_scale != 1.0 or k_scale != 1.0:
+                raise NotImplementedError("FlashInfer/CuTeDSL backend doesn't support quantizing QK into FP8 yet.")
+            out = self._wrapper.run(query, key, value)
+            if v_scale is not None and v_scale != 1.0:
+                out = out * v_scale
+            return out
 
     def _sdpa_for_unsupported_mask(
         self,
