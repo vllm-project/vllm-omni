@@ -278,9 +278,7 @@ class BatchedToken2Wav(nn.Module):
         # chunk up to a multiple of this many frames so the graph cache key
         # space stays small (0 disables bucketing, e.g. when graphs are off).
         self._cfm_graph_bucket_frames = (
-            int(cfm_graph_cfg.get("bucket_frames", 0))
-            if self._cfm_graph_wrapper is not None
-            else 0
+            int(cfm_graph_cfg.get("bucket_frames", 0)) if self._cfm_graph_wrapper is not None else 0
         )
         if self._cfm_graph_bucket_frames > 1:
             logger.info(

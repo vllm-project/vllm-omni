@@ -20,15 +20,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_pads_partial_chunk_up_to_bucket():
     # 50 frames on a 16-frame grid -> 14 padding frames.
-    assert _cfm_pad_frames(
-        mel_frames=50, offset=0, noise_capacity=1000, bucket_frames=16, ragged=False
-    ) == 14
+    assert _cfm_pad_frames(mel_frames=50, offset=0, noise_capacity=1000, bucket_frames=16, ragged=False) == 14
 
 
 def test_aligned_chunk_needs_no_padding():
-    assert _cfm_pad_frames(
-        mel_frames=64, offset=0, noise_capacity=1000, bucket_frames=16, ragged=False
-    ) == 0
+    assert _cfm_pad_frames(mel_frames=64, offset=0, noise_capacity=1000, bucket_frames=16, ragged=False) == 0
 
 
 def test_ragged_valid_lengths_path_disables_bucketing():
@@ -69,22 +65,14 @@ def test_padding_never_overflows_noise_buffer():
     its width would crash. Bucketing is best-effort, never required.
     """
     # 96 frames + 16 pad = 112 > 100 capacity -> give up, pad 0.
-    assert _cfm_pad_frames(
-        mel_frames=96, offset=0, noise_capacity=100, bucket_frames=16, ragged=False
-    ) == 0
+    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=16, ragged=False) == 0
     # Same mel length fits when un-padded: 96 <= 100.
-    assert _cfm_pad_frames(
-        mel_frames=96, offset=0, noise_capacity=100, bucket_frames=1, ragged=False
-    ) == 0
+    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=1, ragged=False) == 0
     # Cache offset eats into the capacity: 64 + 0 pad would fit, 64 + 48 pad
     # would not, so the pad must be dropped.
-    assert _cfm_pad_frames(
-        mel_frames=64, offset=50, noise_capacity=110, bucket_frames=16, ragged=False
-    ) == 0
+    assert _cfm_pad_frames(mel_frames=64, offset=50, noise_capacity=110, bucket_frames=16, ragged=False) == 0
 
 
 def test_padding_applies_with_cache_offset_when_it_fits():
     # offset 50 + mel 50 + pad 14 = 114 <= 200 -> pad stands.
-    assert _cfm_pad_frames(
-        mel_frames=50, offset=50, noise_capacity=200, bucket_frames=16, ragged=False
-    ) == 14
+    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=200, bucket_frames=16, ragged=False) == 14

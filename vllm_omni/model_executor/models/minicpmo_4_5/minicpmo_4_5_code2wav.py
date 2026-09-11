@@ -61,9 +61,7 @@ _REF_TARGET_SAMPLE_RATE = 24000
 _REF_MAX_SECONDS = 6.0
 
 
-def _normalize_reference(
-    ref_audio: Any, sample_rate_hz: int
-) -> tuple[torch.Tensor, int]:
+def _normalize_reference(ref_audio: Any, sample_rate_hz: int) -> tuple[torch.Tensor, int]:
     """Normalize a per-request reference waveform onto a shared grid.
 
     MiniCPM-o streaming uses the reference-audio length as the CFM attention
