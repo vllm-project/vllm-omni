@@ -34,7 +34,7 @@ def test_realtime_state_owner_uses_explicit_bindings_not_dynamic_attribute_proxy
 
 class _ProtocolWebSocket:
     def __init__(self, *events: dict[str, object]) -> None:
-        self._events = asyncio.Queue()
+        self._events: asyncio.Queue[str] = asyncio.Queue()
         for event in events:
             self._events.put_nowait(json.dumps(event))
 
@@ -506,6 +506,8 @@ def test_duplex_capabilities_do_not_claim_core_kv_or_input_append():
 
 
 def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
+    from vllm_omni.engine.kv_append import scheduler_native_append_available
+
     caps = minicpmo45_native_capabilities(max_sessions=2).as_dict()
 
     assert caps["implementation_level"] == "model_native_duplex"
@@ -518,7 +520,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_kv_lease"] is False
     assert caps["supports_core_kv_lease"] is False
     assert caps["supports_stage_resumption"] is True
-    assert caps["supports_scheduler_native_append"] is False
+    assert caps["supports_scheduler_native_append"] is scheduler_native_append_available()
     assert caps["supports_core_resumable_request"] is True
     assert caps["supports_stage_connector_handoff"] is True
     assert caps["supports_audio_truncate"] is True

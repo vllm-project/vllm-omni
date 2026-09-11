@@ -45,8 +45,8 @@ duplex_runtime_extension = "..."
 duplex_serving_adapter = "..."
 ```
 
-The adapter must supply a real scheduler data plane, not just endpoint
-capabilities.
+The implemented Stage0 runtime now supplies those inputs through the real
+scheduler data plane. Endpoint capability flags alone would not provide it.
 
 ## Supported scope
 

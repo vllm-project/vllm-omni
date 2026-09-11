@@ -57,7 +57,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     merge_runtime_info,
     require_request_id,
 )
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import ModelInputError, OmniOutput
 
 logger = init_logger(__name__)
 
@@ -628,7 +628,19 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("Nemotron VoiceChat duplex runtime token metadata is incomplete") from exc
 
+        append_start = duplex.get("kv_append_start")
+        computed = info.get("_omni_num_computed_tokens")
+        if isinstance(append_start, int) and isinstance(computed, int) and computed < append_start:
+            # The current frame cannot reconstruct the preceding fused
+            # embeddings or Conformer/Mamba timeline after preemption.
+            raise ModelInputError(
+                "native_duplex_recompute_unsupported: Nemotron VoiceChat cannot replay historical frame state"
+            )
         session = self._sessions.get(request_id)
+        if session is None and source_input_seq > 1:
+            raise ModelInputError(
+                "native_duplex_recompute_unsupported: Nemotron VoiceChat continuation has no retained model state"
+            )
         if session is None:
             prompt_ids_raw = runtime_config.get("nvc_prompt_token_ids")
             if not isinstance(prompt_ids_raw, list | tuple) or not prompt_ids_raw:

@@ -48,7 +48,9 @@ The current unified-runtime integrations are:
 - MiniCPM-o 4.5, using `vllm_omni/deploy/minicpmo_4_5.yaml`
   (`session_mode: duplex`);
 - PersonaPlex, whose default `vllm_omni/deploy/personaplex.yaml` enables duplex;
-- Nemotron VoiceChat, via its registered duplex plugin package.
+- Nemotron VoiceChat, via its registered duplex plugin package;
+- [Gander Unit8 dialogue and tool/context inputs](gander.md), reusing the MiniCPM-o 4.5 pipeline
+  with `vllm_omni/deploy/gander.yaml`.
 
 JoyVL is a separate HTTP interaction orchestrator and does not use these
 WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).
@@ -92,6 +94,14 @@ A typical `/v1/realtime?duplex=1` session follows this lifecycle:
    playback acknowledgement support.
 7. Send `session.close` and wait for `session.closed`.
 
+For `response_lifecycle=continuous_stream` (Nemotron), a model EOS only ends
+an utterance transcript. Keep supplying audio, including trailing silence
+for file input, then send `session.close`. Do not wait for `response.done`
+before closing: normal close first drains accepted text/audio frames, emits
+`completed` with reason `stream_drained`, and then sends `session.end` and
+`session.closed`. Explicit cancel remains a cancellation. See the
+[official alignment report](../validation/nemotron_official_alignment_20260907.md).
+
 Unlike the turn-based realtime endpoint, input may continue while a response
 is active. The server can emit `overlap.decision` to describe whether input was
 deferred, treated as a short acknowledgement, or used to interrupt output.
@@ -107,6 +117,49 @@ For example, PersonaPlex supports native overlapping speech but currently
 advertises `supports_barge_in=false`; destructive output interruption and
 model-state rewind have not been validated for that integration. Capacity and
 session-resume behavior also depend on the selected deployment configuration.
+
+## Connection recovery and retained state
+
+When `supports_session_resume` is advertised, a replacement connection sends
+`session.resume` with `session_id`, `incarnation`, the last delivered
+`resume_token`, and `last_received_server_event_seq`. The server serializes
+lease changes for that session, revokes the old attachment, sends
+`session.resumed`, and replays retained events before sending new live events.
+If activation is cancelled or its delivery fails, the last accepted credential
+remains usable for recovery while detached; a successful recovery revokes it.
+The failed handshake also restores the engine's detached lease state before a
+retry, so disconnect grace still applies. Cancelling before takeover does not
+detach an old connection that is still live.
+An expired session cannot be restored this way.
+
+The deploy-only setting `duplex_session.attachment_io_timeout_s` defaults to
+`5.0` seconds and must be finite and positive. It bounds the whole resume
+activation/replay phase, and each terminal notification/close attempt; clients
+cannot override it through session payloads. Ordinary live output preserves
+transport backpressure, but a takeover or close can revoke its blocked send.
+Terminal notifications are best-effort: an expired session's resource cleanup
+does not wait for notification delivery, and one session's cleanup does not
+serialize another's. A temporary disconnection still uses `disconnect_grace_s`;
+it does not immediately destroy the retained runtime session or KV.
+
+The replay journal stores immutable serialized event snapshots. Its byte budget
+is computed from those snapshots, so later transcript updates cannot change an
+earlier event or its retained-byte accounting.
+
+The standard WebSocket transport sends these encoded snapshots as text frames
+without decoding and encoding them again. Dictionary-only transport callbacks
+remain supported. On Python 3.12+, nonblocking sends can complete in an isolated
+eager task when the event loop has no custom task factory; other environments
+use the scheduled path. Inline bursts yield every 32 sends so control tasks can
+still run. Blocking sends retain cancellation/revocation and ordering guarantees.
+
+On response completion, the Realtime projector releases its text/transcript
+assembly state and keeps at most 256 recent terminal IDs. On the serving path,
+only `response.created` admits a response; late deltas cannot recreate a retired
+response, even after its terminal ID leaves this cache. The completed
+conversation item remains the owner of history and audio-to-text truncation
+marks until the item is deleted or the session ends. This cleanup does not
+silently evict conversation history, summarize context, or compact model KV.
 
 ## Native Protocol
 

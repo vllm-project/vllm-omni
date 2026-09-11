@@ -356,12 +356,14 @@ class AsyncOmni(EngineClient, OmniBase):
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        context: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Send a turn/control signal to an engine-level duplex session."""
         return await self._get_duplex_request_client().signal(
             session_id,
             event=event,
+            **({"context": context} if context is not None else {}),
             fence=fence,
             next_fence=next_fence,
             session_config=session_config,

@@ -39,9 +39,14 @@ class NemotronVoiceChatDataPlaneContext:
 
 @dataclass(slots=True)
 class _RequestState:
+    accepted_frames: int = 0
     text_frames: int = 0
     audio_frames: int = 0
-    pending_speech_end_frames: list[int] = field(default_factory=list)
+    delivered_text_frames: int = 0
+    delivered_audio_frames: int = 0
+    utterance_text: list[str] = field(default_factory=list)
+    previous_utterance_nonempty: bool = False
+    separator_pending: bool = False
     function_active: bool = False
     function_tokens: list[int] = field(default_factory=list)
     function_call_id: str | None = None
@@ -127,16 +132,6 @@ def _audio_samples(audio: object | None) -> int:
         return 0
 
 
-def _speech_end_event(request_id: str) -> dict[str, object]:
-    return {
-        "stage_role": "tts",
-        "is_listen": False,
-        "data_plane_request_id": request_id,
-        "text": "",
-        "end_of_turn": True,
-    }
-
-
 class NemotronVoiceChatDataPlaneSession:
     """Join frame-locked text/function outputs with Stage-2 audio."""
 
@@ -168,6 +163,30 @@ class NemotronVoiceChatDataPlaneSession:
 
     def begin_request(self, request_id: str) -> None:
         self._requests.setdefault(request_id, _RequestState()).terminal = False
+
+    def note_accepted_input(self, request_id: str, sequence: int) -> None:
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise ValueError("continuous stream append requires a positive engine sequence")
+        state = self._requests.setdefault(request_id, _RequestState())
+        # A correlated retry may return the same committed receipt again.
+        state.accepted_frames = max(state.accepted_frames, sequence)
+
+    def mark_outputs_delivered(self, request_id: str) -> None:
+        state = self._requests[request_id]
+        state.delivered_text_frames = state.text_frames
+        state.delivered_audio_frames = state.audio_frames
+
+    def drain_status(self, request_id: str) -> dict[str, int | bool]:
+        state = self._requests[request_id]
+        expected = state.accepted_frames
+        if state.delivered_text_frames > expected or state.delivered_audio_frames > expected:
+            raise RuntimeError("continuous stream produced more frames than accepted input")
+        return {
+            "accepted_frames": expected,
+            "text_frames": state.delivered_text_frames,
+            "audio_frames": state.delivered_audio_frames,
+            "drained": expected == state.delivered_text_frames == state.delivered_audio_frames,
+        }
 
     def is_terminal(self, request_id: str | None) -> bool:
         return bool(request_id and self._requests.get(request_id) and self._requests[request_id].terminal)
@@ -244,10 +263,16 @@ class NemotronVoiceChatDataPlaneSession:
             for token_id in text_ids[-1:]:
                 state.text_frames += 1
                 if token_id == ids["eos"]:
-                    if state.audio_frames >= state.text_frames:
-                        yield _speech_end_event(request_id)
-                    else:
-                        state.pending_speech_end_frames.append(state.text_frames)
+                    transcript = "".join(state.utterance_text)
+                    yield {
+                        "data_plane_request_id": request_id,
+                        "transcript_done": True,
+                        "transcript": transcript,
+                    }
+                    state.previous_utterance_nonempty = bool(transcript.strip())
+                    state.utterance_text.clear()
+                elif token_id == ids["bos"]:
+                    state.separator_pending = state.previous_utterance_nonempty
                 elif token_id == ids["pad"]:
                     yield {
                         "stage_role": "llm",
@@ -259,7 +284,13 @@ class NemotronVoiceChatDataPlaneSession:
                     }
                 elif token_id != ids["bos"] and wants_text:
                     text = self._decode([token_id])
+                    if state.separator_pending:
+                        text = text.lstrip()
+                        if text:
+                            text = " " + text
+                            state.separator_pending = False
                     if text:
+                        state.utterance_text.append(text)
                         yield {
                             "stage_role": "llm",
                             "is_listen": False,
@@ -280,38 +311,34 @@ class NemotronVoiceChatDataPlaneSession:
         audio = _audio_value(metadata)
         sample_rate = _sample_rate(metadata)
         sample_count = _audio_samples(audio)
-        encoded = (
-            self._encode_audio(audio, sample_rate, context.response_format, context.speed)
-            if wants_audio and audio is not None
-            else None
-        )
-        audio_chunk_complete = sample_count > 0
-        if audio_chunk_complete:
-            # A native-duplex Stage-2 segment can contain one or more 80 ms
-            # codec frames.  Count them against the frame-locked Stage-0 text
-            # channel. The long-lived codec request deliberately keeps
-            # ``finished=False`` across scheduler wakes; a non-empty decoded
-            # chunk, not request lifetime, is the audio-coverage signal.
-            duration_ms = sample_count * 1000 / max(1, sample_rate)
-            state.audio_frames += max(1, round(duration_ms / 80))
-        end_of_turn = bool(state.pending_speech_end_frames) and state.audio_frames >= state.pending_speech_end_frames[0]
-        if encoded:
-            yield {
-                "stage_role": "tts",
-                "is_listen": False,
-                "data_plane_request_id": request_id,
-                "text": "",
-                "audio_data": encoded,
-                "audio_format": context.response_format,
-                "sample_rate_hz": sample_rate,
-                "audio_duration_ms": round(sample_count * 1000 / max(1, sample_rate)),
-                "audio_text_mark": True,
-                "end_of_turn": end_of_turn,
-            }
-        elif end_of_turn:
-            yield _speech_end_event(request_id)
-        if end_of_turn:
-            state.pending_speech_end_frames.pop(0)
+        if sample_count <= 0:
+            return
+        frame_samples = sample_rate * 80 // 1000
+        if frame_samples <= 0 or sample_count % frame_samples:
+            raise ValueError("Nemotron VoiceChat codec output must contain complete 80ms frames")
+        flat_audio = audio.reshape(-1) if isinstance(audio, torch.Tensor) else np.asarray(audio).reshape(-1)
+        for start in range(0, sample_count, frame_samples):
+            state.audio_frames += 1
+            encoded = (
+                self._encode_audio(
+                    flat_audio[start : start + frame_samples], sample_rate, context.response_format, context.speed
+                )
+                if wants_audio
+                else None
+            )
+            if encoded:
+                yield {
+                    "stage_role": "tts",
+                    "is_listen": False,
+                    "data_plane_request_id": request_id,
+                    "text": "",
+                    "audio_data": encoded,
+                    "audio_format": context.response_format,
+                    "sample_rate_hz": sample_rate,
+                    "audio_duration_ms": 80,
+                    "audio_text_mark": True,
+                    "end_of_turn": False,
+                }
 
     def _project_function_token(
         self,

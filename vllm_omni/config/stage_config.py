@@ -403,6 +403,12 @@ class StageDeployConfig:
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
+    # A pipeline-level default is available for compatibility, but a bounded
+    # connector admission window must have a single owner in a multi-stage
+    # streaming pipeline.  Per-stage override (including an explicit zero)
+    # lets downstream receivers poll every stream selected by that owner
+    # instead of creating an independent, potentially disjoint active set.
+    active_stream_window: int | None = None
 
     # Generic execution, scheduling, and KV/cache behavior.
     enforce_eager: bool | None = None
@@ -507,9 +513,14 @@ class DuplexSessionRuntimeConfig:
     reaper_interval_s: float = 5.0
     resume_replay_ttl_s: float = 60.0
     resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
+    attachment_io_timeout_s: float = 5.0
     max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
     max_pending_turns_per_session: int = 4
+    max_pending_appends_per_session: int = 4
     max_sessions: int = 1
+    max_pending_session_opens: int = 0
+    session_open_queue_timeout_s: float = 30.0
+    session_open_aging_quantum_s: float = 1.0
     completed_append_cache_size: int = 256
     server_vad_model_path: str | None = None
     # Startup warmup: run this many silent 80 ms-style frames through a
@@ -517,8 +528,21 @@ class DuplexSessionRuntimeConfig:
     # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
     # never land on the first user. 0 disables the warmup.
     warmup_frames: int = 0
+    # Engine-owned prompt replay retained for scheduler-KV rebuild after a
+    # recoverable replica loss or a planned context rollover.  Both dimensions
+    # are hard bounds: token count protects rebuild latency/KV, while bytes
+    # protects host memory for audio/video payloads.
+    kv_recovery_max_replay_tokens_per_session: int = 8192
+    kv_recovery_max_replay_bytes_per_session: int = 64 * 1024 * 1024
+    # Start a planned rebuild before the scheduler's hard context ceiling and
+    # retain only the newest complete append units.  Zero disables automatic
+    # rollover without weakening the scheduler's hard limit.
+    kv_rollover_trigger_fraction: float = 0.8
+    kv_rollover_retain_tokens: int = 4096
 
     def __post_init__(self) -> None:
+        if not 0 < self.attachment_io_timeout_s < float("inf"):
+            raise ValueError("duplex_session.attachment_io_timeout_s must be finite and positive")
         positive = {
             "disconnect_grace_s": self.disconnect_grace_s,
             "reaper_interval_s": self.reaper_interval_s,
@@ -526,8 +550,12 @@ class DuplexSessionRuntimeConfig:
             "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
             "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
             "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_pending_appends_per_session": self.max_pending_appends_per_session,
             "max_sessions": self.max_sessions,
             "completed_append_cache_size": self.completed_append_cache_size,
+            "kv_recovery_max_replay_tokens_per_session": self.kv_recovery_max_replay_tokens_per_session,
+            "kv_recovery_max_replay_bytes_per_session": self.kv_recovery_max_replay_bytes_per_session,
+            "kv_rollover_retain_tokens": self.kv_rollover_retain_tokens,
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
@@ -535,9 +563,22 @@ class DuplexSessionRuntimeConfig:
             not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
         ):
             raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
+        if self.max_pending_session_opens < 0:
+            raise ValueError("duplex_session.max_pending_session_opens must be non-negative")
+        if self.session_open_queue_timeout_s <= 0 or self.session_open_aging_quantum_s <= 0:
+            raise ValueError("duplex_session open queue timing values must be positive")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
+        if not 0 <= self.kv_rollover_trigger_fraction < 1:
+            raise ValueError("duplex_session.kv_rollover_trigger_fraction must be in [0, 1)")
+        if self.kv_rollover_trigger_fraction > 0 and (
+            self.kv_rollover_retain_tokens >= self.kv_recovery_max_replay_tokens_per_session
+        ):
+            raise ValueError(
+                "duplex_session.kv_rollover_retain_tokens must be smaller than "
+                "kv_recovery_max_replay_tokens_per_session when rollover is enabled"
+            )
 
 
 @dataclass
@@ -1147,6 +1188,21 @@ class StageConfig:
                     engine_args[key] = _get_recursively_merged_dict(existing, value)
                 else:
                     engine_args[key] = value
+
+        # Legacy CLI overlays arrive after merge_pipeline_deploy selected the
+        # built-in AR scheduler. Keep the class and engine mode in lockstep:
+        # an async engine paired with the sync scheduler has no lookahead
+        # placeholder accounting. Explicit/custom scheduler choices retain
+        # ownership of their own compatibility contract.
+        if (
+            self.worker_type == "ar"
+            and isinstance(runtime_overrides.get("async_scheduling"), bool)
+            and runtime_overrides.get("scheduler_cls") is None
+            and self.scheduler_cls in (_scheduler_path(OmniARScheduler), _scheduler_path(OmniARAsyncScheduler))
+        ):
+            engine_args["scheduler_cls"] = _scheduler_path(
+                OmniARAsyncScheduler if engine_args["async_scheduling"] else OmniARScheduler
+            )
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

@@ -1350,12 +1350,14 @@ class AsyncOmniEngine:
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        context: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Signal an engine-level duplex turn."""
         return self._get_duplex_control_client().signal(
             session_id,
             event=event,
+            **({"context": context} if context is not None else {}),
             fence=fence,
             next_fence=next_fence,
             session_config=session_config,
@@ -1372,6 +1374,7 @@ class AsyncOmniEngine:
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        context: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Async wrapper for signaling a duplex turn."""
@@ -1381,6 +1384,7 @@ class AsyncOmniEngine:
             lambda: self.signal_duplex_turn(
                 session_id,
                 event=event,
+                **({"context": context} if context is not None else {}),
                 fence=fence,
                 next_fence=next_fence,
                 session_config=session_config,

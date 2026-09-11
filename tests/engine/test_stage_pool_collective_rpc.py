@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for StagePool.collective_rpc EngineCore control dispatch."""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,7 +17,9 @@ from vllm_omni.engine.stage_pool import StagePool
 pytestmark = [pytest.mark.core_model]
 
 
-def _make_pool(*, stage_type: str = "llm", **client_methods: AsyncMock) -> tuple[StagePool, SimpleNamespace]:
+def _make_pool(
+    *, stage_type: str = "llm", **client_methods: Callable[..., Awaitable[object]]
+) -> tuple[StagePool, SimpleNamespace]:
     client = SimpleNamespace(stage_type=stage_type, **client_methods)
     if "collective_rpc_async" not in client_methods:
         client.collective_rpc_async = AsyncMock(return_value={"via": "collective"})
@@ -87,6 +93,46 @@ def test_collective_rpc_non_control_method_still_returns_error_dict():
         result = await pool.collective_rpc(0, "reset_prefix_cache")
         assert result["supported"] is False
         assert "probe failed" in result["error"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_streaming_prompt_prefill_rejects_not_found(mocker):
+    async def run() -> None:
+        get_metrics = mocker.AsyncMock(
+            return_value={
+                "status": "NOT_FOUND",
+                "num_prompt_tokens": 0,
+                "num_computed_tokens": 0,
+                "is_finished": True,
+                "omni_request_found": False,
+            }
+        )
+        client = SimpleNamespace(get_streaming_prompt_metrics_async=get_metrics)
+
+        with pytest.raises(KeyError, match="streaming prompt request not found: closed-request"):
+            await StagePool._wait_for_streaming_prompt_prefill(client, "closed-request")
+        get_metrics.assert_awaited_once_with("closed-request")
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_streaming_prompt_initial_ack_waits_for_the_full_prompt(mocker):
+    async def run() -> None:
+        get_metrics = mocker.AsyncMock(
+            side_effect=[
+                {"status": "RUNNING", "num_prompt_tokens": 3, "num_computed_tokens": computed} for computed in (1, 2, 3)
+            ]
+        )
+        client = SimpleNamespace(get_streaming_prompt_metrics_async=get_metrics)
+
+        result = await StagePool._wait_for_streaming_prompt_prefill(client, "request-1")
+
+        assert result["num_computed_tokens"] == result["num_prompt_tokens"] == 3
+        assert get_metrics.await_count == 3
+        assert all(call.args == ("request-1",) for call in get_metrics.await_args_list)
 
     asyncio.run(run())
 

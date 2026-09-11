@@ -43,6 +43,9 @@ def _positive_int(value: object, *, name: str) -> int:
 class NemotronVoiceChatDuplexRuntimeExtension:
     """Append one 80 ms acoustic frame to one resumable thinker request."""
 
+    adapter_id = "nemotron_voicechat"
+    runtime_extension_id = "nemotron_voicechat"
+
     def configure_sampling_params(
         self,
         *,

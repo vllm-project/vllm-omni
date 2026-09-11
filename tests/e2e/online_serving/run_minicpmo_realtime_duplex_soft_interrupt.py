@@ -226,6 +226,7 @@ def summarize_artifacts(
     min_responses: int,
     min_audio_deltas_per_response: int,
     expect_followup_response_substring: str | None,
+    require_model_interrupt: bool = False,
 ) -> dict[str, object]:
     if validation_mode not in {"model-policy", "response-required"}:
         raise ValueError(f"unsupported validation mode: {validation_mode}")
@@ -329,6 +330,18 @@ def summarize_artifacts(
         and isinstance(event.get("response"), dict)
         and event["response"].get("status") == "cancelled"
     )
+    model_interrupt_count = sum(
+        bool(
+            event.get("type") == "response.listen"
+            and isinstance(response := event.get("response"), dict)
+            and isinstance(metadata := response.get("metadata"), dict)
+            and metadata.get("reason") == "model_interrupt"
+        )
+        for event in events
+    )
+    cancellation_ok = (
+        cancelled_count >= 1 and model_interrupt_count >= 1 if require_model_interrupt else cancelled_count == 0
+    )
     result_ok = result.get("ok") is True
     # response-required keeps the full listen sandwich around commit. model-policy
     # only requires a completed audio response that started before final commit:
@@ -341,7 +354,7 @@ def summarize_artifacts(
     common_contract_ok = bool(
         result_ok
         and not error_events
-        and cancelled_count == 0
+        and cancellation_ok
         and enough_responses
         and response_lifecycle_ok
         and multi_delta_ok
@@ -354,6 +367,7 @@ def summarize_artifacts(
         and listen_before_first_response
         and listen_after_last_done
         and followup_response_transcript_ok
+        and (not require_model_interrupt or followup_response_transcript_expectation_ok)
     )
     ok = common_contract_ok and mode_contract_ok
     return {
@@ -384,6 +398,9 @@ def summarize_artifacts(
         "followup_response_transcript_expectation_ok": followup_response_transcript_expectation_ok,
         "error_count": len(error_events),
         "cancelled_count": cancelled_count,
+        "require_model_interrupt": require_model_interrupt,
+        "model_interrupt_count": model_interrupt_count,
+        "cancellation_ok": cancellation_ok,
         "compact_sequence": _compact_sequence(events),
         "output_dir": str(output_dir),
     }
@@ -454,6 +471,7 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         min_responses=args.min_responses,
         min_audio_deltas_per_response=args.min_audio_deltas_per_response,
         expect_followup_response_substring=args.expect_followup_response_substring,
+        require_model_interrupt=getattr(args, "require_model_interrupt", False),
     )
     summary.update(
         {
@@ -496,6 +514,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
+    parser.add_argument("--require-model-interrupt", action="store_true")
     parser.add_argument("--input-sha256")
     parser.add_argument("--expect-followup-response-substring")
     args = parser.parse_args()

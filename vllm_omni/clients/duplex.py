@@ -1041,6 +1041,11 @@ class DuplexClient:
             if self._last_server_event_seq is not None and seq <= self._last_server_event_seq:
                 return  # duplicate delivered by resume replay
             self._last_server_event_seq = seq
+        if data.get("type") in {"input.context.replaced", "duplex.input.context.replaced"}:
+            state = data.get("event", data)
+            if isinstance(state, dict) and isinstance(state.get("epoch"), int):
+                self.session_info["epoch"] = state["epoch"]
+                self.session_info["context_version"] = state.get("context_version", 0)
         event = wrap_event(data)
 
         if isinstance(event, SessionResumed):

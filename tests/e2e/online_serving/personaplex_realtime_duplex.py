@@ -50,7 +50,7 @@ class RawRealtimeProbe:
         self.url = url
         self.max_size = max_size
         self.events = EventCollector()
-        self._ws = None
+        self._ws: websockets.ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> RawRealtimeProbe:
@@ -69,6 +69,7 @@ class RawRealtimeProbe:
                 pass
 
     async def _read_events(self) -> None:
+        assert self._ws is not None
         try:
             while True:
                 raw = await self._ws.recv()
@@ -81,6 +82,7 @@ class RawRealtimeProbe:
             return
 
     async def send(self, event: dict[str, object]) -> None:
+        assert self._ws is not None
         await self._ws.send(json.dumps(event))
 
 
@@ -183,6 +185,28 @@ async def _close_session(client: RawRealtimeProbe, *, timeout_s: float) -> None:
         timeout_s=timeout_s,
         label="session.closed",
     )
+    completed = _events(client, "response.done")
+    if len(completed) != 1:
+        raise AssertionError(f"expected one completed continuous response: {completed}")
+    response = completed[0].get("response", {})
+    assert isinstance(response, dict)
+    status_details = response.get("status_details", {})
+    assert isinstance(status_details, dict)
+    if response.get("status") != "completed" or status_details.get("reason") != "stream_drained":
+        raise AssertionError(f"close did not drain the stream: {completed}")
+    ends = _events(client, "session.end")
+    if len(ends) != 1:
+        raise AssertionError(f"close omitted delivery accounting: {ends}")
+    stats = ends[0]["stats"]
+    assert isinstance(stats, dict) and stats.get("drained") is True
+    actual_frames = len(client.events.audio_bytes()) // (2 * FRAME_SAMPLES)
+    if (
+        stats.get("audio_frames") != actual_frames
+        or stats.get("expected_audio_frames") != actual_frames
+        or stats.get("accepted_frames") != actual_frames + 1
+        or stats.get("model_delay_frames") != 1
+    ):
+        raise AssertionError(f"close accounting disagrees with received audio: {actual_frames=}, {stats=}")
     await client.__aexit__(None, None, None)
 
 
@@ -244,7 +268,7 @@ def _audio_frame_stats(
 def _response_ids(client: RawRealtimeProbe) -> set[str]:
     return {
         str(event["response_id"])
-        for event in _events(client, "response.output_audio.delta")
+        for event in _events(client, "response.audio.delta")
         if isinstance(event.get("response_id"), str)
     }
 
@@ -267,9 +291,9 @@ def _session_result(
     if not np.isfinite(pcm).all() or rms <= 1e-5:
         raise AssertionError(f"output audio is non-finite or silent: samples={pcm.size}, rms={rms}")
     rates = {
-        int(event["sample_rate_hz"])
-        for event in _events(client, "response.output_audio.delta")
-        if isinstance(event.get("sample_rate_hz"), int)
+        rate
+        for event in _events(client, "response.audio.delta")
+        if isinstance((rate := event.get("sample_rate_hz")), int)
     }
     if rates != {SAMPLE_RATE_HZ}:
         raise AssertionError(f"unexpected output sample rates: {sorted(rates)}")
@@ -289,7 +313,7 @@ def _session_result(
         )
     runtime_metadata = [
         metadata["vllm_omni"]
-        for event in _events(client, "response.output_audio.delta")
+        for event in _events(client, "response.audio.delta")
         if isinstance((metadata := event.get("metadata")), dict) and isinstance(metadata.get("vllm_omni"), dict)
     ]
     if not any(
@@ -408,8 +432,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     )
     if primary_response_ids & secondary_response_ids:
         raise AssertionError("concurrent sessions shared a response id")
-    _save(output_dir, "primary", primary, primary_audio)
     await _close_session(primary, timeout_s=args.timeout_s)
+    _save(output_dir, "primary", primary, primary.events.audio_bytes())
 
     replacement, replacement_created = await _open_session(
         args,
@@ -458,12 +482,12 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         raise AssertionError("survivor response changed while another session slot was recycled")
     if replacement_response_ids & (primary_response_ids | secondary_response_ids):
         raise AssertionError("replacement session reused another session's response id")
-    _save(output_dir, "secondary", secondary, secondary_audio)
-    _save(output_dir, "replacement", replacement, replacement_audio)
     await asyncio.gather(
         _close_session(secondary, timeout_s=args.timeout_s),
         _close_session(replacement, timeout_s=args.timeout_s),
     )
+    _save(output_dir, "secondary", secondary, secondary.events.audio_bytes())
+    _save(output_dir, "replacement", replacement, replacement.events.audio_bytes())
 
     errors = primary.events.errors() + secondary.events.errors() + replacement.events.errors()
     result = {
@@ -513,10 +537,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-frame-deficit",
         type=int,
-        default=4,
+        default=1,
         help=(
-            "Maximum unflushed tail frames. PersonaPlex Code2Wav emits five-frame "
-            "chunks, so a session cutoff can leave at most four pending frames."
+            "Maximum model-delay frames: cb1..7 require one successor prediction. "
+            "No fully generated frames may remain buffered on close."
         ),
     )
     parser.add_argument("--voiced-frame-rms-threshold", type=float, default=1e-3)

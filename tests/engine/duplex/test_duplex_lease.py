@@ -13,7 +13,10 @@ from vllm_omni.engine.duplex.lease import (
 )
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.runtime import DuplexInputMode
-from vllm_omni.engine.duplex.session import DuplexSessionRuntimeManager
+from vllm_omni.engine.duplex.session import (
+    DuplexSessionRuntimeManager,
+    duplex_append_fingerprint,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -34,6 +37,21 @@ def _lease_config(*, idle_ttl_s: float | None = 300.0) -> DuplexLeaseConfig:
         idle_ttl_s=idle_ttl_s,
         disconnect_grace_s=30.0,
     )
+
+
+@pytest.mark.parametrize("retained", [4, 5])
+def test_session_validates_rollover_budget_before_creating_generation_state(retained: int) -> None:
+    manager = DuplexSessionRuntimeManager(recovery_max_replay_tokens=4, rollover_retain_tokens=retained)
+    with pytest.raises(ValueError, match="retain tokens must be smaller"):
+        manager.open_session(DuplexFence("bad-rollover"), lease_config=_lease_config())
+    assert manager.session_count == 0
+
+
+def test_disabled_rollover_does_not_require_a_smaller_retained_window() -> None:
+    manager = DuplexSessionRuntimeManager(
+        recovery_max_replay_tokens=4, rollover_retain_tokens=4, rollover_trigger_fraction=0.0
+    )
+    assert manager.open_session(DuplexFence("no-rollover"), lease_config=_lease_config()) is not None
 
 
 def test_open_touch_detach_and_idle_expiry_use_monotonic_time() -> None:
@@ -208,6 +226,183 @@ def test_completed_append_cache_is_bounded() -> None:
 
     session.accept_fence(DuplexFence(fence.session_id, epoch=1))
     assert session.completed_appends == {}
+
+
+def test_completed_append_fingerprint_is_order_stable_and_rejects_payload_reuse() -> None:
+    manager = DuplexSessionRuntimeManager()
+    fence = DuplexFence("sid-fingerprint")
+    session = manager.open_session(fence)
+    first = duplex_append_fingerprint(
+        mode=DuplexInputMode.TURN_COMMIT_ONLY,
+        payload={"audio": "abc", "nested": {"b": 2, "a": 1}},
+        final=True,
+        config_generation=0,
+    )
+    reordered = duplex_append_fingerprint(
+        mode=DuplexInputMode.TURN_COMMIT_ONLY,
+        payload={"nested": {"a": 1, "b": 2}, "audio": "abc"},
+        final=True,
+        config_generation=0,
+    )
+    changed = duplex_append_fingerprint(
+        mode=DuplexInputMode.TURN_COMMIT_ONLY,
+        payload={"audio": "different", "nested": {"a": 1, "b": 2}},
+        final=True,
+        config_generation=0,
+    )
+    assert first == reordered
+    assert first != changed
+    session.record_completed_append(
+        "operation",
+        fence=fence,
+        mode=DuplexInputMode.TURN_COMMIT_ONLY,
+        final=True,
+        stage_results=[{"ok": True}],
+        operation_fingerprint=first,
+        config_generation=0,
+    )
+
+    assert session.completed_append(
+        "operation",
+        fence=fence,
+        mode=DuplexInputMode.TURN_COMMIT_ONLY,
+        final=True,
+        operation_fingerprint=reordered,
+        config_generation=0,
+    ) == [{"ok": True}]
+    with pytest.raises(ValueError, match="reused with different metadata"):
+        session.completed_append(
+            "operation",
+            fence=fence,
+            mode=DuplexInputMode.TURN_COMMIT_ONLY,
+            final=True,
+            operation_fingerprint=changed,
+            config_generation=0,
+        )
+
+
+def test_append_fingerprint_covers_materialized_model_metadata() -> None:
+    common = {
+        "mode": DuplexInputMode.APPEND_AUDIO_CHUNK,
+        "payload": {"audio": b"same-pcm", "is_speech": True},
+        "final": False,
+        "config_generation": 3,
+    }
+    first = duplex_append_fingerprint(
+        **common,
+        request_metadata={
+            "prompt": {
+                "prompt_token_ids": [10, 11],
+                "model_intermediate_buffer": {"audio_features": b"features-a"},
+            },
+            "sampling_params": {"temperature": 0.0, "stop_token_ids": {151645, 151646}},
+        },
+    )
+    reordered = duplex_append_fingerprint(
+        **common,
+        request_metadata={
+            "sampling_params": {"stop_token_ids": {151646, 151645}, "temperature": 0.0},
+            "prompt": {
+                "model_intermediate_buffer": {"audio_features": bytearray(b"features-a")},
+                "prompt_token_ids": [10, 11],
+            },
+        },
+    )
+    changed_metadata = duplex_append_fingerprint(
+        **common,
+        request_metadata={
+            "prompt": {
+                "prompt_token_ids": [10, 11],
+                "model_intermediate_buffer": {"audio_features": b"features-b"},
+            },
+            "sampling_params": {"temperature": 0.0, "stop_token_ids": {151645, 151646}},
+        },
+    )
+
+    assert first == reordered
+    assert first != changed_metadata
+
+
+def test_recovery_journal_enforces_token_and_byte_hard_limits() -> None:
+    manager = DuplexSessionRuntimeManager(
+        recovery_max_replay_tokens=3,
+        recovery_max_replay_bytes=1024,
+        rollover_trigger_fraction=0,
+        rollover_retain_tokens=1,
+    )
+    session = manager.open_session(DuplexFence("sid-journal-limits"))
+    fingerprint = b"f" * 32
+    first = session.prepare_replay_append(
+        operation_id="op-1",
+        operation_fingerprint=fingerprint,
+        prompt={"prompt_token_ids": [1, 2], "model_intermediate_buffer": {}},
+    )
+    session.record_replay_append(first)
+
+    second = session.prepare_replay_append(
+        operation_id="op-2",
+        operation_fingerprint=fingerprint,
+        prompt={"prompt_token_ids": [3, 4], "model_intermediate_buffer": {}},
+    )
+    assert session.replay_append_would_overflow(second) is True
+    with pytest.raises(RuntimeError, match="duplex_recovery_journal_capacity_exhausted"):
+        session.record_replay_append(second)
+
+    with pytest.raises(RuntimeError, match="duplex_recovery_journal_entry_too_large"):
+        session.prepare_replay_append(
+            operation_id="op-large",
+            operation_fingerprint=fingerprint,
+            prompt={"prompt_token_ids": [1], "audio": b"x" * 2048},
+        )
+
+
+def test_recovery_journal_is_snapshot_bounded_and_cleared_by_epoch_change() -> None:
+    manager = DuplexSessionRuntimeManager(
+        recovery_max_replay_tokens=8,
+        recovery_max_replay_bytes=4096,
+        rollover_trigger_fraction=0,
+        rollover_retain_tokens=3,
+    )
+    fence = DuplexFence("sid-journal-snapshot")
+    session = manager.open_session(fence)
+    source_prompt = {
+        "prompt_token_ids": [1, 2],
+        "model_intermediate_buffer": {"duplex": {"payload": {"audio": b"pcm"}}},
+    }
+    append = session.prepare_replay_append(
+        operation_id="op-snapshot",
+        operation_fingerprint=b"fingerprint",
+        prompt=source_prompt,
+    )
+    assert isinstance(source_prompt["prompt_token_ids"], list)
+    assert isinstance(source_prompt["model_intermediate_buffer"], dict)
+    source_prompt["prompt_token_ids"].append(99)
+    source_prompt["model_intermediate_buffer"]["duplex"]["payload"]["audio"] = b"changed"
+    session.record_replay_append(append)
+
+    assert append.prompt["prompt_token_ids"] == [1, 2]
+    with pytest.raises(TypeError):
+        append.prompt["new"] = "forbidden"  # type: ignore[index]
+    assert manager.iter_sessions() == (session,)
+
+    session.accept_fence(DuplexFence(fence.session_id, epoch=1))
+    assert session.replay_appends == []
+    assert session.replay_token_count == 0
+    assert session.replay_byte_count == 0
+
+
+def test_recovery_journal_rejects_reference_cycles_instead_of_undercounting() -> None:
+    manager = DuplexSessionRuntimeManager()
+    session = manager.open_session(DuplexFence("sid-journal-cycle"))
+    cyclic: dict[str, object] = {"prompt_token_ids": [1]}
+    cyclic["cycle"] = cyclic
+
+    with pytest.raises(ValueError, match="reference cycle"):
+        session.prepare_replay_append(
+            operation_id="op-cycle",
+            operation_fingerprint=b"fingerprint",
+            prompt=cyclic,
+        )
 
 
 def test_lease_config_and_expiry_record_are_immutable() -> None:

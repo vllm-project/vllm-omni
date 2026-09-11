@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
@@ -100,3 +103,10 @@ def test_snapshot_mm_payload_coalesces_compatible_tensor_list(monkeypatch):
     torch.testing.assert_close(output_chunks[1], chunks[1])
     torch.testing.assert_close(output_chunks[2], chunks[2])
     assert output_chunks[0].untyped_storage().data_ptr() == output_chunks[2].untyped_storage().data_ptr()
+
+
+def test_context_prefill_version_reaches_client_with_audio():
+    version = torch.tensor(3, dtype=torch.int64)
+    inter_stage, client = partition_flat_payload({"audio": torch.ones(4), "meta.duplex_context_version": version})
+    assert client["meta.duplex_context_version"] is version
+    assert inter_stage["meta.duplex_context_version"] is version

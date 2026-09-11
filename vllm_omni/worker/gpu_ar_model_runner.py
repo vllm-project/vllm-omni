@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -87,39 +87,14 @@ def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
         return value.detach().clone()
     if isinstance(value, dict):
         return {k: _clone_cuda_tensor_payload(v, sources) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        if (
-            value
-            and all(
-                isinstance(v, torch.Tensor)
-                and v.is_cuda
-                and v.dtype == value[0].dtype
-                and v.device == value[0].device
-                and v.layout == torch.strided
-                and v.is_contiguous()
-                for v in value
-            )
-            # Keep frame/state packing bounded; large payloads use individual snapshots.
-            and sum(v.numel() * v.element_size() for v in value) <= 1024 * 1024
-        ):
-            packed = torch.cat([v.detach().reshape(-1) for v in value])
-            sources.append(packed)
-            return _PackedTensorPayload(packed, [v.shape for v in value], isinstance(value, tuple))
-        items = [_clone_cuda_tensor_payload(v, sources) for v in value]
-        return tuple(items) if isinstance(value, tuple) else items
+    if isinstance(value, list):
+        return [_clone_cuda_tensor_payload(v, sources) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_cuda_tensor_payload(v, sources) for v in value)
     return value
 
 
 def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
-    if isinstance(value, _PackedTensorPayload):
-        flat = _copy_tensor_payload_to_cpu(value.tensor, pin_memory)
-        items = []
-        offset = 0
-        for shape in value.shapes:
-            count = shape.numel()
-            items.append(flat[offset : offset + count].view(shape))
-            offset += count
-        return tuple(items) if value.is_tuple else items
     if isinstance(value, torch.Tensor):
         if value.device.type != "cuda":
             return value
@@ -133,12 +108,6 @@ def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
     if isinstance(value, tuple):
         return tuple(_copy_tensor_payload_to_cpu(v, pin_memory) for v in value)
     return value
-
-
-class _PackedTensorPayload(NamedTuple):
-    tensor: torch.Tensor
-    shapes: list[torch.Size]
-    is_tuple: bool
 
 
 class _AsyncCPUPayloadSnapshot:
@@ -256,8 +225,8 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def _build_model_runner_output_once(self) -> None:
         if self._model_runner_output is not None:
             return
+        assert self._model_runner_output_builder is not None
         with record_function_or_nullcontext("omni_async_output:get_output/build_model_runner_output"):
-            assert self._model_runner_output_builder is not None
             self._model_runner_output = self._model_runner_output_builder()
         self._model_runner_output_builder = None
 
@@ -345,6 +314,8 @@ class ExecuteModelState(NamedTuple):
 
 
 class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
+    execute_model_state: ExecuteModelState | None
+    kv_extracted_req_ids: list[str] | None
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
@@ -352,9 +323,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     class only overrides sample_tokens to expose hidden states + multimodal
     outputs per request while keeping Async output semantics.
     """
-
-    execute_model_state: ExecuteModelState | None
-    kv_extracted_req_ids: list[str] | None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -471,10 +439,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not isinstance(info, dict):
             return None
         val = info.get("omni_final_stage_id")
-        if val is None:
-            return None
         try:
-            return int(val)
+            return int(val) if val is not None else None
         except (TypeError, ValueError):
             return None
 
@@ -1204,6 +1170,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
+        input_errors = getattr(scheduler_output, "model_input_errors", {})
+        if input_errors and slot_mappings_by_group is not None:
+            self._mask_failed_input_kv_slots(input_errors, req_ids[:num_reqs], slot_mappings_by_group)
+
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
         prepare_runner_inputs = getattr(self.model, "prepare_runner_inputs", None)
@@ -1419,6 +1389,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            self._mask_failed_input_logits(logits)
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
@@ -1522,7 +1493,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
             selected_indices.append(idx)
             selected_req_ids.append(req_id)
-            selected_req_infos.append(cast(dict[str, Any], req_info))
+            assert req_info is not None
+            selected_req_infos.append(req_info)
 
         if not selected_indices:
             return multimodal_outputs
@@ -1632,7 +1604,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         scheduler_output: SchedulerOutput,
     ) -> SchedulerOutput:
         updates: dict[str, Any] = {}
-        for attr in ("num_scheduled_tokens", "scheduled_spec_decode_tokens"):
+        for attr in ("num_scheduled_tokens", "scheduled_spec_decode_tokens", "model_input_errors"):
             val = getattr(scheduler_output, attr, None)
             if isinstance(val, dict):
                 updates[attr] = val.copy()
@@ -1810,6 +1782,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return False
 
         _, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        failures = getattr(scheduler_output, "model_input_errors", {})
+        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in failures]
         if not downstream_req_ids:
             return False
 
@@ -1859,6 +1833,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         combined_multimodal_outputs = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        input_errors = dict(getattr(scheduler_output, "model_input_errors", {}) or {})
+        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in input_errors]
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -1972,9 +1948,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
                     pooler_output.append(flatten_payload(payload))
 
+        pooler_output = pooler_output or []
         pooler_inter: Sequence[dict[str, object] | None] | None
         pooler_client: Sequence[dict[str, object] | None] | None
-        pooler_output = pooler_output or []
         if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
@@ -2019,6 +1995,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                model_input_errors=input_errors,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
             with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
@@ -2128,6 +2105,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                        self.optimistic_seq_lens_cpu,
                         sampled_token_ids,
                         self.requests,
                         self.input_batch,
@@ -2160,6 +2138,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+
+        self._suppress_failed_input_samples(
+            getattr(scheduler_output, "model_input_errors", {}),
+            req_id_to_index_output_copy,
+            valid_sampled_token_ids,
+            invalid_req_indices,
+        )
 
         multimodal_outputs = self._run_post_sample_talker_mtp(
             req_ids=req_ids_output_copy,

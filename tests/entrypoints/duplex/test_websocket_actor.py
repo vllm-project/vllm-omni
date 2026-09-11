@@ -103,6 +103,49 @@ async def test_mailbox_delivers_every_enqueued_event_exactly_once():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["events", "bytes"])
+async def test_mailbox_limits_apply_before_input_reaches_runtime(limit):
+    actor = DuplexWebSocketActor(FakeWebSocket())
+    actor.max_mailbox_events = 1 if limit == "events" else 256
+    actor.max_mailbox_bytes = 80 if limit == "bytes" else 16 * 1024 * 1024
+    first = {"type": "input_audio_buffer.append", "audio": "a"}
+    await actor.enqueue_event(first)
+    with pytest.raises(BufferError, match="mailbox"):
+        await actor.enqueue_event({"type": "input_audio_buffer.append", "audio": "b" * 80})
+    assert actor.mailbox.qsize() == 1
+    assert await actor.next_event() == first
+    assert not actor.has_queued_input_events()
+    await actor.enqueue_event(first)
+    assert await actor.next_event() == first
+
+
+@pytest.mark.asyncio
+async def test_full_mailbox_reserves_one_fifo_reader_terminal_and_releases_budget():
+    actor = DuplexWebSocketActor(FakeWebSocket(), max_mailbox_events=1)
+    event = {"type": "input_audio_buffer.append", "audio": "a"}
+    await actor.enqueue_event(event, encoded_bytes=100)
+    await actor.enqueue_terminal("__disconnect__")
+    await actor.enqueue_terminal("__disconnect__")
+    assert actor.mailbox.qsize() == 2
+    assert await actor.next_event() == event
+    assert await actor.next_event() == {"type": "__disconnect__"}
+    assert actor._queued_mailbox_bytes == 0
+    assert not actor.has_queued_input_events()
+
+
+@pytest.mark.asyncio
+async def test_overflow_cleanup_discards_only_transport_backlog():
+    actor = DuplexWebSocketActor(FakeWebSocket())
+    await actor.enqueue_event({"type": "input_audio_buffer.append", "audio": "a"}, encoded_bytes=100)
+    actor.discard_pending_events()
+    await asyncio.wait_for(actor.mailbox.join(), timeout=1)
+    assert not actor.has_queued_input_events()
+    assert actor._queued_mailbox_bytes == 0
+    await actor.enqueue_terminal("__mailbox_overflow__")
+    assert await actor.next_event() == {"type": "__mailbox_overflow__"}
+
+
+@pytest.mark.asyncio
 async def test_writer_is_single_owner_of_websocket_send():
     websocket = FakeWebSocket()
     actor = DuplexWebSocketActor(websocket)
@@ -143,3 +186,21 @@ async def test_writer_does_not_revoke_accepted_terminal_after_close_starts():
 
     assert websocket.sent == [{"type": "response.done", "epoch": 1, "response_id": "resp-1"}]
     assert actor.stale_output_dropped == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["events", "bytes"])
+async def test_output_backlog_rejects_overflow_and_close_never_waits(limit):
+    actor = DuplexWebSocketActor(
+        FakeWebSocket(),
+        max_output_events=1 if limit == "events" else 256,
+        max_output_bytes=100 if limit == "bytes" else 1024,
+    )
+    await actor.send_json({"type": "audio", "audio": "a"})
+    with pytest.raises(BufferError, match="output"):
+        await actor.send_json({"type": "audio", "audio": "b" * 100})
+    await asyncio.wait_for(actor.close_writer(), 1)
+    await asyncio.wait_for(actor.writer_loop(), 1)
+    assert actor.output_queue.empty()
+    assert actor._queued_output_bytes == 0
+    assert len(actor.websocket.sent) == 1

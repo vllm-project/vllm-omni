@@ -52,6 +52,8 @@ class PersonaPlexServingSessionState:
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
     data_plane_task: asyncio.Task[None] | None = None
+    data_plane_request_id: str | None = None
+    data_plane_response_stage_id: int | None = None
     data_plane_restart_requested: bool = False
     continuation_owner_id: str | None = None
     continuation_units: int = 0
@@ -112,9 +114,12 @@ class PersonaPlexServingRuntimeAdapter:
 
     @staticmethod
     def capabilities(*, max_sessions: int) -> DuplexCapabilities:
+        from vllm_omni.engine.kv_append import scheduler_native_append_available
+
         supports_multi_session = max_sessions > 1
         return DuplexCapabilities(
             supports_model_native_turn_policy=True,
+            response_lifecycle="continuous_stream",
             supports_external_turn_signal=False,
             supports_client_commit=False,
             supports_barge_in=False,
@@ -126,6 +131,8 @@ class PersonaPlexServingRuntimeAdapter:
             supports_turn_commit_only=False,
             supports_model_internal_state=True,
             supports_stage_resumption=True,
+            supports_scheduler_native_append=scheduler_native_append_available(),
+            supports_prompt_replay=False,
             supports_core_resumable_request=True,
             supports_stage_connector_handoff=True,
             supports_independent_io_streams=True,
@@ -145,6 +152,9 @@ class PersonaPlexServingRuntimeAdapter:
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=80,
             target_barge_in_latency_ms=None,
+            adapter_id="personaplex",
+            runtime_extension_id="personaplex",
+            stage_count=2,
         )
 
     @staticmethod

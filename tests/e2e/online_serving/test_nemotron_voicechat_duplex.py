@@ -56,12 +56,16 @@ def test_native_duplex_turn_taking_streams_model_audio(omni_server, tmp_path: Pa
         (
             f"--url ws://{omni_server.host}:{omni_server.port}/v1/realtime --model {omni_server.model} "
             f"--input-wav {root / 'turn_taking.wav'} --input-channel 0 --max-frames 190 "
-            f"--minimum-audio-chunks 48 --minimum-audio-rms 0.001 --no-realtime --timeout-s {CLIENT_TIMEOUT_S} "
+            f"--minimum-audio-chunks 48 --minimum-audio-rms 0.001 --timeout-s {CLIENT_TIMEOUT_S} "
             f"--output-dir {tmp_path / 'native_duplex'}"
         ).split()
     )
     result = asyncio.run(run(args))
     assert result["ok"] is True
-    assert result["input_frames"] == 190
+    assert result["source_frames"] == 190
+    assert result["trailing_silence_frames"] == 250
+    assert result["input_frames"] == 440
+    assert isinstance(result["event_counts"], dict)
+    assert isinstance(result["input_frames"], int)
     assert result["event_counts"]["response.speak"] > 0
-    assert result["audio_bytes"] >= result["input_frames"] * 1764 * 2 // 4
+    assert result["audio_bytes"] == result["input_frames"] * 1764 * 2

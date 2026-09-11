@@ -47,6 +47,8 @@ class _RequestState:
     uses_segment_text_metadata: bool = False
     pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
+    tool_calls: set[str] = field(default_factory=set)
+    applied_context_version: int = 0
     turns: dict[int | None, _TurnState] = field(default_factory=dict)
 
     def turn(self, turn_id: int | None) -> _TurnState:
@@ -188,6 +190,38 @@ class MiniCPMO45DataPlaneSession:
         if context.auto_responds and (stale_turn or stale_epoch):
             return
 
+        special = _special_token_ids(mm_output)
+        context_version = _first_metadata_int(mm_output, "duplex_context_version") or special.get(
+            "gander_context_version", 0
+        )
+        if request_state is not None and context_version > request_state.applied_context_version:
+            request_state.applied_context_version = context_version
+            yield runtime_result(context_prefilled=True, context_version=context_version)
+
+        if "gander_tool_text" in mm_output:
+            from vllm_omni.entrypoints.duplex.runtime_adapter import ServingRuntimeConfigError
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import data_json, parse_call
+
+            call_id = str(mm_output.get("gander_call_id", ""))
+            if request_state is not None:
+                if call_id in request_state.tool_calls:
+                    return
+                request_state.tool_calls.add(call_id)
+            try:
+                call = parse_call(mm_output["gander_tool_text"])
+            except ServingRuntimeConfigError as exc:
+                yield runtime_result(error_code=exc.code, error=str(exc))
+                return
+            yield runtime_result(
+                function_call=True,
+                ends_response=True,
+                call_id=call_id,
+                name=call["name"],
+                arguments=data_json(call["arguments"]),
+                model_turn_id=output_turn_id,
+            )
+            return
+
         mm_text = _llm_output_text(mm_output)
         if mm_text:
             text = mm_text
@@ -200,14 +234,16 @@ class MiniCPMO45DataPlaneSession:
         tts_is_last_chunk = _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
-        if native_decision == "listen":
+        if native_decision in {"listen", "interrupt"}:
             listen_result = runtime_result(
                 stage_role="llm",
                 is_listen=True,
                 model_listen=True,
-                listen_source="model_listen",
+                listen_source="model_interrupt" if native_decision == "interrupt" else "model_listen",
+                reason="model_interrupt" if native_decision == "interrupt" else "model_listen",
+                is_interrupt=native_decision == "interrupt",
                 data_plane_request_id=request_id,
-                end_of_turn=False,
+                end_of_turn=native_decision == "interrupt",
             )
             if output_turn_id is not None:
                 listen_result["model_turn_id"] = output_turn_id
@@ -621,6 +657,8 @@ def _native_decision(
 ) -> str | None:
     if not finished:
         return None
+    if mm_output.get("duplex_native_decision") == "interrupt":
+        return "interrupt"
     if mm_output.get("duplex_native_decision") == "listen" or mm_output.get("model_listen") is True:
         return "listen"
     listen_id = _special_token_ids(mm_output).get("listen_token_id")
@@ -654,7 +692,12 @@ def _special_token_ids(mm_output: dict[str, object]) -> dict[str, int]:
         for key, value in source.items():
             if not isinstance(key, str):
                 continue
-            token_id = coerce_int(value)
+            if isinstance(key, str) and key.startswith("gander_"):
+                from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import latest_int
+
+                token_id = latest_int(value)
+            else:
+                token_id = coerce_int(value)
             if token_id is not None and token_id >= 0:
                 out[key] = token_id
     return out

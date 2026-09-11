@@ -26,6 +26,8 @@ class MiniCPMO45ServingSessionState:
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
     data_plane_task: asyncio.Task[None] | None = None
+    data_plane_request_id: str | None = None
+    data_plane_response_stage_id: int | None = None
     data_plane_restart_requested: bool = False
     continuation_owner_id: str | None = None
     continuation_units: int = 0

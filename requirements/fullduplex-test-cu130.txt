@@ -1,0 +1,16 @@
+# Reproducible entry requirements for the vLLM 0.28.0 native-duplex CUDA tests.
+# Install in this checkout's .venv, never into a shared model-serving environment.
+-r cuda.txt
+vllm==0.28.0
+transformers==5.14.1
+step-audio2==1.0.0
+silero-vad==6.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-mock==3.15.1
+pytest-xdist==3.8.0
+opencc==1.4.1
+ninja==1.13.2
+opencv-python-headless==5.0.0.93
+# Common dependencies pull in opencv-python through cosmos-guardrail. Both
+# distributions own cv2: reinstall the pinned headless wheel LAST (see runbook).

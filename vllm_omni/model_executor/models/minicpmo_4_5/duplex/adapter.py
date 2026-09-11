@@ -42,6 +42,17 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
             "initial_user_text",
+            "gander_enabled",
+            "gander_tools",
+            "gander_instructions",
+            "gander_tokenizer_path",
+            "duplex_context_version",
+            "gander_replacements",
+            "gander_initial_slate",
+            "gander_calls",
+            "gander_context_receipts",
+            "gander_context_version",
+            "gander_slate_version",
         }
     )
 
@@ -82,6 +93,24 @@ class MiniCPMO45NativeDuplexServingAdapter:
         stage_max_tokens["0"] = (
             config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
         )
+        if runtime_config.get("gander_enabled"):
+            if config.extra_body.get("gander_history", {}) != runtime_config.get("gander_history", {}):
+                raise MiniCPMO45ClientRuntimeConfigError("History window policy cannot change within a session")
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import normalize_tools, tokenizer_for
+
+            tools = normalize_tools(
+                config.extra_body.get("realtime_tools"), tokenizer_for(str(runtime_config["gander_tokenizer_path"]))
+            )
+            if tools != runtime_config.get("gander_tools", []):
+                raise MiniCPMO45ClientRuntimeConfigError(
+                    "Tools cannot change within a session", code="tools_update_unsupported"
+                )
+            if config.extra_body.get("gander_task_slate", "") != runtime_config.get(
+                "gander_initial_slate", runtime_config.get("gander_task_slate", "")
+            ):
+                raise MiniCPMO45ClientRuntimeConfigError("Use input.context.append for task slate updates")
+            if tools:
+                stage_max_tokens["0"] = max(int(stage_max_tokens["0"]), 256)
         stage_max_tokens.setdefault("1", 8192)
         runtime_config["duplex_stage_max_tokens"] = stage_max_tokens
 
@@ -101,6 +130,36 @@ class MiniCPMO45NativeDuplexServingAdapter:
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+        if getattr(getattr(model_config, "hf_config", None), "gander_unit8", False):
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import window_config
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import (
+                instructions_with_tools,
+                normalize_tools,
+                tokenizer_for,
+            )
+
+            history = deepcopy(extra_body.get("gander_history", {}))
+            window_config({"gander_history": history})
+            runtime_config["gander_history"] = history
+            runtime_config["duplex_context_version"] = 0
+            tokenizer = tokenizer_for(model_config.model)
+            tools = normalize_tools(extra_body.get("realtime_tools"), tokenizer)
+            slate = extra_body.get("gander_task_slate", "")
+            if not isinstance(slate, str) or len(tokenizer.encode(slate, add_special_tokens=False)) > 256:
+                raise MiniCPMO45ClientRuntimeConfigError("Initial task slate must be a string of at most 256 tokens")
+            runtime_config.update(
+                {
+                    "gander_enabled": True,
+                    "gander_tools": tools,
+                    "gander_instructions": instructions_with_tools(config.instructions, tools, slate),
+                    "gander_tokenizer_path": model_config.model,
+                    "gander_task_slate": slate,
+                    "gander_initial_slate": slate,
+                    "gander_slate_version": 0,
+                }
+            )
+        elif extra_body.get("realtime_tools") or extra_body.get("gander_task_slate"):
+            raise MiniCPMO45ClientRuntimeConfigError("Tools/task slate require Gander")
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text
@@ -165,6 +224,8 @@ class MiniCPMO45NativeDuplexServingAdapter:
         model_config: Any,
     ) -> None:
         stage0_max_tokens = config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
+        if runtime_config.get("gander_tools"):
+            stage0_max_tokens = max(stage0_max_tokens, 256)
         runtime_config["duplex_stage_max_tokens"] = {"0": stage0_max_tokens, "1": 8192}
         stage0_params: dict[str, object] = {
             "temperature": config.temperature if config.temperature is not None else 0.7,
@@ -209,7 +270,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         if tokenizer is None:
             return
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-            instructions,
+            runtime_config.get("gander_instructions", instructions),
             ref_sample_count is not None,
             initial_user_text,
         )
@@ -231,13 +292,22 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "chunk_eos_token_id",
             "chunk_tts_eos_token_id",
             "listen_token_id",
-            "turn_eos_token_id",
         )
         for field in stop_token_fields:
             token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
             token_id = MiniCPMO45NativeDuplexServingAdapter._convert_token_to_id(tokenizer, token)
             if token_id is not None and token_id not in out:
                 out.append(token_id)
+        if getattr(getattr(model_config, "hf_config", None), "gander_unit8", False):
+            interrupt_id = MiniCPMO45NativeDuplexServingAdapter._convert_token_to_id(tokenizer, "<|interrupt|>")
+            if interrupt_id is None:
+                raise ValueError("Gander tokenizer is missing <|interrupt|>")
+            out.append(interrupt_id)
+            # Gander feeds turn_eos and then chunk_eos in the same unit.
+            # Stopping at turn_eos leaves the forced chunk closure for the
+            # following microphone unit and skips that unit's action.
+            turn_eos_id = MiniCPMO45NativeDuplexServingAdapter._convert_token_to_id(tokenizer, "<|turn_eos|>")
+            out = [token_id for token_id in out if token_id != turn_eos_id]
         return out
 
     @staticmethod

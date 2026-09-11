@@ -12,6 +12,39 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_native_runner_bulk_collection_excludes_chat_fallback(monkeypatch):
+    import importlib
+    import runpy
+    import sys
+    from pathlib import Path
+
+    # Keep the shared fixture module's import-time configuration real; only
+    # the native runner's fresh collection is under the synthetic loader.
+    importlib.import_module("tests.dfx.perf.scripts.run_benchmark")
+    configs = [
+        {
+            "test_name": name,
+            "benchmark_runner": runner,
+            "server_params": {"model": "test/model"},
+            "benchmark_params": [{"name": "c1", "workload": workload}],
+        }
+        for name, runner, workload in (
+            ("native", "native-duplex", "native-duplex-audio"),
+            ("fallback", "default", "chat"),
+        )
+    ]
+    monkeypatch.setattr("tests.dfx.conftest.load_benchmark_configs", lambda *a, **kw: configs)
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+    path = Path(__file__).parents[1] / "scripts/run_native_duplex_benchmark.py"
+    module = runpy.run_path(str(path))
+    assert len(module["paired_benchmark_params"]) == 1
+    params = module["benchmark_params"].__wrapped__(SimpleNamespace(param=("native", 0)))
+    assert params["params"]["workload"] == "native-duplex-audio"
+    monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file=fallback.json"])
+    with pytest.raises(ValueError, match="benchmark_runner=native-duplex"):
+        runpy.run_path(str(path))
+
+
 def test_task_excluded_from_cli_args():
     """'task' field must not become --task CLI arg."""
     params = {
@@ -302,13 +335,58 @@ def test_paired_omni_benchmark_reuses_server_and_preserves_case_metadata(tmp_pat
         ]
     finally:
         active_context.close()
-
     assert events == [
         ("start", omni_p0_server),
         ("stop", omni_p0_server),
         ("start", tts_server),
         ("stop", tts_server),
     ]
+
+
+def test_benchmark_server_model_honors_model_prefix(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    monkeypatch.setenv("MODEL_PREFIX", str(tmp_path))
+
+    resolved, served_name_args = run_benchmark._resolve_benchmark_server_model("openbmb/MiniCPM-o-4_5")
+
+    assert resolved == str(tmp_path / "openbmb" / "MiniCPM-o-4_5")
+    assert served_name_args == ["--served-model-name", "openbmb/MiniCPM-o-4_5"]
+
+
+def test_benchmark_server_model_keeps_absolute_path(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    monkeypatch.setenv("MODEL_PREFIX", str(tmp_path / "prefix"))
+    model = str(tmp_path / "models" / "checkpoint")
+
+    resolved, served_name_args = run_benchmark._resolve_benchmark_server_model(model)
+
+    assert resolved == model
+    assert served_name_args == []
+
+
+def test_seed_tts_root_environment_is_used_as_config_fallback(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    monkeypatch.setenv("SEED_TTS_ROOT", str(tmp_path))
+
+    assert run_benchmark._seed_tts_root_args({"dataset_name": "seed-tts"}) == [
+        "--seed-tts-root",
+        str(tmp_path.resolve()),
+    ]
+    assert run_benchmark._seed_tts_root_args({"dataset_name": "seed-tts", "seed_tts_root": "/configured/root"}) == []
+    assert run_benchmark._seed_tts_root_args({"dataset_name": "random"}) == []
+
+
+def test_seed_tts_root_environment_rejects_missing_directory(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    missing_root = tmp_path / "missing"
+    monkeypatch.setenv("SEED_TTS_ROOT", str(missing_root))
+
+    with pytest.raises(FileNotFoundError, match="SEED_TTS_ROOT is not a directory"):
+        run_benchmark._seed_tts_root_args({"dataset_name": "seed-tts"})
 
 
 def test_is_hardware_nested_baseline():

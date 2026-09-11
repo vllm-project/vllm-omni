@@ -126,6 +126,7 @@ nav:
         - Disaggregated Inference: design/feature/disaggregated_inference.md
         - Host Weight Runtime: design/feature/host_weight_runtime.md
         - Async Chunk: design/feature/async_chunk.md
+        - Transactional Duplex KV Append: design/feature/duplex_kv_append.md
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
         - Prefill/Decode Phase Contract: design/feature/preprocess_phase_contract.md

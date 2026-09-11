@@ -5,6 +5,7 @@ import threading
 from collections import deque
 from typing import Any
 
+from ..connectors.base import OmniConnectorBase
 from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
@@ -17,20 +18,23 @@ class OmniTransferAdapterBase:
     leaves the specific data processing (chunks, KV cache, etc.) to subclasses.
     """
 
+    request_ids_mapping: dict[str, str]
+
     def __init__(self, config: Any):
         self.config = config
         if not hasattr(self, "connector"):
-            self.connector = None
+            self.connector: OmniConnectorBase | None = None
         # Requests that are waiting to be polled
-        self._pending_load_reqs = deque()
+        # Concrete adapters own the request handles and save-task schemas.
+        self._pending_load_reqs: deque[Any] = deque()
         # Requests that have successfully retrieved data
-        self._finished_load_reqs = set()
+        self._finished_load_reqs: set[str] = set()
         self._cancelled_load_reqs: set[str] = set()
 
         # Requests that are waiting to be saved
-        self._pending_save_reqs = deque()
+        self._pending_save_reqs: deque[Any] = deque()
         # Requests that have successfully saved data
-        self._finished_save_reqs = set()
+        self._finished_save_reqs: set[str] = set()
 
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()

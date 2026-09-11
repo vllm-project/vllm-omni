@@ -7,7 +7,10 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from importlib import import_module
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, SupportsIndex, SupportsInt, cast
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.duplex.protocol import DuplexCapabilities
 
 
 class ServingRuntimeConfigError(ValueError):
@@ -87,6 +90,8 @@ class ServingRuntimeSessionState(Protocol):
     deferred_response_create: bool
     deferred_precreate_response: bool
     data_plane_task: asyncio.Task[None] | None
+    data_plane_request_id: str | None
+    data_plane_response_stage_id: int | None
     data_plane_restart_requested: bool
     continuation_owner_id: str | None
     continuation_units: int
@@ -171,6 +176,8 @@ class TurnBasedServingSessionState:
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
     data_plane_task: asyncio.Task[None] | None = None
+    data_plane_request_id: str | None = None
+    data_plane_response_stage_id: int | None = None
     data_plane_restart_requested: bool = False
     continuation_owner_id: str | None = None
     continuation_units: int = 0
@@ -219,6 +226,25 @@ class RuntimeDataPlane(Protocol):
     def project(self, result: object, *, context: object | None = None) -> Iterable[dict[str, object]]: ...
 
 
+class ContinuousRuntimeDataPlane(RuntimeDataPlane, Protocol):
+    """Additional accounting required by continuous-stream drain barriers."""
+
+    def note_accepted_input(self, request_id: str, sequence: int) -> None: ...
+
+    def mark_outputs_delivered(self, request_id: str) -> None: ...
+
+    def drain_status(self, request_id: str) -> dict[str, int | bool]: ...
+
+
+def require_continuous_data_plane(data_plane: RuntimeDataPlane) -> ContinuousRuntimeDataPlane:
+    # The base surface was validated when loading the adapter. Check only the
+    # three additional hooks, retaining support for dynamically bound plugins.
+    methods = ("note_accepted_input", "mark_outputs_delivered", "drain_status")
+    if not all(callable(getattr(data_plane, name, None)) for name in methods):
+        raise RuntimeError("continuous-stream runtime requires input and delivery accounting")
+    return cast(ContinuousRuntimeDataPlane, data_plane)
+
+
 class ServingRuntimeAdapter(Protocol):
     adapter_id: str
     session_states: MutableMapping[str, ServingRuntimeSessionState]
@@ -236,7 +262,7 @@ class ServingRuntimeAdapter(Protocol):
 
     def is_enabled(self, config: object) -> bool: ...
 
-    def capabilities(self, *, max_sessions: int) -> object: ...
+    def capabilities(self, *, max_sessions: int) -> DuplexCapabilities: ...
 
     def validate_client_extra_body(self, extra_body: object) -> None: ...
 
@@ -288,7 +314,8 @@ def validate_serving_runtime_adapter(adapter: object) -> ServingRuntimeAdapter:
     missing = [name for name in required_methods if not callable(getattr(adapter, name, None))]
     if missing:
         raise TypeError(f"Duplex serving runtime adapter is missing callable method(s): {', '.join(missing)}")
-    if not isinstance(getattr(adapter, "adapter_id", None), str) or not adapter.adapter_id:
+    adapter_id = getattr(adapter, "adapter_id", None)
+    if not isinstance(adapter_id, str) or not adapter_id:
         raise TypeError("Duplex serving runtime adapter must declare adapter_id")
     if not isinstance(getattr(adapter, "session_states", None), MutableMapping):
         raise TypeError("Duplex serving runtime adapter must declare mutable session_states")
@@ -315,7 +342,7 @@ def validate_serving_runtime_adapter(adapter: object) -> ServingRuntimeAdapter:
             "Duplex serving runtime adapter data_plane is missing callable method(s): "
             + ", ".join(missing_data_plane_methods)
         )
-    return adapter  # type: ignore[return-value]
+    return cast(ServingRuntimeAdapter, adapter)
 
 
 def payload_turn_id(payload: object) -> int | None:
@@ -325,7 +352,9 @@ def payload_turn_id(payload: object) -> int | None:
 
 
 def coerce_int(value: object) -> int | None:
+    if not isinstance(value, str | bytes | bytearray | SupportsInt | SupportsIndex):
+        return None
     try:
-        return int(value) if value is not None else None
+        return int(value)
     except (TypeError, ValueError):
         return None

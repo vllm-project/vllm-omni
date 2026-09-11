@@ -67,6 +67,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model",
         "omni",
         "output_modalities",
+        # API aliases are consumed by init_app_state, not stage engines.
+        "served_model_name",
         "stage_id",
         "tokenizer",
     }

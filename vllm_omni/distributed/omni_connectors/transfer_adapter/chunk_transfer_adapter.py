@@ -18,6 +18,7 @@ from vllm.v1.utils import ConstantList
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.base import OmniConnectorBase
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
 from ..utils.logging import get_connector_logger
@@ -125,6 +126,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # polled. Per-registration identity lets the receiver reject an old
         # segment's queued or in-flight work after the same request id resumes.
         self._registered_load_entries: dict[str, _LoadEntry] = {}
+        # One lookahead chunk per request. A boundary encountered while
+        # coalescing must remain available for the next receiver registration.
+        self._codec_lookahead: dict[str, tuple[dict[str, Any], int]] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         (
@@ -146,7 +150,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        self.connector: OmniConnectorBase = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -168,16 +172,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, object] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
+        # Persistent FIFO independent of scheduler queue placement. A yielding
+        # stream rejoins the tail, behind every peer already waiting for a slot.
+        self._active_stream_waiters: dict[str, Request] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
         # waiting_queue.prepend_requests mid-step, which trips vllm's
@@ -255,6 +262,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
+        # Generation chunks replace the prompt. Keep the backing token lists
+        # in sync too: scheduler NewRequestData may expose _all_token_ids as
+        # prefill_token_ids, which otherwise still contains pre-warm zeros.
+        all_ids = getattr(request, "_all_token_ids", None)
+        if isinstance(all_ids, list):
+            all_ids[:] = request.prompt_token_ids
+        output_ids = getattr(request, "_output_token_ids", None)
+        if isinstance(output_ids, list):
+            output_ids.clear()
+        request.num_output_placeholders = 0
         request.num_prompt_tokens = len(request.prompt_token_ids)
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
@@ -353,6 +370,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             segment_generation: generation captured before a resumable stop
                 can apply a queued update to the mutable request
         """
+        if request is None:
+            raise ValueError("saving a connector chunk requires a request")
         is_finished = request.is_finished() and not request.resumable
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -444,14 +463,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 return True
             chunk_id = self.get_req_chunk[req_id]
             external_req_id = self.request_ids_mapping.get(req_id, req_id)
+            prefetched = self._codec_lookahead.pop(req_id, None)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
         try:
-            result = self.connector.get(
-                str(target_stage_id),
-                str(stage_id),
-                connector_get_key,
+            result = (
+                prefetched
+                if prefetched is not None
+                else self.connector.get(
+                    str(target_stage_id),
+                    str(stage_id),
+                    connector_get_key,
+                )
             )
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
@@ -465,6 +489,54 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
+
+        consumed = 1
+        frame = self._indexed_codec_chunk(result[0])
+        get_nowait = getattr(self.connector, "get_nowait", None)
+        # Never delay the first frame or wait to fill a batch. Only already
+        # available, contiguous codec data can amortize a generation step.
+        if self.model_mode != "ar" and frame is not None and frame[0] > 0 and callable(get_nowait):
+            offset, audio = frame
+            segment_finished = self._is_truthy_scalar(result[0]["meta"].get("is_segment_finished"))
+            parts = [audio]
+            total_frames = audio.shape[1]
+            total_size = result[1]
+            deadline = time.monotonic() + 0.001
+            while total_frames < 5 and time.monotonic() < deadline:
+                key = f"{external_req_id}_{target_stage_id}_{chunk_id + consumed}"
+                try:
+                    following = get_nowait(str(target_stage_id), str(stage_id), key)
+                except Exception:
+                    # The current chunk is already received; deliver it even
+                    # when the optional next-key probe fails.
+                    break
+                if following is None:
+                    break
+                candidate = self._indexed_codec_chunk(following[0])
+                if (
+                    candidate is None
+                    or candidate[0] != offset + total_frames
+                    or candidate[1].shape[0] != audio.shape[0]
+                    or candidate[1].dtype != audio.dtype
+                    or candidate[1].device != audio.device
+                    or total_frames + candidate[1].shape[1] > 5
+                    # The merged chunk retains the first metadata. A changed
+                    # segment marker must remain a separate receive/commit,
+                    # not disappear or prematurely finish the later frames.
+                    or self._is_truthy_scalar(following[0]["meta"].get("is_segment_finished")) != segment_finished
+                ):
+                    with self._receiver_state_lock:
+                        if self._registered_load_entries.get(req_id) is entry:
+                            self._codec_lookahead[req_id] = following
+                    break
+                parts.append(candidate[1])
+                total_frames += candidate[1].shape[1]
+                total_size += following[1]
+                consumed += 1
+            if consumed > 1:
+                payload = dict(result[0])
+                payload["codes"] = {"audio": torch.cat(parts, dim=1)}
+                result = payload, total_size
 
         with self._receiver_state_lock:
             # cleanup_receiver() can run while connector.get() is in flight.
@@ -481,8 +553,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 connector_get_key=connector_get_key,
             )
             if is_success:
+                self.get_req_chunk[req_id] += consumed - 1
                 self._registered_load_entries.pop(req_id, None)
             return is_success
+
+    @classmethod
+    def _indexed_codec_chunk(cls, payload: dict[str, Any]) -> tuple[int, torch.Tensor] | None:
+        if not isinstance(payload, dict) or set(payload) - {"codes", "meta"}:
+            return None
+        meta, codes = payload.get("meta"), payload.get("codes")
+        if not isinstance(meta, dict) or not isinstance(codes, dict) or set(codes) != {"audio"}:
+            return None
+        if meta.get("codec_coalesce") is not True:
+            return None
+        if set(meta) - {"codec_frame_offset", "codec_coalesce", "finished", "is_segment_finished"}:
+            return None
+        if cls._is_truthy_scalar(meta.get("finished")):
+            return None
+        offset, audio = meta.get("codec_frame_offset"), codes["audio"]
+        if (
+            isinstance(offset, int)
+            and not isinstance(offset, bool)
+            and offset >= 0
+            and isinstance(audio, torch.Tensor)
+            and audio.ndim == 2
+            and audio.shape[1] > 0
+        ):
+            return offset, audio
+        return None
 
     def _commit_received_chunk(
         self,
@@ -573,11 +671,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                             for subkey, subvalue in value.items():
-                                # A 1-D audio tensor is represented by the
-                                # placeholder prompt above, but sibling fields
-                                # such as the reference voice still belong in
-                                # the current runtime snapshot.
-                                if subkey == "audio" and not use_tensor_codes:
+                                # Full snapshots retain their codec payload:
+                                # first-prefill input_ids can still contain the
+                                # runner's reserved placeholder tokens. Models
+                                # must be able to read the producer's real codes.
+                                if subkey == "audio" and not use_tensor_codes and not replace_snapshot:
                                     continue
                                 merged_sub[subkey] = subvalue
                             if merged_sub:
@@ -657,7 +755,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = (
+            unflatten_payload(raw_mm if isinstance(raw_mm, dict) else dict(raw_mm))
+            if isinstance(raw_mm, Mapping)
+            else raw_mm
+        )
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -819,6 +921,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def _clear_receiver_state_locked(self, request_id: str) -> None:
         """Clear receiver state while ``_receiver_state_lock`` is held."""
         self._active_streams.pop(request_id, None)
+        self._active_stream_waiters.pop(request_id, None)
         self.upstream_exhausted_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
@@ -830,6 +933,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._streaming_condition_lengths.pop(request_id, None)
         self._streaming_condition_seqs.pop(request_id, None)
         self._registered_load_entries.pop(request_id, None)
+        self._codec_lookahead.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
@@ -965,8 +1069,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 waiting_queue.prepend_requests([request])
             return
 
-        self._promote_active_streams(running_queue)
-        self._promote_active_streams(waiting_queue)
+        # Normally ``restore_queues`` makes every parked request visible
+        # before the next scheduler tick.  A segment-boundary yield can race
+        # with that finally path, though, so include the private deques in the
+        # admission snapshot as well.  Looking at all queues in one pass is
+        # also important for fairness: a yielded running request must not
+        # reacquire a slot before an eligible waiting peer has been seen.
+        self._promote_active_streams(
+            running_queue,
+            self._held_non_active,
+            waiting_queue,
+            self.waiting_for_chunk_running_requests,
+            self.waiting_for_chunk_waiting_requests,
+        )
         self._process_chunk_queue(
             waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
         )
@@ -975,7 +1090,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._apply_pending_ar_prompt_updates(scheduler_requests)
         self._requeue_replaced_prompts(waiting_queue, running_queue)
-        self._promote_active_streams(waiting_queue)
+        self._promote_active_streams(
+            waiting_queue,
+            self.waiting_for_chunk_running_requests,
+            self.waiting_for_chunk_waiting_requests,
+            self._held_non_active,
+        )
         self._preempt_non_active_running(waiting_queue, running_queue)
 
     def update_streaming_prompt_for_condition(
@@ -1136,17 +1256,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.requests_origin_status[request_id] = RequestStatus.WAITING
             waiting_queue.add_request(request)
 
-    def _promote_active_streams(self, queue: Any) -> None:
-        if len(self._active_streams) >= self._active_window:
+    def _promote_active_streams(self, *queues: Any) -> None:
+        """Fill available slots in persistent FIFO order across scheduler ticks.
+
+        Register waiters even while the window is full. Only requests visible
+        in the supplied queues are eligible; a segment-stop request can be
+        temporarily off-queue until the scheduler parks it for its next input.
+        """
+        if self._active_window <= 0:
             return
-        for request in list(queue):
+        candidates: set[str] = set()
+        for queue in queues:
+            for request in queue:
+                request_id = request.request_id
+                candidates.add(request_id)
+                if request_id not in self._active_streams:
+                    # Updating an existing dict entry preserves its FIFO rank.
+                    self._active_stream_waiters[request_id] = request
+        for request_id in tuple(self._active_stream_waiters):
             if len(self._active_streams) >= self._active_window:
-                return
-            request_id = request.request_id
-            if request_id in self._active_streams:
+                break
+            if request_id not in candidates:
                 continue
-            # Iterating the existing queue preserves FIFO admission.
-            self._active_streams[request_id] = request
+            self._active_streams[request_id] = self._active_stream_waiters.pop(request_id)
 
     def _ensure_active_stream(self, request: Request) -> bool:
         if self._active_window <= 0:
@@ -1155,9 +1287,33 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if request_id in self._active_streams:
             self._active_streams[request_id] = request
             return True
+        self._active_stream_waiters[request_id] = request
         if len(self._active_streams) >= self._active_window:
             return False
+        if next(iter(self._active_stream_waiters)) != request_id:
+            return False
+        self._active_stream_waiters.pop(request_id)
         self._active_streams[request_id] = request
+        return True
+
+    def yield_active_stream(self, request_id: str) -> bool:
+        """Release one bounded-window slot at a resumable segment boundary.
+
+        Native duplex requests are intentionally long lived, so waiting for
+        whole-request cleanup before releasing ``_active_streams`` lets the
+        first K sessions monopolize a K-sized active window forever.  A local
+        segment stop is the safe scheduling boundary: no model step for that
+        segment remains runnable and the request is about to re-enter the
+        connector wait path for its next input.  Removing only the admission
+        marker here preserves all per-request prompt/connector state while
+        allowing FIFO promotion of another parked session on the next tick.
+        """
+        if self._active_window <= 0:
+            return False
+        request = self._active_streams.pop(request_id, None)
+        if request is None:
+            return False
+        self._active_stream_waiters[request_id] = request
         return True
 
     def collect_timed_out_request_ids(self, timeout_s: float) -> set[str]:
@@ -1427,7 +1583,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
-            request_ids = requests.keys()
+            request_ids = requests.keys() if requests is not None else ()
 
         connector_owned_ids = {
             request.request_id

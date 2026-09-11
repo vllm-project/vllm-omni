@@ -270,17 +270,18 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             req_to_new_blocks=req_to_new_blocks,
         )
 
-        cached_reqs_data = OmniCachedRequestData(
-            req_ids=cached_reqs_data.req_ids,
-            resumed_req_ids=cached_reqs_data.resumed_req_ids,
-            new_token_ids=cached_reqs_data.new_token_ids,
-            all_token_ids=cached_reqs_data.all_token_ids,
-            new_block_ids=cached_reqs_data.new_block_ids,
-            num_computed_tokens=cached_reqs_data.num_computed_tokens,
-            num_output_tokens=cached_reqs_data.num_output_tokens,
-            prompt_token_ids=cached_prompt_token_ids,
-            additional_information=cached_additional_information,
-        )
+        cached_request_data = {
+            "req_ids": cached_reqs_data.req_ids,
+            "resumed_req_ids": cached_reqs_data.resumed_req_ids,
+            "new_token_ids": cached_reqs_data.new_token_ids,
+            "all_token_ids": cached_reqs_data.all_token_ids,
+            "new_block_ids": cached_reqs_data.new_block_ids,
+            "num_computed_tokens": cached_reqs_data.num_computed_tokens,
+            "num_output_tokens": cached_reqs_data.num_output_tokens,
+            "prompt_token_ids": cached_prompt_token_ids,
+            "additional_information": cached_additional_information,
+        }
+        cached_reqs_data = OmniCachedRequestData(**cached_request_data)
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
 
@@ -529,6 +530,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
+                        self.chunk_transfer_adapter.yield_active_stream(req_id)
                         self.chunk_transfer_adapter.segment_finished_requests.discard(req_id)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)

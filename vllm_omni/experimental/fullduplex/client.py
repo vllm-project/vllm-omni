@@ -210,6 +210,7 @@ class RealtimeEventCollector:
     event_received_at_s: list[float] = field(default_factory=list)
     response_audio: dict[str, list[bytes]] = field(default_factory=dict)
     response_ids: list[str] = field(default_factory=list)
+    playback_acknowledgements: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     output_sample_rate_hz: int = 24_000
 
     @staticmethod
@@ -244,6 +245,13 @@ class RealtimeEventCollector:
             sample_rate_hz = stored_event.get("sample_rate_hz")
             if isinstance(sample_rate_hz, int) and sample_rate_hz > 0:
                 self.output_sample_rate_hz = sample_rate_hz
+        if event_type == "playback.acknowledged":
+            payload = stored_event.get("event")
+            acknowledgement = payload if isinstance(payload, dict) else stored_event
+            item_id = acknowledgement.get("item_id")
+            if isinstance(item_id, str) and item_id.startswith("item_"):
+                ack_response_id = item_id.removeprefix("item_")
+                self.playback_acknowledgements.setdefault(ack_response_id, []).append(dict(acknowledgement))
 
     def count(self, event_type: str) -> int:
         return sum(event.get("type") == event_type for event in self.events)
@@ -272,6 +280,20 @@ class RealtimeEventCollector:
     def response_is_done(self, response_id: str) -> bool:
         return any(
             event.get("type") == "response.done" and self.response_id(event) == response_id for event in self.events
+        )
+
+    def response_playback_reserved(self, response_id: str) -> bool:
+        """Return whether the server acknowledged this response's 0 ms slot."""
+        return any(
+            acknowledgement.get("played_ms") == 0 and acknowledgement.get("committed_ms") == 0
+            for acknowledgement in self.playback_acknowledgements.get(response_id, ())
+        )
+
+    def response_playback_history_committed(self, response_id: str) -> bool:
+        """Return whether any playback ACK materialized response history."""
+        return any(
+            acknowledgement.get("history_committed") is True
+            for acknowledgement in self.playback_acknowledgements.get(response_id, ())
         )
 
     def errors(self) -> list[dict[str, object]]:
@@ -447,14 +469,18 @@ class RealtimeDuplexClient:
         *,
         max_size: int = 64 * 1024 * 1024,
         additional_headers: dict[str, str] | None = None,
+        reserve_response_history: bool = True,
     ) -> None:
         self.url = url
         self.max_size = max_size
         self.additional_headers = additional_headers
+        self.reserve_response_history = reserve_response_history
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
         self._media_clock_ms = 0
+        self._playback_reservation_ids: set[str] = set()
+        self._playback_ack_ms: dict[str, int] = {}
 
     async def __aenter__(self) -> RealtimeDuplexClient:
         self._ws = await websockets.connect(
@@ -483,10 +509,16 @@ class RealtimeDuplexClient:
                     continue
                 event = json.loads(raw)
                 if isinstance(event, dict):
-                    event.setdefault("_media_clock_ms", self._media_clock_ms)
-                    self.events.add(event)
+                    await self._handle_server_event(event)
         except ConnectionClosed:
             return
+
+    async def _handle_server_event(self, event: dict[str, object]) -> None:
+        event.setdefault("_media_clock_ms", self._media_clock_ms)
+        self.events.add(event)
+        response_id = self.events.response_id(event)
+        if self.reserve_response_history and event.get("type") == "response.created" and response_id is not None:
+            await self.reserve_playback_history(response_id)
 
     async def send(self, event: dict[str, object]) -> None:
         await self._ws.send(json.dumps(event))
@@ -681,7 +713,29 @@ class RealtimeDuplexClient:
             if not pcm16 and self.events.response_is_done(response_id):
                 continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
+            if played_ms <= self._playback_ack_ms.get(response_id, -1):
+                continue
             await self.send_playback_ack(response_id, played_ms)
+            self._playback_ack_ms[response_id] = played_ms
+
+    async def reserve_playback_history(self, response_id: str) -> bool:
+        """Reserve an assistant history slot before a later user commit.
+
+        Full-duplex input may continue while the response is generated.  The
+        zero-progress ACK fixes the response's history position without
+        claiming that any audio has already played.  A later playback ACK can
+        then materialize or extend the same slot with the actual cursor.
+        """
+        if response_id in self._playback_reservation_ids:
+            return False
+        self._playback_reservation_ids.add(response_id)
+        try:
+            await self.send_playback_ack(response_id, 0)
+        except BaseException:
+            self._playback_reservation_ids.discard(response_id)
+            raise
+        self._playback_ack_ms[response_id] = max(0, self._playback_ack_ms.get(response_id, 0))
+        return True
 
     async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
         await self.send(

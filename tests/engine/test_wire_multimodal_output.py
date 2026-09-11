@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Msgpack roundtrip tests for OmniEngineCoreOutputs with multimodal_output.
 
 Validates that tensor-only payloads survive msgspec encode/decode and that
@@ -51,6 +51,28 @@ def test_empty_multimodal_roundtrip():
     )
     decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[eco]))
     assert decoded.outputs[0].multimodal_output is None
+
+
+def test_streaming_segment_input_metadata_roundtrip():
+    """Scalar control metadata uses its own msgpack-safe output field."""
+    metadata = {
+        "duplex": {
+            "data_plane": True,
+            "session_id": "session-1",
+            "seq": 3,
+            "final": True,
+        }
+    }
+    eco = OmniEngineCoreOutput(
+        request_id="req-segment-metadata",
+        new_token_ids=[151718],
+        finish_reason=None,
+        streaming_segment_input_metadata=metadata,
+    )
+
+    decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[eco]))
+
+    assert decoded.outputs[0].streaming_segment_input_metadata == metadata
 
 
 def test_multiple_tensor_keys_roundtrip():

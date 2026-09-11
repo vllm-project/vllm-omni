@@ -15,33 +15,46 @@ cleanup applied after published commit `e011d936`, and the remaining work that
 must not be advertised as complete. Implemented contracts and future
 architecture work are called out separately below.
 
+The current 0.28 interface cleanup is specified in
+[Transactional KV Append](feature/duplex_kv_append.md).
+It unifies the shared OpenAI Stage0 path for MiniCPM-o, PersonaPlex, and
+Nemotron while keeping model replay capability separate. The review snapshot
+and dated validation sections below describe earlier trees, including their
+then-current deployment limits. They are not acceptance evidence for this
+cleanup or proof that the MiniCPM answer-ending risk has been resolved.
+
 The checkpoint preserves the active runtime path already exercised on H20. It does
 not introduce another reducer, controller, worker provider, or shadow runtime.
 
-## Review Snapshot
+## Historical Review Snapshot
 
 - PR: `vllm-project/vllm-omni#3907`
 - Published head before this refactor: `e011d936`
 - Published base snapshot: `62589203`
 - Published diff: 93 files, approximately `+29.2k/-0.6k`
-- Local runtime and pytest validation: intentionally not used
-- Required validation environment: an NVIDIA H20 CUDA host
+- Local runtime and pytest validation: used only for fast contract checks
+- Required production evidence: a matching CUDA host and a vLLM build exposing
+  the streaming-prompt scheduler API
 - PR head reviewed for the current cleanup:
   `f4f78fa555af4d65e46b003022d352ca2ea9d703`
 - Validated tree: the uncommitted refactor synchronized file-for-file to the
   isolated H20 worktree on 2026-07-20
 
-The current tree has received fresh H20 focused and E2E validation against vLLM
-0.25.0. The final affected matrix includes the pre-response continuation and
-Stage1 CUDA Graph padding regressions. The checked-in MiniCPM profile admits
-two concurrent sessions through an engine-owned limit; a third
-session was rejected and capacity returned after one session closed. The two
-accepted sessions independently completed their audio, transcript, response,
-playback, and close lifecycles. This is isolation and admission evidence for the
-tested two-session deployment, not a production fairness, arbitrary-capacity,
-or failure-recovery claim. The validated paths include the MiniCPM duplex
-runtime extension, typed resumable policy, extracted control plane and clients, request
-preregistration, typed direct-output decision, engine-managed two-session
+The earlier runtime checkpoint received focused H20 E2E validation against
+vLLM 0.25.0. The scheduler-native extension has now also received focused H200
+E2E and fault-injection validation against vLLM 0.28.0 plus streaming-prompt
+source commit `ed6e712edd77c041bab62836157b578a76799489`. The final historical
+H20 affected matrix includes the pre-response continuation and
+Stage1 CUDA Graph padding regressions. The historical H20 profile admitted two
+concurrent sessions and rejected a third until capacity was returned. The
+current checked-in MiniCPM profile admits four concurrent sessions through the
+same engine-owned limit; on H200, two synchronized four-session/two-turn trials
+completed all eight responses with independent request identity and no errors.
+This is isolation, admission, and bounded fairness evidence for the tested
+single-H200 four-session deployment, not an arbitrary-capacity SLO. The
+validated paths include the experimental runtime
+extension, typed resumable policy, extracted control plane and clients, request
+preregistration, typed direct-output decision, engine-managed four-session
 capacity in the checked-in deploy profile, separate public/runtime configuration
 channels, private Session ledgers, ordered `session.update`, the MiniCPM runner
 fast path, continuous
@@ -50,7 +63,8 @@ scope limits are recorded below.
 
 ## Scope
 
-The checkpoint keeps these verified contracts:
+The implementation targets these contracts; the exact cleanup snapshot must
+meet the acceptance criteria below before it is signed off:
 
 - MiniCPM Stage0 conversation KV continuity;
 - Stage1 TTS and Token2Wav continuity;
@@ -70,12 +84,18 @@ The checkpoint keeps these verified contracts:
   model and per-session VAD state;
 - existing JoyVL behavior.
 
-The checkpoint does not claim:
+The current tree does not claim:
 
-- scheduler-native KV append;
+- raw KV-tensor append (the implemented primitive is prompt-token append with
+  reuse of resident scheduler KV);
 - an acoustic-onset-to-cancel latency target across arbitrary client chunk sizes;
-- production multi-session admission, fairness, capacity, or failure recovery;
-- bounded long-session KV;
+- raw KV-tensor live migration after worker/replica loss (MiniCPM's separate
+  replay capability can create a new physical request and rebuild from
+  committed prompt units; PersonaPlex and Nemotron retain typed safe failure
+  without automatic prompt replay);
+- H20/H100 sign-off for the scheduler-native delta (the fresh evidence is H200);
+- arbitrary-capacity fairness or starvation SLOs; configured session limits
+  and earlier CUDA results require validation on the exact cleanup snapshot.
 - audio/video synchronization beyond one camera frame per model unit (camera
   frames ride the audio appends as `video_frames`; the wire contract is in the
   [Realtime Duplex API](../serving/realtime_duplex_api.md) guide).
@@ -94,7 +114,9 @@ WebSocket
   -> DuplexControlPlane + DuplexSessionRuntimeManager
   -> MiniCPM DuplexRuntimeExtension + engine session/stage bindings
   -> StagePool
-  -> resumable scheduler request
+  -> admit_duplex_request_async for the first unit
+     / StageEngineCoreProc.append_streaming_prompt_unit for later units
+  -> vLLM 0.28 retained request + StreamingUpdate
   -> MiniCPM Stage0
   -> Stage1 TTS / Token2Wav
   -> output processor
@@ -169,6 +191,11 @@ Properties covered by focused tests:
 The router replaces the global RPC lock. It supports out-of-order replies,
 timeout unregister, late-result rejection, fatal-error broadcast, and close
 unblocking.
+
+`control_id` is only reply correlation. Logical append retry identity is the
+separate `operation_id`, while stale epoch/turn rejection is owned by the
+`DuplexFence` and session runtime. The RPC router does not own either append
+idempotency or same-session ordering.
 
 Additional lifecycle rules:
 
@@ -470,14 +497,48 @@ sampling generation unchanged.
 | `reaper_interval_s` | `5.0` | Orchestrator | Sets the cadence for lease expiry and pending cleanup retries. |
 | `resume_replay_ttl_s` | `60.0` | API attachment registry | Expires replay events retained for resume or takeover. |
 | `resume_replay_max_bytes_per_session` | `8388608` | API attachment registry | Bounds each session's replay buffer. |
+| `attachment_io_timeout_s` | `5.0` | API attachment registry | Bounds the whole resume activation/replay and each terminal notification/close; must be finite and positive. |
 | `max_pending_input_bytes_per_session` | `16777216` | API session input ledger | Applies per-session byte backpressure before input is admitted. |
 | `max_pending_turns_per_session` | `4` | API session input ledger | Bounds queued turns that have not completed runtime processing. |
+| `max_pending_appends_per_session` | `4` | Engine control plane | Bounds queued/in-flight appends per session; cancel and close bypass the limit and preempt pending append waits. |
 | `max_sessions` | `1` | Engine session manager | Atomically enforces admission; closing sessions retain capacity until cleanup finalizes. |
 | `completed_append_cache_size` | `256` | Engine session manager | Bounds completed append idempotency records per session. |
 
 Deploy profiles may lower or raise these values to match scheduler capacity,
 but clients cannot override them. The engine remains authoritative for
 admission and cleanup ownership even when the API performs an early check.
+
+The attachment journal owns immutable serialized event snapshots, not references
+to mutable conversation items. Accounting, live delivery and resume replay use
+the same snapshot. Attachments may expose a `send_text` callback to deliver the
+encoded snapshot as a WebSocket text frame without JSON round-tripping; the
+dictionary callback remains the compatibility path and handles control events.
+Pending sends use a completion future that revocation can resolve directly,
+without a separate Event.wait task for every message. On Python 3.12+, the
+default event loop can finish nonblocking sends eagerly in an isolated task
+context. Custom task factories are honored, older Python uses normal scheduling,
+and every 32 inline completions yield to maintain cooperative progress.
+Per-session attachment revocation releases a blocked writer
+without cancelling its model-output producer. Resume serializes the engine
+lease CAS with transport activation; cancellation preserves the last accepted
+credential while detached, and an in-flight CAS records its result before a
+retry can issue another CAS. Generation and incarnation fences still reject
+old attachments and closed sessions.
+
+Runtime terminal events have per-session ordered cleanup tasks. A slow task
+cancellation in one session does not delay another's cleanup. Retired transport
+notification/close is tracked, bounded best-effort work outside that cleanup.
+Transport callbacks must remain asynchronous; cancelling a callback cannot undo
+bytes already handed to its old socket, but its completion cannot change the
+new attachment or its journal. A callback that delays cancellation remains
+tracked until it completes.
+
+The Realtime projector releases terminal response assembly state, retaining at
+most 256 recent terminal IDs. After `response.created` establishes the serving
+lifecycle, unknown deltas/terminals are dropped instead of creating response
+state, including identities evicted from that cache. Conversation items retain
+the completed content and playback truncation marks until explicit deletion or
+session teardown. This is not automatic history eviction or model KV compaction.
 
 ### Client-side companion package
 
@@ -562,24 +623,251 @@ operation fails. Unregistered outputs, including names that merely use the old
 `duplex-` prefix, are dropped. Timeout, cancel, and close remove the
 preregistered state.
 
-## Why Scheduler Changes Remain
+## Scheduler-Native Prompt Append
 
-Serving cannot preserve model KV after a segment ends. The scheduler must keep
-one resumable request in a waiting state and accept a later update:
+`engine.kv_append` detects the single supported vLLM 0.28 retained-request
+contract without modifying upstream classes. Session open checks that contract,
+every live Stage0 client's Omni methods, and a positive context limit. The
+shared OpenAI adapters for MiniCPM-o, PersonaPlex, and Nemotron all use this
+transactional Stage0 path. Unsupported native submission is rejected; it no
+longer falls back to `StagePool.submit_update`.
+
+The default dependency remains vLLM 0.28.0. Its native implementation uses
+`resumable` requests and `StreamingUpdate`; Omni's atomic append utility layers
+operation identity and lifecycle control over that retained-KV mechanism. A
+version pin alone does not supply Omni's sampling, retry, or recovery contracts.
+
+The first unit uses the explicitly declared client
+`admit_duplex_request_async`, which calls upstream `add_request_async` with a
+resumable request. Initial acknowledgement waits for the complete prefill
+(`num_computed_tokens >= num_prompt_tokens`), not a held last token. Subsequent
+units use `StageEngineCoreProc.append_streaming_prompt_unit`, declared on the
+Omni-owned Core subclass. There is no external finalize RPC.
+
+The cleanup removes `_streaming_prompt_compat.py`, its experimental forwarding
+module, import-time append/admission patches on upstream `EngineCore` and
+`AsyncMPClient`, the synthetic status alias, dual-version scheduler branches,
+and the old worker `new_prompt_token_ids` path. The Omni scheduler's private
+`_append_duplex_tokens` helper delegates to its metadata-aware
+`_update_request_as_session` override and then upstream's private method. That
+upstream dependency remains an upgrade boundary; this is not a claim that
+Omni uses only stable public vLLM APIs.
+
+The scheduler keeps one request and its allocated KV blocks alive across model
+unit boundaries:
 
 ```text
 RUNNING
   -> segment stop
-WAITING_FOR_STREAMING_REQ  (KV retained)
-  -> next append
+WAITING_FOR_STREAMING_REQ    (request and prior KV blocks retained)
+  -> append_streaming_prompt_unit(operation_id)
+WAITING                     (update and receipt commit finish in one utility)
+  -> schedule
 RUNNING
   -> session close
 FINISHED                   (KV released)
 ```
 
-Scheduler responsibilities are limited to resumable request state, runtime
-context update, stop/boundary handling, and final release. Scheduler must not
-own response IDs, playback, overlap, Realtime events, or model policy.
+Prompt-token append reuses retained KV. The update and `_commit_native_append`
+execute synchronously in one EngineCore utility on the scheduler thread;
+scheduling cannot interleave between them. The latter is internal receipt
+bookkeeping, not another RPC or scheduling phase. The utility writes a
+per-request pending journal after token mutation and before receipt commit.
+If commit raises after token acceptance, only the same operation ID and full
+digest may retry. A committed marker lets a retry publish its receipt without
+committing twice, even if the model has already completed the new segment.
+A different operation or fingerprint is rejected while the journal is pending,
+so recovery cannot append the tokens
+again. A bounded, scheduler-owned receipt cache deduplicates a lost-response
+retry by `operation_id`; a full fingerprint binds the ID to the raw payload,
+final bit, configuration generation, materialized prompt/model buffer, sampling
+metadata, and token IDs. Reusing the same ID with any different input is
+rejected, and StagePool rejects a native update that arrives without that full
+fingerprint instead of degrading to token-only idempotency. The scheduler
+utility repeats that validation before request lookup or mutation, so an
+alternate caller cannot bypass the engine boundary and regain token-only
+deduplication. Initial native admission likewise validates both fields before
+replica selection or output registration. Evicted receipts leave bounded digest tombstones, so an old retry
+fails explicitly instead of being physically appended again. Every native
+append control, including the first request admission, must carry a non-empty
+operation ID before request resources are reserved. Serving-generated silence
+continuations receive one UUID when their task is created and reuse that stable
+ID for any retry. A resident physical request remains pinned to its selected
+Stage0 replica.
+
+`supports_prompt_replay` is independent of atomic append. Only MiniCPM enables
+it; PersonaPlex and Nemotron explicitly disable it. They cannot enter automatic
+replay/rebuild or context rollover merely because their Stage0 uses append.
+Replica loss instead returns typed safe failure such as
+`native_kv_replica_lost`; reconstructing codec or recurrent model state requires
+its own model contract.
+
+For MiniCPM sessions with replay enabled, each successful materialized append
+is also recorded as a complete unit in an engine-owned journal bounded by
+token and byte limits. When membership reports that replica lost and a healthy
+replica remains, the next
+append creates a new physical request generation, replays only committed units,
+then applies the live append. This is bounded prompt replay and KV rebuild, not
+transfer of raw KV tensors. An uncertain append is never replayed across
+replicas. A missing replacement, an incomplete/oversized journal, or a replay
+failure returns a typed safe failure; when no recovery is possible the session
+is terminal and the client must reopen/replay. Caller deadlines bound readiness
+polling and the utility await, preventing a timed-out append from holding the
+per-session control tail for the old fixed 120-second window. A cancel or close
+preempts pending append or replay work and then aborts the physical request; it
+does not cancel unrelated open/signal/touch/resume controls or re-cancel an
+append task that is already publishing its correlated cancellation reply.
+Terminal control waits for earlier session controls to finish, and normal
+same-session controls remain FIFO.
+After an uncertain utility timeout, StagePool retains one bounded operation
+guard and output registration: only the same operation ID/fingerprint/tokens
+may retry until its scheduler receipt resolves, so a later append cannot jump
+past an operation that may already have committed. The serving bridge retries
+that exact operation once on a transport timeout or typed `timeout` result,
+reusing its payload and fence; native session open rejects engine clients that
+cannot accept `operation_id`, so the retry cannot silently fall back to an
+at-least-once append.
+
+Sampling updates carry the new immutable `SamplingParams` through StagePool,
+the explicit client/Core utility methods, and the scheduler/worker.
+Utility arguments decoded as `Any` are explicitly reconstructed as
+`SamplingParams`. The scheduler also updates its separate `max_tokens` field,
+which upstream vLLM 0.28.0 does not update in `_update_request_as_session`.
+Cached worker updates refresh InputBatch sampling tensors; a seeded generator
+is retained unless its seed changes.
+
+Partial prefills have no delivered sample. Their duplex sampling rows are
+explicitly marked disabled, so the model cannot advance a turn fence,
+terminator, repetition history, or RNG for a discarded token. This also applies
+when a long prompt is recomputed in several batches after KV preemption.
+
+Logical-epoch receipt ownership is separate from physical KV ownership. The
+session retains SHA-256 tombstones for evicted operation IDs across rollover
+and replica replay. At most 65,536 tombstones are retained; capacity is checked
+before submission, and exhaustion requires cancel/reopen. Epoch advancement
+clears this namespace only after old-fence operations become invalid.
+
+MiniCPM also retains a physical-request-owned CPU history of actual prepared
+audio/vision embeddings. It is bounded by 40,960 token positions and 512 MiB
+per physical request and is released by terminal request cleanup. Preemption
+recomputation overlays the historical spans at their original positions;
+computed output-token gaps use ordinary token embeddings. This is local
+recomputation support, not KV live migration. The engine publishes
+`kv_append_start` for each unit so the worker can verify its exact prepared
+span even after preemption resets the current computed offset. `final=True`
+arms the turn-end fence but does not reserve an extra audio unit.
+
+Failed input preparation is request-local: the runner latches the error,
+masks that request's KV write slots with `PAD_SLOT_ID`, suppresses its generated
+tokens and downstream payload, and returns `model_input_errors`. The scheduler
+terminates it with `FINISHED_ERROR` rather than parking/resuming invalid KV.
+The scheduler keeps a bounded recent-error cache (256 entries, messages capped
+at 1024 characters) so a racing readiness RPC returns the original typed
+`model_input_error` after physical request cleanup instead of `not_found`.
+The same failure hooks are wired on CUDA and NPU; hardware evidence for one
+platform must not be presented as validation of the other.
+
+Stage0 rejects an append before mutation when projected retained context exceeds
+`max_model_len`; the MiniCPM profile pins that hard ceiling to 40960. Before the
+ceiling, MiniCPM's replay-enabled control plane plans a new physical generation at the configured
+utilization fraction, retains the newest complete append units that fit the
+rollover budget, and rebuilds KV before accepting the live append. It never
+splits an append unit. This bounds resident context and replay storage, but it
+does discard older prompt units: it is not automatic summarization, semantic
+compression, or lossless arbitrary-context compaction. If even the rebased
+candidate cannot fit, the append fails before old KV is destroyed. Successful
+rebuilds distinguish historical replay from a live candidate rebased onto an
+empty journal: only historical outputs are suppressed. The model publishes an
+explicit per-step replay flag, including `false` on live output; accumulation
+replaces this flag rather than concatenating it. Suppression reads both wire
+dicts and structured completion payloads so delayed historical output cannot
+escape merely because the request has already switched back to live mode.
+Successful append replies expose current context, limit, utilization, receipt count, and
+deduplication state. Prometheus exports bounded-label append outcomes/latency,
+control-tail wait, active/closing sessions, KV/context growth, receipt growth,
+replay-journal size, resource generation, rebuild outcomes, and replica-affinity
+loss. No metric uses session, request, or operation IDs as labels. An
+unrecoverable context failure remains non-retryable for that operation but does
+not silently discard the session: `input.cancel`/barge-in rotates the fence and
+aborts the exhausted resident request, `session.close` releases it immediately,
+and idle/disconnect lease expiry is the final safety-net reclamation path.
+
+The current interleave point is a completed model unit: append waits for
+`WAITING_FOR_STREAMING_REQ`. It does not mutate an actively decoding prompt.
+Scheduler responsibilities are request/KV state, runtime metadata,
+stop/boundary handling, retry receipts, and final release. Response IDs,
+playback, overlap, Realtime events, and model policy remain outside this owner.
+
+The generic `StagePool.submit_update` retains active public-streaming,
+downstream talker/code2wav, diffusion, and PD consumers. PersonaPlex's
+independent browser backend also retains its frame-stepper/session lifecycle.
+Neither is a retired KV shim. See the feature design's removed/protected
+boundaries before proposing any further deletion.
+
+### Earlier implementation evidence
+
+The following records describe source snapshots before the single-contract
+cleanup. They do not establish its correctness, capacity, or performance.
+The current MiniCPM profile keeps Stage0 async scheduling disabled; enabling
+it and validating complete answers require separate runs.
+
+Native capability validation requires a positive Stage0 context limit. The
+MiniCPM profile keeps `async_scheduling=false` on every platform. A 2026-09-06
+follow-up added a worker-side unit-stop fence and consistent runner/CLI
+scheduler selection. Aligned async-on now completes the H200
+four-session gate; the failures described below are historical. The recorded
+Seed-TTS performance samples below use chat fallback, not native KV append;
+they cannot establish native speedup or its absence. Native performance needs
+separate validation, so the default remains off. See
+[the follow-up validation](../validation/kv_append_v028.md).
+The scheduler contains an async fence that rolls back an unconsumed lookahead placeholder,
+marks in-flight output stale, sets `drop_stale_output`, clears speculative
+tokens, and rejects impossible placeholder/computed-token state before append.
+It passed a real H200 single-session/two-turn run with
+`OmniARAsyncScheduler`, stable request/replica identity, and monotonic context
+growth. It did not pass the synchronized four-session liveness gate: with
+async scheduling enabled, Stage0 EngineCore exited under concurrent append,
+none of the four sessions reached its first `response.created`, and the
+remaining requests correctly surfaced `native_kv_replica_lost`. With async
+scheduling disabled, all four sessions completed two turns in each of two
+trials. Therefore the checked-in profile fails closed with async scheduling
+disabled and admits the validated four-session shape. The async fence and
+regression tests remain groundwork, not an enabled production capability.
+
+The scheduler-native path was added after the historical H20 evidence
+summarized at the top of this document. CPU contract tests cover the intended atomicity,
+deduplication, capability, deadline, and replica-affinity rules. On 2026-09-04,
+the formal affected CPU L1 ran against streaming-prompt vLLM source commit
+`ed6e712edd77c041bab62836157b578a76799489` on the H200 host and passed 519
+tests: 24 scheduler-mixin, 323 orchestrator/error/duplex-handler, 38 control-
+plane, 17 membership, and 117 other affected tests. A separate 40-test router,
+correlated-client, AsyncOmni abort/output regression group passed in the same
+formal environment. The dependency-isolated local smoke also passed all 38
+control-plane tests and 12 focused scheduler append/journal tests; that smaller
+run remains state-machine evidence, not the basis of the formal count. The added
+control-plane case saturates one
+session's four-entry append backlog while 31 independent sessions complete,
+then verifies that close preempts and reclaims every hot-session append. On
+H200, scheduler-native core and expansion groups passed 4 and 3 tests. The
+async-on two-turn run used `OmniARAsyncScheduler`, retained one request and
+replica, and grew Stage0 context monotonically under the configured 40960-token
+limit. A committed-reply-loss injection proved that Serving retries the same
+operation ID and the scheduler deduplicates it to one receipt and one context
+increment. A stopped Stage0 replica proved both `input.cancel` and
+`session.close` can preempt a pending append within the bounded control path.
+A killed resident-KV replica in a two-replica Stage0 topology rebuilt committed
+prompt units on the surviving replica under a new physical request generation;
+the single-replica loss path still produced `native_kv_replica_lost`, terminated
+the session safely, and reclaimed resources. Neither path migrates raw KV
+tensors. The reduced-context E2E exercised planned rollover before its
+256-token hard ceiling, kept every physical generation within the limit, and
+continued on a new request generation. Oversized rebased candidates remain
+typed `rate_limit_error/resource_exhausted` failures before old KV is removed.
+The async-on Seed-TTS comparison is recorded below. Later synchronized
+four-session/two-turn trials with async-off completed 8/8 responses twice;
+async-on instead terminated Stage0 EngineCore before any first response. The
+default single-GPU profile therefore admits four sessions and keeps Stage0
+async scheduling disabled.
 
 ## Serving and Compatibility Boundaries
 
@@ -807,30 +1095,162 @@ Graph capture. This is a model execution constraint, not an E2E-only override.
 
 ### Resource capabilities
 
-At the time of this snapshot the checked-in MiniCPM duplex deploy profile set
-Stage0 and Stage1 `max_num_seqs` to two and configured the engine runtime
-manager with `max_sessions=2`; the duplex settings have since been folded into
-`vllm_omni/deploy/minicpmo_4_5.yaml`, which admits four sessions
-(`duplex_session.max_sessions: 4`, matching its stage `max_num_seqs`). The
-Realtime capability response advertises
-multi-session and same-replica multi-session support with
+The checked-in MiniCPM duplex deploy profile retains four scheduler sequence
+slots in each stage and configures both the engine runtime manager and Stage1
+active-stream window with `max_sessions=4`; Stage2 remains ungated so it cannot
+choose a disjoint active set. The Realtime capability response therefore
+advertises multi-session and same-replica multi-session support with
 `session_admission_mode="engine_managed"`. Client session fields cannot raise
-this server-owned limit. Fresh E2E evidence covers two concurrent sessions in
-both model-policy and response-required modes, rejection of a third session,
-and admission of a replacement after one accepted session closes. It does not
-establish behavior beyond that configured limit.
+this server-owned limit. These are configuration values, not a new capacity
+sign-off. Earlier H20/H200 evidence is recorded below against its own source
+snapshots. The cleanup requires fresh liveness and complete-answer checks;
+the configured four-session shape alone does not establish fairness or an SLO.
+
+The Stage1 active window uses a persistent FIFO across scheduler ticks. A
+segment-boundary yield joins its tail, behind every existing waiter, and
+terminal cleanup removes the queue entry. A one-promotion cooldown is not
+sufficient: with `N > K + 1` the oldest streams can keep alternating and starve
+later ones. CPU regressions cover repeated `K=1/2/4, N=K+2` rotations and waiter
+cancellation; the four-session CUDA gate also includes `K=2` contention rather
+than relying exclusively on the default `K=N=4` shape.
 
 Session leases, lease TTL, resumable attachment, orphan reaping, and bounded
-Serving input/backpressure are implemented. A production admission controller,
-KV-aware capacity budgeting, fairness, starvation metrics, and multi-session
-worker-failure recovery remain follow-up work. Capability claims must stay
-limited to the mechanisms and two-session execution shape validated here.
+Serving input/backpressure are implemented. Engine append admission is bounded,
+different sessions execute independently, and queue/starvation metrics are
+available. For MiniCPM with prompt replay enabled, committed prompt units can
+rebuild KV on a surviving configured replica under a new physical request
+generation; otherwise replica loss safely terminates the affected session.
+PersonaPlex and Nemotron do not enable that recovery capability. Raw KV-tensor
+live migration is intentionally not claimed. Capability claims must stay limited to the
+mechanisms and execution shapes actually validated on the target host.
 
 ## Validation Evidence
 
-All pytest and runtime evidence for this branch must run on the remote H20.
+Production pytest and runtime evidence for this branch must run on a matching
+CUDA host; lightweight local state-machine runs are development smoke evidence
+only. The H20 record below validates the earlier runtime checkpoint. The H200
+record validates the scheduler-native/streaming-prompt delta and does not by
+itself sign off H20 or H100.
 
-### Current synchronized tree
+### Scheduler-native H200 evidence (2026-09-04 through 2026-09-05)
+
+- Streaming-prompt CPU L1: 519 passed; correlated router/AsyncOmni group:
+  40 passed; focused scheduler/config/control additions: 94 passed with 18
+  deselected, including 26 scheduler and 17 deploy-config cases. The later
+  playback-history reservation regression passed 20 focused tests and the
+  affected client/runtime/native-hook/input-processor matrix passed 226 tests.
+- H200 scheduler-native CUDA groups: 4 core tests passed with one deselected,
+  and 3 expansion tests passed. Async-on two-turn continuity passed with one
+  request/replica identity and context/receipt observations remaining
+  monotonic below the 40960-token ceiling. A later default-profile
+  single-session/two-turn run also passed in 171.56 seconds with two responses,
+  no errors, stable physical request/replica identity, and monotonic context
+  growth. The strengthened terminal-boundary rerun passed in 173.60 seconds;
+  both completed responses carried a terminal internal
+  `response.output_audio.delta` with `end_of_turn=true`, a non-negative model
+  turn ID, and explicit scheduler-data-plane/model-runner/KV-backed metadata.
+- The async-off four-session/two-turn gate ran two synchronized trials on one
+  H200. Both completed 8/8 responses with no session error. Workload elapsed
+  time was 24.7671 and 12.0442 seconds (0.3230 and 0.6642 responses/s); mean
+  TTFT was 3703.282 and 1325.641 ms, with maximum TTFT 7371.141 and 4471.330
+  ms. Request and semantic isolation held across all four sessions. The fifth
+  concurrent session was rejected with typed `resource_exhausted: limit=4`.
+  This is the evidence for the default four-session production envelope. A
+  later rerun after strengthening the terminal-boundary contract again passed
+  both trials at 8/8 responses (19.8517 and 13.0358 seconds; 0.4030 and 0.6137
+  responses/s). All 16 completed responses explicitly exposed a genuine model
+  turn EOS through the terminal internal audio-delta metadata described above;
+  cancelled, failed, or synthetic `response.done` events cannot satisfy this
+  assertion.
+- The same four-session gate with Stage0 async-on is an explicit negative
+  result: Stage0 EngineCore exited under concurrent append, 0/4 sessions reached
+  their first `response.created`, and subsequent control surfaced typed
+  `native_kv_replica_lost`. The checked-in profile and CPU config contract keep
+  Stage0 async scheduling disabled.
+- The four-test reliability file covers committed append reply loss,
+  pending-append cancel/close preemption, recoverable resident-KV replica loss,
+  and reduced-context rollover. It does not include the separate terminal
+  single-replica-loss or oversized-candidate rejection cases. Focused H200
+  runs passed committed-reply-loss exactly-once retry in 196.95 seconds,
+  pending-append cancel/close bounded preemption in 163.32 seconds, surviving-
+  replica replay/KV rebuild in 226.37 seconds, and planned context rollover in
+  159.15 seconds. A subsequent unified run of the complete four-test H200
+  reliability file passed 4/4 in 743.31 seconds, so these results are also
+  covered by one clean, serial invocation rather than only by separate focused
+  runs. The recovery/rollover tests assert a successful append on a new physical
+  generation and bounded metrics, then close; they do **not** establish a
+  completed spoken response after rebuild or lossless conversation-history
+  equivalence. The normal-path model-EOS gate above does not close this gap.
+- The async-off one-session/four-turn Seed-TTS reference completed all turns at
+  0.30 request/s, 115.45 ms mean TTFT, 3350.05 ms mean E2EL, 473.05 ms mean
+  audio TTFP, and 0.22 mean audio RTF. The matching async-on run also completed
+  all four turns at 0.30 request/s, with 122.72 ms mean TTFT, 3358.11 ms mean
+  E2EL, 482.31 ms mean audio TTFP, and 0.22 mean audio RTF. This sample shows no
+  throughput gain and slightly worse latency; together with the four-session
+  EngineCore failure, it does not justify enabling async scheduling.
+
+### Review regressions (2026-09-05)
+
+The local review used base/HEAD
+`3cddda978153f3a19ecd691d343854dd074e587d` plus the existing worktree. It
+reproduced and fixed four boundary defects: non-FIFO slot readmission;
+mislabeling an empty-journal live candidate as replay; stale/concatenated replay
+markers on subsequent live output; and suppression that ignored structured
+completion payloads or let unrelated request metadata mask their marker.
+The focused pre-fix tests failed at the corresponding assertions. After the
+fixes, the affected CPU matrix passed **642 tests in 5.79 seconds** on Python
+3.12.3 and streaming-prompt vLLM 0.28.0 in the existing H200 container. The five
+changed production files and `pyproject.toml` were SHA-256 matched between the
+local checkout and that test environment. A separate correlated-router,
+AsyncOmni output/abort and duplex-entrypoint group passed **47 tests in 2.80
+seconds**, with one non-selected test. These are logic tests, not GPU
+performance evidence.
+
+The final-code H200 serial GPU invocation passed **4 tests in 751.89
+seconds**: the default `K=4` four-session gate, the new `K=2` contention gate,
+surviving-replica rebuild, and reduced-context rollover. Each window gate ran
+two trials of four sessions and two turns; all **32 responses** completed with
+the scheduler-native/model-runner/KV-backed model-EOS checks and no session
+errors. Recovery/rollover retain the narrower append/metrics evidence scope
+described above; this run does not establish post-rebuild speech completeness.
+
+The new CPU cases are collected by the existing `core_model and cpu` ready
+jobs. The additional four-session/two-slot parameter uses the existing
+`advanced_model` merge job and its helper dependency; no new pipeline is
+needed. Run from the repo root after activating the matching vLLM environment:
+
+```bash
+# Focused local L1 regressions; no model weights required.
+python -m pytest -q -o addopts= \
+  tests/distributed/omni_connectors/test_chunk_transfer_adapter.py \
+  tests/engine/duplex/test_duplex_control_plane.py \
+  tests/worker/test_native_duplex_hooks.py \
+  tests/engine/test_multimodal_accumulation.py \
+  tests/engine/test_orchestrator_error_handling.py \
+  -m 'core_model and cpu' --run-level=core_model
+
+# L3 CI-like CUDA gate: both K=4 and K=2, N=4, two turns, two trials.
+# Requires one H200-class test GPU and cached MiniCPM-o model/ref-audio assets.
+# Set MODEL_PREFIX to the directory containing openbmb/MiniCPM-o-4_5.
+python -m pytest -q -o addopts= \
+  tests/e2e/online_serving/test_minicpmo_4_5_duplex.py \
+  -k test_duplex_four_sessions_rotate_without_starvation_across_multiple_turns \
+  -m 'advanced_model and cuda' --run-level=advanced_model
+
+# Exact four-test serial GPU invocation used for the review (same prerequisites).
+python -m pytest -q -o addopts= \
+  tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_four_sessions_rotate_without_starvation_across_multiple_turns \
+  tests/dfx/reliability/test_reliability_minicpmo_4_5_duplex.py::test_native_duplex_committed_kv_recovers_on_surviving_replica \
+  tests/dfx/reliability/test_reliability_minicpmo_4_5_duplex.py::test_native_duplex_context_rollover_bounds_kv_growth_and_continues
+```
+
+The full CPU matrix additionally includes the entire duplex engine directory,
+scheduler mixin, orchestrator and stage-input bridge, output processor, native
+Talker batching, MiniCPM stage-input processor, and realtime driver tests.
+`-o addopts=` disables repository xdist defaults in the environment without
+pytest-xdist; it does not change the selected test level or assertions.
+
+### Historical H20 synchronized tree
 
 The current dirty tree was synchronized to the isolated H20 worktree at
 `/home/admin/workspace/aop_lab/model_runner_v2/vllm-omni-worktrees/pr3907-boundary-cg-0721`.
@@ -1044,6 +1464,11 @@ WAV path, and cleanup result.
 
 This checkpoint is ready to publish only when:
 
+- importing/probing the append contract does not modify the specified upstream
+  Core/client classes or status enum, and missing 0.28 fields fail closed;
+- all three shared models successfully route native Stage0 through the explicit
+  admission/atomic utility contract, while replay remains independently gated;
+- initial acknowledgement waits for the full prompt without a finalize RPC;
 - one mailbox passes exactly-once and wire-order tests;
 - cancel advances the engine fence even when the old append continues in an
   executor, and the next-epoch append remains accepted;
@@ -1054,17 +1479,19 @@ This checkpoint is ready to publish only when:
 - an accepted terminal cannot be dropped by the writer;
 - no duplicate `response.speak` or transcript delta appears;
 - Stage0 KV continuity and Stage1 turn reset pass;
-- the real H20 multi-turn audio E2E passes;
+- a real matching-CUDA multi-turn audio E2E passes for each migrated model,
+  including complete-answer checks beyond receipt of chunk/turn EOS;
 - ordinary non-duplex paths in the affected matrix still pass;
 - no local path, proxy token, temporary profiling probe, or test-only switch is present.
 
-Passing this checkpoint supports the statement:
+Report only the exact snapshot, models, hardware, concurrency and failure
+shapes that passed. Historical passes do not establish this cleanup's result.
+MiniCPM rollover/replay and PersonaPlex/Nemotron typed state-loss failure are
+separate acceptance items, not a single cross-model recovery claim.
 
-> Single-session, model-owned MiniCPM-o 4.5 native duplex is reviewable on the
-> validated H20 configuration.
-
-It does not support claims for an acoustic-onset barge-in latency target across
-arbitrary client chunk sizes, multi-session production concurrency, bounded
-long-session KV, or scheduler-native append. Camera-frame input
-(`video_frames`) landed after this snapshot and is covered by its own E2E
-test rather than by the evidence above.
+Passing those checks does not support claims for an acoustic-onset barge-in latency target across
+arbitrary client chunk sizes, raw KV-tensor append or live migration,
+unbounded fairness/starvation guarantees, lossless arbitrary-context
+compaction, or scheduler-native H20/H100/NPU sign-off without corresponding
+runs. Equivalent complete outputs and repeated baseline measurements are
+required before reporting any performance gain.
