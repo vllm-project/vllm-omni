@@ -6,8 +6,8 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
-from vllm_omni.entrypoints.duplex.audio import convert_output_audio
-from vllm_omni.entrypoints.duplex.realtime_state import (
+from vllm_omni.entrypoints.realtime.audio import convert_output_audio
+from vllm_omni.entrypoints.realtime.state import (
     _RealtimeResponseState,
 )
 

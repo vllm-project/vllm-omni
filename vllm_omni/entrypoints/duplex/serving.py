@@ -41,10 +41,6 @@ from vllm_omni.entrypoints.duplex.protocol import (
     native_duplex_opt_in,
     normalize_native_duplex_key,
 )
-from vllm_omni.entrypoints.duplex.realtime_session import (
-    REALTIME_OUTPUT_AUDIO_FORMATS,
-    NativeRealtimeSessionProtocol,
-)
 from vllm_omni.entrypoints.duplex.runtime_adapter import (
     ServingRuntimeAdapter,
     ServingRuntimeConfigError,
@@ -76,6 +72,13 @@ from vllm_omni.entrypoints.duplex.websocket import (
     DOMAIN_TERMINAL_EVENTS,
     DuplexSessionTasks,
     DuplexWebSocketActor,
+)
+from vllm_omni.entrypoints.realtime.runner import run_realtime_session
+from vllm_omni.entrypoints.realtime.session import (
+    REALTIME_OUTPUT_AUDIO_FORMATS,
+)
+from vllm_omni.entrypoints.realtime.session import (
+    RealtimeSessionProtocol as NativeRealtimeSessionProtocol,
 )
 from vllm_omni.metrics.realtime import RealtimeVADMetrics
 
@@ -179,10 +182,7 @@ class OmniDuplexSessionHandler(
         )
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
-        await self.handle_session(
-            websocket,
-            realtime_protocol=NativeRealtimeSessionProtocol(websocket.query_params),
-        )
+        await run_realtime_session(websocket, self)
 
     def _ensure_lifecycle_listener(self) -> None:
         if not isinstance(self._lifecycle_queue, asyncio.Queue):

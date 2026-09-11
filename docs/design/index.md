@@ -19,6 +19,7 @@ implementation contract; it is not, by itself, a general support claim.
 
 - [Full-Duplex Runtime (MiniCPM-o 4.5)](fullduplex.md)
 - [Full-Duplex Runtime (PersonaPlex)](fullduplex-personaplex.md)
+- [Shared Realtime Protocol Extraction](feature/realtime_protocol.md)
 - [Disaggregated Inference](feature/disaggregated_inference.md)
 - [Host Weight Runtime](feature/host_weight_runtime.md)
 - [Async Chunk](feature/async_chunk.md)

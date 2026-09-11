@@ -12,12 +12,24 @@ from uuid import uuid4
 
 import numpy as np
 
-from vllm_omni.entrypoints.duplex.audio import (
+from vllm_omni.entrypoints.realtime.audio import (
     encode_float32_mono_wav_base64,
 )
-from vllm_omni.entrypoints.duplex.server_vad import (
+from vllm_omni.entrypoints.realtime.config import (
+    LEGACY_NATIVE_DUPLEX_KEY as LEGACY_NATIVE_DUPLEX_KEY,
+)
+from vllm_omni.entrypoints.realtime.config import (
+    NATIVE_DUPLEX_KEY as NATIVE_DUPLEX_KEY,
+)
+from vllm_omni.entrypoints.realtime.config import (
     ServerVADConfig,
     parse_session_turn_detection,
+)
+from vllm_omni.entrypoints.realtime.config import (
+    native_duplex_opt_in as native_duplex_opt_in,
+)
+from vllm_omni.entrypoints.realtime.config import (
+    normalize_native_duplex_key as normalize_native_duplex_key,
 )
 
 
@@ -35,30 +47,6 @@ class DuplexSessionState(str, Enum):
     OPEN = "open"
     CLOSING = "closing"
     CLOSED = "closed"
-
-
-# Canonical extra_body key for the per-session opt-in to a model-native
-# duplex runtime, plus the deprecated model-prefixed spelling it replaced.
-# Client payloads may still use the legacy key; it is folded into the
-# canonical one at ingestion so everything downstream (and every echo in
-# session.created/session.updated) sees only NATIVE_DUPLEX_KEY.
-NATIVE_DUPLEX_KEY = "native_duplex"
-LEGACY_NATIVE_DUPLEX_KEY = "minicpmo45_native_duplex"
-
-
-def normalize_native_duplex_key(extra_body: dict[str, object]) -> dict[str, object]:
-    """Fold the deprecated alias into the canonical key (canonical wins)."""
-    if LEGACY_NATIVE_DUPLEX_KEY in extra_body:
-        legacy = extra_body.pop(LEGACY_NATIVE_DUPLEX_KEY)
-        extra_body.setdefault(NATIVE_DUPLEX_KEY, legacy)
-    return extra_body
-
-
-def native_duplex_opt_in(extra_body: Mapping[str, object]) -> object:
-    """Read the opt-in flag, accepting the deprecated alias for raw dicts."""
-    if NATIVE_DUPLEX_KEY in extra_body:
-        return extra_body[NATIVE_DUPLEX_KEY]
-    return extra_body.get(LEGACY_NATIVE_DUPLEX_KEY)
 
 
 class DuplexTurnState(str, Enum):
