@@ -64,13 +64,11 @@ def _cfm_pad_frames(
     overflow the decoder's noise buffer.
 
     The padding frames are deliberately folded into the attention and CNN
-    cache widths as well: those cache shapes are part of the CUDA-graph key,
-    so they must advance on the same grid for the capture shapes to collapse.
-    The trade-off is that the caches grow in ``bucket_frames`` steps instead
-    of by the real frame count, so a long utterance reaches the decoder's
-    ``rand_noise`` capacity sooner than without bucketing. With the shipped
-    bucket of 16 and a 30000-frame noise buffer the supported audio length
-    stays far above any streaming TTS workload.
+    cache widths: those cache shapes are part of the CUDA-graph key, so they
+    must advance on the same grid for the capture shapes to collapse. The
+    caches therefore grow in ``bucket_frames`` steps rather than by the real
+    frame count, bounded by the decoder's ``rand_noise`` capacity (30000
+    frames with the shipped bucket of 16, far above any streaming workload).
     """
     if ragged or bucket_frames <= 1:
         return 0
@@ -620,9 +618,7 @@ class BatchedToken2Wav(nn.Module):
             ragged=valid_lengths is not None or self._cfm_graph_wrapper is None,
         )
         if pad_frames:
-            # Pad onto the bucket grid. The attention/CNN caches below also
-            # advance by the padded width on purpose: their shapes are part of
-            # the CUDA-graph key (see _cfm_pad_frames for the trade-off).
+            # See _cfm_pad_frames: the caches also advance by the padded width.
             mu = torch.nn.functional.pad(mu, (0, pad_frames))
             cond = torch.nn.functional.pad(cond, (0, pad_frames))
         end = offset + int(mu.shape[2])

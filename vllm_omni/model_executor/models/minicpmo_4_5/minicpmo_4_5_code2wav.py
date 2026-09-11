@@ -59,10 +59,7 @@ def _scalar(value: Any, default: Any = None) -> Any:
 
 
 _REF_TARGET_SAMPLE_RATE = 24000
-# Default reference window. Mirrors the shipped prompt asset
-# (``assets/HT_ref_audio.wav`` is 6.016s) so runtime references land on the
-# same frame count the model was prompted with; overridable per deployment
-# via ``ref_audio_max_seconds``.
+# Overridable per deployment via ``ref_audio_max_seconds``.
 _REF_MAX_SECONDS = 6.0
 
 
@@ -80,16 +77,13 @@ def _normalize_reference(
     every reference onto the same sample rate and a fixed length (truncate
     long ones, zero-pad short ones) so L0 becomes one constant value.
 
-    Long references are truncated to ``max_seconds`` with a warning: the
-    window matches the shipped default prompt length, but callers serving
-    longer enrollment clips should raise ``ref_audio_max_seconds`` (larger
-    windows enlarge the CFM attention cache, see ``_cfm_pad_frames``).
+    References longer than ``max_seconds`` are truncated with a warning;
+    the window is configurable via ``ref_audio_max_seconds``.
     """
     tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
     if tensor.dim() > 1:
         # (channels, samples) -> mono; plain reshape(-1) would interleave.
-        # Upstream stage input processors already flatten to 1-D, so this is
-        # a guard for non-standard callers rather than the common path.
+        # Upstream already flattens to 1-D; this guards non-standard callers.
         tensor = tensor.mean(dim=0)
     waveform = tensor.reshape(-1).cpu().contiguous()
     if waveform.numel() == 0:
@@ -97,11 +91,9 @@ def _normalize_reference(
         # waveform must not be zero-padded into a valid-length reference.
         return waveform, _REF_TARGET_SAMPLE_RATE
     if sample_rate_hz != _REF_TARGET_SAMPLE_RATE and waveform.numel() > 0:
-        # Anti-aliased polyphase resampling, matching what token2wav's own
-        # prompt loader uses: linear interpolation would alias 48k -> 24k and
-        # leave stair-step artifacts on 16k -> 24k, and because the loader
-        # only resamples when the stored rate differs, whatever we write is
-        # what the model consumes.
+        # Match token2wav's own loader (torchaudio, anti-aliased): it only
+        # resamples when the stored rate differs, so this output is what the
+        # model consumes.
         waveform = (
             torchaudio.transforms.Resample(
                 orig_freq=sample_rate_hz,
@@ -119,10 +111,8 @@ def _normalize_reference(
         )
         waveform = waveform[:max_samples].contiguous()
     elif waveform.numel() < max_samples:
-        # Zero-pad short references to the fixed length so every request
-        # shares one L0 (reference frame count). The window matches the
-        # shipped prompt length, and trailing silence has minimal style
-        # impact for voice cloning (verified via E3 WER/SIM regression).
+        # Zero-pad short references so every request shares one L0; trailing
+        # silence has minimal style impact (verified via E3 WER/SIM).
         waveform = torch.nn.functional.pad(waveform, (0, max_samples - waveform.numel()))
     return waveform, _REF_TARGET_SAMPLE_RATE
 
