@@ -39,9 +39,7 @@ def _reference(q, k, q_weight, k_weight, rope_table):
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("seq_len", [1, 257, 1024])
 def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
-        fused_qk_norm_rope,
-    )
+    from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope
 
     torch.manual_seed(17)
     heads = 14
@@ -112,7 +110,7 @@ def _boogu_inputs(strided: bool):
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("strided", [False, True])
 def test_fused_qk_norm_rope_interleaved(strided):
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import (
         _eager_qk_norm_rope,
         _launch_fused_qk_norm_rope,
         fused_qk_norm_rope,
@@ -141,7 +139,7 @@ def test_fused_qk_norm_rope_half_split_general_dim():
     public op falls back to eager at this geometry), pending the
     maintainers' call.
     """
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import (
         _eager_qk_norm_rope,
         _launch_fused_qk_norm_rope,
     )
@@ -157,7 +155,7 @@ def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
     """The op-level token-gate override: unset -> caller's default; a
     non-negative integer string overrides it (``0`` = always fuse); anything
     else is rejected naming the variable."""
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope_min_tokens
+    from vllm_omni.diffusion.layers.ops import fused_qk_norm_rope_min_tokens
 
     env = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
     monkeypatch.delenv(env, raising=False)

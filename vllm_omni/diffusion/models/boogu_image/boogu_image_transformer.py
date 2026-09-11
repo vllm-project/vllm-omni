@@ -37,10 +37,10 @@ from vllm.triton_utils import HAS_TRITON
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
-    _fused_cuda_supported,
+from vllm_omni.diffusion.layers.ops import (
     fused_qk_norm_rope,
     fused_qk_norm_rope_min_tokens,
+    fused_qk_norm_rope_supported,
 )
 from vllm_omni.diffusion.models.utils import make_attention_mask
 from vllm_omni.platforms import current_omni_platform
@@ -142,7 +142,13 @@ def _qk_norm_rope(
         rotary_emb is not None
         and len(rotary_emb) > 2
         and rotary_emb[2] is not None
-        and _fused_cuda_supported(query, key, query.shape[-1], query.shape[-1], interleaved=True)
+        and fused_qk_norm_rope_supported(
+            query,
+            key,
+            query.shape[-1],
+            query.shape[-1],
+            interleaved=True,
+        )
     ):
         batch, seq_len, num_heads, head_dim = query.shape
         num_kv_heads = key.shape[2]
@@ -1348,7 +1354,7 @@ class BooguImageTransformer2DModel(nn.Module):
 
         if isinstance(raw_instruction_hidden_states, torch.Tensor):
             instruction_hidden_states = raw_instruction_hidden_states
-        elif isinstance(raw_instruction_hidden_states, (list, tuple)):
+        elif isinstance(raw_instruction_hidden_states, list | tuple):
             assert len(raw_instruction_hidden_states) == num_instruction_feature_layers
             if "cat" in reduce_type.lower():
                 instruction_hidden_states = torch.cat(raw_instruction_hidden_states, dim=-1)
