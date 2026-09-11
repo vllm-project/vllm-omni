@@ -26,6 +26,11 @@ class InteractionHandler(ABC):
     # When True, chunk-boundary apply needs ``ChunkMediaSpec`` (num_frames/fps)
     # Those information are useful when interaction handler needs interpolation/integration on a frame-by-frame basis
     needs_chunk_media: ClassVar[bool] = False
+    # When True, the coordinator skips ``apply_at_chunk_boundary`` until a session
+    # exists (normally created on the first enqueue). When False, every chunk
+    # boundary runs apply even with no prior enqueue so the handler can create
+    # its session and materialize default chunk data (e.g. identity camera hold).
+    lazy_initialize_session: ClassVar[bool] = True
 
     @classmethod
     def from_pipeline(cls, pipeline: object) -> Self:

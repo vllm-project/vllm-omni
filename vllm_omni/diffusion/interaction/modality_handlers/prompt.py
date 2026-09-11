@@ -90,6 +90,7 @@ class PromptInteractionHandler(InteractionHandler):
     """
 
     modality: ClassVar[str] = "prompt"
+    lazy_initialize_session: ClassVar[bool] = True
 
     def __init__(
         self,

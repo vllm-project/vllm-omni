@@ -13,8 +13,8 @@ from typing import Literal
 InteractionPayload = Mapping[str, object]
 
 # Shared command semantics across modalities that support them.
-# Prompt specialization uses ``"target"`` only.
-InteractionMode = Literal["target"]
+# Prompt specialization narrows this to ``"target"`` only.
+InteractionMode = Literal["target", "velocity"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,7 @@ class InteractionEvent:
 
     Example:
     - ``QueuedPromptEvent`` in ``vllm_omni.diffusion.interaction.modality_handlers.prompt``
+    - ``QueuedCameraEvent`` in ``vllm_omni.diffusion.interaction.modality_handlers.camera``
     """
 
     event_id: str
@@ -60,10 +61,37 @@ class InteractionSession:
 
     Example:
     - ``PromptSession`` in ``vllm_omni.diffusion.interaction.modality_handlers.prompt``
+    - ``CameraSession`` in ``vllm_omni.diffusion.interaction.modality_handlers.camera``
     """
 
     lock: Lock = field(default_factory=Lock, repr=False)
     last_boundary_at: float | None = None
+
+
+def resolve_event_frame_offset(
+    *,
+    received_at: float,
+    previous_boundary_at: float | None,
+    num_frames: int,
+    fps: float,
+) -> int:
+    """Map an event arrival time onto ``[0, num_frames - 1]`` for this chunk.
+
+    * Uses ``floor((received_at - previous_boundary_at) * fps)``.
+    * Events without a prior boundary (or with non-positive fps) map to frame 0.
+    * Offsets past the represented media window are clamped to the final frame.
+    """
+    import math
+
+    num_frames = max(int(num_frames), 1)
+    if previous_boundary_at is None or fps <= 0:
+        return 0
+    offset = math.floor((received_at - previous_boundary_at) * float(fps))
+    if offset < 0:
+        return 0
+    if offset >= num_frames:
+        return num_frames - 1
+    return int(offset)
 
 
 @dataclass

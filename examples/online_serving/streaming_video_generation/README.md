@@ -21,7 +21,7 @@ The `--diffusion-streaming-output` CLI flag is forwarded as `streaming_output=Tr
 | Direction | Message | Format | Description |
 | --- | --- | --- | --- |
 | Client to server | `session.start` | JSON text: `{"type":"session.start","model":"...","prompt":"...","format":"m4s"}` | Starts generation. `format` is optional and accepts `m4s` (default). Sampling fields such as `width`, `height`, `fps`, `num_frames`, and `extra_params` may be included. Image-conditioned models take a first frame as `image_reference`: `{"image_url":"https://..."}` or a `data:` URL. |
-| Client to server | `session.interaction` | JSON text: `{"type":"session.interaction","interaction":{"event_id":"xxx","event":{"prompt":"..."},"transition_chunks":3}}` | Updates the active prompt midway through generation. `event_id` is optional and `transition_chunks` defaults to the model setting. |
+| Client to server | `session.interaction` | JSON text: `{"type":"session.interaction","interaction":{"event_id":"xxx","event":{"prompt":"..."},"transition_chunks":3}}` | Updates the active prompt and/or camera midway through generation. Camera at `event.multi_modal_data.camera` is structural SE3 (`mode` + `translation`/`rotation`). `event_id` is optional and `transition_chunks` defaults to the model setting. |
 | Server to client | `video.start` | JSON text: `{"type":"video.start","request_id":"...","format":"m4s","config":{...}}` | Confirms the session and mirrors the accepted `format`. |
 | Server to client | `video.chunk_metadata` | JSON text: `{"type":"video.chunk_metadata","request_id":"...","kind":"media","transport_chunk_index":0,"generation_chunk_index":0,"num_frames":9,"byte_length":1234,"started_event_ids":[],"active_event_ids":[],"completed_event_ids":[]}` | Precedes each binary frame and describes the immediately following payload. |
 | Server to client | Video chunk | Binary WebSocket frame | Fragmented MP4 (`m4s`) video bytes. |
@@ -59,10 +59,10 @@ python streaming_video_client.py \
   --output helios_stream.mp4
 ```
 
-The client sends one `session.start` message, prints each received binary video chunk with its byte size and elapsed time, and saves the received bytes to `--output` after `session.done`.
+The example client sends one `session.start` message, prints each received binary video chunk with its byte size and elapsed time, and saves the received bytes to `--output` after `session.done`.
 The client remuxes the gathered stream to a regular progressive MP4 file so that local playback knows the video duration.
 
-Schedule midway prompt updates with `--prompt-updates`. None are sent unless you ask for them, and only pipelines that implement midway prompt updates accept them (LingBot-World, for one, does not, and rejects the whole session). Each entry uses `"at"` as seconds on the client clock after the server sends `video.start`:
+Schedule midway prompt updates with `--prompt-updates`. None are sent unless you ask for them, and only pipelines that implement midway prompt updates accept them. Each entry uses `"at"` as seconds on the client clock after the server sends `video.start`:
 
 ```bash
 python streaming_video_client.py \
@@ -70,6 +70,21 @@ python streaming_video_client.py \
   --prompt-updates '[
     {"at": 2.5, "prompt": "A sea turtle glides past the reeds"},
     {"at": 5.0, "prompt": "Sunlight breaks through the morning mist", "transition_chunks": 2}
+  ]'
+```
+
+Schedule midway camera updates with `--camera-updates` when the served model
+registers the camera modality (e.g., LingBot World 2).
+It accepts `["camera"]["data"]["translation"/"rotation"]` in the endpoint's required SE3 format.
+If also accepts `["action"]` and offers to convert keystrokes to the SE3 format.
+
+```bash
+python streaming_video_client.py \
+  --model robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
+  --image-reference /path/to/first_frame.png \
+  --camera-updates '[
+    {"at": 1.0, "actions": ["w"]},
+    {"at": 3.0, "camera": {"mode": "target", "data": {"translation": [0.0, 0.0, 1.0], "rotation": [0.0, 0.0, 0.0, 1.0]}}, "transition_chunks": 2}
   ]'
 ```
 
@@ -144,6 +159,7 @@ python streaming_video_client.py \
   --output lingbot_world_v2_stream.mp4
 ```
 
-`camera_action_script` carries one three-latent-frame WASD action list per generated
-chunk. Mid-session `session.interaction` only updates the prompt, so a LingBot rollout
-follows the camera script it started with.
+`camera_action_script` is an optional request-scoped WASD script (one
+three-latent-frame action list per generated chunk). Prefer mid-session
+`session.interaction` camera control via `--camera-updates` when you need
+live motion; the engine wire format is structural SE3 only.

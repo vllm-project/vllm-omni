@@ -535,7 +535,6 @@ class HeliosPipeline(
                 "zero_steps": int(extra.get("zero_steps", 1)),
             }
         )
-        self.prepare_next_chunk(state)
         return state
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:

@@ -1844,6 +1844,8 @@ def _stepwise_state(
 def _run_stepwise(pipeline, state):
     outputs = []
     pipeline.prepare_encode(state)
+    # Runner owns chunk-0 prepare after encode; unit tests call it directly.
+    pipeline.prepare_next_chunk(state)
     while not state.request_denoise_completed:
         noise = pipeline.denoise_step(None, states=[state])
         pipeline.step_scheduler(state, noise)

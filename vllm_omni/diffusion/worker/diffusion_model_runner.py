@@ -1061,6 +1061,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     clear_pipeline_stage_durations(self.pipeline)
                     # encode
                     self.pipeline.prepare_encode(state)
+                    # Before chunk-0: some interactions (e.g., camera) need initial session data.
+                    if supports_interaction_apply(self.pipeline) and state.chunk_index == 0:
+                        pipe = cast(SupportsInteractionApply, self.pipeline)
+                        assert self._interaction_coordinator is not None, "Model not loaded. Call load_model() first."
+                        state.interaction_chunk_metadata = self._interaction_coordinator.maybe_prepare_initial_session(
+                            state, pipe
+                        )
+                        pipe.prepare_next_chunk(state)
                     merge_stage_durations(
                         state,
                         consume_pipeline_stage_durations(self.pipeline),
@@ -1397,47 +1405,51 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         interaction: OmniInteractionPrompt,
     ) -> None:
         """Route a midway interaction through the pipeline interaction coordinator."""
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        assert self.pipeline is not None and self._interaction_coordinator is not None, (
+            "Model not loaded. Call load_model() first."
+        )
         if not self.od_config.streaming_output:
             raise ValueError("submit_interaction requires streaming_output=True")
         if not self._supports_step_mode():
             raise ValueError("submit_interaction requires step execution support")
 
-        coordinator = self._interaction_coordinator
-        if coordinator is None:
-            coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
-            self._interaction_coordinator = coordinator
-            if hasattr(self.pipeline, "_interaction_coordinator"):
-                self.pipeline._interaction_coordinator = coordinator
-
         event = interaction.get("event")
-        has_mm = isinstance(event, dict) and "multi_modal_data" in event
+        event_id = interaction.get("event_id")
+        transition_chunks = interaction.get("transition_chunks")
+        multi_modal_data = event.get("multi_modal_data") if isinstance(event, dict) else None
         has_prompt = isinstance(event, dict) and "prompt" in event and event.get("prompt") is not None
+        if isinstance(event, dict) and "multi_modal_data" in event and multi_modal_data is not None:
+            if not isinstance(multi_modal_data, dict) or not multi_modal_data:
+                raise ValueError("interaction event.multi_modal_data must be a non-empty object when provided")
+        has_mm = isinstance(multi_modal_data, dict) and bool(multi_modal_data)
 
-        # Prompt-only interactions in this release; multi_modal_data lands with camera support.
-        if not isinstance(event, dict) or has_mm or not has_prompt:
-            raise NotImplementedError(
-                "Only text-only prompt update interactions with 'event.prompt' and optional "
-                "'transition_chunks' are supported in this release"
-            )
-        if not coordinator.has_modality("prompt"):
-            raise ValueError(f"prompt_update is not supported by pipeline {self.od_config.model_class_name!r}")
+        if not isinstance(event, dict) or (not has_prompt and not has_mm):
+            raise ValueError("interaction event requires prompt and/or multi_modal_data")
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("event_id must be non-empty")
+
+        parts: list[tuple[str, dict]] = []
+        if has_prompt:
+            if not self._interaction_coordinator.has_modality("prompt"):
+                raise ValueError(f"prompt_update is not supported by pipeline {self.od_config.model_class_name!r}")
+            prompt = event["prompt"]
+            if not isinstance(prompt, str) or not prompt:
+                raise ValueError("prompt must be non-empty")
+            parts.append(("prompt", {"prompt": prompt}))
+        if has_mm:
+            for modality, payload in multi_modal_data.items():
+                if not isinstance(payload, dict):
+                    raise ValueError(f"multi_modal_data[{modality!r}] must be an object")
+                parts.append((str(modality), payload))
 
         state = self.state_cache.get(request_id)
         if state is None:
             raise ValueError(f"No active request state for interaction: {request_id!r}")
 
-        event_id = interaction.get("event_id")
-        if not isinstance(event_id, str) or not event_id:
-            raise ValueError("event_id must be non-empty")
-        prompt = event["prompt"]
-        if not isinstance(prompt, str) or not prompt:
-            raise ValueError("prompt must be non-empty")
-        coordinator.enqueue(
+        self._interaction_coordinator.enqueue_parts(
             state,
-            modality="prompt",
+            parts=parts,
             event_id=event_id,
             received_at=time.monotonic(),
-            payload={"prompt": prompt},
-            transition_chunks=interaction.get("transition_chunks"),
+            transition_chunks=transition_chunks,
         )

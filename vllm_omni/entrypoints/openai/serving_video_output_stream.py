@@ -362,15 +362,55 @@ class OmniStreamingVideoOutputHandler:
         if not isinstance(event, dict):
             await self._send_error(websocket, "session.interaction requires event object", send_lock=send_lock)
             return
-
         prompt = event.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
+        multi_modal_data = event.get("multi_modal_data")
+        has_prompt = isinstance(prompt, str) and bool(prompt.strip())
+        has_mm = isinstance(multi_modal_data, dict) and bool(multi_modal_data)
+        if not has_prompt and not has_mm:
             await self._send_error(
                 websocket,
-                "session.interaction requires a non-empty event.prompt",
+                "session.interaction requires a non-empty event.prompt and/or non-empty event.multi_modal_data",
                 send_lock=send_lock,
             )
             return
+        if "prompt" in event and prompt is not None and not has_prompt:
+            await self._send_error(
+                websocket,
+                "session.interaction event.prompt must be a non-empty string when provided",
+                send_lock=send_lock,
+            )
+            return
+        if "multi_modal_data" in event and multi_modal_data is not None and not has_mm:
+            await self._send_error(
+                websocket,
+                "session.interaction event.multi_modal_data must be a non-empty object when provided",
+                send_lock=send_lock,
+            )
+            return
+        if has_mm:
+            for modality, payload in multi_modal_data.items():
+                if not isinstance(payload, dict):
+                    await self._send_error(
+                        websocket,
+                        f"session.interaction multi_modal_data[{modality!r}] must be an object",
+                        send_lock=send_lock,
+                    )
+                    return
+                mode = payload.get("mode", "target")
+                if mode not in ("target", "velocity"):
+                    await self._send_error(
+                        websocket,
+                        f"session.interaction multi_modal_data[{modality!r}].mode must be 'target' or 'velocity'",
+                        send_lock=send_lock,
+                    )
+                    return
+                if "data" not in payload or not isinstance(payload.get("data"), dict):
+                    await self._send_error(
+                        websocket,
+                        f"session.interaction multi_modal_data[{modality!r}].data must be an object",
+                        send_lock=send_lock,
+                    )
+                    return
 
         if "negative_prompt" in event and event["negative_prompt"] is not None:
             await self._send_error(
@@ -380,9 +420,19 @@ class OmniStreamingVideoOutputHandler:
             )
             return
 
+        normalized_event: dict[str, Any] = {}
+        if has_prompt:
+            normalized_event["prompt"] = prompt
+        if has_mm:
+            normalized_event["multi_modal_data"] = multi_modal_data
+        # Preserve other event fields that OmniInteractionEvent may carry.
+        for key, value in event.items():
+            if key not in normalized_event and key not in ("prompt", "multi_modal_data"):
+                normalized_event[key] = value
+
         normalized: OmniInteractionPrompt = {
             "event_id": event_id,
-            "event": cast(OmniInteractionEvent, event),
+            "event": cast(OmniInteractionEvent, normalized_event),
         }
         transition_chunks = interaction.get("transition_chunks")
         if transition_chunks is not None:

@@ -108,7 +108,12 @@ def _make_diffusion_model_runner(
     # instances; unit tests of submit_interaction stub this. Stepwise path tests
     # rebind to the real method.
     runner._supports_step_mode = lambda: True
-    runner._interaction_coordinator = None
+    # Mirror load_model: coordinator is always present once the runner is "loaded".
+    # Build now so handlers capture the pipeline's current encode_prompt (tests may
+    # rebind the mock before calling this helper).
+    runner._interaction_coordinator = InteractionCoordinator.build(pipeline, runner.od_config)
+    if hasattr(pipeline, "_interaction_coordinator"):
+        pipeline._interaction_coordinator = runner._interaction_coordinator
     return runner
 
 
@@ -167,24 +172,97 @@ class TestPromptUpdateExecution:
         "interaction",
         [
             {},
-            {"multi_modal_data": {"camera": {"type": "pose"}}},
-            {"event": {"prompt": "updated", "multi_modal_data": {"camera": {"type": "pose"}}}},
-            {"event": {"prompt": "updated", "multi_modal_data": {}}},
-            {"event": {"prompt": "updated", "multi_modal_data": None}},
-            {"event": {"prompt": "updated", "multi_modal_data": "bad"}},
+            {"event_id": "bad", "event": {"multi_modal_data": {}}},
+            {"event_id": "bad", "event": {"multi_modal_data": None}},
+            {"event_id": "bad", "event": {"prompt": "updated", "multi_modal_data": "bad"}},
+            {
+                "event_id": "cam-only",
+                "event": {
+                    "multi_modal_data": {
+                        "camera": {
+                            "mode": "velocity",
+                            "data": {"translation": [0.0, 0.0, 0.05], "rotation": [0.0, 0.0, 0.0, 1.0]},
+                        },
+                    }
+                },
+            },
+            {
+                "event_id": "cam-and-prompt",
+                "event": {
+                    "prompt": "updated",
+                    "multi_modal_data": {
+                        "camera": {
+                            "mode": "velocity",
+                            "data": {"translation": [0.0, 0.0, 0.05], "rotation": [0.0, 0.0, 0.0, 1.0]},
+                        },
+                    },
+                },
+            },
         ],
     )
-    def test_runner_interaction_rejects_structural_payloads_until_implemented(
+    def test_runner_rejects_unsupported_interactions(
         self,
         pipeline: HeliosPipeline,
         interaction: dict[str, Any],
     ) -> None:
-        """Unsupported interaction dict shapes are preserved to and rejected by the runner."""
+        """Helios has no camera handler; malformed / unsupported payloads are rejected."""
         runner = _make_diffusion_model_runner(pipeline=pipeline)
-        runner.state_cache["req-1"] = _make_diffusion_request_state()
+        state = _make_diffusion_request_state()
+        runner.state_cache["req-1"] = state
 
-        with pytest.raises(NotImplementedError, match="Only text-only prompt update interactions"):
+        with pytest.raises(ValueError):
             runner.submit_interaction("req-1", cast(Any, interaction))
+
+        # Rejected composite/malformed events must leave interaction queues unchanged.
+        pipeline.encode_prompt.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+        assert "prompt" not in state.interaction_sessions
+        assert "camera" not in state.interaction_sessions
+
+    def test_rejected_composite_leaves_existing_prompt_queue_unchanged(
+        self,
+        pipeline: HeliosPipeline,
+    ) -> None:
+        """Helios must not apply a composite prompt when camera modality is unsupported."""
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        state = _make_diffusion_request_state()
+        runner.state_cache["req-1"] = state
+        runner.submit_interaction("req-1", _prompt_interaction("already-queued", event_id="prior"))
+        session = state.interaction_sessions["prompt"]
+        assert isinstance(session, PromptSession)
+        prior = session.pending_event
+        assert prior is not None
+        assert prior.event_id == "prior"
+        pipeline.encode_prompt.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+
+        with pytest.raises(ValueError, match="camera"):
+            runner.submit_interaction(
+                "req-1",
+                cast(
+                    Any,
+                    {
+                        "event_id": "cam-and-prompt",
+                        "event": {
+                            "prompt": "should-not-replace",
+                            "multi_modal_data": {
+                                "camera": {
+                                    "mode": "velocity",
+                                    "data": {
+                                        "translation": [0.0, 0.0, 0.05],
+                                        "rotation": [0.0, 0.0, 0.0, 1.0],
+                                    },
+                                },
+                            },
+                        },
+                    },
+                ),
+            )
+
+        pipeline.encode_prompt.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+        pending = session.pending_event
+        assert pending is not None
+        assert pending.event_id == "prior"
+        assert pending.prompt == "already-queued"
+        assert "camera" not in state.interaction_sessions
 
     @pytest.mark.parametrize("model_class_name", ["HeliosPipeline", "HeliosPyramidPipeline"])
     def test_coordinator_registers_prompt_for_helios_aliases(

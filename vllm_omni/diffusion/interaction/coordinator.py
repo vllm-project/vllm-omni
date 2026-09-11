@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.interaction.registry import STRUCTURED_HANDLER_REGISTRY
@@ -12,7 +13,7 @@ from vllm_omni.diffusion.interaction.types import (
     InteractionPayload,
     merge_interaction_metadata,
 )
-from vllm_omni.diffusion.models.interface import supports_interaction_apply
+from vllm_omni.diffusion.models.interface import SupportsInteractionApply, supports_interaction_apply
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 if TYPE_CHECKING:
@@ -83,6 +84,71 @@ class InteractionCoordinator:
             transition_chunks=transition_chunks,
         )
 
+    def enqueue_parts(
+        self,
+        state: StepRequestState,
+        *,
+        parts: list[tuple[str, InteractionPayload]],
+        event_id: str,
+        received_at: float,
+        transition_chunks: int | None,
+    ) -> None:
+        """Ensure every modality is supported, then enqueue all parts.
+
+        Composite events must not partially mutate queues when a later track is
+        unsupported.
+        """
+        if not parts:
+            raise ValueError("interaction event requires prompt and/or multi_modal_data")
+
+        for modality, _payload in parts:
+            self.get_handler(modality)  # Resolve handlers. Happy path expects no ValueError
+        for modality, payload in parts:
+            self.enqueue(
+                state,
+                modality=modality,
+                event_id=event_id,
+                received_at=received_at,
+                payload=payload,
+                transition_chunks=transition_chunks,
+            )
+
+    def maybe_prepare_initial_session(
+        self,
+        state: StepRequestState,
+        pipeline: SupportsInteractionApply,
+    ) -> InteractionChunkMetadata:
+        """Materialize non-lazy modality sessions before chunk 0 denoise.
+
+        Handlers with ``lazy_initialize_session=False`` (e.g. camera) must exist
+        before the first chunk even with no client enqueue.
+        """
+        num_frames: int | None = None
+        fps: float | None = None
+        if any(
+            (not handler.lazy_initialize_session) and handler.needs_chunk_media for handler in self._handlers.values()
+        ):
+            media = pipeline.peek_chunk_media(state)
+            num_frames = media.num_frames
+            fps = media.fps
+
+        boundary_at = time.monotonic()
+        chunk_index = state.chunk_index
+        metas: list[InteractionChunkMetadata] = []
+        for handler in self._handlers_in_apply_order():
+            if handler.lazy_initialize_session:
+                continue
+            meta = handler.apply_at_chunk_boundary(
+                state,
+                boundary_at=boundary_at,
+                chunk_index=chunk_index,
+                num_frames=num_frames,
+                fps=fps,
+            )
+            if meta is not None:
+                metas.append(meta)
+        return merge_interaction_metadata(metas)
+
     def apply_at_chunk_boundary(
         self,
         state: StepRequestState,
@@ -98,9 +164,8 @@ class InteractionCoordinator:
         metas: list[InteractionChunkMetadata] = []
         for handler in self._handlers_in_apply_order():
             if handler.modality not in state.interaction_sessions:
-                # This function is always called at chunk boundary without knowing if an interaction is really enqueued.
-                # `state.interaction_sessions[this modality]` is lazy-populated after the first interaction is enqueued.
-                # So, check here and skip a modality handler if this modality's session is not yet created.
+                # This modality's interaction session is lazy-initialized and is not initialized yet.
+                # Skip handler.apply_at_chunk_boundary until the first enqueue creates the session.
                 continue
             meta = handler.apply_at_chunk_boundary(
                 state,

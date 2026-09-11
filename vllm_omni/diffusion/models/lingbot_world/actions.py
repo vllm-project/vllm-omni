@@ -327,11 +327,23 @@ def integrate_lingbot_camera_actions(
         movement = np.zeros(3, dtype=np.float64)
         movement += forward * 0.05 * (("w" in actions) - ("s" in actions))
         movement += right * 0.05 * (("d" in actions) - ("a" in actions))
+        # Keep the cumulative controller pose in FP64 between chunks, matching
+        # SGLang's NumPy integration and avoiding long-session drift.
         current_pose = np.eye(4, dtype=np.float64)
         current_pose[:3, :3] = new_rotation
         current_pose[:3, 3] = translation + movement
         poses.append(current_pose)
 
+    trajectory = camera_trajectory_from_absolute_pose(torch.from_numpy(np.stack(poses)), width=width, height=height)
+    return trajectory, current_pitch
+
+
+def camera_trajectory_from_absolute_pose(
+    poses: torch.Tensor,
+    *,
+    width: int,
+    height: int,
+) -> CameraTrajectory:
     # build_plucker_embedding expects intrinsics in the 832x480 reference
     # coordinate system. These values become SGLang's [500, 500, W/2, H/2]
     # after that function scales them to the requested resolution.
@@ -342,9 +354,7 @@ def integrate_lingbot_camera_actions(
         _REFERENCE_HEIGHT / 2,
     )
     trajectory = CameraTrajectory(
-        # Keep the cumulative controller pose in FP64 between chunks, matching
-        # SGLang's NumPy integration and avoiding long-session drift.
-        poses=torch.from_numpy(np.stack(poses)),
+        poses=poses,
         intrinsics=torch.tensor(reference_intrinsics, dtype=torch.float32).repeat(len(poses), 1),
     )
-    return trajectory, current_pitch
+    return trajectory
