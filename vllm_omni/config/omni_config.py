@@ -457,6 +457,9 @@ class OmniStageLoadConfig(_TrackExplicitConfigFields, VllmLoadConfig):
     tokenizer_mode: str = "auto"
     config_format: str | None = None
     skip_mm_profiling: bool | None = None
+    # vLLM owns the runtime offloader; these stage inputs configure weight placement.
+    cpu_offload_gb: float | None = Field(default=None, ge=0.0)
+    cpu_offload_params: set[str] | None = None
 
 
 @_enforce_keyword_only_init
@@ -1072,7 +1075,11 @@ def _upstream_engine_field_map(
     }
 
 
-_LOAD_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(VllmLoadConfig)
+_LOAD_CONFIG_ENGINE_FIELD_MAP = {
+    **_upstream_engine_field_map(VllmLoadConfig),
+    "cpu_offload_gb": "cpu_offload_gb",
+    "cpu_offload_params": "cpu_offload_params",
+}
 _CACHE_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
     VllmCacheConfig,
     aliases={"cache_dtype": "kv_cache_dtype"},

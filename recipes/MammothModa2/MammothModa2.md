@@ -18,11 +18,19 @@ The generic example formats the AR prompt, drives the AR → DiT stage pipeline,
 and forwards MammothModa2-specific generation parameters through the
 pipeline-declared `extra_body` contract.
 
-MammothModa2's DiT stage consumes its inputs through the multi-stage kwargs
-interface (not `OmniDiffusionRequest`), so its generation knobs
-(`text_guidance_scale`, `cfg_range`, `num_inference_steps`) are passed via
-`--extra-body` rather than the standard `--num-inference-steps` / `--cfg-scale`
-flags. Image size uses the standard `--height` / `--width` flags.
+MammothModa2's DiT stage runs in the shared diffusion runtime in request mode.
+The first integration intentionally supports one request and one image per
+forward only (`max_num_seqs: 1`, `num_outputs_per_prompt: 1`). Request-level
+batching, step execution, continuous batching, cache acceleration,
+compilation, quantization, parallelism, and offload are not enabled by this
+recipe by default. An experimental two-rank Preview DiT Ulysses configuration
+is described below; it does not change the single-rank default.
+
+Image size, seed, guidance, and denoising steps use the standard diffusion
+request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
+parameter. For compatibility, the runtime also accepts the former
+`text_guidance_scale` and `num_inference_steps` keys in `extra_body`; when
+present and non-null, those keys take precedence over the standard fields.
 
 ## References
 
@@ -41,28 +49,21 @@ flags. Image size uses the standard `--height` / `--width` flags.
 
 ## Hardware Support
 
-The default deploy config runs both the AR and DiT stages on a single GPU
-(`devices: "0"`). The committed `gpu_memory_utilization` split (stage-0 AR `0.5`,
-stage-1 DiT `0.3`) is sized for an ~80 GB GPU. The model also fits on a 48 GB GPU
-after rebalancing the split so the AR weights (~23 GB) leave room for the KV
-cache — see the note under *1x L40S 48GB*.
+The default deploy config places both the AR and DiT stages on one GPU
+(`devices: "0"`). Its committed `gpu_memory_utilization` split is 0.5 for
+stage 0 and 0.3 for stage 1. The A800 validation plan below also shows a
+two-GPU placement with one stage per GPU for attributable timing and memory;
+the results are pending.
 
 ## GPU
 
-### 1x L40S 48GB
-
-> **48 GB config adjustment:** the committed
-> `vllm_omni/deploy/mammoth_moda2.yaml` uses
-> `gpu_memory_utilization` 0.5 / 0.3 (sized for ~80 GB). To fit on a 48 GB L40S,
-> set the stage-0 (AR) value to `0.8` and the stage-1 (DiT) value to `0.16`
-> before running. (On an ~80 GB GPU, leave the defaults unchanged.)
+### 1x NVIDIA A800 80GB
 
 #### Environment
 
 - OS: Linux
 - Python: Match the repository requirements for your checkout
-- Driver / runtime: NVIDIA CUDA environment with one L40S 48 GB (verified) or an
-  ~80 GB GPU for the default config
+- Driver / runtime: NVIDIA CUDA environment with one A800 80 GB
 - vLLM version: Match the repository requirements for your checkout
 - vLLM-Omni version or commit: Use the commit you are deploying from
 
@@ -75,8 +76,7 @@ hf download bytedance-research/MammothModa2-Preview --local-dir ./MammothModa2-P
 ```
 
 Run text-to-image with the shared offline example from the repository root. The
-deploy config sets `trust_remote_code`, so no extra flag is needed. Forward the
-MammothModa2 generation parameters as a JSON object through `--extra-body`:
+deploy config sets `trust_remote_code`, so no extra flag is needed:
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
@@ -85,23 +85,25 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
   --height 1024 \
   --width 1024 \
-  --extra-body '{"text_guidance_scale": 4.0, "cfg_range": [0.0, 1.0], "num_inference_steps": 50}' \
+  --seed 42 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --extra-body '{"cfg_range": [0.0, 1.0]}' \
   --output mammoth_t2i.png
 ```
 
-The `--extra-body` JSON forwards MammothModa2-specific parameters into
-`OmniDiffusionSamplingParams.extra_args`. Keys are filtered against the model's
-declared `extra_body_params` (see
+The standard diffusion request fields are `height`, `width`, `seed`,
+`guidance_scale`, and `num_inference_steps`; use their corresponding CLI flags
+shown above. `--height` and `--width` must be multiples of 16.
+
+`cfg_range` is the only recommended MammothModa2 field in `--extra-body`; it
+sets the relative step range `[start, end]` over which CFG is applied (default
+`[0.0, 1.0]`). For compatibility, `text_guidance_scale` and
+`num_inference_steps` remain accepted `extra_body` aliases and, when non-null,
+take precedence over the standard request fields. Model extras are filtered
+against the declared `extra_body_params` (see
 [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)),
-so unknown keys for MammothModa2 are silently dropped:
-
-- `text_guidance_scale` — classifier-free guidance scale for the DiT stage
-  (default `9.0`; CFG is active only when `> 1.0`).
-- `cfg_range` — relative step range `[start, end]` over which CFG is applied
-  (default `[0.0, 1.0]`).
-- `num_inference_steps` — number of DiT denoising steps (default `50`).
-
-`--height` and `--width` must be multiples of 16.
+so unknown MammothModa2 extras may be dropped.
 
 Run text-to-text through the shared understanding example. It recognizes the
 MammothModa2 checkpoint and automatically selects `mammoth_moda2_ar.yaml`:
@@ -132,7 +134,136 @@ ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 ```
 
-### 1x AMD MI300X, MammothModa2 Preview
+### 2x NVIDIA A800 80GB validation plan
+
+Use one A800 per stage so AR and DiT memory and timing are attributable. The
+per-stage override changes placement only; both stages remain single-rank.
+
+```bash
+VLLM_LOGGING_LEVEL=DEBUG vllm serve ./MammothModa2-Preview --omni \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+  --stage-overrides '{"0":{"devices":"0"},"1":{"devices":"1"}}' \
+  --port 8099 \
+  --log-stats
+```
+
+Startup logs should identify stage 1 as `StageDiffusionClient` and resolve it
+to `MammothModa2DiTPipeline`. `DiffusionEngine` step timing is a DEBUG-level,
+per-request message, so it appears only after sending a text-to-image request
+with `VLLM_LOGGING_LEVEL=DEBUG`; it is not a startup marker. Seeing the legacy
+generation model runner for stage 1 is a failed migration.
+
+### Experimental Preview DiT Ulysses SP=2
+
+This opt-in path splits only the main joint-transformer sequence. Q-Former,
+text/noise refiners, sequential CFG, scheduler and VAE remain replicated.
+Preview has 21 query heads and 7 KV heads with head dimension 120, so degree
+two requires `ulysses_mode: advanced_uaa`; strict even-head partitioning is
+not valid. Shared Ulysses temporarily pads the head groups and restores the
+original output heads. Sequence padding is removed before image extraction.
+
+The initial scope is Preview text-to-image, request mode, one request and
+one output image, with eager execution and no cache acceleration,
+quantization or offload. Ring, TP/PP/DP, HSDP, expert/CFG/VAE parallelism,
+step execution and Dev text-to-image are not supported with this SP path.
+The AR-only Preview/Dev understanding topology is unchanged.
+
+The following BF16 offline configuration completed a one-prompt Preview E2E smoke
+on two A100-SXM4-80GB GPUs with NVLink NV4. AR shares GPU 0 with DiT rank 0;
+DiT rank 1 uses GPU 1. This is not a general capacity or performance guarantee:
+SP does not shard model weights or the replicated refiners/VAE. Keep the
+default deploy config unchanged and save this opt-in config separately as
+`mammoth-sp2.yaml`:
+
+```yaml
+async_chunk: false
+pipeline: mammoth_moda2
+trust_remote_code: true
+distributed_executor_backend: mp
+dtype: bfloat16
+enable_prefix_caching: false
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    max_model_len: 8192
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+  - stage_id: 1
+    devices: "0,1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    ulysses_degree: 2
+    ulysses_mode: advanced_uaa
+    diffusion_attention_backend: TORCH_SDPA
+    engine_extras:
+      dtype: bfloat16
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ./MammothModa2-Preview --deploy-config ./mammoth-sp2.yaml \
+  --ulysses-degree 2 --ulysses-mode advanced_uaa --enforce-eager \
+  --prompt "A red ceramic teapot on a wooden table beside a small green plant, soft morning light, detailed product photograph." \
+  --height 1024 --width 1024 --seed 42 --num-inference-steps 50 \
+  --guidance-scale 4.0 --extra-body '{"text_guidance_scale":4.0,"cfg_range":[0.0,1.0]}' \
+  --output ./mammoth-sp2.png
+```
+
+Pass the Ulysses flags explicitly: the shared example's command-line defaults
+also enter config resolution. For the SP=1 control, change stage 1's devices
+to `"0"`, set its `ulysses_degree` to 1, and pass `--ulysses-degree 1`.
+For the FP32 DiT control, keep AR in BF16 and change only stage 1's
+`engine_extras.dtype` to `float32`. BF16 `FLASH_ATTN` is a separately tested
+backend; compare SP=1 and SP=2 with the same backend.
+
+The correctness control below uses two CUDA devices, real NCCL collectives,
+released 2520/21/7/120 head geometry with reduced depth, FP32 SDPA math,
+BF16 SDPA and BF16 FlashAttention. The BF16 controls also compare against
+FP32 computation with the same quantized weights and inputs.
+A separate tiny native pipeline replay exercises the constructor, registry
+hooks, Q-Former, DiT, sequential CFG, request-level seed handling, scheduler and
+VAE with synthetic AR conditioning. It tests explicit/default-seed A/B/A
+requests; it is not a released-conditioning or full-checkpoint E2E test.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=4 python -m pytest -q \
+  tests/diffusion/distributed/test_mammothmoda2_ulysses.py
+```
+
+The full-weight qualification used Preview revision
+`ef5a5e41dbf0de1ef6275586b7580f0d4248b4c6`, vLLM 0.28.0, Torch 2.13.0+cu130,
+Transformers 5.14.1, Diffusers 0.40.0, Python 3.12.3 and driver 580.159.03.
+An earlier FP32 DiT control completed both SP=1 and SP=2 and saved 1024x1024
+RGB PNG images. AR token IDs matched; saved channel values differed by at
+most one 8-bit level (mean absolute difference 0.005415).
+
+The BF16 fixed-conditioning replay uses one real AR payload, identical
+initial noise, conditions and masks, 50 steps, seed 42 and guidance 4. Each
+configuration runs one observed warmup and three uninstrumented measured
+requests. Both SDPA and FlashAttention preserve exact self-repeat; observed
+denoiser predictions and VAE inputs agree exactly across ranks.
+SP=1 and SP=2 are not bit-identical: normalized
+RGB mean absolute error is 0.001682 for SDPA and 0.001817 for FlashAttention;
+PSNR is 51.03/47.57 dB and SSIM is 0.9961/0.9950 respectively. These are
+single-prompt numerical/visual controls, not broad image-quality certification.
+Selected late-step predictions differ more than the final decoded image;
+the benchmark preserves those tensors instead of claiming trajectory equality.
+
+Preview and Dev text/image-understanding A/B/A controls produced identical
+text, token IDs and stop reasons before and after the SP changes (12 requests
+per revision). This preserves existing Dev end-marker formatting; it is not
+an understanding-accuracy benchmark or Dev text-to-image validation.
+
+For exact capture, replay and understanding commands, see
+[the qualification tools](../../benchmarks/mammoth_moda2/README.md).
+Keep code, weights, backend, dtype, inputs and sampling fixed in paired runs.
+SP replicates weights and VAE, so do not infer peak-memory or GPU-cost savings
+from a reduction in DiT latency.
+
+### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 
 #### Environment
 

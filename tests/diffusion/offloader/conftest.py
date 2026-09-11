@@ -21,6 +21,6 @@ def dist_group():
         if dist.is_initialized():
             dist.destroy_process_group()
         gc.collect()
-        if current_omni_platform.is_available():
+        if current_omni_platform.device_type != "cpu" and current_omni_platform.is_available():
             current_omni_platform.empty_cache()
             current_omni_platform.synchronize()

@@ -94,6 +94,20 @@ def _from_pipeline_key(
     )
 
 
+def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
+    config = _from_pipeline_key(
+        "mammoth_moda2",
+        cli_overrides={"model": "/models/MammothModa2-Preview"},
+    )
+    stage = config.stage_by_id(1)
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.model_class_name == "MammothModa2DiTPipeline"
+    assert stage.diffusion_config.model == "/models/MammothModa2-Preview"
+    assert stage.diffusion_config.step_execution is False
+    assert stage.scheduler_config.max_num_seqs == 1
+    assert stage.connector_config.omni_kv_config == {"need_recv_cache": False}
+
+
 def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
     config = _from_pipeline_key(
         "minimax_h3_disaggregated",
@@ -240,6 +254,28 @@ def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime
     assert stage0.scheduler_config.max_num_seqs == 7
     assert stage1.parallel_config.tensor_parallel_size == 2
     assert stage1.runtime_config.num_gpus == stage1.parallel_config.world_size
+
+
+def test_from_pipeline_config_preserves_stage_local_cpu_weight_offload():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    omni_config = _from_pipeline_key(
+        "qwen3_tts",
+        cli_overrides={"stage_0_cpu_offload_gb": 12.0, "stage_0_cpu_offload_params": ["mlp"]},
+    )
+    stage0 = omni_config.stage_by_id(0)
+    stage1 = omni_config.stage_by_id(1)
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage0, model="test-model")
+    assert engine_args["cpu_offload_gb"] == 12.0
+    assert engine_args["cpu_offload_params"] == {"mlp"}
+    other_args = build_engine_args_dict_from_omni_stage_config(stage1, model="test-model")
+    assert not other_args.get("cpu_offload_gb")
+    assert not other_args.get("cpu_offload_params")
+
+
+def test_from_pipeline_config_rejects_negative_cpu_weight_offload():
+    with pytest.raises(ValueError, match="cpu_offload_gb"):
+        _from_pipeline_key("qwen3_tts", cli_overrides={"stage_0_cpu_offload_gb": -1.0})
 
 
 @pytest.mark.parametrize(
@@ -732,6 +768,8 @@ def test_sub_config_fields_match_structured_scopes():
         "tokenizer_mode",
         "config_format",
         "skip_mm_profiling",
+        "cpu_offload_gb",
+        "cpu_offload_params",
     }
     assert OmniStageLoadConfig(load_format="PT").load_format == "pt"
     assert issubclass(OmniStageCacheConfig, VllmCacheConfig)
