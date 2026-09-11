@@ -16,6 +16,7 @@ from typing import Any
 import soundfile as sf
 import torch
 import torch.nn as nn
+import torchaudio
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
@@ -96,18 +97,19 @@ def _normalize_reference(
         # waveform must not be zero-padded into a valid-length reference.
         return waveform, _REF_TARGET_SAMPLE_RATE
     if sample_rate_hz != _REF_TARGET_SAMPLE_RATE and waveform.numel() > 0:
-        target_len = int(round(waveform.numel() * _REF_TARGET_SAMPLE_RATE / sample_rate_hz))
-        if target_len > 0:
-            waveform = (
-                torch.nn.functional.interpolate(
-                    waveform.view(1, 1, -1),
-                    size=target_len,
-                    mode="linear",
-                    align_corners=False,
-                )
-                .view(-1)
-                .contiguous()
-            )
+        # Anti-aliased polyphase resampling, matching what token2wav's own
+        # prompt loader uses: linear interpolation would alias 48k -> 24k and
+        # leave stair-step artifacts on 16k -> 24k, and because the loader
+        # only resamples when the stored rate differs, whatever we write is
+        # what the model consumes.
+        waveform = (
+            torchaudio.transforms.Resample(
+                orig_freq=sample_rate_hz,
+                new_freq=_REF_TARGET_SAMPLE_RATE,
+            )(waveform.view(1, -1))
+            .view(-1)
+            .contiguous()
+        )
     max_samples = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
     if waveform.numel() > max_samples:
         logger.warning(
