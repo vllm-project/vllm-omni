@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -39,7 +39,7 @@ def _reference(q, k, q_weight, k_weight, rope_table):
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("seq_len", [1, 257, 1024])
 def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    from vllm_omni.diffusion.layers.ops import (
         fused_qk_norm_rope,
     )
 
