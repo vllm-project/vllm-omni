@@ -1,10 +1,37 @@
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import QwenEmbedRope
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    QwenEmbedRope,
+    _apply_qwen_image_rotary_emb,
+)
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_qwen_rotary_preserves_frequency_precision(dtype, noncontiguous):
+    from diffusers.models.transformers.transformer_qwenimage import apply_rotary_emb_qwen
+
+    generator = torch.Generator().manual_seed(42)
+    x = torch.randn(2, 17, 3, 128, generator=generator).to(dtype)
+    if noncontiguous:
+        x = x.transpose(1, 2).contiguous().transpose(1, 2)
+    angles = torch.randn(17, 64, generator=generator)
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    expected = apply_rotary_emb_qwen(x, freqs, use_real=False)
+    actual = _apply_qwen_image_rotary_emb(x, freqs)
+    assert actual.dtype == dtype
+    assert actual.shape == x.shape
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    if dtype == torch.bfloat16:
+        # A regression to early BF16 frequency rounding must be observable.
+        rounded_freqs = torch.complex(freqs.real.to(dtype).float(), freqs.imag.to(dtype).float())
+        rounded = _apply_qwen_image_rotary_emb(x, rounded_freqs)
+        assert not torch.equal(actual, rounded)
 
 
 def test_txt_seq_lens_from_embeds_uses_padded_width_not_valid_token_count():

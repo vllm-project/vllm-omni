@@ -411,6 +411,50 @@ def test_lora_manager_rolls_back_all_layers_when_activation_fails():
     assert len(first.set_calls) == first_calls_after_success + 2
 
 
+def test_lora_manager_rejects_adapter_that_binds_no_layer():
+    """An adapter whose target modules match nothing must fail, not silently no-op."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.blocks.0.attn.to_q": layer}
+
+    # Adapter-side name the engine does not expose, e.g. a diffusers-style
+    # checkpoint against a differently named engine layout.
+    mismatched = LoRALayerWeights(
+        module_name="unet.down_blocks.0.attn.to_q",
+        rank=2,
+        lora_alpha=2,
+        lora_a=torch.ones((2, 2)),
+        lora_b=torch.ones((2, 2)),
+    )
+    manager._registered_adapters = {
+        3: type(
+            "LM",
+            (),
+            {
+                "id": 3,
+                "loras": {"unet.down_blocks.0.attn.to_q": mismatched},
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+    }
+
+    with pytest.raises(ValueError, match="applies to no layer") as excinfo:
+        manager._activate_adapter(3, scale=1.0)
+
+    # The message must name what was received so the mismatch is diagnosable.
+    assert "unet.down_blocks.0.attn.to_q" in str(excinfo.value)
+
+    # Nothing was bound and the adapter must not be left marked active.
+    assert manager._active_adapter_id is None
+    assert layer.set_calls == []
+    assert layer.reset_calls >= 1
+
+
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:
     return LoRARequest(
         lora_name=f"adapter_{adapter_id}",

@@ -24,12 +24,10 @@ import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
-from vllm.entrypoints.launcher import terminate_if_errored
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    RequestResponseMetadata,
-)
+from vllm.entrypoints.launchers.launcher import terminate_if_errored
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
@@ -1602,7 +1600,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         Field naming follows the OpenAI ``speech.audio.delta`` schema, which
         carries the base64 chunk in ``audio`` (not ``delta`` — that is the
-        Realtime API ``response.audio.delta`` convention, a different event).
+        Realtime API ``response.output_audio.delta`` convention, a different event).
         See https://platform.openai.com/docs/api-reference/audio-streaming.
 
         The terminal ``speech.audio.done`` event carries a ``usage`` object
