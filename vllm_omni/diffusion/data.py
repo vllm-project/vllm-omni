@@ -2112,7 +2112,7 @@ def build_attention_config(
 
     Called exactly once in ``OmniDiffusionConfig.__post_init__``.
     Handles type-conversion **and** env-var fallback
-    (``DIFFUSION_ATTENTION_BACKEND``).
+    (``DIFFUSION_ATTENTION_BACKEND`` and ``DIFFUSION_ATTENTION_QUANT``).
     """
     normalized = parse_attention_config(attention_config)
 
@@ -2126,7 +2126,30 @@ def build_attention_config(
     if env_attention_backend.lower() == "auto":
         return normalized
 
-    normalized.default = AttentionSpec(backend=env_attention_backend)
+    quant = None
+    if env_attention_backend.upper() in ("FLASHINFER_ATTN", "TRTLLM_ATTN"):
+        env_attention_quant = os.environ.get("DIFFUSION_ATTENTION_QUANT")
+        if env_attention_quant is not None:
+            fields = [field.strip() for field in env_attention_quant.split(":")]
+            if len(fields) not in (2, 4) or not all(fields):
+                raise ValueError(
+                    "DIFFUSION_ATTENTION_QUANT must have the format "
+                    "<dtype_qk>:<dtype_vo>[:<q_block_size>:<k_block_size>]."
+                )
+            quant_kwargs: dict[str, Any] = {
+                "dtype_qk": fields[0],
+                "dtype_vo": fields[1],
+            }
+            if len(fields) == 4:
+                q_block_size, k_block_size = int(fields[2]), int(fields[3])
+                if (q_block_size, k_block_size) != (0, 0):
+                    quant_kwargs.update(
+                        q_block_size=q_block_size,
+                        k_block_size=k_block_size,
+                    )
+            quant = AttnQuantSpec(**quant_kwargs)
+
+    normalized.default = AttentionSpec(backend=env_attention_backend, quant=quant)
     logger.info(
         "Parsed attention config from DIFFUSION_ATTENTION_BACKEND '%s': default=%s, per_role=%s",
         env_attention_backend,
