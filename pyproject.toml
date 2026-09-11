@@ -328,6 +328,7 @@ extend-ignore-identifiers-re = [
     ".*arange",
     ".*MoBA",
     ".*temperal_downsample",
+    ".*temperal_upsample",
     ".*_nd",
     ".*nd$",
     ".*EmbedND$",

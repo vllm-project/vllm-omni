@@ -59,6 +59,7 @@ defines the shared configuration and backend extension points.
 | Distribute diffusion work across devices | [Parallelism](../user_guide/diffusion/parallelism/overview.md) | [Parallelism designs](../design/index.md#parallelism) |
 | Select dense, sparse, or quantized attention paths | [Attention Backends](../user_guide/diffusion/attention_backends.md) | [Attention Backend Selection](../design/feature/attention_backend_selection.md) |
 | Compile repeated diffusion regions | [Regional Compilation](../user_guide/diffusion/regional_compilation.md) | User-facing optimization guide |
+| Speed up Wan VAE video decode | [Wan VAE Decoder Fast Path](../user_guide/diffusion/vae_fast_path.md) | User-facing optimization guide |
 | Add generated video frames | [Frame Interpolation](../user_guide/diffusion/frame_interpolation.md) | User-facing extension guide |
 | Reduce diffusion model startup time | [Startup and Loading](../user_guide/diffusion/startup_and_loading.md) | User-facing loading guide |
 | Apply diffusion adapters | [LoRA](../user_guide/diffusion/lora.md) | User-facing extension guide |

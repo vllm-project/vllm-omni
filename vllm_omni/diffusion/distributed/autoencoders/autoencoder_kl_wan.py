@@ -19,6 +19,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import decode_frames, is_installed
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 from vllm_omni.platforms import current_omni_platform
 
@@ -101,6 +102,15 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         return_dict: bool = True,
     ):
         """Decode the non-tiled temporal path, optionally streaming chunks."""
+        if on_chunk is None and is_installed(self) and not torch.is_grad_enabled():
+            try:
+                out = decode_frames(self, z)
+            finally:
+                self.clear_cache()
+            if not return_dict:
+                return (out,)
+            return DecoderOutput(sample=out)
+
         self.clear_cache()
         callback_error: BaseException | None = None
         try:

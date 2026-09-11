@@ -571,6 +571,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
     diffusion_offload_config: dict[str, Any] | None = None
