@@ -38,9 +38,10 @@ MODEL_DIR_ENV = "VLLM_OMNI_AUK_MODEL_DIR"
 REFERENCE_WAV_PATH = get_asset_path("cosyvoice3/zero_shot_prompt.wav")
 ZERO_SHOT_TEXT = "The quick brown fox jumps over the lazy dog."
 ZERO_SHOT_SECONDS = 3.0
+# The upstream cookbook template: description first, then the content.
 INSTRUCT_TEXT = (
-    'Please generate speech content "Welcome back, how was your day?" based on the following '
-    'description: "A calm young woman speaking warmly and slowly."'
+    'Generate speech based on the following description: "A calm young woman speaking warmly and slowly.". '
+    'The content to speak is: "Welcome back, how was your day?".'
 )
 INSTRUCT_SECONDS = 2.5
 # 8 Euler steps keep the test short; the base recipe is 32.

@@ -10,9 +10,11 @@
 # between the stages: async_chunk stays off.
 async_chunk: false
 trust_remote_code: true
-# Stage 0 must see the whole prompt in one forward: the layer fusion
-# accumulates over a single prefill, and neither a cache hit nor a split
-# prefill would produce the full [tokens, 2048] condition.
+# Prefix caching must stay off: a cache hit skips the prefix positions, and
+# the fused [tokens, 2048] condition needs every position of the prompt.
+# Chunked prefill works (the runner concatenates the per-chunk hidden states)
+# but measured no wall-time gain, since the encoder is a few percent of a
+# request, and it costs bit-exact reproducibility across scheduling.
 enable_prefix_caching: false
 enable_chunked_prefill: false
 
@@ -27,6 +29,8 @@ stages:
     gpu_memory_utilization: 0.45
     enforce_eager: true
     max_num_batched_tokens: 32768
+    # AuK takes text plus at most one clip; no image or video tower is built.
+    limit_mm_per_prompt: {audio: 1}
     default_sampling_params:
       temperature: 0.0
       max_tokens: 1

@@ -21,12 +21,14 @@ generator first, which moves the noise and produces a different, equally valid
 realization; comparing latents then measures the noise, not the port. The
 posterior mean costs a reference latent that is 0.045 MSE (0.969 cosine) away
 from the draw the reference used, which is the smaller of the two errors.
-Run it with::
+Generate the reference artifacts once with the upstream package installed
+(``tools/auk_parity_reference.py --auk-repo ... --ckpt-dir ... --qwen-dir ...
+--out /path/to/auk-parity``; it writes ``parity_ref/<variant>`` and
+``fusion_ref``), then run::
 
     AUK_OMNI_CKPT_DIR=/path/to/auk-omni-base \
-    AUK_PARITY_REF=/path/to/parity_ref/base \
-    CUDA_VISIBLE_DEVICES=6 python -m pytest -s \
-        tests/diffusion/models/auk/test_pipeline_auk.py
+    AUK_PARITY_REF=/path/to/auk-parity/parity_ref/base \
+    python -m pytest -s tests/diffusion/models/auk/test_pipeline_auk.py
 
 ``AUK_OMNI_CKPT_DIR`` is the assembled directory this pipeline loads, which is
 not the same thing as the released AuK snapshot that the transformer and codec

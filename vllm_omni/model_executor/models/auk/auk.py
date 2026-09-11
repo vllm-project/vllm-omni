@@ -13,7 +13,7 @@ softmax weights into one ``[tokens, hidden]`` text condition, emitted through
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from functools import cached_property
 from itertools import islice
 
@@ -55,9 +55,21 @@ TEXT_COND_KEY = "output"
 _FUSION_LN_EPS = 1e-5
 
 
+class AuKProcessingInfo(Qwen2_5OmniThinkerProcessingInfo):
+    """Qwen2.5-Omni thinker processing restricted to AuK's single audio input.
+
+    AuK conditions on text plus at most one reference or source clip; images
+    and video are not part of its contract, so they are not advertised (and the
+    thinker then builds no vision tower).
+    """
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"audio": 1}
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen2_5OmniThinkerMultiModalProcessor,
-    info=Qwen2_5OmniThinkerProcessingInfo,
+    info=AuKProcessingInfo,
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 class AuKForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
@@ -97,6 +109,12 @@ class AuKForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, Sup
             hf_config=thinker_config,
             architectures=["Qwen2_5OmniThinkerModel"],
         )
+        # The audio-only mm limits keep the thinker from building its vision
+        # tower; drop it explicitly as well, as the upstream implementation does,
+        # so no vision weights are loaded or resident.
+        if getattr(self.thinker, "visual", None) is not None:
+            del self.thinker.visual
+            self.thinker.visual = None
         self.model = self.thinker
         self.make_empty_intermediate_tensors = self.thinker.make_empty_intermediate_tensors
 

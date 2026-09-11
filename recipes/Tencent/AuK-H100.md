@@ -28,7 +28,7 @@ text, exactly as in the upstream repository's cookbook.
 | Task family | Instruction | Audio input | Duration |
 | --- | --- | --- | --- |
 | Zero-shot TTS | "Say the following with the same voice: '...'" | reference clip | `gen_seconds` required |
-| Instruct TTS | description + text (see upstream cookbook) | none | `gen_seconds` required |
+| Instruct TTS | `Generate speech based on the following description: "{voice description}". The content to speak is: "{text}".` (upstream template; other orderings can make the model speak the description) | none | `gen_seconds` required |
 | Content / lyric editing | "Replace '...' with '...'" and similar | source clip | defaults to the source length |
 | Acoustic / paralinguistic editing | pitch, speed, volume, emotion, timbre, de-accent, nonverbal, whisper | source clip | defaults to the source length (speed edits scale it) |
 | Enhancement / separation | "Keep pure speech voice, remove noise and reverberation." and similar | source clip | defaults to the source length |
@@ -113,6 +113,19 @@ Editing and enhancement requests pass the source clip and may omit
 VLLM_OMNI_AUK_MODEL_DIR=ckpts/auk-omni python -m pytest tests/e2e/offline_inference/test_auk.py -q
 ```
 
+The parity suites compare the port against the upstream implementation and
+need reference artifacts produced by the upstream package (install it with
+`pip install -e /path/to/AuK` in its own environment; it pins its own torch):
+
+```bash
+python tools/auk_parity_reference.py --auk-repo /path/to/AuK --ckpt-dir ckpts/AuK \
+    --qwen-dir ckpts/Qwen2.5-Omni-3B --out auk-parity
+AUK_CKPT_DIR=ckpts/AuK AUK_REF_WAV=/path/to/AuK/assets/demo-input-audio/zero-shot-tts/ref.wav \
+    python -m pytest tests/diffusion/models/auk/test_auk_transformer_parity.py tests/diffusion/models/auk/test_auk_vae_parity.py -q
+AUK_OMNI_CKPT_DIR=ckpts/auk-omni AUK_PARITY_REF=auk-parity/parity_ref/base \
+    python -m pytest tests/diffusion/models/auk/test_pipeline_auk.py -q
+```
+
 Measured on one H100 against the upstream implementation with the same seeds
 and mean VAE latents (four cookbook cases, base checkpoint): identical
 transcripts, speaker similarity to the upstream output 0.993 to 0.999, log-mel
@@ -127,9 +140,13 @@ about 47 s with a warm page cache.
   both stages resident (deploy defaults: encoder 0.45, diffusion stage 0.35
   of device memory).
 - Key flags: `enforce_eager` on both stages (the encoder walks the decoder
-  layers itself for the layer fusion); `enable_prefix_caching` and
-  `enable_chunked_prefill` must stay off for the encoder because the fused
-  condition covers one full prefill.
+  layers itself for the layer fusion). `enable_prefix_caching` must stay off
+  for the encoder: a cache hit skips prompt positions that the fused
+  condition needs. `enable_chunked_prefill` is off by default: forcing it
+  (128-token chunks, so two to three chunks per prompt) reproduces the
+  unchunked condition to bf16 rounding (per-token cosine 0.99999) and leaves
+  request walls unchanged, because the encoder is about 3% of a base request,
+  while concurrent runs stop being bit-identical to sequential ones.
 - Known limitations: the encoder's audio tower runs without `flash_attn` in a
   plain vLLM install, which shifts the encoder output on audio token positions
   (per-token cosine 0.96 vs the upstream fp32 fusion; text positions 0.9999)
