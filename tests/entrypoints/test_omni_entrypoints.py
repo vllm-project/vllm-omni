@@ -166,7 +166,8 @@ class FakeAsyncOmniEngine:
     def abort(self, request_ids: list[str]) -> None:
         self.aborted.append(list(request_ids))
 
-    async def abort_async(self, request_ids: list[str]) -> None:
+    async def abort_async(self, request_ids: list[str], timeout=None) -> None:
+        del timeout
         self.abort(request_ids)
 
     async def collective_rpc_async(self, **_: Any) -> list[Any]:
