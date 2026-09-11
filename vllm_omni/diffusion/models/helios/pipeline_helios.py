@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
@@ -22,6 +21,7 @@ from typing_extensions import override
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
@@ -214,7 +214,11 @@ class HeliosPipeline(
         self.text_encoder = UMT5EncoderModel.from_pretrained(
             model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
-        self.vae = AutoencoderKLWan.from_pretrained(
+        # Use the distributed VAE so the registry enables patch-parallel decode
+        # (vae_patch_parallel_size > 1) and auto-enables tiling, mirroring Wan2.2.
+        # Kept fp32 to avoid VAE bf16 quality risk; bf16 autocast is a follow-up
+        # needing visual validation.
+        self.vae = DistributedAutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
 
