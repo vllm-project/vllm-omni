@@ -167,6 +167,22 @@ class AsyncOmniEngine:
         self._log_stats = log_stats
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
 
+        # Pack --pid-* CLI flags into a single ``pid_decode`` dict consumed by
+        # ``OmniDiffusionConfig``. When ``--enable-pid`` is set, the matching
+        # keys are popped from kwargs and re-injected as ``pid_decode`` so
+        # they flow through the normal stage-config plumbing.
+        _pid_enable = kwargs.pop("enable_pid", False)
+        if _pid_enable:
+            _pid_decode: dict[str, Any] = {"enabled": True}
+            for _cli_key, _cfg_key in (
+                ("pid_checkpoint", "checkpoint_path"),
+                ("pid_gemma", "gemma_model"),
+            ):
+                _val = kwargs.pop(_cli_key, None)
+                if _val is not None:
+                    _pid_decode[_cfg_key] = _val
+            kwargs["pid_decode"] = _pid_decode
+
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
         # ------------------------------------------------------------------ #
