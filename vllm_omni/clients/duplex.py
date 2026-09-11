@@ -460,9 +460,7 @@ _EVENT_TYPES: dict[str, type[DuplexEvent]] = {
     "session.expired": SessionExpired,
     "response.created": ResponseCreated,
     "response.done": ResponseDone,
-    "response.audio.delta": AudioDelta,
     "response.output_audio.delta": AudioDelta,
-    "response.audio_transcript.delta": TranscriptDelta,
     "response.output_audio_transcript.delta": TranscriptDelta,
     "response.text.delta": TextDelta,
     "response.output_text.delta": TextDelta,
@@ -1359,7 +1357,7 @@ class EventCollector:
             if self.response_id(event) == response_id
             and event.get("type")
             in {
-                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
                 "response.output_text.delta",
                 "response.text.delta",
             }
@@ -1406,7 +1404,7 @@ class EventCollector:
             if (
                 event.get("type")
                 in {
-                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
                     "response.output_text.delta",
                     "response.text.delta",
                 }

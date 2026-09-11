@@ -76,9 +76,9 @@ def load_json_config(model_path: str, subfolder: str, filename: str, local_files
                 return json.load(f)
     else:
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/{filename}",
             )
@@ -1358,6 +1358,8 @@ class HeliosPipeline(
         """Single-stage denoising loop for one chunk."""
         batch_size = latents.shape[0]
         do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+        # Distilled (DMD) needs the chunk-start noise for renoise; mirror step_scheduler.
+        stage1_start_latents = latents
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
@@ -1420,7 +1422,20 @@ class HeliosPipeline(
                         cfg_normalize=False,
                     )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if self.is_distilled:
+                    latents = self.scheduler.step(
+                        noise_pred,
+                        t,
+                        latents,
+                        return_dict=False,
+                        cur_sampling_step=i,
+                        dmd_noisy_tensor=stage1_start_latents,
+                        dmd_sigmas=self.scheduler.sigmas,
+                        dmd_timesteps=self.scheduler.timesteps,
+                        all_timesteps=timesteps,
+                    )[0]
+                else:
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
                 pbar.update()
 

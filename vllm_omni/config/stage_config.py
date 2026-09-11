@@ -458,6 +458,7 @@ class StageDeployConfig:
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
+    video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
@@ -471,6 +472,7 @@ class StageDeployConfig:
 
     # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
+    enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
@@ -509,6 +511,7 @@ class DuplexSessionRuntimeConfig:
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
     completed_append_cache_size: int = 256
+    server_vad_model_path: str | None = None
     # Startup warmup: run this many silent 80 ms-style frames through a
     # throwaway realtime session before real clients are admitted, so
     # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
@@ -528,6 +531,10 @@ class DuplexSessionRuntimeConfig:
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.server_vad_model_path is not None and (
+            not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
+        ):
+            raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
@@ -1124,10 +1131,22 @@ class StageConfig:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
             reconcile_diffusion_attention_overrides(engine_args, runtime_overrides)
 
-        # CLI overrides take precedence over YAML defaults
+        # CLI overrides take precedence over YAML defaults. Most dict-valued
+        # overrides are deep-merged so a partial CLI dict (e.g. --no-guardrails
+        # riding on ``model_config``) layers onto the deploy YAML instead of
+        # clobbering sibling keys such as ``policy_server_config`` — the same
+        # rationale as the platform-overlay deep-merge. Legacy atomic mappings
+        # are handled explicitly below.
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                engine_args[key] = value
+                existing = engine_args.get(key)
+                # ``omni_kv_config`` is an atomic legacy override: callers use
+                # a partial mapping to replace the topology-provided transfer
+                # role, rather than to add fields to it.
+                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                    engine_args[key] = _get_recursively_merged_dict(existing, value)
+                else:
+                    engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

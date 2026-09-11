@@ -85,5 +85,7 @@ def test_text_only_nonstreaming_pcm_001(omni_server, openai_client) -> None:
         "voice": "default",
         "min_audio_bytes": _MIN_AUDIO_BYTES,
         "min_hnr_db": -2.0,
+        # dots.tts-soar emits native 48 kHz PCM, which has no rate header.
+        "expected_sample_rate": 48_000,
     }
     openai_client.send_audio_speech_request(request_config)

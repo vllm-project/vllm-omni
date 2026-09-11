@@ -54,8 +54,17 @@ except ImportError:
     soundfile = None
 
 
+from vllm.entrypoints.generate.base.protocol import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+    FunctionCall,
+    FunctionDefinition,
+    RequestResponseMetadata,
+    ToolCall,
+)
 from vllm.entrypoints.generate.base.serving import clamp_prompt_logprobs
-from vllm.entrypoints.launcher import terminate_if_errored
+from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -69,22 +78,15 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     _get_mm_token_counts,
     _make_prompt_tokens_details,
 )
-from vllm.entrypoints.openai.engine.protocol import (
-    DeltaFunctionCall,
-    DeltaMessage,
-    DeltaToolCall,
-    ErrorInfo,
-    ErrorResponse,
-    FunctionCall,
-    FunctionDefinition,
-    RequestResponseMetadata,
-    ToolCall,
-    UsageInfo,
-)
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.serve.engine.protocol import (
+    ErrorInfo,
+    ErrorResponse,
+    UsageInfo,
+)
 from vllm.entrypoints.serve.engine.typing import ChatLikeRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
@@ -700,7 +702,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # Always attach mm_processor_kwargs (possibly empty) so
-                # OmniInputPreprocessor._process_text routes through the
+                # OmniRenderer routes through the
                 # multimodal processor path. Without it, the preprocessor
                 # falls back to plain _tokenize_prompt and AR-based image-gen
                 # models like GLM-Image never see their image-generation
@@ -3078,11 +3080,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ar_image_size: str | None = None
             if height is not None and width is not None:
                 ar_image_size = f"{width}x{height}"
+            # Reuse build_kwargs's own (possibly-omitted) "bot_task" entry rather
+            # than the raw outer `bot_task` variable: build_prompt_tokens/build_prompt
+            # above default an omitted bot_task per-task (e.g. "think" for t2i), and
+            # resolve_stop_token_ids must normalize from that same omitted-or-not
+            # starting point to agree on which stop tokens apply -- passing the raw
+            # `bot_task` (still None when omitted) made the two calls disagree.
+            ar_stop_kwargs: dict[str, Any] = {}
+            if "bot_task" in build_kwargs:
+                ar_stop_kwargs["bot_task"] = build_kwargs["bot_task"]
             ar_stop_token_ids = resolve_stop_token_ids(
                 task=ar_task,
-                bot_task=bot_task,
                 tokenizer=tokenizer,
                 image_size=ar_image_size,
+                **ar_stop_kwargs,
             )
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
@@ -3288,7 +3299,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_compression: int = 100,
         size: str = "auto",
         raw_request: Request | None = None,
-    ) -> tuple[list[Image.Image], dict[str, Any], float, str | None] | ErrorResponse | AsyncIterator[str]:
+    ) -> (
+        tuple[list[Image.Image], dict[str, Any], float, str | None, dict[str, Any] | None]
+        | ErrorResponse
+        | AsyncIterator[str]
+    ):
         """Generate diffusion images and return raw images plus generation stats."""
         if request_id is None:
             request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -3375,6 +3390,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         images = getattr(result, "images", [])
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
+        response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
         cot_output = None
 
         req_out = result
@@ -3407,7 +3423,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if isinstance(ar_text, str) and ar_text.strip():
                         cot_output = ar_text
 
-        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output
+        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output, response_metrics
 
     async def _stream_diffusion_image_chunks(
         self,
