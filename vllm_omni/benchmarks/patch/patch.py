@@ -50,6 +50,11 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
     daily_omni_local_videos_dir,
     resolve_daily_omni_local_root,
 )
+from vllm_omni.benchmarks.data_modules.duplex_eval_dataset import (
+    DuplexEvalDataset,
+    DuplexEvalSampleRequest,
+    DuplexEvalSessionOptions,
+)
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     DEFAULT_OMNIINTERACT_REPO,
     OmniInteractDataset,
@@ -67,6 +72,14 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET as DEFAULT_DUPLEX_EVAL_DATASET
+from vllm_omni.benchmarks.duplex_eval import (
+    DuplexEvalCaseResult,
+    DuplexEvalRequestConfig,
+    finalize_duplex_eval_batch,
+    options_from_args,
+    run_duplex_eval_case,
+)
 from vllm_omni.benchmarks.omniinteract import (
     VIDEO_FPS,
     OmniInteractBenchmarkConfig,
@@ -334,6 +347,13 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     setattr(rfi, "omniinteract_prepared_input", sample.omniinteract_prepared_input)
 
 
+def _attach_duplex_eval_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    if not isinstance(sample, DuplexEvalSampleRequest):
+        return
+    setattr(rfi, "duplex_eval_sample", sample.duplex_eval_sample)
+    setattr(rfi, "duplex_eval_options", sample.duplex_eval_options)
+
+
 def _append_error(existing: str, message: str) -> str:
     return f"{existing}\n{message}" if existing else message
 
@@ -441,6 +461,7 @@ def get_samples(args, tokenizer):
         "sound-effect",
     )
     is_omniinteract = args.dataset_name == "omniinteract"
+    is_duplex_eval = args.dataset_name == "omni-duplex-eval"
 
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in [
@@ -449,7 +470,9 @@ def get_samples(args, tokenizer):
         "openai-realtime-duplex",
         "daily-omni",
     ]
-    is_omni_dataset = is_daily_omni or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
+    is_omni_dataset = (
+        is_daily_omni or is_seed_tts or is_omniinteract or is_duplex_eval or args.dataset_name == "random-mm"
+    )
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -510,6 +533,33 @@ def get_samples(args, tokenizer):
                 ref_audio_data_url=encoded_ref_audio,
             )
         # Replace OmniInteract's ``0`` (all) with the measured request count.
+        args.num_prompts = len(requests)
+        return requests
+
+    if is_duplex_eval:
+        dataset_path = getattr(args, "dataset_path", None)
+        dataset = str(dataset_path) if dataset_path else DEFAULT_DUPLEX_EVAL_DATASET
+        options = options_from_args(args)
+        duplex_dataset = DuplexEvalDataset(
+            dataset=dataset,
+            split=str(getattr(args, "duplex_eval_split", "all")),
+            family=str(getattr(args, "duplex_eval_family", "all")),
+            media_root=getattr(args, "duplex_eval_media_root", None),
+            limit=getattr(args, "duplex_eval_limit", None),
+            ids=getattr(args, "duplex_eval_ids", None),
+            exclude_ids=getattr(args, "duplex_eval_exclude_ids", None),
+            random_seed=args.seed,
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+        requests = duplex_dataset.sample(
+            tokenizer,
+            args.num_prompts,
+            request_id_prefix=args.request_id_prefix,
+            options=options,
+        )
+        if not requests:
+            raise ValueError("No Omni-DuplexEval samples were selected")
+        # Replace Omni-DuplexEval's ``0`` (all) with the measured request count.
         args.num_prompts = len(requests)
         return requests
 
@@ -2310,6 +2360,64 @@ async def _async_request_omniinteract(
     return output
 
 
+async def _async_request_duplex_eval(
+    request_func_input: RequestFuncInput,
+    *,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Drive one Omni-DuplexEval sample through the timed generation window.
+
+    Generation only: the lifecycle signals returned by
+    :func:`run_duplex_eval_case` (``response_done`` / ``drain_timeout`` /
+    ``close_timeout``) let the batch finaliser flag hung samples. Judging is
+    intentionally absent (v2 design §5.2).
+    """
+    sample = getattr(request_func_input, "duplex_eval_sample", None)
+    options = getattr(request_func_input, "duplex_eval_options", None)
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    try:
+        if sample is None or not isinstance(options, DuplexEvalSessionOptions):
+            raise ValueError("DuplexEval RequestFuncInput is missing its dataset session layout")
+        config = DuplexEvalRequestConfig(
+            model=request_func_input.model_name or request_func_input.model,
+            url=_realtime_websocket_url(request_func_input.api_url),
+            options=options,
+        )
+        case_result = await run_duplex_eval_case(sample, config)
+        output.latency = case_result.latency_s
+        output.success = case_result.success
+        output.error = case_result.error
+        # Explicit ``None`` placeholder: without it metrics.py would treat the
+        # default ``output.ttft == 0.0`` as a real sample and report pseudo-zero
+        # TTFT / audio TTFP / RTF (v2 design §4.4).
+        output.duplex_session_metrics = {
+            "mean_ttft_ms": None,
+            "mean_ttfp_ms": None,
+            "mean_rtf": None,
+            "source": "omni-duplex-eval",
+        }
+        setattr(output, "duplex_eval_case_result", case_result)
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error("Omni-DuplexEval Realtime request failed: %s", output.error)
+        setattr(
+            output,
+            "duplex_eval_case_result",
+            DuplexEvalCaseResult(
+                id=getattr(sample, "id", ""),
+                split=getattr(sample, "split", ""),
+                family=getattr(sample, "family", ""),
+                error=output.error,
+            ),
+        )
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 class _RealtimeTTSProbe:
     """Explicit-session Realtime TTS driver over the public duplex client.
 
@@ -2400,6 +2508,8 @@ async def async_request_openai_realtime_duplex(
     del session
     if getattr(request_func_input, "omniinteract_case", None) is not None:
         return await _async_request_omniinteract(request_func_input, pbar=pbar)
+    if getattr(request_func_input, "duplex_eval_sample", None) is not None:
+        return await _async_request_duplex_eval(request_func_input, pbar=pbar)
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
     output.start_time = time.perf_counter()
@@ -2883,6 +2993,7 @@ async def benchmark(
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
+        _attach_duplex_eval_to_request_func_input(request, request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
@@ -2898,6 +3009,8 @@ async def benchmark(
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
+    # Generation-time ledger only: no judge, no network, outside the timed window.
+    duplex_eval_summary = finalize_duplex_eval_batch(input_requests, outputs)
 
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
@@ -3000,6 +3113,8 @@ async def benchmark(
         result["duplex_session_metrics"] = duplex_session_metrics
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
+    if duplex_eval_summary is not None:
+        result["duplex_eval"] = duplex_eval_summary
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

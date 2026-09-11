@@ -23,12 +23,20 @@ import math
 from pathlib import Path
 
 _DEFAULT_OMNIINTERACT_NUM_PROMPTS = 3
+_DEFAULT_DUPLEX_EVAL_NUM_PROMPTS = 3
 
 
 def _positive_finite_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(f"must be a finite positive number, got {value!r}")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be non-negative, got {value!r}")
     return parsed
 
 
@@ -75,6 +83,110 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path("omniinteract-output"),
         help="Directory for case and evaluator artifacts.",
+    )
+
+
+def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add the Omni-DuplexEval generation arguments for ``vllm bench serve``.
+
+    Judge arguments intentionally do not exist here: scoring runs in a separate
+    process (Phase 2/3 of the DFX runner) after the timed benchmark window, so
+    ``vllm bench serve`` never contains a judge code path (design §3.6 / §5.4).
+    """
+    from vllm_omni.benchmarks.data_modules.duplex_eval_dataset import (
+        DUPLEX_EVAL_FAMILIES,
+    )
+
+    group = parser.add_argument_group("Omni-DuplexEval Benchmark Options")
+    group.add_argument(
+        "--duplex-eval-split",
+        type=str,
+        default="all",
+        help="Single split (e.g. RTD_OCR) or 'all' for every known RTD/PR split.",
+    )
+    group.add_argument(
+        "--duplex-eval-family",
+        choices=list(DUPLEX_EVAL_FAMILIES),
+        default="all",
+        help="Family filter: 'all', 'rtd' (realtime-description) or 'pr' (proactive-reminder).",
+    )
+    group.add_argument(
+        "--duplex-eval-media-root",
+        type=str,
+        default=None,
+        help="Base directory used to resolve relative media paths; loader errors on a missing root.",
+    )
+    group.add_argument(
+        "--duplex-eval-limit",
+        type=_non_negative_int,
+        default=None,
+        help="Maximum number of samples per split (applied after exclusion).",
+    )
+    group.add_argument(
+        "--duplex-eval-ids",
+        nargs="+",
+        default=None,
+        help="Explicit sample-id allow-list; mutually exclusive with --duplex-eval-exclude-ids.",
+    )
+    group.add_argument(
+        "--duplex-eval-exclude-ids",
+        nargs="+",
+        default=None,
+        help="Exclusion list ('<id>' or '<split>/<id>'); applied before --duplex-eval-limit.",
+    )
+    group.add_argument(
+        "--duplex-eval-output-dir",
+        type=Path,
+        default=Path("duplex-eval-responses"),
+        help="Root directory for generated sample artifacts.",
+    )
+    group.add_argument(
+        "--duplex-eval-score-dir",
+        type=Path,
+        default=Path("duplex-eval-scores"),
+        help="Root directory for the generation ledger and Phase-2 score artifacts.",
+    )
+    group.add_argument(
+        "--duplex-eval-ref-audio",
+        type=_existing_file,
+        default=None,
+        help="Reference WAV required by MiniCPM-o native-duplex audio output.",
+    )
+    group.add_argument(
+        "--duplex-eval-fps",
+        type=_positive_finite_float,
+        default=1.0,
+        help="Frame-sampling rate used while generating the duplex response.",
+    )
+    group.add_argument(
+        "--duplex-eval-pace",
+        choices=["realtime", "as-fast-as-possible"],
+        default="realtime",
+        help="Generation pace; non-realtime records clock=invalid and needs --duplex-eval-allow-invalid-clock.",
+    )
+    group.add_argument(
+        "--duplex-eval-clock",
+        choices=["media"],
+        default="media",
+        help="Timeline used for generated artifacts.",
+    )
+    group.add_argument(
+        "--duplex-eval-overwrite",
+        action="store_true",
+        default=False,
+        help="Regenerate samples even when their artifacts already exist.",
+    )
+    group.add_argument(
+        "--duplex-eval-allow-invalid-clock",
+        action="store_true",
+        default=False,
+        help="Permit clock=invalid artifacts (troubleshooting only).",
+    )
+    group.add_argument(
+        "--duplex-eval-no-artifacts",
+        action="store_true",
+        default=False,
+        help="Skip publishing the batch_summary.json / eval_manifest.jsonl generation ledger.",
     )
 
 
@@ -259,6 +371,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
     "omniinteract",
+    "omni-duplex-eval",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -331,6 +444,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
     add_omniinteract_cli_args(parser)
+    add_duplex_eval_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
@@ -360,6 +474,38 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             args.max_concurrency = 1
         elif max_concurrency <= 0:
             raise ValueError("OmniInteract requires --max-concurrency to be positive")
+    if getattr(args, "dataset_name", None) == "omni-duplex-eval":
+        if getattr(args, "backend", None) != "openai-realtime-duplex":
+            raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex")
+        if getattr(args, "endpoint", None) != "/v1/realtime":
+            raise ValueError("Omni-DuplexEval requires --endpoint /v1/realtime")
+        if not getattr(args, "duplex_eval_ref_audio", None):
+            raise ValueError("Omni-DuplexEval requires --duplex-eval-ref-audio")
+        for banned, flag in (
+            ("ignore_eos", "--ignore-eos"),
+            ("profile", "--profile"),
+            ("skip_tokenizer_init", "--skip-tokenizer-init"),
+        ):
+            if getattr(args, banned, False):
+                raise ValueError(f"Omni-DuplexEval does not support {flag}")
+        if float(getattr(args, "probe_request_rate", 0.0) or 0.0) > 0:
+            raise ValueError("Omni-DuplexEval does not support --probe-request-rate")
+        if str(getattr(args, "duplex_eval_pace", "realtime")) != "realtime" and not getattr(
+            args, "duplex_eval_allow_invalid_clock", False
+        ):
+            raise ValueError(
+                "--duplex-eval-pace as-fast-as-possible records clock=invalid; pass "
+                "--duplex-eval-allow-invalid-clock to score it"
+            )
+        if getattr(args, "duplex_eval_ids", None) and getattr(args, "duplex_eval_exclude_ids", None):
+            raise ValueError("--duplex-eval-ids and --duplex-eval-exclude-ids are mutually exclusive")
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = _DEFAULT_DUPLEX_EVAL_NUM_PROMPTS
+        max_concurrency = getattr(args, "max_concurrency", None)
+        if max_concurrency is None:
+            args.max_concurrency = 1
+        elif max_concurrency <= 0:
+            raise ValueError("Omni-DuplexEval requires --max-concurrency to be positive")
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
     backend = getattr(args, "backend", None)

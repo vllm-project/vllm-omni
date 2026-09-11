@@ -3,8 +3,10 @@
 
 """Tests for DFX runner metadata field exclusion."""
 
+import argparse
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -588,3 +590,219 @@ def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples
             {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
             1,
         )
+
+
+# ---------------------------------------------------------------------------
+# Omni-DuplexEval runner metadata (design v2 §9.2, T22-T33)
+# ---------------------------------------------------------------------------
+
+_DUPLEX_EVAL_PERF_JSON = Path(__file__).with_name("test_minicpmo_4_5_omni_duplex_eval.json")
+
+# Keys rendered by the generic ``run_benchmark`` loop that are *not* served by
+# ``add_duplex_eval_cli_args`` (upstream ``vllm bench serve`` takes them).
+_UPSTREAM_SERVE_KEYS = frozenset(
+    {
+        "dataset_name",
+        "dataset_path",
+        "backend",
+        "endpoint",
+        "num_prompts",
+        "max_concurrency",
+        "num_warmups",
+        "disable_shuffle",
+        "trust_remote_code",
+        "percentile-metrics",
+        "no_oversample",
+        "extra_body",
+    }
+)
+
+
+def _load_duplex_eval_config() -> dict:
+    return json.loads(_DUPLEX_EVAL_PERF_JSON.read_text(encoding="utf-8"))[0]
+
+
+def _duplex_eval_params(**overrides) -> dict:
+    params = {"dataset_name": "omni-duplex-eval", "duplex_eval_exclude_ids": ["517", "565"]}
+    params.update(overrides)
+    return params
+
+
+def _merged_duplex_summary(**overrides) -> dict:
+    summary = {
+        "total": 6,
+        "generated": 6,
+        "generation_failed": 0,
+        "failure_ids": [],
+        "artifacts_complete": True,
+        "clock": "media",
+        "clock_mismatch_ids": [],
+        "exclude_ids": ["517", "565"],
+        "selected_ids": ["RTD_OCR/560", "RTD_OCR/561"],
+        "phase": "generate+evaluate+summarize",
+        "judge_enabled": True,
+        "scored": 6,
+        "score_summary": {"protocol_pin": "pin", "samples": 6},
+    }
+    summary.update(overrides)
+    return summary
+
+
+def test_omni_duplex_result_accepts_complete_merged_summary():
+    """T22: complete generation + merged judge phase passes the Gate."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result({"completed": 6, "duplex_eval": _merged_duplex_summary()}, _duplex_eval_params(), 6)
+
+
+def test_omni_duplex_result_rejects_incomplete_generation():
+    """T23: generated < total fails loudly (the two known stuck samples)."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    summary = _merged_duplex_summary(generated=5, generation_failed=1, failure_ids=["RTD_OCR/565"])
+    with pytest.raises(AssertionError, match="generation incomplete"):
+        assert_result({"completed": 6, "duplex_eval": summary}, _duplex_eval_params(), 6)
+
+
+def test_omni_duplex_result_rejects_incomplete_artifacts():
+    """T24: a missing generation ledger fails the Gate."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    summary = _merged_duplex_summary(artifacts_complete=False)
+    with pytest.raises(AssertionError, match="artifacts are incomplete"):
+        assert_result({"completed": 6, "duplex_eval": summary}, _duplex_eval_params(), 6)
+
+
+def test_omni_duplex_result_tolerates_degraded_judge():
+    """T25: judge_enabled=false + skip reason keeps only G1-G3."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    summary = _merged_duplex_summary(
+        judge_enabled=False,
+        phase="generate",
+        judge_skipped_reason="judge unreachable (judge_server_params.required=false)",
+        scored=0,
+    )
+    del summary["score_summary"]
+    assert_result({"completed": 6, "duplex_eval": summary}, _duplex_eval_params(), 6)
+
+
+def test_omni_duplex_result_rejects_exclude_echo_mismatch():
+    """T26a: the effective exclude list must be echoed back verbatim."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="exclude-id echo mismatch"):
+        assert_result(
+            {"completed": 6, "duplex_eval": _merged_duplex_summary(exclude_ids=["517"])}, _duplex_eval_params(), 6
+        )
+
+
+def test_omni_duplex_result_rejects_excluded_sample_selected():
+    """T26b: an excluded sample must never appear in selected_ids."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    summary = _merged_duplex_summary(selected_ids=["RTD_OCR/517"])
+    with pytest.raises(AssertionError, match="excluded samples were still selected"):
+        assert_result({"completed": 6, "duplex_eval": summary}, _duplex_eval_params(), 6)
+
+
+def test_omni_duplex_result_needs_no_benchmark_mode():
+    """T27: the duplex-eval branch must not depend on a ``benchmark_mode`` key."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    params = _duplex_eval_params()
+    assert "benchmark_mode" not in params
+    assert_result({"completed": 6, "duplex_eval": _merged_duplex_summary()}, params, 6)
+
+
+def test_omni_duplex_result_without_baseline_skips_tpot_assertion():
+    """T28: no baseline block means no TPOT sample assertions (locking B2)."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = {"completed": 6, "duplex_eval": _merged_duplex_summary(), "mean_tpot_ms": float("nan")}
+    assert_result(result, _duplex_eval_params(), 6)
+
+
+def test_omni_duplex_custom_percentile_keys_do_not_assert():
+    """T29: unknown percentile metrics are inert for the duplex-eval Gate."""
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    params = _duplex_eval_params(**{"percentile-metrics": "e2el,judge_latency_ms"})
+    assert_result({"completed": 6, "duplex_eval": _merged_duplex_summary()}, params, 6)
+
+
+def test_omni_duplex_perf_json_marks_resolve():
+    """T30: the shipped JSON declares exactly one hardware_marks + local_model/omni."""
+    from tests.dfx.conftest import resolve_pytest_marks
+
+    config = _load_duplex_eval_config()
+    assert sum(1 for item in config["mark"] if isinstance(item, dict) and "hardware_marks" in item) == 1
+    names = {mark.name for mark in resolve_pytest_marks(config["mark"])}
+    assert {"local_model", "omni", "cards_2", "H100", "A3", "cuda", "npu"} <= names
+    assert "full_model" not in names
+
+
+def test_omni_duplex_judge_server_params_ignored_by_server_parser(tmp_path):
+    """T31: ``judge_server_params`` must not leak into the duplex server params."""
+    from tests.dfx.conftest import _create_unique_server_params
+
+    config = _load_duplex_eval_config()
+    assert "judge_server_params" in config
+    rows = _create_unique_server_params([config], tmp_path)
+    assert len(rows) == 1
+    test_name, model, _deploy, _overrides, _extra, _use_omni = rows[0]
+    assert test_name == config["test_name"]
+    assert model == config["server_params"]["model"]
+
+
+def _duplex_eval_serve_cli_keys() -> set[str]:
+    from vllm_omni.entrypoints.cli.benchmark.cli_args import add_duplex_eval_cli_args
+
+    parser = argparse.ArgumentParser()
+    add_duplex_eval_cli_args(parser)
+    return {
+        option[2:].replace("-", "_")
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+
+
+def test_omni_duplex_perf_json_keys_are_cli_or_excluded():
+    """T32: every JSON key is either a real CLI flag or in the exclude allow-list.
+
+    This is the reverse check for the silent argparse failure described in
+    design §12.1 V3: a ``benchmark_params`` key that is neither excluded nor a
+    registered ``vllm bench serve`` flag makes the whole case fail to launch.
+    """
+    from tests.dfx.perf.scripts.run_benchmark import _BENCHMARK_PARAM_EXCLUDE_KEYS
+
+    allowed = set(_BENCHMARK_PARAM_EXCLUDE_KEYS) | _duplex_eval_serve_cli_keys() | set(_UPSTREAM_SERVE_KEYS)
+    config = _load_duplex_eval_config()
+    for params in config["benchmark_params"]:
+        unknown = set(params) - allowed
+        assert not unknown, f"perf JSON keys rendered as unknown flags: {sorted(unknown)}"
+
+
+def test_omni_duplex_hardware_marks_accept_cuda_and_npu_same_cards():
+    """T33a: branch B-2 mark shape (cuda H100 + npu A3, num_cards=2) is legal."""
+    from tests.helpers.mark import hardware_marks
+
+    names = {mark.name for mark in hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)}
+    assert {"H100", "A3", "cuda", "npu", "cards_2"} <= names
+
+
+def test_omni_duplex_hardware_marks_reject_mixed_card_counts():
+    """T33b: per-platform card counts must match (branch B-1 needs a split test_name)."""
+    from tests.helpers.mark import hardware_marks
+
+    with pytest.raises(ValueError, match="different per-platform num_cards"):
+        hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 2, "npu": 1})
+
+
+def test_omni_duplex_perf_json_avoids_host_absolute_paths():
+    """The JSON must reference the mirror through BENCHMARK_ASSETS, never a host path."""
+    for params in _load_duplex_eval_config()["benchmark_params"]:
+        dataset_path = params["dataset_path"]
+        assert dataset_path.startswith("${BENCHMARK_ASSETS}")
+        assert not dataset_path.startswith("/Users/")
