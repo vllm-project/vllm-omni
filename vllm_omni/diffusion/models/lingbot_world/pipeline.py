@@ -19,6 +19,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -63,10 +64,16 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.streaming_decode import (
+    StreamingDecodeState,
+    WanStreamingDecoder,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from diffusers.video_processor import VideoProcessor
@@ -535,6 +542,12 @@ class LingBotWorldCausalDMDPipeline(
         self._ar_width = int(model_config.get("ar_diffusion_width", 832))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
         self._ar_sessions: dict[str, _LingBotARSessionState] = {}
+        # One temporal decoder cache per stepwise session, keyed the way the
+        # runner keys AR sessions (session_id == request_id) so both are
+        # released together rather than through two independent lifecycles.
+        self._streaming_decode_states: dict[str, StreamingDecodeState] = {}
+        self._cached_streaming_decoder: WanStreamingDecoder | None = None
+        self._streaming_decode_unsupported = False
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "vae.encode",
@@ -614,9 +627,11 @@ class LingBotWorldCausalDMDPipeline(
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
         self._ar_sessions.pop(session_id, None)
+        self._release_streaming_decode_state(session_id)
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self._ar_sessions.pop(session_id, None)
+        self._release_streaming_decode_state(session_id)
 
     def _parse_request(self, req: DiffusionRequestBatch) -> _LingBotRequestInputs:
         if req.num_reqs != 1 or len(req.prompts) != 1:
@@ -1273,15 +1288,82 @@ class LingBotWorldCausalDMDPipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
+    def _streaming_decoder(self) -> WanStreamingDecoder | None:
+        """The session-owned streaming decoder, or ``None`` on a VAE that cannot stream.
+
+        Tiled and patch-parallel decode split a frame spatially and drive the
+        module's own ``feat_cache`` across those tiles, so a per-session cache
+        threaded through them is a separate design and is not attempted here;
+        those configurations keep the stateless per-chunk decode. The check
+        runs once and its result is cached, including the negative.
+        """
+        if self._streaming_decode_unsupported:
+            return None
+        if self._cached_streaming_decoder is not None:
+            return self._cached_streaming_decoder
+        decoder: WanStreamingDecoder | None = None
+        reason: str | None = None
+        vae_patch_parallel_size = int(
+            getattr(getattr(self.od_config, "parallel_config", None), "vae_patch_parallel_size", 1) or 1
+        )
+        if bool(getattr(self.vae, "use_tiling", False)):
+            reason = "VAE tiling is enabled"
+        elif vae_patch_parallel_size > 1:
+            reason = f"VAE patch parallelism is enabled (vae_patch_parallel_size={vae_patch_parallel_size})"
+        else:
+            try:
+                decoder = WanStreamingDecoder(self.vae)
+                # Materialize the cache geometry now: a decoder that cannot
+                # report it would otherwise fail on the first chunk instead.
+                _ = decoder.num_causal_convs
+            except TypeError as exc:
+                decoder = None
+                reason = str(exc)
+        if decoder is None:
+            logger.warning(
+                "LingBot streaming decode is unavailable (%s); AR blocks will be decoded independently, "
+                "which drops each block's opening frame and restarts temporal context at every boundary.",
+                reason,
+            )
+            self._streaming_decode_unsupported = True
+            return None
+        self._cached_streaming_decoder = decoder
+        return decoder
+
+    def _streaming_decode_state(self, decoder: WanStreamingDecoder, session_id: str) -> StreamingDecodeState:
+        state = self._streaming_decode_states.get(session_id)
+        if state is None:
+            state = decoder.new_decode_state(session_id)
+            self._streaming_decode_states[session_id] = state
+        return state
+
+    def _release_streaming_decode_state(self, session_id: str) -> None:
+        """Drop one session's decoder cache. Safe for a session that never decoded."""
+        state = self._streaming_decode_states.pop(session_id, None)
+        if state is None:
+            return
+        decoder = self._cached_streaming_decoder
+        if decoder is None:
+            state.release()
+        else:
+            decoder.release(state)
+
     def _decode_chunk_to_pixels(
-        self, latents: torch.Tensor, *, output_type: str
+        self, latents: torch.Tensor, *, output_type: str, session_id: str | None = None
     ) -> torch.Tensor | np.ndarray | list[list[PIL.Image.Image]]:
         """Decode one AR block so streaming consumers receive pixels, not latents.
 
-        Blocks are decoded independently, which keeps the shared VAE stateless
-        and lets a rollout be served without a per-session temporal cache. That
-        is the same shape Helios streams today; cross-block ``feat_cache``
-        continuity is a separate decision and is not made here.
+        With a ``session_id`` the block is decoded through that session's own
+        temporal cache, so chunk *N + 1* continues chunk *N*: the causal decoder
+        expands the session's opening latent frame to one raw frame and every
+        later one to the full temporal factor, which is the frame timeline an
+        offline whole-clip decode of the same latents produces. The cache lives
+        on the session rather than on the shared VAE module, so concurrent
+        sessions cannot overwrite one another's temporal context.
+
+        Without a ``session_id`` -- or on a VAE that cannot stream -- blocks are
+        decoded independently: every block re-expands its own opening frame, so
+        the rollout loses frames and continuity at each block boundary.
 
         The registered post-process hook returns a ``{"payload", "metadata"}``
         envelope untouched, so the pixel conversion it would do for a bare
@@ -1289,7 +1371,19 @@ class LingBotWorldCausalDMDPipeline(
         """
         latent_mean, latent_std = self._vae_latent_stats(latents)
         vae_latents = (latents * latent_std + latent_mean).to(dtype=self.vae.dtype)
-        video = self.vae.decode(vae_latents, return_dict=False)[0]
+        decoder = None if session_id is None else self._streaming_decoder()
+        if decoder is None:
+            video = self.vae.decode(vae_latents, return_dict=False)[0]
+        else:
+            state = self._streaming_decode_state(decoder, cast(str, session_id))
+            try:
+                video = decoder.decode_chunk(vae_latents, state)
+            except Exception:
+                # A half-advanced cache cannot be resumed: the session's next
+                # chunk would continue from a temporal context that was never
+                # completed, so drop it here rather than at close.
+                self._release_streaming_decode_state(cast(str, session_id))
+                raise
         return self._video_processor().postprocess_video(video, output_type=output_type)
 
     def _video_processor(self) -> VideoProcessor:
@@ -1560,7 +1654,13 @@ class LingBotWorldCausalDMDPipeline(
         if inputs.output_type == "latent":
             payload: dict[str, Any] = {"latents": latents}
         else:
-            payload = {"video": self._decode_chunk_to_pixels(latents, output_type=inputs.output_type)}
+            payload = {
+                "video": self._decode_chunk_to_pixels(
+                    latents,
+                    output_type=inputs.output_type,
+                    session_id=state.request_id,
+                )
+            }
         output = {
             "payload": payload,
             "metadata": {
