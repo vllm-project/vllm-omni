@@ -171,7 +171,7 @@ def test_hf_collapse_to_train_without_row_identity_raises_actionable_error(tmp_p
         return {"train": [{"id": "x", "question_text": "What is this?"}]}
 
     monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
-    with pytest.raises(ValueError, match="config per split"):
+    with pytest.raises(ValueError, match="Hugging Face splits"):
         load_samples(hf_dir)
 
 
@@ -182,6 +182,57 @@ def test_non_manifest_file_raises_clear_error(tmp_path):
     bad.write_text("# readme\nnot a manifest", encoding="utf-8")
     with pytest.raises(ValueError, match="JSON/JSONL manifest"):
         load_samples(str(bad))
+
+
+def _write_parquet(path, rows):
+    pyarrow = pytest.importorskip("pyarrow")
+    pyarrow.parquet.write_table(pyarrow.Table.from_pylist(rows), str(path))
+
+
+def test_local_parquet_split_filters_rows_by_identity(tmp_path):
+    # Regression: a single ``.parquet`` file is exposed by ``load_dataset`` as a
+    # generic ``train`` physical split, so ``--split RTD_OCR`` used to raise
+    # ``Unknown split "RTD_OCR"``. The requested split must instead filter the
+    # rows by their preserved identity.
+    pytest.importorskip("datasets")
+    parquet = tmp_path / "samples.parquet"
+    _write_parquet(
+        parquet,
+        [
+            {"id": "rtd", "split": "RTD_OCR", "question_text": "Read this."},
+            {"id": "pr", "split": "PR_correction", "question_text": "Correct this."},
+        ],
+    )
+    assert {sample.id for sample in load_samples(str(parquet))} == {"rtd", "pr"}
+    rtd = load_samples(str(parquet), split="RTD_OCR")
+    assert [sample.id for sample in rtd] == ["rtd"]
+    assert rtd[0].family == "rtd"
+    pr = load_samples(str(parquet), split="PR_correction")
+    assert [sample.id for sample in pr] == ["pr"]
+    assert pr[0].family == "pr"
+    assert pr[0].task_type == "correction"
+
+
+def test_local_directory_named_splits_resolve_without_row_identity(tmp_path):
+    # Regression: a single-configuration mirror whose data files are named after
+    # the benchmark splits must resolve each split for real (no fake loader) and
+    # without any per-row identity.
+    pytest.importorskip("datasets")
+    hf_dir = tmp_path / "Omni-DuplexEval"
+    data_dir = hf_dir / "data"
+    data_dir.mkdir(parents=True)
+    _write_parquet(data_dir / "RTD_OCR-00000-of-00001.parquet", [{"id": "rtd", "question_text": "Read this."}])
+    _write_parquet(
+        data_dir / "PR_correction-00000-of-00001.parquet",
+        [{"id": "pr", "question_text": "Correct this."}],
+    )
+    by_id = {sample.id: sample for sample in load_samples(hf_dir)}
+    assert by_id["rtd"].split == "RTD_OCR"
+    assert by_id["rtd"].family == "rtd"
+    assert by_id["pr"].split == "PR_correction"
+    assert by_id["pr"].family == "pr"
+    assert by_id["pr"].task_type == "correction"
+    assert [sample.id for sample in load_samples(hf_dir, split="RTD_OCR")] == ["rtd"]
 
 
 def test_response_aliases_and_clock_guard():

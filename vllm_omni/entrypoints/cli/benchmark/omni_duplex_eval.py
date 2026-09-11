@@ -20,10 +20,11 @@ def _common(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_DATASET,
         help=(
             "Hugging Face dataset id, a JSON/JSONL manifest, or a local Hugging Face "
-            "dataset directory. A local directory must be a dataset layout (one "
-            "data/<config> subfolder per RTD_*/PR_* split) or a single .parquet file; "
-            "a bare data/ directory collapses to a single 'train' split and only works "
-            "if every row already carries split/family/task_type identity."
+            "dataset mirror. A local directory must use a single configuration whose "
+            "data files are named after the RTD_*/PR_* splits "
+            "(data/<SPLIT>-00000-of-00001.parquet); a single .parquet file is also "
+            "accepted. --split filters the rows by their preserved split identity, so "
+            "rows without identity fail loudly."
         ),
     )
     parser.add_argument("--split", default="all", help="Restrict to one split (e.g. RTD_OCR) or 'all'.")
