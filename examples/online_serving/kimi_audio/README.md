@@ -177,10 +177,12 @@ acoustic noise; it does not promise bitwise equality across GPU configurations.
 
 These examples describe the current input contract. Full server startup,
 pretrained output quality and concurrency have not been validated. The retained
-CPU tests are component reference checks; offline/online E2E coverage remains
-pending. Streaming wiring and per-request acoustic state are implemented but
-have not been exercised with pretrained weights, HTTP playback or concurrent
-requests.
+CPU tests are component reference checks. `tests/e2e/online_serving/test_kimi_audio.py`
+now defines single-request, concurrent-request and SSE audio tests against one
+real async-chunk server. These tests have not been run; offline and multimodal
+chat E2E cases remain pending. Streaming wiring and per-request acoustic state
+are implemented but have not been exercised with pretrained weights, HTTP
+playback or concurrent requests.
 
 Decoder validation and acoustic computation share batch failure cleanup. If a
 forward fails, it releases acoustic state for that batch's known request IDs,

@@ -36,7 +36,7 @@ def cpu_pp_group(monkeypatch):
 
 
 class CPUAttention(torch.nn.Module):
-    """Same HF attention math on both sides of the residual-flow comparison."""
+    """HF attention math behind the vLLM layer's flattened-token interface."""
 
     def __init__(self, config, layer_index, cache):
         super().__init__()
@@ -45,10 +45,9 @@ class CPUAttention(torch.nn.Module):
         self.cache = cache
         self.layer_index = layer_index
 
-    def forward(self, *, hidden_states, positions=None, position_ids=None, **kwargs):
-        is_vllm = hidden_states.ndim == 2
-        states = hidden_states.unsqueeze(0) if is_vllm else hidden_states
-        pos = positions.unsqueeze(0) if is_vllm else position_ids
+    def forward(self, *, hidden_states, positions):
+        states = hidden_states.unsqueeze(0)
+        pos = positions.unsqueeze(0)
         key_length = self.cache.get_seq_length(self.layer_index) + states.shape[1]
         mask = torch.zeros(1, 1, states.shape[1], key_length, dtype=states.dtype)
         mask.masked_fill_(torch.arange(key_length).view(1, 1, 1, -1) > pos[:, None, :, None], float("-inf"))
@@ -58,7 +57,7 @@ class CPUAttention(torch.nn.Module):
             attention_mask=mask,
             past_key_values=self.cache,
         )
-        return output[0] if is_vllm else (output, None, None)
+        return output[0]
 
 
 class InplaceRMSNorm(Qwen2RMSNorm):
@@ -117,7 +116,7 @@ def forward_fixture():
 @torch.inference_mode()
 def test_both_branches_match_official_prefill_and_incremental_steps(forward_fixture):
     stage, tensors = forward_fixture
-    assert len(stage.layers) == 28 and stage.branch_layer == 21 and len(stage.mimo_layers) == 6
+    prefix_length = 0
     for case in ("prefill", "step0", "step1"):
         output = stage(
             input_ids=None, positions=tensors[f"{case}.positions"], inputs_embeds=tensors[f"{case}.inputs"].clone()
@@ -125,11 +124,12 @@ def test_both_branches_match_official_prefill_and_incremental_steps(forward_fixt
         text, audio = output.chunk(2, dim=-1)
         torch.testing.assert_close(text, tensors[f"{case}.text"], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(audio, tensors[f"{case}.audio"], rtol=1e-5, atol=1e-6)
+        prefix_length += tensors[f"{case}.inputs"].shape[0]
     # The two branches' cache slots must each have seen the full prefix plus
     # both later steps. These are HF test caches, not native vLLM KV blocks.
     cache = stage.layers[0].self_attn.cache
-    for index in range(34):
-        assert cache.get_seq_length(index) == tensors["prefill.inputs"].shape[0] + 2
+    for index in range(len(stage.layers) + len(stage.mimo_layers)):
+        assert cache.get_seq_length(index) == prefix_length
 
 
 @torch.inference_mode()

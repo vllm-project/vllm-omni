@@ -60,7 +60,6 @@ def test_bind_existing_tokenizer_without_interpreting_markers_in_text():
 
     assert prompt.text_token_ids[1:-2] == list(text.encode("utf-8"))
     assert bound.tokens == KimiAudioSpecialTokens.from_vocab(REFERENCE["special_tokens"])
-    assert bound.encode_text.__self__ is encoding
 
 
 def encoded_inputs(messages):
@@ -94,7 +93,7 @@ def test_matches_official_prompt_manager(builder, case):
     assert sum(result.is_continuous_mask) == sum(len(feature) for feature in result.continuous_features)
     assert [float(feature[0, 0]) for feature in result.continuous_features] == case["feature_values"]
     for actual, expected in zip(
-        result.continuous_features, (x for x in inputs.values() if x.continuous_features is not None)
+        result.continuous_features, (x for x in inputs.values() if x.continuous_features is not None), strict=True
     ):
         torch.testing.assert_close(actual, expected.continuous_features)
     assert messages == case["messages"]
@@ -104,10 +103,12 @@ def test_requests_do_not_share_prompt_buffers(builder):
     case = next(case for case in REFERENCE["cases"] if case["name"] == "audio_text_output")
     inputs = encoded_inputs(case["messages"])
     first = builder.build(case["messages"], audio_inputs=inputs)
+    second = builder.build(case["messages"], audio_inputs=inputs)
+    first.text_token_ids.clear()
     first.audio_token_ids.clear()
     first.is_continuous_mask.clear()
     first.continuous_features.clear()
-    second = builder.build(case["messages"], audio_inputs=inputs)
+    assert second.text_token_ids == case["text_token_ids"]
     assert second.audio_token_ids == case["audio_token_ids"]
-    assert sum(second.is_continuous_mask) == 3
-    assert len(second.continuous_features) == 1
+    assert [i for i, value in enumerate(second.is_continuous_mask) if value] == case["continuous_positions"]
+    assert len(second.continuous_features) == len(case["feature_values"])

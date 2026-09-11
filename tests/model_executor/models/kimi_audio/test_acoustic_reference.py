@@ -35,8 +35,9 @@ def cpu_flash_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, **kwargs):
     return torch.cat(outputs)
 
 
-@pytest.fixture
-def acoustic_files(tmp_path):
+@pytest.fixture(scope="module")
+def acoustic_files(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("kimi_acoustic")
     reference = json.loads((FIXTURES / "acoustic_reference.json").read_text(encoding="utf-8"))
     tensors = load_file(str(FIXTURES / "acoustic_reference.safetensors"))
     fm_dir, vocoder_dir = tmp_path / "audio_detokenizer", tmp_path / "vocoder"
@@ -86,11 +87,10 @@ def test_internal_streaming_acoustics_match_official(acoustic_files, monkeypatch
 
     monkeypatch.setattr(decoder.vocoder, "decode_mel", record_mel)
     for case in reference["cases"]:
-        decoder.clear_states()
-        decoder.max_pos_size = case["max_pos_size"]
-        torch.manual_seed(case["seed"])
+        stream = decoder.new_stream(seed=case["seed"])
+        stream.max_pos_size = case["max_pos_size"]
         for i, codes in enumerate(case["chunks"]):
-            actual = decoder.detokenize_streaming(
+            actual = stream.detokenize_streaming(
                 torch.tensor([codes]),
                 ode_step=reference["ode_steps"],
                 upsample_factor=4,
@@ -103,8 +103,8 @@ def test_internal_streaming_acoustics_match_official(acoustic_files, monkeypatch
             # bf16 common activations cache reciprocals, unlike upstream's
             # eager division. FP32 vocoder parity is checked separately above.
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
-            assert decoder.semantic_fm.start_position_id == case["positions"][i]
-            assert decoder.semantic_fm.ode_wrapper.kv_cache_tokens == case["cache_lengths"][i]
-        assert decoder.previous_chunk_left is decoder.pre_mel is decoder.pre_wav is None
-        assert decoder.semantic_fm.ode_wrapper.incremental_state == {}
-        assert decoder.semantic_fm.ode_wrapper.x_cond is None
+            assert stream.semantic_fm.start_position_id == case["positions"][i]
+            assert stream.semantic_fm.ode_wrapper.kv_cache_tokens == case["cache_lengths"][i]
+        assert stream.previous_chunk_left is stream.pre_mel is stream.pre_wav is None
+        assert stream.semantic_fm.ode_wrapper.incremental_state == {}
+        assert stream.semantic_fm.ode_wrapper.x_cond is None
