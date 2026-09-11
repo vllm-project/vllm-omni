@@ -6,6 +6,7 @@ from torch import nn
 
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (
     QwenImagePipeline,
+    canonicalize_qwen_image_attention_mask,
 )
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
     QwenImageEditPipeline,
@@ -19,6 +20,15 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered import (
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_attention_mask_canonicalization_drops_only_all_valid_masks():
+    all_valid = torch.ones((1, 4), dtype=torch.bool)
+    padded = torch.tensor([[True, True, False, False]])
+
+    assert canonicalize_qwen_image_attention_mask(None) is None
+    assert canonicalize_qwen_image_attention_mask(all_valid) is None
+    assert canonicalize_qwen_image_attention_mask(padded) is padded
 
 
 class _RejectingTextEncoder:
