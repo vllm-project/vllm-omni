@@ -80,6 +80,8 @@ class KimiAudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
             )
             self.enable_update_additional_information = self.model.enable_update_additional_information
             self.requires_raw_input_tokens = self.model.requires_raw_input_tokens
+            self.requires_request_ids = self.model.requires_request_ids
+            self.on_requests_finished = self.model.on_requests_finished
         else:
             raise ValueError(f"Unsupported Kimi-Audio model_stage: {self.model_stage!r}")
 

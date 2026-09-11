@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Complete-request audio decoding through Kimi's in-tree acoustic modules."""
+"""Complete and incremental audio decoding through Kimi's acoustic modules."""
 
 from collections.abc import Iterable
 from pathlib import Path
@@ -15,14 +15,15 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    from .detokenizer import PrefixStreamingFlowMatchingDetokenizer
+
 
 class KimiAudioDecoder(nn.Module):
     """Stage 1: semantic codes -> Flow Matching -> BigVGAN -> waveform.
 
-    Networks are loaded once by load_weights, never by a request. A complete
-    request is decoded before the next one starts, so the official mutable
-    acoustic context is cleared between requests. Cross-step async_chunk
-    decoding needs separate request-owned acoustic states and is not enabled.
+    Networks are loaded once. Each request owns its Flow Matching cache,
+    lookahead, waveform overlap and noise generator across async chunks.
+    Computation is serial within a batch; acoustic state is never shared.
     """
 
     have_multimodal_outputs = True
@@ -30,11 +31,10 @@ class KimiAudioDecoder(nn.Module):
     has_postprocess = False
     enable_update_additional_information = True
     requires_raw_input_tokens = True
+    requires_request_ids = True
 
     def __init__(self, *, vllm_config: "VllmConfig", prefix: str = "") -> None:
         super().__init__()
-        if getattr(vllm_config.model_config, "async_chunk", False):
-            raise ValueError("Kimi-Audio decoder currently requires complete requests; async_chunk is not implemented")
         if (
             vllm_config.parallel_config.tensor_parallel_size != 1
             or vllm_config.parallel_config.pipeline_parallel_size != 1
@@ -46,6 +46,7 @@ class KimiAudioDecoder(nn.Module):
         config = vllm_config.model_config.hf_config
         self.audio_vocab_size = config.vocab_size - config.kimia_token_offset
         self.detokenizer = None
+        self._streams: dict[str, tuple["PrefixStreamingFlowMatchingDetokenizer", int]] = {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # This stage owns four acoustic files, not the root LLM checkpoint.
@@ -99,6 +100,14 @@ class KimiAudioDecoder(nn.Module):
         # inference consumes raw codec IDs instead of these placeholders.
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device)
 
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        # GenerationModelRunner supplies internal IDs, including cancellation
+        # while waiting for a chunk. Use the same IDs as forward, not HTTP IDs.
+        for request_id in finished_req_ids:
+            entry = self._streams.pop(request_id, None)
+            if entry is not None:
+                entry[0].clear_states()
+
     @torch.inference_mode()
     def forward(
         self,
@@ -109,53 +118,92 @@ class KimiAudioDecoder(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        if self.detokenizer is None:
-            raise RuntimeError("Kimi-Audio acoustic weights must be loaded before decoding")
-        counts = kwargs.get("seq_token_counts")
-        if counts is None:
-            raise ValueError("Kimi-Audio decoder requires per-request seq_token_counts")
-        counts = [int(count) for count in counts]
-        if any(count <= 0 for count in counts) or sum(counts) > input_ids.numel():
-            raise ValueError("Invalid Kimi-Audio decoder request spans")
-        infos = kwargs.get("model_intermediate_buffer") or runtime_additional_information or [{} for _ in counts]
-        if len(infos) != len(counts):
-            raise ValueError("Kimi-Audio decoder request payloads and spans must align")
+        """Return only newly decoded samples; Omni accumulates non-streaming output.
 
-        audios, start = [], 0
-        for count, info in zip(counts, infos, strict=True):
-            if not bool(info.get("meta", {}).get("finished", True)):
-                raise ValueError("Kimi-Audio decoder requires a complete semantic sequence")
-            codes = info.get("codes", {}).get("audio", input_ids.reshape(-1)[start : start + count])
-            start += count
-            codes = torch.as_tensor(codes, device=input_ids.device)
-            if codes.ndim != 1 or (codes.numel() and codes.dtype not in (torch.int32, torch.int64)):
-                raise ValueError("Kimi-Audio decoder expects one-dimensional integer codebook IDs")
-            if torch.any(codes < 0) or torch.any(codes >= self.audio_vocab_size):
-                raise ValueError("Kimi-Audio decoder expects raw codebook IDs without the LLM offset")
-            if codes.numel() == 0:
-                audios.append(torch.empty(0, dtype=torch.float32, device=input_ids.device))
-                continue
+        A complete input follows the same block loop as incremental inputs.
+        The final block releases retained lookahead and waveform overlap.
+        """
+        batch_request_ids = kwargs.get("request_ids") or []
+        try:
+            if self.detokenizer is None:
+                raise RuntimeError("Kimi-Audio acoustic weights must be loaded before decoding")
+            counts = kwargs.get("seq_token_counts")
+            if counts is None:
+                raise ValueError("Kimi-Audio decoder requires per-request seq_token_counts")
+            counts = [int(count) for count in counts]
+            if any(count <= 0 for count in counts) or sum(counts) > input_ids.numel():
+                raise ValueError("Invalid Kimi-Audio decoder request spans")
+            infos = kwargs.get("model_intermediate_buffer") or runtime_additional_information or [{} for _ in counts]
+            if len(infos) != len(counts):
+                raise ValueError("Kimi-Audio decoder request payloads and spans must align")
+            # Profiling has no request IDs and executes an ephemeral complete
+            # sequence. Real async requests must have the runner's internal IDs.
+            request_ids = batch_request_ids or [None for _ in counts]
+            if len(request_ids) != len(counts):
+                raise ValueError("Kimi-Audio decoder request IDs and spans must align")
 
-            chunks = []
-            self.detokenizer.clear_states()
-            try:
-                # Preserve official detokenize_audio as one cohesive flow:
-                # 30 semantic tokens per call, fourfold upsampling, final flush.
-                for offset in range(0, codes.numel(), 30):
-                    chunks.append(
-                        self.detokenizer.detokenize_streaming(
-                            codes[offset : offset + 30].long().unsqueeze(0),
-                            upsample_factor=4,
-                            is_final=offset + 30 >= codes.numel(),
+            audios, start = [], 0
+            for count, info, request_id in zip(counts, infos, request_ids, strict=True):
+                meta = info.get("meta", {})
+                # The connector consumes meta.finished for scheduling; the sibling
+                # stream_finished reaches the model unchanged on every chunk.
+                finished = bool(meta.get("stream_finished", meta.get("finished", True)))
+                if not finished and request_id is None:
+                    raise ValueError("Kimi-Audio incremental decoding requires a request ID")
+                codes = info.get("codes", {}).get("audio", input_ids.reshape(-1)[start : start + count])
+                start += count
+                codes = torch.as_tensor(codes, device=input_ids.device)
+                if codes.ndim == 2 and codes.shape[1] == 1:
+                    codes = codes[:, 0]
+                if codes.ndim != 1 or (codes.numel() and codes.dtype not in (torch.int32, torch.int64)):
+                    raise ValueError("Kimi-Audio decoder expects one-dimensional integer codebook IDs")
+                if torch.any(codes < 0) or torch.any(codes >= self.audio_vocab_size):
+                    raise ValueError("Kimi-Audio decoder expects raw codebook IDs without the LLM offset")
+                if not finished and (codes.numel() == 0 or codes.numel() % 30):
+                    raise ValueError("Kimi-Audio non-final acoustic chunks must contain complete 30-code blocks")
+                entry = self._streams.get(request_id) if request_id is not None else None
+                chunk_seq = meta.get("chunk_seq", 0)
+                if chunk_seq != (entry[1] if entry is not None else 0):
+                    raise ValueError("Kimi-Audio acoustic chunk is out of order or its request state was lost")
+                if codes.numel() == 0:
+                    if entry is not None:
+                        raise ValueError("Kimi-Audio final acoustic block must carry the held-back semantic codes")
+                    audios.append(torch.empty(0, dtype=torch.float32, device=input_ids.device))
+                    continue
+
+                chunks = []
+                stream = entry[0] if entry is not None else self.detokenizer.new_stream(meta.get("audio_seed"))
+                if request_id is not None:
+                    # Register before computation so a first-chunk failure is
+                    # reclaimed by the same batch cleanup as an existing stream.
+                    self._streams[request_id] = (stream, chunk_seq + 1)
+                try:
+                    # Preserve official detokenize_audio as one cohesive flow:
+                    # 30 semantic tokens per call, fourfold upsampling, final flush.
+                    for offset in range(0, codes.numel(), 30):
+                        chunks.append(
+                            stream.detokenize_streaming(
+                                codes[offset : offset + 30].long().unsqueeze(0),
+                                upsample_factor=4,
+                                is_final=finished and offset + 30 >= codes.numel(),
+                            )
                         )
-                    )
-                audios.append(torch.cat(chunks, dim=-1).float().reshape(-1))
-            finally:
-                self.detokenizer.clear_states()
-        return OmniOutput(
-            text_hidden_states=None,
-            multimodal_outputs={
-                "model_outputs": audios,
-                "sr": [torch.tensor(24000, dtype=torch.int32) for _ in audios],
-            },
-        )
+                    audios.append(torch.cat(chunks, dim=-1).float().reshape(-1))
+                finally:
+                    if finished:
+                        stream.clear_states()
+                        if request_id is not None:
+                            self._streams.pop(request_id, None)
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": audios,
+                    "sr": [torch.tensor(24000, dtype=torch.int32) for _ in audios],
+                },
+            )
+        except Exception:
+            # A failed forward returns no batch output. Discard every affected
+            # stream, including rows already advanced before another row failed.
+            # Requests outside this batch keep their acoustic history.
+            self.on_requests_finished(batch_request_ids)
+            raise

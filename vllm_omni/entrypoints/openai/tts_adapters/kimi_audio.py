@@ -40,8 +40,8 @@ class KimiAudioAdapter(ARTTSAdapter):
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input.strip():
             return "Kimi-Audio requires nonempty input text"
-        if request.is_streaming():
-            return "Kimi-Audio currently requires non-streaming speech output"
+        if request.is_streaming() and not getattr(self.ctx.engine_client.model_config, "async_chunk", False):
+            return "Kimi-Audio streaming speech requires the kimi_audio_async_chunk.yaml deployment"
         if request.voice not in (None, "default"):
             return "Kimi-Audio has no selectable voices; omit voice or use 'default'"
         unsupported = [

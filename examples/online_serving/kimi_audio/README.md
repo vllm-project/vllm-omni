@@ -1,8 +1,9 @@
 # Kimi-Audio online serving
 
 Kimi-Audio accepts user/assistant text and audio messages and generates text,
-audio, or both. The current deployment collects AR output before acoustic
-decoding (`async_chunk: false`). The requests below use non-streaming responses.
+audio, or both. `kimi_audio.yaml` collects AR output before acoustic decoding;
+`kimi_audio_async_chunk.yaml` transfers semantic codes while AR is generating.
+Both use the same input path and acoustic networks.
 
 Install vLLM-Omni with its `kimi-audio` extra, including the acoustic decoder
 dependencies, and restart the server after installing this branch. The install
@@ -51,9 +52,12 @@ the model task. Set both fields explicitly:
 | `both` | `["text", "audio"]` | Return text and decoded audio. |
 
 `output_type: "text"` with audio in `modalities` is incompatible. The renderer
-does not receive top-level `modalities`; the existing AR-to-decoder boundary
-rejects this combination **after AR completes** through Omni's existing
-request-error path. This is not early HTTP input validation.
+does not receive top-level `modalities`. In batch mode the AR-to-decoder boundary
+rejects this combination after AR completes. In async-chunk mode the producer
+records the conversion failure, but the framework does not propagate it as an
+immediate HTTP error; it can result in empty audio. Joint HTTP validation and
+streaming conversion-error propagation remain incomplete. Use the compatible
+combinations above.
 For text-only requests, set `output_type: "text"` and
 `modalities: ["text"]` together. Do not put `modalities` inside
 `chat_template_kwargs`; that experimental option has been replaced by
@@ -100,7 +104,7 @@ Opaque `audio.id` references and cache-only audio UUIDs are not supported; send
 the audio content again with its transcript. The normal media cache remains in
 use.
 
-The current chat contract covers one completion with `stream: false` and
+The current chat contract covers one completion and
 ordinary user/assistant messages. System/tool messages, custom templates,
 reasoning or structured-output modes, prompt truncation/padding and prompt
 echo/offsets are outside this contract. Kimi uses its fixed audio preprocessing
@@ -121,14 +125,68 @@ curl http://localhost:8091/v1/audio/speech \
 ```
 
 This adapter asks the conversational model to read the input aloud; verbatim
-reading is not enforced by the decoder. Voice selection, voice cloning and
-streaming speech are not implemented. Standard speech formatting uses the
+reading is not enforced by the decoder. Voice selection and voice cloning
+are not implemented. Standard speech formatting uses the
 shared server. `seed` and `extra_params.kimi_audio` use the existing request
 sampling mechanisms.
+
+## Streaming
+
+Start the server with the streaming deployment:
+
+```bash
+vllm serve moonshotai/Kimi-Audio-7B-Instruct --omni \
+  --stage-configs-path vllm_omni/deploy/kimi_audio_async_chunk.yaml \
+  --trust-remote-code --port 8091
+```
+
+For chat SSE, use the chat request above with `"stream": true` and
+`"audio": {"format": "pcm16"}`. Text deltas and base64-encoded audio deltas
+use Omni's existing chat response format. Concatenate decoded PCM bytes in
+arrival order; they are 24 kHz, mono, signed 16-bit audio.
+
+For raw streaming speech:
+
+```bash
+curl --no-buffer http://localhost:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "moonshotai/Kimi-Audio-7B-Instruct",
+    "input": "你好，欢迎使用 Kimi-Audio。",
+    "response_format": "pcm",
+    "stream": true,
+    "stream_format": "audio",
+    "max_new_tokens": 512
+  }' --output speech.pcm
+```
+
+Omit `stream_format` to receive the shared speech SSE events instead of raw
+bytes. Streaming speech requires the async-chunk deployment; non-streaming
+responses can also use this deployment and are accumulated by Omni.
+
+The producer preserves official 30-code blocks, holding one code beyond each
+full block so the last block can be marked final. First decoding starts after
+31 valid audio codes, or earlier if the request ends. The decoder retains its
+12-token lookahead and waveform overlap per request and emits only new samples.
+This preserves the acoustic block boundaries; it is not a tuned low-latency
+configuration. Both stages default to one active request until GPU memory and
+concurrency are measured. An explicit request seed also seeds request-local
+acoustic noise; it does not promise bitwise equality across GPU configurations.
 
 ## Status
 
 These examples describe the current input contract. Full server startup,
 pretrained output quality and concurrency have not been validated. The retained
 CPU tests are component reference checks; offline/online E2E coverage remains
-pending. Cross-stage `async_chunk` streaming remains unimplemented.
+pending. Streaming wiring and per-request acoustic state are implemented but
+have not been exercised with pretrained weights, HTTP playback or concurrent
+requests.
+
+Decoder validation and acoustic computation share batch failure cleanup. If a
+forward fails, it releases acoustic state for that batch's known request IDs,
+including rows already advanced; requests outside the batch retain their state.
+This local cleanup does not retry the request or replace framework error handling.
+
+The connector owns transport timeouts and cancellation. Its sender-failure
+channel currently logs rather than immediately failing the client request;
+this implementation does not change that shared behavior.

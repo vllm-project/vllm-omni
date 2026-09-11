@@ -34,6 +34,7 @@ KIMI_AUDIO_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             prompt_transform_func=f"{_PROC}.prepare_kimi_audio_request",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.kimi_audio_to_decoder_async_chunk",
             sampling_constraints={
                 "detokenize": True,
                 # ids.output already excludes EOS and control tokens. Native
@@ -51,6 +52,7 @@ KIMI_AUDIO_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.kimi_audio_to_decoder",
             sampling_constraints={"detokenize": False, "max_tokens": 1},
         ),

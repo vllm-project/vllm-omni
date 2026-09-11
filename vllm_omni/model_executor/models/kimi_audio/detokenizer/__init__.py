@@ -32,6 +32,7 @@ class PrefixStreamingFlowMatchingDetokenizer:
         self.hamming_window_cache = {}
         self.previous_chunk_left = None
         self.look_ahead_tokens = look_ahead_tokens
+        self.generator: torch.Generator | None = None
 
         self.clear_states()
 
@@ -57,6 +58,30 @@ class PrefixStreamingFlowMatchingDetokenizer:
         )
         return cls(bigvgan, semantic_fm, look_ahead_tokens=look_ahead_tokens)
 
+    def new_stream(self, seed: int | None = None):
+        """Share loaded networks, but give each request its own acoustic state."""
+        fm = self.semantic_fm
+        stream = type(self)(
+            self.vocoder,
+            StreamingSemanticFMWrapper(
+                fm.speech_model,
+                max_kv_cache_tokens=fm.max_kv_cache_tokens,
+                normalize_mel=fm.normalize_mel,
+                mel_mean=fm.mel_mean,
+                mel_std=fm.mel_std,
+                device=fm.device,
+            ),
+            look_ahead_tokens=self.look_ahead_tokens,
+        )
+        # Match the official CPU noise draw before moving it to the GPU. A
+        # request's noise sequence must not depend on other requests' chunks.
+        stream.generator = torch.Generator(device="cpu")
+        if seed is None:
+            stream.generator.seed()
+        else:
+            stream.generator.manual_seed(seed)
+        return stream
+
     @torch.inference_mode()
     def detokenize_streaming(
         self,
@@ -78,7 +103,9 @@ class PrefixStreamingFlowMatchingDetokenizer:
             semantic_token_previous = self.previous_chunk_left["semantic_token"]
             semantic_token = torch.cat([semantic_token_previous, semantic_token], dim=-1)
 
-        x_t_chunk = torch.randn(semantic_token.shape[0], 80).to(semantic_token.device).to(self.dtype)
+        x_t_chunk = (
+            torch.randn(semantic_token.shape[0], 80, generator=self.generator).to(semantic_token.device).to(self.dtype)
+        )
 
         if self.look_ahead_tokens != 0 and self.previous_chunk_left is None:
             self.previous_chunk_left = {"semantic_token": None}

@@ -1,5 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-# Kimi-Audio streaming deployment placeholder, not a runnable configuration.
-# A shared pipeline may ultimately use async_chunk to switch modes in one YAML.
+# Two-stage streaming; GPU startup, memory sizing and output quality are unverified.
+# Preserve the official 30-code acoustic blocks and 12-token lookahead.
+# The sender holds one code beyond each full block to identify the final block.
+async_chunk: true
+trust_remote_code: true
+dtype: bfloat16
+enable_prefix_caching: false
+
+connectors:
+  kimi_audio_shm:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    tokenizer_mode: kimi_audio_omni
+    enforce_eager: true
+    async_scheduling: false
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.65
+    output_connectors:
+      to_stage_1: kimi_audio_shm
+    default_sampling_params:
+      temperature: 0.0
+      top_k: 5
+      top_p: 1.0
+      repetition_penalty: 1.0
+      max_tokens: 4096
+      extra_args:
+        kimi_audio: {}
+
+  - stage_id: 1
+    devices: "0"
+    enforce_eager: true
+    async_scheduling: false
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.15
+    engine_extras:
+      skip_tokenizer_init: true
+    input_connectors:
+      from_stage_0: kimi_audio_shm
+    default_sampling_params:
+      temperature: 0.0
