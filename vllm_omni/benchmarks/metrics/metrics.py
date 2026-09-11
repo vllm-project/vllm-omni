@@ -132,6 +132,39 @@ _STREAMING_OUTPUT_UNIT_TYPES = frozenset(
     }
 )
 
+
+def _is_audio_speech_without_text_output(
+    backend: str | None,
+    metrics: MultiModalsBenchmarkMetrics,
+) -> bool:
+    """``openai-audio-speech`` bench with no user-facing generated text tokens."""
+    return backend == "openai-audio-speech" and metrics.total_output == 0
+
+
+def _is_zero_text_result(output: RequestFuncOutput, backend: str | None) -> bool:
+    """True when a successful request produced no user-facing generated text.
+
+    Must run *before* the tokenizer-is-None ``output_len = 1`` placeholder, or
+    tokenizer-free speech / image / video runs invent a token and leak text metrics.
+    """
+    generated_text = getattr(output, "generated_text", None) or ""
+    if generated_text:
+        return False
+    if backend == "openai-audio-speech":
+        return True
+    has_audio = (
+        float(getattr(output, defs.AUDIO_DURATION, 0.0) or 0.0) > 0
+        or int(getattr(output, defs.AUDIO_FRAMES, 0) or 0) > 0
+    )
+    has_image = int(getattr(output, defs.IMAGE_COUNT, 0) or 0) > 0
+    has_video = (
+        float(getattr(output, defs.VIDEO_DURATION, 0.0) or 0.0) > 0.0
+        or int(getattr(output, defs.VIDEO_FRAMES, 0) or 0) > 0
+        or float(getattr(output, defs.VIDEO_GENERATION_TIME_MS, 0.0) or 0.0) > 0.0
+    )
+    return has_audio or has_image or has_video
+
+
 _AGGREGATE_PERCENTILE_FIELD_NAMES = {
     defs.AUDIO_TTFP: (
         defs.MEAN_AUDIO_TTFP_MS,
@@ -225,6 +258,7 @@ def print_metrics(
     outputs: list[RequestFuncOutput] | None = None,
     selected_percentiles: list[float] | None = None,
     print_stage: bool = False,
+    backend: str | None = None,
 ):
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -242,7 +276,7 @@ def print_metrics(
         print_peak_memory_metrics(metrics)
     if task_type != TaskType.GENERATION or "e2el" in selected_percentile_metrics:
         process_one_metric("e2el", metrics)
-    print_text_metrics(task_type, selected_percentile_metrics, metrics)
+    print_text_metrics(task_type, selected_percentile_metrics, metrics, backend=backend)
     if task_type == TaskType.GENERATION:
         if _has_audio_output(metrics):
             print_audio_metrics(selected_percentile_metrics, metrics)
@@ -264,7 +298,13 @@ def print_metrics(
     print("=" * 50)
 
 
-def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiModalsBenchmarkMetrics):
+def print_text_metrics(
+    task_type,
+    selected_percentile_metrics,
+    metrics: MultiModalsBenchmarkMetrics,
+    *,
+    backend: str | None = None,
+):
     # Pure image/video runs have no user-facing text tokens; skip the whole
     # Text Result section (token throughput / peak would be misleading).
     if metrics.total_output <= 0 and (_has_image_output(metrics) or _has_video_output(metrics)):
@@ -272,6 +312,9 @@ def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiMod
 
     print("{s:{c}^{n}}".format(s=" Text Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    if _is_audio_speech_without_text_output(backend, metrics):
+        return
+
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
         print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
         print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
@@ -818,6 +861,7 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
+    backend: str | None = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
@@ -864,16 +908,10 @@ def calculate_metrics(
             output_len = outputs[i].output_tokens
 
             if not output_len:
-                # Pure image/video (no generated text) must stay at 0 tokens.
-                # Do not invent output_len=1 via the tokenizer-is-None placeholder.
-                generated_text = getattr(outputs[i], "generated_text", None) or ""
-                has_image = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0) > 0
-                has_video = (
-                    float(getattr(outputs[i], defs.VIDEO_DURATION, 0.0) or 0.0) > 0.0
-                    or int(getattr(outputs[i], defs.VIDEO_FRAMES, 0) or 0) > 0
-                    or float(getattr(outputs[i], defs.VIDEO_GENERATION_TIME_MS, 0.0) or 0.0) > 0.0
-                )
-                if not generated_text and (has_image or has_video):
+                # Zero-text (speech / image / video) must stay 0.
+                # The tokenizer-is-None placeholder of 1 is only for text
+                # runs that produced tokens we cannot count.
+                if _is_zero_text_result(outputs[i], backend):
                     output_len = 0
                 elif tokenizer is None:
                     output_len = 1
@@ -1182,5 +1220,6 @@ def calculate_metrics(
         outputs=outputs,
         selected_percentiles=selected_percentiles,
         print_stage=print_stage,
+        backend=backend,
     )
     return metrics, actual_output_lens

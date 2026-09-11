@@ -10,7 +10,11 @@ import math
 import pytest
 from vllm.benchmarks.serve import TaskType
 
-from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
+from vllm_omni.benchmarks.metrics.metrics import (
+    _is_audio_speech_without_text_output,
+    _is_zero_text_result,
+    calculate_metrics,
+)
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
@@ -367,6 +371,30 @@ def test_duplex_goodput_does_not_pair_measurements_from_different_requests():
 
 
 # ============================================================================
+# openai-audio-speech text-output gating
+# ============================================================================
+
+
+class _MetricsWithTotalOutput:
+    def __init__(self, total_output: int) -> None:
+        self.total_output = total_output
+
+
+@pytest.mark.parametrize(
+    ("backend", "total_output", "expected"),
+    [
+        ("openai-audio-speech", 0, True),
+        ("openai-audio-speech", 1, False),
+        (None, 0, False),
+        ("openai-chat", 0, False),
+        ("openai-audio-speech", 10, False),
+    ],
+)
+def test_is_audio_speech_without_text_output(backend, total_output, expected):
+    assert _is_audio_speech_without_text_output(backend, _MetricsWithTotalOutput(total_output)) is expected
+
+
+# ============================================================================
 # TTFT suppression for pure-audio (TTS) benchmarks
 # ============================================================================
 
@@ -409,6 +437,105 @@ def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
 
 
 _TTS_PERCENTILE_METRICS = ["ttft", "e2el", "audio_rtf", "audio_ttfp", "audio_duration"]
+
+
+def _run_tts_calculate_metrics(outputs, *, tokenizer, backend=None):
+    return calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=10.0,
+        tokenizer=tokenizer,
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_TTS_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+        backend=backend,
+    )
+
+
+def test_zero_text_result_is_decided_before_tokenizer_fallback():
+    speech = _make_tts_output(100)
+    assert _is_zero_text_result(speech, "openai-audio-speech") is True
+    assert _is_zero_text_result(speech, None) is True
+
+    text = _make_output(100, output_tokens=0)
+    text.generated_text = "hello"
+    text.audio_duration = 0.0
+    text.audio_frames = 0
+    assert _is_zero_text_result(text, None) is False
+
+
+def test_tokenizer_none_speech_keeps_zero_text_metrics(capsys):
+    """tokenizer=None must not invent output_len=1 for successful TTS."""
+    outputs = [_make_tts_output(100), _make_tts_output(120)]
+
+    metrics, actual_output_lens = _run_tts_calculate_metrics(
+        outputs,
+        tokenizer=None,
+        backend="openai-audio-speech",
+    )
+
+    assert actual_output_lens == [0, 0]
+    assert metrics.total_output == 0
+    out = capsys.readouterr().out
+    assert "Total generated tokens:" not in out
+    assert "Output token throughput" not in out
+    assert "Time to First Token" not in out
+    assert "Time to First Packet" in out
+
+
+def test_tokenizer_none_text_fallback_still_uses_placeholder():
+    """skip-tokenizer text runs with generated_text still get output_len=1."""
+    output = _make_output(100, output_tokens=0)
+    output.generated_text = "hello"
+    output.audio_duration = 0.0
+    output.audio_frames = 0
+    output.itl = []
+
+    metrics, actual_output_lens = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["ttft"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+
+    assert actual_output_lens == [1]
+    assert metrics.total_output == 1
+
+
+def test_audio_speech_backend_omits_generated_token_lines(capsys):
+    """Speech backend with zero text tokens must skip generated-token / TTFT lines."""
+    calculate_metrics(
+        input_requests=[],
+        outputs=[_make_tts_output(100)],
+        dur_s=10.0,
+        tokenizer=_EmptyAwareTokenizer(),
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=_TTS_PERCENTILE_METRICS,
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+        backend="openai-audio-speech",
+    )
+
+    out = capsys.readouterr().out
+    assert "Total input tokens:" in out
+    assert "Total generated tokens:" not in out
+    assert "Output token throughput" not in out
+    assert "Time to First Token" not in out
+    assert "Time to First Packet" in out
 
 
 def test_tts_benchmark_omits_ttft(capsys):
