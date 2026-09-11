@@ -606,11 +606,11 @@ scoped to one `response_id` unless stated otherwise.
 | Public event | Trigger and ordering | Cardinality |
 | --- | --- | --- |
 | `response.created` | First event for a visible assistant response; precedes its output-item, content-part, speak, text, and audio events. | Exactly once for every visible response. |
-| `response.speak` | The model selected speak; emitted after `response.created` and no later than the first `response.audio.delta`. It carries decision metadata, not transcript text. | At most once. |
-| `response.audio.delta` | Carries one ordered audio chunk. Every emitted audio delta is followed by a `response.audio_transcript.delta` for the same chunk. | Zero or more. |
-| `response.audio_transcript.delta` | Append-only transcript contribution paired with an audio delta; it may be empty for a text-less audio unit and must not repeat or overlap earlier text. | One per audio delta. |
-| `response.audio.done` | Closes the audio stream after its final delta and before response terminal events. It is omitted for a response with no audio or transcript. | At most once. |
-| `response.audio_transcript.done` | Contains the exact concatenation of all non-overlapping transcript deltas for the response. | At most once, and only for a non-empty transcript. |
+| `response.speak` | The model selected speak; emitted after `response.created` and no later than the first `response.output_audio.delta`. It carries decision metadata, not transcript text. | At most once. |
+| `response.output_audio.delta` | Carries one ordered audio chunk. Every emitted audio delta is followed by a `response.output_audio_transcript.delta` for the same chunk. | Zero or more. |
+| `response.output_audio_transcript.delta` | Append-only transcript contribution paired with an audio delta; it may be empty for a text-less audio unit and must not repeat or overlap earlier text. | One per audio delta. |
+| `response.output_audio.done` | Closes the audio stream after its final delta and before response terminal events. It is omitted for a response with no audio or transcript. | At most once. |
+| `response.output_audio_transcript.done` | Contains the exact concatenation of all non-overlapping transcript deltas for the response. | At most once, and only for a non-empty transcript. |
 | `response.output_item.done` / `conversation.item.done` | Finalize the assistant item after content-part terminal events and before `response.done`. | At most once each. |
 | `response.done` | Terminal event for a created response; follows audio, transcript, content-part, and item terminal events. | Exactly once for every created response that reaches a terminal state. |
 | `rate_limits.updated` | Compatibility event emitted immediately after `response.done`; the current payload has an empty rate-limit list. | Once per emitted `response.done`. |
@@ -625,8 +625,8 @@ response and never reuse that response ID for later model turns.
 
 Compatibility changes must update this table and its protocol contract tests in
 the same change. The golden transcript test requires joined
-`response.audio_transcript.delta` values to equal
-`response.audio_transcript.done.transcript`; response tests separately enforce
+`response.output_audio_transcript.delta` values to equal
+`response.output_audio_transcript.done.transcript`; response tests separately enforce
 at-most-once `response.speak` and terminal event cardinality.
 
 ### Session internal ledgers

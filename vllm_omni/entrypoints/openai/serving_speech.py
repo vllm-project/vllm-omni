@@ -1600,7 +1600,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         Field naming follows the OpenAI ``speech.audio.delta`` schema, which
         carries the base64 chunk in ``audio`` (not ``delta`` — that is the
-        Realtime API ``response.audio.delta`` convention, a different event).
+        Realtime API ``response.output_audio.delta`` convention, a different event).
         See https://platform.openai.com/docs/api-reference/audio-streaming.
 
         The terminal ``speech.audio.done`` event carries a ``usage`` object

@@ -20,7 +20,7 @@ The target is the engine-native path:
   -> PersonaPlex Talker
   -> streaming PersonaPlex Code2Wav
   -> PersonaPlex data-plane projector
-  -> response.audio.delta + response.audio_transcript.delta
+  -> response.output_audio.delta + response.output_audio_transcript.delta
 ```
 
 The standalone `/api/chat` and `/v1/audio/duplex` server that accompanied the
@@ -197,7 +197,7 @@ model-neutral native results:
 
 It owns per-request audio and text cursors so a cumulative output cannot replay
 old audio. The generic projector turns each native result into the Realtime
-`response.audio.delta` / `response.audio_transcript.delta` pair (and
+`response.output_audio.delta` / `response.output_audio_transcript.delta` pair (and
 `response.output_text.delta` for text) under one `response_id`; the full
 mapping is the name map in the
 [Realtime Duplex API](../serving/realtime_duplex_api.md) serving guide.

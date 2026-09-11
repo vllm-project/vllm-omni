@@ -4,10 +4,10 @@ steps:
     depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "omni-test"
+      build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
+        source_file_dependencies: omni_qwen3_omni_perf
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
@@ -24,6 +24,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · Perf Test · Async Chunk"
+        source_file_dependencies: omni_qwen3_omni_perf
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
@@ -40,6 +41,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Test"
+        source_file_dependencies: omni_minicpmo_4_5_function
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -48,6 +50,7 @@ steps:
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5_expansion.py -m 'full_model' --run-level 'full_model'
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Test"
+        source_file_dependencies: omni_minicpmo_4_5_duplex_function
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -62,6 +65,7 @@ steps:
             -m "npu and A3 and omni"
             --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
+        source_file_dependencies: omni_minicpmo_4_5_accuracy
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -82,6 +86,7 @@ steps:
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
+        source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5-npu
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
@@ -98,6 +103,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test (A2)"
+        source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5-npu-a2
         timeout_in_minutes: 180
         mirror_hardwares: a2b3_npu_1
@@ -115,6 +121,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
+        source_file_dependencies: omni_minicpmo_4_5_duplex_perf
         key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts-npu
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
@@ -133,9 +140,10 @@ steps:
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "tts-test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: TTS · Perf Test"
+        source_file_dependencies: tts_qwen3_tts_perf
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -151,15 +159,15 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-  - group: ":card_index_dividers: Diffusion I2I Model Test"
-    key: nightly-HunyuanImage3-x2i-test-group
+  - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
+    key: nightly-diffusion-x2iat-group
     depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "diffusion-x2iat-test"
+      build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
+        source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -169,15 +177,8 @@ steps:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         commands:
           - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and A3" --run-level full_model
-  - group: ":card_index_dividers: Diffusion Benchmark Perf Test"
-    key: nightly-diffusion-benchmark-group
-    depends_on: upload-nightly-pipeline
-    if: >-
-      build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "diffusion-x2iat-test"
-    steps:
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 CFGP=2"
+        source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -194,6 +195,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 SP=2"
+        source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -210,6 +212,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=4"
+        source_file_dependencies: diffusion_hunyuan_image3_perf
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -230,10 +233,10 @@ steps:
     depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "diffusion-x2v-test"
+      build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":full_moon: Diffusion X2V · Function Test"
+      - label: ":full_moon: Diffusion X2V · Wan 2.2 Function Test"
+        source_file_dependencies: diffusion_wan22_function
         mirror_hardwares: a2b3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -241,7 +244,8 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
         commands:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k npu_i2v --run-level "full_model"
-      - label: ":full_moon: Diffusion X2V · Perf Test"
+      - label: ":full_moon: Diffusion X2V · Wan 2.2 Perf Test"
+        source_file_dependencies: diffusion_wan22_perf
         key: nightly-diffusion-x2v-performance
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
