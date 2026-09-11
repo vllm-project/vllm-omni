@@ -46,6 +46,31 @@ def relpos_encode_token_budget(
     return max(lookahead + 1, min(int(cap), room))
 
 
+def _cfm_pad_frames(
+    *,
+    mel_frames: int,
+    offset: int,
+    noise_capacity: int,
+    bucket_frames: int,
+    ragged: bool,
+) -> int:
+    """Frame padding that aligns one CFM call onto the capture-shape grid.
+
+    Steady-state chunk lengths vary per request; without padding every length
+    becomes its own CUDA-graph capture shape. Padding the frame axis up to
+    ``bucket_frames`` collapses them onto one grid (the output is trimmed back
+    by the caller). Returns 0 when bucketing does not apply: the ragged
+    valid-lengths path, graph bucketing disabled, or padding that would
+    overflow the decoder's noise buffer.
+    """
+    if ragged or bucket_frames <= 1:
+        return 0
+    pad = (bucket_frames - mel_frames % bucket_frames) % bucket_frames
+    if offset + mel_frames + pad > noise_capacity:
+        return 0
+    return pad
+
+
 def plan_token2wav_encode_slices(
     num_frames: int,
     *,
@@ -249,6 +274,19 @@ class BatchedToken2Wav(nn.Module):
                     "CFM CUDA Graph is disabled on device type %s",
                     flow_parameter.device.type if flow_parameter is not None else "unknown",
                 )
+        # mel-frame bucket size for the CFM CUDA Graph path. Pad each decode
+        # chunk up to a multiple of this many frames so the graph cache key
+        # space stays small (0 disables bucketing, e.g. when graphs are off).
+        self._cfm_graph_bucket_frames = (
+            int(cfm_graph_cfg.get("bucket_frames", 0))
+            if self._cfm_graph_wrapper is not None
+            else 0
+        )
+        if self._cfm_graph_bucket_frames > 1:
+            logger.info(
+                "CFM CUDA Graph bucketing enabled (bucket_frames=%d)",
+                self._cfm_graph_bucket_frames,
+            )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
 
     def _hift_inference(
@@ -566,6 +604,17 @@ class BatchedToken2Wav(nn.Module):
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
         offset = int(att_cache.shape[4]) if att_cache is not None else 0
+        mel_frames = int(mu.shape[2])
+        pad_frames = _cfm_pad_frames(
+            mel_frames=mel_frames,
+            offset=offset,
+            noise_capacity=int(decoder.rand_noise.shape[2]),
+            bucket_frames=self._cfm_graph_bucket_frames,
+            ragged=valid_lengths is not None or self._cfm_graph_wrapper is None,
+        )
+        if pad_frames:
+            mu = torch.nn.functional.pad(mu, (0, pad_frames))
+            cond = torch.nn.functional.pad(cond, (0, pad_frames))
         end = offset + int(mu.shape[2])
         if end > int(decoder.rand_noise.shape[2]):
             raise RuntimeError(
@@ -667,6 +716,8 @@ class BatchedToken2Wav(nn.Module):
                     )
                 next_att_cache[step].copy_(step_att)
                 del step_att
+        if pad_frames:
+            x = x[:, :, :mel_frames]
         if ragged_att_cache is not None:
             return x, torch.stack(next_cnn), ragged_att_cache
         assert next_att_cache is not None
