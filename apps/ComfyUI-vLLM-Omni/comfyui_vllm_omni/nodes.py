@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Literal
 
 import torch
@@ -764,7 +767,13 @@ class VLLMOmniMiniMaxH3Params:
                     "FLOAT",
                     {"default": 12.0, "min": 0.0, "max": 100.0, "step": 0.1},
                 ),
-            }
+            },
+            "optional": {
+                "aspect_ratio": (
+                    ["16:9", "21:9", "4:3", "1:1", "3:4", "9:16"],
+                    {"default": "16:9", "tooltip": "T2VA canvas ratio; match the Generate Video dimensions."},
+                ),
+            },
         }
 
     RETURN_TYPES = ("VIDEO_PARAMS",)
@@ -772,8 +781,9 @@ class VLLMOmniMiniMaxH3Params:
     FUNCTION = "get_params"
     CATEGORY = "vLLM-Omni/Video Params"
 
-    def get_params(self, **kwargs):
+    def get_params(self, aspect_ratio: str = "16:9", **kwargs):
         params = MiniMaxH3ModelSpecificParams(kwargs)
+        params["aspect_ratio"] = aspect_ratio
         params["type"] = "minimax_h3"
         return (params,)
 
