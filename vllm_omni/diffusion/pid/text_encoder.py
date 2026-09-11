@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Gemma-2-2b-it text encoder for PiD.
 
 Loads via :func:`from_pretrained_with_prefetch` (HF-cache-tolerant, parallel

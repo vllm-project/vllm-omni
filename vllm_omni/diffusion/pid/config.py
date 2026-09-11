@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PiD network & sampling config registry for all supported backbones.
 
 All backbones share the same PixDiT_T2I architecture; only the LQ-related
@@ -14,9 +14,6 @@ Backbone -> VAE characteristics:
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Literal
 
 # ---------------------------------------------------------------------------
 # Shared PixDiT_T2I backbone args (identical across all backbones)
@@ -142,30 +139,6 @@ PID_CHECKPOINT_REGISTRY: dict[str, tuple[str, str, int]] = {
     ),
 }
 
-# ---------------------------------------------------------------------------
-# Typed config wrappers
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PidNetConfig:
-    """Typed wrapper for a backbone-specific PidNet constructor args."""
-
-    backbone: Literal["qwenimage", "flux", "sd3", "sdxl", "flux2"] = "qwenimage"
-    net_kwargs: dict = field(default_factory=lambda: dict(QWENIMAGE_PID_NET_CONFIG))
-
-
-@dataclass
-class PidSamplingConfig:
-    """Typed wrapper for sampling parameters."""
-
-    sampling_kwargs: dict = field(default_factory=lambda: dict(PID_SAMPLING_CONFIG))
-
-
-# ---------------------------------------------------------------------------
-# Convenience getters
-# ---------------------------------------------------------------------------
-
 
 def get_pid_net_config(backbone: str) -> dict:
     """Return the net config dict for ``backbone``."""
@@ -179,8 +152,3 @@ def get_pid_net_config(backbone: str) -> dict:
     if backbone not in mapping:
         raise ValueError(f"Unknown backbone: {backbone}. Choose from {list(mapping.keys())}.")
     return dict(mapping[backbone])
-
-
-def get_pid_sampling_config() -> dict:
-    """Return a copy of the shared sampling config."""
-    return dict(PID_SAMPLING_CONFIG)

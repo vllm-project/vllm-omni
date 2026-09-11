@@ -59,7 +59,7 @@ If `type(pipeline)` or any class in its `__mro__` is a `LATENT_FORMS` key,
 **nothing to do** — `lookup_latent_form` resolves it. Just smoke-test:
 
 ```bash
-vllm serve <model> --omni --pid-enable --pid-gemma <gemma-2-2b-it>
+vllm serve <model> --omni --enable-pid --pid-gemma <gemma-2-2b-it>
 ```
 
 ---
@@ -157,8 +157,8 @@ PID_CHECKPOINT_REGISTRY["your_backbone"] = (
 ```
 
 Also export `YOUR_BACKBONE_PID_NET_CONFIG` from `pid/__init__.py`, and add
-the backbone name to `PidNetConfig.backbone`'s `Literal` if you want typed
-validation.
+the backbone name to the mapping in `get_pid_net_config()` for validated
+lookup.
 
 > **VAE characteristics** come from the target LDM: `vae.config` (latent
 > channels) + `vae_scale_factor` + packing. `(lq_latent_channels,
@@ -235,7 +235,7 @@ there is no silent-wrong-image path. Round-trip test:
 - **Mount**: `init_pid_decoder_on` resolves the backbone via
   `lookup_latent_form(model)` and eager-loads weights, resident, aligned with
   `enforce_eager`.
-- **Gating** (`maybe_pid_passthrough`): global `--pid-enable` off → per-request
+- **Gating** (`maybe_pid_passthrough`): global `--enable-pid` off → per-request
   request raises (weights are not lazily loaded); family unregistered →
   warning (explicit request → error); `output_type == "latent"` → skip;
   initial latent present (img2img/edit, `strength < 1`, `latents` /
@@ -265,7 +265,7 @@ there is no silent-wrong-image path. Round-trip test:
 - [ ] `to_x0` unit tests: token-count ↔ grid math, `pid_h/w` size, error
       branches for non-canonical latents (CPU, no weights).
 - [ ] Gating unit tests pass (`test_pid_runner_integration.py` decision table).
-- [ ] With `--pid-enable`, checkpoint loads with no fatal
+- [ ] With `--enable-pid`, checkpoint loads with no fatal
       `missing/unexpected` keys beyond expected LQ keys.
 - [ ] Output size == LDM size × `scale` (e.g. 1024 → 4096 with `scale=4`).
 - [ ] `"pid_decode": {"enabled": false}` returns the VAE path (identical to a

@@ -186,7 +186,7 @@ YOUR_BACKBONE_PID_NET_CONFIG = _make_net_config(
   is generic — no per-model changes.
 - Do NOT add `--pid-scale/--pid-num-steps/--pid-seed` CLI flags — they live in
   `PidDecodeConfig` defaults, overridden per request via `pid_decode`.
-- CLI surface is fixed: `--pid-enable / --pid-checkpoint / --pid-gemma`.
+- CLI surface is fixed: `--enable-pid / --pid-checkpoint / --pid-gemma`.
 
 ---
 
@@ -207,15 +207,15 @@ Mock with `mocker`/`monkeypatch`; never instantiate PidNet/Gemma on CPU.
 
 ### 5b. L2/L3 e2e — `tests/e2e/online_serving/test_<model>_pid.py`
 
-L2: server with `--pid-enable` → output size == LDM size × `scale`.
+L2: server with `--enable-pid` → output size == LDM size × `scale`.
 L3: per-request `pid_decode` override; `enabled:false` falls back to VAE;
-requesting PiD without `--pid-enable` errors.
+requesting PiD without `--enable-pid` errors.
 
 ### 5c. Manual serve smoke test
 
 ```bash
 vllm serve <HF-id-or-local-path> --omni --port 8091 \
-  --pid-enable \
+  --enable-pid \
   --pid-checkpoint <local model_ema_bf16.pth or omit for auto-download> \
   --pid-gemma /path/to/gemma-2-2b-it
 ```

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # PixelDiT T2I — consolidated network architecture.
 # Verbatim copy from the original PixelDiT repo, merged into a single file.
 # Sources:
@@ -631,8 +631,6 @@ class MMDiTJointAttention(nn.Module):
             # SP: image stream sharded along Nx, text stream replicated as a
             # joint-front KV context. vLLM-Omni Attention internally handles
             # Ulysses (all-to-all) / Ring / AllGather-KV for the image query.
-            # The text stream's own attention output is not produced (same as
-            # Qwen-Image under SP) -> its residual stays unchanged.
             if attn_mask is not None:
                 logger.warning_once("MMDiTJointAttention: attention mask ignored under sequence parallelism.")
             md = AttentionMetadata(
@@ -641,13 +639,10 @@ class MMDiTJointAttention(nn.Module):
                 joint_value=vy,
                 joint_strategy="front",
             )
-            # The Ulysses/Ring strategies re-concatenate the joint text to the
-            # front of the output ([Ny + Nx, H, Hc]), so drop the text part and
-            # keep only the (sharded) image tokens.
-            out_x = self.vattn(qx, kx, vx, md)  # [B, Ny + Nx, H, Hc]
-            out_x = out_x[:, Ny:, :, :]
-            out_x = out_x.reshape(B, Nx, C)
-            out_y = torch.zeros_like(y)
+
+            out_joint = self.vattn(qx, kx, vx, md)  # [B, Ny + Nx, H, Hc]
+            out_y = out_joint[:, :Ny, :, :].reshape(B, Ny, C)
+            out_x = out_joint[:, Ny:, :, :].reshape(B, Nx, C)
         else:
             # SDPA expects [B, H, S, Hc]; build joint sequence [text, image].
             qx = qx.transpose(1, 2)

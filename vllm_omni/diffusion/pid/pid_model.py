@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -263,13 +263,14 @@ class PidInferenceModel(nn.Module):
         """
         if isinstance(caption, str):
             caption = [caption]
-        B = len(caption)
-
-        # Some upstream pipelines may leave allow_tf32=False, which penalises
-        # every fp32 Linear (AdaLN projections, controlnet gate) even under
-        # autocast(bf16).  Restoring it costs nothing and keeps A100 perf
-        # predictable.
-        # torch.backends.cuda.matmul.allow_tf32 = True
+        # The runner passes one request's latents as a single batch ([n, C, zH,
+        # zW] for num_outputs_per_prompt = n) with a single caption string, so
+        # broadcast the caption to the latent batch size.
+        B = int(lq_latent.shape[0])
+        if len(caption) == 1 and B > 1:
+            caption = caption * B
+        elif len(caption) != B:
+            raise ValueError(f"PiD decode: caption count ({len(caption)}) must be 1 or match latent batch size ({B})")
 
         # Use tensor_kwargs (dtype-only; device derived from lq_latent at
         # call time) to match the original PixelDiTModel: the student was

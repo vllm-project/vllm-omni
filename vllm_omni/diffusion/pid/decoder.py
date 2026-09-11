@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Generic PiD (Pixel Diffusion) decoder shared by all LDM backbones.
 
 Backbone-specific differences (VAE latent channels / spatial compression)
@@ -33,8 +33,7 @@ class PidDecodeConfig:
     enabled: bool = False
     # Path to the PiD distilled checkpoint (.pth).
     checkpoint_path: str = ""
-    # Local directory containing gemma-2-2b-it weights (required).
-    gemma_model: str = ""
+    gemma_model: str = "Efficient-Large-Model/gemma-2-2b-it"
     # Super-resolution factor applied to the LDM output resolution.
     scale: int = 4
     # Number of distilled SDE sampling steps (4 for the distilled checkpoint).
@@ -44,9 +43,6 @@ class PidDecodeConfig:
     # Noise level injected into the LQ latent. 0.0 means the clean x_0 latent.
     degrade_sigma: float = 0.0
     # Compute precision preset: "bfloat16" (default, matches distilled
-    # checkpoint training), "float16" (fp16 autocast), or "float32" (pure
-    # fp32 forward, disables autocast). The tensor container is always
-    # float32; non-float32 values enable autocast for matmuls only.
     precision: str = "bfloat16"
 
 

@@ -836,7 +836,7 @@ class OmniServeCommand(CLISubcommand):
         )
         # PiD (Pixel Diffusion) super-resolution decoder arguments.
         omni_config_group.add_argument(
-            "--pid-enable",
+            "--enable-pid",
             action="store_true",
             default=False,
             help="Enable PiD super-resolution decode for the diffusion pipeline.",

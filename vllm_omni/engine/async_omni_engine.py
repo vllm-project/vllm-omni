@@ -168,10 +168,10 @@ class AsyncOmniEngine:
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
 
         # Pack --pid-* CLI flags into a single ``pid_decode`` dict consumed by
-        # ``OmniDiffusionConfig``. When ``--pid-enable`` is set, the matching
+        # ``OmniDiffusionConfig``. When ``--enable-pid`` is set, the matching
         # keys are popped from kwargs and re-injected as ``pid_decode`` so
         # they flow through the normal stage-config plumbing.
-        _pid_enable = kwargs.pop("pid_enable", False)
+        _pid_enable = kwargs.pop("enable_pid", False)
         if _pid_enable:
             _pid_decode: dict[str, Any] = {"enabled": True}
             for _cli_key, _cfg_key in (
