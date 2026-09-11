@@ -11,6 +11,8 @@
 # YAML anchors are nested lists; the loader flattens them.
 
 x-qwen3-tts: &qwen3_tts
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/entrypoints/omni_base.py
   - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/model_executor/models/qwen3_tts/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
@@ -23,6 +25,8 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/stage_pool.py
 
 x-minicpmo-4-5: &minicpmo_4_5
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/entrypoints/omni_base.py
   - vllm_omni/model_executor/models/minicpmo_4_5/
   - vllm_omni/model_executor/models/step_audio2/
   - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
@@ -43,7 +47,6 @@ x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/core/sched/
   - vllm_omni/outputs/multimodal_accumulation.py
   - vllm_omni/engine/stage_init_utils.py
-  - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/engine/orchestrator.py
   - vllm_omni/entrypoints/cli/serve.py
   - vllm_omni/entrypoints/openai/api_server.py
@@ -51,11 +54,15 @@ x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/config/stage_config.py
 
 x-qwen2-5-omni: &qwen2_5_omni
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/entrypoints/omni_base.py
   - vllm_omni/model_executor/models/qwen2_5_omni/
   - vllm_omni/model_executor/stage_input_processors/qwen2_5_omni.py
   - vllm_omni/deploy/qwen2_5_omni.yaml
 
 x-qwen3-omni: &qwen3_omni
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/entrypoints/omni_base.py
   - vllm_omni/entrypoints/openai/serving_chat.py
   - vllm_omni/model_executor/models/qwen3_omni/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
@@ -116,11 +123,9 @@ x-lingbot-world: &lingbot_world
 
 
 source_file_dependencies:
-  # Shared uploader/registry paths. Not a job key — do not attach this to a step.
-  # Used only when no job-key prefix matches: then a hit keeps every job.
+  # Hardware presets and shared test helpers. Not a job key — do not attach this
+  # to a step. Used only when no job-key prefix matches: then a hit keeps every job.
   source_filter_fallback:
-    - .buildkite/common/scripts/upload_pipeline.py
-    - .buildkite/common/ci_source_file_dependencies.yml
     - .buildkite/common/ci_mirror_hardwares.yml
     - tests/helpers/
 
@@ -280,6 +285,7 @@ source_file_dependencies:
     - *wan22
     - tests/e2e/offline_inference/test_wan22_t2v.py
     - tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py
+    - tests/e2e/offline_inference/test_device_postprocess_equivalence.py
     - tests/e2e/online_serving/test_wan22_t2v.py
     - tests/e2e/online_serving/test_wan22_expansion.py
 

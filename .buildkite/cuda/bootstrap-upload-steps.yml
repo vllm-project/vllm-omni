@@ -22,19 +22,16 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # L3 Test — PR merge-test label (diff-aware) or main (full pipeline / WEEKLY --e2e)
+  # L3 Test — PR merge-test label or post-merge on main (both diff-aware);
+  # main+WEEKLY=1 uploads the E2E group only (--e2e).
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline
     commands:
       - |
         EXTRA=""
-        if [ "${BUILDKITE_BRANCH}" = "main" ]; then
-          if [ "${WEEKLY:-}" = "1" ]; then
-            EXTRA="--e2e"
-          else
-            EXTRA="--all"
-          fi
+        if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--e2e"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
     agents:
