@@ -49,6 +49,9 @@ stages:
       # initial_codec_chunk_frames and codec_chunk_frames.
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
       cudagraph_num_of_warmups: 1
+    additional_config:
+      moss_codec_enable_npu_graph: true
+      moss_codec_max_npu_graphs: 16   # 7 batch_sizes × 2 frame_sizes = 14 buckets + margin
     # profiler_config:
     #   profiler: torch
     #   torch_profiler_dir: /root/vllm-omni-workspace/vllm-omni/results/moss_local_stage1/batch_8
