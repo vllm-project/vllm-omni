@@ -11,6 +11,11 @@ async_chunk: false
 stages:
   - stage_id: 0
     max_num_seqs: 1
+    # Kept true so the default deployment is unchanged. Gr00tN1d7Pipeline now
+    # implements setup_compile(), so setting this to false in an overlay
+    # torch.compiles the action head -- measured -30% latency / +43% throughput
+    # on an A30 with the golden action values unchanged. Opt-in instructions and
+    # the compile_mode knob are in recipes/NVIDIA/GR00T-N1.7.md.
     enforce_eager: true
     model_class_name: Gr00tN1d7Pipeline
     model_config:

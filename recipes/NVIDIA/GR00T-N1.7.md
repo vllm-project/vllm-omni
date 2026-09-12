@@ -91,6 +91,60 @@ The test sends a synthetic two-frame DROID observation and checks:
 - All action values are finite float32
 - Reset response is `"reset successful"`
 
+## Optional: torch.compile the action head
+
+The default deploy config runs eager. The pipeline is launch-bound rather than
+compute-bound: an Nsight Systems capture of one steady-state request on an A30 shows
+5,086 kernel launches with a 6 us median duration, and the GPU busy for only 70 ms of a
+144 ms request. 3,446 of those launches (68%) are ~6 us elementwise/layernorm kernels
+that account for 29% of GPU time.
+
+`Gr00tN1d7Pipeline.setup_compile()` torch.compiles the action head, which the runner
+calls when a stage is not `enforce_eager`. Opt in with an overlay:
+
+```yaml
+# gr00t_compile.yaml
+base_config: vllm_omni/deploy/Gr00tN1d7.yaml
+stages:
+  - stage_id: 0
+    enforce_eager: false
+    compile_mode: default          # or reduce-overhead
+```
+
+!!! warning
+    Keep `compile_mode` at the stage level, not under `model_config:`. Overlay
+    merging is deep only for the keys in `_DEEP_MERGE_KEYS`; a `model_config:`
+    block in an overlay **replaces** the base block instead of merging, which
+    drops `policy_server_config` and silently disables OpenPI serving
+    (`Robot OpenPI serving disabled for model ...`, and the client fails its
+    msgpack handshake with `TypeError: a bytes-like object is required`).
+
+```bash
+vllm serve nvidia/GR00T-N1.7-3B --omni --deploy-config gr00t_compile.yaml
+```
+
+Measured on 1xA30, DP=1, 30 requests/client after 20 warmup requests. Actions were
+checked against the golden values in
+`tests/e2e/online_serving/test_gr00t_openpi_expansion.py` (atol 1e-2) before each run:
+
+| `compile_mode` | latency | throughput | golden values |
+|---|---|---|---|
+| (eager, default) | 146.9 ms | 7.49 req/s | PASS |
+| `default` | 102.9 ms (-30%) | 10.69 req/s (+43%) | PASS |
+| `reduce-overhead` | 99.3 ms (-32%) | 11.06 req/s (+48%) | PASS |
+
+Notes:
+
+- Inductor fusion carries most of the win; CUDA graphs add ~3 ms on top. `default` has
+  none of the CUDA graph static-address constraints, so prefer it unless you have
+  measured otherwise.
+- Only the action head is compiled. Its shapes are fixed by the checkpoint (batch 1,
+  `action_horizon` 40, `num_inference_timesteps` 4). The Qwen3-VL backbone is left eager
+  on purpose: its per-observation token count defeats CUDA graph capture, and compiling
+  it moves the actions past the e2e tolerance (`eef_9d` 1.5e-2 against atol 1e-2) while
+  being slower than compiling the action head alone.
+- Compilation happens on the first inference, so warm up before measuring.
+
 ## Notes
 
 - **Do not change the model-specific `policy_server_config` values.** `action_horizon`,
