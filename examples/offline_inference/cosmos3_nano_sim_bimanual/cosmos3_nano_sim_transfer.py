@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run Cosmos-Dreams-Transfer from an imaginaire4 Transfer JSON record."""
+"""Run Cosmos3-Nano-Sim-Transfer from an imaginaire4 Transfer JSON record."""
 
 from __future__ import annotations
 
@@ -74,16 +74,16 @@ def _unwrap_video(output: Any) -> Any:
     while isinstance(output, list | OmniRequestOutput | dict):
         identity = id(output)
         if identity in seen:
-            raise ValueError("Cosmos-Dreams-Transfer returned a cyclic video output envelope.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer returned a cyclic video output envelope.")
         seen.add(identity)
 
         if isinstance(output, list):
             if not output:
-                raise ValueError("Cosmos-Dreams-Transfer returned an empty video output list.")
+                raise ValueError("Cosmos3-Nano-Sim-Transfer returned an empty video output list.")
             output = output[0]
         elif isinstance(output, OmniRequestOutput):
             if not output.images:
-                raise ValueError("Cosmos-Dreams-Transfer returned no video frames.")
+                raise ValueError("Cosmos3-Nano-Sim-Transfer returned no video frames.")
             output = output.images
         elif "video" in output:
             output = output["video"]
@@ -91,11 +91,11 @@ def _unwrap_video(output: Any) -> Any:
             output = output["payload"]
         else:
             raise ValueError(
-                "Cosmos-Dreams-Transfer returned an unsupported output mapping; "
+                "Cosmos3-Nano-Sim-Transfer returned an unsupported output mapping; "
                 f"expected 'video' or 'payload', got keys {sorted(map(str, output))}."
             )
         if output is None:
-            raise ValueError("Cosmos-Dreams-Transfer returned an empty video payload.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer returned an empty video payload.")
     return output
 
 
@@ -119,10 +119,10 @@ def _video_frames(video: Any) -> list[np.ndarray]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Converted Cosmos-Dreams-Transfer Diffusers directory.")
+    parser.add_argument("--model", required=True, help="Converted Cosmos3-Nano-Sim-Transfer Diffusers directory.")
     parser.add_argument("--input-json", type=Path, required=True, help="imaginaire4 Transfer JSON record.")
-    parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos_dreams_transfer.yaml")
-    parser.add_argument("--output", type=Path, default=Path("cosmos_dreams_transfer.mp4"))
+    parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos3_nano_sim_transfer.yaml")
+    parser.add_argument("--output", type=Path, default=Path("cosmos3_nano_sim_transfer.mp4"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--resolution",
@@ -173,7 +173,7 @@ def main() -> None:
     }
     omni = Omni(
         model=args.model,
-        model_class_name="CosmosDreamsTransferPipeline",
+        model_class_name="Cosmos3NanoSimTransferPipeline",
         deploy_config=args.deploy_config,
         enforce_eager=True,
     )
@@ -197,7 +197,7 @@ def main() -> None:
         from diffusers.utils import export_to_video
 
         export_to_video(_video_frames(result), str(args.output), fps=fps)
-    print(f"Saved Cosmos-Dreams-Transfer {args.output_type} output to {args.output}")
+    print(f"Saved Cosmos3-Nano-Sim-Transfer {args.output_type} output to {args.output}")
 
 
 if __name__ == "__main__":

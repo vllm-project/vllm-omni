@@ -321,20 +321,10 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3_nano_sim_bimanual",
         "Cosmos3NanoSimBimanualPipeline",
     ),
-    "CosmosDreamsTransferPipeline": (
+    "Cosmos3NanoSimTransferPipeline": (
         "cosmos3_nano_sim_bimanual",
-        "pipeline_cosmos_dreams_transfer",
-        "CosmosDreamsTransferPipeline",
-    ),
-    "CosmosDreamsTransferOmniPipeline": (
-        "cosmos3_nano_sim_bimanual",
-        "pipeline_cosmos_dreams_transfer",
-        "CosmosDreamsTransferPipeline",
-    ),
-    "Cosmos3TransferInteractivePipeline": (
-        "cosmos3_nano_sim_bimanual",
-        "pipeline_cosmos_dreams_transfer",
-        "CosmosDreamsTransferPipeline",
+        "pipeline_cosmos3_nano_sim_transfer",
+        "Cosmos3NanoSimTransferPipeline",
     ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
@@ -389,9 +379,7 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "LingBotWorldCausalDMDPipeline",
     "Cosmos3NanoSimBimanualPipeline",
-    "CosmosDreamsTransferPipeline",
-    "CosmosDreamsTransferOmniPipeline",
-    "Cosmos3TransferInteractivePipeline",
+    "Cosmos3NanoSimTransferPipeline",
 }
 
 
@@ -617,9 +605,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_post_process_func",
-    "CosmosDreamsTransferPipeline": "get_cosmos_dreams_transfer_post_process_func",
-    "CosmosDreamsTransferOmniPipeline": "get_cosmos_dreams_transfer_post_process_func",
-    "Cosmos3TransferInteractivePipeline": "get_cosmos_dreams_transfer_post_process_func",
+    "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
@@ -634,9 +620,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_ir_op_priority_func",
-    "CosmosDreamsTransferPipeline": "get_cosmos_dreams_transfer_ir_op_priority_func",
-    "CosmosDreamsTransferOmniPipeline": "get_cosmos_dreams_transfer_ir_op_priority_func",
-    "Cosmos3TransferInteractivePipeline": "get_cosmos_dreams_transfer_ir_op_priority_func",
+    "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -669,9 +653,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3NanoSimBimanualPipeline": "get_cosmos3_nano_sim_bimanual_pre_process_func",
-    "CosmosDreamsTransferPipeline": "get_cosmos_dreams_transfer_pre_process_func",
-    "CosmosDreamsTransferOmniPipeline": "get_cosmos_dreams_transfer_pre_process_func",
-    "Cosmos3TransferInteractivePipeline": "get_cosmos_dreams_transfer_pre_process_func",
+    "Cosmos3NanoSimTransferPipeline": "get_cosmos3_nano_sim_transfer_pre_process_func",
 }
 
 

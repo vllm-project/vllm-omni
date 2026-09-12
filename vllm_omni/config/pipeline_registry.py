@@ -48,7 +48,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 )
 from vllm_omni.model_executor.models.cosmos3_nano_sim_bimanual.pipeline import (
     COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
-    COSMOS_DREAMS_TRANSFER_PIPELINE,
+    COSMOS3_NANO_SIM_TRANSFER_PIPELINE,
 )
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
@@ -145,7 +145,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "lance": LANCE_PIPELINE,
     "cosmos3_nano_sim_bimanual": COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
-    "cosmos_dreams_transfer": COSMOS_DREAMS_TRANSFER_PIPELINE,
+    "cosmos3_nano_sim_transfer": COSMOS3_NANO_SIM_TRANSFER_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,

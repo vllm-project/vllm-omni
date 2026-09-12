@@ -28,9 +28,9 @@ from vllm_omni.model_extras.cosmos3_nano_sim_bimanual import (
     COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS,
     COSMOS3_NANO_SIM_BIMANUAL_EXTRA_OUTPUT_PARAMS,
 )
-from vllm_omni.model_extras.cosmos_dreams_transfer import (
-    COSMOS_DREAMS_TRANSFER_EXTRA_BODY_PARAMS,
-    COSMOS_DREAMS_TRANSFER_EXTRA_OUTPUT_PARAMS,
+from vllm_omni.model_extras.cosmos3_nano_sim_transfer import (
+    COSMOS3_NANO_SIM_TRANSFER_EXTRA_BODY_PARAMS,
+    COSMOS3_NANO_SIM_TRANSFER_EXTRA_OUTPUT_PARAMS,
 )
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
@@ -204,16 +204,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_NANO_SIM_BIMANUAL_EXTRA_OUTPUT_PARAMS,
     },
-    **{
-        model_class_name: {
-            "extra_body_params": COSMOS_DREAMS_TRANSFER_EXTRA_BODY_PARAMS,
-            "extra_output_params": COSMOS_DREAMS_TRANSFER_EXTRA_OUTPUT_PARAMS,
-        }
-        for model_class_name in (
-            "CosmosDreamsTransferPipeline",
-            "CosmosDreamsTransferOmniPipeline",
-            "Cosmos3TransferInteractivePipeline",
-        )
+    "Cosmos3NanoSimTransferPipeline": {
+        "extra_body_params": COSMOS3_NANO_SIM_TRANSFER_EXTRA_BODY_PARAMS,
+        "extra_output_params": COSMOS3_NANO_SIM_TRANSFER_EXTRA_OUTPUT_PARAMS,
     },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,

@@ -157,7 +157,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     """Cosmos3-Nano-Sim-Bimanual inference with dense-or-paged persistent GEN K/V.
 
     The default diffusion engine exercises the dense numerical-oracle path,
-    which Cosmos-Dreams-Transfer also runs on. When the AR-Diffusion runner
+    which Cosmos3-Nano-Sim-Transfer also runs on. When the AR-Diffusion runner
     binds a state, the exact same attention uses paged storage instead.
     """
 

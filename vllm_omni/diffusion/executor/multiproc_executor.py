@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
 import json
 import multiprocessing as mp
 import multiprocessing.connection
-import inspect
 import os
 import queue
 import threading
@@ -305,7 +305,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # regardless of how many workers there are ("Reducing Torch parallelism from N
         # threads to 1"). The spawned diffusion worker inherits that environment, so its
         # host-side Torch CPU ops run single-threaded. On a 1-GPU run there is no
-        # oversubscription to relieve, so the clamp only starves the GPU: on Cosmos-Dreams
+        # oversubscription to relieve, so the clamp only starves the GPU: on Cosmos3-Nano-Sim-Bimanual
         # (1 GPU, 36 cores, 257 frames @ 720x1280) it cost 3.21 s of wall clock, of which
         # nsys attributes 3.207 s to additional GPU idle, with byte-identical output.
         #

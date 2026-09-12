@@ -1,8 +1,8 @@
-# Cosmos-Dreams-Transfer offline dense-oracle deployment. The checkpoint path
+# Cosmos3-Nano-Sim-Transfer offline dense-oracle deployment. The checkpoint path
 # and immutable schema-v1 conditioning contract come from transformer/config.json.
 # Paged cache serving remains a Phase T2 follow-up.
 
-pipeline: cosmos_dreams_transfer
+pipeline: cosmos3_nano_sim_transfer
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16
@@ -14,7 +14,7 @@ stages:
     devices: "0"
     max_num_seqs: 1
     enforce_eager: true
-    model_class_name: CosmosDreamsTransferPipeline
+    model_class_name: Cosmos3NanoSimTransferPipeline
     model_config:
       action_gen: false
       default_fps: 15.0

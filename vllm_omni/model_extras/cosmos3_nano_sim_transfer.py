@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serving parameters exposed by Cosmos-Dreams-Transfer."""
+"""Serving parameters exposed by Cosmos3-Nano-Sim-Transfer."""
 
-COSMOS_DREAMS_TRANSFER_EXTRA_BODY_PARAMS = frozenset(
+COSMOS3_NANO_SIM_TRANSFER_EXTRA_BODY_PARAMS = frozenset(
     {
         "blur",
         "close_session",
@@ -19,4 +19,4 @@ COSMOS_DREAMS_TRANSFER_EXTRA_BODY_PARAMS = frozenset(
     }
 )
 
-COSMOS_DREAMS_TRANSFER_EXTRA_OUTPUT_PARAMS = frozenset()
+COSMOS3_NANO_SIM_TRANSFER_EXTRA_OUTPUT_PARAMS = frozenset()

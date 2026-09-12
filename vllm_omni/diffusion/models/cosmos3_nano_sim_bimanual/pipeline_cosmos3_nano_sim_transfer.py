@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline dense-oracle pipeline for Cosmos-Dreams-Transfer."""
+"""Offline dense-oracle pipeline for Cosmos3-Nano-Sim-Transfer."""
 
 from __future__ import annotations
 
@@ -50,8 +50,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualSessionState,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos_dreams_transfer import (
-    CosmosDreamsTransferTransformer,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_transfer import (
+    Cosmos3NanoSimTransferTransformer,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import iter_clean_commit_frames
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
@@ -137,12 +137,12 @@ def _default_transfer_resolution(policy: Cosmos3NanoSimBimanualResolutionPolicy)
     matching = [key for key, sizes in VIDEO_RES_SIZE_INFO.items() if (width, height) in sizes.values()]
     if not matching:
         raise ValueError(
-            f"Cosmos-Dreams-Transfer default_resolution must be a canonical Cosmos3 bucket, got {height}x{width}."
+            f"Cosmos3-Nano-Sim-Transfer default_resolution must be a canonical Cosmos3 bucket, got {height}x{width}."
         )
     return max(matching, key=int)
 
 
-def resolve_cosmos_dreams_transfer_geometry(
+def resolve_cosmos3_nano_sim_transfer_geometry(
     sampling_params: Any,
     prompt_data: Any,
     policy: Cosmos3NanoSimBimanualResolutionPolicy,
@@ -166,16 +166,16 @@ def resolve_cosmos_dreams_transfer_geometry(
     try:
         target_width, target_height = find_closest_target_size(*source_hw, resolution)
     except ValueError as exc:
-        raise ValueError(f"Cosmos-Dreams-Transfer resolution bucket is invalid: {resolution!r}.") from exc
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer resolution bucket is invalid: {resolution!r}.") from exc
     geometry = policy.resolve(target_height, target_width)
 
     requested_height = getattr(sampling_params, "height", None)
     requested_width = getattr(sampling_params, "width", None)
     if (requested_height is None) != (requested_width is None):
-        raise ValueError("Cosmos-Dreams-Transfer height and width must be supplied together.")
+        raise ValueError("Cosmos3-Nano-Sim-Transfer height and width must be supplied together.")
     if requested_height is not None and (int(requested_height), int(requested_width)) != geometry.session_key:
         raise ValueError(
-            "Cosmos-Dreams-Transfer serialized dimensions do not match the control-selected bucket: "
+            "Cosmos3-Nano-Sim-Transfer serialized dimensions do not match the control-selected bucket: "
             f"requested {requested_height}x{requested_width}, selected {geometry.height}x{geometry.width}."
         )
     return geometry
@@ -184,18 +184,20 @@ def resolve_cosmos_dreams_transfer_geometry(
 def _strict_frame_count(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ARDiffusionRequestRejectedError(
-            f"Cosmos-Dreams-Transfer num_frames must be an integer without coercion, got {value!r}."
+            f"Cosmos3-Nano-Sim-Transfer num_frames must be an integer without coercion, got {value!r}."
         )
     return int(value)
 
 
 def _strict_bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
-        raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams-Transfer {name} must be a JSON boolean, got {value!r}.")
+        raise ARDiffusionRequestRejectedError(
+            f"Cosmos3-Nano-Sim-Transfer {name} must be a JSON boolean, got {value!r}."
+        )
     return value
 
 
-def format_cosmos_dreams_transfer_prompt(
+def format_cosmos3_nano_sim_transfer_prompt(
     prompt: str,
     *,
     hint: str,
@@ -208,7 +210,7 @@ def format_cosmos_dreams_transfer_prompt(
 
     prompt_fps = int(round(fps))
     if prompt_fps <= 0:
-        raise ValueError(f"Cosmos-Dreams-Transfer prompt FPS must round to a positive integer, got {fps}.")
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer prompt FPS must round to a positive integer, got {fps}.")
     formatted = _format_json_object_prompt(
         prompt,
         num_frames=num_frames,
@@ -228,7 +230,7 @@ def format_cosmos_dreams_transfer_prompt(
     return f"{formatted.rstrip()} {suffix}"
 
 
-def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
+def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfig):
     """Resolve a Transfer bucket, preprocess to it, and serialize final H/W."""
 
     from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
@@ -238,7 +240,7 @@ def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
     policy = _resolution_policy(od_config, manifest)
 
     def transfer_target_size(request) -> tuple[int, int]:
-        geometry = resolve_cosmos_dreams_transfer_geometry(
+        geometry = resolve_cosmos3_nano_sim_transfer_geometry(
             request.sampling_params,
             request.prompt,
             policy,
@@ -257,9 +259,9 @@ def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
             extra = {}
             sp.extra_args = extra
         if not isinstance(extra, dict):
-            raise ValueError("Cosmos-Dreams-Transfer extra_args must be a mutable mapping during preprocessing.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer extra_args must be a mutable mapping during preprocessing.")
         prompt_data = request.prompt
-        geometry = resolve_cosmos_dreams_transfer_geometry(sp, prompt_data, policy)
+        geometry = resolve_cosmos3_nano_sim_transfer_geometry(sp, prompt_data, policy)
         sp.height, sp.width = geometry.height, geometry.width
 
         def request_param(key: str) -> Any:
@@ -293,45 +295,47 @@ def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
                 else:
                     extra.pop(injected_hint, None)
         final_sp = processed.sampling_params
-        final_geometry = resolve_cosmos_dreams_transfer_geometry(final_sp, processed.prompt, policy)
+        final_geometry = resolve_cosmos3_nano_sim_transfer_geometry(final_sp, processed.prompt, policy)
         final_sp.height, final_sp.width = final_geometry.height, final_geometry.width
         return processed
 
     return pre_process_func
 
 
-def get_cosmos_dreams_transfer_post_process_func(od_config: OmniDiffusionConfig):
+def get_cosmos3_nano_sim_transfer_post_process_func(od_config: OmniDiffusionConfig):
     return get_cosmos3_nano_sim_bimanual_post_process_func(od_config)
 
 
-def get_cosmos_dreams_transfer_ir_op_priority_func(od_config: OmniDiffusionConfig):
+def get_cosmos3_nano_sim_transfer_ir_op_priority_func(od_config: OmniDiffusionConfig):
     return get_cosmos3_nano_sim_bimanual_ir_op_priority_func(od_config)
 
 
-class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
+class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     """Full-clip Transfer inference using the dense causal-history oracle."""
 
-    _transformer_cls_override: ClassVar[type[CosmosDreamsTransferTransformer]] = CosmosDreamsTransferTransformer
+    _transformer_cls_override: ClassVar[type[Cosmos3NanoSimTransferTransformer]] = Cosmos3NanoSimTransferTransformer
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        if not isinstance(self.transformer, CosmosDreamsTransferTransformer):
+        if not isinstance(self.transformer, Cosmos3NanoSimTransferTransformer):
             raise TypeError(
-                "Cosmos-Dreams-Transfer pipeline resolved the wrong transformer type: "
+                "Cosmos3-Nano-Sim-Transfer pipeline resolved the wrong transformer type: "
                 f"{type(self.transformer).__name__}."
             )
 
     def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
         contract = self.manifest.require_control_video_conditioning()
         if self.manifest.sink_frames != 0:
-            raise ValueError("Cosmos-Dreams-Transfer requires sink_frames=0.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer requires sink_frames=0.")
         if not contract.no_eviction:
-            raise ValueError("Cosmos-Dreams-Transfer requires no_eviction=True.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer requires no_eviction=True.")
         if not bool(getattr(od_config, "enforce_eager", False)):
-            raise ValueError("Cosmos-Dreams-Transfer requires enforce_eager=True; compiled execution is unsupported.")
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Transfer requires enforce_eager=True; compiled execution is unsupported."
+            )
         kv_cache_dtype = getattr(od_config, "diffusion_kv_cache_dtype", None)
         if kv_cache_dtype not in (None, "auto"):
-            raise ValueError("Cosmos-Dreams-Transfer does not support a quantized diffusion KV cache.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer does not support a quantized diffusion KV cache.")
 
     @staticmethod
     def _is_action_weight(name: str) -> bool:
@@ -358,17 +362,17 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         loaded = super().load_weights(checked_weights())
         if action_weights:
             preview = ", ".join(sorted(action_weights)[:12])
-            raise ValueError(f"Cosmos-Dreams-Transfer checkpoint contains forbidden action weights: {preview}.")
+            raise ValueError(f"Cosmos3-Nano-Sim-Transfer checkpoint contains forbidden action weights: {preview}.")
         return loaded
 
     def ar_diffusion_kv_cache_spec(self):
         raise NotImplementedError(
-            "Cosmos-Dreams-Transfer paged-cache topology is Phase T2; use the default dense diffusion engine."
+            "Cosmos3-Nano-Sim-Transfer paged-cache topology is Phase T2; use the default dense diffusion engine."
         )
 
     def _parse_tick(self, tick):
         del tick
-        raise ValueError("Cosmos-Dreams-Transfer tick transport is Phase T3 and is not supported by this pipeline.")
+        raise ValueError("Cosmos3-Nano-Sim-Transfer tick transport is Phase T3 and is not supported by this pipeline.")
 
     def _request_param(self, sp: Any, prompt_data: Any, key: str, default: Any = None) -> Any:
         value = self._get_sp_param(sp, key, None)
@@ -388,7 +392,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         return super()._resolve_request_fps(sp, prompt_data)
 
     def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> Cosmos3NanoSimBimanualGeometry:
-        return resolve_cosmos_dreams_transfer_geometry(sp, prompt_data, self.resolution_policy)
+        return resolve_cosmos3_nano_sim_transfer_geometry(sp, prompt_data, self.resolution_policy)
 
     def _resolve_requested_pixel_frames(
         self,
@@ -408,12 +412,12 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     ) -> _TransferRequestContract:
         if typed_inputs is not None or bool(self._get_sp_param(sp, "chunk_only", False)):
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams-Transfer T1 supports only offline full-clip requests; tick transport is Phase T3."
+                "Cosmos3-Nano-Sim-Transfer T1 supports only offline full-clip requests; tick transport is Phase T3."
             )
         for action_key in ("action", "domain_id", "domain_name", "embodiment"):
             if self._request_param(sp, prompt_data, action_key, None) is not None:
                 raise ARDiffusionRequestRejectedError(
-                    f"Cosmos-Dreams-Transfer does not accept action conditioning field {action_key!r}."
+                    f"Cosmos3-Nano-Sim-Transfer does not accept action conditioning field {action_key!r}."
                 )
 
         named_hints = []
@@ -427,7 +431,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         control_video = self._request_param(sp, prompt_data, "control_video", None)
         if generic_hint is not None and named_hints:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams-Transfer accepts either control_hint/control_video or one named hint, not both."
+                "Cosmos3-Nano-Sim-Transfer accepts either control_hint/control_video or one named hint, not both."
             )
         if generic_hint is not None:
             hint = str(generic_hint).strip().lower()
@@ -435,12 +439,12 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             hint_values[hint] = {}
         if len(named_hints) != 1:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams-Transfer requires exactly one edge, blur, depth, or seg control hint."
+                "Cosmos3-Nano-Sim-Transfer requires exactly one edge, blur, depth, or seg control hint."
             )
         hint = named_hints[0]
         if hint not in TRANSFER_HINTS:
             raise ARDiffusionRequestRejectedError(
-                f"Unsupported Cosmos-Dreams-Transfer control hint {hint!r}; expected one of {list(TRANSFER_HINTS)}."
+                f"Unsupported Cosmos3-Nano-Sim-Transfer control hint {hint!r}; expected one of {list(TRANSFER_HINTS)}."
             )
 
         try:
@@ -449,10 +453,10 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if control_video is not None and (parsed_hint.control is not None or parsed_hint.control_path is not None):
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams-Transfer control_video cannot be combined with a named control/control_path."
+                "Cosmos3-Nano-Sim-Transfer control_video cannot be combined with a named control/control_path."
             )
         if parsed_hint.control_weight != 1.0:
-            raise ARDiffusionRequestRejectedError("Cosmos-Dreams-Transfer single-control weight must equal 1.0.")
+            raise ARDiffusionRequestRejectedError("Cosmos3-Nano-Sim-Transfer single-control weight must equal 1.0.")
         hint_config: dict[str, Any] = {"control_weight": parsed_hint.control_weight}
         if parsed_hint.control_path is not None:
             hint_config["control_path"] = parsed_hint.control_path
@@ -469,7 +473,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         )
         if control_guidance != 1.0:
             raise ARDiffusionRequestRejectedError(
-                f"Cosmos-Dreams-Transfer distilled inference requires control_guidance=1.0, got {control_guidance}."
+                f"Cosmos3-Nano-Sim-Transfer distilled inference requires control_guidance=1.0, got {control_guidance}."
             )
         first_conditional = _admission_int(
             self._request_param(sp, prompt_data, "num_first_chunk_conditional_frames", 0),
@@ -477,7 +481,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         )
         if first_conditional != 0:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams-Transfer requires num_first_chunk_conditional_frames=0."
+                "Cosmos3-Nano-Sim-Transfer requires num_first_chunk_conditional_frames=0."
             )
         share_positions = _strict_bool(
             self._request_param(sp, prompt_data, "share_vision_temporal_positions", True),
@@ -485,25 +489,28 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         )
         if not share_positions:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams-Transfer requires share_vision_temporal_positions=True."
+                "Cosmos3-Nano-Sim-Transfer requires share_vision_temporal_positions=True."
             )
         emphasize = _strict_bool(
             self._request_param(sp, prompt_data, "emphasize_control_in_prompt", True),
             "emphasize_control_in_prompt",
         )
         if not emphasize:
-            raise ARDiffusionRequestRejectedError("Cosmos-Dreams-Transfer requires emphasize_control_in_prompt=True.")
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3-Nano-Sim-Transfer requires emphasize_control_in_prompt=True."
+            )
 
         num_pixel_frames = _strict_frame_count(self._request_param(sp, prompt_data, "num_frames", 1))
         if num_pixel_frames < 17 or (num_pixel_frames - 1) % 16 != 0:
             raise ARDiffusionRequestRejectedError(
-                f"Cosmos-Dreams-Transfer requires F >= 17 and (F - 1) % 16 == 0 pixel frames; got F={num_pixel_frames}."
+                "Cosmos3-Nano-Sim-Transfer requires F >= 17 and (F - 1) % 16 == 0 "
+                f"pixel frames; got F={num_pixel_frames}."
             )
         latent_frames = (num_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
         required_history_frames = 2 * latent_frames + 1
         if required_history_frames > self.manifest.window_frames:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams-Transfer full history exceeds the artifact's no-eviction window: "
+                "Cosmos3-Nano-Sim-Transfer full history exceeds the artifact's no-eviction window: "
                 f"required {required_history_frames}, configured {self.manifest.window_frames}."
             )
         return _TransferRequestContract(
@@ -534,7 +541,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             None,
             prompt_data=prompt_data,
         )
-        formatted = format_cosmos_dreams_transfer_prompt(
+        formatted = format_cosmos3_nano_sim_transfer_prompt(
             prompt,
             hint=request.hint,
             num_frames=request.num_pixel_frames,
@@ -561,7 +568,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         prompt_data: Any = None,
     ) -> _TransferConditioning:
         if typed_inputs is not None or start_frame != 0:
-            raise ValueError("Cosmos-Dreams-Transfer T1 requires a fresh offline full-clip session.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer T1 requires a fresh offline full-clip session.")
         additional = prompt_data.get("additional_information", {}) if isinstance(prompt_data, Mapping) else {}
         source_video = additional.get("preprocessed_transfer_video") if isinstance(additional, Mapping) else None
         input_frames = normalized_video_to_uint8_cthw(source_video) if source_video is not None else None
@@ -587,7 +594,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         )
         if control_frames.shape[1] != request.num_pixel_frames:
             raise ValueError(
-                "Cosmos-Dreams-Transfer control video must cover the complete requested clip: "
+                "Cosmos3-Nano-Sim-Transfer control video must cover the complete requested clip: "
                 f"expected {request.num_pixel_frames} frames, got {control_frames.shape[1]}."
             )
         control_video = uint8_cthw_to_normalized_5d(control_frames, dtype=torch.float32)
@@ -601,7 +608,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         )
         if tuple(control_latents.shape) != expected:
             raise ValueError(
-                "Cosmos-Dreams-Transfer control/target latent shape mismatch: "
+                "Cosmos3-Nano-Sim-Transfer control/target latent shape mismatch: "
                 f"expected {expected}, got {tuple(control_latents.shape)}."
             )
         return _TransferConditioning(request=request, control_latents=control_latents)
@@ -612,7 +619,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             self._get_sp_param(sp, "initial_latent", None) is not None
             or _prompt_value(prompt_data, "initial_latent") is not None
         ):
-            raise ValueError("Cosmos-Dreams-Transfer does not accept initial_latent or seed images.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer does not accept initial_latent or seed images.")
         if isinstance(prompt_data, Mapping):
             additional = prompt_data.get("additional_information", {}) or {}
             multi_modal = prompt_data.get("multi_modal_data", {}) or {}
@@ -621,7 +628,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
                 or (isinstance(additional, Mapping) and additional.get("preprocessed_image") is not None)
                 or (isinstance(multi_modal, Mapping) and multi_modal.get("image") is not None)
             ):
-                raise ValueError("Cosmos-Dreams-Transfer does not accept initial_latent or seed images.")
+                raise ValueError("Cosmos3-Nano-Sim-Transfer does not accept initial_latent or seed images.")
         return None
 
     def _prefill_first_frame(
@@ -629,7 +636,7 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     ):
         del state, kwargs
         if initial_latent is not None:
-            raise ValueError("Cosmos-Dreams-Transfer does not accept an RGB prefix latent.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer does not accept an RGB prefix latent.")
         return None
 
     def _run_chunk(
@@ -708,16 +715,11 @@ class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         return clean_chunk
 
 
-Cosmos3TransferInteractivePipeline = CosmosDreamsTransferPipeline
-CosmosDreamsTransferOmniPipeline = CosmosDreamsTransferPipeline
-
 __all__ = [
-    "Cosmos3TransferInteractivePipeline",
-    "CosmosDreamsTransferOmniPipeline",
-    "CosmosDreamsTransferPipeline",
-    "format_cosmos_dreams_transfer_prompt",
-    "get_cosmos_dreams_transfer_ir_op_priority_func",
-    "get_cosmos_dreams_transfer_post_process_func",
-    "get_cosmos_dreams_transfer_pre_process_func",
-    "resolve_cosmos_dreams_transfer_geometry",
+    "Cosmos3NanoSimTransferPipeline",
+    "format_cosmos3_nano_sim_transfer_prompt",
+    "get_cosmos3_nano_sim_transfer_ir_op_priority_func",
+    "get_cosmos3_nano_sim_transfer_post_process_func",
+    "get_cosmos3_nano_sim_transfer_pre_process_func",
+    "resolve_cosmos3_nano_sim_transfer_geometry",
 ]

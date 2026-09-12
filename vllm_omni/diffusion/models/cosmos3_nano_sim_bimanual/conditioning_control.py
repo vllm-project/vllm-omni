@@ -25,11 +25,11 @@ def build_shared_vision_mrope_position_ids(
 
     if frame_start < 0 or num_frames <= 0 or grid_h <= 0 or grid_w <= 0:
         raise ValueError(
-            "Cosmos-Dreams-Transfer mRoPE dimensions must be positive and frame_start non-negative; "
+            "Cosmos3-Nano-Sim-Transfer mRoPE dimensions must be positive and frame_start non-negative; "
             f"got start={frame_start}, frames={num_frames}, grid={grid_h}x{grid_w}."
         )
     if fps <= 0 or base_fps <= 0:
-        raise ValueError(f"Cosmos-Dreams-Transfer FPS values must be positive, got fps={fps}, base_fps={base_fps}.")
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer FPS values must be positive, got fps={fps}, base_fps={base_fps}.")
     position_ids, _ = compute_mrope_position_ids_vision(
         num_frames,
         grid_h,
@@ -49,7 +49,7 @@ def pack_pure_vision_tokens(vision_tokens: torch.Tensor) -> torch.Tensor:
 
     if vision_tokens.ndim != 4:
         raise ValueError(
-            f"Cosmos-Dreams-Transfer vision tokens must have shape [B,T,P,D], got {tuple(vision_tokens.shape)}."
+            f"Cosmos3-Nano-Sim-Transfer vision tokens must have shape [B,T,P,D], got {tuple(vision_tokens.shape)}."
         )
     return vision_tokens.flatten(1, 2)
 
@@ -63,10 +63,10 @@ def unpack_pure_vision_tokens(
     """Restore ``[B,T,P,D]`` from a pure-vision packed sequence."""
 
     if tokens.ndim != 3:
-        raise ValueError(f"Cosmos-Dreams-Transfer packed tokens must have shape [B,S,D], got {tuple(tokens.shape)}.")
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer packed tokens must have shape [B,S,D], got {tuple(tokens.shape)}.")
     expected = num_frames * vision_tokens_per_frame
     if tokens.shape[1] != expected:
-        raise ValueError(f"Cosmos-Dreams-Transfer packed length must be {expected}, got {tokens.shape[1]}.")
+        raise ValueError(f"Cosmos3-Nano-Sim-Transfer packed length must be {expected}, got {tokens.shape[1]}.")
     return tokens.view(tokens.shape[0], num_frames, vision_tokens_per_frame, tokens.shape[-1])
 
 

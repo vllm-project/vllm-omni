@@ -33,9 +33,9 @@ Omit both `--height` and `--width` to infer an aligned, aspect-preserving
 canvas from the input media, or to use the deployment default when the record
 has no media. Supply both flags to request any policy-valid explicit canvas.
 
-## Transfer variant
+## Cosmos3-Nano-Sim-Transfer
 
-`cosmos_dreams_transfer.py` accepts the imaginaire4 Transfer JSON shape:
+`cosmos3_nano_sim_transfer.py` accepts the imaginaire4 Transfer JSON shape:
 `prompt`, optional `vision_path`, `num_frames`, and exactly one of `edge`,
 `blur`, `depth`, or `seg`. Edge and blur can be computed from `vision_path`;
 depth and segmentation records normally provide `control_path` inside the
@@ -47,11 +47,19 @@ snapped to the requested canonical bucket family and the resulting dimensions
 are validated by the same Cosmos3-Nano-Sim-Bimanual policy used during model execution.
 
 ```bash
-python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos_dreams_transfer.py \
-  --model /checkpoints/cosmos-dreams-transfer-diffusers \
+python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_transfer.py \
+  --model /checkpoints/cosmos3-nano-sim-transfer-diffusers \
   --input-json /data/transfer_video_edge.json \
   --resolution 480 \
   --num-frames 97 \
   --seed 42 \
-  --output cosmos_dreams_transfer.mp4
+  --output cosmos3_nano_sim_transfer.mp4
 ```
+
+Export Transfer through the same two imaginaire4 stages described in the
+[Bimanual recipe](../../../recipes/cosmos3/Cosmos3-Nano-Sim-Bimanual.md), using
+`--cosmos3-nano-sim-bimanual` with the Transfer experiment and checkpoint.
+The exporter detects `conditioning.mode="control_video"` and writes
+`Cosmos3NanoSimTransferPipeline` into the model indexes. Shared manifests and
+metadata retain the `cosmos3_nano_sim_bimanual` prefix. The deployment is
+[`cosmos3_nano_sim_transfer.yaml`](../../../vllm_omni/deploy/cosmos3_nano_sim_transfer.yaml).
