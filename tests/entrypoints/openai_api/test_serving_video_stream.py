@@ -12,11 +12,15 @@ import json
 import threading
 import weakref
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
 from PIL import Image
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from tests.helpers.serving_chat import build_serving_chat
+from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.entrypoints.openai import video_stream_base, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     QwenOmniStreamingVideoHandler,
@@ -139,6 +143,130 @@ async def test_receive_config_accepts_client_legacy_aliases():
     assert config.num_frames == 7
     assert config.enable_frame_filter is False
     assert config.frame_filter_threshold == 0.87
+
+
+@pytest.fixture
+def run_sampling_session(monkeypatch):
+    async def run(config_overrides):
+        engine = MagicMock()
+        engine.stage_configs = [
+            StageConfig(stage_id=index, model_stage=name)
+            for index, name in enumerate(("thinker", "talker", "code2wav"))
+        ]
+        engine.default_sampling_params_list = [
+            SamplingParams(temperature=0.4, max_tokens=64, top_p=0.85),
+            SamplingParams(temperature=0.7, max_tokens=96),
+            SamplingParams(temperature=0.8, max_tokens=128),
+        ]
+
+        async def generate(**kwargs):
+            yield _text_result("answer")
+
+        engine.generate.side_effect = generate
+        handler = QwenOmniStreamingVideoHandler(
+            chat_service=build_serving_chat(engine_client=engine),
+            engine_client=engine,
+        )
+        monkeypatch.setattr(handler, "_preprocess_to_engine_prompt", AsyncMock(return_value={"prompt": "video"}))
+        ws = MockWebSocket(
+            [
+                json.dumps(
+                    {
+                        "type": "session.config",
+                        "model": "test",
+                        "modalities": ["text"],
+                        "enable_frame_filter": False,
+                        **config_overrides,
+                    }
+                ),
+                json.dumps({"type": "video.frame", "data": _b64(_make_jpeg())}),
+                json.dumps({"type": "video.query", "text": "describe"}),
+                json.dumps({"type": "video.done"}),
+            ]
+        )
+        await handler.handle_session(ws)
+        return ws, engine
+
+    return run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_chunk_mode", ["on", "off"])
+@pytest.mark.parametrize("num_stage_overrides", [1, 3])
+async def test_video_sampling_params_reach_engine(
+    run_sampling_session, monkeypatch, async_chunk_mode, num_stage_overrides
+):
+    monkeypatch.setenv("VLLM_VIDEO_ASYNC_CHUNK", async_chunk_mode)
+    overrides = [
+        {"temperature": 0.2, "max_tokens": 1, "seed": 42},
+        {"temperature": 0.6, "max_tokens": 12},
+        {"temperature": 0.9, "max_tokens": 24},
+    ][:num_stage_overrides]
+
+    ws, engine = await run_sampling_session({"sampling_params_list": overrides})
+
+    assert not [msg for msg in ws.sent if msg["type"] == "error"]
+    engine.generate.assert_called_once()
+    params = engine.generate.call_args.kwargs["sampling_params_list"]
+    assert len(params) == 3
+    for index, param in enumerate(params):
+        assert isinstance(param, SamplingParams)
+        default = engine.default_sampling_params_list[index]
+        expected = (
+            overrides[index]
+            if index < len(overrides)
+            else {
+                "temperature": default.temperature,
+                "max_tokens": default.max_tokens,
+            }
+        )
+        assert param.temperature == expected["temperature"]
+        assert param.max_tokens == expected["max_tokens"]
+        assert param.output_kind == RequestOutputKind.DELTA
+        assert param is not default
+    assert params[0].seed == 42
+    assert all(param.output_kind == RequestOutputKind.CUMULATIVE for param in engine.default_sampling_params_list)
+    assert next(msg for msg in ws.sent if msg["type"] == "response.text.done")["text"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_video_sampling_params_provided_stage_uses_constructor_defaults(run_sampling_session):
+    ws, engine = await run_sampling_session({"sampling_params_list": [{"temperature": 0.2}]})
+
+    assert not [msg for msg in ws.sent if msg["type"] == "error"]
+    engine.generate.assert_called_once()
+    params = engine.generate.call_args.kwargs["sampling_params_list"]
+    constructor_defaults = SamplingParams()
+    assert params[0].temperature == 0.2
+    for field in ("max_tokens", "top_p"):
+        assert getattr(params[0], field) == getattr(constructor_defaults, field)
+        assert getattr(params[0], field) != getattr(engine.default_sampling_params_list[0], field)
+    assert len(params) == 3
+    for param, default in zip(params[1:], engine.default_sampling_params_list[1:]):
+        assert param.temperature == default.temperature
+        assert param.max_tokens == default.max_tokens
+        assert param.top_p == default.top_p
+        assert param is not default
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_overrides", [{}, {"sampling_params_list": None}, {"sampling_params_list": []}])
+async def test_video_sampling_params_omitted_preserve_engine_defaults(run_sampling_session, config_overrides):
+    ws, engine = await run_sampling_session(config_overrides)
+
+    assert not [msg for msg in ws.sent if msg["type"] == "error"]
+    engine.generate.assert_called_once()
+    assert engine.generate.call_args.kwargs.get("sampling_params_list") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_params", [{"temperature": -1}, {"max_tokens": 0}, {"unknown_sampling_option": 1}])
+async def test_video_sampling_params_invalid_do_not_reach_engine(run_sampling_session, invalid_params):
+    ws, engine = await run_sampling_session({"sampling_params_list": [invalid_params]})
+
+    engine.generate.assert_not_called()
+    assert any(msg["type"] == "error" for msg in ws.sent)
+    assert ws.sent[-1]["type"] == "session.done"
 
 
 @pytest.mark.asyncio
