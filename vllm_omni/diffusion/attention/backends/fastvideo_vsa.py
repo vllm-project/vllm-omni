@@ -213,6 +213,7 @@ def _get_non_pad_index(variable_block_sizes: torch.Tensor, max_block_size: int) 
 
 
 @torch.compiler.disable
+@functools.lru_cache(maxsize=32)
 def _get_tile_metadata(
     dit_seq_shape: tuple[int, int, int],
     tile_size: tuple[int, int, int],
