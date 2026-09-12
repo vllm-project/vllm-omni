@@ -1332,6 +1332,10 @@ class TestDeployConfigLoading:
         assert deploy.duplex_session.max_sessions == max_sessions
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert stages[0].yaml_extras["default_sampling_params"]["stop_token_ids"] == [
+            151704,
+            151645,
+        ]
 
     def test_load_minicpmo_default_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))

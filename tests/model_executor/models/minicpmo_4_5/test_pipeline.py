@@ -91,6 +91,10 @@ class TestPipelineTopology:
         assert thinker.final_output_type == "text"
         assert thinker.owns_tokenizer is True
         assert thinker.requires_multimodal_data is True
+        assert thinker.sampling_constraints == {
+            "detokenize": True,
+            "stop_token_ids": [151704, 151645],
+        }
 
     def test_talker_stage(self, pipeline: PipelineConfig) -> None:
         talker = pipeline.get_stage(1)
