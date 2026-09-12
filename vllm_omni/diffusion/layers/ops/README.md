@@ -44,7 +44,8 @@ dispatch are preserved.
   order/identity, CPU reference behavior on packed GQA views, input validation,
   and registered fake output metadata.
 - `tests/diffusion/layers/test_fused_qk_norm_rope.py`: existing CUDA BF16 reference
-  comparison (`atol=0.0625`, `rtol=0.02`).
+  comparison (`atol=0.0625`, `rtol=0.02`), fullgraph compilation with input
+  preservation, and CUDA Graph replay after updating input buffers.
 - `tests/diffusion/layers/test_fused_qk_norm_rope_npu.py`: CPU tests of the Ascend
   adapters and real-device dispatch/reference coverage (`atol=rtol=0.02`).
 
@@ -54,8 +55,22 @@ and results with each PR; source migration alone does not establish model-level
 accuracy or latency non-regression. Claimed compile/graph modes and real H3
 outputs/timings need separate verification under the RFC's Q1/Q2 criteria.
 
-Boogu interleaved support and its public eligibility query follow
-[PR #6982](https://github.com/vllm-project/vllm-omni/pull/6982). They are not
-implemented by this migration. Preserve Boogu's own enablement policy and
-reference when integrating that work; the shared eager reference is not a
-universal replacement for every model's normalization chain.
+The CUDA test file is collected by the existing **Diffusion · Other Test**
+job in `.buildkite/cuda/test-ready.yml`. Run the same operator checks locally
+with a CUDA GPU and the matching vLLM/Omni environment; no model weights are
+required:
+
+```bash
+python -m pytest -q tests/diffusion/layers/test_fused_qk_norm_rope.py \
+  -m 'core_model and cuda' --run-level=core_model
+```
+
+The proposed integration order keeps this H3 migration first, followed by
+Boogu's interleaved kernel, token gate, and model integration in
+[PR #6982](https://github.com/vllm-project/vllm-omni/pull/6982). Complementary
+public support-query work in
+[PR #7422](https://github.com/vllm-project/vllm-omni/pull/7422) then follows the
+adopted Boogu revision. Those additions are outside this migration. Preserve
+Boogu's own enablement policy and reference when integrating that work; the
+shared eager reference is not a universal replacement for every model's
+normalization chain.

@@ -28,8 +28,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_omni.platforms import current_omni_platform
 
+# Preserve the existing H3 CUDA/NPU fast-path geometry. These are dispatch
+# restrictions, not public input limits: other valid shapes use eager ops.
 _FUSED_HEAD_DIM = 128
 _FUSED_ROTARY_DIM = 96
+# Triton tiling only; num_heads need not be eight or a multiple of eight.
 _HEADS_PER_PROGRAM = 8
 
 
