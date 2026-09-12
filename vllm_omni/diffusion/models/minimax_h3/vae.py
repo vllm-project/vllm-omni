@@ -570,7 +570,8 @@ class MiniMaxH3AudioVAE(nn.Module):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1)
-        waveform = self.remote.decode(latent * std + mean)
+        with _AudioVAEDeterminismContext():
+            waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
         return waveform.permute(1, 0, 2).contiguous().float()
