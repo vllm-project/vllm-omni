@@ -522,6 +522,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
 
                 if cfg_rank == 0:
                     # Rank 0: Compute positive (conditional) prediction
+                    if kv_caches is not None:
+                        kv_caches.set_mode("read")
                     local_pred = self.transformer(
                         hidden_states=latent_model_input,
                         encoder_hidden_states=prompt_embeds,
@@ -535,6 +537,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
                     )[0].float()
                 else:
                     # Rank 1: Compute negative (unconditional) prediction
+                    if kv_caches is not None:
+                        kv_caches.set_mode("skip")
                     local_pred = self.transformer(
                         hidden_states=latent_model_input,
                         encoder_hidden_states=negative_prompt_embeds,
@@ -566,6 +570,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
             else:
                 # Sequential CFG (single GPU or no CFG)
                 # Conditional forward pass
+                if kv_caches is not None:
+                    kv_caches.set_mode("read")
                 noise_pred_cond = self.transformer(
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds,
@@ -580,6 +586,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
 
                 if do_classifier_free_guidance:
                     # Unconditional forward pass
+                    if kv_caches is not None:
+                        kv_caches.set_mode("skip")
                     noise_pred_uncond = self.transformer(
                         hidden_states=latent_model_input,
                         encoder_hidden_states=negative_prompt_embeds,
