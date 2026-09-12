@@ -91,6 +91,57 @@ outputs were byte-identical and full decode passed. This is evidence for host
 CPU response encoding. Actual gains depend on the CPU and runtime, and should
 not be interpreted as GPU, DiT, or stage 0 speedups.
 
+## PDD 8-NFE acceleration
+
+The published `alibaba-pai/MiniMax-H3-Acc-LoRAs` adapters use 32 distilled
+heads fused into eight denoising evaluations. The API requires **9 sigma
+points** (`num_inference_steps=9`), video shift 12, audio shift 3, and
+`lora_scale=1.0`. Eight sigma points is not the eight-evaluation schedule.
+
+Use `MiniMax-H3-Ref2VA-Acc-8Step.safetensors` for `ref2va` and
+`MiniMax-H3-FL2VA-Acc-8Step.safetensors` for `t2va`/`fl2va`. These artifacts
+have separate task-specific DiT weights; the loader rejects a task mismatch.
+Download the desired published artifact into `PDD_DIR` and start the server
+with dynamic LoRA enabled (`--enable-lora --max-lora-rank 64`). For example,
+with a server that has the Ref2VA partition loaded:
+
+```bash
+export PDD_DIR=/absolute/path/to/pdd
+curl --fail-with-body http://localhost:8000/v1/videos/sync \
+  -F 'prompt=A person waves hello in a quiet room.' \
+  -F 'input_references=@reference.png' \
+  -F 'seconds=5' \
+  -F 'width=1344' -F 'height=768' \
+  -F 'num_inference_steps=9' \
+  -F 'seed=42' -F 'generate_sound=true' \
+  -F 'extra_params={"task":"ref2va","aspect_ratio":"16:9","flow_shift":12.0,"audio_flow_shift":3.0}' \
+  -F "lora={\"name\":\"pdd-ref2va-8step\",\"path\":\"${PDD_DIR}/MiniMax-H3-Ref2VA-Acc-8Step.safetensors\",\"scale\":1.0}" \
+  --output pdd.mp4
+ffprobe -v error -show_streams -show_format pdd.mp4
+ffmpeg -v error -i pdd.mp4 -f null -
+```
+
+PDD and Turbo are distinct acceleration paths. PDD step execution uses one
+forward per request because fused head plans are per-request state. Distilled
+outputs are not expected to be pixel-identical to the base model; check action,
+identity, audio, and temporal continuity for the intended workload.
+
+### Historical runtime evidence
+
+An H20 deployment recorded a 10-second, 1344x768 Ref2VA workload with three
+references, seed 42, FP8, TP2/USP4, and eight denoising evaluations. Its
+September 1, 2026 report recorded 195.8/195.9/198.1 seconds after warm-up,
+against a 575.7-second 28-step baseline. The retained evaluation log reports
+243 frames at 24 FPS, 10.12 seconds, stereo AAC at 32 kHz, and the intended
+spoken line without additional speech.
+
+These are historical deployment measurements, **not validation of this PR's
+current revision**. Subsequent fixes changed trunk binding and head lifecycle,
+and the original comparison media are no longer at the report's paths. The
+September 12 audit recovered logs and reports, not a fresh matched A/B. Do not
+use the historical 2.9x ratio as a current-version performance guarantee.
+A GPU E2E run of the current revision remains required before acceptance.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
