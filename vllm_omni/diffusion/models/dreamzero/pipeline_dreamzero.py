@@ -15,7 +15,7 @@ import math
 import os
 import re as re_module
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 
 import numpy as np
@@ -60,8 +60,11 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.tick_protocol import AR_DIFFUSION_TICK_KEY
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
 from vllm_omni.experimental.world_models.session_state import (
+    SessionAdmissionError,
+    SessionStateLostError,
     SessionStateManager,
     resolve_session_state_config,
 )
@@ -73,6 +76,15 @@ MAX_DREAMZERO_SESSIONS = 64
 # Shipped DreamZero geometry retains 24 Wan VAE causal-convolution cache
 # entries. This is the measured persistent CUDA upper bound per live session.
 DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
+
+# Bound model-owned state separately from KV slots. DreamZero keeps VAE
+# causal history that cannot be reconstructed, so capacity pressure must
+# reject new sessions rather than evict live history.
+#
+# The runner releases state on close/reset. Stages without that runner need
+# close propagation or will eventually reach this bound. Configure genuine
+# concurrency via OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS.
+MAX_RESIDENT_DREAMZERO_SESSION_STATES = 4
 
 # The pipeline's per-session state is a bespoke ``DreamZeroState`` by default, or
 # a ``DreamZeroStateAdapter`` view when the opt-in session manager is enabled.
@@ -467,14 +479,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self.num_frame_per_block: int = ah_config["num_frame_per_block"]
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
-        # Opt-in: back per-session state with the shared SessionStateManager
-        # (RFC #4480). Default off -> the bespoke DreamZeroState path above.
+        # The optional shared manager and the default store use the same admission
+        # limit and reject-on-full policy.
         self._use_memory_manager, mm_max_sessions = resolve_session_state_config(
             enable=od_config.enable_session_state_manager,
-            max_sessions=MAX_DREAMZERO_SESSIONS,
+            max_sessions=MAX_RESIDENT_DREAMZERO_SESSION_STATES,
         )
+        self._max_session_states = mm_max_sessions
         self._memory_manager: SessionStateManager | None = (
-            SessionStateManager(max_sessions=mm_max_sessions) if self._use_memory_manager else None
+            SessionStateManager(max_sessions=mm_max_sessions, evict_when_full=False)
+            if self._use_memory_manager
+            else None
         )
         if self._use_memory_manager:
             logger.info("DreamZero: session state manager enabled (max_sessions=%d)", mm_max_sessions)
@@ -560,11 +575,89 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         session_key = str(session_id or "default")
         state = self._states.get(session_key)
         if state is None:
+            self._admit_session_state(session_key)
             state = DreamZeroState()
             self._states[session_key] = state
         else:
             self._states.move_to_end(session_key)
         return state
+
+    def _require_session_state(self, session_id: str | None) -> DreamZeroSessionState:
+        """Require resident state for continuation; never create replacement history."""
+        session_key = str(session_id or "default")
+        manager = getattr(self, "_memory_manager", None)
+        if manager is not None:
+            # Check membership first: constructing the adapter would create missing
+            # state and bypass continuation validation.
+            if session_key not in manager:
+                raise SessionStateLostError(self._session_state_lost_message(session_key))
+            return DreamZeroStateAdapter(
+                session_id,
+                manager,
+                vae_encoder_window=self.num_frame_per_block,
+            )
+        state = self._states.get(session_key)
+        if state is None:
+            raise SessionStateLostError(self._session_state_lost_message(session_key))
+        self._states.move_to_end(session_key)
+        return state
+
+    @staticmethod
+    def _request_begins_session(extra_args: Mapping[str, object]) -> bool:
+        """Treat either the typed tick or flat reset flag as a session begin."""
+        tick = extra_args.get(AR_DIFFUSION_TICK_KEY)
+        if isinstance(tick, Mapping) and bool(tick.get("reset", False)):
+            return True
+        return bool(extra_args.get("reset", False))
+
+    @staticmethod
+    def _session_state_lost_message(session_key: str) -> str:
+        return (
+            f"DreamZero session {session_key!r} has no resident state, so this request cannot "
+            "continue it. Its per-session history (including the VAE causal-convolution cache) "
+            "cannot be rebuilt, so the request is refused rather than silently restarted on empty "
+            'state. Begin a new session by sending a request with extra_args["reset"]=True.'
+        )
+
+    def _admit_session_state(self, session_key: str) -> None:
+        """Reject a new session at capacity, preserving all resident states."""
+        # Allow lightweight fixtures that initialize only _states.
+        max_states = getattr(self, "_max_session_states", MAX_RESIDENT_DREAMZERO_SESSION_STATES)
+        if max_states <= 0 or len(self._states) < max_states:
+            # Non-positive means "no bound".
+            return
+        raise SessionAdmissionError(
+            f"cannot admit DreamZero session {session_key!r}: {len(self._states)} of {max_states} "
+            f"resident session states are in use (~{DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION // (1024 * 1024)} "
+            "MiB each). Existing sessions hold history that cannot be rebuilt, so they are kept and "
+            "this one is refused. Either more sessions are live at once than the cap allows, or "
+            "finished sessions were never released because close_ar_diffusion_session() never "
+            "arrived -- which happens when the pipeline holds session state on a stage that does "
+            "not host the AR-Diffusion engine. Raise the cap with "
+            "OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS if the concurrency is real."
+        )
+
+    def set_resident_session_state_capacity(self, capacity: int) -> None:
+        """Raise both stores' admission limits to the runner's resident capacity.
+
+        The runner budgets model-owned state per session. Without a publishing
+        runner, the configured limit applies. Never lower a live limit.
+        """
+        capacity = int(capacity)
+        if capacity <= 0:
+            return
+        current = getattr(self, "_max_session_states", MAX_RESIDENT_DREAMZERO_SESSION_STATES)
+        if capacity <= current:
+            return
+        self._max_session_states = capacity
+        manager = getattr(self, "_memory_manager", None)
+        if manager is not None:
+            manager.raise_max_sessions(capacity)
+        logger.info(
+            "DreamZero: resident session-state capacity raised %d -> %d to match the engine's own capacity",
+            current,
+            capacity,
+        )
 
     # -----------------------------------------------------------------------
     # Root config loading
@@ -1063,7 +1156,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def decode_accumulated_video_latents(self, session_id: str | None = None) -> torch.Tensor:
         """Decode all AR-chunk latents accumulated for ``session_id``."""
-        state = self._get_or_create_state(session_id)
+        state = self._require_session_state(session_id)
         latents = state.get_concatenated_video_latents()
         if latents is None:
             session_key = str(session_id or "default")
@@ -1072,7 +1165,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def clear_accumulated_video_latents(self, session_id: str | None = None) -> None:
         """Clear accumulated video latents for ``session_id`` without resetting KV state."""
-        state = self._get_or_create_state(session_id)
+        state = self._require_session_state(session_id)
         state.clear_video_latents()
 
     # -----------------------------------------------------------------------
@@ -1379,7 +1472,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 )
             raise KeyError("robot_obs")
         session_id = str(extra_args.get("session_id") or "default")
-        state = self._get_or_create_state(session_id)
+        # Only a begin may create state; continuations require existing history.
+        if self._request_begins_session(extra_args):
+            state = self._get_or_create_state(session_id)
+        else:
+            state = self._require_session_state(session_id)
         self.state = state
         transform, unified_obs = self._transform_robot_obs(robot_obs)
         device = get_local_device()

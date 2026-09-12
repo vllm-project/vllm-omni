@@ -245,13 +245,15 @@ def test_bespoke_path_without_memory_manager() -> None:
     from collections import OrderedDict
 
     from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
-        MAX_DREAMZERO_SESSIONS,
+        MAX_RESIDENT_DREAMZERO_SESSION_STATES,
         DreamZeroPipeline,
     )
 
     pipe = DreamZeroPipeline.__new__(DreamZeroPipeline)
     pipe._states = OrderedDict()
-    pipe._max_session_states = MAX_DREAMZERO_SESSIONS
+    # The bespoke store's own bound; MAX_DREAMZERO_SESSIONS counts KV slots and
+    # is far too large to bound 603 MiB-per-session model-owned state.
+    pipe._max_session_states = MAX_RESIDENT_DREAMZERO_SESSION_STATES
 
     state = DreamZeroPipeline._get_or_create_state(pipe, "x")
     assert isinstance(state, DreamZeroState)

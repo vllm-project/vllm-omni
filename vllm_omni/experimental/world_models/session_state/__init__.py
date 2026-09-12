@@ -16,7 +16,9 @@ from vllm_omni.experimental.world_models.session_state.attrs import SessionAttr
 from vllm_omni.experimental.world_models.session_state.base import StateObject
 from vllm_omni.experimental.world_models.session_state.manager import (
     DEFAULT_MAX_SESSIONS,
+    SessionAdmissionError,
     SessionState,
+    SessionStateLostError,
     SessionStateManager,
     resolve_session_state_config,
 )
@@ -28,7 +30,9 @@ __all__ = [
     "SeenStorages",
     "StateObject",
     "SessionAttr",
+    "SessionAdmissionError",
     "SessionState",
+    "SessionStateLostError",
     "SessionStateManager",
     "device_bytes",
     "resolve_session_state_config",

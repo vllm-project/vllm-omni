@@ -150,6 +150,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             device=self.device,
         )
         self._session_capacity = self.kv_cache.session_capacity
+        # Publish capacity to pipelines that bound model-owned state. The hook is
+        # optional because not every AR pipeline owns such a store.
+        publish_capacity = getattr(capability, "set_resident_session_state_capacity", None)
+        if callable(publish_capacity):
+            publish_capacity(self._session_capacity)
         logger.info(
             "AR-Diffusion KV cache: blocks=%d layers=%d local_kv_heads=%d head_size=%d "
             "tokens/frame=%d frames/block=%d window=%d sink=%d kv_branches=%s cross=%s "
