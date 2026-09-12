@@ -125,9 +125,21 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         config = dataclasses.replace(
             self.ar_diffusion_kv_config,
             chunk_size=spec.tokens_per_frame,
-            window_chunks=self.ar_diffusion_kv_config.window_chunks or spec.window_frames,
-            sink_chunks=self.ar_diffusion_kv_config.sink_chunks or spec.sink_frames,
-            reset_at_boundary=self.ar_diffusion_kv_config.reset_at_boundary or spec.reset_at_boundary,
+            window_chunks=(
+                spec.window_frames
+                if self.ar_diffusion_kv_config.window_chunks is None
+                else self.ar_diffusion_kv_config.window_chunks
+            ),
+            sink_chunks=(
+                spec.sink_frames
+                if self.ar_diffusion_kv_config.sink_chunks is None
+                else self.ar_diffusion_kv_config.sink_chunks
+            ),
+            reset_at_boundary=(
+                spec.reset_at_boundary
+                if self.ar_diffusion_kv_config.reset_at_boundary is None
+                else self.ar_diffusion_kv_config.reset_at_boundary
+            ),
         )
         self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability

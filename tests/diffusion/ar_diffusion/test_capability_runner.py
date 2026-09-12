@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections import OrderedDict
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -175,6 +176,7 @@ def make_runner(
     available_bytes: int = 1 << 28,
     step_execution: bool = False,
     gpu_memory_fraction: float = 0.1,
+    kv_config: ARDiffusionKVConfig | None = None,
 ) -> ARDiffusionModelRunner:
     runner = object.__new__(ARDiffusionModelRunner)
     runner.od_config = SimpleNamespace(
@@ -185,7 +187,7 @@ def make_runner(
     )
     runner.device = torch.device("cpu")
     runner.pipeline = pipeline
-    runner.ar_diffusion_kv_config = ARDiffusionKVConfig(
+    runner.ar_diffusion_kv_config = kv_config or ARDiffusionKVConfig(
         enable=True,
         gpu_memory_fraction=gpu_memory_fraction,
     )
@@ -291,6 +293,39 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     runner.close_session("s1")
     assert "s1" not in runner._sessions
     assert pipeline.closes == ["s1"]
+
+
+def test_explicit_falsy_kv_overrides_replace_model_defaults():
+    spec = dataclasses.replace(lingbot_like_spec(), reset_at_boundary=True)
+    runner = make_runner(
+        CapablePipeline(spec),
+        kv_config=ARDiffusionKVConfig(
+            enable=True,
+            sink_chunks=0,
+            reset_at_boundary=False,
+        ),
+    )
+
+    assert runner.kv_cache is not None
+    assert runner.kv_cache.spec.sink_chunks == 0
+    assert runner.kv_cache.spec.reset_at_boundary is False
+
+
+def test_unspecified_kv_overrides_use_model_defaults():
+    spec = dataclasses.replace(lingbot_like_spec(), reset_at_boundary=True)
+    runner = make_runner(CapablePipeline(spec))
+
+    assert runner.kv_cache is not None
+    assert runner.kv_cache.spec.sink_chunks == spec.sink_frames
+    assert runner.kv_cache.spec.reset_at_boundary is spec.reset_at_boundary
+
+
+def test_explicit_zero_window_override_is_rejected():
+    with pytest.raises(ValueError, match="window_chunks must be positive"):
+        make_runner(
+            CapablePipeline(lingbot_like_spec()),
+            kv_config=ARDiffusionKVConfig(enable=True, window_chunks=0),
+        )
 
 
 def test_lingbot_like_interleaved_sessions_keep_independent_kv_partitions():

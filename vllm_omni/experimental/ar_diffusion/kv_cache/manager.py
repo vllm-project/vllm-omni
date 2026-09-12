@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 import os
 from collections.abc import Collection, Iterable, Sequence
+from dataclasses import replace
 
 import torch
 from vllm.logger import init_logger
@@ -181,10 +182,21 @@ class ARDiffusionKVCache:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
         if config.window_chunks is None:
             raise ValueError("Phase 1 requires a bounded window (window_chunks)")
+        if config.window_chunks <= 0:
+            raise ValueError(f"ARDiffusionKVConfig.window_chunks must be positive, got {config.window_chunks}")
         if config.chunk_size <= 0:
             raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
         if not kv_branches:
             raise ValueError("ARDiffusionKVCache requires at least one KV branch")
+        sink_chunks = 0 if config.sink_chunks is None else config.sink_chunks
+        if sink_chunks < 0:
+            raise ValueError(f"ARDiffusionKVConfig.sink_chunks must be non-negative, got {sink_chunks}")
+        reset_at_boundary = False if config.reset_at_boundary is None else config.reset_at_boundary
+        config = replace(
+            config,
+            sink_chunks=sink_chunks,
+            reset_at_boundary=reset_at_boundary,
+        )
         if session_capacity <= 0:
             raise ValueError(f"session_capacity must be positive, got {session_capacity}")
         kv_branch_names = [kv_branch.name for kv_branch in kv_branches]
@@ -236,8 +248,8 @@ class ARDiffusionKVCache:
             sliding_window=config.window_chunks * config.chunk_size,
             chunk_size=config.chunk_size,
             window_chunks=config.window_chunks,
-            sink_chunks=config.sink_chunks,
-            reset_at_boundary=config.reset_at_boundary,
+            sink_chunks=sink_chunks,
+            reset_at_boundary=reset_at_boundary,
         )
 
         # Scratch blocks are outside KVCacheManager ownership. A non-committing
@@ -274,7 +286,7 @@ class ARDiffusionKVCache:
         )
 
         def _required_managed_blocks(capacity: int) -> int:
-            resident_per_session = config.sink_chunks + config.window_chunks
+            resident_per_session = sink_chunks + config.window_chunks
             return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
 
         def _required_bytes(capacity: int) -> int:
