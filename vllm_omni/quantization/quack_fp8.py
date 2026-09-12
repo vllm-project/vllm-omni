@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from importlib import import_module
+from multiprocessing import current_process
 
 import torch
 from vllm.logger import init_logger
@@ -52,6 +55,41 @@ def _set_persistent_cache_dir() -> None:
     os.environ["QUACK_CACHE_DIR"] = os.path.join(root, "vllm_omni", "quack")
 
 
+def _configure_quack_compilation() -> None:
+    """Keep autotuning in daemon workers without starting compiler children."""
+    try:
+        async_compile = import_module("quack.cache.async_compile")
+    except ModuleNotFoundError as exc:
+        # Older Quack releases compile synchronously and have no async pool.
+        if exc.name not in {"quack.cache", "quack.cache.async_compile"}:
+            raise
+        return
+    original_pool_scope = getattr(async_compile, "pool_scope", None)
+    suppress_pool = getattr(async_compile, "suppress_pool", None)
+    if not callable(original_pool_scope) or not callable(suppress_pool):
+        logger.warning(
+            "Quack async compilation API is unsupported: pool_scope and suppress_pool must be callable. "
+            "Skipping the compilation patch; autotuning in daemon workers may fail."
+        )
+        return
+    if getattr(original_pool_scope, "_omni_daemon_safe", False):
+        return
+
+    @contextmanager
+    def daemon_safe_pool_scope():
+        # spawn can import this module before installing the child's daemon flag.
+        # Check at tuning time; suppress_pool keeps compilation in-process.
+        if current_process().daemon:
+            with suppress_pool():
+                yield None
+        else:
+            with original_pool_scope() as pool:
+                yield pool
+
+    daemon_safe_pool_scope._omni_daemon_safe = True
+    async_compile.pool_scope = daemon_safe_pool_scope
+
+
 def _load_quack():
     global _gemm_interface
     if _gemm_interface is not None:
@@ -72,6 +110,7 @@ def _load_quack():
         torch2cute_dtype_map.setdefault(torch.float8_e4m3fn, cutlass.Float8E4M3FN)
         torch2cute_dtype_map.setdefault(torch.float8_e5m2, cutlass.Float8E5M2)
 
+        _configure_quack_compilation()
         _gemm_interface = gemm_interface
         logger.info("Quack FP8 fused-bias GEMM enabled (CuteDSL).")
         return gemm_interface
@@ -101,6 +140,7 @@ def quack_scaled_fp8_mm(
 _valid_scale_ptrs: set[tuple[int, int]] = set()
 
 
+@torch.compiler.disable
 def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
     """True when both per-tensor scales are finite and positive.
 
@@ -109,6 +149,10 @@ def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
     make ``alpha = scale_a * scale_b`` overflow to ``+inf`` and return an all-inf tile.
     Cache only positive results: a buffer still holding the sentinel is re-checked and
     picks up the fast path once the real scale is written.
+
+    Exclude pointer checks and cache updates from tracing to avoid recompilation
+    for each layer's scale addresses. For Cosmos3-Super-Image2Video-4Step request time (193 frames,
+    720p, single GB200) is: ~13 min on ToT vs. ~22 s with this fix.
     """
     key = (scale_a.data_ptr(), scale_b.data_ptr())
     if key in _valid_scale_ptrs:
@@ -155,17 +199,19 @@ def install_quack_fp8_patch() -> None:
     logger.info("Patched FlashInfer FP8 ScaledMM to use quack fused-bias GEMM.")
 
 
+@torch.inference_mode()
 def warmup_quack_fp8(
     shapes: list[tuple[int, int, int]],
     device: str = "cuda",
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
+    """Warm no-bias GEMMs with the transposed weight layout used by vLLM."""
     if _load_quack() is None:
         return
     scale = torch.ones(1, device=device, dtype=torch.float32)
     for m, k, n in shapes:
         a = torch.zeros(m, k, device=device, dtype=torch.float8_e4m3fn)
-        b = torch.zeros(k, n, device=device, dtype=torch.float8_e4m3fn)
+        b = torch.zeros(n, k, device=device, dtype=torch.float8_e4m3fn).t()
         quack_scaled_fp8_mm(a, b, scale, scale, out_dtype)
     if torch.cuda.is_available():
         torch.accelerator.synchronize()
