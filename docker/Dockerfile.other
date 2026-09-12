@@ -1,0 +1,26 @@
+ARG SGLANG_BASE_IMAGE=lmsysorg/sglang
+ARG SGLANG_BASE_TAG=v0.5.18-cu130-runtime
+FROM ${SGLANG_BASE_IMAGE}:${SGLANG_BASE_TAG}
+
+ARG APP_DIR=/workspace/vllm-omni
+ARG SGLANG_OMNI_COMMIT=627e74b8c01bfce3e2cec4d1b0a39adc695f68e8
+
+ENV VLLM_OMNI_VENV=/opt/vllm-omni-benchmark
+ENV VLLM_OMNI_PYTHON=${VLLM_OMNI_VENV}/bin/python
+
+WORKDIR ${APP_DIR}
+COPY . .
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends espeak-ng ffmpeg git jq sox libsox-fmt-all && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir "pytest>=8,<9" "pytest-asyncio==1.4.0" "pytest-xdist==3.8.0" uv && \
+    uv pip install --system --prerelease=allow \
+      "sglang-omni @ git+https://github.com/sgl-project/sglang-omni.git@${SGLANG_OMNI_COMMIT}" && \
+    uv pip install --system --no-deps einops "qwen-tts==0.1.1" && \
+    uv venv --python python3 "${VLLM_OMNI_VENV}" && \
+    uv pip install --python "${VLLM_OMNI_PYTHON}" "vllm==0.28.0" -r requirements/common.txt
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+ENTRYPOINT []
