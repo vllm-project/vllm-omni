@@ -50,6 +50,13 @@ Accuracy benchmarks for image generation/editing models, adapting external suite
 - **Layout**: `accuracy/text_to_image/` (GEBench), `accuracy/image_to_image/` (GEdit-Bench)
 - **Method**: generation and judge scoring both run through local `vllm-omni serve` endpoints
 
+### [MammothModa2](mammoth_moda2/README.md) — Startup and Weight Loading
+
+Startup / model-loading benchmark for the two-stage MammothModa2 (AR → DiT) deployment, plus a raw safetensors loading micro-benchmark.
+
+- **Layout**: `mammoth_moda2/bench_startup.py` (single-process startup and first/steady request timing), `mammoth_moda2/parse_startup_log.py` (per-stage breakdown from engine logs), `mammoth_moda2/bench_storage_scenarios.sh` (cold/warm page cache on local disk vs. network storage), `mammoth_moda2/raw_load_bench.py` (safetensors → GPU without vLLM)
+- **Key metrics**: time to engine ready, per-stage spawn/init/weight-load/profile time, first vs. steady-state request latency
+
 ### Common serving metrics framework
 
 `vllm_omni/benchmarks/` extends `vllm bench serve --omni` with Omni-specific datasets, backends, and multimodal metrics. Key metrics include:

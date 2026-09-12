@@ -170,6 +170,15 @@ The first request took 85.224 seconds. The AR stage generated 4,161 visual token
 
 The output was a valid 1024 by 1024 RGB PNG.
 
+### Startup benchmark
+
+The [startup benchmark](../../benchmarks/mammoth_moda2/README.md) provides
+commands, measurement boundaries and a single-A800 eager baseline. On that
+16-CPU-quota machine, parallel stage initialization and 16 CPU threads reduced
+`Omni()` initialization from about 60 s to 37 s. See the benchmark for the
+configuration and limitations; CUDA-graph mode needs separate memory and
+quality validation.
+
 ## MammothModa2-Dev unified inference
 
 MammothModa2-Dev uses a Qwen3-VL AR backbone, while MammothModa2-Preview uses
