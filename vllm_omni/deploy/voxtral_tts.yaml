@@ -71,6 +71,13 @@ stages:
     skip_mm_profiling: true
 
 platforms:
+  npu:
+    # vLLM-Ascend requires a fixed block_size of 128 for KV cache.
+    stages:
+      - stage_id: 0
+        block_size: 128
+      - stage_id: 1
+        block_size: 128
   xpu:
     stages:
       - stage_id: 0
