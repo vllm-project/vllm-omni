@@ -4,6 +4,7 @@
 """Kimi-Audio admission and complete/streaming AR-to-decoder conversion."""
 
 import hashlib
+import secrets
 from collections.abc import Sequence
 from typing import Any
 
@@ -37,6 +38,11 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
         raise OmniClientError("Kimi-Audio additional_information must be a dictionary with string keys")
     if any(key.startswith("kimi_audio_") for key in additional_info):
         raise OmniClientError("Kimi-Audio internal request state cannot be supplied through additional_information")
+    meta = additional_info.get("meta")
+    if meta is None:
+        meta = {}
+    if not isinstance(meta, dict):
+        raise OmniClientError("Kimi-Audio additional_information.meta must be a dictionary")
 
     params = sampling_params_list[0]
     if params.n != 1:
@@ -101,13 +107,18 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
     if caller_salt is not None and not isinstance(caller_salt, str):
         raise OmniClientError("Kimi-Audio cache_salt must be a string")
     cache_salt = hashlib.sha256(msgspec.msgpack.encode((info["kimi_audio_input"], caller_salt))).hexdigest()
+    # Downstream conversion receives the original prompt. Omni copies processed
+    # additional_information.meta back to it, but not model_intermediate_buffer.
+    # Resolve an omitted seed once: None is dropped on the wire and would leave
+    # a stale audio_seed when a caller reuses a previously submitted prompt.
+    audio_seed = params.seed if params.seed is not None else secrets.randbits(63)
     return {
         **prompt,
         "cache_salt": cache_salt,
+        "additional_information": {**additional_info, "meta": {**meta, "audio_seed": audio_seed}},
         "model_intermediate_buffer": {
             **info,
             "kimi_audio_request_validated": True,
-            "kimi_audio_seed": params.seed,
         },
     }
 
@@ -158,7 +169,7 @@ def kimi_audio_to_decoder(
                     "codes": {"audio": codes},
                     "meta": {
                         "finished": True,
-                        "audio_seed": prompt["model_intermediate_buffer"].get("kimi_audio_seed"),
+                        "audio_seed": prompt["additional_information"]["meta"]["audio_seed"],
                     },
                 },
             }

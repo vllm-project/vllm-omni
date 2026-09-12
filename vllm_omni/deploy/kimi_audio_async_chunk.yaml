@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-# Two-stage streaming; GPU startup, memory sizing and output quality are unverified.
+# Two-stage streaming exercised on A800 80GB; see the online README for validation scope.
 # Preserve the official 30-code acoustic blocks and 12-token lookahead.
 # The sender holds one code beyond each full block to identify the final block.
 async_chunk: true
@@ -37,7 +37,9 @@ stages:
       repetition_penalty: 1.0
       max_tokens: 4096
       extra_args:
-        kimi_audio: {}
+        kimi_audio:
+          audio_temperature: 0.8
+          audio_top_k: 10
 
   - stage_id: 1
     devices: "0"

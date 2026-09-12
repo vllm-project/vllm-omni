@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-# Initial non-streaming configuration; GPU startup and memory sizing are unverified.
+# Non-streaming baseline exercised on A800 80GB; memory settings are not tuned.
 # Offline inputs use prepare_kimi_audio_inputs. The speech adapter reuses this
 # preparation for instructed reading; the renderer prepares multimodal chat.
 async_chunk: false
@@ -26,7 +26,9 @@ stages:
       repetition_penalty: 1.0
       max_tokens: 4096
       extra_args:
-        kimi_audio: {}
+        kimi_audio:
+          audio_temperature: 0.8
+          audio_top_k: 10
 
   - stage_id: 1
     devices: "0"

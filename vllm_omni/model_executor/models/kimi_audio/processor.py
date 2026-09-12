@@ -38,7 +38,10 @@ class KimiAudioDataParser(MultiModalDataParser):
 
 class KimiAudioProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        if self.ctx.model_config.model_stage == "kimi_audio_decoder":
+        # vLLM queries input support while constructing its base ModelConfig,
+        # before Omni attaches model_stage. Report model-level support then;
+        # the stage-specific query below still excludes the acoustic decoder.
+        if getattr(self.ctx.model_config, "model_stage", None) == "kimi_audio_decoder":
             return {}
         return {"audio": None}
 

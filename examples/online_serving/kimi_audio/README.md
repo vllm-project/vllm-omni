@@ -5,6 +5,11 @@ audio, or both. `kimi_audio.yaml` collects AR output before acoustic decoding;
 `kimi_audio_async_chunk.yaml` transfers semantic codes while AR is generating.
 Both use the same input path and acoustic networks.
 
+Both deployments use the official inference example's audio sampling settings:
+`audio_temperature=0.8` and `audio_top_k=10`, with greedy text sampling.
+The two streams have separate settings; setting the text `temperature` to zero
+does not make audio sampling greedy.
+
 Install vLLM-Omni with its `kimi-audio` extra, including the acoustic decoder
 dependencies, and restart the server after installing this branch. The install
 registers `kimi_audio_omni`: it selects the Omni renderer while reusing vLLM's
@@ -12,7 +17,7 @@ Kimi-Audio tokenizer.
 
 ```bash
 vllm serve moonshotai/Kimi-Audio-7B-Instruct --omni \
-  --stage-configs-path vllm_omni/deploy/kimi_audio.yaml \
+  --deploy-config vllm_omni/deploy/kimi_audio.yaml \
   --trust-remote-code --port 8091
 ```
 
@@ -21,7 +26,8 @@ needs `THUDM/glm-4-voice-tokenizer`; loading resolves the pinned revision. To us
 an existing local snapshot, add
 `--additional-config '{"kimi_audio":{"glm_tokenizer_path":"/path/to/glm-tokenizer"}}'`.
 The checkpoint's `whisper-large-v3`, `audio_detokenizer` and `vocoder` files must
-also be present. GPU startup and memory sizing still require validation.
+also be present. Startup has been exercised on a single A800 80GB; memory
+settings are not tuned for other devices or larger request capacities.
 
 ## Chat
 
@@ -136,7 +142,7 @@ Start the server with the streaming deployment:
 
 ```bash
 vllm serve moonshotai/Kimi-Audio-7B-Instruct --omni \
-  --stage-configs-path vllm_omni/deploy/kimi_audio_async_chunk.yaml \
+  --deploy-config vllm_omni/deploy/kimi_audio_async_chunk.yaml \
   --trust-remote-code --port 8091
 ```
 
@@ -169,20 +175,36 @@ full block so the last block can be marked final. First decoding starts after
 31 valid audio codes, or earlier if the request ends. The decoder retains its
 12-token lookahead and waveform overlap per request and emits only new samples.
 This preserves the acoustic block boundaries; it is not a tuned low-latency
-configuration. Both stages default to one active request until GPU memory and
-concurrency are measured. An explicit request seed also seeds request-local
+configuration. Both stages default to one active request; the manual concurrency
+run used `max_num_seqs=2` on both stages. An explicit request seed also seeds request-local
 acoustic noise; it does not promise bitwise equality across GPU configurations.
 
 ## Status
 
-These examples describe the current input contract. Full server startup,
-pretrained output quality and concurrency have not been validated. The retained
-CPU tests are component reference checks. `tests/e2e/online_serving/test_kimi_audio.py`
-now defines single-request, concurrent-request and SSE audio tests against one
-real async-chunk server. These tests have not been run; offline and multimodal
-chat E2E cases remain pending. Streaming wiring and per-request acoustic state
-are implemented but have not been exercised with pretrained weights, HTTP
-playback or concurrent requests.
+Manual runs on an A800 80GB exercised pretrained-weight startup, offline text
+and audio inputs, non-streaming chat and speech, chat and speech SSE, two
+concurrent chat requests, and client cancellation followed by new requests.
+For the short chat and speech SSE cases, concatenated PCM matched the saved
+non-streaming reference. Audio review used saved WAV files. These observations
+cover the recorded cases, not arbitrary inputs or concurrent workloads.
+
+The instructed-reading examples exposed a missing opening greeting and, in a
+longer case, repeated content. Both also occurred in independent official
+reference runs under the compared conditions; their root causes remain
+unresolved. One transcription omitted reference punctuation while retaining
+the words. Do not interpret HTTP completion or an audio completion event as
+proof of verbatim speech or natural AR termination.
+
+`meta.finished` can produce a scalar-tensor concatenation warning in the shared
+output accumulator, which falls back to keeping the latest value. No output
+failure was observed from that warning in these runs; it remains unfixed.
+
+The retained CPU tests are component reference checks.
+`tests/e2e/online_serving/test_kimi_audio.py` defines single-request,
+concurrent-request and SSE tests against one real server; this automated suite
+was not run as part of the manual validation. Multi-GPU PP, raw-byte speech
+streaming, real-time player buffering, graph capture, performance tuning and
+fault-injection recovery remain outside that validation scope.
 
 Decoder validation and acoustic computation share batch failure cleanup. If a
 forward fails, it releases acoustic state for that batch's known request IDs,
