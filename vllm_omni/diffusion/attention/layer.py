@@ -81,6 +81,8 @@ class Attention(nn.Module):
         # varlen attention with learned sink logits). The shared Attention
         # layer still owns parallel dispatch and compile boundaries.
         custom_attention: nn.Module | None = None,
+        # Preserve dense FP32 inference for models opting into CUDA auto fallback.
+        allow_fp32_fallback: bool = False,
     ):
         super().__init__()
 
@@ -193,8 +195,8 @@ class Attention(nn.Module):
                 role=role,
                 backend_explicit=self.backend_explicit,
             )
-            # Some model-specific paths call this helper directly. The main backend
-            # dispatch below never switches to it implicitly.
+            # Compatibility kernels run inside shared dispatch, between the
+            # parallel strategy's input preparation and output restoration.
             self.sdpa_fallback = SDPABackend.get_impl_cls()(
                 num_heads=num_heads,
                 head_size=head_size,
@@ -221,6 +223,7 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.causal = causal
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.allow_fp32_fallback = allow_fp32_fallback
 
         self.use_ring = False
         self.ring_pg = None
@@ -497,13 +500,33 @@ class Attention(nn.Module):
 
         self._assert_metadata_compatible(attn_metadata)
 
+        if (
+            self.allow_fp32_fallback
+            and query.is_cuda
+            and query.dtype == torch.float32
+            and query.ndim == 4
+            and not self.backend_explicit
+            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and (
+                attn_metadata is None
+                or (
+                    attn_metadata.full_attn_spans is None
+                    and attn_metadata.query_ranges is None
+                    and attn_metadata.video_layout is None
+                    and attn_metadata.packed_padding is None
+                    and not attn_metadata.extra
+                )
+            )
+        ):
+            logger.warning_once("Using SDPA for this layer's FP32 input with automatic CUDA FlashAttention selection.")
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
         # The startup KV-capacity profile needs tensor shapes, not a paged
         # attention result. If dense FLASH_ATTN deps are absent (NPU MindIE-SD
         # or CUDA CuTe FA4), SDPA provides that profile forward. Formal paged
         # requests never use this branch because their Worker adapter is active.
-        # Do not silently remap float32 (or other dtypes) to SDPA: a
-        # user-explicit backend must run or raise.
+        # A user-explicit backend must run or raise.
         if (
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None

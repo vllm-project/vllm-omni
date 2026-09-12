@@ -233,6 +233,7 @@ def _fake_ltx_parallel_attention():
 
     layer = object.__new__(ltx2_transformer._LTX2ParallelAttention)
     nn.Module.__init__(layer)
+    layer.allow_fp32_fallback = False
     layer.attn_backend = Backend
     layer.attention = SimpleNamespace(forward=run("native"))
     layer.sdpa_fallback = SimpleNamespace(forward=run("sdpa"))

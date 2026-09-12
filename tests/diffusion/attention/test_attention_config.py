@@ -10,6 +10,7 @@ Tests cover:
 - AttentionMetadata.extra field
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,7 +18,12 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.attention.layer as layer_mod
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+import vllm_omni.diffusion.attention.selector as selector_mod
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    PackedPaddingMetadata,
+    QueryRange,
+)
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import (
@@ -477,6 +483,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
     @pytest.mark.parametrize("mindiesd_available", [False, True])
     def test_paged_npu_memory_profile_uses_sdpa_only_without_mindiesd(self, monkeypatch, mindiesd_available):
         attention = Attention.__new__(Attention)
+        attention.allow_fp32_fallback = False
         attention._scheduler_paged_kv = True
         attention.paged_kv_cache_role = "primary"
         attention.backend_pref = "FLASH_ATTN"
@@ -519,6 +526,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
     @pytest.mark.parametrize("fa4_available", [False, True])
     def test_paged_cuda_memory_profile_uses_sdpa_without_dense_fa4(self, monkeypatch, fa4_available):
         attention = Attention.__new__(Attention)
+        attention.allow_fp32_fallback = False
         attention._scheduler_paged_kv = True
         attention.paged_kv_cache_role = "primary"
         attention.backend_pref = "FLASH_ATTN"
@@ -561,6 +569,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
 
     def test_dense_flash_import_error_is_not_reclassified(self, monkeypatch):
         attention = Attention.__new__(Attention)
+        attention.allow_fp32_fallback = False
         attention._scheduler_paged_kv = False
         attention.paged_kv_cache_role = "primary"
         attention.backend_pref = "FLASH_ATTN"
@@ -900,6 +909,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             return sentinel
 
         fake_attention = SimpleNamespace(
+            allow_fp32_fallback=False,
             attention=SimpleNamespace(
                 forward=_selected_forward,
             ),
@@ -936,6 +946,164 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
 
         with pytest.raises(ValueError, match="Ring attention does not support attn_mask"):
             Attention._run_ring_attention(fake_attention, query, query, query, metadata)
+
+
+class TestOptInFloat32Fallback:
+    @staticmethod
+    def _make_attention(monkeypatch, *, backend=None, allow=True, kv_cache_dtype=None):
+        events, state = [], {}
+        context = object()
+
+        class _SelectedImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            @staticmethod
+            def supports_kv_cache_dtype(*args):
+                return True
+
+            def forward(self, query, key, value, metadata):
+                events.append("selected")
+                state["kernel_call"] = (query, key, value, metadata)
+                state["kernel_output"] = query + 4
+                return state["kernel_output"]
+
+        class _FallbackImpl(_SelectedImpl):
+            def forward(self, query, key, value, metadata):
+                output = super().forward(query, key, value, metadata)
+                events[-1] = "fallback"
+                return output
+
+        class _FlashBackend(FlashAttentionBackend):
+            @staticmethod
+            def get_impl_cls():
+                return _SelectedImpl
+
+        class _SDPABackend(layer_mod.SDPABackend):
+            @staticmethod
+            def get_impl_cls():
+                return _SelectedImpl
+
+        class _Strategy:
+            def pre_attention(self, query, key, value, metadata):
+                events.append("pre")
+                state["prepared"] = (
+                    query + 1,
+                    key + 2,
+                    value + 3,
+                    replace(metadata) if metadata is not None else None,
+                )
+                return (*state["prepared"], context)
+
+            def post_attention(self, output, ctx):
+                events.append("post")
+                assert output is state["kernel_output"]
+                assert ctx is context
+                return output + 7
+
+        # Keep real role/config resolution and construction; replace hardware
+        # lookup and kernels. These are CPU dispatch tests, not SP collectives.
+        monkeypatch.setattr(
+            selector_mod,
+            "_cached_get_backend_cls",
+            lambda name, *args, **kwargs: _SDPABackend if name == "TORCH_SDPA" else _FlashBackend,
+        )
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FallbackImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: _Strategy())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+        config = OmniDiffusionConfig(
+            diffusion_attention_config={"default": backend} if backend else {},
+            diffusion_kv_cache_dtype=kv_cache_dtype,
+        )
+        with set_current_diffusion_config(config):
+            attention = Attention(
+                num_heads=4,
+                num_kv_heads=2,
+                head_size=8,
+                causal=False,
+                softmax_scale=0.25,
+                **({"allow_fp32_fallback": True} if allow else {}),
+            )
+        return attention, events, state
+
+    @pytest.mark.parametrize(
+        "backend,allow,dtype,is_cuda,expected",
+        [
+            pytest.param(None, True, torch.float32, True, "fallback", id="auto-fp32"),
+            pytest.param(None, False, torch.float32, True, "selected", id="default-opt-out"),
+            pytest.param("FLASH_ATTN", True, torch.float32, True, "selected", id="explicit-flash"),
+            pytest.param("TORCH_SDPA", True, torch.float32, True, "selected", id="explicit-sdpa"),
+            pytest.param(None, True, torch.bfloat16, True, "selected", id="bf16"),
+            pytest.param(None, True, torch.float32, False, "selected", id="cpu-fp32"),
+        ],
+    )
+    def test_public_forward_preserves_strategy_and_backend_choice(
+        self, monkeypatch, backend, allow, dtype, is_cuda, expected
+    ):
+        attention, events, state = self._make_attention(monkeypatch, backend=backend, allow=allow)
+        # Only the dispatch predicate is simulated; every tensor stays on CPU.
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: is_cuda))
+        query = torch.ones(1, 2, 4, 8, dtype=dtype)
+        key = torch.full((1, 2, 2, 8), 2, dtype=dtype)
+        value = torch.full_like(key, 3)
+        metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False]]))
+
+        output = attention(query, key, value, metadata)
+
+        assert events == ["pre", expected, "post"]
+        assert all(got is prepared for got, prepared in zip(state["kernel_call"], state["prepared"]))
+        assert state["kernel_call"][3] is not metadata
+        assert state["kernel_call"][3].attn_mask is metadata.attn_mask
+        torch.testing.assert_close(output, query + 12)
+        assert attention.backend_explicit is (backend is not None)
+        impl = attention.sdpa_fallback if expected == "fallback" else attention.attention
+        assert impl.kwargs["num_kv_heads"] == 2
+        assert impl.kwargs["softmax_scale"] == 0.25
+
+    def test_explicit_backend_failure_is_not_retried_with_sdpa(self, monkeypatch):
+        attention, events, _ = self._make_attention(monkeypatch, backend="FLASH_ATTN")
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        selected = Mock(side_effect=RuntimeError("selected backend rejects this dtype"))
+        monkeypatch.setattr(attention.attention, "forward", selected)
+        query = torch.ones(1, 2, 4, 8)
+
+        with pytest.raises(RuntimeError, match="selected backend rejects this dtype"):
+            attention(query, query, query)
+
+        selected.assert_called_once()
+        assert events == ["pre"]
+
+    @pytest.mark.parametrize("contract", ["packed", "packed-padding", "piecewise", "quantized-kv"])
+    def test_backend_metadata_is_not_silently_sent_to_dense_sdpa(self, monkeypatch, contract):
+        quant_dtype = "fp8" if contract == "quantized-kv" else None
+        attention, events, state = self._make_attention(monkeypatch, kv_cache_dtype=quant_dtype)
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        lengths = torch.tensor([0, 1, 2], dtype=torch.int32)
+        metadata = AttentionMetadata()
+        if contract == "packed":
+            metadata.extra = {
+                "cu_seqlens_q": lengths,
+                "cu_seqlens_k": lengths,
+                "max_seqlen_q": 1,
+                "max_seqlen_k": 1,
+            }
+        elif contract == "packed-padding":
+            metadata.packed_padding = PackedPaddingMetadata(1, 1, lengths[:2], lengths[:2])
+        elif contract == "piecewise":
+            metadata.full_attn_spans = [[(0, 1)]]
+            metadata.query_ranges = (QueryRange(0, 2, 0),)
+        query = torch.ones(1, 2, 4, 8)
+
+        attention(query, query, query, metadata)
+
+        assert events == ["pre", "selected", "post"]
+        forwarded = state["kernel_call"][3]
+        if quant_dtype:
+            # Quantization is injected by the public forward from config.
+            assert forwarded.extra == {"kv_cache_dtype": "fp8"}
+            assert metadata.extra == {}
+        else:
+            assert forwarded is state["prepared"][3]
 
 
 class TestDiffusionKvCacheQuantization:
