@@ -9,7 +9,8 @@ import os
 import sys
 import threading
 import types
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
@@ -153,8 +154,40 @@ _DYNIN_CONFIG_CANDIDATE_RELPATHS = (
 _DYNIN_REMOTE_ALLOW_PATTERNS = ("*.py", "*.json", "*.yaml", "*.yml")
 
 _DYNIN_REMOTE_CACHE_LOCK = threading.Lock()
+# Serializes remote module *execution* only. Attr-cache lookups and snapshot
+# resolution stay lock-free; the lock keeps concurrent ``_load_remote_module``
+# calls from returning a half-executed module out of ``sys.modules``. Shims
+# passed as ``import_context`` run inside this critical section.
+_DYNIN_REMOTE_IMPORT_LOCK = threading.RLock()
 _DYNIN_REMOTE_PACKAGE_BY_SNAPSHOT: dict[str, str] = {}
 _DYNIN_REMOTE_ATTR_CACHE: dict[tuple[str, str, str, str | None, bool], Any] = {}
+_DIFFUSERS_FLAX_WEIGHTS_NAME = "diffusion_flax_model.msgpack"
+
+RemoteImportContext = Callable[[], AbstractContextManager[Any]]
+
+
+@contextmanager
+def _dynin_magvit_diffusers_compat():
+    """Temporarily restore the diffusers export required by MAGVIT remote code.
+
+    diffusers 0.40 removed ``FLAX_WEIGHTS_NAME`` from ``diffusers.utils`` while the
+    MAGVIT remote code still imports it at module import time. The export is
+    injected only while that module executes and removed again afterwards; the
+    process-wide mutation lasts for that window only. Entered by
+    ``_load_remote_module`` while ``_DYNIN_REMOTE_IMPORT_LOCK`` is held, which is
+    what keeps concurrent inject/restore pairs from interleaving.
+    """
+    from diffusers import utils as diffusers_utils
+
+    attributes = vars(diffusers_utils)
+    injected = "FLAX_WEIGHTS_NAME" not in attributes
+    if injected:
+        attributes["FLAX_WEIGHTS_NAME"] = _DIFFUSERS_FLAX_WEIGHTS_NAME
+    try:
+        yield
+    finally:
+        if injected:
+            attributes.pop("FLAX_WEIGHTS_NAME", None)
 
 
 @dataclass(frozen=True)
@@ -765,6 +798,7 @@ def _load_remote_module(
     source: str,
     revision: str | None,
     local_files_only: bool,
+    import_context: RemoteImportContext = nullcontext,
 ):
     snapshot_dir = _resolve_remote_snapshot_dir(
         source=source,
@@ -779,23 +813,25 @@ def _load_remote_module(
     package_name = _ensure_remote_package(snapshot_dir)
     full_name = f"{package_name}.{module_name}"
 
-    existing = sys.modules.get(full_name)
-    if existing is not None:
-        return existing
+    with _DYNIN_REMOTE_IMPORT_LOCK:
+        existing = sys.modules.get(full_name)
+        if existing is not None:
+            return existing
 
-    spec = importlib.util.spec_from_file_location(full_name, module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to create import spec for '{module_path}'.")
+        spec = importlib.util.spec_from_file_location(full_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Failed to create import spec for '{module_path}'.")
 
-    module = importlib.util.module_from_spec(spec)
-    module.__package__ = package_name
-    sys.modules[full_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(full_name, None)
-        raise
-    return module
+        module = importlib.util.module_from_spec(spec)
+        module.__package__ = package_name
+        sys.modules[full_name] = module
+        try:
+            with import_context():
+                spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(full_name, None)
+            raise
+        return module
 
 
 def resolve_remote_attr(
@@ -808,6 +844,7 @@ def resolve_remote_attr(
     local_files_only: bool | None = None,
     fallback_module_names: Iterable[str] = (),
     optional: bool = False,
+    import_context: RemoteImportContext = nullcontext,
 ) -> Any | None:
     resolved_source = _resolve_remote_source(source, settings)
     resolved_revision = _resolve_remote_revision(revision, settings)
@@ -828,6 +865,7 @@ def resolve_remote_attr(
                 source=resolved_source,
                 revision=resolved_revision,
                 local_files_only=resolved_local_only,
+                import_context=import_context,
             )
             if hasattr(module, attr_name):
                 value = getattr(module, attr_name)
@@ -987,6 +1025,7 @@ def get_dynin_magvit_attr(
         revision=revision,
         local_files_only=local_files_only,
         optional=True,
+        import_context=_dynin_magvit_diffusers_compat,
     )
     if value is not None:
         return value
@@ -1004,6 +1043,7 @@ def get_dynin_magvit_attr(
             revision=resolved_revision,
             local_files_only=resolved_local_only,
             optional=False,
+            import_context=_dynin_magvit_diffusers_compat,
         )
 
     raise ImportError(
