@@ -26,12 +26,7 @@ try:
 except ImportError as exc:  # pragma: no cover - driver dependency.
     raise SystemExit("Install websockets first: pip install websockets") from exc
 
-from vllm_omni.clients.duplex import (
-    AudioDelta,
-    EventCollector,
-    wrap_event,
-    write_pcm16_wav,
-)
+from vllm_omni.clients.duplex import EventCollector, write_pcm16_wav
 from vllm_omni.clients.duplex import (
     wait_for_condition as wait_for,
 )
@@ -39,6 +34,7 @@ from vllm_omni.clients.duplex import (
 SAMPLE_RATE_HZ = 24_000
 FRAME_SAMPLES = 1_920
 FRAME_PERIOD_S = FRAME_SAMPLES / SAMPLE_RATE_HZ
+AUDIO_DELTA_EVENT_TYPES = frozenset({"response.audio.delta", "response.output_audio.delta"})
 
 
 class _ProbeTransport(Protocol):
@@ -156,6 +152,38 @@ def _events(client: RawRealtimeProbe, event_type: str) -> list[dict[str, object]
     return [event for event in client.events.events if event.get("type") == event_type]
 
 
+def _audio_events(client: RawRealtimeProbe) -> list[dict[str, object]]:
+    """Return audio deltas from both current and legacy Realtime event names."""
+    return [event for event in client.events.events if event.get("type") in AUDIO_DELTA_EVENT_TYPES]
+
+
+def _validated_audio_event(event: dict[str, object]) -> bytes:
+    """Decode one wire audio delta without depending on client event aliases."""
+    encoded = event.get("delta")
+    if not isinstance(encoded, str):
+        raise ValueError("missing_audio_delta")
+    try:
+        chunk = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        raise ValueError("invalid_audio_base64") from None
+    if chunk:
+        if len(chunk) % 2:
+            raise ValueError("unaligned_pcm16_packet")
+        if event.get("sample_rate_hz") != SAMPLE_RATE_HZ:
+            raise ValueError("invalid_audio_sample_rate")
+        if not isinstance(event.get("response_id"), str) or not event.get("response_id"):
+            raise ValueError("missing_audio_response_id")
+    return chunk
+
+
+def _validated_audio_chunks(client: RawRealtimeProbe) -> list[tuple[dict[str, object], bytes]]:
+    return [(event, _validated_audio_event(event)) for event in _audio_events(client)]
+
+
+def _audio_bytes(client: RawRealtimeProbe) -> bytes:
+    return b"".join(chunk for _, chunk in _validated_audio_chunks(client) if chunk)
+
+
 async def _open_session(
     args: argparse.Namespace,
     *,
@@ -259,11 +287,7 @@ def _audio_frame_stats(
 
 
 def _response_ids(client: RawRealtimeProbe) -> set[str]:
-    return {
-        str(event["response_id"])
-        for event in _events(client, "response.output_audio.delta")
-        if isinstance(event.get("response_id"), str)
-    }
+    return {str(event["response_id"]) for event in _audio_events(client) if isinstance(event.get("response_id"), str)}
 
 
 def _session_result(
@@ -273,8 +297,16 @@ def _session_result(
     args: argparse.Namespace,
     minimum_chunks: int,
 ) -> tuple[bytes, set[str], dict[str, object]]:
-    chunks = sum(len(items) for items in client.events.response_audio.values())
-    raw = client.events.audio_bytes()
+    if isinstance(client, RawRealtimeProbe):
+        audio_chunks = _validated_audio_chunks(client)
+        chunks = sum(bool(chunk) for _, chunk in audio_chunks)
+        raw = b"".join(chunk for _, chunk in audio_chunks if chunk)
+    else:
+        # Unit fixtures may provide an already-decoded EventCollector without
+        # retaining the base64 wire field. Real websocket probes always take
+        # the strict wire-validation path above.
+        chunks = sum(len(items) for items in client.events.response_audio.values())
+        raw = client.events.audio_bytes()
     if chunks < minimum_chunks or not raw or len(raw) % 2:
         raise AssertionError(f"invalid PCM16 output: chunks={chunks}, bytes={len(raw)}")
     pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
@@ -283,11 +315,7 @@ def _session_result(
     # Audible speech is checked per frame below with the higher 1e-3 default.
     if not np.isfinite(pcm).all() or rms <= 1e-5:
         raise AssertionError(f"output audio is non-finite or silent: samples={pcm.size}, rms={rms}")
-    rates = {
-        rate
-        for event in _events(client, "response.output_audio.delta")
-        if isinstance(rate := event.get("sample_rate_hz"), int)
-    }
+    rates = {rate for event in _audio_events(client) if isinstance(rate := event.get("sample_rate_hz"), int)}
     if rates != {SAMPLE_RATE_HZ}:
         raise AssertionError(f"unexpected output sample rates: {sorted(rates)}")
     stats = _audio_frame_stats(
@@ -306,7 +334,7 @@ def _session_result(
         )
     runtime_metadata = [
         metadata["vllm_omni"]
-        for event in _events(client, "response.output_audio.delta")
+        for event in _audio_events(client)
         if isinstance((metadata := event.get("metadata")), dict) and isinstance(metadata.get("vllm_omni"), dict)
     ]
     if not any(
@@ -400,14 +428,12 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     )
     await asyncio.gather(
         wait_for(
-            lambda: len(primary.events.audio_bytes()) // (2 * FRAME_SAMPLES) >= primary_frames - args.max_frame_deficit,
+            lambda: len(_audio_bytes(primary)) // (2 * FRAME_SAMPLES) >= primary_frames - args.max_frame_deficit,
             timeout_s=args.timeout_s,
             label="primary frame coverage",
         ),
         wait_for(
-            lambda: (
-                len(secondary.events.audio_bytes()) // (2 * FRAME_SAMPLES) >= secondary_frames - args.max_frame_deficit
-            ),
+            lambda: (len(_audio_bytes(secondary)) // (2 * FRAME_SAMPLES) >= secondary_frames - args.max_frame_deficit),
             timeout_s=args.timeout_s,
             label="secondary frame coverage",
         ),
@@ -445,16 +471,14 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     await asyncio.gather(
         wait_for(
             lambda: (
-                len(secondary.events.audio_bytes()) // (2 * FRAME_SAMPLES)
-                >= secondary_total_frames - args.max_frame_deficit
+                len(_audio_bytes(secondary)) // (2 * FRAME_SAMPLES) >= secondary_total_frames - args.max_frame_deficit
             ),
             timeout_s=args.timeout_s,
             label="survivor frame coverage after slot recycle",
         ),
         wait_for(
             lambda: (
-                len(replacement.events.audio_bytes()) // (2 * FRAME_SAMPLES)
-                >= replacement_frames - args.max_frame_deficit
+                len(_audio_bytes(replacement)) // (2 * FRAME_SAMPLES) >= replacement_frames - args.max_frame_deficit
             ),
             timeout_s=args.timeout_s,
             label="replacement frame coverage",
@@ -529,16 +553,25 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
     packets: list[dict[str, object]] = []
     response_ids: set[str] = set()
     packet_times: list[float] = []
+    invalid_packets: list[dict[str, object]] = []
     samples = 0
-    for raw, received in zip(client.events.events, client.events.event_received_at_s):
-        event = wrap_event(raw)
-        chunk = event.audio if isinstance(event, AudioDelta) else None
+    for index, (raw, received) in enumerate(zip(client.events.events, client.events.event_received_at_s, strict=True)):
+        if raw.get("type") not in AUDIO_DELTA_EVENT_TYPES:
+            continue
+        try:
+            chunk = _validated_audio_event(raw)
+        except ValueError as exc:
+            # Only fixed diagnostic codes from the validator are exported,
+            # never audio payloads or details from the remote endpoint.
+            invalid_packets.append({"event_index": index, "received_at_s": received, "code": str(exc)})
+            continue
         if chunk:
             samples += len(chunk) // 2
             packet_times.append(received)
-            packets.append({"received_at_s": received, "samples": len(chunk) // 2, "response_id": event.response_id})
-            if event.response_id:
-                response_ids.add(event.response_id)
+            response_id = raw.get("response_id")
+            packets.append({"received_at_s": received, "samples": len(chunk) // 2, "response_id": response_id})
+            if isinstance(response_id, str) and response_id:
+                response_ids.add(response_id)
     intervals = [(b - a) * 1000 for a, b in zip(packet_times, packet_times[1:])]
     first_send = sends[0][1] if sends else None
     audio_duration = samples / SAMPLE_RATE_HZ
@@ -558,6 +591,7 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
             for i, (planned, sent, completed) in enumerate(sends)
         ],
         "audio_packet_timeline": packets,
+        "invalid_audio_packets": invalid_packets,
     }
 
 
@@ -659,6 +693,8 @@ async def _run_load_session(
         error = f"{error}; {cleanup_error}" if error else cleanup_error
     if client.events.errors():
         error = error or "server emitted a Realtime error"
+    if metrics["invalid_audio_packets"]:
+        error = error or "invalid audio packets"
     first_audio = metrics["client_first_audio_after_stream_start_ms"]
     if isinstance(first_audio, float) and first_audio < 0:
         error = error or "audio arrived before the first input frame"

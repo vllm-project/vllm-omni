@@ -315,6 +315,20 @@ exit nonzero. Cancellation closes transports and propagates to the caller.
 the client's monotonic clock. It does not export handshake credentials or
 raw audio payloads. Metric definitions are explicit:
 
+Load mode validates each nonempty audio packet's strict base64 encoding, PCM16
+sample alignment, 24 kHz sample rate and response identity. Valid aggregate
+audio cannot hide a malformed packet. Rejected packets make the session fail
+and appear in `invalid_audio_packets` with their event index, receive time and
+fixed diagnostic code; they do not contribute samples or timing intervals.
+Empty audio deltas remain legal and contribute no samples. This check does
+not change the public client's decoding or the default lifecycle mode.
+
+The probe accepts both the current OpenAI Realtime audio event name
+`response.audio.delta` and the legacy `response.output_audio.delta`. Validation
+uses the wire payload directly rather than relying on a particular client
+library's alias table, so a server-side event-name migration cannot silently
+turn real audio into a zero-output measurement.
+
 | Field | Meaning |
 | --- | --- |
 | `client_audio_packet_interval_ms` | Consecutive nonempty packet arrivals: median, linear p99, max, and zero-based index of the first maximal interval. Interval index 0 ends at packet 1. One packet can contain multiple codec frames; this is not server tick latency. |
@@ -325,10 +339,15 @@ raw audio payloads. Metric definitions are explicit:
 
 No output gives missing latency/RTF values, not zero. By default RTF is
 diagnostic; `--max-client-rtf` adds an explicit ceiling. The existing frame
-coverage, audible-frame and scheduler-data-plane checks still apply. Passing
-client-only metrics does not certify model quality or a real-time capacity
-target on another GPU. Begin with N=1 and N=2; higher N is a capacity
-experiment, not a promised property of an A100 or of this patch.
+coverage, audible-frame and scheduler-data-plane checks still apply. A longer
+`--drain-s` can demonstrate eventual completion under backlog, but it must not
+be reported as real-time capacity when the fixed-window run failed or client
+RTF exceeded the stated target. Likewise, the first live session can pay
+one-time model/codec/JIT costs; either use the server's configured duplex
+warmup path or label that run as cold-start evidence before comparing steady
+capacity. Passing client-only metrics does not certify model quality or a
+real-time capacity target on another GPU. Begin with N=1 and N=2; higher N is a
+capacity experiment, not a promised property of an A100 or of this patch.
 
 Deterministic driver and localhost WebSocket checks need no model or GPU:
 
@@ -338,6 +357,6 @@ python -m pytest tests/e2e/online_serving/test_personaplex_load_driver.py \
 ```
 
 These checks test the driver against controlled protocol responses. Run the
-command above against real weights separately before reporting model-serving
+load-driver command against real weights separately before reporting model-serving
 performance. Server tick timestamps and generic TTFT/TPOT aggregation remain
 the responsibility of the existing duplex metrics paths, not this driver.
