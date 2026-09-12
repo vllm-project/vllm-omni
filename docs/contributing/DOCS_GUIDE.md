@@ -1,12 +1,16 @@
 # Documentation Build Guide
 
-This directory contains the source files for the vLLM-Omni documentation.
+The `docs/` directory contains the source files for the vLLM-Omni documentation.
 
 ## Building Documentation Locally
 
 ### Prerequisites
 
-Install documentation dependencies:
+Use Python 3.12 to match the Read the Docs build environment. The package supports
+Python 3.10 through 3.13, as declared in
+[`pyproject.toml`](https://github.com/vllm-project/vllm-omni/blob/main/pyproject.toml).
+Follow [Getting Started](README.md#getting-started) to create and activate an
+environment, then install documentation dependencies from the repository root:
 
 ```bash
 uv pip install -e ".[docs]"
@@ -57,14 +61,17 @@ class Omni:
 
 ## Documentation Structure
 
-```
+```text
 docs/
-├── index.md              # Main documentation page
-├── getting_started/      # Getting started guides
-├── architecture/        # Architecture documentation
-├── api/                 # API reference (auto-generated from code)
-├── examples/            # Code examples
-└── stylesheets/         # Custom CSS
+├── README.md            # Main documentation page
+├── .nav.yml             # Documentation navigation
+├── getting_started/     # Getting started guides
+├── contributing/        # Contributor guides, including this page
+├── design/              # Architecture and design documents
+├── api/                 # API reference entry pages
+├── examples/            # Examples overview
+├── user_guide/examples/  # Task guides and generated model example pages
+└── mkdocs/              # Build hooks, theme overrides, CSS, and JavaScript
 ```
 
 ## Naming Model Examples
@@ -84,37 +91,15 @@ adjust its title because the directory defines its public documentation URL.
 
 ## Publishing Documentation
 
-### GitHub Pages (Recommended)
+The repository's Read the Docs build is configured in
+[`.readthedocs.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.readthedocs.yml).
+It uses Python 3.12, installs the package with the `docs` extra, and builds with
+`mkdocs.yml`, treating warnings as failures.
 
-The documentation is automatically deployed to GitHub Pages using GitHub Actions.
-
-1. **Enable GitHub Pages**:
-   - Go to repository `Settings` → `Pages`
-   - Set `Source` to `GitHub Actions`
-   - Save settings
-
-2. **Push changes**:
-   ```bash
-   git push origin main
-   ```
-
-3. **Documentation will be available at**:
-   - `https://vllm-omni.readthedocs.io`
-
-The GitHub Actions workflow (`.github/workflows/docs.yml`) will automatically:
-- Build the documentation when you push to `main` branch
-- Deploy it to GitHub Pages
-- Update the documentation whenever you make changes
-
-
-### Read the Docs (Alternative)
-
-You can also use Read the Docs for hosting:
-
-1. Sign up at https://readthedocs.org/
-2. Import the `vllm-project/vllm-omni` repository
-3. Read the Docs will automatically build using `.readthedocs.yml`
-4. Documentation will be available at: `https://vllm-omni.readthedocs.io/`
+Submit documentation changes through a pull request following the
+[contribution guide](README.md#pull-requests-code-reviews). Contributors can
+preview changes locally with `mkdocs serve`; configuring a hosting service is
+not required to contribute.
 
 ## Configuration
 
@@ -123,15 +108,15 @@ The documentation configuration is in `mkdocs.yml` at the project root.
 ## Tips
 
 - **API Documentation**: API docs are automatically generated using `mkdocs-api-autonav` and `mkdocstrings`
-  - No need to manually create API pages - they're generated automatically
-  - Use `[module.name.ClassName][]` syntax for cross-references in Summary pages
+    - No need to manually create API pages - they're generated automatically
+    - Use `[module.name.ClassName][]` syntax for cross-references in Summary pages
 - **Code Snippets**: Use `--8<-- "path/to/file.py"` for including code snippets
 - **Markdown**: Use Markdown for all documentation (no need for RST)
 - **Material Theme**: Use Material theme features like:
-  - Admonitions: `!!! note`, `!!! warning`, etc.
-  - Code blocks with syntax highlighting
-  - Tabs for organizing content
-  - Math formulas using `pymdownx.arithmatex`
+    - Admonitions: `!!! note`, `!!! warning`, etc.
+    - Code blocks with syntax highlighting
+    - Tabs for organizing content
+    - Math formulas using `pymdownx.arithmatex`
 
 ## Troubleshooting
 
@@ -149,6 +134,6 @@ The documentation configuration is in `mkdocs.yml` at the project root.
 
 ### Build errors
 
-- Check Python version (requires 3.9+)
+- Check the Python version against `pyproject.toml`; Python 3.12 matches the Read the Docs build
 - Ensure all dependencies are installed: `pip install -e ".[docs]"`
 - Check `mkdocs.yml` syntax with `mkdocs build --strict`
