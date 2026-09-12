@@ -31,27 +31,29 @@ from vllm_omni.diffusion.models.cosmos3.transfer import (
     uint8_cthw_to_normalized_5d,
 )
 from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
-from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
     TRANSFER_HINTS,
     TransferHint,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.geometry import (
-    CosmosDreamsGeometry,
-    CosmosDreamsResolutionPolicy,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
+    Cosmos3NanoSimBimanualGeometry,
+    Cosmos3NanoSimBimanualResolutionPolicy,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
-    CosmosDreamsPipeline,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualPipeline,
     _admission_float,
     _admission_int,
     _resolution_policy,
-    get_cosmos_dreams_ir_op_priority_func,
-    get_cosmos_dreams_post_process_func,
+    get_cosmos3_nano_sim_bimanual_ir_op_priority_func,
+    get_cosmos3_nano_sim_bimanual_post_process_func,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import CosmosDreamsSessionState
-from vllm_omni.diffusion.models.cosmos_dreams.transformer_cosmos_dreams_transfer import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualSessionState,
+)
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos_dreams_transfer import (
     CosmosDreamsTransferTransformer,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.utils import iter_clean_commit_frames
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import iter_clean_commit_frames
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
 
 
@@ -130,17 +132,12 @@ def _transfer_media_hw(value: Any) -> tuple[int, int] | None:
     return media_hw(value)
 
 
-def _default_transfer_resolution(policy: CosmosDreamsResolutionPolicy) -> str:
+def _default_transfer_resolution(policy: Cosmos3NanoSimBimanualResolutionPolicy) -> str:
     height, width = policy.default_resolution
-    matching = [
-        key
-        for key, sizes in VIDEO_RES_SIZE_INFO.items()
-        if (width, height) in sizes.values()
-    ]
+    matching = [key for key, sizes in VIDEO_RES_SIZE_INFO.items() if (width, height) in sizes.values()]
     if not matching:
         raise ValueError(
-            "Cosmos-Dreams-Transfer default_resolution must be a canonical Cosmos3 bucket, "
-            f"got {height}x{width}."
+            f"Cosmos-Dreams-Transfer default_resolution must be a canonical Cosmos3 bucket, got {height}x{width}."
         )
     return max(matching, key=int)
 
@@ -148,8 +145,8 @@ def _default_transfer_resolution(policy: CosmosDreamsResolutionPolicy) -> str:
 def resolve_cosmos_dreams_transfer_geometry(
     sampling_params: Any,
     prompt_data: Any,
-    policy: CosmosDreamsResolutionPolicy,
-) -> CosmosDreamsGeometry:
+    policy: Cosmos3NanoSimBimanualResolutionPolicy,
+) -> Cosmos3NanoSimBimanualGeometry:
     """Snap the prioritized Transfer source to a policy-valid Cosmos3 bucket."""
 
     resolution = _request_value(
@@ -169,9 +166,7 @@ def resolve_cosmos_dreams_transfer_geometry(
     try:
         target_width, target_height = find_closest_target_size(*source_hw, resolution)
     except ValueError as exc:
-        raise ValueError(
-            f"Cosmos-Dreams-Transfer resolution bucket is invalid: {resolution!r}."
-        ) from exc
+        raise ValueError(f"Cosmos-Dreams-Transfer resolution bucket is invalid: {resolution!r}.") from exc
     geometry = policy.resolve(target_height, target_width)
 
     requested_height = getattr(sampling_params, "height", None)
@@ -236,9 +231,9 @@ def format_cosmos_dreams_transfer_prompt(
 def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
     """Resolve a Transfer bucket, preprocess to it, and serialize final H/W."""
 
-    from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
 
-    manifest = CosmosDreamsManifest.from_od_config(od_config)
+    manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
     manifest.require_control_video_conditioning()
     policy = _resolution_policy(od_config, manifest)
 
@@ -306,14 +301,14 @@ def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_cosmos_dreams_transfer_post_process_func(od_config: OmniDiffusionConfig):
-    return get_cosmos_dreams_post_process_func(od_config)
+    return get_cosmos3_nano_sim_bimanual_post_process_func(od_config)
 
 
 def get_cosmos_dreams_transfer_ir_op_priority_func(od_config: OmniDiffusionConfig):
-    return get_cosmos_dreams_ir_op_priority_func(od_config)
+    return get_cosmos3_nano_sim_bimanual_ir_op_priority_func(od_config)
 
 
-class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
+class CosmosDreamsTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     """Full-clip Transfer inference using the dense causal-history oracle."""
 
     _transformer_cls_override: ClassVar[type[CosmosDreamsTransferTransformer]] = CosmosDreamsTransferTransformer
@@ -392,7 +387,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
                 return resolved_input_fps
         return super()._resolve_request_fps(sp, prompt_data)
 
-    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> CosmosDreamsGeometry:
+    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> Cosmos3NanoSimBimanualGeometry:
         return resolve_cosmos_dreams_transfer_geometry(sp, prompt_data, self.resolution_policy)
 
     def _resolve_requested_pixel_frames(
@@ -531,7 +526,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
         *,
         sampling_params: Any,
         prompt_data: Any,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         fps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         request = self._validate_conditioning_request(
@@ -560,7 +555,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
         *,
         typed_inputs: Any | None,
         request: _TransferRequestContract,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         start_frame: int,
         target_frame: int,
         prompt_data: Any = None,
@@ -611,7 +606,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
             )
         return _TransferConditioning(request=request, control_latents=control_latents)
 
-    def _initial_condition_latent(self, prompt_data: Any, sp, geometry: CosmosDreamsGeometry) -> None:
+    def _initial_condition_latent(self, prompt_data: Any, sp, geometry: Cosmos3NanoSimBimanualGeometry) -> None:
         del geometry
         if (
             self._get_sp_param(sp, "initial_latent", None) is not None
@@ -629,7 +624,9 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
                 raise ValueError("Cosmos-Dreams-Transfer does not accept initial_latent or seed images.")
         return None
 
-    def _prefill_first_frame(self, state: CosmosDreamsSessionState, initial_latent: torch.Tensor | None, **kwargs):
+    def _prefill_first_frame(
+        self, state: Cosmos3NanoSimBimanualSessionState, initial_latent: torch.Tensor | None, **kwargs
+    ):
         del state, kwargs
         if initial_latent is not None:
             raise ValueError("Cosmos-Dreams-Transfer does not accept an RGB prefix latent.")
@@ -637,9 +634,9 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
 
     def _run_chunk(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         *,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         chunk_start: int,
         chunk_end: int,
         target_frame: int,

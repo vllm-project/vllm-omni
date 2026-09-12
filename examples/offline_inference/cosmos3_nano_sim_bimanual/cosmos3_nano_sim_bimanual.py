@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run a Cosmos-Dreams sample from the reference JSONL/NPZ format."""
+"""Run a Cosmos3-Nano-Sim-Bimanual sample from the reference JSONL/NPZ format."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def _unwrap_video(output: Any) -> Any:
         output = output[0]
     if isinstance(output, OmniRequestOutput):
         if not output.images:
-            raise ValueError("Cosmos-Dreams returned no video frames.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual returned no video frames.")
         return _unwrap_video(output.images)
     if isinstance(output, dict):
         return output.get("video", output.get("frames", output))
@@ -110,11 +110,11 @@ def _video_frames(video: Any) -> list[np.ndarray]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Converted Cosmos-Dreams Diffusers directory.")
+    parser.add_argument("--model", required=True, help="Converted Cosmos3-Nano-Sim-Bimanual Diffusers directory.")
     parser.add_argument("--jsonl", type=Path, required=True, help="Reference inference jsonl file.")
     parser.add_argument("--sample-index", type=int, default=0)
-    parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos_dreams.yaml")
-    parser.add_argument("--output", type=Path, default=Path("cosmos_dreams.mp4"))
+    parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml")
+    parser.add_argument("--output", type=Path, default=Path("cosmos3_nano_sim_bimanual.mp4"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
@@ -159,7 +159,7 @@ def main() -> None:
 
     omni = Omni(
         model=args.model,
-        model_class_name="CosmosDreamsPipeline",
+        model_class_name="Cosmos3NanoSimBimanualPipeline",
         deploy_config=args.deploy_config,
         enforce_eager=True,
     )
@@ -183,7 +183,7 @@ def main() -> None:
         from diffusers.utils import export_to_video
 
         export_to_video(_video_frames(result), str(args.output), fps=fps)
-    print(f"Saved Cosmos-Dreams {args.output_type} output to {args.output}")
+    print(f"Saved Cosmos3-Nano-Sim-Bimanual {args.output_type} output to {args.output}")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Causal three-way Cosmos3 transformer used by Cosmos-Dreams."""
+"""Causal three-way Cosmos3 transformer used by Cosmos3-Nano-Sim-Bimanual."""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     _apply_rotary_pos_emb,
     _tf_config_get,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
-from vllm_omni.diffusion.models.cosmos_dreams.geometry import CosmosDreamsGeometry
-from vllm_omni.diffusion.models.cosmos_dreams.utils import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import Cosmos3NanoSimBimanualGeometry
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     build_interleaved_mrope_position_ids,
     interleave_action_vision_tokens,
     split_interleaved_action_vision_tokens,
@@ -34,12 +34,12 @@ from vllm_omni.platforms import current_omni_platform
 
 
 @dataclass
-class CosmosDreamsTransformerOutput:
+class Cosmos3NanoSimBimanualTransformerOutput:
     video: torch.Tensor
     current_kv: list[tuple[torch.Tensor, torch.Tensor]]
 
 
-class CosmosDreamsJointAttention(Cosmos3CrossAttention):
+class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
     """One softmax over text, committed history, and the current chunk."""
 
     def forward(
@@ -59,16 +59,22 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
         null_action_frame_indexes: tuple[int, ...] = (),
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] != 1:
-            raise ValueError(f"Cosmos-Dreams causal attention supports batch_size=1, got {hidden_states.shape[0]}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual causal attention supports batch_size=1, got {hidden_states.shape[0]}"
+            )
         if real_text_kv_len <= 0 or real_text_kv_len > text_k.shape[1]:
             raise ValueError(
-                "Cosmos-Dreams real text KV length must be in the stored range, "
+                "Cosmos3-Nano-Sim-Bimanual real text KV length must be in the stored range, "
                 f"got real={real_text_kv_len}, stored={text_k.shape[1]}"
             )
         if text_k.shape != text_v.shape:
-            raise ValueError(f"Cosmos-Dreams text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}"
+            )
         if dense_history is not None and paged_context is not None:
-            raise ValueError("Cosmos-Dreams attention accepts either dense_history or paged_context, not both")
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual attention accepts either dense_history or paged_context, not both"
+            )
 
         batch, seq_len, _ = hidden_states.shape
         q = self.to_q(hidden_states).view(batch, seq_len, self.num_heads_local, self.head_dim)
@@ -80,7 +86,7 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
         if action_tokens_per_frame is None:
             if null_action_frame_indexes:
-                raise ValueError("Cosmos-Dreams null action indexes require action conditioning tokens")
+                raise ValueError("Cosmos3-Nano-Sim-Bimanual null action indexes require action conditioning tokens")
         else:
             v = zero_null_action_values(
                 v,
@@ -115,7 +121,7 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
         return self.to_out(output.reshape(batch, seq_len, -1)), k, v
 
 
-class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
+class Cosmos3NanoSimBimanualGenDecoderLayer(Cosmos3GenDecoderLayer):
     """Cosmos3 GEN layer with causal joint attention and unchanged weight names."""
 
     def __init__(
@@ -146,7 +152,7 @@ class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
             qk_norm=qk_norm,
             prefix=prefix,
         )
-        self.cross_attention = CosmosDreamsJointAttention(
+        self.cross_attention = Cosmos3NanoSimBimanualJointAttention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
@@ -174,11 +180,11 @@ class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
         return hidden_states, current_k, current_v
 
 
-class CosmosDreamsTransformer(Cosmos3VFMTransformer):
+class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
     """Cosmos3 MoT generator with persistent causal GEN K/V history."""
 
-    _gen_layer_cls = CosmosDreamsGenDecoderLayer
-    _repeated_blocks = ["CosmosDreamsGenDecoderLayer"]
+    _gen_layer_cls = Cosmos3NanoSimBimanualGenDecoderLayer
+    _repeated_blocks = ["Cosmos3NanoSimBimanualGenDecoderLayer"]
 
     def _language_model_kwargs(self) -> dict[str, Any]:
         return {"use_und_k_norm_for_gen": bool(self.use_und_k_norm_for_gen)}
@@ -189,7 +195,9 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         if missing:
             preview = ", ".join(missing[:12])
             suffix = "" if len(missing) <= 12 else f" (and {len(missing) - 12} more)"
-            raise ValueError(f"Cosmos-Dreams checkpoint is missing required transformer weights: {preview}{suffix}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual checkpoint is missing required transformer weights: {preview}{suffix}"
+            )
 
     @staticmethod
     def _validate_supported_config(model_config: Any) -> None:
@@ -205,7 +213,8 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             actual = _tf_config_get(model_config, key, expected)
             if actual != expected:
                 raise ValueError(
-                    f"Unsupported Cosmos-Dreams transformer config: {key}={actual!r}; expected {expected!r}."
+                    "Unsupported Cosmos3-Nano-Sim-Bimanual transformer config: "
+                    f"{key}={actual!r}; expected {expected!r}."
                 )
 
     def __init__(
@@ -217,10 +226,10 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         sound_dim: int | None = None,
         sound_latent_fps: float | None = None,
     ) -> None:
-        self.manifest = CosmosDreamsManifest.from_od_config(od_config)
+        self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
         self.manifest.require_exported_artifact()
         if sound_gen:
-            raise ValueError("Cosmos-Dreams v1 does not support joint sound generation")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual v1 does not support joint sound generation")
         super().__init__(
             od_config,
             temporal_compression_factor=temporal_compression_factor,
@@ -230,7 +239,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         )
         if self.temporal_compression_factor != self.manifest.temporal_compression_factor:
             raise ValueError(
-                "Cosmos-Dreams temporal compression differs between VAE and manifest: "
+                "Cosmos3-Nano-Sim-Bimanual temporal compression differs between VAE and manifest: "
                 f"{self.temporal_compression_factor} != {self.manifest.temporal_compression_factor}"
             )
         self._validate_conditioning_config()
@@ -244,10 +253,10 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         action_schema = self.manifest.require_action_schema()
         action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
         if not self.action_gen:
-            raise ValueError("Cosmos-Dreams checkpoints must enable action_gen")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoints must enable action_gen")
         if self.action_dim != action_schema.model_action_dim:
             raise ValueError(
-                "Cosmos-Dreams action dimension differs between transformer and manifest: "
+                "Cosmos3-Nano-Sim-Bimanual action dimension differs between transformer and manifest: "
                 f"{self.action_dim} != {action_schema.model_action_dim}"
             )
 
@@ -269,10 +278,11 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         expected_action_shape = (1, num_frames * action_count, self.action_dim)
         if tuple(action_latents.shape) != expected_action_shape:
             raise ValueError(
-                f"Cosmos-Dreams actions must have shape {expected_action_shape}, got {tuple(action_latents.shape)}"
+                "Cosmos3-Nano-Sim-Bimanual actions must have shape "
+                f"{expected_action_shape}, got {tuple(action_latents.shape)}"
             )
         if action_domain_ids is None:
-            raise ValueError("Cosmos-Dreams action conditioning requires action_domain_ids")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual action conditioning requires action_domain_ids")
         action_hidden = self.action_proj_in(action_latents, action_domain_ids)
         action_hidden = action_hidden + self.action_modality_embed.to(action_hidden.dtype)
         return action_hidden.view(1, num_frames, action_count, self.hidden_size)
@@ -310,10 +320,13 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         for key, value in layer_kv:
             if key.shape != value.shape or key.shape[0] != 1:
                 raise ValueError(
-                    f"Cosmos-Dreams text K/V must be matching batch-one tensors, got {key.shape} and {value.shape}"
+                    "Cosmos3-Nano-Sim-Bimanual text K/V must be matching batch-one "
+                    f"tensors, got {key.shape} and {value.shape}"
                 )
             if key.shape[1] > max_len:
-                raise ValueError(f"Cosmos-Dreams prompt has {key.shape[1]} KV tokens but text_cache_max_len={max_len}")
+                raise ValueError(
+                    f"Cosmos3-Nano-Sim-Bimanual prompt has {key.shape[1]} KV tokens but text_cache_max_len={max_len}"
+                )
             pad_len = max_len - key.shape[1]
             if pad_len:
                 key = torch.cat([key, key.new_zeros(1, pad_len, *key.shape[2:])], dim=1)
@@ -381,7 +394,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         *,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         text_kv: list[tuple[torch.Tensor, torch.Tensor]],
         real_text_kv_len: int,
         frame_start: int,
@@ -392,7 +405,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         dense_history: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         condition_vision: bool = False,
         null_action_frame_indexes: tuple[int, ...] = (),
-    ) -> CosmosDreamsTransformerOutput:
+    ) -> Cosmos3NanoSimBimanualTransformerOutput:
         """Denoise or clean-commit one current chunk.
 
         ``paged_kv`` is non-committing during denoise and committing only for a
@@ -400,31 +413,38 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         """
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:
             raise ValueError(
-                f"Cosmos-Dreams hidden_states must have shape [1,C,T,H,W], got {tuple(hidden_states.shape)}"
+                f"Cosmos3-Nano-Sim-Bimanual hidden_states must have shape [1,C,T,H,W], got {tuple(hidden_states.shape)}"
             )
         if timestep.shape not in {(1,), (1, 1)}:
-            raise ValueError(f"Cosmos-Dreams timestep must have shape [1] or [1,1], got {tuple(timestep.shape)}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual timestep must have shape [1] or [1,1], got {tuple(timestep.shape)}"
+            )
         if len(text_kv) != self.num_hidden_layers:
-            raise ValueError(f"Cosmos-Dreams expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}"
+            )
         if paged_kv is not None and dense_history is not None:
-            raise ValueError("Cosmos-Dreams forward accepts either paged_kv or dense_history, not both")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual forward accepts either paged_kv or dense_history, not both")
         if paged_kv is not None and len(paged_kv) != self.num_hidden_layers:
-            raise ValueError(f"Cosmos-Dreams expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}"
+            )
         if dense_history is not None and len(dense_history) != self.num_hidden_layers:
             raise ValueError(
-                f"Cosmos-Dreams expected {self.num_hidden_layers} dense history layers, got {len(dense_history)}"
+                "Cosmos3-Nano-Sim-Bimanual expected "
+                f"{self.num_hidden_layers} dense history layers, got {len(dense_history)}"
             )
 
         _, _, num_frames, latent_h, latent_w = hidden_states.shape
         grid_h, grid_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)
         if (latent_h, latent_w) != (geometry.latent_height, geometry.latent_width):
             raise RuntimeError(
-                "Cosmos-Dreams transformer latent shape does not match resolved geometry: "
+                "Cosmos3-Nano-Sim-Bimanual transformer latent shape does not match resolved geometry: "
                 f"{(latent_h, latent_w)} != {(geometry.latent_height, geometry.latent_width)}"
             )
         if (grid_h, grid_w) != geometry.patch_grid:
             raise RuntimeError(
-                "Cosmos-Dreams transformer patch grid does not match resolved geometry: "
+                "Cosmos3-Nano-Sim-Bimanual transformer patch grid does not match resolved geometry: "
                 f"{(grid_h, grid_w)} != {geometry.patch_grid}"
             )
         vision_tokens = self.patchify(hidden_states, num_frames, latent_h, latent_w)
@@ -463,7 +483,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             forward_context = paged_kv[0].forward_ctx
             if forward_context.seq_len != hidden.shape[1]:
                 raise RuntimeError(
-                    "Cosmos-Dreams paged context token count does not match "
+                    "Cosmos3-Nano-Sim-Bimanual paged context token count does not match "
                     f"this chunk: {forward_context.seq_len} != {hidden.shape[1]}"
                 )
             forward_context.prepare(
@@ -507,4 +527,4 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             )
             vision_hidden = vision_hidden.flatten(1, 2)
             video = self.unpatchify(self.proj_out(vision_hidden), num_frames, latent_h, latent_w)
-        return CosmosDreamsTransformerOutput(video=video, current_kv=current_kv)
+        return Cosmos3NanoSimBimanualTransformerOutput(video=video, current_kv=current_kv)

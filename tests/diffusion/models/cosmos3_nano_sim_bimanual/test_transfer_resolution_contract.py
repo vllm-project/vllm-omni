@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.diffusion.models.cosmos_dreams.geometry import CosmosDreamsResolutionPolicy
-from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams_transfer import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import Cosmos3NanoSimBimanualResolutionPolicy
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos_dreams_transfer import (
     resolve_cosmos_dreams_transfer_geometry,
 )
 
@@ -33,7 +33,7 @@ def test_transfer_input_video_drives_bucket_before_hint_control() -> None:
     geometry = resolve_cosmos_dreams_transfer_geometry(
         params,
         prompt,
-        CosmosDreamsResolutionPolicy(),
+        Cosmos3NanoSimBimanualResolutionPolicy(),
     )
 
     assert geometry.session_key == (480, 832)
@@ -45,7 +45,7 @@ def test_transfer_hint_control_drives_bucket_without_input_video() -> None:
     geometry = resolve_cosmos_dreams_transfer_geometry(
         params,
         {"prompt": "test"},
-        CosmosDreamsResolutionPolicy(),
+        Cosmos3NanoSimBimanualResolutionPolicy(),
     )
 
     assert geometry.session_key == (832, 480)
@@ -62,13 +62,13 @@ def test_transfer_serialized_dimensions_must_match_generated_bucket() -> None:
         resolve_cosmos_dreams_transfer_geometry(
             params,
             {"prompt": "test"},
-            CosmosDreamsResolutionPolicy(),
+            Cosmos3NanoSimBimanualResolutionPolicy(),
         )
 
 
 def test_transfer_generated_bucket_must_pass_dreams_policy() -> None:
     params = _sampling_params(resolution="720", edge={"control": {"height": 480, "width": 832}})
-    policy = CosmosDreamsResolutionPolicy(
+    policy = Cosmos3NanoSimBimanualResolutionPolicy(
         default_resolution=(480, 832),
         max_pixels=480 * 832,
     )

@@ -1,6 +1,6 @@
-# Cosmos-Dreams / Cosmos3-Interactive distilled forward-dynamics deployment.
+# Cosmos3-Nano-Sim-Bimanual distilled forward-dynamics deployment.
 
-pipeline: cosmos_dreams
+pipeline: cosmos3_nano_sim_bimanual
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16
@@ -12,7 +12,7 @@ stages:
     devices: "0"
     max_num_seqs: 1
     enforce_eager: true
-    model_class_name: CosmosDreamsPipeline
+    model_class_name: Cosmos3NanoSimBimanualPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     model_config:
       action_gen: true

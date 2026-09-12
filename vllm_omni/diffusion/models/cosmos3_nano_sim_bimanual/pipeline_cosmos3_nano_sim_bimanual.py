@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Causal autoregressive pipeline for Cosmos-Dreams checkpoints."""
+"""Causal autoregressive pipeline for Cosmos3-Nano-Sim-Bimanual checkpoints."""
 
 from __future__ import annotations
 
@@ -21,25 +21,25 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     get_cosmos3_post_process_func,
     get_cosmos3_pre_process_func,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest, deploy_option
-from vllm_omni.diffusion.models.cosmos_dreams.geometry import (
-    CosmosDreamsGeometry,
-    CosmosDreamsResolutionPolicy,
-    resolve_cosmos_dreams_geometry,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest, deploy_option
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
+    Cosmos3NanoSimBimanualGeometry,
+    Cosmos3NanoSimBimanualResolutionPolicy,
+    resolve_cosmos3_nano_sim_bimanual_geometry,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.normalizer import ActionAffineNormalizer
-from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
-    CosmosDreamsSessionFingerprint,
-    CosmosDreamsSessionState,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualSessionFingerprint,
+    Cosmos3NanoSimBimanualSessionState,
     append_dense_kv_history,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.streaming_vae import decode_wan_causal_chunk
-from vllm_omni.diffusion.models.cosmos_dreams.tick_adapter import parse_cosmos_dreams_tick
-from vllm_omni.diffusion.models.cosmos_dreams.transformer_cosmos_dreams import (
-    CosmosDreamsTransformer,
-    CosmosDreamsTransformerOutput,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.streaming_vae import decode_wan_causal_chunk
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import parse_cosmos3_nano_sim_bimanual_tick
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualTransformer,
+    Cosmos3NanoSimBimanualTransformerOutput,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.utils import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     iter_ar_chunk_ranges,
     iter_clean_commit_frames,
     prompt_token_hash,
@@ -82,21 +82,25 @@ def _admission_int(value: Any, name: str) -> int:
     try:
         return int(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams {name} must be an integer, got {value!r}.") from exc
+        raise ARDiffusionRequestRejectedError(
+            f"Cosmos3-Nano-Sim-Bimanual {name} must be an integer, got {value!r}."
+        ) from exc
 
 
 def _admission_float(value: Any, name: str) -> float:
     try:
         return float(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams {name} must be numeric, got {value!r}.") from exc
+        raise ARDiffusionRequestRejectedError(
+            f"Cosmos3-Nano-Sim-Bimanual {name} must be numeric, got {value!r}."
+        ) from exc
 
 
 def _resolution_policy(
     od_config: OmniDiffusionConfig,
-    manifest: CosmosDreamsManifest,
-) -> CosmosDreamsResolutionPolicy:
-    return CosmosDreamsResolutionPolicy(
+    manifest: Cosmos3NanoSimBimanualManifest,
+) -> Cosmos3NanoSimBimanualResolutionPolicy:
+    return Cosmos3NanoSimBimanualResolutionPolicy(
         default_resolution=deploy_option(od_config, "default_resolution", (720, 1280)),
         max_pixels=deploy_option(od_config, "max_pixels", 921_600),
         vae_spatial_compression_factor=manifest.vae_spatial_compression_factor,
@@ -113,10 +117,10 @@ def _request_media(prompt: Any) -> Any:
     return _first_not_none(media.get("image"), media.get("video"))
 
 
-def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
+def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfig):
     """Resolve serializable geometry, delegate media work, and validate its result."""
 
-    manifest = CosmosDreamsManifest.from_od_config(od_config)
+    manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
     policy = _resolution_policy(od_config, manifest)
     cosmos3_pre_process = get_cosmos3_pre_process_func(od_config)
 
@@ -124,14 +128,14 @@ def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
         sp = request.sampling_params
         prompt = request.prompt
         media = _request_media(prompt)
-        geometry = resolve_cosmos_dreams_geometry(sp, media, policy)
+        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
         sp.height, sp.width = geometry.height, geometry.width
 
         result = cosmos3_pre_process(request)
         # Re-resolving explicit final dimensions catches any downstream
         # alignment, area, aspect, or model-grid violation.
         final_sp = result.sampling_params
-        geometry = resolve_cosmos_dreams_geometry(final_sp, None, policy)
+        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(final_sp, None, policy)
         final_sp.height, final_sp.width = geometry.height, geometry.width
         return result
 
@@ -140,17 +144,17 @@ def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
 
 # The registry resolves process funcs by name against this model's own
 # module, so reusing the Cosmos3 implementations means re-exporting them
-# under a Cosmos-Dreams name rather than registering them directly.
-def get_cosmos_dreams_post_process_func(od_config: OmniDiffusionConfig):
+# under a Cosmos3-Nano-Sim-Bimanual name rather than registering them directly.
+def get_cosmos3_nano_sim_bimanual_post_process_func(od_config: OmniDiffusionConfig):
     return get_cosmos3_post_process_func(od_config)
 
 
-def get_cosmos_dreams_ir_op_priority_func(od_config: OmniDiffusionConfig):
+def get_cosmos3_nano_sim_bimanual_ir_op_priority_func(od_config: OmniDiffusionConfig):
     return get_cosmos3_ir_op_priority_func(od_config)
 
 
-class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
-    """Cosmos3-Interactive inference with dense-or-paged persistent GEN K/V.
+class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
+    """Cosmos3-Nano-Sim-Bimanual inference with dense-or-paged persistent GEN K/V.
 
     The default diffusion engine exercises the dense numerical-oracle path,
     which Cosmos-Dreams-Transfer also runs on. When the AR-Diffusion runner
@@ -158,11 +162,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     """
 
     # The engine's generic warmup request is 512x512 with a one-step sampler,
-    # while Cosmos-Dreams has request-resolved geometry and a four-step sampler.
+    # while Cosmos3-Nano-Sim-Bimanual has request-resolved geometry and a four-step sampler.
     # Skip that incompatible request; AR-Diffusion owns any model-valid rollout
     # warmup when CUDA graphs are enabled.
     dummy_run_num_frames: ClassVar[int] = 0
-    _transformer_cls_override: ClassVar[type[CosmosDreamsTransformer]] = CosmosDreamsTransformer
+    _transformer_cls_override: ClassVar[type[Cosmos3NanoSimBimanualTransformer]] = Cosmos3NanoSimBimanualTransformer
     _MAIN_BRANCH = "main"
     _SESSION_CAPACITY = 1
     _ar_diffusion_kv_state = None
@@ -173,55 +177,59 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         self.manifest = self._load_manifest(od_config)
         self.resolution_policy = _resolution_policy(od_config, self.manifest)
         self.manifest.require_exported_artifact()
-        if not isinstance(self.transformer, CosmosDreamsTransformer):
+        if not isinstance(self.transformer, Cosmos3NanoSimBimanualTransformer):
             raise TypeError(
-                f"Cosmos-Dreams pipeline resolved the wrong transformer type: {type(self.transformer).__name__}."
+                "Cosmos3-Nano-Sim-Bimanual pipeline resolved the wrong transformer "
+                f"type: {type(self.transformer).__name__}."
             )
         if not self.is_distilled_model:
-            raise ValueError("Cosmos-Dreams requires a distilled fixed-step checkpoint.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual requires a distilled fixed-step checkpoint.")
         scheduler_t_list = tuple(float(value) for value in self._scheduler_init_t_list)
         if len(scheduler_t_list) != 4:
             raise ValueError(
-                f"Cosmos-Dreams requires exactly four distilled denoise steps, got {len(scheduler_t_list)}."
+                f"Cosmos3-Nano-Sim-Bimanual requires exactly four distilled denoise steps, got {len(scheduler_t_list)}."
             )
         if len(scheduler_t_list) != len(self.manifest.t_list) or any(
             not math.isclose(scheduler_value, manifest_value, rel_tol=0.0, abs_tol=1e-8)
             for scheduler_value, manifest_value in zip(scheduler_t_list, self.manifest.t_list, strict=True)
         ):
             raise ValueError(
-                "Cosmos-Dreams scheduler and transformer manifests define different fixed-step schedules: "
+                "Cosmos3-Nano-Sim-Bimanual scheduler and transformer manifests define different fixed-step schedules: "
                 f"scheduler={scheduler_t_list}, transformer={self.manifest.t_list}."
             )
         scheduler_train_timesteps = int(self.scheduler.config.num_train_timesteps)
         if scheduler_train_timesteps != self.manifest.num_train_timesteps:
             raise ValueError(
-                "Cosmos-Dreams scheduler and transformer manifests define different training timestep counts: "
+                "Cosmos3-Nano-Sim-Bimanual scheduler and transformer manifests define "
+                "different training timestep counts: "
                 f"scheduler={scheduler_train_timesteps}, transformer={self.manifest.num_train_timesteps}."
             )
         self._distilled_num_steps = len(scheduler_t_list)
         if od_config.parallel_config.sequence_parallel_size > 1:
             raise ValueError(
-                "Cosmos-Dreams supports tensor parallelism but not sequence parallelism; "
+                "Cosmos3-Nano-Sim-Bimanual supports tensor parallelism but not sequence parallelism; "
                 f"got sequence_parallel_size={od_config.parallel_config.sequence_parallel_size}."
             )
         self._init_conditioning(od_config)
         self.default_fps = float(deploy_option(od_config, "default_fps", 15.0))
         if not math.isfinite(self.default_fps) or self.default_fps <= 0:
-            raise ValueError(f"Cosmos-Dreams default_fps must be positive, got {self.default_fps}.")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual default_fps must be positive, got {self.default_fps}.")
         self.checkpoint_id = (
             self.manifest.checkpoint_id if self.manifest.checkpoint_id != "unknown" else str(od_config.model)
         )
-        self._states: OrderedDict[str, CosmosDreamsSessionState] = OrderedDict()
+        self._states: OrderedDict[str, Cosmos3NanoSimBimanualSessionState] = OrderedDict()
 
-    def _load_manifest(self, od_config: OmniDiffusionConfig) -> CosmosDreamsManifest:
-        return CosmosDreamsManifest.from_od_config(od_config)
+    def _load_manifest(self, od_config: OmniDiffusionConfig) -> Cosmos3NanoSimBimanualManifest:
+        return Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
 
     def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
         """Initialize action adapters from the exported contract."""
 
         action_schema = self.manifest.action_schema
         if action_schema is None:
-            raise ValueError("Cosmos-Dreams action pipeline requires validated schema-v1 action conditioning.")
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual action pipeline requires validated schema-v1 action conditioning."
+            )
         action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
         self.action_normalizers = {
             embodiment: ActionAffineNormalizer.from_contract(contract)
@@ -262,12 +270,14 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if unexpected:
             preview = ", ".join(sorted(unexpected)[:12])
             suffix = "" if len(unexpected) <= 12 else f" (and {len(unexpected) - 12} more)"
-            raise ValueError(f"Cosmos-Dreams checkpoint contains unexpected transformer tensors: {preview}{suffix}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual checkpoint contains unexpected transformer tensors: {preview}{suffix}"
+            )
         return loaded
 
     # -- AR-Diffusion pipeline capability ---------------------------------
 
-    def _kv_spec_for_geometry(self, geometry: CosmosDreamsGeometry) -> ARDiffusionKVCacheSpec:
+    def _kv_spec_for_geometry(self, geometry: Cosmos3NanoSimBimanualGeometry) -> ARDiffusionKVCacheSpec:
         return ARDiffusionKVCacheSpec(
             num_layers=self.transformer.num_hidden_layers,
             num_kv_heads=self.transformer.num_kv_heads_local,
@@ -289,7 +299,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
         return self._kv_spec_for_geometry(geometry)
 
-    def _request_kv_spec(self, geometry: CosmosDreamsGeometry) -> ARDiffusionRequestKVSpec:
+    def _request_kv_spec(self, geometry: Cosmos3NanoSimBimanualGeometry) -> ARDiffusionRequestKVSpec:
         return ARDiffusionRequestKVSpec(
             kv_spec=self._kv_spec_for_geometry(geometry),
             geometry_key=geometry.session_key,
@@ -300,7 +310,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         return self._request_kv_spec(geometry)
 
     def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
-        geometry = resolve_cosmos_dreams_geometry(request.sampling_params, None, self.resolution_policy)
+        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(request.sampling_params, None, self.resolution_policy)
         return self._request_kv_spec(geometry)
 
     def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
@@ -342,17 +352,17 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 f"{name}=expected {expected_value!r}, got {actual_value!r}"
                 for name, (expected_value, actual_value) in mismatches.items()
             )
-            raise ValueError(f"Cosmos-Dreams AR-Diffusion structural specification is invalid ({detail}).")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual AR-Diffusion structural specification is invalid ({detail}).")
 
     def _validate_bound_kv_geometry(
         self,
         state: Any,
-        geometry: CosmosDreamsGeometry | None = None,
+        geometry: Cosmos3NanoSimBimanualGeometry | None = None,
     ) -> None:
         """Treat every bound-pool mismatch as an internal invariant failure.
 
         ``window_frames`` and ``sink_frames`` are checkpoint-manifest semantics
-        for Cosmos-Dreams, not performance-only engine knobs, but the generic AR
+        for Cosmos3-Nano-Sim-Bimanual, not performance-only engine knobs, but the generic AR
         runner can apply deployment overrides. Startup validates those values;
         this bound-time gate defensively checks the cache that was actually built.
         """
@@ -406,15 +416,18 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 for name, (expected_value, actual_value) in mismatches.items()
             )
             raise RuntimeError(
-                f"Cosmos-Dreams bound AR-Diffusion KV cache violates the resolved model specification ({details})."
+                "Cosmos3-Nano-Sim-Bimanual bound AR-Diffusion KV cache violates the "
+                f"resolved model specification ({details})."
             )
 
     @contextmanager
     def bind_ar_diffusion_state(self, session_id, state):
         if self._ar_diffusion_kv_state is not None:
-            raise RuntimeError("Cosmos-Dreams AR-Diffusion state is already bound.")
+            raise RuntimeError("Cosmos3-Nano-Sim-Bimanual AR-Diffusion state is already bound.")
         if state.session_id != session_id:
-            raise ValueError(f"Cosmos-Dreams bound session mismatch: {state.session_id!r} != {session_id!r}.")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual bound session mismatch: {state.session_id!r} != {session_id!r}."
+            )
         self._validate_bound_kv_geometry(state)
         self._ar_diffusion_kv_state = state
         self._bound_session_id = str(session_id)
@@ -474,7 +487,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
         if not tick and state_was_new and not reset and not close_session:
             raise ARDiffusionRequestRejectedError(
-                f"Cosmos-Dreams full rollout session {session_id!r} requires reset=True at start "
+                f"Cosmos3-Nano-Sim-Bimanual full rollout session {session_id!r} requires reset=True at start "
                 "or close_session=True at end."
             )
 
@@ -483,7 +496,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     def _parse_tick(self, tick: ARDiffusionTickRequest):
         """Parse the Humanoid-owned typed action track."""
 
-        return parse_cosmos_dreams_tick(tick)
+        return parse_cosmos3_nano_sim_bimanual_tick(tick)
 
     def _resolve_request_fps(self, sp: Any, prompt_data: Any) -> float:
         """Resolve the request FPS used by prompts, mRoPE, and fingerprints."""
@@ -499,11 +512,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "FPS",
         )
 
-    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> CosmosDreamsGeometry:
+    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> Cosmos3NanoSimBimanualGeometry:
         """Resolve the serialized request canvas at worker admission."""
 
         del prompt_data
-        return resolve_cosmos_dreams_geometry(sp, None, self.resolution_policy)
+        return resolve_cosmos3_nano_sim_bimanual_geometry(sp, None, self.resolution_policy)
 
     def _resolve_requested_pixel_frames(
         self,
@@ -535,7 +548,9 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if domain_value is not None:
             domain_id = _admission_int(domain_value, "domain_id")
             if domain_id < 0:
-                raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams domain_id must be non-negative, got {domain_id}.")
+                raise ARDiffusionRequestRejectedError(
+                    f"Cosmos3-Nano-Sim-Bimanual domain_id must be non-negative, got {domain_id}."
+                )
         else:
             try:
                 domain_id = self.manifest.resolve_domain_name(str(domain_name))
@@ -543,7 +558,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if domain_id >= self.manifest.num_embodiment_domains:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams domain_id is outside the exported embodiment table: "
+                "Cosmos3-Nano-Sim-Bimanual domain_id is outside the exported embodiment table: "
                 f"{domain_id} not in [0, {self.manifest.num_embodiment_domains})."
             )
         try:
@@ -558,7 +573,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         typed_inputs: Any | None,
         request: _ActionRequestContract,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         start_frame: int,
         target_frame: int,
         prompt_data: Any = None,
@@ -568,11 +583,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         del prompt_data, geometry
         raw_action = self._prepare_raw_action(
             embodiment=request.embodiment,
-            action_value=(
-                typed_inputs.action
-                if typed_inputs is not None
-                else self._get_sp_param(sp, "action", None)
-            ),
+            action_value=(typed_inputs.action if typed_inputs is not None else self._get_sp_param(sp, "action", None)),
         )
         layout = self._resolve_action_layout(
             raw_action,
@@ -600,7 +611,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         sampling_params: Any,
         prompt_data: Any,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         fps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the Humanoid AR prompt without a system prompt."""
@@ -612,20 +623,20 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             use_system_prompt=False,
         )
 
-    def _get_or_create_state(self, session_id: str) -> CosmosDreamsSessionState:
+    def _get_or_create_state(self, session_id: str) -> Cosmos3NanoSimBimanualSessionState:
         state = self._states.get(session_id)
         if state is None:
             while len(self._states) >= self._SESSION_CAPACITY:
                 _, evicted = self._states.popitem(last=False)
                 evicted.reset()
-            state = CosmosDreamsSessionState(session_id=session_id)
+            state = Cosmos3NanoSimBimanualSessionState(session_id=session_id)
             self._states[session_id] = state
         self._states.move_to_end(session_id)
         return state
 
     def _ensure_text_kv(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -641,7 +652,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
             if real_len > self.manifest.text_cache_max_len:
                 raise ValueError(
-                    f"Cosmos-Dreams prompt exceeds text_cache_max_len: {real_len} > {self.manifest.text_cache_max_len}."
+                    "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
+                    f"{real_len} > {self.manifest.text_cache_max_len}."
                 )
             if paged_state is None:
                 cached = raw_kv
@@ -661,11 +673,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         text_ids: torch.Tensor,
         *,
         real_text_kv_len: int,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         fps: float,
         conditioning_request: Any,
-    ) -> CosmosDreamsSessionFingerprint:
-        return CosmosDreamsSessionFingerprint(
+    ) -> Cosmos3NanoSimBimanualSessionFingerprint:
+        return Cosmos3NanoSimBimanualSessionFingerprint(
             prompt_hash=prompt_token_hash(text_ids),
             real_text_kv_lengths=((self._MAIN_BRANCH, real_text_kv_len),),
             height=geometry.height,
@@ -681,9 +693,9 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _append_dense_kv(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         current_kv: list[tuple[torch.Tensor, torch.Tensor]],
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
     ) -> None:
         history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
         state.dense_kv_by_branch[self._MAIN_BRANCH] = append_dense_kv_history(
@@ -696,11 +708,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _transformer_forward(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         *,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         text_kv: list[tuple[torch.Tensor, torch.Tensor]],
         real_text_kv_len: int,
         frame_start: int,
@@ -708,7 +720,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         conditioning_kwargs: Mapping[str, Any],
         condition_vision: bool,
         commit_current: bool,
-    ) -> CosmosDreamsTransformerOutput:
+    ) -> Cosmos3NanoSimBimanualTransformerOutput:
         paged_state = self._ar_diffusion_kv_state
         tokens_per_frame = geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame)
         seq_len = hidden_states.shape[2] * tokens_per_frame
@@ -757,7 +769,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         expected_raw_action_dim = self.manifest.raw_action_dim_for(embodiment)
         if action.shape[-1] != expected_raw_action_dim:
             raise ValueError(
-                f"Cosmos-Dreams embodiment {embodiment!r} requires raw action dimension "
+                f"Cosmos3-Nano-Sim-Bimanual embodiment {embodiment!r} requires raw action dimension "
                 f"{expected_raw_action_dim}, got {action.shape[-1]}."
             )
         action = self.action_normalizers[embodiment].normalize(action)
@@ -792,7 +804,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if rows == local_rows:
             return "local"
         raise ARDiffusionRequestRejectedError(
-            "Cosmos-Dreams action length cannot cover the requested latent frames: "
+            "Cosmos3-Nano-Sim-Bimanual action length cannot cover the requested latent frames: "
             f"rows={rows}, frame_range=[{start_frame}, {target_frame}), "
             f"expected local rows={local_rows} or at least global rows={global_rows}."
         )
@@ -838,7 +850,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         self,
         prompt_data: Any,
         sp: Any,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
     ) -> torch.Tensor | None:
         explicit = self._get_sp_param(sp, "initial_latent", None)
         if explicit is not None:
@@ -853,7 +865,9 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 geometry.latent_width,
             )
             if tuple(latent.shape) != expected:
-                raise ValueError(f"Cosmos-Dreams initial_latent must have shape {expected}, got {tuple(latent.shape)}.")
+                raise ValueError(
+                    f"Cosmos3-Nano-Sim-Bimanual initial_latent must have shape {expected}, got {tuple(latent.shape)}."
+                )
             return latent.to(device=self.device, dtype=self.dtype)
 
         if isinstance(prompt_data, str):
@@ -864,13 +878,14 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if image is None and isinstance(video, torch.Tensor):
             if video.ndim != 5:
                 raise ValueError(
-                    f"Cosmos-Dreams preprocessed video must have shape [1,3,T,H,W], got {tuple(video.shape)}."
+                    "Cosmos3-Nano-Sim-Bimanual preprocessed video must have shape "
+                    f"[1,3,T,H,W], got {tuple(video.shape)}."
                 )
             image = video[:, :, 0]
         if image is None:
             return None
         if not isinstance(image, torch.Tensor):
-            raise TypeError("Cosmos-Dreams preprocessed image must be a torch.Tensor.")
+            raise TypeError("Cosmos3-Nano-Sim-Bimanual preprocessed image must be a torch.Tensor.")
         latent = self._encode_conditioning_image_latent(image)
         expected = (
             1,
@@ -881,17 +896,17 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if tuple(latent.shape) != expected:
             raise ValueError(
-                "Cosmos-Dreams encoded conditioning media does not match resolved geometry: "
+                "Cosmos3-Nano-Sim-Bimanual encoded conditioning media does not match resolved geometry: "
                 f"expected {expected}, got {tuple(latent.shape)}."
             )
         return latent
 
     def _commit_clean_frame(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         latent: torch.Tensor,
         *,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         frame_idx: int,
         text_kv: list[tuple[torch.Tensor, torch.Tensor]],
         real_text_kv_len: int,
@@ -914,9 +929,9 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _denoise_chunk(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         *,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         chunk_start: int,
         chunk_end: int,
         seed: int,
@@ -971,9 +986,9 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _run_chunk(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         *,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         chunk_start: int,
         chunk_end: int,
         target_frame: int,
@@ -1047,10 +1062,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _prefill_first_frame(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         initial_latent: torch.Tensor | None,
         *,
-        geometry: CosmosDreamsGeometry,
+        geometry: Cosmos3NanoSimBimanualGeometry,
         target_frame: int,
         terminal_request: bool,
         request_start_frame: int,
@@ -1105,7 +1120,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _decode_live_latents(
         self,
-        state: CosmosDreamsSessionState,
+        state: Cosmos3NanoSimBimanualSessionState,
         latents: torch.Tensor,
     ) -> torch.Tensor:
         """Decode only the new tick block with session-owned Wan features."""
@@ -1172,7 +1187,9 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         # created, initialized, evicted, or written before it completes: the
         # rejection contract promises the client an unchanged session.
         if len(req.prompts) != 1:
-            raise ARDiffusionRequestRejectedError("CosmosDreamsPipeline supports exactly one prompt per request.")
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos3NanoSimBimanualPipeline supports exactly one prompt per request."
+            )
         prompt_data = req.prompts[0]
         if isinstance(prompt_data, str):
             prompt = prompt_data
@@ -1180,13 +1197,13 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             prompt = str(prompt_data.get("prompt", ""))
         else:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams prompt input must be a string or a mapping with a 'prompt' field."
+                "Cosmos3-Nano-Sim-Bimanual prompt input must be a string or a mapping with a 'prompt' field."
             )
         sp = req.sampling_params
         extra = {} if sp.extra_args is None else sp.extra_args
         if not isinstance(extra, Mapping):
             raise ARDiffusionRequestRejectedError(
-                f"Cosmos-Dreams extra_args must be a mapping, got {type(extra).__name__}."
+                f"Cosmos3-Nano-Sim-Bimanual extra_args must be a mapping, got {type(extra).__name__}."
             )
         try:
             typed_tick = ARDiffusionTickRequest.from_extra_args(extra)
@@ -1196,11 +1213,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if typed_tick is not None:
             if self._ar_diffusion_kv_state is None:
                 raise ARDiffusionRequestRejectedError(
-                    "Cosmos-Dreams typed ticks require ARDiffusionEngine session binding."
+                    "Cosmos3-Nano-Sim-Bimanual typed ticks require ARDiffusionEngine session binding."
                 )
             if typed_tick.prompt is not None and typed_tick.prompt != prompt:
                 raise ARDiffusionRequestRejectedError(
-                    "Cosmos-Dreams ar_diffusion_tick.prompt must match the standard request prompt."
+                    "Cosmos3-Nano-Sim-Bimanual ar_diffusion_tick.prompt must match the standard request prompt."
                 )
         session_id = str(
             typed_tick.session_id
@@ -1209,7 +1226,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if self._bound_session_id is not None and session_id != self._bound_session_id:
             raise ARDiffusionRequestRejectedError(
-                f"Cosmos-Dreams request session {session_id!r} does not match bound session {self._bound_session_id!r}."
+                "Cosmos3-Nano-Sim-Bimanual request session "
+                f"{session_id!r} does not match bound session {self._bound_session_id!r}."
             )
 
         reset = typed_tick.reset if typed_tick is not None else bool(extra.get("reset", False))
@@ -1244,7 +1262,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             self._validate_bound_kv_geometry(self._ar_diffusion_kv_state, geometry)
         fps = self._resolve_request_fps(sp, prompt_data)
         if not math.isfinite(fps) or fps <= 0:
-            raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
+            raise ARDiffusionRequestRejectedError(f"Cosmos3-Nano-Sim-Bimanual FPS must be positive, got {fps}.")
         conditioning_request = self._validate_conditioning_request(
             sp,
             typed_inputs,
@@ -1257,11 +1275,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if guidance_scale != 1.0:
             raise ARDiffusionRequestRejectedError(
-                f"Cosmos-Dreams distilled inference requires guidance_scale=1.0, got {guidance_scale}."
+                f"Cosmos3-Nano-Sim-Bimanual distilled inference requires guidance_scale=1.0, got {guidance_scale}."
             )
         if sp.num_inference_steps not in (None, self._distilled_num_steps):
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams distilled inference uses the checkpoint-defined four-step schedule; "
+                "Cosmos3-Nano-Sim-Bimanual distilled inference uses the checkpoint-defined four-step schedule; "
                 f"got num_inference_steps={sp.num_inference_steps}."
             )
 
@@ -1275,7 +1293,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         real_text_kv_len = int(text_mask[0].sum().item())
         if real_text_kv_len > self.manifest.text_cache_max_len:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams prompt exceeds text_cache_max_len: "
+                "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
                 f"{real_text_kv_len} > {self.manifest.text_cache_max_len}."
             )
         fingerprint = self._fingerprint(
@@ -1293,7 +1311,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if state_was_new:
             if requested_frame_idx != 0:
                 raise ARDiffusionRequestRejectedError(
-                    f"Cosmos-Dreams new sessions must start at latent frame 0; got {requested_frame_idx}."
+                    f"Cosmos3-Nano-Sim-Bimanual new sessions must start at latent frame 0; got {requested_frame_idx}."
                 )
         else:
             try:
@@ -1302,7 +1320,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(str(exc)) from exc
             if tick and existing_state.tick_output_type not in (None, tick_output_type):
                 raise ARDiffusionRequestRejectedError(
-                    "Cosmos-Dreams tick output_type cannot change within a session; session reset required."
+                    "Cosmos3-Nano-Sim-Bimanual tick output_type cannot change within a session; session reset required."
                 )
 
         try:
@@ -1311,7 +1329,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if start_frame > 0 and initial_latent is not None:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams initial media may only be supplied at frame 0; session reset required."
+                "Cosmos3-Nano-Sim-Bimanual initial media may only be supplied at frame 0; session reset required."
             )
 
         requested_pixel_frames: int | None = None
@@ -1326,7 +1344,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
             if tick_frames <= 0:
                 raise ARDiffusionRequestRejectedError(
-                    f"Cosmos-Dreams num_latent_frames must be positive, got {tick_frames}."
+                    f"Cosmos3-Nano-Sim-Bimanual num_latent_frames must be positive, got {tick_frames}."
                 )
             target_frame = start_frame + tick_frames
             # Frame zero is the singleton causal prefix. A normal first tick
@@ -1336,7 +1354,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 target_frame += 1
             if not close_session and (target_frame - 1) % self.manifest.chunk_size != 0:
                 raise ARDiffusionRequestRejectedError(
-                    "Cosmos-Dreams non-terminal ticks must end on a canonical [1,4,4,...] "
+                    "Cosmos3-Nano-Sim-Bimanual non-terminal ticks must end on a canonical [1,4,4,...] "
                     f"chunk boundary, got target latent frame {target_frame}."
                 )
         else:
@@ -1347,12 +1365,13 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
             if requested_pixel_frames <= 0:
                 raise ARDiffusionRequestRejectedError(
-                    f"Cosmos-Dreams num_frames must be positive, got {requested_pixel_frames}."
+                    f"Cosmos3-Nano-Sim-Bimanual num_frames must be positive, got {requested_pixel_frames}."
                 )
             target_frame = (requested_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
             if target_frame < start_frame:
                 raise ARDiffusionRequestRejectedError(
-                    "Cosmos-Dreams full rollout target precedes existing session state; session reset required."
+                    "Cosmos3-Nano-Sim-Bimanual full rollout target precedes existing "
+                    "session state; session reset required."
                 )
         try:
             conditioning = self._prepare_conditioning(
@@ -1428,11 +1447,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             request_latent_chunks.append(clean_chunk)
 
         if not request_latent_chunks:
-            raise RuntimeError("Cosmos-Dreams request produced no new latent frames.")
+            raise RuntimeError("Cosmos3-Nano-Sim-Bimanual request produced no new latent frames.")
         request_latents = torch.cat(request_latent_chunks, dim=2)
         accumulated = state.accumulated_latents
         if not tick and accumulated is None:
-            raise RuntimeError("Cosmos-Dreams full rollout produced no accumulated latent frames.")
+            raise RuntimeError("Cosmos3-Nano-Sim-Bimanual full rollout produced no accumulated latent frames.")
         if sp.output_type == "latent":
             output_value = request_latents if tick else accumulated
         else:

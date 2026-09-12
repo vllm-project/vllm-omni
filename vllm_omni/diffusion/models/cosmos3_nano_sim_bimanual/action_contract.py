@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cosmos-Dreams action contract as consumed by inference.
+"""Cosmos3-Nano-Sim-Bimanual action contract as consumed by inference.
 
 The exported artifact also records how it was produced: the training
 experiment, the dataset classes it was resolved from, and the repository
@@ -35,7 +35,7 @@ def float32_value(value: float) -> float:
 
     result = struct.unpack("!f", struct.pack("!f", float(value)))[0]
     if not math.isfinite(result):
-        raise ValueError(f"Cosmos-Dreams action-contract value must be finite, got {value!r}.")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual action-contract value must be finite, got {value!r}.")
     return 0.0 if result == 0.0 else result
 
 
@@ -115,13 +115,13 @@ class AffineTransform(_StrictModel):
     @model_validator(mode="after")
     def validate_parameters(self) -> AffineTransform:
         if not self.offset or len(self.offset) != len(self.scale):
-            raise ValueError("Cosmos-Dreams normalizer offset/scale must have equal non-zero lengths.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual normalizer offset/scale must have equal non-zero lengths.")
         canonical_offset = tuple(float32_value(value) for value in self.offset)
         canonical_scale = tuple(float32_value(value) for value in self.scale)
         if canonical_offset != self.offset or canonical_scale != self.scale:
-            raise ValueError("Cosmos-Dreams normalizer offset/scale must be encoded at float32 precision.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual normalizer offset/scale must be encoded at float32 precision.")
         if any(value <= 0.0 for value in self.scale):
-            raise ValueError("Cosmos-Dreams normalizer scales must be strictly positive.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual normalizer scales must be strictly positive.")
         return self
 
 
@@ -154,7 +154,7 @@ class QuantileRotNormalizerContract(_StrictModel):
         expected = canonical_sha256(self.behavioral_payload())
         if self.transform_sha256 != expected:
             raise ValueError(
-                "Cosmos-Dreams normalizer transform_sha256 does not match its behavioral payload: "
+                "Cosmos3-Nano-Sim-Bimanual normalizer transform_sha256 does not match its behavioral payload: "
                 f"expected {expected}, got {self.transform_sha256}."
             )
         return self
@@ -185,7 +185,7 @@ class PoseScaleNormalizerContract(_StrictModel):
     def verify_transform(self) -> PoseScaleNormalizerContract:
         if len(self.transform.offset) != CAMERA_RAW_ACTION_DIM:
             raise ValueError(
-                "Cosmos-Dreams pose_scale offset/scale lengths must equal raw_action_dim=9, "
+                "Cosmos3-Nano-Sim-Bimanual pose_scale offset/scale lengths must equal raw_action_dim=9, "
                 f"got {len(self.transform.offset)} and {len(self.transform.scale)}."
             )
         expected_offset = (0.0,) * CAMERA_RAW_ACTION_DIM
@@ -194,12 +194,13 @@ class PoseScaleNormalizerContract(_StrictModel):
         ) * (CAMERA_RAW_ACTION_DIM - 3)
         if self.transform.offset != expected_offset or self.transform.scale != expected_scale:
             raise ValueError(
-                "Cosmos-Dreams pose_scale transform does not match its translation_scale/rotation_scale derivation."
+                "Cosmos3-Nano-Sim-Bimanual pose_scale transform does not match its "
+                "translation_scale/rotation_scale derivation."
             )
         expected_hash = canonical_sha256(self.behavioral_payload())
         if self.transform_sha256 != expected_hash:
             raise ValueError(
-                "Cosmos-Dreams normalizer transform_sha256 does not match its behavioral payload: "
+                "Cosmos3-Nano-Sim-Bimanual normalizer transform_sha256 does not match its behavioral payload: "
                 f"expected {expected_hash}, got {self.transform_sha256}."
             )
         return self
@@ -211,7 +212,7 @@ ActionNormalizerContract = Annotated[
 ]
 
 
-class CosmosDreamsEmbodimentContract(_StrictModel):
+class Cosmos3NanoSimBimanualEmbodimentContract(_StrictModel):
     """Per-embodiment raw action semantics."""
 
     domain_id: StrictInt = Field(ge=0, lt=NUM_EMBODIMENT_DOMAINS)
@@ -220,18 +221,18 @@ class CosmosDreamsEmbodimentContract(_StrictModel):
     normalizer: ActionNormalizerContract
 
     @model_validator(mode="after")
-    def verify_normalizer_width(self) -> CosmosDreamsEmbodimentContract:
+    def verify_normalizer_width(self) -> Cosmos3NanoSimBimanualEmbodimentContract:
         # A normalizer narrower or wider than the declared raw width would
         # accept a request-shaped action and then fail inside normalize().
         if len(self.normalizer.transform.offset) != self.raw_action_dim:
             raise ValueError(
-                f"Cosmos-Dreams normalizer dimension must equal raw_action_dim={self.raw_action_dim}, "
+                f"Cosmos3-Nano-Sim-Bimanual normalizer dimension must equal raw_action_dim={self.raw_action_dim}, "
                 f"got {len(self.normalizer.transform.offset)}."
             )
         return self
 
 
-class CosmosDreamsActionSchema(_StrictModel):
+class Cosmos3NanoSimBimanualActionSchema(_StrictModel):
     """Per-embodiment action contract for action-conditioned checkpoints."""
 
     schema_version: Literal[3]
@@ -239,7 +240,7 @@ class CosmosDreamsActionSchema(_StrictModel):
     model_action_dim: Literal[64]
     num_embodiment_domains: Literal[32]
     default_embodiment: str = Field(min_length=1)
-    embodiments: dict[str, CosmosDreamsEmbodimentContract]
+    embodiments: dict[str, Cosmos3NanoSimBimanualEmbodimentContract]
     padding: ActionPadding
     training_config_excerpt: Provenance | None = None
     contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -286,20 +287,20 @@ class CosmosDreamsActionSchema(_StrictModel):
     def validate_temporal_compression_factor(self, temporal_compression_factor: int) -> None:
         if self.action_tokens_per_frame != temporal_compression_factor:
             raise ValueError(
-                "Cosmos-Dreams action_tokens_per_frame must equal temporal_compression_factor; "
+                "Cosmos3-Nano-Sim-Bimanual action_tokens_per_frame must equal temporal_compression_factor; "
                 f"got {self.action_tokens_per_frame} and {temporal_compression_factor}"
             )
 
     @model_validator(mode="after")
-    def verify_target_contract(self) -> CosmosDreamsActionSchema:
+    def verify_target_contract(self) -> Cosmos3NanoSimBimanualActionSchema:
         if not self.embodiments:
-            raise ValueError("Cosmos-Dreams action contract must declare at least one embodiment.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual action contract must declare at least one embodiment.")
         if self.default_embodiment not in self.embodiments:
-            raise ValueError("Cosmos-Dreams default_embodiment must name one declared embodiment.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual default_embodiment must name one declared embodiment.")
         expected = canonical_sha256(self.behavioral_payload())
         if self.contract_sha256 != expected:
             raise ValueError(
-                "Cosmos-Dreams action contract_sha256 does not match its behavioral payload: "
+                "Cosmos3-Nano-Sim-Bimanual action contract_sha256 does not match its behavioral payload: "
                 f"expected {expected}, got {self.contract_sha256}."
             )
         return self
@@ -316,20 +317,22 @@ class CosmosDreamsActionSchema(_StrictModel):
             elif len(candidates) == 1:
                 embodiment = candidates[0]
             elif not candidates:
-                raise ValueError(f"No Cosmos-Dreams embodiment uses domain_id={domain_id}.")
+                raise ValueError(f"No Cosmos3-Nano-Sim-Bimanual embodiment uses domain_id={domain_id}.")
             else:
                 raise ValueError(
-                    f"Cosmos-Dreams domain_id={domain_id} is ambiguous across {sorted(candidates)}; "
+                    f"Cosmos3-Nano-Sim-Bimanual domain_id={domain_id} is ambiguous across {sorted(candidates)}; "
                     "supply an embodiment name."
                 )
         else:
             embodiment = str(name).strip().lower()
         if embodiment not in self.embodiments:
-            raise ValueError(f"Unknown Cosmos-Dreams embodiment {name!r}; expected one of {sorted(self.embodiments)}.")
+            raise ValueError(
+                f"Unknown Cosmos3-Nano-Sim-Bimanual embodiment {name!r}; expected one of {sorted(self.embodiments)}."
+            )
         expected_domain = self.embodiments[embodiment].domain_id
         if domain_id is not None and int(domain_id) != expected_domain:
             raise ValueError(
-                "Cosmos-Dreams embodiment/domain mismatch: "
+                "Cosmos3-Nano-Sim-Bimanual embodiment/domain mismatch: "
                 f"{embodiment!r} requires domain_id={expected_domain}, got {domain_id}."
             )
         return embodiment

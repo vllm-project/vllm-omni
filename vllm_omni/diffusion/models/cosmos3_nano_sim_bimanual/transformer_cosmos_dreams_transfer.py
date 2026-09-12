@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import torch
 
-from vllm_omni.diffusion.models.cosmos_dreams.conditioning_control import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.conditioning_control import (
     build_shared_vision_mrope_position_ids,
     pack_pure_vision_tokens,
     unpack_pure_vision_tokens,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.transformer_cosmos_dreams import (
-    CosmosDreamsTransformer,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualTransformer,
 )
 
 
-class CosmosDreamsTransferTransformer(CosmosDreamsTransformer):
+class CosmosDreamsTransferTransformer(Cosmos3NanoSimBimanualTransformer):
     """Pure-vision Transfer variant with no action modules or weights."""
 
     def _validate_conditioning_config(self) -> None:

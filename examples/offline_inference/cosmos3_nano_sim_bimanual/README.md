@@ -1,4 +1,4 @@
-# Cosmos-Dreams offline parity runner
+# Cosmos3-Nano-Sim-Bimanual offline parity runner
 
 This runner accepts the reference interactive JSONL plus an optional NPZ
 payload. A record may contain `prompt`/`ai_caption`, `input_video`/`video`/`image`,
@@ -16,13 +16,13 @@ For checkpoints containing multiple legacy YAM datasets, select `abc_yam`,
 retaining distinct normalizers.
 
 ```bash
-python examples/offline_inference/cosmos_dreams/cosmos_dreams.py \
-  --model /checkpoints/cosmos-dreams-diffusers \
+python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+  --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl /data/reference_samples.jsonl \
   --sample-index 0 \
   --num-frames 601 \
   --seed 42 \
-  --output cosmos_dreams_sample_0.mp4
+  --output cosmos3_nano_sim_bimanual_sample_0.mp4
 ```
 
 Use `--output-type latent --output sample_0.pt` for the pre-VAE parity gate.
@@ -44,10 +44,10 @@ selected hint object. T1 accepts only full clips with `F >= 17` and
 The Transfer source priority is the input vision clip, then `control_video`,
 then the selected hint's `control` or `control_path`. Its aspect ratio is
 snapped to the requested canonical bucket family and the resulting dimensions
-are validated by the same Cosmos-Dreams policy used during model execution.
+are validated by the same Cosmos3-Nano-Sim-Bimanual policy used during model execution.
 
 ```bash
-python examples/offline_inference/cosmos_dreams/cosmos_dreams_transfer.py \
+python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos_dreams_transfer.py \
   --model /checkpoints/cosmos-dreams-transfer-diffusers \
   --input-json /data/transfer_video_edge.json \
   --resolution 480 \
