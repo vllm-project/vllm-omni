@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax Music 3 pipeline topology: AR talker -> acoustic decoder.
 
 Stage 0 ``minimax_music3_ar``: a Qwen3 backbone (the repo's ``language_model/``
@@ -71,6 +71,7 @@ MINIMAX_MUSIC3_PIPELINE = PipelineConfig(
             # more to the point, stage 0 produces chunks rather than parking on
             # them, so it never holds a runner slot while waiting for one.
             extras={"tts_args": {"max_instructions_length": _MAX_INSTRUCTIONS_LENGTH}},
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

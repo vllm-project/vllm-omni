@@ -54,6 +54,7 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             sampling_constraints={
                 "detokenize": False,
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

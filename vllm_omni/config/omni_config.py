@@ -458,6 +458,10 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    # Topology-owned mirror of StagePipelineConfig.recompute_preemption.
+    # Projected in _build_model_config; not an engine-override owner. The
+    # scheduler still reads OmniModelConfig until RFC #4021 consumers switch.
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str] | None = None
     allowed_local_media_path: str | None = None
@@ -1723,6 +1727,7 @@ def _build_model_config(
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
     kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
+    kwargs["recompute_preemption"] = topology.recompute_preemption
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None

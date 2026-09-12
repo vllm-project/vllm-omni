@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-Omni-MoE pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation
@@ -59,6 +59,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            recompute_preemption="fail",
             requires_full_payload_input=True,
         ),
         StagePipelineConfig(

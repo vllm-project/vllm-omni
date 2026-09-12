@@ -30,6 +30,7 @@ VOXTRAL_TTS_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.generator2tokenizer_async_chunk"),
             sampling_constraints={"detokenize": True},
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AURA Omni pipeline topology.
 
 Semantic modules:
@@ -67,6 +67,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=3,

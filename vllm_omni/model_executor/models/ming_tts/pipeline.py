@@ -35,6 +35,7 @@ MING_TTS_PIPELINE = PipelineConfig(
                 "max_tokens": 512,
                 "detokenize": True,
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
