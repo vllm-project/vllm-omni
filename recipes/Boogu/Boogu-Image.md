@@ -384,6 +384,45 @@ curl -s http://localhost:8091/v1/chat/completions \
   supports Boogu-Image-Edit directly
   (`--model Boogu/Boogu-Image-0.1-Edit --guidance-scale 5.0`, optional
   `--guidance-scale-2`).
+- **Request batching (`--max-num-seqs > 1`) is not bit-exact vs. serial.**
+  Compatible TI2I requests (same task type, same `guidance_scale_2`
+  explicitness) can share one forward pass. The instruction encoder batches
+  with `padding="longest"`, so a request's *padded batch shape* depends on
+  whichever partner request(s) happen to co-arrive, even though production
+  RoPE derives each row's own effective position count from that row's own
+  `attention_mask.sum()` rather than from the batch's padded width. In the
+  measurements below, `--max-num-seqs 1` and `--max-num-seqs > 1` do not
+  produce pixel-identical output for the same seed; the exact mechanism
+  (padding-shape-dependent kernel/reduction-order numerics vs. some other
+  batch-shape effect) has not been isolated, so treat this as an observed
+  drift under the specific configs below, not a diagnosed root cause, and
+  do not extrapolate the numbers below as a general upper bound on other
+  configs. Two distinct regimes have been measured so far, and they are
+  **not** interchangeable tolerances:
+    - **Fixed-shape co-batch** (partner instructions encode to the same
+      length): `Boogu-Image-0.1-Edit`, 512x512, 20 steps, guidance 5/2, one
+      fixed reference image and instruction pair, seeds 42-73, B=2 vs. serial
+      -- mean pixel MAE **1.70/255**, max per-image MAE **2.68/255**, min PSNR
+      **34.35 dB** (2/32 image pairs were pixel-exact).
+    - **Heterogeneous partner length** (co-batched instructions encode to
+      different lengths): MAD **2.6-6.0** in the fixed-length partner-mixing
+      check on this PR's test head -- larger than the fixed-shape case above
+      in that check. A targeted current-head A/B run observed a comparable
+      range: `Boogu-Image-0.1-Edit`, 512x512, 20 steps, guidance 5/2, one
+      fixed A request (5-token instruction) co-batched in turn with a
+      2-token and a 49-token partner instruction (both also differing in
+      reference image and content, not length alone; `max_num_seqs=2`,
+      co-batching verified via request tracing, not assumed) --
+      solo vs. `A`+2-token partner MAD **4.06/255** (PSNR 29.9 dB),
+      solo vs. `A`+49-token partner MAD **3.87/255** (PSNR 29.7 dB),
+      2-token vs. 49-token partner MAD **4.05/255** (PSNR 30.2 dB). A
+      controlled ablation (same partner content/reference, varying only
+      instruction length) would be needed to isolate a pure length effect,
+      and has not been run.
+  Pin `--max-num-seqs 1` for any workload that requires strict
+  serial-reproducibility (e.g. golden-image regression tests); use
+  `--max-num-seqs > 1` only when this drift is acceptable for the throughput
+  gain.
 
 ## Fast image editing (Boogu-Image-0.1-Edit-Turbo)
 

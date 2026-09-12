@@ -600,3 +600,112 @@ def test_transformer_forward_ti2i_shape():
 
     assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
     assert torch.isfinite(out).all()
+
+
+def test_transformer_forward_batch_invariant_to_partner_padding():
+    """Row A must not change when only row B's padded length changes.
+
+    Both rows carry a non-empty reference image (the TI2I/editing path), so
+    this exercises the reference-image refiner and the joint
+    instruction/reference/noise sequence concatenation and position
+    offsets -- not just the T2I path, which skips the reference refiner
+    entirely and would leave that concatenation logic uncovered. Real
+    attention masking, RoPE, and sequence concatenation are exercised
+    end-to-end through the actual (tiny) weights -- the mechanism the CPU
+    pipeline-level fakes in ``test_pipeline_boogu_image.py`` cannot reach,
+    since those stop at a fake encoder/transformer boundary. A's instruction
+    content, reference latent, and attention mask are held byte-identical
+    across runs; only B's padded region grows.
+    """
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    _randomize_parameters(model)
+    # _randomize_parameters' uniform(-0.02, 0.02) scale (tuned for the other
+    # shape/finite-value tests in this file) makes the instruction stream's
+    # contribution to the final output smaller than float32 rounding noise
+    # after 4 layers of untrained mixing with the image latents -- both the
+    # invariance check and the negative control below were passing/failing
+    # vacuously at that scale (diffs ~1e-6) until confirmed via a scaled-up
+    # diagnostic that masking is in fact respected; amplify locally so a real
+    # masking regression is distinguishable from noise.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.mul_(20.0)
+    model.eval()
+
+    batch_size = 2
+    in_channels = 4
+    latent_h = latent_w = 8
+    instruction_feat_dim = 32
+    a_len = 5
+
+    torch.manual_seed(0)
+    latents = torch.randn(batch_size, in_channels, latent_h, latent_w)
+    timestep = torch.full((batch_size,), 0.5)
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(model.axes_dim_rope, model.axes_lens, theta=10000)
+    a_content = torch.randn(a_len, instruction_feat_dim)
+    # Non-empty, fixed per-row reference latents route both rows through the
+    # TI2I reference-image refiner and the joint instruction/reference/noise
+    # concatenation, rather than the T2I path (which skips both entirely).
+    a_ref = torch.randn(in_channels, 6, 10)
+    b_ref = torch.randn(in_channels, 6, 10)
+    ref_image_hidden_states = [[a_ref], [b_ref]]
+
+    def run(b_len, a_mask_len=a_len, a_tail_value=0.0):
+        """``a_mask_len`` marks how many of row A's leading positions are valid.
+
+        Real usage always leaves it at ``a_len``; the negative control below
+        widens it to include A's own padding tail so that tail's content
+        starts to matter, proving the invariance check exercises real
+        masking rather than an architecture that ignores trailing positions
+        regardless of the mask.
+        """
+        width = max(a_len, b_len)
+        instruction_hidden_states = torch.zeros(batch_size, width, instruction_feat_dim)
+        instruction_hidden_states[0, :a_len] = a_content
+        if width > a_len:
+            instruction_hidden_states[0, a_len:] = a_tail_value
+        torch.manual_seed(100 + b_len)
+        instruction_hidden_states[1, :b_len] = torch.randn(b_len, instruction_feat_dim)
+
+        instruction_attention_mask = torch.zeros(batch_size, width, dtype=torch.bool)
+        instruction_attention_mask[0, :a_mask_len] = True
+        instruction_attention_mask[1, :b_len] = True
+
+        with torch.no_grad():
+            return model(
+                latents,
+                timestep,
+                instruction_hidden_states,
+                freqs_real,
+                instruction_attention_mask,
+                ref_image_hidden_states=ref_image_hidden_states,
+            )
+
+    out_short_b = run(b_len=3)
+    out_long_b = run(b_len=8)  # B now sits in a much wider padded batch than A.
+
+    torch.testing.assert_close(
+        out_short_b[0],
+        out_long_b[0],
+        rtol=1e-4,
+        atol=1e-4,
+        msg="row A changed when only B's padded length grew",
+    )
+
+    # Negative control: mark A's own padding tail "valid" (mask length ==
+    # full width) and show that what sits there now measurably changes A's
+    # output -- a magnitude-based outlier there did not (SDPA masking makes
+    # softmax weight on a correctly-excluded position exactly zero regardless
+    # of its magnitude), so this instead varies the tail's *content* under a
+    # broken mask and checks the two runs diverge.
+    width = max(a_len, 8)
+    tail_x = torch.randn(width - a_len, instruction_feat_dim)
+    tail_y = torch.randn(width - a_len, instruction_feat_dim)
+    out_broken_x = run(b_len=8, a_mask_len=width, a_tail_value=tail_x)
+    out_broken_y = run(b_len=8, a_mask_len=width, a_tail_value=tail_y)
+    assert not torch.allclose(out_broken_x[0], out_broken_y[0], rtol=1e-4, atol=1e-4)

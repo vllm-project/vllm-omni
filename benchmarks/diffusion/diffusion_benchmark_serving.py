@@ -1101,6 +1101,11 @@ def calculate_metrics(
     error_outputs = [o for o in outputs if not o.success]
 
     num_success = len(success_outputs)
+    error_log_path = os.environ.get("BENCH_ERROR_LOG")
+    if error_outputs and error_log_path:
+        with open(error_log_path, "a") as f:
+            for output in error_outputs:
+                f.write(f"ERROR latency={output.latency:.3f} detail={output.error!r}\n")
     latencies = [o.latency for o in success_outputs]
     peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
