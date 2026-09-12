@@ -126,7 +126,7 @@ def extract_omni_serve_subparser_init():
                         "_ensure_vllm_platform": lambda: None,  # no-op for doc
                         "_nonneg_finite_float": float,
                         "_json_object": json.loads,
-                        "_parse_stage_overrides": __import__("json").loads,
+                        "_parse_stage_overrides": json.loads,
                         "VLLM_SUBCMD_PARSER_EPILOG": "",
                         "logger": logger,
                         "DummySubparsers": DummySubparsers,

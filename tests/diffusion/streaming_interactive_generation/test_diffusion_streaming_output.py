@@ -308,7 +308,7 @@ class TestPipelineStreamingOutputToEntrypoint:
 
         mocker.patch(
             "vllm_omni.entrypoints.openai.serving_video_output_stream.create_streaming_video_encoder",
-            lambda *, output_format, fps, video_codec_options=None: FakeStreamingVideoEncoder(),
+            lambda *, output_format, fps, video_codec_options=None, video_codec=None: FakeStreamingVideoEncoder(),
         )
         mocker.patch(
             "vllm_omni.entrypoints.openai.serving_video_output_stream.is_video_generation_pipeline",

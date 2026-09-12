@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for `/v1/realtime/video` WebSocket video output streaming."""
 
 from __future__ import annotations
@@ -17,8 +17,12 @@ from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
 from tests.helpers.media import generate_synthetic_image
+from vllm_omni.diffusion.data import VideoOutputTransportConfig
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
-from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.serving_video_output_stream import (
+    OmniStreamingVideoOutputHandler,
+    _SessionProgress,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -68,8 +72,8 @@ def _build_test_app(
         def close(self):
             return final_chunk
 
-    def _make_encoder(*, output_format, fps, video_codec_options=None):
-        del output_format, fps, video_codec_options
+    def _make_encoder(*, output_format, fps, video_codec_options=None, video_codec=None):
+        del output_format, fps, video_codec_options, video_codec
         return FakeStreamingVideoEncoder()
 
     encoder_factory = mocker.MagicMock(side_effect=_make_encoder)
@@ -154,6 +158,33 @@ class TestStreamingVideoOutputWebSocket:
         _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
 
         assert sampling_params.quality == "high"
+
+    def test_invalid_codec_is_rejected_before_prompt_preparation(self, mocker: MockerFixture) -> None:
+        async def mock_generate(*_args, **_kwargs):
+            if False:
+                yield None
+
+        _app, handler, engine_client = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[],
+            mock_generate=mock_generate,
+        )
+        engine_client.get_diffusion_od_config.return_value = mocker.Mock(
+            video_output_transport=VideoOutputTransportConfig(
+                output_format="webm",
+                video_codec="libvpx-vp9",
+            )
+        )
+        prepare = mocker.patch.object(handler, "_build_prompt_and_sampling_params", new=mocker.AsyncMock())
+        request = VideoGenerationRequest(prompt="invalid streaming codec")
+
+        async def consume_first_chunk() -> None:
+            stream = handler._stream_video_bytes(request, "stream-invalid-codec", "m4s", _SessionProgress())
+            await anext(stream)
+
+        with pytest.raises(ValueError, match="incompatible with 'mp4'"):
+            asyncio.run(consume_first_chunk())
+        prepare.assert_not_awaited()
 
     def test_streaming_session_emits_video_start_binary_chunks_and_done(self, mocker: MockerFixture):
         """A full session delivers video.start, binary chunks, then session.done."""

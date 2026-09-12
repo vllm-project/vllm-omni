@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """WebSocket handler for streaming generated video chunks.
 
 Protocol:
@@ -56,6 +56,8 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     StreamingVideoFormat,
     create_streaming_video_encoder,
     decode_input_reference,
+    resolve_video_output_settings,
+    without_video_output_overrides,
 )
 from vllm_omni.inputs.data import (
     OmniDiffusionSamplingParams,
@@ -460,16 +462,20 @@ class OmniStreamingVideoOutputHandler:
         progress: _SessionProgress,
     ) -> AsyncGenerator[tuple[bytes, dict[str, Any]], None]:
         """Yield encoded video bytes from diffusion streaming outputs."""
+        settings = resolve_video_output_settings(
+            self._engine_client,
+            request.extra_params,
+            low_latency=True,
+            force_output_format="mp4",
+        )
         prompt, gen_params, vp = await self._build_prompt_and_sampling_params(request)
-        video_codec_options = {"preset": "ultrafast", "threads": "0", "tune": "zerolatency"}
-        if isinstance(request.extra_params, dict) and "video_codec_options" in request.extra_params:
-            video_codec_options = request.extra_params["video_codec_options"]
 
         output_fps = vp.fps or gen_params.resolved_frame_rate or 16
         encoder = create_streaming_video_encoder(
             output_format=output_format,
             fps=output_fps,
-            video_codec_options=video_codec_options,
+            video_codec=settings.codec,
+            video_codec_options=settings.codec_options,
         )
         completed = False
         try:
@@ -556,7 +562,7 @@ class OmniStreamingVideoOutputHandler:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
-            gen_params.extra_args.update(request.extra_params)
+            gen_params.extra_args.update(without_video_output_overrides(request.extra_params))
 
         self._apply_lora(request.lora, gen_params)
         return prompt, gen_params, vp

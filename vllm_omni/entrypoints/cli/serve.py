@@ -728,7 +728,9 @@ class OmniServeCommand(CLISubcommand):
             type=_json_object,
             default=None,
             help=(
-                "JSON object configuring video output preparation, for example '{\"enable_device_postprocess\": true}'."
+                "JSON object configuring device postprocessing and output transport, for example "
+                '\'{"enable_device_postprocess": true, "transport_mode": "bytes", '
+                '"output_format": "mp4"}\'.'
             ),
         )
         omni_config_group.add_argument(

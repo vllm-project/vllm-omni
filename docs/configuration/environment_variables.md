@@ -101,6 +101,7 @@ Invalid integer values raise a Pydantic validation error.
 | `VLLM_OMNI_SERVER_STORAGE__PATH` | Path; default `/tmp/storage` | Directory for completed server files. | Stable |
 | `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY` | Integer; default `4` | Maximum concurrent file operations. No additional range validation is currently applied. | Stable |
 | `VLLM_OMNI_SERVER_STORAGE__FILE_TTL` | Integer seconds or unset; default unset | Optional lifetime for locally stored files. | Stable |
+| `VLLM_OMNI_SERVER_STORAGE__PUBLIC_BASE_URL` | URL or unset; default unset | Static-server or CDN base URL that publishes the storage directory. | Stable |
 | `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL` | Integer seconds or unset | Sweep frequency. If file TTL is set and this is unset, the effective default is `300`. | Stable |
 | `VLLM_OMNI_STORAGE_PATH` | Path | Deprecated alias for `VLLM_OMNI_SERVER_STORAGE__PATH`. The new name wins when both are set. | Deprecated |
 | `VLLM_OMNI_STORAGE_MAX_CONCURRENCY` | Integer | Deprecated alias for `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`. The new name wins when both are set. | Deprecated |

@@ -23,7 +23,7 @@ from typing import Annotated, Any, Literal
 
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -86,6 +86,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
+from vllm_omni.diffusion.utils.media_utils import media_type_for_format
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
@@ -141,6 +142,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
     VideoGenerationRequest,
+    VideoGenerationResponse,
     VideoGenerationStatus,
     VideoListResponse,
     VideoResponse,
@@ -155,10 +157,11 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
+    _is_loopback_host,
 )
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle, UrlStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
@@ -280,9 +283,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
 
-        # Start background processes
-        await STORAGE_MANAGER.start()
-
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         if _should_enable_profiler_endpoints(stage_configs):
@@ -352,32 +352,35 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             # server socket is accepting.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
-        shutdown_task = await serve_http(
-            _TimestampMiddleware(app),
-            sock=sock,
-            enable_ssl_refresh=args.enable_ssl_refresh,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            # NOTE: When the 'disable_uvicorn_access_log' value is True,
-            # no access log will be output.
-            access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
-            ssl_ca_certs=args.ssl_ca_certs,
-            ssl_cert_reqs=args.ssl_cert_reqs,
-            ssl_ciphers=args.ssl_ciphers,
-            h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
-            h11_max_header_count=args.h11_max_header_count,
-            **uvicorn_kwargs,
-        )
-
         try:
+            await STORAGE_MANAGER.start()
+            shutdown_task = await serve_http(
+                _TimestampMiddleware(app),
+                sock=sock,
+                enable_ssl_refresh=args.enable_ssl_refresh,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                # NOTE: When the 'disable_uvicorn_access_log' value is True,
+                # no access log will be output.
+                access_log=not args.disable_uvicorn_access_log,
+                timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs,
+                ssl_ciphers=args.ssl_ciphers,
+                h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+                h11_max_header_count=args.h11_max_header_count,
+                **uvicorn_kwargs,
+            )
             await shutdown_task
         finally:
             if warmup_task is not None:
                 warmup_task.cancel()
+            storage_stop_result = await asyncio.gather(STORAGE_MANAGER.stop(), return_exceptions=True)
+            if isinstance(storage_stop_result[0], BaseException):
+                logger.warning("Failed to stop the storage manager: %s", storage_stop_result[0])
             state = getattr(app, "state", None)
             serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
             if serving_video is not None:
@@ -583,6 +586,7 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            allow_shared_memory=_is_loopback_host(getattr(args, "host", None)),
         )
         state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
             engine_client=engine_client,
@@ -947,6 +951,7 @@ async def omni_init_app_state(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
+        allow_shared_memory=_is_loopback_host(getattr(args, "host", None)),
     )
     state.openai_serving_realtime_robot = None
 
@@ -2255,6 +2260,20 @@ async def create_video(
         reference_audio,
         control_path,
     ) = ctx
+    try:
+        settings = handler._resolve_video_output_settings(request)
+    except HTTPException:
+        _cleanup_video_references(reference_video, reference_audio, control_path)
+        raise
+    if settings.transport_mode != "bytes":
+        _cleanup_video_references(reference_video, reference_audio, control_path)
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=(
+                f"transport_mode={settings.transport_mode!r} returns an immediate response and is only "
+                "supported by POST /v1/videos/sync"
+            ),
+        )
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(
@@ -2276,7 +2295,10 @@ async def create_video(
 @router.post(
     "/v1/videos/sync",
     responses={
-        HTTPStatus.OK.value: {"content": {"video/mp4": {}}},
+        HTTPStatus.OK.value: {
+            "model": VideoGenerationResponse,
+            "content": {"video/mp4": {}, "video/webm": {}, "application/json": {}},
+        },
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -2297,8 +2319,8 @@ async def create_video_sync(
     """Synchronous video generation endpoint.
 
     Accepts the same form parameters as ``POST /v1/videos`` but blocks until
-    generation completes and returns raw video bytes (``video/mp4``) directly.
-    Designed for benchmark and testing scenarios.
+    generation completes. Bytes mode returns the encoded artifact; immediate
+    response modes return ``VideoGenerationResponse`` JSON.
 
     Metadata is returned via response headers ``X-Request-Id``,
     ``X-Model``, and ``X-Inference-Time-S``.
@@ -2315,10 +2337,26 @@ async def create_video_sync(
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
+    generated_response: VideoGenerationResponse | None = None
+    video_bytes: bytes | None = None
     try:
-        video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
-            await asyncio.wait_for(
-                handler.generate_video_bytes(
+        settings = handler._resolve_video_output_settings(request)
+        if settings.transport_mode == "bytes":
+            video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
+                await asyncio.wait_for(
+                    handler.generate_video_bytes(
+                        request,
+                        request_id,
+                        reference_image=reference_image,
+                        reference_video=reference_video,
+                        reference_audio=reference_audio,
+                    ),
+                    timeout=VIDEO_SYNC_TIMEOUT_S,
+                )
+            )
+        else:
+            generated_response = await asyncio.wait_for(
+                handler.generate_videos(
                     request,
                     request_id,
                     reference_image=reference_image,
@@ -2326,8 +2364,9 @@ async def create_video_sync(
                     reference_audio=reference_audio,
                 ),
                 timeout=VIDEO_SYNC_TIMEOUT_S,
-            ),
-        )
+            )
+            stage_durations = generated_response.stage_durations
+            peak_memory_mb = generated_response.peak_memory_mb
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
@@ -2350,17 +2389,17 @@ async def create_video_sync(
         _cleanup_video_references(reference_video, reference_audio, control_path)
     inference_time_s = time.perf_counter() - started_at
 
-    return Response(
-        content=video_bytes,
-        media_type="video/mp4",
-        headers={
-            "X-Request-Id": request_id,
-            "X-Model": effective_model_name,
-            "X-Inference-Time-S": f"{inference_time_s:.3f}",
-            "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
-            "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
-        },
-    )
+    response_headers = {
+        "X-Request-Id": request_id,
+        "X-Model": effective_model_name,
+        "X-Inference-Time-S": f"{inference_time_s:.3f}",
+        "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
+        "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
+    }
+    if generated_response is not None:
+        return JSONResponse(content=generated_response.model_dump(mode="json"), headers=response_headers)
+    assert video_bytes is not None
+    return Response(content=video_bytes, media_type=settings.media_type, headers=response_headers)
 
 
 @router.get("/v1/videos", response_model=VideoListResponse)
@@ -2465,7 +2504,7 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     elif job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:
-                await STORAGE_MANAGER.delete(video_id)
+                await STORAGE_MANAGER.delete(job.file_name)
             except Exception:
                 logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
 
@@ -2475,7 +2514,7 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
 
-    await STORAGE_MANAGER.delete(video_id)
+    await STORAGE_MANAGER.delete(job.file_name)
     await VIDEO_STORE.pop(video_id)
     return VideoDeleteResponse(id=job.id, deleted=True)
 
@@ -2504,19 +2543,44 @@ async def download_video(video_id: str) -> Response:
     if not job.file_name:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
-    file_handle = await STORAGE_MANAGER.open(video_id)
+    file_handle = await STORAGE_MANAGER.open(job.file_name)
     if file_handle is None:
         raise HTTPException(status_code=404, detail="Generated video file not found on disk")
 
     file_name = job.file_name or f"{video_id}.{job.file_extension}"
     if isinstance(file_handle, FileStorageHandle):
         response = FileResponse(path=file_handle.path, media_type=job.media_type, filename=file_name)
+    elif isinstance(file_handle, UrlStorageHandle):
+        response = RedirectResponse(url=file_handle.url, status_code=HTTPStatus.TEMPORARY_REDIRECT)
     else:
         raise HTTPException(
             status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
         )
 
     return response
+
+
+@router.get("/v1/videos/artifacts/{storage_key}")
+async def download_video_artifact(storage_key: str) -> Response:
+    try:
+        handle = await STORAGE_MANAGER.open(storage_key)
+    except ValueError:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Invalid artifact key") from None
+    if handle is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="Artifact not found")
+
+    if isinstance(handle, FileStorageHandle):
+        output_format = storage_key.rsplit(".", 1)[-1].lower() if "." in storage_key else ""
+        try:
+            media_type = media_type_for_format(output_format)
+        except ValueError:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST, detail="Unsupported video artifact format"
+            ) from None
+        return FileResponse(path=handle.path, media_type=media_type, filename=storage_key)
+    if isinstance(handle, UrlStorageHandle):
+        return RedirectResponse(url=handle.url, status_code=HTTPStatus.TEMPORARY_REDIRECT)
+    raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="Unsupported storage handle")
 
 
 @profiler_router.post("/start_profile")

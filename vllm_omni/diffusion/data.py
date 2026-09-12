@@ -9,7 +9,7 @@ import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import diffusers
 import huggingface_hub
@@ -762,10 +762,50 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 @dataclass
 class VideoOutputTransportConfig:
     enable_device_postprocess: bool = False
+    transport_mode: Literal["bytes", "base64", "url", "shared_memory"] = "bytes"
+    shared_memory_ttl_seconds: int = 300
+    output_format: Literal["mp4", "webm"] = "mp4"
+    video_codec: str | None = None
+    video_codec_options: dict[str, str] = field(default_factory=dict)
+
+    VALID_TRANSPORT_MODES: ClassVar[frozenset[str]] = frozenset({"bytes", "base64", "url", "shared_memory"})
+    VALID_OUTPUT_FORMATS: ClassVar[frozenset[str]] = frozenset({"mp4", "webm"})
+
+    @classmethod
+    def from_value(cls, value: object) -> Self:
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+        values = dict(value)
+        codec_options = values.get("video_codec_options")
+        if isinstance(codec_options, Mapping):
+            values["video_codec_options"] = dict(codec_options)
+        return cls(**values)
 
     def __post_init__(self) -> None:
         if not isinstance(self.enable_device_postprocess, bool):
             raise TypeError("enable_device_postprocess must be a bool")
+        if not isinstance(self.transport_mode, str) or self.transport_mode not in self.VALID_TRANSPORT_MODES:
+            raise ValueError(
+                f"transport_mode must be one of {sorted(self.VALID_TRANSPORT_MODES)}, got {self.transport_mode!r}"
+            )
+        if type(self.shared_memory_ttl_seconds) is not int or self.shared_memory_ttl_seconds <= 0:
+            raise ValueError(
+                f"shared_memory_ttl_seconds must be a positive integer, got {self.shared_memory_ttl_seconds!r}"
+            )
+        if not isinstance(self.output_format, str) or self.output_format not in self.VALID_OUTPUT_FORMATS:
+            raise ValueError(
+                f"output_format must be one of {sorted(self.VALID_OUTPUT_FORMATS)}, got {self.output_format!r}"
+            )
+        if self.video_codec is not None and (not isinstance(self.video_codec, str) or not self.video_codec):
+            raise TypeError("video_codec must be a non-empty string or None")
+        if not isinstance(self.video_codec_options, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) for key, value in self.video_codec_options.items()
+        ):
+            raise TypeError("video_codec_options must be a dict[str, str]")
 
 
 @dataclass
@@ -1270,12 +1310,7 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
-        if self.video_output_transport is None:
-            self.video_output_transport = VideoOutputTransportConfig()
-        elif isinstance(self.video_output_transport, Mapping):
-            self.video_output_transport = VideoOutputTransportConfig(**dict(self.video_output_transport))
-        elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
-            raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+        self.video_output_transport = VideoOutputTransportConfig.from_value(self.video_output_transport)
 
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
