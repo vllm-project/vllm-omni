@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
@@ -10,7 +11,10 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.ring.ring_kernels import pytorch_attn_forward
-from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
+from vllm_omni.diffusion.attention.backends.ring.ring_utils import (
+    ring_kv_block_valid_length,
+    update_out_and_lse,
+)
 from vllm_omni.diffusion.distributed.comm import RingComm
 
 logger = init_logger(__name__)
@@ -33,6 +37,7 @@ def ring_pytorch_attn_func(
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
+    valid_kv_length: int | None = None,
 ):
     return RingAttentionFunc.apply(
         group,
@@ -45,6 +50,7 @@ def ring_pytorch_attn_func(
         joint_tensor_key,
         joint_tensor_value,
         joint_strategy,
+        valid_kv_length,
     )
 
 
@@ -64,6 +70,7 @@ class RingAttentionFunc(torch.autograd.Function):
         joint_tensor_key=None,
         joint_tensor_value=None,
         joint_strategy="front",
+        valid_kv_length: int | None = None,
     ):
         # Validate causal + joint_strategy combination
         # When causal=True and joint_strategy="rear", the causal mask would incorrectly
@@ -77,6 +84,22 @@ class RingAttentionFunc(torch.autograd.Function):
                 "to ensure joint tokens act as a visible prefix for all local tokens. "
                 "With 'rear' strategy, the causal mask would incorrectly block local tokens "
                 "from seeing the joint tokens."
+            )
+
+        # Trimming the circulated K/V blocks changes their length while the
+        # query block keeps the full padded length. A causal SDPA mask over a
+        # rectangular (seqlen_q, seqlen_k) tile is aligned to the bottom right,
+        # so a trimmed block would shift the diagonal and let queries attend to
+        # the wrong key positions -- silently, with no shape error. The two are
+        # therefore an unsupported combination rather than a slow path: the
+        # caller must either drop the padding before the ring or run
+        # non-causal.
+        if is_causal and valid_kv_length is not None:
+            raise ValueError(
+                "valid_kv_length is not supported with causal=True in Ring Attention. "
+                "Trimming a circulated K/V block shortens seqlen_k while seqlen_q keeps "
+                "the padded length, and the causal diagonal is bottom-right aligned, so "
+                "the mask would silently shift. Unpad before the ring, or use causal=False."
             )
 
         comm = RingComm(group)
@@ -98,8 +121,15 @@ class RingAttentionFunc(torch.autograd.Function):
                 comm.commit()
 
             if not is_causal or step <= comm.rank:
-                step_k = k
-                step_v = v
+                block_rank = (comm.rank - step) % comm.world_size
+                block_valid_length = ring_kv_block_valid_length(
+                    valid_kv_length,
+                    k.shape[1],
+                    block_rank,
+                    comm.world_size,
+                )
+                step_k = k[:, :block_valid_length]
+                step_v = v[:, :block_valid_length]
                 if step == 0 and joint_tensor_key is not None:
                     if joint_strategy == "front":
                         step_k = torch.cat([joint_tensor_key, step_k], dim=1)
@@ -108,15 +138,16 @@ class RingAttentionFunc(torch.autograd.Function):
                         step_k = torch.cat([step_k, joint_tensor_key], dim=1)
                         step_v = torch.cat([step_v, joint_tensor_value], dim=1)
 
-                block_out, block_lse = pytorch_attn_forward(
-                    q,
-                    step_k,
-                    step_v,
-                    softmax_scale=sm_scale,
-                    causal=is_causal and step == 0,
-                    op_type=op_type,
-                )
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_layout="bhs")
+                if step_k.shape[1] > 0:
+                    block_out, block_lse = pytorch_attn_forward(
+                        q,
+                        step_k,
+                        step_v,
+                        softmax_scale=sm_scale,
+                        causal=is_causal and step == 0,
+                        op_type=op_type,
+                    )
+                    out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_layout="bhs")
 
             if step + 1 != comm.world_size:
                 comm.wait()

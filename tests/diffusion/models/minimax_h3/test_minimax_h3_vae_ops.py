@@ -198,7 +198,7 @@ def test_video_vae_installs_exact_optimizations(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, **_kwargs: FakeRemote(),
     )
     install = Mock(return_value=True)
     monkeypatch.setattr(vae_module, "install_h3_vae_optimizations", install)
