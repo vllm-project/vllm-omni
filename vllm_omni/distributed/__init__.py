@@ -1,6 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from .ipc_weight_sharing import (
+    IPC_PROTOCOL_VERSION,
+    ChannelAddress,
+    ManifestMismatchError,
+    ManifestValidationError,
+    MappedWeights,
+    ProtocolError,
+    ProtocolTimeoutError,
+    ProviderUnavailableError,
+    TensorHandleMapper,
+    TensorManifestEntry,
+    WeightManifest,
+    WeightSharingConsumer,
+    WeightSharingEndpoint,
+    WeightSharingError,
+    WeightSharingProvider,
+    build_weight_manifest,
+    compare_manifests,
+    export_cuda_handles,
+    get_cuda_device_uuid,
+    rebuild_cuda_tensor,
+    remap_cuda_handle_device,
+)
 from .omni_connectors import (
     ConnectorSpec,
     MooncakeConnector,
@@ -32,4 +55,26 @@ __all__ = [
     "YuanrongTransferEngineConnector",
     # Utilities
     "load_omni_transfer_config",
+    # Cross-process weight sharing
+    "ChannelAddress",
+    "IPC_PROTOCOL_VERSION",
+    "ManifestMismatchError",
+    "ManifestValidationError",
+    "MappedWeights",
+    "ProtocolError",
+    "ProtocolTimeoutError",
+    "ProviderUnavailableError",
+    "TensorManifestEntry",
+    "TensorHandleMapper",
+    "WeightManifest",
+    "WeightSharingConsumer",
+    "WeightSharingEndpoint",
+    "WeightSharingError",
+    "WeightSharingProvider",
+    "build_weight_manifest",
+    "compare_manifests",
+    "export_cuda_handles",
+    "get_cuda_device_uuid",
+    "rebuild_cuda_tensor",
+    "remap_cuda_handle_device",
 ]
