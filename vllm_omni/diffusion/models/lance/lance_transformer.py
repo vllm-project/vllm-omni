@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Lance transformer pieces.
 
 The Lance LLM is BAGEL's Qwen2-MoT transformer verbatim — the released
@@ -108,6 +108,27 @@ LANCE_VIT_TEMPORAL_PATCH_SIZE = 2  # Qwen2.5-VL ViT temporal patch
 LANCE_VIT_SPATIAL_MERGE = 2  # Qwen2.5-VL spatial merge factor
 LANCE_VIT_NORM_MEAN = (0.48145466, 0.4578275, 0.40821073)
 LANCE_VIT_NORM_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def _mrope_position_chunk(
+    tt: torch.Tensor,
+    hh: torch.Tensor,
+    ww: torch.Tensor,
+    start_position_id: int,
+    end_position_id: int,
+    t_scale: float,
+) -> torch.Tensor:
+    base_position_id = start_position_id + 1
+    temporal_positions = (tt.to(dtype=torch.float64) * t_scale).to(dtype=torch.long)
+    body = torch.stack((temporal_positions, hh, ww), dim=0).flatten(1).add_(base_position_id)
+    return torch.cat(
+        (
+            torch.full((3, 1), start_position_id, dtype=torch.long),
+            body,
+            torch.full((3, 1), end_position_id, dtype=torch.long),
+        ),
+        dim=1,
+    )
 
 
 def get_3d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
@@ -1101,11 +1122,7 @@ class LanceBagel(Bagel):
         packed_vae_position_ids, packed_vae_token_indexes, packed_init_noises = [], [], []
         packed_seqlens, packed_indexes = [], []
         packed_key_value_indexes = []
-        # 3-D position ids per token (mRoPE).  ``per_axis_pos[i]`` is the list
-        # of (t, h, w) for the i-th query token; we stack into ``(3, S)`` at the
-        # end.  Text framing tokens broadcast scalar to all axes; video latent
-        # tokens carry per-token ``(P + t, P + h, P + w)``.
-        per_axis_pos: list[tuple[int, int, int]] = []
+        position_id_chunks: list[torch.Tensor] = []
 
         query_curr = curr = 0
         for (T, H, W), curr_kvlen, curr_position_id in zip(video_shapes, curr_kvlens, curr_rope):
@@ -1122,8 +1139,6 @@ class LanceBagel(Bagel):
             # ``(P+1+ti*t_scale, P+1+hi, P+1+wi)``, end at ``(P+max+1, ...)``.
             # Verified against upstream's video_edit rope dump for T_lat=12,
             # H_lat=35, W_lat=47 (call09 / cond noise iter 0).
-            per_axis_pos.append((curr_position_id, curr_position_id, curr_position_id))
-
             h = H // self.latent_downsample
             w = W // self.latent_downsample
             t = (T - 1) // downsample_t + 1
@@ -1131,9 +1146,6 @@ class LanceBagel(Bagel):
 
             # 1-D position ids into the 3-D table (frame-major, then row, then col).
             tt, hh, ww = torch.meshgrid(torch.arange(t), torch.arange(h), torch.arange(w), indexing="ij")
-            tt_flat = tt.flatten().tolist()
-            hh_flat = hh.flatten().tolist()
-            ww_flat = ww.flatten().tolist()
             vae_position_ids = (tt * (max_per_side * max_per_side) + hh * max_per_side + ww).flatten()
             packed_vae_position_ids.append(vae_position_ids)
 
@@ -1150,14 +1162,6 @@ class LanceBagel(Bagel):
             # ``second_per_grid_t = 1.0`` matches upstream's default;
             # ``tokens_per_second = 2`` is Lance's vit config.
             t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID
-            for ti, hi, wi in zip(tt_flat, hh_flat, ww_flat):
-                per_axis_pos.append(
-                    (
-                        curr_position_id + 1 + int(ti * t_scale),
-                        curr_position_id + 1 + hi,
-                        curr_position_id + 1 + wi,
-                    )
-                )
 
             packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(query_curr)
@@ -1171,15 +1175,11 @@ class LanceBagel(Bagel):
             # (max_w=46), with P=111: end_p = 111 + 46 + 1 + 1 = 159. ✓
             max_thw = max(int((t - 1) * t_scale), h - 1, w - 1) + 1
             end_p = curr_position_id + max_thw + 1
-            per_axis_pos.append((end_p, end_p, end_p))
+            position_id_chunks.append(_mrope_position_chunk(tt, hh, ww, curr_position_id, end_p, t_scale))
 
             packed_seqlens.append(num_video_tokens + 2)
 
-        # Stack into (3, total_query_tokens) for mRoPE.
-        pos_t = torch.tensor([p[0] for p in per_axis_pos], dtype=torch.long)
-        pos_h = torch.tensor([p[1] for p in per_axis_pos], dtype=torch.long)
-        pos_w = torch.tensor([p[2] for p in per_axis_pos], dtype=torch.long)
-        packed_position_ids_3d = torch.stack([pos_t, pos_h, pos_w], dim=0)
+        packed_position_ids_3d = torch.cat(position_id_chunks, dim=1)
 
         generation_input = {
             "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
@@ -1209,7 +1209,7 @@ class LanceBagel(Bagel):
         downsample_t = int(getattr(self.config.vae_config, "downsample_temporal", 4))
 
         packed_indexes, packed_key_value_indexes = [], []
-        per_axis_pos: list[tuple[int, int, int]] = []
+        position_id_chunks: list[torch.Tensor] = []
         query_curr = curr = 0
         t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID
         for (T, H, W), curr_kvlen, curr_position_id in zip(video_shapes, curr_kvlens, curr_rope):
@@ -1221,8 +1221,6 @@ class LanceBagel(Bagel):
             query_curr += 1
             # Match :meth:`prepare_video_latent` convention exactly (see
             # comments there for the upstream rope layout this replicates).
-            per_axis_pos.append((curr_position_id, curr_position_id, curr_position_id))
-
             h = H // self.latent_downsample
             w = W // self.latent_downsample
             t = (T - 1) // downsample_t + 1
@@ -1231,26 +1229,17 @@ class LanceBagel(Bagel):
             curr += num_video_tokens
             query_curr += num_video_tokens
             tt, hh, ww = torch.meshgrid(torch.arange(t), torch.arange(h), torch.arange(w), indexing="ij")
-            for ti, hi, wi in zip(tt.flatten().tolist(), hh.flatten().tolist(), ww.flatten().tolist()):
-                per_axis_pos.append(
-                    (
-                        curr_position_id + 1 + int(ti * t_scale),
-                        curr_position_id + 1 + hi,
-                        curr_position_id + 1 + wi,
-                    )
-                )
 
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
             max_thw = max(int((t - 1) * t_scale), h - 1, w - 1) + 1
             end_p = curr_position_id + max_thw + 1
-            per_axis_pos.append((end_p, end_p, end_p))
+            position_id_chunks.append(_mrope_position_chunk(tt, hh, ww, curr_position_id, end_p, t_scale))
 
-        pos_t = torch.tensor([p[0] for p in per_axis_pos], dtype=torch.long)
-        pos_h = torch.tensor([p[1] for p in per_axis_pos], dtype=torch.long)
-        pos_w = torch.tensor([p[2] for p in per_axis_pos], dtype=torch.long)
-        cfg_packed_position_ids_3d = torch.stack([pos_t, pos_h, pos_w], dim=0)
+        cfg_packed_position_ids_3d = (
+            torch.cat(position_id_chunks, dim=1) if position_id_chunks else torch.empty((3, 0), dtype=torch.long)
+        )
 
         return {
             "cfg_packed_position_ids": cfg_packed_position_ids_3d,
@@ -1293,7 +1282,7 @@ class LanceBagel(Bagel):
         packed_seqlens: list[int] = []
         patchified_vae_latent_shapes: list[tuple] = []
         vae_image_tensors: list[torch.Tensor] = []
-        per_axis_pos: list[tuple[int, int, int]] = []
+        position_id_chunks: list[torch.Tensor] = []
 
         query_curr = curr = 0
         newlens: list[int] = []
@@ -1307,8 +1296,6 @@ class LanceBagel(Bagel):
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
-            per_axis_pos.append((curr_position_id, curr_position_id, curr_position_id))
-
             image_tensor = transforms(image)
             vae_image_tensors.append(image_tensor)
             # ``image_tensor`` is ``(C, H, W)`` for image input or ``(C, T, H, W)``
@@ -1347,14 +1334,6 @@ class LanceBagel(Bagel):
             # images we leave the t-channel scalar (T=1 → ``ti=0`` anyway).
             t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID if is_video else 1
             max_thw = max(int((t_lat - 1) * t_scale), h_lat - 1, w_lat - 1) + 1
-            for ti, hi, wi in zip(tt.flatten().tolist(), hh.flatten().tolist(), ww.flatten().tolist()):
-                per_axis_pos.append(
-                    (
-                        curr_position_id + 1 + int(ti * t_scale),
-                        curr_position_id + 1 + hi,
-                        curr_position_id + 1 + wi,
-                    )
-                )
 
             packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(query_curr)
@@ -1362,7 +1341,7 @@ class LanceBagel(Bagel):
             curr += 1
             query_curr += 1
             end_p = curr_position_id + max_thw + 1
-            per_axis_pos.append((end_p, end_p, end_p))
+            position_id_chunks.append(_mrope_position_chunk(tt, hh, ww, curr_position_id, end_p, t_scale))
 
             packed_seqlens.append(num_image_tokens + 2)
             newlens.append(curr_kvlen + num_image_tokens + 2)
@@ -1379,10 +1358,7 @@ class LanceBagel(Bagel):
                     image_tensor
                 )
 
-        pos_t = torch.tensor([p[0] for p in per_axis_pos], dtype=torch.long)
-        pos_h = torch.tensor([p[1] for p in per_axis_pos], dtype=torch.long)
-        pos_w = torch.tensor([p[2] for p in per_axis_pos], dtype=torch.long)
-        packed_position_ids_3d = torch.stack([pos_t, pos_h, pos_w], dim=0)
+        packed_position_ids_3d = torch.cat(position_id_chunks, dim=1)
 
         generation_input = {
             "padded_images": padded_images,
