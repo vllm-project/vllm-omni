@@ -437,6 +437,11 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
     dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["model.model.language_model"]
 
+    @property
+    def transformer(self) -> nn.Module:
+        """Expose the decoder through the standard cache-backend API."""
+        return self.model.model.language_model
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         self.od_config = od_config
@@ -676,6 +681,9 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 expected_image_len,
             )
             samples.append(uncond_sample)
+
+        language_model = self.model.model.language_model
+        language_model.do_true_cfg = len(samples) > 1
 
         z = self._prepare_noise_and_patchify(
             height,
