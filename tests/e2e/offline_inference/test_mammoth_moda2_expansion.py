@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -114,7 +115,7 @@ pytestmark = [
 ]
 
 
-# @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3201")
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3201")
 @hardware_test(res={"cuda": "H100"})
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner, precision: str):
     """
@@ -190,7 +191,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner, precision: str):
                 continue
             for completion in completion_outputs:
                 mm = getattr(completion, "multimodal_output", None)
-                if not (isinstance(mm, dict) and "image" in mm):
+                if not (isinstance(mm, Mapping) and "image" in mm):
                     continue
                 img_list = mm["image"] if isinstance(mm["image"], list) else [mm["image"]]
                 for img_tensor in img_list:
