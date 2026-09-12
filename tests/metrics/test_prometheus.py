@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import re
@@ -128,6 +131,66 @@ class TestScrapeOutput:
         # default registry is being scraped by checking for process_* metrics
         # from the Python prometheus_client runtime.
         assert "process_" in scrape_output
+
+
+def test_duplex_metrics_have_bounded_labels_and_expected_values(registry: CollectorRegistry) -> None:
+    model = "duplex-metrics-model"
+    prom = OmniPrometheusMetrics(model_name=model)
+
+    prom.set_duplex_sessions(3, 1)
+    prom.observe_duplex_append("success", 0.02)
+    prom.observe_duplex_append("deduplicated", 0.001)
+    prom.observe_duplex_control_queue_wait("append", 0.03)
+    prom.set_duplex_context(1024, 4096, 0.25, 7)
+    prom.inc_duplex_replica_affinity_loss()
+    prom.set_duplex_recovery_state(512, 4096, 2)
+    prom.inc_duplex_kv_recovery("replica_loss", "success")
+    prom.inc_duplex_kv_recovery("context_rollover", "failure")
+    output = generate_latest(registry).decode()
+
+    assert (
+        _sample_value(
+            output,
+            f'vllm_omni:duplex_sessions{{model_name="{model}",state="active"}}',
+        )
+        == 3.0
+    )
+    assert (
+        _sample_value(
+            output,
+            f'vllm_omni:duplex_append_requests_total{{model_name="{model}",outcome="deduplicated"}}',
+        )
+        == 1.0
+    )
+    assert _sample_value(output, f'vllm_omni:duplex_replay_journal_tokens{{model_name="{model}"}}') == 512.0
+    assert _sample_value(output, f'vllm_omni:duplex_replay_journal_bytes{{model_name="{model}"}}') == 4096.0
+    assert _sample_value(output, f'vllm_omni:duplex_resource_generation{{model_name="{model}"}}') == 2.0
+    assert (
+        _sample_value(
+            output,
+            f'vllm_omni:duplex_kv_rebuilds_total{{model_name="{model}",outcome="success",reason="replica_loss"}}',
+        )
+        == 1.0
+    )
+    assert (
+        _sample_value(
+            output,
+            f'vllm_omni:duplex_control_queue_wait_s_count{{model_name="{model}",operation="append"}}',
+        )
+        == 1.0
+    )
+    assert _sample_value(output, f'vllm_omni:duplex_context_tokens{{model_name="{model}"}}') == 1024.0
+    assert _sample_value(output, f'vllm_omni:duplex_context_limit_tokens{{model_name="{model}"}}') == 4096.0
+    assert _sample_value(output, f'vllm_omni:duplex_context_utilization{{model_name="{model}"}}') == 0.25
+    assert _sample_value(output, f'vllm_omni:duplex_append_receipts{{model_name="{model}"}}') == 7.0
+    assert (
+        _sample_value(
+            output,
+            f'vllm_omni:duplex_replica_affinity_loss_total{{model_name="{model}"}}',
+        )
+        == 1.0
+    )
+    assert "session_id=" not in "\n".join(line for line in output.splitlines() if "duplex_" in line)
 
 
 class TestRequestLifecycleGauges:

@@ -31,6 +31,7 @@ class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     capabilities: dict[str, object]
     session_config: dict[str, object] | None = None
     runtime_config: dict[str, object] | None = None
+    admission_priority: int = 0
 
 
 class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
@@ -43,6 +44,9 @@ class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
     mode: str
     payload: object
     final: bool = False
+    # Same-process absolute deadline.  The orchestrator uses it to stop a
+    # scheduler-ready wait before the correlated RPC caller gives up.
+    deadline_monotonic: float | None = None
 
 
 class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
@@ -54,6 +58,9 @@ class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
     next_fence: DuplexFence | None = None
     session_config: dict[str, object] | None = None
     runtime_config: dict[str, object] | None = None
+
+    context: dict[str, object] | None = None
+    deadline_monotonic: float | None = None
 
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
@@ -95,6 +102,7 @@ class DuplexControlError(EngineQueueMessage, kw_only=True):
     code: str
     message: str
     retryable: bool = False
+    acceptance: Literal["not_accepted", "unknown"] = "unknown"
 
 
 class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
@@ -110,6 +118,8 @@ class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
     error: DuplexControlError | None = None
     accepted_fence: DuplexFence | None = None
     lease_generation: int | None = None
+    admission: dict[str, object] | None = None
+    trace: dict[str, object] | None = None
 
     @property
     def rpc_correlation_key(self) -> tuple[str, str]:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -11,6 +11,8 @@ logger = get_connector_logger(__name__)
 
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
+
+    stage_id: int
 
     # Whether the connector can handle raw bytes/torch.Tensor natively
     # without going through OmniSerializer.  Connectors that copy raw
@@ -54,6 +56,14 @@ class OmniConnectorBase(ABC):
             Tuple of (Python object, serialized byte size) if found, None otherwise
         """
         pass
+
+    def get_nowait(self, from_stage: str, to_stage: str, get_key: str) -> tuple[Any, int] | None:
+        """Optional non-waiting lookahead; unsupported transports return None.
+
+        Unlike get(), this must not wait for missing data or a writer lock.
+        Returning None must leave the chunk available to the normal receiver.
+        """
+        return None
 
     @abstractmethod
     def cleanup(self, request_id: str) -> None:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the AR sampled-token logprob contract."""
 
 from __future__ import annotations
@@ -85,6 +88,8 @@ def test_rejects_non_finite_sampled_logprob() -> None:
 
 
 class _Request:
+    streaming_prompt_continuous: bool
+
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
         self.client_index = 0
@@ -97,7 +102,7 @@ class _Request:
         # track in-flight outputs discarded at preemption/streaming-stop.
         self.num_stale_output_tokens = 0
         self.has_encoder_inputs = False
-        self.pooling_params = None
+        self.pooling_params: SimpleNamespace | None = None
         self.resumable = True
         self.stop_reason = None
         self.trace_headers = None
@@ -269,6 +274,50 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     assert output_by_id["bad"].new_token_ids == []
     assert output_by_id["good"].new_token_ids == [8]
     np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+
+
+def test_model_input_error_finishes_only_failed_request_and_never_resumes_its_kv():
+    bad, good = _Request("bad"), _Request("good")
+    bad.streaming_prompt_continuous = True
+    bad.sampling_params = good.sampling_params = SimpleNamespace(num_logprobs=None)
+    scheduler = _make_scheduler_stub([bad, good])
+    updated = []
+
+    def update(request, tokens):
+        updated.append(request.request_id)
+        return tokens, False
+
+    def stopped(request):
+        assert not request.resumable
+        assert not request.streaming_prompt_continuous
+        return True
+
+    _bind_request_lifecycle(scheduler, update_request=update, handle_stopped=stopped)
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"bad": 1, "good": 1}, scheduled_spec_decode_tokens={}, num_invalid_spec_tokens=0
+    )
+    result = SimpleNamespace(
+        sampled_token_ids=[[7], [8]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"bad": 0, "good": 1},
+        routed_experts=None,
+        model_input_errors={"bad": "native_duplex_prefill_failed: empty encoder output"},
+        multimodal_outputs=[{"latent": "must not escape"}, None],
+        inter_stage_outputs=[{"audio": "must not escape"}, None],
+    )
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduled, result)
+    by_id = {item.request_id: item for item in outputs[0].outputs}
+    assert updated == ["good"]
+    assert "bad" not in scheduler.requests
+    assert by_id["bad"].finish_reason is FinishReason.ERROR
+    assert by_id["bad"].new_token_ids == []
+    assert by_id["bad"].multimodal_output is None
+    assert by_id["good"].new_token_ids == [8]
 
 
 def _pooling_model_runner_output(pooler_tensor) -> SimpleNamespace:

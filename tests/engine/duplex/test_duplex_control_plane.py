@@ -10,6 +10,7 @@ from dataclasses import FrozenInstanceError
 import msgspec
 import pytest
 
+from vllm_omni.engine.duplex.contracts import DuplexContextOutput
 from vllm_omni.engine.duplex.control_plane import (
     DuplexControlPlane,
     DuplexOutputContext,
@@ -101,6 +102,101 @@ class _Clock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_fails", [False, True], ids=["cleanup-ok", "cleanup-retry"])
+async def test_output_before_append_receipt_budget_failure_closes_session(cleanup_fails) -> None:
+    """A committed input with unretainable output cannot reopen as empty KV."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
+
+    class Extension(_Extension):
+        context_unit_sequence = staticmethod(MiniCPMO45DuplexRuntimeExtension.context_unit_sequence)
+        apply_context_output = staticmethod(MiniCPMO45DuplexRuntimeExtension.apply_context_output)
+
+        def plan_append(self, **kwargs):
+            return DuplexAppendPlan(
+                prompt={
+                    "prompt_token_ids": [1],
+                    "model_intermediate_buffer": {"duplex": {"seq": kwargs["seq"], "gander_output_ids": []}},
+                }
+            )
+
+        def finalize_context_unit(self, **kwargs):
+            return DuplexContextOutput(unit_sequence=1, data={"output_ids": list(range(8))})
+
+    class Port(_TypedStagePort):
+        fail_cleanup = cleanup_fails
+
+        async def submit(self, submission):
+            # Production output can arrive while the append utility receipt
+            # is still being collected. No journal entry exists at this point.
+            plane.decide_output(
+                0,
+                object(),
+                DuplexOutputContext(
+                    identity=DuplexRequestIdentity(session_id=fence.session_id, fence=fence),
+                    final_stage_id=1,
+                    segment_finished=True,
+                ),
+            )
+            assert session.pending_context_outputs
+            return await super().submit(submission)
+
+        async def cleanup(self, request_ids, *, abort=False):
+            await super().cleanup(request_ids, abort=abort)
+            if self.fail_cleanup:
+                raise RuntimeError("cleanup temporarily unavailable")
+
+    port = Port()
+    extension = Extension()
+    sink: asyncio.Queue = asyncio.Queue()
+    plane = DuplexControlPlane(extension=extension, stage_port=port, result_sink=sink)
+    fence = DuplexFence("output-before-receipt")
+    session = plane.sessions.open_session(
+        fence,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK}, scheduler_native_append=True, prompt_replay=True
+        ),
+    )
+    entry = session.prepare_replay_append(
+        operation_id="op1", operation_fingerprint=b"x" * 32, prompt=extension.plan_append(seq=1).prompt
+    )
+    session.recovery_max_replay_bytes = entry.byte_count + 1
+    try:
+        await plane.handle_append(
+            AppendDuplexInputMessage(
+                control_id="one",
+                session_id=fence.session_id,
+                fence=fence,
+                operation_id="op1",
+                mode="append_audio_chunk",
+                payload={},
+            )
+        )
+        reply = await sink.get()
+        assert not reply.ok
+        assert "entry_too_large" in reply.error.message
+        assert session.lease.terminal_reason is not None
+        assert port.cleanup_calls
+        assert plane.sessions.get(fence.session_id) is None or cleanup_fails
+        # Raising the byte limit cannot make this damaged session usable.
+        session.recovery_max_replay_bytes = 100000
+        await plane.handle_append(
+            AppendDuplexInputMessage(
+                control_id="two",
+                session_id=fence.session_id,
+                fence=fence,
+                operation_id="op2",
+                mode="append_audio_chunk",
+                payload={},
+            )
+        )
+        assert not (await sink.get()).ok
+        assert len(port.submit_calls) == 1
+    finally:
+        port.fail_cleanup = False
+        await plane.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1106,7 +1202,7 @@ async def test_stage_submission_is_compensated_when_local_commit_fails() -> None
 
 
 @pytest.mark.asyncio
-async def test_failed_submission_compensation_blocks_append_until_reaper_cleans_it() -> None:
+async def test_failed_commit_retires_session_and_reaper_retries_cleanup() -> None:
     class _FailingCleanupStagePort(_TypedStagePort):
         def __init__(self) -> None:
             super().__init__()
@@ -1126,7 +1222,6 @@ async def test_failed_submission_compensation_blocks_append_until_reaper_cleans_
         fence,
         capabilities=DuplexRuntimeCapabilities(input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK}),
     )
-    original_commit = session.commit_append
 
     def fail_commit(_reservation):
         raise RuntimeError("local commit failed")
@@ -1141,7 +1236,8 @@ async def test_failed_submission_compensation_blocks_append_until_reaper_cleans_
     )
     await plane.handle(first)
     assert (await result_sink.get()).ok is False
-    assert plane.pending_submission_cleanup_count == 1
+    assert session.lease.terminal_reason == "duplex_append_commit_failed"
+    assert len(plane._pending_control_cleanups) == 1
     assert len(stage_port.submit_calls) == 1
 
     await plane.handle(
@@ -1154,15 +1250,19 @@ async def test_failed_submission_compensation_blocks_append_until_reaper_cleans_
         )
     )
     assert (await result_sink.get()).ok is False
-    assert plane.pending_submission_cleanup_count == 1
+    assert len(plane._pending_control_cleanups) == 1
     assert len(stage_port.submit_calls) == 1
 
-    session.commit_append = original_commit  # type: ignore[method-assign]
     stage_port.cleanup_failures = 0
     await plane.reap_expired()
 
-    assert plane.pending_submission_cleanup_count == 0
-    assert session.resource_request_ids() == []
+    assert not plane._pending_control_cleanups
+    assert plane.sessions.get(fence.session_id) is None
+    request_id = stage_port.submit_calls[0].context.request_id
+    assert stage_port.cleanup_calls == [([request_id], True), ([request_id], True)]
+    await plane.handle(first)
+    assert (await result_sink.get()).ok is False
+    assert len(stage_port.submit_calls) == 1
 
 
 def test_stale_output_is_rejected_before_extension_decision() -> None:

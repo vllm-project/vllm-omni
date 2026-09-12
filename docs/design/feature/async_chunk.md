@@ -12,17 +12,19 @@
 
 The `async_chunk` feature enables asynchronous, chunked processing of data across multiple stages in a multi-stage pipeline (e.g., Qwen3-Omni with Thinker → Talker → Code2Wav stages). Instead of waiting for a complete stage output before forwarding to the next stage, this feature allows stages to process and forward data in chunks as it becomes available, significantly reducing latency and improving throughput.
 
-**Chunk Size Definition**
+### Chunk Size Definition
 
 - **Prefill Phase**: `chunk_size = num_scheduled_tokens` for chunked prefill processing
-- **Decode Phase**: `chunk_size = num_scheduled_tokens = 1 ` for per-token streaming
+- **Decode Phase**: `chunk_size = num_scheduled_tokens = 1` for per-token streaming
 
 For qwen3-omni:
+
 - **Thinker → Talker**: Per decode step (typically chunk_size=1)
 - **Talker → Code2Wav**: Accumulated to `codec_chunk_frames` (default=25) before sending. During the initial phase, a dynamic initial chunk size (IC) is automatically selected based on server load to reduce TTFP. Use the per-request `initial_codec_chunk_frames` API field to override.
 - **Code2Wav**: Streaming decode with code2wav chunk_size
 
 With `async_chunk`:
+
 - Stages can start processing as soon as chunks are available
 - Overlapping execution across stages
 - Reduced latency and improved throughput
@@ -30,24 +32,24 @@ With `async_chunk`:
 - Async scheduling: Chunk IO (get/put) overlaps with compute via background threads so the scheduler is not blocked waiting for chunks
 
 ## Performance
+
 1. **Reduced Latency**: Next stage can start processing immediately
 2. **Streaming Support**: Enables streaming for audio generation
 3. **IO-Compute Overlap**: Chunk retrieval happens asynchronously while other requests compute
 4. **Non-blocking Scheduler**: Requests waiting for chunks don't block the entire scheduler
 5. **Code2Wav Batch Inference**: Supports batched processing in code2wav stage
 
-| Input     | Output           | Async_chunk enabled | Code2Wav batch size | Max_Concurrency | Prompts | Mean E2E   | Mean TTFT  | Mean TPOT | Mean TTFP   | Mean RTF | Mean ITL |
-|-----------|------------------|---------------------|---------------------|----------------|---------|------------|------------|-----------|-------------|----------|----------|
-| text 100  | text 100+audio   | False               | 1                   | 1              | 50      | 6581.80    | 43.22      | 8.31      | 6459.34     | 0.24     | 8.22     |
-| text 100  | text 100+audio   | False               | 1                   | 4              | 50      | 7398.63    | 67.57      | 9.14      | 7285.35     | 0.27     | 9.05     |
-| text 100  | text 100+audio   | False               | 1                   | 10             | 50      | 13522.99   | 131.82     | 12.72     | 13410.44    | 0.49     | 12.60    |
-| text 100  | text 100+audio   | False               | 64                  | 1              | 50      | 6505.13    | 43.14      | 8.52      | 6395.40     | 0.24     | 8.44     |
-| text 100  | text 100+audio   | False               | 64                  | 4              | 50      | 7668.15    | 51.15      | 9.36      | 7562.37     | 0.28     | 9.27     |
-| text 100  | text 100+audio   | False               | 64                  | 10             | 50      | 9516.18    | 138.06     | 14.75     | 9409.26     | 0.34     | 14.60    |
-| text 100  | text 100+audio   | True                | 1                   | 1              | 50      | 6179.79    | 44.58      | 8.69      | 522.99      | 0.22     | 8.60     |
-| text 100  | text 100+audio   | True                | 1                   | 4              | 50      | 7692.69    | 103.96     | 10.22     | 785.85      | 0.29     | 10.12    |
-| text 100  | text 100+audio   | True                | 1                   | 10             | 50      | 11152.71   | 685.60     | 17.64     | 1628.88     | 0.41     | 17.62    |
-
+| Input    | Output         | Async_chunk enabled | Code2Wav batch size | Max_Concurrency | Prompts | Mean E2E | Mean TTFT | Mean TPOT | Mean TTFP | Mean RTF | Mean ITL |
+| -------- | -------------- | ------------------- | ------------------- | --------------- | ------- | -------- | --------- | --------- | --------- | -------- | -------- |
+| text 100 | text 100+audio | False               | 1                   | 1               | 50      | 6581.80  | 43.22     | 8.31      | 6459.34   | 0.24     | 8.22     |
+| text 100 | text 100+audio | False               | 1                   | 4               | 50      | 7398.63  | 67.57     | 9.14      | 7285.35   | 0.27     | 9.05     |
+| text 100 | text 100+audio | False               | 1                   | 10              | 50      | 13522.99 | 131.82    | 12.72     | 13410.44  | 0.49     | 12.60    |
+| text 100 | text 100+audio | False               | 64                  | 1               | 50      | 6505.13  | 43.14     | 8.52      | 6395.40   | 0.24     | 8.44     |
+| text 100 | text 100+audio | False               | 64                  | 4               | 50      | 7668.15  | 51.15     | 9.36      | 7562.37   | 0.28     | 9.27     |
+| text 100 | text 100+audio | False               | 64                  | 10              | 50      | 9516.18  | 138.06    | 14.75     | 9409.26   | 0.34     | 14.60    |
+| text 100 | text 100+audio | True                | 1                   | 1               | 50      | 6179.79  | 44.58     | 8.69      | 522.99    | 0.22     | 8.60     |
+| text 100 | text 100+audio | True                | 1                   | 4               | 50      | 7692.69  | 103.96    | 10.22     | 785.85    | 0.29     | 10.12    |
+| text 100 | text 100+audio | True                | 1                   | 10              | 50      | 11152.71 | 685.60    | 17.64     | 1628.88   | 0.41     | 17.62    |
 
 Performance data collected on H800 GPUs through comprehensive benchmarking with cudagraph enabled. text input uses random dataset.
 
@@ -89,24 +91,26 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 
 **Diagram Legend:**
 
-| Step | Stage Type | Description |
-|------|-----------|------------|
+| Step      | Stage Type     | Description                                 |
+| --------- | -------------- | ------------------------------------------- |
 | `prefill` | Initialization | Context processing, KV cache initialization |
-| `decode` | Autoregressive | Token-by-token generation in AR stages |
-| `codes` | Audio Encoding | RVQ codec codes from Talker stage |
-| `output` | Final Output | Text chunks or audio waveforms |
+| `decode`  | Autoregressive | Token-by-token generation in AR stages      |
+| `codes`   | Audio Encoding | RVQ codec codes from Talker stage           |
+| `output`  | Final Output   | Text chunks or audio waveforms              |
 
 ### Data Flow
 
 #### Stage 0: Thinker (Multimodal Understanding + Text Generation)
+
 - **Prefill**: Processes multimodal input (text/image/audio/video), initializes KV cache
 - **Decode Loop**: Generates text tokens autoregressively
 - **Chunk Triggers**: Each decode step (typically `chunk_size=1`) can trigger downstream processing
 - **Dual Output**:
-  - **Text Stream**: `text_0`, `text_1`, `text_2`... `text_n` streamed to output
-  - **Hidden States**: Passed to Talker stage for audio synthesis
+    - **Text Stream**: `text_0`, `text_1`, `text_2`... `text_n` streamed to output
+    - **Hidden States**: Passed to Talker stage for audio synthesis
 
 #### Stage 1: Talker (Text → RVQ Audio Codes)
+
 - **Prefill**: Receives hidden states from Thinker as semantic condition
 - **Decode Loop**: Generates RVQ codec codes autoregressively
 - **Accumulation**: Codes accumulate to `codec_chunk_frames` (default=25) before forwarding
@@ -114,18 +118,20 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 - **Output**: `codes` blocks (chunk 0, 1, ... n) sent to Code2Wav
 
 #### Stage 2: Code2Wav (Vocoder Decoder)
+
 - **Non-Autoregressive**: Processes RVQ codes in parallel batches
 - **Streaming Decode**: Converts codes to audio waveforms chunk-by-chunk
 - **Batching**: Supports batched inference for multiple concurrent requests
 - **Output**: Audio segments `audio_0`, `audio_1`, ... `audio_n`
 
 #### Stage 3: Output (Dual Stream)
+
 - **Text Streaming**: `text_0` → `text_1` → `text_2` → ... (user sees response in real-time)
 - **Audio Streaming**: `audio_0` → `audio_1` → ... (user hears audio progressively)
 
 ### Execution Timeline
 
-```
+```text
 Timeline: Parallel vs Sequential
 
 Sequential (async_chunk=false):
@@ -144,6 +150,7 @@ Total: ~3.5s, TTFP: ~0.5s
 ```
 
 #### Sequential Flow (for comparison)
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/qwen3-omni-non-async-chunk.png">
@@ -154,13 +161,13 @@ Total: ~3.5s, TTFP: ~0.5s
 In sequential mode, each stage must wait for the previous stage to complete entirely before starting.
 
 ### Async Chunk System Architecture
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/async-chunk-architecture.png">
     <img alt="Async Chunk Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/async-chunk-architecture.png" width=100%>
   </picture>
 </p>
-
 
 ### Key Components
 
@@ -230,6 +237,14 @@ sizing.
 - `connectors: dict`: Deploy-owned connector definitions
 - `max_num_seqs: int`: Maximum number of sequences for concurrent processing in the stage
 
+When `active_stream_window > 0`, the transfer adapter keeps a persistent FIFO
+of streams waiting for admission, including those observed while the window is
+full. A resumable stream that yields at a completed segment boundary rejoins
+the tail; scheduler queue restoration must not let it overtake existing
+waiters. Completion and cancellation remove both active and waiting entries.
+This is fairness at safe segment boundaries, not a wall-clock starvation SLO:
+a stalled active stream still needs the configured timeout/abort path.
+
 ### Connector Configuration
 
 ```yaml
@@ -252,9 +267,9 @@ For optimal performance with async_chunk, the code2wav stage should be configure
 
 ```yaml
 stages:
-  - stage_id: 2  # code2wav stage
+  - stage_id: 2 # code2wav stage
     devices: "1"
-    max_num_seqs: 64  # Enables batched audio generation
+    max_num_seqs: 64 # Enables batched audio generation
 ```
 
 ## Related Files

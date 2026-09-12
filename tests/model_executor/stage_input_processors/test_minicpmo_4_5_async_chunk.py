@@ -519,3 +519,28 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert payload is not None
     assert payload.meta.cache_epoch == 1
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+
+
+def test_model_interrupt_resets_codec_cache_and_rejects_old_turn():
+    manager = _manager()
+    request = _request("interrupted")
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25)), request, False)
+    assert first is not None
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(101, 102), request, False) is None
+    followup = tts2code2wav_async_chunk(
+        manager, _duplex_delta(*range(200, 225), turn_id=8, text="new reply"), request, False
+    )
+    assert followup is not None
+    assert followup.meta.cache_epoch == first.meta.cache_epoch + 1
+    assert followup.meta.chunk_seq == 0
+    assert _codes(followup) == [4218, 4218, 4218, *range(200, 225)]
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=7), request, False) is None
+
+
+def test_replacement_request_can_restart_native_turn_number():
+    manager = _manager()
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=7), _request("shared", "old"), False)
+    second = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=0), _request("shared", "new"), False)
+    assert first is not None and second is not None
+    assert second.meta.cache_epoch == first.meta.cache_epoch + 1
+    assert second.meta.chunk_seq == 0

@@ -369,6 +369,34 @@ def _mux_mp4_bytes_with_synthetic_audio(
         return video_mp4_bytes
 
 
+def _encode_video_frames_with_pyav(video_frames: list[np.ndarray], *, fps: int) -> bytes:
+    """Encode RGB frames when imageio selected its PyAV compatibility plugin."""
+    import av
+
+    if not video_frames:
+        raise ValueError("Synthetic video requires at least one frame")
+
+    first_frame = video_frames[0]
+    height, width = first_frame.shape[:2]
+    buffer = io.BytesIO()
+    with av.open(buffer, mode="w", format="mp4") as container:
+        stream = container.add_stream(
+            "libx264",
+            rate=fps,
+            options={"preset": "medium", "crf": "23"},
+        )
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        for frame in video_frames:
+            video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+            for packet in stream.encode(video_frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return buffer.getvalue()
+
+
 def generate_synthetic_video(
     width: int,
     height: int,
@@ -466,6 +494,14 @@ def generate_synthetic_video(
                 writer.append_data(frame)
         buffer.seek(0)
         video_only_bytes = buffer.read()
+    except TypeError as e:
+        # ``format="mp4"`` falls back to imageio's PyAV plugin when the
+        # imageio-ffmpeg extra is absent. That plugin does not accept the
+        # legacy writer's quality/ffmpeg kwargs, so encode with PyAV directly.
+        if "PyAVPlugin.write()" not in str(e) or "unexpected keyword argument" not in str(e):
+            print(f"Warning: Failed to encode synthetic video: {e}")
+            raise
+        video_only_bytes = _encode_video_frames_with_pyav(video_frames, fps=fps)
     except Exception as e:
         print(f"Warning: Failed to encode synthetic video: {e}")
         raise

@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, overload
 
 REALTIME_INPUT_AUDIO_FORMATS = {
     "pcm16",
@@ -148,6 +149,8 @@ class RealtimeSessionState:
     _initial_session_update: bool = False
     _input_speech_started: bool = False
     _response_states: dict[str | int, _RealtimeResponseState] = field(default_factory=dict)
+    _completed_response_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    _has_response_lifecycle: bool = False
     _item_truncation_cursors: dict[str, tuple[int, int]] = field(default_factory=dict)
     _active_response_id: str | None = None
     _last_response_id: str | None = None
@@ -174,7 +177,7 @@ class RealtimeSessionState:
                 native_duplex = getter("minicpmo45_native_duplex")
         resume_only = getter("resume") if getter is not None else None
         autostart = getter("autostart") if getter is not None else None
-        default_extra_body = {}
+        default_extra_body: dict[str, object] = {}
         if str(native_duplex).strip().lower() in {"1", "true", "yes", "on"}:
             default_extra_body["native_duplex"] = True
         return cls(
@@ -198,13 +201,21 @@ class _RealtimeStateField(Generic[_StateValue]):
         del owner
         self._name = name
 
-    def __get__(self, instance: Any, owner: type | None = None) -> _StateValue | _RealtimeStateField[_StateValue]:
+    @overload
+    def __get__(self, instance: None, owner: type | None = None) -> _RealtimeStateField[_StateValue]: ...
+
+    @overload
+    def __get__(self, instance: RealtimeStateOwner, owner: type | None = None) -> _StateValue: ...
+
+    def __get__(
+        self, instance: RealtimeStateOwner | None, owner: type | None = None
+    ) -> _StateValue | _RealtimeStateField[_StateValue]:
         del owner
         if instance is None:
             return self
         return getattr(instance._state, self._name)
 
-    def __set__(self, instance: Any, value: _StateValue) -> None:
+    def __set__(self, instance: RealtimeStateOwner, value: _StateValue) -> None:
         setattr(instance._state, self._name, value)
 
 
@@ -212,34 +223,36 @@ class RealtimeStateOwner:
     """Declare the mutable state surface shared by input/output projectors."""
 
     _state: RealtimeSessionState
-    _opened: bool = _RealtimeStateField()
-    _autostarted_default_session: bool = _RealtimeStateField()
-    _resume_only: bool = _RealtimeStateField()
-    _pending_outbound: asyncio.Queue[dict[str, object]] = _RealtimeStateField()
-    _held_realtime_payloads: list[dict[str, object]] = _RealtimeStateField()
-    _hold_realtime_output_until_session_created: bool = _RealtimeStateField()
-    _default_model: object | None = _RealtimeStateField()
-    _default_session_id: object | None = _RealtimeStateField()
-    _default_extra_body: dict[str, object] = _RealtimeStateField()
-    _input_audio_format: str = _RealtimeStateField()
-    _input_sample_rate_hz: int = _RealtimeStateField()
-    _output_audio_format: str = _RealtimeStateField()
-    _overlap_silence_rms: float = _RealtimeStateField()
-    _turn_detection: dict[str, object] | None = _RealtimeStateField()
-    _native_input_append: bool = _RealtimeStateField()
-    _pending_turn_detection_update: _PendingTurnDetectionUpdate | None = _RealtimeStateField()
-    _send_realtime_json: Any = _RealtimeStateField()
-    _initial_session_update: bool = _RealtimeStateField()
-    _input_speech_started: bool = _RealtimeStateField()
-    _response_states: dict[str | int, _RealtimeResponseState] = _RealtimeStateField()
-    _item_truncation_cursors: dict[str, tuple[int, int]] = _RealtimeStateField()
-    _active_response_id: str | None = _RealtimeStateField()
-    _last_response_id: str | None = _RealtimeStateField()
-    _conversation_items: dict[str, dict[str, object]] = _RealtimeStateField()
-    _last_conversation_item_id: str | None = _RealtimeStateField()
-    _output_sample_rate_hz: int | None = _RealtimeStateField()
-    _active_input_item_id: str | None = _RealtimeStateField()
-    _input_audio_buffer_has_audio: bool = _RealtimeStateField()
-    _input_audio_buffer_had_non_speech: bool = _RealtimeStateField()
-    _input_audio_buffer_transcript_parts: list[str] = _RealtimeStateField()
-    _turn_detection_configured: bool = _RealtimeStateField()
+    _opened = _RealtimeStateField[bool]()
+    _autostarted_default_session = _RealtimeStateField[bool]()
+    _resume_only = _RealtimeStateField[bool]()
+    _pending_outbound = _RealtimeStateField[asyncio.Queue[dict[str, object]]]()
+    _held_realtime_payloads = _RealtimeStateField[list[dict[str, object]]]()
+    _hold_realtime_output_until_session_created = _RealtimeStateField[bool]()
+    _default_model = _RealtimeStateField[object | None]()
+    _default_session_id = _RealtimeStateField[object | None]()
+    _default_extra_body = _RealtimeStateField[dict[str, object]]()
+    _input_audio_format = _RealtimeStateField[str]()
+    _input_sample_rate_hz = _RealtimeStateField[int]()
+    _output_audio_format = _RealtimeStateField[str]()
+    _overlap_silence_rms = _RealtimeStateField[float]()
+    _turn_detection = _RealtimeStateField[dict[str, object] | None]()
+    _native_input_append = _RealtimeStateField[bool]()
+    _pending_turn_detection_update = _RealtimeStateField[_PendingTurnDetectionUpdate | None]()
+    _send_realtime_json = _RealtimeStateField[Any]()
+    _initial_session_update = _RealtimeStateField[bool]()
+    _input_speech_started = _RealtimeStateField[bool]()
+    _response_states = _RealtimeStateField[dict[str | int, _RealtimeResponseState]]()
+    _completed_response_ids = _RealtimeStateField[OrderedDict[str, None]]()
+    _has_response_lifecycle = _RealtimeStateField[bool]()
+    _item_truncation_cursors = _RealtimeStateField[dict[str, tuple[int, int]]]()
+    _active_response_id = _RealtimeStateField[str | None]()
+    _last_response_id = _RealtimeStateField[str | None]()
+    _conversation_items = _RealtimeStateField[dict[str, dict[str, object]]]()
+    _last_conversation_item_id = _RealtimeStateField[str | None]()
+    _output_sample_rate_hz = _RealtimeStateField[int | None]()
+    _active_input_item_id = _RealtimeStateField[str | None]()
+    _input_audio_buffer_has_audio = _RealtimeStateField[bool]()
+    _input_audio_buffer_had_non_speech = _RealtimeStateField[bool]()
+    _input_audio_buffer_transcript_parts = _RealtimeStateField[list[str]]()
+    _turn_detection_configured = _RealtimeStateField[bool]()

@@ -1,0 +1,24 @@
+# Gander-Omni/Gander Unit8/50, composed with minicpmo_4_5.gander.
+# Reuses the scheduler-owned MiniCPM-o Thinker, Talker and Code2Wav.
+base_config: minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+session_mode: duplex
+active_stream_window: 4
+duplex_session:
+  max_sessions: 4
+  # Complete tool/reference prefix snapshots are retained in the input journal.
+  kv_recovery_max_replay_bytes_per_session: 268435456
+stages:
+  - stage_id: 0
+    max_model_len: 40960
+    max_num_seqs: 4
+    enforce_eager: true
+  - stage_id: 1
+    max_num_seqs: 4
+    enforce_eager: true
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 1.0
+      top_k: -1
+  - stage_id: 2
+    max_num_seqs: 4

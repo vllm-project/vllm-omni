@@ -6,17 +6,22 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import cast
 
 from vllm_omni.engine.duplex.contracts import (
+    DUPLEX_CONTRACT_VERSION,
     DuplexAppendPlan,
     DuplexInputMode,
     DuplexOutputAction,
     DuplexOutputDecision,
+    DuplexPluginDescriptor,
     DuplexRuntimeCapabilities,
     DuplexRuntimeExtension,
+    DuplexTraceEnvelope,
     SessionMode,
     duplex_data_plane_request_info,
     duplex_resource_request_belongs_to_session,
+    duplex_resource_request_generation,
     duplex_resource_request_id,
 )
 
@@ -44,7 +49,7 @@ def validate_duplex_runtime_extension(
     missing = [name for name in required_methods if not callable(getattr(extension, name, None))]
     if missing:
         raise TypeError(f"Duplex runtime extension is missing callable method(s): {', '.join(missing)}")
-    typed_extension = extension  # type: ignore[assignment]
+    typed_extension = cast(DuplexRuntimeExtension, extension)
     if sampling_defaults is not None:
         configured = typed_extension.configure_sampling_params(
             runtime_config={},
@@ -72,6 +77,7 @@ from vllm_omni.engine.duplex.lease import (  # noqa: E402, F401
 from vllm_omni.engine.duplex.session import (  # noqa: E402, F401
     DuplexAppendReservation,
     DuplexCompletedAppend,
+    DuplexContextLedgerSnapshot,
     DuplexFenceMismatchError,
     DuplexInputAppend,
     DuplexRequestResource,
@@ -81,9 +87,11 @@ from vllm_omni.engine.duplex.session import (  # noqa: E402, F401
 )
 
 __all__ = [
+    "DUPLEX_CONTRACT_VERSION",
     "DuplexAppendPlan",
     "DuplexAppendReservation",
     "DuplexCompletedAppend",
+    "DuplexContextLedgerSnapshot",
     "DuplexFenceMismatchError",
     "DuplexInputAppend",
     "DuplexInputMode",
@@ -92,6 +100,8 @@ __all__ = [
     "DuplexLeaseState",
     "DuplexOutputAction",
     "DuplexOutputDecision",
+    "DuplexPluginDescriptor",
+    "DuplexTraceEnvelope",
     "DuplexRequestResource",
     "DuplexRuntimeCapabilities",
     "DuplexRuntimeExtension",
@@ -102,6 +112,7 @@ __all__ = [
     "SessionMode",
     "duplex_data_plane_request_info",
     "duplex_resource_request_belongs_to_session",
+    "duplex_resource_request_generation",
     "duplex_resource_request_id",
     "load_duplex_runtime_extension",
     "validate_duplex_runtime_extension",

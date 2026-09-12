@@ -8,7 +8,7 @@ import base64
 import binascii
 import inspect
 import json
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -18,6 +18,7 @@ from fastapi import WebSocket
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.engine.duplex.runtime import duplex_resource_request_id
 from vllm_omni.entrypoints.duplex.capability import (
@@ -67,6 +68,7 @@ from vllm_omni.entrypoints.duplex.server_vad import (
 from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexJournalGapError,
     DuplexSessionAttachmentRegistry,
+    DuplexTransportAttachment,
     InvalidResumeTokenError,
 )
 from vllm_omni.entrypoints.duplex.session_runner import (
@@ -172,10 +174,14 @@ class OmniDuplexSessionHandler(
         self._resync_required_sessions: set[str] = set()
         self._lifecycle_queue = getattr(self._chat_service.engine_client, "duplex_lifecycle_events", None)
         self._lifecycle_task: asyncio.Task[None] | None = None
+        self._lifecycle_cleanups: dict[str, asyncio.Task[None]] = {}
+        self._lifecycle_notifications: set[asyncio.Task[None]] = set()
+        self._pending_resume_controls: dict[str, asyncio.Task[int]] = {}
         self._attachment_registry = DuplexSessionAttachmentRegistry(
             replay_ttl_s=self._duplex_session_config.resume_replay_ttl_s,
             replay_max_bytes_per_session=self._duplex_session_config.resume_replay_max_bytes_per_session,
             disconnect_grace_s=self._duplex_session_config.disconnect_grace_s,
+            transport_timeout_s=self._duplex_session_config.attachment_io_timeout_s,
         )
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
@@ -200,16 +206,31 @@ class OmniDuplexSessionHandler(
         try:
             while True:
                 message = await queue.get()
-                try:
-                    if isinstance(message, DuplexSessionLifecycleMessage):
-                        await self._apply_runtime_lifecycle(message)
-                finally:
+                if not isinstance(message, DuplexSessionLifecycleMessage):
                     queue.task_done()
-                if self._registry.active_count() == 0:
-                    return
+                    continue
+                previous = self._lifecycle_cleanups.get(message.session_id)
+                task = asyncio.create_task(self._run_session_lifecycle_cleanup(message, previous, queue))
+                self._lifecycle_cleanups[message.session_id] = task
         finally:
             if self._lifecycle_task is asyncio.current_task():
                 self._lifecycle_task = None
+
+    async def _run_session_lifecycle_cleanup(
+        self, message: DuplexSessionLifecycleMessage, previous: asyncio.Task[None] | None, queue: asyncio.Queue
+    ) -> None:
+        """Preserve per-session order without awaiting a peer's task cancellation."""
+        try:
+            if previous is not None:
+                await asyncio.shield(previous)
+            await self._apply_runtime_lifecycle(message)
+        except Exception:
+            logger.exception("Duplex lifecycle cleanup failed for %s", message.session_id)
+        finally:
+            queue.task_done()
+            if self._lifecycle_cleanups.get(message.session_id) is asyncio.current_task():
+                self._lifecycle_cleanups.pop(message.session_id, None)
+            self._stop_lifecycle_listener_if_idle()
 
     async def _apply_runtime_lifecycle(self, message: DuplexSessionLifecycleMessage) -> None:
         session = self._registry.get(message.session_id)
@@ -234,13 +255,10 @@ class OmniDuplexSessionHandler(
         }
         if protocol is not None:
             expired_payload = protocol.encode_outbound_event(expired_payload)[0]
-        with suppress(Exception):
-            await self._attachment_registry.send_event(
-                session.session_id,
-                expired_payload,
-                journal=False,
-            )
-
+        # Fence the transport first. Resource cleanup must never wait for a
+        # websocket send/close; the runtime has already terminated this lease.
+        session.mark_closing()
+        attachment = await self._attachment_registry.close(session.session_id)
         tasks = self._session_tasks.pop(session.session_id, None)
         if tasks is not None:
             await tasks.cancel_append_tasks()
@@ -253,6 +271,7 @@ class OmniDuplexSessionHandler(
         if native is not None and native.data_plane_task is not None:
             data_plane_task = native.data_plane_task
             native.data_plane_task = None
+            native.data_plane_request_id = None
             data_plane_task.cancel()
             with suppress(asyncio.CancelledError):
                 await data_plane_task
@@ -263,14 +282,26 @@ class OmniDuplexSessionHandler(
         self._realtime_protocols.pop(session.session_id, None)
         self._lease_generations.pop(session.session_id, None)
         self._resync_required_sessions.discard(session.session_id)
-        attachment = await self._attachment_registry.close(session.session_id)
         if attachment is not None:
-            with suppress(Exception):
-                await attachment.close("session_expired")
+            self._notify_retired_attachment(attachment, "session_expired", expired_payload)
+
+    def _notify_retired_attachment(
+        self, attachment: DuplexTransportAttachment, reason: str, payload: dict[str, object]
+    ) -> None:
+        """Track bounded best-effort transport work outside lifecycle cleanup."""
+        task = asyncio.create_task(self._attachment_registry.retire_attachment(attachment, reason, payload))
+        self._lifecycle_notifications.add(task)
+
+        def completed(done: asyncio.Task[None]) -> None:
+            self._lifecycle_notifications.discard(done)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                logger.warning("Duplex retired attachment notification failed: %s", error)
+
+        task.add_done_callback(completed)
 
     def _stop_lifecycle_listener_if_idle(self) -> None:
         task = self._lifecycle_task
-        if self._registry.active_count() != 0 or task is None or task.done():
+        if self._registry.active_count() != 0 or self._lifecycle_cleanups or task is None or task.done():
             return
         if task is not asyncio.current_task():
             task.cancel()
@@ -933,6 +964,7 @@ class OmniDuplexSessionHandler(
         realtime_protocol: NativeRealtimeSessionProtocol | None = None,
         attachment_send=None,
         attachment_close=None,
+        attachment_send_text: Callable[[str], Awaitable[None]] | None = None,
     ) -> _DuplexSessionHandshake | None:
         raw = await self._receive_text(
             websocket,
@@ -963,6 +995,7 @@ class OmniDuplexSessionHandler(
                 realtime_protocol=realtime_protocol,
                 attachment_send=attachment_send,
                 attachment_close=attachment_close,
+                attachment_send_text=attachment_send_text,
             )
         if not isinstance(event, dict) or event.get("type") not in {"session.create", "open_session", "session.config"}:
             await send_json(
@@ -1024,10 +1057,49 @@ class OmniDuplexSessionHandler(
         self,
         event: dict[str, object],
         *,
+        send_json: Callable[[dict[str, object]], Awaitable[None]],
+        realtime_protocol: NativeRealtimeSessionProtocol,
+        attachment_send: Callable[[dict[str, object]], Awaitable[None]],
+        attachment_close: Callable[[str], Awaitable[None]],
+        attachment_send_text: Callable[[str], Awaitable[None]] | None = None,
+    ) -> _DuplexSessionHandshake | None:
+        """Keep the engine lease CAS and transport activation in one session order."""
+        session_id = event.get("session_id")
+        try:
+            lock = self._attachment_registry.handshake_lock(session_id) if isinstance(session_id, str) else None
+        except KeyError:
+            lock = None
+
+        async def activate() -> _DuplexSessionHandshake | None:
+            return await self._resume_session_handshake_locked(
+                event,
+                send_json=send_json,
+                realtime_protocol=realtime_protocol,
+                attachment_send=attachment_send,
+                attachment_close=attachment_close,
+                attachment_send_text=attachment_send_text,
+            )
+
+        if lock is None or not isinstance(session_id, str):
+            return await activate()
+        async with lock:
+            pending = self._pending_resume_controls.get(session_id)
+            if pending is not None:
+                # A disconnected caller cannot cancel an already-issued CAS.
+                # Its completion records the generation before the next retry.
+                with suppress(Exception):
+                    await asyncio.shield(pending)
+            return await activate()
+
+    async def _resume_session_handshake_locked(
+        self,
+        event: dict[str, object],
+        *,
         send_json,
         realtime_protocol: NativeRealtimeSessionProtocol,
         attachment_send,
         attachment_close,
+        attachment_send_text: Callable[[str], Awaitable[None]] | None = None,
     ) -> _DuplexSessionHandshake | None:
         session_id = event.get("session_id")
         incarnation = event.get("incarnation")
@@ -1119,7 +1191,32 @@ class OmniDuplexSessionHandler(
             )
             return None
         expected_generation = self._lease_generations.get(session_id, 0)
-        try:
+        abandoned = False
+
+        async def detach_failed_resume(generation: int) -> int:
+            # A failed activation must not leave a detached client looking
+            # attached to the engine for the full idle TTL. A retry waits for
+            # this control before issuing another CAS, so it cannot detach a
+            # newer successful attachment. Preserve an old still-live socket
+            # when cancellation happened before transport takeover began.
+            if (
+                self._registry.get(session_id) is session
+                and session.state == DuplexSessionState.OPEN
+                and self._lease_generations.get(session_id) == generation
+                and not await self._attachment_registry.is_attached(session_id)
+            ):
+                touch = getattr(self._chat_service.engine_client, "touch_duplex_session_async", None)
+                if callable(touch):
+                    await touch(
+                        session_id,
+                        fence=DuplexFence(
+                            session_id, epoch=session.epoch, turn_id=session.turn_id, incarnation=session.incarnation
+                        ),
+                        activity=DuplexLeaseActivity.DETACH,
+                    )
+            return generation
+
+        async def resume_and_record_lease() -> int:
             runtime_result = await resume_runtime(
                 session_id,
                 fence=DuplexFence(
@@ -1133,6 +1230,36 @@ class OmniDuplexSessionHandler(
             lease_generation = self._runtime_lease_generation(runtime_result)
             if lease_generation is None:
                 raise RuntimeError("runtime resume result omitted lease_generation")
+            if self._registry.get(session_id) is not session or session.state != DuplexSessionState.OPEN:
+                raise RuntimeError("session expired during runtime resume")
+            self._lease_generations[session_id] = lease_generation
+            if abandoned:
+                await detach_failed_resume(lease_generation)
+            return lease_generation
+
+        control = asyncio.create_task(resume_and_record_lease())
+        self._pending_resume_controls[session_id] = control
+
+        def completed(done: asyncio.Task[int]) -> None:
+            if self._pending_resume_controls.get(session_id) is done:
+                self._pending_resume_controls.pop(session_id, None)
+            if not done.cancelled():
+                done.exception()
+
+        control.add_done_callback(completed)
+
+        def schedule_detach(generation: int) -> None:
+            cleanup = asyncio.create_task(detach_failed_resume(generation))
+            self._pending_resume_controls[session_id] = cleanup
+            cleanup.add_done_callback(completed)
+
+        try:
+            lease_generation = await asyncio.shield(control)
+        except asyncio.CancelledError:
+            abandoned = True
+            if control.done() and not control.cancelled() and control.exception() is None:
+                schedule_detach(control.result())
+            raise
         except Exception as exc:
             await send_json(
                 {
@@ -1165,12 +1292,15 @@ class OmniDuplexSessionHandler(
                 send=attachment_send,
                 close=attachment_close,
                 activation_payload_factory=activation_payload_factory,
+                send_text=attachment_send_text,
             )
-        except Exception as exc:
+        except BaseException as exc:
             # The engine-side CAS already advanced even if the transport
             # vanished before it received the rotated token. Keep that
             # generation so the registry's one-shot recovery token can retry.
-            self._lease_generations[session_id] = lease_generation
+            schedule_detach(lease_generation)
+            if not isinstance(exc, Exception):
+                raise
             await send_json(
                 {
                     "type": "error",
@@ -1179,7 +1309,6 @@ class OmniDuplexSessionHandler(
                 }
             )
             return None
-        self._lease_generations[session_id] = lease_generation
         replaced = resumed.replaced_attachment
         if replaced is not None:
             replaced_payload = realtime_protocol.encode_outbound_event(
@@ -1189,10 +1318,7 @@ class OmniDuplexSessionHandler(
                     "attachment_generation": replaced.generation,
                 }
             )[0]
-            with suppress(Exception):
-                await replaced.send(replaced_payload)
-            with suppress(Exception):
-                await replaced.close("session_replaced")
+            self._notify_retired_attachment(replaced, "session_replaced", replaced_payload)
         return _DuplexSessionHandshake(
             session=session,
             resumed=True,
@@ -1557,8 +1683,8 @@ class OmniDuplexSessionHandler(
                     "code": "native_duplex_mode_update_unsupported",
                     "error": "session.update cannot change native_duplex after the session is created",
                 }
-        if isinstance(payload.get("instructions"), str):
-            session.config.instructions = str(payload["instructions"])
+        if isinstance((checked_instructions := payload.get("instructions")), str):
+            session.config.instructions = str(checked_instructions)
         elif "instructions" in payload and payload.get("instructions") is None:
             session.config.instructions = None
         if isinstance(voice, str):
@@ -1572,8 +1698,8 @@ class OmniDuplexSessionHandler(
         response_format, _ = NativeRealtimeSessionProtocol._parse_realtime_audio_format(response_format)
         if isinstance(response_format, str) and response_format.lower() in REALTIME_OUTPUT_AUDIO_FORMATS:
             session.config.response_format = NativeRealtimeSessionProtocol._duplex_response_format(response_format)
-        if isinstance(payload.get("temperature"), int | float):
-            session.config.temperature = float(payload["temperature"])
+        if isinstance((checked_temperature := payload.get("temperature")), int | float):
+            session.config.temperature = float(checked_temperature)
         speed = payload.get("speed")
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")
@@ -1588,52 +1714,50 @@ class OmniDuplexSessionHandler(
         )
         if "max_response_output_tokens" in payload or "max_output_tokens" in payload or "max_tokens" in payload:
             session.config.max_tokens = NativeRealtimeSessionProtocol.realtime_max_output_tokens(max_tokens)
-        if isinstance(payload.get("overlap_policy"), str):
-            session.config.overlap_policy = DuplexSessionConfig._normalize_overlap_policy(
-                str(payload["overlap_policy"])
-            )
-        if isinstance(payload.get("overlap_short_ack_ms"), int | float):
-            session.config.overlap_short_ack_ms = max(0, int(payload["overlap_short_ack_ms"]))
-        if isinstance(payload.get("overlap_barge_in_ms"), int | float):
-            session.config.overlap_barge_in_ms = max(0, int(payload["overlap_barge_in_ms"]))
-        if isinstance(payload.get("overlap_silence_rms"), int | float):
-            session.config.overlap_silence_rms = max(0.0, float(payload["overlap_silence_rms"]))
-        if isinstance(payload.get("playback_commit_policy"), str):
+        if isinstance((checked_overlap_policy := payload.get("overlap_policy")), str):
+            session.config.overlap_policy = DuplexSessionConfig._normalize_overlap_policy(str(checked_overlap_policy))
+        if isinstance((checked_overlap_short_ack_ms := payload.get("overlap_short_ack_ms")), int | float):
+            session.config.overlap_short_ack_ms = max(0, int(checked_overlap_short_ack_ms))
+        if isinstance((checked_overlap_barge_in_ms := payload.get("overlap_barge_in_ms")), int | float):
+            session.config.overlap_barge_in_ms = max(0, int(checked_overlap_barge_in_ms))
+        if isinstance((checked_overlap_silence_rms := payload.get("overlap_silence_rms")), int | float):
+            session.config.overlap_silence_rms = max(0.0, float(checked_overlap_silence_rms))
+        if isinstance((checked_playback_commit_policy := payload.get("playback_commit_policy")), str):
             session.config.playback_commit_policy = DuplexSessionConfig._normalize_playback_commit_policy(
-                str(payload["playback_commit_policy"])
+                str(checked_playback_commit_policy)
             )
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
             session.config.modalities = list(modalities)
-        if isinstance(payload.get("extra_body"), dict):
-            session.config.extra_body.update(payload["extra_body"])
-            extra = payload["extra_body"]
-            if isinstance(extra.get("overlap_policy"), str):
+        if isinstance((checked_extra_body := payload.get("extra_body")), dict):
+            session.config.extra_body.update(checked_extra_body)
+            extra = checked_extra_body
+            if isinstance((checked_overlap_policy := extra.get("overlap_policy")), str):
                 session.config.overlap_policy = DuplexSessionConfig._normalize_overlap_policy(
-                    str(extra["overlap_policy"])
+                    str(checked_overlap_policy)
                 )
-            if isinstance(extra.get("playback_commit_policy"), str):
+            if isinstance((checked_playback_commit_policy := extra.get("playback_commit_policy")), str):
                 session.config.playback_commit_policy = DuplexSessionConfig._normalize_playback_commit_policy(
-                    str(extra["playback_commit_policy"])
+                    str(checked_playback_commit_policy)
                 )
-        if isinstance(payload.get("tools"), list):
-            session.config.extra_body["realtime_tools"] = payload["tools"]
+        if isinstance((checked_tools := payload.get("tools")), list):
+            session.config.extra_body["realtime_tools"] = checked_tools
         elif "tools" in payload and payload.get("tools") is None:
             session.config.extra_body.pop("realtime_tools", None)
-        if isinstance(payload.get("tool_choice"), str | dict):
-            session.config.extra_body["realtime_tool_choice"] = payload["tool_choice"]
+        if isinstance((checked_tool_choice := payload.get("tool_choice")), str | dict):
+            session.config.extra_body["realtime_tool_choice"] = checked_tool_choice
         elif "tool_choice" in payload and payload.get("tool_choice") is None:
             session.config.extra_body.pop("realtime_tool_choice", None)
-        if isinstance(payload.get("metadata"), dict):
-            session.config.extra_body["realtime_metadata"] = dict(payload["metadata"])
+        if isinstance((checked_metadata := payload.get("metadata")), dict):
+            session.config.extra_body["realtime_metadata"] = dict(checked_metadata)
         elif "metadata" in payload and payload.get("metadata") is None:
             session.config.extra_body.pop("realtime_metadata", None)
-        if isinstance(payload.get("include"), list):
-            session.config.extra_body["realtime_include"] = list(payload["include"])
+        if isinstance((checked_include := payload.get("include")), list):
+            session.config.extra_body["realtime_include"] = list(checked_include)
         elif "include" in payload and payload.get("include") is None:
             session.config.extra_body.pop("realtime_include", None)
-        if isinstance(payload.get("prompt"), dict):
-            session.config.extra_body["realtime_prompt"] = dict(payload["prompt"])
+        if isinstance((checked_prompt := payload.get("prompt")), dict):
+            session.config.extra_body["realtime_prompt"] = dict(checked_prompt)
         elif "prompt" in payload and payload.get("prompt") is None:
             session.config.extra_body.pop("realtime_prompt", None)
         input_audio_transcription = NativeRealtimeSessionProtocol._input_audio_transcription_config(payload)
@@ -1641,9 +1765,9 @@ class OmniDuplexSessionHandler(
             session.config.extra_body["realtime_input_audio_transcription"] = dict(input_audio_transcription)
         elif "input_audio_transcription" in payload and payload.get("input_audio_transcription") is None:
             session.config.extra_body.pop("realtime_input_audio_transcription", None)
-        if isinstance(payload.get("input_audio_noise_reduction"), dict):
+        if isinstance((checked_input_audio_noise_reduction := payload.get("input_audio_noise_reduction")), dict):
             session.config.extra_body["realtime_input_audio_noise_reduction"] = dict(
-                payload["input_audio_noise_reduction"]
+                checked_input_audio_noise_reduction
             )
         elif "input_audio_noise_reduction" in payload and payload.get("input_audio_noise_reduction") is None:
             session.config.extra_body.pop("realtime_input_audio_noise_reduction", None)
@@ -1651,12 +1775,12 @@ class OmniDuplexSessionHandler(
             session.config.extra_body["realtime_input_audio_noise_reduction"] = dict(audio_input["noise_reduction"])
         elif isinstance(audio_input, dict) and audio_input.get("noise_reduction") is None:
             session.config.extra_body.pop("realtime_input_audio_noise_reduction", None)
-        if isinstance(payload.get("audio"), dict):
-            session.config.extra_body["realtime_audio"] = dict(payload["audio"])
+        if isinstance((checked_audio := payload.get("audio")), dict):
+            session.config.extra_body["realtime_audio"] = dict(checked_audio)
         elif "audio" in payload and payload.get("audio") is None:
             session.config.extra_body.pop("realtime_audio", None)
-        if isinstance(payload.get("tracing"), str | dict):
-            session.config.extra_body["realtime_tracing"] = payload["tracing"]
+        if isinstance((checked_tracing := payload.get("tracing")), str | dict):
+            session.config.extra_body["realtime_tracing"] = checked_tracing
         elif "tracing" in payload and payload.get("tracing") is None:
             session.config.extra_body.pop("realtime_tracing", None)
         session.config.extra_body["realtime_session_payload"] = (
@@ -1764,7 +1888,8 @@ class OmniDuplexSessionHandler(
             response_format = NativeRealtimeSessionProtocol._duplex_response_format(response_format)
         else:
             response_format = None
-        temperature = float(payload["temperature"]) if isinstance(payload.get("temperature"), int | float) else None
+        raw_temperature = payload.get("temperature")
+        temperature = float(raw_temperature) if isinstance(raw_temperature, int | float) else None
         speed = payload.get("speed")
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")
@@ -1795,10 +1920,10 @@ class OmniDuplexSessionHandler(
         prompt = payload.get("prompt")
         if isinstance(prompt, dict):
             response_extra["realtime_response_prompt"] = dict(prompt)
-        if isinstance(payload.get("tools"), list):
-            response_extra["realtime_response_tools"] = payload["tools"]
-        if isinstance(payload.get("tool_choice"), str | dict):
-            response_extra["realtime_response_tool_choice"] = payload["tool_choice"]
+        if isinstance((checked_tools := payload.get("tools")), list):
+            response_extra["realtime_response_tools"] = checked_tools
+        if isinstance((checked_tool_choice := payload.get("tool_choice")), str | dict):
+            response_extra["realtime_response_tool_choice"] = checked_tool_choice
         extra_body = payload.get("extra_body")
         if isinstance(extra_body, dict):
             if session.capabilities.implementation_level == "model_native_duplex":
@@ -1873,6 +1998,7 @@ class OmniDuplexSessionHandler(
         return None
 
     async def _handle_playback_ack(self, session: DuplexSession, event: dict[str, object], send_json) -> None:
+        expected_item_id: str | None
         played_ms = event.get("played_ms", event.get("audio_ms", 0))
         committed_ms = event.get("committed_ms")
         if not isinstance(played_ms, int | float):

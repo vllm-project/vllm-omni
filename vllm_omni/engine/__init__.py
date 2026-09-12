@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Engine components for vLLM-Omni.
 """
@@ -79,6 +82,11 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
+    # Opt-in continuous streaming-prompt mode used by model-native duplex.
+    # The upstream streaming-prompt API normally finalizes before decoding;
+    # this flag lets the Omni scheduler keep the request appendable between
+    # model-owned duplex units.
+    streaming_prompt_continuous: bool = False
 
     @classmethod
     def from_request(
@@ -119,8 +127,10 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            session_id=getattr(request, "session_id", None),
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
+            streaming_prompt_continuous=getattr(request, "streaming_prompt_continuous", False),
         )
 
 
@@ -133,6 +143,12 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # Immutable, scalar-only identity/control metadata for the input unit that
+    # produced a streaming segment boundary.  This is deliberately separate
+    # from ``multimodal_output`` (whose wire contract is tensor-only) so an
+    # engine-owned final-append fence can reach the stage bridge without being
+    # inferred from model tokens.
+    streaming_segment_input_metadata: dict[str, Any] | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

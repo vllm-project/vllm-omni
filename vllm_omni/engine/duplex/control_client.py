@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Callable
 
@@ -38,6 +39,7 @@ class DuplexControlRequestError(RuntimeError):
         self.result = result
         self.code = str(error_data.get("code") or "internal_error")
         self.retryable = bool(error_data.get("retryable", False))
+        self.acceptance = error_data.get("acceptance", "unknown")
         accepted_fence = result.get("accepted_fence")
         self.accepted_fence = accepted_fence if isinstance(accepted_fence, DuplexFence) else None
         lease_generation = result.get("lease_generation")
@@ -80,11 +82,14 @@ class DuplexControlClient:
             "error_count": result_message.error_count,
             "accepted_fence": result_message.accepted_fence,
             "lease_generation": result_message.lease_generation,
+            "admission": dict(result_message.admission or {}),
+            "trace": dict(result_message.trace or {}),
             "error": (
                 {
                     "code": result_message.error.code,
                     "message": result_message.error.message,
                     "retryable": result_message.error.retryable,
+                    "acceptance": result_message.error.acceptance,
                 }
                 if result_message.error is not None
                 else None
@@ -132,9 +137,11 @@ class DuplexControlClient:
     ) -> dict[str, object]:
         if expected_epoch is not None and expected_epoch != fence.epoch:
             raise ValueError("expected_epoch must match fence.epoch")
+        control_id = self._control_id_factory()
+        deadline_monotonic = None if timeout is None else time.monotonic() + max(float(timeout), 0.0)
         return self.execute(
             AppendDuplexInputMessage(
-                control_id=self._control_id_factory(),
+                control_id=control_id,
                 operation_id=operation_id,
                 fence=fence,
                 session_id=session_id,
@@ -142,6 +149,7 @@ class DuplexControlClient:
                 mode=mode,
                 payload=payload,
                 final=final,
+                deadline_monotonic=deadline_monotonic,
             ),
             timeout=timeout,
         )
@@ -155,6 +163,7 @@ class DuplexControlClient:
         next_fence: DuplexFence | None,
         session_config: dict[str, object] | None,
         runtime_config: dict[str, object] | None,
+        context: dict[str, object] | None = None,
         timeout: float | None,
     ) -> dict[str, object]:
         return self.execute(
@@ -163,6 +172,8 @@ class DuplexControlClient:
                 fence=fence,
                 session_id=session_id,
                 event=event,
+                context=context,
+                deadline_monotonic=None if timeout is None else time.monotonic() + timeout,
                 next_fence=next_fence,
                 session_config=dict(session_config) if session_config is not None else None,
                 runtime_config=dict(runtime_config) if runtime_config is not None else None,

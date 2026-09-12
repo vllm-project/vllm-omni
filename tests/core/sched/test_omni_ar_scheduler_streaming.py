@@ -914,6 +914,8 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=True,
         segment_finished_requests={session.request_id},
+        requests_with_ready_chunks={session.request_id},
+        _active_streams={},
     )
 
     sched._resume_downstream_chunk_receiver(session)
@@ -924,6 +926,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     assert session not in sched.skipped_waiting.requests
     assert sched.num_waiting_for_streaming_input == 0
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+    assert session.request_id not in sched.chunk_transfer_adapter.requests_with_ready_chunks
 
 
 @pytest.mark.parametrize(
@@ -947,6 +950,8 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=receives_chunks,
         segment_finished_requests={session.request_id},
+        requests_with_ready_chunks={session.request_id},
+        _active_streams={},
     )
     sched.skipped_waiting = MagicMock()
     sched._enqueue_waiting_request = MagicMock()
@@ -956,5 +961,6 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
     assert sched.num_waiting_for_streaming_input == 1
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+    assert session.request_id not in sched.chunk_transfer_adapter.requests_with_ready_chunks
     sched.skipped_waiting.remove_requests.assert_not_called()
     sched._enqueue_waiting_request.assert_not_called()

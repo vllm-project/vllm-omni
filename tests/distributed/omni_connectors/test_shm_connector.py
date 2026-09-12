@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
 import os
@@ -25,6 +25,20 @@ def connector():
 
 
 class TestKeyBasedReadWrite:
+    def test_nowait_does_not_consume_a_writer_locked_chunk(self, connector):
+        import fcntl
+        import uuid
+
+        key = f"codec_nowait_{uuid.uuid4().hex}"
+        assert connector.put("0", "1", key, {"value": 1})[0]
+        with open(f"/dev/shm/shm_{key}_lockfile.lock", "rb+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            assert connector.get_nowait("0", "1", key) is None
+            assert key in connector._pending_keys
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        assert connector.get_nowait("0", "1", key)[0] == {"value": 1}
+        assert connector.get_nowait("0", "1", key) is None
+
     def test_put_then_get_by_key(self, connector):
         data = {"hello": "world", "n": 42}
         ok, size, meta = connector.put("s0", "s1", "test_key_1", data)

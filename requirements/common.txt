@@ -33,6 +33,7 @@ aenum==3.1.16
 pyzmq>=25.0.0
 janus>=1.0.0
 msgpack>=1.0.0
+jsonschema>=4.0.0  # Validate declared Gander function schemas and generated arguments.
 pydantic>=2.1.0
 pydantic-settings>=2.0.0
 # Required for GGUF-quantized diffusion model loading (gguf_adapters). The CI

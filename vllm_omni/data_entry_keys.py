@@ -70,6 +70,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     chunk_seq: int
     cache_epoch: int
     codec_chunk_frames: int
+    codec_frame_offset: int
+    codec_coalesce: bool
     codec_left_context_frames: int
     code_flat_numel: int
     last_chunk: bool
@@ -215,6 +217,8 @@ class MetaStruct(_StructBase):
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
     codec_chunk_frames: int | None = None
+    codec_frame_offset: int | None = None
+    codec_coalesce: bool | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None

@@ -3,22 +3,29 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from vllm_omni.entrypoints.duplex.audio import convert_output_audio
 from vllm_omni.entrypoints.duplex.realtime_state import (
+    RealtimeStateOwner,
     _RealtimeResponseState,
 )
 
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.duplex.realtime_session import NativeRealtimeSessionProtocol
 
-class RealtimeOutputProjector:
+
+class RealtimeOutputProjector(RealtimeStateOwner):
     """Project internal duplex events onto the OpenAI Realtime schema."""
 
     def _from_duplex_event(self, event: dict[str, Any]) -> list[dict[str, object]]:
+        protocol = cast("NativeRealtimeSessionProtocol", self)
+        item: dict[str, object] | None
+        payloads: list[dict[str, object]]
         event_type = event.get("type")
         if event_type == "session.created":
-            session = self._realtime_session_payload(event.get("session"))
+            session = protocol._realtime_session_payload(event.get("session"))
             created: dict[str, object] = {"type": "session.created", "session": session}
             for key in (
                 "incarnation",
@@ -27,24 +34,24 @@ class RealtimeOutputProjector:
             ):
                 if key in event:
                     created[key] = event[key]
-            payloads: list[dict[str, object]] = [created]
-            if self._initial_session_update:
+            payloads = [created]
+            if protocol._initial_session_update:
                 payloads.append({"type": "session.updated", "session": session})
-                self._initial_session_update = False
-            self._hold_realtime_output_until_session_created = False
-            if self._held_realtime_payloads:
-                payloads.extend(self._held_realtime_payloads)
-                self._held_realtime_payloads = []
+                protocol._initial_session_update = False
+            protocol._hold_realtime_output_until_session_created = False
+            if protocol._held_realtime_payloads:
+                payloads.extend(protocol._held_realtime_payloads)
+                protocol._held_realtime_payloads = []
             return payloads
         if event_type == "session.updated":
-            session = self._realtime_session_payload(event.get("session"))
+            session = protocol._realtime_session_payload(event.get("session"))
             return [{"type": "session.updated", "session": session}]
         if event_type == "input_audio_buffer.speech_started":
             item_id = event.get("item_id")
             if isinstance(item_id, str):
-                self._active_input_item_id = item_id
-            self._input_speech_started = True
-            self._input_audio_buffer_has_audio = True
+                protocol._active_input_item_id = item_id
+            protocol._input_speech_started = True
+            protocol._input_audio_buffer_has_audio = True
             return [
                 {
                     "type": "input_audio_buffer.speech_started",
@@ -53,12 +60,12 @@ class RealtimeOutputProjector:
                 }
             ]
         if event_type == "input_audio_buffer.speech_stopped":
-            self._input_speech_started = False
+            protocol._input_speech_started = False
             return [
                 {
                     "type": "input_audio_buffer.speech_stopped",
                     "audio_end_ms": max(0, int(event.get("audio_end_ms", 0) or 0)),
-                    "item_id": event.get("item_id") or self._active_input_item_id,
+                    "item_id": event.get("item_id") or protocol._active_input_item_id,
                 }
             ]
         if event_type in {
@@ -69,14 +76,28 @@ class RealtimeOutputProjector:
             "session.resync_required",
         }:
             if event_type == "session.resumed":
-                self._hold_realtime_output_until_session_created = False
+                protocol._hold_realtime_output_until_session_created = False
             return [dict(event)]
+        if event_type == "session.end":
+            return [dict(event)]
+        if event_type == "response.transcript.done":
+            response_id = event.get("response_id")
+            return [
+                {
+                    "type": "response.audio_transcript.done",
+                    "response_id": response_id,
+                    "item_id": protocol._response_item_id(response_id),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "transcript": event.get("transcript", ""),
+                }
+            ]
         if event_type == "response.created":
             response_id = event.get("response_id")
             if isinstance(response_id, str) and response_id:
-                self._active_response_id = response_id
-                self._last_response_id = response_id
-            item_id = self._response_item_id(response_id)
+                protocol._active_response_id = response_id
+                protocol._last_response_id = response_id
+            item_id = protocol._response_item_id(response_id)
             modalities = event.get("modalities")
             has_audio_modality = not isinstance(modalities, list) or "audio" in modalities
             item = {
@@ -87,14 +108,14 @@ class RealtimeOutputProjector:
                 "status": "in_progress",
                 "content": [],
             }
-            self._conversation_items[item_id] = item
+            protocol._conversation_items[item_id] = item
             payloads = [
-                self._response_created_event(event),
-                *self._conversation_item_added_events(item),
-                *self._response_output_item_added_events(response_id=response_id, item=item),
+                protocol._response_created_event(event),
+                *protocol._conversation_item_added_events(item),
+                *protocol._response_output_item_added_events(response_id=response_id, item=item),
             ]
             if has_audio_modality:
-                payloads.extend(self._ensure_response_audio_part_added(response_id))
+                payloads.extend(protocol._ensure_response_audio_part_added(response_id))
             return payloads
         if event_type == "response.listen":
             listen_response: dict[str, object] = {
@@ -118,7 +139,7 @@ class RealtimeOutputProjector:
             return [listen_payload]
         if event_type == "response.speak":
             response_id = event.get("response_id")
-            state = self._response_state(response_id)
+            state = protocol._response_state(response_id)
             if state is not None:
                 if state.speak_emitted:
                     return []
@@ -127,10 +148,10 @@ class RealtimeOutputProjector:
                 {
                     "type": "response.speak",
                     "response_id": response_id,
-                    "item_id": self._response_item_id(response_id),
+                    "item_id": protocol._response_item_id(response_id),
                     "output_index": 0,
                     "content_index": 0,
-                    "metadata": self._response_speak_metadata(event),
+                    "metadata": protocol._response_speak_metadata(event),
                 }
             ]
         if event_type == "overlap.decision":
@@ -148,16 +169,16 @@ class RealtimeOutputProjector:
         if event_type == "response.output_audio.delta":
             response_id = event.get("response_id")
             audio = event.get("audio", "")
-            payloads: list[dict[str, object]] = []
+            payloads = []
             if isinstance(audio, str) and audio:
-                payloads.extend(self._ensure_response_audio_part_added(response_id))
-                payloads.extend(self._realtime_audio_delta_events(event, response_id, audio))
-                self._refresh_in_progress_response_item(response_id)
+                payloads.extend(protocol._ensure_response_audio_part_added(response_id))
+                payloads.extend(protocol._realtime_audio_delta_events(event, response_id, audio))
+                protocol._refresh_in_progress_response_item(response_id)
             text = event.get("text")
             has_text = isinstance(text, str) and bool(text)
-            if has_text:
-                self._append_response_transcript(response_id, text)
-                self._refresh_in_progress_response_item(response_id)
+            if isinstance(text, str) and has_text:
+                protocol._append_response_transcript(response_id, text)
+                protocol._refresh_in_progress_response_item(response_id)
             # Keep the audio.delta + transcript.delta pair invariant even for
             # text-less units (deduplicated continuations, turn-end flush):
             # clients that treat the pair as unit-complete would otherwise
@@ -170,16 +191,16 @@ class RealtimeOutputProjector:
                     {
                         "type": "response.output_audio_transcript.delta",
                         "response_id": response_id,
-                        "item_id": self._response_item_id(response_id),
+                        "item_id": protocol._response_item_id(response_id),
                         "output_index": 0,
                         "content_index": 0,
                         "delta": text,
                     }
                 )
             if event.get("end_of_turn") is True:
-                payloads.extend(self._realtime_audio_done_events(event, response_id))
+                payloads.extend(protocol._realtime_audio_done_events(event, response_id))
                 payloads.extend(
-                    self._realtime_response_terminal_events(
+                    protocol._realtime_response_terminal_events(
                         event,
                         response_id,
                         status="completed",
@@ -193,16 +214,16 @@ class RealtimeOutputProjector:
         if event_type == "response.text.delta":
             response_id = event.get("response_id")
             text = event.get("delta", "")
-            state = self._response_state(response_id)
+            state = protocol._response_state(response_id)
             if state is not None and isinstance(text, str) and text:
                 state.text_parts.append(text)
-                self._refresh_in_progress_response_item(response_id)
-            payloads = self._ensure_response_text_part_added(response_id)
+                protocol._refresh_in_progress_response_item(response_id)
+            payloads = protocol._ensure_response_text_part_added(response_id)
             payloads.append(
                 {
                     "type": "response.output_text.delta",
                     "response_id": response_id,
-                    "item_id": self._response_item_id(response_id),
+                    "item_id": protocol._response_item_id(response_id),
                     "output_index": 0,
                     "content_index": 1 if state is not None and state.audio_part_added else 0,
                     "delta": text,
@@ -211,11 +232,12 @@ class RealtimeOutputProjector:
             return payloads
         if event_type == "response.done":
             response_id = event.get("response_id")
-            status = event.get("status") if isinstance(event.get("status"), str) else "completed"
+            raw_status = event.get("status")
+            status = raw_status if isinstance(raw_status, str) else "completed"
             status_details = event.get("status_details") if isinstance(event.get("status_details"), dict) else None
             return [
-                *self._realtime_audio_done_events(event, response_id),
-                *self._realtime_response_terminal_events(
+                *protocol._realtime_audio_done_events(event, response_id),
+                *protocol._realtime_response_terminal_events(
                     event,
                     response_id,
                     status=status,
@@ -228,10 +250,10 @@ class RealtimeOutputProjector:
             # commits must not consume another turn's item ID.
             item_id = event_item_id if isinstance(event_item_id, str) and event_item_id else f"item_{uuid4().hex}"
             # The reader may already have accepted audio for the next turn.
-            if self._active_input_item_id == item_id:
-                self._reset_realtime_input_buffer_state()
-            item = self._conversation_items.get(item_id)
-            payloads = [self._input_audio_buffer_committed_event(item_id=item_id)]
+            if protocol._active_input_item_id == item_id:
+                protocol._reset_realtime_input_buffer_state()
+            item = protocol._conversation_items.get(item_id)
+            payloads = [protocol._input_audio_buffer_committed_event(item_id=item_id)]
             if item is None:
                 message = event.get("message")
                 no_response = event.get("no_response") is True
@@ -245,29 +267,29 @@ class RealtimeOutputProjector:
                     "content": (
                         [{"type": "input_audio", "transcript": "", "is_speech": False}]
                         if no_response and is_speech is False
-                        else self._user_item_content_from_duplex_message(message)
+                        else protocol._user_item_content_from_duplex_message(message)
                     ),
                 }
-                self._conversation_items[item_id] = item
-                payloads.extend(self._conversation_item_added_events(item))
+                protocol._conversation_items[item_id] = item
+                payloads.extend(protocol._conversation_item_added_events(item))
             item["status"] = "completed"
-            transcription_event = self._input_audio_transcription_completed_event(item_id, item)
+            transcription_event = protocol._input_audio_transcription_completed_event(item_id, item)
             if transcription_event is not None:
                 payloads.append(transcription_event)
-            payloads.append(self._conversation_item_done_event(item))
+            payloads.append(protocol._conversation_item_done_event(item))
             return payloads
         if event_type == "input.cancelled":
-            self._reset_realtime_input_buffer_state()
+            protocol._reset_realtime_input_buffer_state()
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "input_audio_buffer.cleared":
-            self._reset_realtime_input_buffer_state()
+            protocol._reset_realtime_input_buffer_state()
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "audio.cancelled":
             response_id = event.get("response_id")
-            payloads: list[dict[str, object]] = []
-            if event.get("reason") == "output_audio_buffer_clear":
+            payloads = []
+            if event.get("reason") in {"output_audio_buffer_clear", "context_replaced", "model_interrupt"}:
                 if not isinstance(response_id, str) or not response_id:
-                    response_id = self._active_response_id or self._last_response_id
+                    response_id = protocol._active_response_id or protocol._last_response_id
                 payloads.append(
                     {
                         "type": "output_audio_buffer.cleared",
@@ -277,28 +299,28 @@ class RealtimeOutputProjector:
                 if not isinstance(response_id, str) or not response_id:
                     return payloads
             elif not isinstance(response_id, str) or not response_id:
-                response_id = self._active_response_id
+                response_id = protocol._active_response_id
             if not isinstance(response_id, str) or not response_id:
                 return payloads
-            if self._response_is_done(response_id):
+            if protocol._response_is_done(response_id):
                 return payloads
             committed_ms = event.get("committed_ms")
             if isinstance(committed_ms, int | float):
-                item_id = self._response_item_id(response_id)
+                item_id = protocol._response_item_id(response_id)
                 committed_audio_ms = max(0, int(committed_ms))
-                self._item_truncation_cursors[item_id] = (0, committed_audio_ms)
-                item = self._conversation_items.get(item_id)
+                protocol._item_truncation_cursors[item_id] = (0, committed_audio_ms)
+                item = protocol._conversation_items.get(item_id)
                 if item is not None:
-                    self._truncate_realtime_item_content(
+                    protocol._truncate_realtime_item_content(
                         item,
                         content_index=0,
                         audio_end_ms=committed_audio_ms,
                     )
                 # Align server history with acknowledged playback; only explicit
                 # client truncation emits ``conversation.item.truncated``.
-            payloads.extend(self._realtime_audio_done_events(event, response_id))
+            payloads.extend(protocol._realtime_audio_done_events(event, response_id))
             payloads.extend(
-                self._realtime_response_terminal_events(
+                protocol._realtime_response_terminal_events(
                     event,
                     response_id,
                     status="cancelled",
@@ -308,8 +330,8 @@ class RealtimeOutputProjector:
                     },
                 )
             )
-            if isinstance(response_id, str) and response_id == self._active_response_id:
-                self._active_response_id = None
+            if isinstance(response_id, str) and response_id == protocol._active_response_id:
+                protocol._active_response_id = None
             return payloads
         if event_type == "playback.acknowledged":
             return [{"type": "playback.acknowledged", "event": event}]
@@ -317,21 +339,21 @@ class RealtimeOutputProjector:
             item = event.get("item")
             if isinstance(item, dict) and isinstance(item.get("id"), str):
                 item_id = str(item["id"])
-                already_known = item_id in self._conversation_items
-                self._conversation_items[item_id] = item
+                already_known = item_id in protocol._conversation_items
+                protocol._conversation_items[item_id] = item
                 if already_known:
                     if item.get("status") == "completed":
-                        return [self._conversation_item_done_event(item)]
+                        return [protocol._conversation_item_done_event(item)]
                     return []
-                payloads = self._conversation_item_added_events(item)
+                payloads = protocol._conversation_item_added_events(item)
                 if item.get("status") == "completed":
-                    payloads.append(self._conversation_item_done_event(item))
+                    payloads.append(protocol._conversation_item_done_event(item))
                 return payloads
             return [{"type": "conversation.item.created", "item": item, "event": event}]
         if event_type == "conversation.item.deleted":
             item_id = event.get("item_id")
             if isinstance(item_id, str):
-                self._remove_conversation_item(item_id)
+                protocol._remove_conversation_item(item_id)
             return [
                 {
                     "type": "conversation.item.deleted",
@@ -344,9 +366,9 @@ class RealtimeOutputProjector:
             audio_end_ms = event.get("audio_end_ms")
             content_index = event.get("content_index", 0)
             if isinstance(item_id, str):
-                item = self._conversation_items.get(item_id)
+                item = protocol._conversation_items.get(item_id)
                 if item is not None:
-                    self._truncate_realtime_item_content(
+                    protocol._truncate_realtime_item_content(
                         item,
                         content_index=int(content_index) if isinstance(content_index, int | float) else 0,
                         audio_end_ms=int(audio_end_ms) if isinstance(audio_end_ms, int | float) else 0,
@@ -362,7 +384,7 @@ class RealtimeOutputProjector:
             ]
         if event_type == "response.output_item.done":
             response_id = event.get("response_id")
-            return self._realtime_response_terminal_events(
+            return protocol._realtime_response_terminal_events(
                 event,
                 response_id,
                 status="completed",
@@ -389,7 +411,7 @@ class RealtimeOutputProjector:
                 "call_id": call_id,
                 "arguments": arguments,
             }
-            self._conversation_items[str(item["id"])] = item
+            protocol._conversation_items[str(item["id"])] = item
             response = {
                 "id": response_id,
                 "object": "realtime.response",
@@ -400,7 +422,7 @@ class RealtimeOutputProjector:
             }
             return [
                 {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
-                *self._conversation_item_added_events(item),
+                *protocol._conversation_item_added_events(item),
                 {
                     "type": "response.output_item.added",
                     "response_id": response_id,
@@ -429,7 +451,7 @@ class RealtimeOutputProjector:
                     "output_index": 0,
                     "item": dict(item),
                 },
-                self._conversation_item_done_event(item),
+                protocol._conversation_item_done_event(item),
                 {"type": "response.done", "response": response},
             ]
         if event_type == "error":
@@ -439,7 +461,7 @@ class RealtimeOutputProjector:
             message = str(raw_error or event.get("message") or "Duplex runtime error")
             code = str(event.get("code") or "duplex_error")
             return [
-                self._realtime_error_payload(
+                protocol._realtime_error_payload(
                     code,
                     message,
                     event_id=event.get("realtime_event_id") or event.get("event_id"),
@@ -569,6 +591,11 @@ class RealtimeOutputProjector:
         return state
 
     def _response_is_done(self, response_id: object) -> bool:
+        if isinstance(response_id, str) and (
+            response_id in self._completed_response_ids
+            or (self._has_response_lifecycle and response_id not in self._response_states)
+        ):
+            return True
         state = self._response_state(response_id, create=False)
         return state is not None and state.done_emitted
 
@@ -584,8 +611,9 @@ class RealtimeOutputProjector:
         *,
         status: str,
     ) -> dict[str, object]:
-        item_id = self._response_item_id(response_id)
-        state = self._response_state(response_id)
+        protocol = cast("NativeRealtimeSessionProtocol", self)
+        item_id = protocol._response_item_id(response_id)
+        state = protocol._response_state(response_id)
         transcript = state.transcript if state is not None else ""
         text = state.text if state is not None else ""
         audio_duration_ms = state.audio_duration_ms if state is not None else None
@@ -593,15 +621,15 @@ class RealtimeOutputProjector:
         content: list[dict[str, object]] = []
         if (state is not None and state.audio_part_added) or transcript or audio_duration_ms is not None:
             content.append(
-                self._response_item_content_part(
+                protocol._response_item_content_part(
                     transcript=transcript,
                     audio_duration_ms=audio_duration_ms,
                     audio_text_marks=audio_text_marks,
                 )
             )
         if text:
-            content.append(self._response_item_text_content_part(text=text))
-        item = {
+            content.append(protocol._response_item_text_content_part(text=text))
+        item: dict[str, object] = {
             "id": item_id,
             "object": "realtime.item",
             "type": "message",
@@ -609,28 +637,30 @@ class RealtimeOutputProjector:
             "status": status,
             "content": content,
         }
-        self._apply_pending_item_truncation(item)
+        protocol._apply_pending_item_truncation(item)
         return item
 
     def _apply_pending_item_truncation(self, item: dict[str, object]) -> None:
+        protocol = cast("NativeRealtimeSessionProtocol", self)
         item_id = item.get("id")
         if not isinstance(item_id, str) or not item_id:
             return
-        cursor = self._item_truncation_cursors.get(item_id)
+        cursor = protocol._item_truncation_cursors.get(item_id)
         if cursor is None:
             return
         content_index, audio_end_ms = cursor
-        self._truncate_realtime_item_content(
+        protocol._truncate_realtime_item_content(
             item,
             content_index=content_index,
             audio_end_ms=audio_end_ms,
         )
 
     def _refresh_in_progress_response_item(self, response_id: object) -> None:
+        protocol = cast("NativeRealtimeSessionProtocol", self)
         if not isinstance(response_id, str) or not response_id:
             return
-        item_id = self._response_item_id(response_id)
-        item = self._conversation_items.get(item_id)
+        item_id = protocol._response_item_id(response_id)
+        item = protocol._conversation_items.get(item_id)
         if not isinstance(item, dict):
             return
         content = item.get("content")
@@ -638,7 +668,7 @@ class RealtimeOutputProjector:
             content = []
             item["content"] = content
 
-        state = self._response_state(response_id)
+        state = protocol._response_state(response_id)
         if state is None:
             return
         transcript = state.transcript
@@ -646,7 +676,7 @@ class RealtimeOutputProjector:
         audio_text_marks = state.audio_text_marks
         has_audio = state.audio_part_added or bool(transcript) or audio_duration_ms is not None
         if has_audio:
-            audio_part = self._response_item_content_part(
+            audio_part = protocol._response_item_content_part(
                 transcript=transcript,
                 audio_duration_ms=audio_duration_ms,
                 audio_text_marks=audio_text_marks,
@@ -669,7 +699,7 @@ class RealtimeOutputProjector:
                 }
                 else 0
             )
-            text_part = self._response_item_text_content_part(text=text)
+            text_part = protocol._response_item_text_content_part(text=text)
             if (
                 len(content) > text_index
                 and isinstance(content[text_index], dict)
@@ -679,7 +709,7 @@ class RealtimeOutputProjector:
             else:
                 content.insert(text_index, text_part)
 
-        self._apply_pending_item_truncation(item)
+        protocol._apply_pending_item_truncation(item)
 
     def _append_response_transcript(self, response_id: object, text: str) -> None:
         state = self._response_state(response_id)
@@ -688,7 +718,8 @@ class RealtimeOutputProjector:
         state.transcript_parts.append(text)
 
     def _ensure_response_text_part_added(self, response_id: object) -> list[dict[str, object]]:
-        state = self._response_state(response_id)
+        protocol = cast("NativeRealtimeSessionProtocol", self)
+        state = protocol._response_state(response_id)
         if state is None:
             return []
         if state.text_part_added:
@@ -699,15 +730,16 @@ class RealtimeOutputProjector:
             {
                 "type": "response.content_part.added",
                 "response_id": response_id,
-                "item_id": self._response_item_id(response_id),
+                "item_id": protocol._response_item_id(response_id),
                 "output_index": 0,
                 "content_index": content_index,
-                "part": self._response_text_content_part(),
+                "part": protocol._response_text_content_part(),
             }
         ]
 
     def _ensure_response_audio_part_added(self, response_id: object) -> list[dict[str, object]]:
-        state = self._response_state(response_id)
+        protocol = cast("NativeRealtimeSessionProtocol", self)
+        state = protocol._response_state(response_id)
         if state is None:
             return []
         if state.audio_part_added:
@@ -717,10 +749,10 @@ class RealtimeOutputProjector:
             {
                 "type": "response.content_part.added",
                 "response_id": response_id,
-                "item_id": self._response_item_id(response_id),
+                "item_id": protocol._response_item_id(response_id),
                 "output_index": 0,
                 "content_index": 0,
-                "part": self._response_content_part(),
+                "part": protocol._response_content_part(),
             }
         ]
 
@@ -788,17 +820,18 @@ class RealtimeOutputProjector:
         response_id: object,
         audio: str,
     ) -> list[dict[str, object]]:
-        item_id = self._response_item_id(response_id)
-        fmt, format_rate = self._parse_realtime_audio_format(event.get("format", "wav"))
-        source_fmt = self._realtime_output_format(fmt)
+        protocol = cast("NativeRealtimeSessionProtocol", self)
+        item_id = protocol._response_item_id(response_id)
+        fmt, format_rate = protocol._parse_realtime_audio_format(event.get("format", "wav"))
+        source_fmt = protocol._realtime_output_format(fmt)
         source_sample_rate_hz = event.get("sample_rate_hz") or format_rate
         target_sample_rate_hz = (
-            self._output_sample_rate_hz if self._output_audio_format in {"g711_ulaw", "g711_alaw"} else None
+            protocol._output_sample_rate_hz if protocol._output_audio_format in {"g711_ulaw", "g711_alaw"} else None
         )
         audio, fmt, converted_sample_rate_hz = convert_output_audio(
             audio,
             source_fmt=source_fmt,
-            target_fmt=self._output_audio_format,
+            target_fmt=protocol._output_audio_format,
             source_sample_rate_hz=(
                 int(source_sample_rate_hz) if isinstance(source_sample_rate_hz, int | float) else None
             ),
@@ -807,7 +840,7 @@ class RealtimeOutputProjector:
         sample_rate_hz = (
             converted_sample_rate_hz
             if fmt in {"g711_ulaw", "g711_alaw"}
-            else event.get("sample_rate_hz") or format_rate or self._output_sample_rate_hz
+            else event.get("sample_rate_hz") or format_rate or protocol._output_sample_rate_hz
         )
         metadata: dict[str, object] = {}
         for key in ("session_id", "epoch", "model_speak", "end_of_turn", "playback", "vllm_omni"):
@@ -819,10 +852,10 @@ class RealtimeOutputProjector:
         marks = event.get("audio_text_marks")
         if isinstance(marks, list):
             metadata["audio_text_marks"] = marks
-        state = self._response_state(response_id)
+        state = protocol._response_state(response_id)
         if state is not None:
             state.audio_delta_emitted = True
-            self._remember_response_audio_metadata(response_id, event)
+            protocol._remember_response_audio_metadata(response_id, event)
         payloads: list[dict[str, object]] = []
         if state is not None and not state.speak_emitted and metadata.get("model_speak") is True:
             state.speak_emitted = True
@@ -834,7 +867,7 @@ class RealtimeOutputProjector:
                     "item_id": item_id,
                     "output_index": 0,
                     "content_index": 0,
-                    "metadata": self._response_speak_metadata(event),
+                    "metadata": protocol._response_speak_metadata(event),
                 },
             )
         payloads.append(
@@ -861,8 +894,9 @@ class RealtimeOutputProjector:
         event: dict[str, Any],
         response_id: object,
     ) -> list[dict[str, object]]:
-        item_id = self._response_item_id(response_id)
-        state = self._response_state(response_id, event=event)
+        protocol = cast("NativeRealtimeSessionProtocol", self)
+        item_id = protocol._response_item_id(response_id)
+        state = protocol._response_state(response_id, event=event)
         transcript = state.transcript if state is not None else ""
         payloads: list[dict[str, object]] = []
         if isinstance(response_id, str) and state is not None and not state.audio_delta_emitted and not transcript:
@@ -900,6 +934,7 @@ class RealtimeOutputProjector:
         status: str = "completed",
         status_details: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
+        protocol = cast("NativeRealtimeSessionProtocol", self)
         item_id = self._response_item_id(response_id)
         state = self._response_state(response_id, event=event)
         transcript = state.transcript if state is not None else ""
@@ -913,7 +948,7 @@ class RealtimeOutputProjector:
                     "item_id": item_id,
                     "output_index": 0,
                     "content_index": 0,
-                    "part": self._response_content_part(transcript=transcript),
+                    "part": protocol._response_content_part(transcript=transcript),
                 }
             )
         if state is not None and state.text_parts and not state.output_text_done:
@@ -939,13 +974,13 @@ class RealtimeOutputProjector:
                     "item_id": item_id,
                     "output_index": 0,
                     "content_index": content_index,
-                    "part": self._response_text_content_part(text=state.text),
+                    "part": protocol._response_text_content_part(text=state.text),
                 }
             )
         if state is None or not state.output_item_done:
             if state is not None:
                 state.output_item_done = True
-            item = self._response_done_output_item(response_id, status=status)
+            item = protocol._response_done_output_item(response_id, status=status)
             payloads.append(
                 {
                     "type": "response.output_item.done",
@@ -957,8 +992,8 @@ class RealtimeOutputProjector:
             if state is None or not state.conversation_item_done:
                 if state is not None:
                     state.conversation_item_done = True
-                payloads.append(self._conversation_item_done_event(item))
-        done_event = self._realtime_response_done_event(
+                payloads.append(protocol._conversation_item_done_event(item))
+        done_event = protocol._realtime_response_done_event(
             {**event, "response_id": response_id},
             state=state,
             status=status,
@@ -966,9 +1001,9 @@ class RealtimeOutputProjector:
         )
         if done_event is not None:
             payloads.append(done_event)
-            payloads.append(self._rate_limits_updated_event())
-            if isinstance(response_id, str) and response_id == self._active_response_id:
-                self._active_response_id = None
+            payloads.append(protocol._rate_limits_updated_event())
+            if isinstance(response_id, str) and response_id == protocol._active_response_id:
+                protocol._active_response_id = None
         return payloads
 
     def _realtime_response_done_event(

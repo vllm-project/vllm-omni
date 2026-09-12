@@ -131,6 +131,7 @@ class _WorkItem:
     tts_is_last_chunk: bool
     segment_end: bool
     turn_end: bool
+    gander_context_version: int = 0
     has_payload: bool = True
 
 
@@ -477,6 +478,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             runtime_prompt_key=runtime_prompt_key,
             duplex_epoch=int(_scalar(meta.get("duplex_epoch"), -1)),
             duplex_turn_id=int(_scalar(meta.get("duplex_turn_id"), -1)),
+            gander_context_version=int(_scalar(meta.get("gander_context_version"), 0)),
             segment_text_utf8=segment_text_utf8,
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
@@ -797,6 +799,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # processor before the full-duplex data plane consumes them.
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
+                "meta.duplex_context_version": [
+                    torch.tensor(item.gander_context_version, dtype=torch.int32) for item in items
+                ],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],

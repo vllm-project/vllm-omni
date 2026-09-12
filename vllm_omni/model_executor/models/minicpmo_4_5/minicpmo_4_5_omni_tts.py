@@ -14,6 +14,7 @@ Pipeline:
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
+from functools import cached_property
 from typing import Any
 
 import torch
@@ -50,9 +51,13 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
 
-def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
+def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None, *, remaining_context: int = 4096) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
     boundary = isinstance(meta, Mapping) and (bool(meta.get("turn_start")) or bool(meta.get("turn_end")))
+    if isinstance(meta, Mapping) and meta.get("gander_speech_tokens") == 50:
+        # Gander masks early EOS even on the first speaking unit. Only the
+        # final unit may finish early (DetachedTalker visible_budget=50).
+        return (max(1, remaining_context), 0) if meta.get("turn_end") else (51, 50)
     ceiling = _DUPLEX_CODEC_TOKENS_PER_CHUNK
     return ceiling, 0 if boundary else ceiling
 
@@ -102,7 +107,10 @@ def _apply_batched_repetition_penalty(
         penalties = penalties.expand(batch_size)
     elif penalties.numel() != batch_size:
         raise ValueError(f"expected 1 or {batch_size} codec repetition penalties, got {penalties.numel()}")
-    if not bool((penalties != 1.0).any()):
+    # A Python scalar can short-circuit without reading device data. For a
+    # tensor of per-row penalties, computing neutral factors is cheaper than
+    # synchronizing CUDA to answer an all-ones predicate every decode step.
+    if isinstance(penalty, int | float) and penalty == 1.0:
         return logits
 
     penalized = logits.clone()
@@ -117,12 +125,13 @@ def _apply_batched_repetition_penalty(
         if not encoded_rows:
             continue
 
-        # Bound the int64 bincount workspace independently of request concurrency.
+        # Fixed-size counters preserve the original frequencies without
+        # bincount's device-value-dependent output sizing / host sync. Keep
+        # workspace bounded independently of request concurrency.
         encoded = encoded_rows[0] if len(encoded_rows) == 1 else torch.cat(encoded_rows)
-        frequencies = torch.bincount(
-            encoded,
-            minlength=(end - start) * vocab_size,
-        ).reshape(end - start, vocab_size)
+        frequencies = torch.zeros((end - start) * vocab_size, dtype=torch.long, device=logits.device)
+        frequencies.scatter_add_(0, encoded, torch.ones_like(encoded))
+        frequencies = frequencies.reshape(end - start, vocab_size)
         alpha = torch.pow(penalties[start:end].unsqueeze(1), frequencies.to(dtype=logits.dtype))
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
@@ -242,9 +251,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if tts_token_ids.numel() == 0 or tts_hidden_states.numel() == 0:
             # The thinker can legally emit an empty speech segment (<|tts_bos|>
             # immediately followed by a boundary token) when it decides not to
-            # speak. Condition on the boundary tokens alone, which matches the
-            # 2-token scheduler prompt the stage bridge builds for an empty
-            # handoff.
+            # speak. Native streaming uses only audio_bos, matching
+            # generate_chunk's text+hidden+audio_bos condition; offline uses
+            # the regular text_eos+audio_bos boundary pair.
+            if native_duplex:
+                return self.emb_text(
+                    torch.tensor(
+                        [self._tts_bos_id],
+                        device=self.emb_text.weight.device,
+                        dtype=torch.long,
+                    )
+                )
             return self._boundary_embeddings()
         device = self.emb_text.weight.device
         dtype = self.emb_text.weight.dtype
@@ -367,7 +384,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             code_ids = torch.as_tensor(previous_codes, device=self.emb_code[0].weight.device, dtype=torch.long)
         else:
             raise ValueError("streaming prompt recompute is missing confirmed codec ids")
-        if code_ids.numel() > _DUPLEX_CODEC_TOKENS_PER_CHUNK - 1:
+        max_previous_codes = (
+            50 if getattr(getattr(self, "config", None), "gander_unit8", False) else _DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
+        )
+        if code_ids.numel() > max_previous_codes:
             raise ValueError(f"streaming prompt recompute has too many codec ids: {code_ids.numel()}")
         if code_ids.numel() and bool(((code_ids < 0) | (code_ids >= self._codec_eos_id)).any()):
             raise ValueError("streaming prompt recompute codec ids include an invalid or terminal token")
@@ -407,6 +427,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id = str(info_dict.get("request_id", "0"))
 
         if is_prefill or first_call:
+            if is_prefill:
+                # A native duplex turn can finish one Talker request and
+                # resubmit the same request id in a single scheduler step.
+                # ``on_requests_finished`` runs before this preprocess hook and
+                # defers the old request's cleanup until ``forward``.  Cancel
+                # that cleanup now, otherwise forward deletes the fresh state
+                # initialized below and make_omni_output resurrects the stale
+                # (usually ``finished=True``) audio_state from the old payload.
+                self._deferred_cleanup_ids.discard(request_id)
             token_ids, hidden_states = get_tts_handoff(info_dict)
             # Cross-process stage transport serializes CPU tensors as lists.
             # Normalize both local tensor handoffs and transported payloads
@@ -487,7 +516,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     f"prompt_len={info_dict.get('_omni_prompt_len')}"
                 )
             if native_duplex:
-                max_tokens, min_tokens = _native_duplex_chunk_budget(meta if isinstance(meta, Mapping) else None)
+                max_tokens, min_tokens = _native_duplex_chunk_budget(
+                    meta if isinstance(meta, Mapping) else None,
+                    remaining_context=int(self._tts_config.max_position_embeddings) - target_len,
+                )
+                if isinstance(meta, Mapping) and meta.get("gander_speech_tokens") == 50:
+                    # Upstream creates a fresh within-unit penalty history.
+                    retained_codes = []
             else:
                 # MiniCPMTTS.generate()'s max_new_token, clamped to what the
                 # Talker context can still hold. Sampler min_tokens (upstream's
@@ -564,6 +599,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         native_duplex_flags: list[torch.Tensor] = []
         duplex_epochs: list[torch.Tensor] = []
         duplex_turn_ids: list[torch.Tensor] = []
+        gander_context_versions: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
@@ -606,16 +642,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
                 else:
                     contains_turn_eos = False
+                explicit_turn_end = meta_info.get("turn_end") is True
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
                 duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
                 duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                gander_context_versions.append(
+                    torch.tensor(int(meta_info.get("gander_context_version", 0)), dtype=torch.long)
+                )
                 segment_texts_utf8.append(
                     torch.tensor(
                         list(segment_text.encode("utf-8")),
                         dtype=torch.uint8,
                     )
                 )
-                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+                turn_end_flags.append(
+                    torch.tensor(
+                        native_duplex and (explicit_turn_end or contains_turn_eos),
+                        dtype=torch.bool,
+                    )
+                )
 
             if not isinstance(info, dict):
                 continue
@@ -670,6 +715,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "native_duplex": native_duplex_flags,
                     "duplex_epoch": duplex_epochs,
                     "duplex_turn_id": duplex_turn_ids,
+                    "gander_context_version": gander_context_versions,
                     "llm_output_text_utf8": segment_texts_utf8,
                     "turn_end": turn_end_flags,
                 }
@@ -766,6 +812,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 logits[masked, eos_id] = float("-inf")
         return logits
 
+    @cached_property
+    def sampler(self):
+        """Reuse vLLM's sampler; per-request RNG and penalties live in metadata."""
+        return Sampler()
+
     def sample(self, logits, sampling_metadata):
         prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)
         if isinstance(logits, torch.Tensor) and isinstance(prompt_ids, torch.Tensor):
@@ -778,7 +829,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
         force_eos = self._pending_force_eos_rows
         self._pending_force_eos_rows = None
-        output = Sampler()(logits, sampling_metadata)
+        output = self.sampler(logits, sampling_metadata)
         return self._force_eos_on_sampled_ids(output, force_eos)
 
     def _apply_codec_repetition_penalty(self, logits, sampling_metadata):

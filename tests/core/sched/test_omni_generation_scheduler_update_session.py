@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for generation streaming session replacement.
 
 These tests pin the behavior of `_update_request_as_session` against
@@ -10,7 +13,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -105,7 +107,7 @@ def test_generation_scheduler_records_prefill_stats_for_metrics() -> None:
     assert request.prefill_stats.num_cached_tokens == 0
 
 
-def test_resumable_generation_stop_marks_segment_boundary() -> None:
+def test_resumable_generation_stop_marks_segment_boundary(mocker) -> None:
     session = _make_request(request_id="req-generation-segment")
     session.status = RequestStatus.RUNNING
     session.resumable = True
@@ -114,12 +116,13 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     # must settle it before handling the segment boundary.
     session.num_in_flight_tokens = 1
 
-    sched = MagicMock()
+    sched = mocker.MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = SimpleNamespace(
         is_done_receiving_chunks=lambda _request_id: True,
         segment_finished_requests={session.request_id},
+        yield_active_stream=mocker.Mock(),
     )
 
     def rearm_resumable_request(request: Request) -> bool:
@@ -128,8 +131,8 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
 
     sched._handle_stopped_request.side_effect = rearm_resumable_request
     sched.running = [session]
-    sched.waiting = MagicMock()
-    sched.skipped_waiting = MagicMock()
+    sched.waiting = mocker.MagicMock()
+    sched.skipped_waiting = mocker.MagicMock()
     sched.structured_output_manager.should_advance.return_value = False
     # Async scheduling can observe the segment boundary in the next schedule()
     # before this model output is applied and defer the same request for finish.
@@ -142,12 +145,12 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
 
-    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output = mocker.MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
-    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output = mocker.MagicMock(spec=ModelRunnerOutput)
     model_runner_output.sampled_token_ids = [[]]
     model_runner_output.logprobs = None
     model_runner_output.prompt_logprobs_dict = {}
@@ -167,6 +170,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     output = outputs[session.client_index].outputs[0]
     assert output.finish_reason is not None
     assert output.is_segment_finished is True
+    sched.chunk_transfer_adapter.yield_active_stream.assert_called_once_with(session.request_id)
     sched._handle_stopped_request.assert_called_once_with(session)
     assert sched._pending_finish_reqs == []
 

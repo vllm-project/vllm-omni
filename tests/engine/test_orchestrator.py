@@ -52,7 +52,7 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.outputs import OmniRequestOutput
@@ -116,6 +116,8 @@ class FakePromptRequest:
 
 
 class FakeStageClient:
+    sample_rate: int
+
     def __init__(
         self,
         *,
@@ -145,8 +147,8 @@ class FakeStageClient:
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
-        self._engine_core_outputs = queue.Queue()
-        self._diffusion_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[EngineCoreOutputs] = queue.Queue()
+        self._diffusion_outputs: queue.Queue[OmniRequestOutput] = queue.Queue()
 
     # Orchestrator-facing interface.
     async def add_request_async(self, *args, **kwargs) -> None:
@@ -206,6 +208,62 @@ class FakeStageClient:
 
     def push_diffusion_output(self, output) -> None:
         self._diffusion_outputs.put_nowait(output)
+
+
+class FakeNativeDuplexStageClient(FakeStageClient):
+    """Exercise native Stage0 admission and append as separate transports."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.append_calls: list[dict[str, Any]] = []
+        self._native_prompt_lengths: dict[str, int] = {}
+
+    async def admit_duplex_request_async(self, request) -> None:
+        assert request.resumable is False
+        assert request.streaming_prompt_continuous is True
+        # OutputProcessor already captured its per-unit lifecycle. The real
+        # Omni client enables retained KV only at the scheduler transport edge.
+        request.resumable = True
+        self._native_prompt_lengths[request.request_id] = len(request.prompt_token_ids)
+        await self.add_request_async(request)
+
+    async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+        prompt_tokens = self._native_prompt_lengths[request_id]
+        return {
+            "status": "WAITING_FOR_STREAMING_REQ",
+            "num_prompt_tokens": prompt_tokens,
+            "num_computed_tokens": prompt_tokens,
+            "omni_context_tokens": prompt_tokens,
+            "omni_context_limit": 64,
+            "omni_request_found": True,
+            "is_finished": False,
+        }
+
+    async def append_streaming_prompt_unit_async(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        *,
+        model_intermediate_buffer: dict[str, Any] | None,
+        operation_id: str | None,
+        operation_fingerprint: bytes | None,
+        sampling_params: Any = None,
+    ) -> dict[str, Any]:
+        assert request_id in self._native_prompt_lengths
+        assert operation_id
+        assert isinstance(operation_fingerprint, bytes) and operation_fingerprint
+        self.append_calls.append(
+            {
+                "request_id": request_id,
+                "token_ids": list(token_ids),
+                "model_intermediate_buffer": model_intermediate_buffer,
+                "operation_id": operation_id,
+                "operation_fingerprint": operation_fingerprint,
+                "sampling_params": sampling_params,
+            }
+        )
+        self._native_prompt_lengths[request_id] += len(token_ids)
+        return {**await self.get_streaming_prompt_metrics_async(request_id), "deduplicated": False}
 
 
 def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
@@ -271,7 +329,8 @@ class FakeOutputProcessor:
                 (ro for ro in self.request_outputs if getattr(ro, "request_id", None) == rid),
                 None,
             )
-            token_ids = list(seeded.outputs[0].token_ids) if seeded is not None and seeded.outputs else [1, 2]
+            seeded_outputs = getattr(seeded, "outputs", None)
+            token_ids = list(seeded_outputs[0].token_ids) if seeded_outputs else [1, 2]
             # Intentionally stamp an internal-looking id on the RequestOutput so
             # StagePool must re-key by the orchestrator id it passed in.
             outputs.append(
@@ -402,9 +461,9 @@ def _build_stage_pools(
 
 
 def _build_harness(
-    stage_clients: list[object],
+    stage_clients: list[FakeStageClient],
     *,
-    output_processors: list[object] | None = None,
+    output_processors: list[FakeOutputProcessor] | None = None,
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
     log_stats: bool = False,
@@ -1132,6 +1191,7 @@ def _duplex_open_message(
         capabilities={
             "input_modes": [DuplexInputMode.APPEND_AUDIO_CHUNK.value],
             "implementation_level": "model_native_duplex",
+            "supports_scheduler_native_append": True,
         },
         session_config=session_config or {},
         runtime_config=runtime_config or {},
@@ -1159,7 +1219,7 @@ def _duplex_request_state(
 
 @pytest.mark.asyncio
 async def test_duplex_control_plane_keeps_public_and_runtime_config_separate() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     rpc_q: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -1187,6 +1247,7 @@ async def test_duplex_control_plane_keeps_public_and_runtime_config_separate() -
     assert rpc_q.get_nowait().ok is True
     session = orchestrator.duplex_sessions.require(open_message.session_id)
     request_state = _duplex_request_state(orchestrator, session, stage_id=0)
+    assert request_state is not None
     assert request_state.sampling_params_list[0].max_tokens == 3
     assert request_state.sampling_params_list[0].stop_token_ids == [151705]
     bridge = request_state.streaming.bridge_states["duplex"]
@@ -1236,7 +1297,7 @@ def test_ordinary_orchestrator_bypasses_duplex_control_plane() -> None:
 
 @pytest.mark.asyncio
 async def test_duplex_close_cleans_preregistered_request_without_append() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     rpc_q: asyncio.Queue = asyncio.Queue()
     running_counter = FakeRunningCounter()
     orchestrator = Orchestrator(
@@ -1272,7 +1333,7 @@ async def test_duplex_close_cleans_preregistered_request_without_append() -> Non
 
 @pytest.mark.asyncio
 async def test_duplex_open_failure_rolls_back_session_and_reserved_request() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     rpc_q: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -1299,8 +1360,61 @@ async def test_duplex_open_failure_rolls_back_session_and_reserved_request() -> 
 
 
 @pytest.mark.asyncio
+async def test_duplex_initial_output_registration_precedes_retained_kv_admission() -> None:
+    observed: list[tuple[str, str, bool]] = []
+
+    class RegistrationBoundaryProcessor(FakeOutputProcessor):
+        def add_request(self, *args, **kwargs) -> None:
+            request = kwargs["request"]
+            # Capture the value during registration: this same request object
+            # is mutated later by the client, so inspecting it afterwards
+            # would miss an incorrect persistent output registration.
+            observed.append(("output_processor", request.request_id, request.resumable))
+            super().add_request(*args, **kwargs)
+
+    class AdmissionBoundaryClient(FakeNativeDuplexStageClient):
+        async def add_request_async(self, request) -> None:
+            observed.append(("scheduler", request.request_id, request.resumable))
+            await super().add_request_async(request)
+
+    stage0 = AdmissionBoundaryClient(stage_type="llm", final_output=True)
+    output_processor = RegistrationBoundaryProcessor()
+    rpc_q: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc_q,
+        stage_pools=_build_stage_pools([[stage0]], output_processors=[output_processor]),
+        duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
+    )
+    open_message = _duplex_open_message("sid-registration-boundary")
+    await _handle_duplex(orchestrator, open_message)
+    assert rpc_q.get_nowait().ok is True
+
+    await _handle_duplex(
+        orchestrator,
+        AppendDuplexInputMessage(
+            control_id="first-unit",
+            operation_id="first-unit",
+            fence=open_message.fence,
+            session_id=open_message.session_id,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+            payload={"is_speech": True},
+        ),
+    )
+
+    assert rpc_q.get_nowait().ok is True
+    request_id = duplex_resource_request_id(open_message.fence, "stage0")
+    assert observed == [("output_processor", request_id, False), ("scheduler", request_id, True)]
+    assert len(output_processor.add_request_calls) == len(stage0.add_request_calls) == 1
+    assert output_processor.add_request_calls[0][1]["request"] is stage0.add_request_calls[0][0]
+    assert stage0.append_calls == []
+
+
+@pytest.mark.asyncio
 async def test_duplex_running_counter_tracks_only_submitted_request() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     rpc_q: asyncio.Queue = asyncio.Queue()
     running_counter = FakeRunningCounter()
     orchestrator = Orchestrator(
@@ -1321,6 +1435,7 @@ async def test_duplex_running_counter_tracks_only_submitted_request() -> None:
         orchestrator,
         AppendDuplexInputMessage(
             control_id="append-duplex-counter",
+            operation_id="append-duplex-counter",
             fence=open_message.fence,
             session_id=open_message.session_id,
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
@@ -1348,7 +1463,7 @@ async def test_duplex_failed_append_does_not_advance_sequence_or_fence() -> None
         def plan_append(self, **kwargs):
             raise RuntimeError("planned append failure")
 
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     rpc_q: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -1363,6 +1478,7 @@ async def test_duplex_failed_append_does_not_advance_sequence_or_fence() -> None
         DuplexFence("sid-append-rollback"),
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+            scheduler_native_append=True,
         ),
     )
 
@@ -1370,6 +1486,7 @@ async def test_duplex_failed_append_does_not_advance_sequence_or_fence() -> None
         orchestrator,
         AppendDuplexInputMessage(
             control_id="append-rollback",
+            operation_id="append-rollback",
             fence=fence,
             session_id=fence.session_id,
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
@@ -1387,7 +1504,7 @@ async def test_duplex_failed_append_does_not_advance_sequence_or_fence() -> None
 
 @pytest.mark.asyncio
 async def test_duplex_duplicate_append_operation_is_submitted_once() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     rpc_q: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -1402,6 +1519,7 @@ async def test_duplex_duplicate_append_operation_is_submitted_once() -> None:
         fence,
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+            scheduler_native_append=True,
         ),
     )
 
@@ -1422,14 +1540,24 @@ async def test_duplex_duplicate_append_operation_is_submitted_once() -> None:
     retry = rpc_q.get_nowait()
     assert first.ok is True
     assert retry.ok is True
-    assert first.stage_results == retry.stage_results
+    assert len(first.stage_results) == len(retry.stage_results) == 1
+    first_stage = first.stage_results[0]
+    retry_stage = retry.stage_results[0]
+    assert first_stage["stage_id"] == retry_stage["stage_id"]
+    assert first_stage["replica_id"] == retry_stage["replica_id"]
+    retry_result = dict(retry_stage["result"])
+    assert retry_result.pop("deduplicated") is True
+    retry_append_metrics = dict(retry_result["append_metrics"])
+    assert retry_append_metrics.pop("deduplicated") is True
+    retry_result["append_metrics"] = retry_append_metrics
+    assert first_stage["result"] == retry_result
     assert len(stage0.add_request_calls) == 1
     assert session.input_seq == 1
 
 
 @pytest.mark.asyncio
 async def test_duplex_barge_in_aborts_bound_stage_requests_before_releasing_fence() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0], [stage1]],
@@ -1452,6 +1580,7 @@ async def test_duplex_barge_in_aborts_bound_stage_requests_before_releasing_fenc
         DuplexFence("sid-stage-signal"),
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+            scheduler_native_append=True,
         ),
     )
     session.bind_stage_request(0, "req-stage0", fence=session.fence)
@@ -1485,7 +1614,7 @@ async def test_duplex_barge_in_aborts_bound_stage_requests_before_releasing_fenc
 
 @pytest.mark.asyncio
 async def test_duplex_late_barge_in_releases_only_cancelled_fence_bindings() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0], [stage1]],
@@ -1508,6 +1637,7 @@ async def test_duplex_late_barge_in_releases_only_cancelled_fence_bindings() -> 
         cancelled_fence,
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+            scheduler_native_append=True,
         ),
     )
     session.bind_stage_request(0, "req-stage0", fence=cancelled_fence)
@@ -1538,7 +1668,7 @@ async def test_duplex_late_barge_in_releases_only_cancelled_fence_bindings() -> 
 
 @pytest.mark.asyncio
 async def test_duplex_cancel_without_next_fence_is_rejected_without_releasing_bindings() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0]],
         output_processors=[FakeOutputProcessor()],
@@ -1609,7 +1739,7 @@ async def test_duplex_session_update_replaces_runtime_config() -> None:
 
 @pytest.mark.asyncio
 async def test_duplex_session_update_refreshes_next_append_sampling_params() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0]],
         output_processors=[FakeOutputProcessor()],
@@ -1629,6 +1759,7 @@ async def test_duplex_session_update_refreshes_next_append_sampling_params() -> 
         fence,
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+            scheduler_native_append=True,
         ),
         runtime_config={
             "duplex_stage_max_tokens": {"0": 2},
@@ -1658,6 +1789,7 @@ async def test_duplex_session_update_refreshes_next_append_sampling_params() -> 
         orchestrator,
         AppendDuplexInputMessage(
             control_id="append-updated-policy",
+            operation_id="append-updated-policy",
             fence=fence,
             session_id=fence.session_id,
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
@@ -1675,7 +1807,7 @@ async def test_duplex_session_update_refreshes_next_append_sampling_params() -> 
 
 @pytest.mark.asyncio
 async def test_duplex_invalid_session_update_preserves_previous_config() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     rpc_q: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
@@ -1743,7 +1875,7 @@ async def test_duplex_arbitrary_non_cancel_signal_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0]],
         output_processors=[FakeOutputProcessor()],
@@ -1764,6 +1896,7 @@ async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() ->
         cancelled_fence,
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+            scheduler_native_append=True,
         ),
     )
 
@@ -1786,6 +1919,7 @@ async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() ->
         orchestrator,
         AppendDuplexInputMessage(
             control_id="late-old-append",
+            operation_id="late-old-append",
             fence=cancelled_fence,
             session_id=session.session_id,
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
@@ -1802,6 +1936,7 @@ async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() ->
         orchestrator,
         AppendDuplexInputMessage(
             control_id="next-epoch-append",
+            operation_id="next-epoch-append",
             fence=next_fence,
             session_id=session.session_id,
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
@@ -1817,7 +1952,7 @@ async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() ->
 
 @pytest.mark.asyncio
 async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0 = FakeNativeDuplexStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0]],
         output_processors=[FakeOutputProcessor()],
@@ -1835,6 +1970,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
         DuplexFence("sid-bridge-turn"),
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+            scheduler_native_append=True,
         ),
         session_config={
             "voice": "test",
@@ -1850,6 +1986,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
         orchestrator,
         AppendDuplexInputMessage(
             control_id="append-1",
+            operation_id="append-1",
             fence=DuplexFence("sid-bridge-turn"),
             session_id="sid-bridge-turn",
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
@@ -1872,6 +2009,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
         orchestrator,
         AppendDuplexInputMessage(
             control_id="append-2",
+            operation_id="append-2",
             fence=DuplexFence("sid-bridge-turn", turn_id=1, response_seq=1),
             session_id="sid-bridge-turn",
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
@@ -1884,10 +2022,11 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
     assert duplex_state2["turn_id"] == 1
     assert duplex_state2["epoch"] == 0
     expected_request_id = duplex_resource_request_id(DuplexFence("sid-bridge-turn"), "stage0")
-    assert [call[0].request_id for call in stage0.add_request_calls] == [
-        expected_request_id,
-        expected_request_id,
-    ]
+    assert [call[0].request_id for call in stage0.add_request_calls] == [expected_request_id]
+    assert len(stage0.append_calls) == 1
+    assert stage0.append_calls[0]["request_id"] == expected_request_id
+    assert stage0.append_calls[0]["operation_id"] == "append-2"
+    assert stage0.append_calls[0]["model_intermediate_buffer"]["duplex"]["turn_id"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2147,6 +2286,517 @@ async def test_stage_pool_submit_update_refreshes_output_processor_state() -> No
 
     assert len(output_processor.add_request_calls) == 2
     assert output_processor.add_request_calls[1][1]["prompt"] == "seg-2"
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_native_append_refreshes_output_processor_state() -> None:
+    output_processor = FakeOutputProcessor()
+
+    class NativeStageClient(FakeStageClient):
+        def __init__(self) -> None:
+            super().__init__(stage_type="llm", final_output=False)
+            self.metrics_calls = 0
+            self.appended: list[tuple[str, list[int], dict[str, Any] | None, str | None, bytes | None]] = []
+
+        async def admit_duplex_request_async(self, request) -> None:
+            self.add_request_calls.append((request,))
+
+        async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+            self.metrics_calls += 1
+            if self.metrics_calls == 1:
+                return {"status": "RUNNING", "num_prompt_tokens": 2, "num_computed_tokens": 1}
+            return {
+                "status": "WAITING_FOR_STREAMING_REQ",
+                "num_prompt_tokens": 2,
+                "num_computed_tokens": 2,
+            }
+
+        async def append_streaming_prompt_unit_async(
+            self,
+            request_id: str,
+            token_ids: list[int],
+            *,
+            model_intermediate_buffer: dict[str, Any] | None,
+            operation_id: str | None,
+            operation_fingerprint: bytes | None,
+            sampling_params: Any = None,
+        ) -> None:
+            # Output state must exist before the scheduler can emit this segment.
+            assert len(output_processor.add_request_calls) == 2
+            assert sampling_params.temperature == 0.8
+            assert sampling_params.max_tokens == 7
+            self.appended.append(
+                (request_id, token_ids, model_intermediate_buffer, operation_id, operation_fingerprint)
+            )
+
+    stage0 = NativeStageClient()
+    pool = StagePool(
+        0,
+        [stage0],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    await pool.submit_streaming_prompt_initial(
+        "req-0",
+        req_state,
+        SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
+        prompt_text="seg-1",
+        operation_id="append-unit-1",
+        operation_fingerprint=b"initial-fingerprint",
+    )
+    await pool.submit_streaming_prompt_update(
+        "req-0",
+        SimpleNamespace(
+            request_id="req-0",
+            prompt_token_ids=[3],
+            model_intermediate_buffer={"unit": 2},
+            sampling_params=SamplingParams(temperature=0.8, max_tokens=7),
+        ),
+        operation_id="append-unit-2",
+        operation_fingerprint=b"fingerprint",
+    )
+
+    assert len(output_processor.add_request_calls) == 2
+    assert output_processor.add_request_calls[1][1]["request"].prompt_token_ids == [3]
+    assert stage0.appended == [("req-0", [3], {"unit": 2}, "append-unit-2", b"fingerprint")]
+    # Initial acknowledgement needs every prompt token computed, then update
+    # admission checks the parked state separately. No finalize utility exists.
+    assert stage0.metrics_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_native_append_waits_for_previous_output_registration_retirement() -> None:
+    request_id = "req-output-retirement"
+    lifecycle: list[str] = []
+
+    class RetirementAwareOutputProcessor(FakeOutputProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.request_states = {request_id: object()}
+
+        def add_request(self, *args, **kwargs) -> None:
+            assert request_id not in self.request_states
+            lifecycle.append("registered")
+            super().add_request(*args, **kwargs)
+
+    class ParkedStageClient(FakeStageClient):
+        async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+            return {"status": "WAITING_FOR_STREAMING_REQ"}
+
+        async def append_streaming_prompt_unit_async(self, *args, **kwargs) -> dict[str, Any]:
+            del args, kwargs
+            assert lifecycle == ["retired", "registered"]
+            lifecycle.append("appended")
+            return {"deduplicated": False}
+
+    output_processor = RetirementAwareOutputProcessor()
+    pool = StagePool(
+        0,
+        [ParkedStageClient(stage_type="llm", final_output=False)],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings[request_id] = 0
+
+    async def retire_previous_output() -> None:
+        await asyncio.sleep(0)
+        assert output_processor.add_request_calls == []
+        del output_processor.request_states[request_id]
+        lifecycle.append("retired")
+
+    retirement = asyncio.create_task(retire_previous_output())
+    await pool.submit_streaming_prompt_update(
+        request_id,
+        SimpleNamespace(request_id=request_id, prompt_token_ids=[3]),
+        operation_id="append-after-retirement",
+        operation_fingerprint=b"retirement-fingerprint",
+        deadline_monotonic=time.monotonic() + 1,
+    )
+    await retirement
+
+    assert lifecycle == ["retired", "registered", "appended"]
+    assert len(output_processor.add_request_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_native_append_output_retirement_honors_caller_deadline() -> None:
+    request_id = "req-output-retirement-timeout"
+
+    class RegisteredOutputProcessor(FakeOutputProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.request_states = {request_id: object()}
+
+    class ParkedStageClient(FakeStageClient):
+        def __init__(self) -> None:
+            super().__init__(stage_type="llm", final_output=False)
+            self.append_calls = 0
+
+        async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+            return {"status": "WAITING_FOR_STREAMING_REQ"}
+
+        async def append_streaming_prompt_unit_async(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self.append_calls += 1
+
+    output_processor = RegisteredOutputProcessor()
+    client = ParkedStageClient()
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings[request_id] = 0
+
+    with pytest.raises(TimeoutError, match="output retirement timed out"):
+        await pool.submit_streaming_prompt_update(
+            request_id,
+            SimpleNamespace(request_id=request_id, prompt_token_ids=[3]),
+            operation_id="append-before-retirement",
+            operation_fingerprint=b"retirement-timeout-fingerprint",
+            deadline_monotonic=time.monotonic() + 0.02,
+        )
+
+    assert output_processor.add_request_calls == []
+    assert client.append_calls == 0
+    assert request_id not in pool._native_append_operations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation_id", "operation_fingerprint", "message"),
+    [
+        (None, b"fingerprint", "requires a non-empty operation_id"),
+        ("append-initial", None, "requires a full operation_fingerprint"),
+    ],
+)
+async def test_stage_pool_native_initial_requires_complete_operation_identity_before_binding(
+    operation_id: str | None,
+    operation_fingerprint: bytes | None,
+    message: str,
+) -> None:
+    output_processor = FakeOutputProcessor()
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="llm", final_output=False)],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    request_id = "req-initial-without-identity"
+
+    with pytest.raises(ValueError, match=message):
+        await pool.submit_streaming_prompt_initial(
+            request_id,
+            OrchestratorRequestState(
+                request_id=request_id,
+                sampling_params_list=[_sampling_params()],
+                final_stage_id=0,
+            ),
+            SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            operation_id=operation_id,
+            operation_fingerprint=operation_fingerprint,
+        )
+
+    assert pool.get_bound_replica_id(request_id) is None
+    assert output_processor.add_request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_prompt_append_ready_honors_expired_caller_deadline() -> None:
+    class MetricsClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+            del request_id
+            self.calls += 1
+            return {"status": "RUNNING"}
+
+    client = MetricsClient()
+
+    with pytest.raises(TimeoutError, match="append readiness timed out"):
+        await StagePool._wait_for_streaming_prompt_append_ready(
+            client,
+            "req-expired",
+            deadline_monotonic=time.monotonic() - 1.0,
+        )
+
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait_name", ["_wait_for_streaming_prompt_prefill", "_wait_for_streaming_prompt_append_ready"])
+async def test_native_readiness_preserves_model_error_after_core_cleanup(wait_name):
+    class Client:
+        async def get_streaming_prompt_metrics_async(self, request_id):
+            return {
+                "status": "FINISHED_ERROR",
+                "omni_request_found": False,
+                "is_finished": True,
+                "omni_model_input_error": "native_duplex_prefill_failed: encoder empty",
+            }
+
+    with pytest.raises(RuntimeError, match="native_duplex_prefill_failed"):
+        await getattr(StagePool, wait_name)(Client(), "failed", deadline_monotonic=time.monotonic() + 1)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_native_append_fails_closed_after_replica_binding_loss() -> None:
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="llm", final_output=False)],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    with pytest.raises(StageUnavailableError, match="resident KV cannot be reassigned"):
+        await pool.submit_streaming_prompt_update(
+            "req-with-lost-binding",
+            SimpleNamespace(request_id="req-with-lost-binding", prompt_token_ids=[3]),
+            operation_id="append-after-loss",
+        )
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_native_append_requires_full_fingerprint_before_registration() -> None:
+    output_processor = FakeOutputProcessor()
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="llm", final_output=False)],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings["req-without-fingerprint"] = 0
+
+    with pytest.raises(ValueError, match="requires a full operation_fingerprint"):
+        await pool.submit_streaming_prompt_update(
+            "req-without-fingerprint",
+            SimpleNamespace(request_id="req-without-fingerprint", prompt_token_ids=[3]),
+            operation_id="append-without-fingerprint",
+        )
+
+    assert output_processor.add_request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_native_append_timeout_keeps_output_registration() -> None:
+    class TimeoutClient(FakeStageClient):
+        async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+            del request_id
+            return {"status": "WAITING_FOR_STREAMING_REQ"}
+
+        async def append_streaming_prompt_unit_async(self, *args, **kwargs) -> None:
+            del args, kwargs
+            await asyncio.Event().wait()
+
+    class RemovableOutputProcessor(FakeOutputProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.remove_calls: list[str] = []
+
+        def remove_request(self, request_id: str) -> None:
+            self.remove_calls.append(request_id)
+
+    output_processor = RemovableOutputProcessor()
+    pool = StagePool(
+        0,
+        [TimeoutClient(stage_type="llm", final_output=False)],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings["req-timeout"] = 0
+
+    with pytest.raises(TimeoutError, match="append timed out"):
+        await pool.submit_streaming_prompt_update(
+            "req-timeout",
+            SimpleNamespace(request_id="req-timeout", prompt_token_ids=[3]),
+            operation_id="append-timeout",
+            operation_fingerprint=b"timeout-fingerprint",
+            deadline_monotonic=time.monotonic() + 0.02,
+        )
+
+    assert len(output_processor.add_request_calls) == 1
+    assert output_processor.remove_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_lost_append_reply_retry_reuses_output_registration() -> None:
+    class LostReplyClient(FakeStageClient):
+        def __init__(self) -> None:
+            super().__init__(stage_type="llm", final_output=False)
+            self.append_attempts = 0
+
+        async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+            del request_id
+            return {"status": "WAITING_FOR_STREAMING_REQ"}
+
+        async def append_streaming_prompt_unit_async(self, *args, **kwargs) -> dict[str, Any]:
+            del args, kwargs
+            self.append_attempts += 1
+            if self.append_attempts == 1:
+                await asyncio.Event().wait()
+            return {"deduplicated": True, "omni_context_tokens": 8}
+
+    output_processor = FakeOutputProcessor()
+    client = LostReplyClient()
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings["req-lost-reply"] = 0
+    request = SimpleNamespace(request_id="req-lost-reply", prompt_token_ids=[3])
+
+    with pytest.raises(TimeoutError, match="append timed out"):
+        await pool.submit_streaming_prompt_update(
+            request.request_id,
+            request,
+            operation_id="append-stable",
+            operation_fingerprint=b"stable-fingerprint",
+            deadline_monotonic=time.monotonic() + 0.02,
+        )
+
+    _, metrics = await pool.submit_streaming_prompt_update(
+        request.request_id,
+        request,
+        operation_id="append-stable",
+        operation_fingerprint=b"stable-fingerprint",
+        deadline_monotonic=time.monotonic() + 1,
+    )
+
+    assert metrics["deduplicated"] is True
+    assert client.append_attempts == 2
+    assert len(output_processor.add_request_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_scheduler_uncertain_retry_reuses_output_registration() -> None:
+    class UncertainCommitClient(FakeStageClient):
+        def __init__(self) -> None:
+            super().__init__(stage_type="llm", final_output=False)
+            self.append_attempts = 0
+
+        async def get_streaming_prompt_metrics_async(self, request_id: str) -> dict[str, Any]:
+            del request_id
+            return {"status": "WAITING_FOR_STREAMING_REQ"}
+
+        async def append_streaming_prompt_unit_async(self, *args, **kwargs) -> dict[str, Any]:
+            del args, kwargs
+            self.append_attempts += 1
+            if self.append_attempts == 1:
+                raise RuntimeError(
+                    "streaming_prompt_uncertain_operation_requires_retry: "
+                    "request=req-uncertain-commit, operation='append-stable'"
+                )
+            return {"deduplicated": True, "omni_context_tokens": 8}
+
+    output_processor = FakeOutputProcessor()
+    client = UncertainCommitClient()
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings["req-uncertain-commit"] = 0
+    request = SimpleNamespace(request_id="req-uncertain-commit", prompt_token_ids=[3])
+
+    with pytest.raises(RuntimeError, match="streaming_prompt_uncertain_operation_requires_retry"):
+        await pool.submit_streaming_prompt_update(
+            request.request_id,
+            request,
+            operation_id="append-stable",
+            operation_fingerprint=b"stable-fingerprint",
+        )
+
+    _, metrics = await pool.submit_streaming_prompt_update(
+        request.request_id,
+        request,
+        operation_id="append-stable",
+        operation_fingerprint=b"stable-fingerprint",
+    )
+
+    assert metrics["deduplicated"] is True
+    assert client.append_attempts == 2
+    assert len(output_processor.add_request_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_rejects_new_append_while_previous_operation_is_uncertain() -> None:
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="llm", final_output=False)],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings["req-uncertain"] = 0
+    pool._native_append_operations["req-uncertain"] = (
+        "append-old",
+        b"old-fingerprint",
+        (3,),
+        "uncertain",
+    )
+
+    with pytest.raises(RuntimeError, match="streaming_prompt_uncertain_operation_requires_retry"):
+        await pool.submit_streaming_prompt_update(
+            "req-uncertain",
+            SimpleNamespace(request_id="req-uncertain", prompt_token_ids=[4]),
+            operation_id="append-new",
+            operation_fingerprint=b"new-fingerprint",
+        )
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_rejects_same_uncertain_operation_with_different_fingerprint() -> None:
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="llm", final_output=False)],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._request_bindings["req-uncertain-fingerprint"] = 0
+    pool._native_append_operations["req-uncertain-fingerprint"] = (
+        "append-stable",
+        b"old-fingerprint",
+        (3,),
+        "uncertain",
+    )
+
+    with pytest.raises(RuntimeError, match="streaming_prompt_uncertain_operation_requires_retry"):
+        await pool.submit_streaming_prompt_update(
+            "req-uncertain-fingerprint",
+            SimpleNamespace(request_id="req-uncertain-fingerprint", prompt_token_ids=[3]),
+            operation_id="append-stable",
+            operation_fingerprint=b"different-model-metadata",
+        )
+
+
+def test_stage_pool_binding_release_clears_uncertain_native_append_guard() -> None:
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type="llm", final_output=False)],
+        output_processor=FakeOutputProcessor(),
+    )
+    pool._request_bindings["req-release-uncertain"] = 0
+    pool._native_append_operations["req-release-uncertain"] = (
+        "append-stable",
+        b"fingerprint",
+        (3,),
+        "uncertain",
+    )
+
+    pool.release_binding("req-release-uncertain")
+
+    assert "req-release-uncertain" not in pool._request_bindings
+    assert "req-release-uncertain" not in pool._native_append_operations
 
 
 @pytest.mark.asyncio

@@ -168,6 +168,7 @@ steps:
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
         commands:
+          - export VLLM_USE_V2_MODEL_RUNNER=0
           - |
             timeout 35m bash -c "
               pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'core_model'

@@ -65,6 +65,17 @@ class SuccessRateGate:
     concurrency: int | None = None
 
 
+def assert_realtime_duplex_audio_result(result: dict, *, expected_error: str | None = None) -> None:
+    errors = [event for event in result["events"] if event.get("type") == "error"]
+    if expected_error is not None:
+        assert any(expected_error in json.dumps(event) for event in errors), errors
+        assert result["audio_bytes"] == 0
+    else:
+        assert not errors, errors
+        assert result["audio_bytes"] > 0
+        assert any(event.get("type") == "response.done" for event in result["events"])
+
+
 def is_quality_failure(exc: BaseException) -> bool:
     """True when ``exc`` is one of the sampled quality assertions above.
 

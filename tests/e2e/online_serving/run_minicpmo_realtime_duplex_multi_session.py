@@ -553,6 +553,7 @@ def _demo_args(
         turns=args.turns,
         timeout_s=args.timeout_s,
         model_policy_settle_ms=args.model_policy_settle_ms,
+        emit_duplex_control_results=bool(getattr(args, "emit_duplex_control_results", False)),
         start_barrier=start_barrier,
     )
 
@@ -600,6 +601,14 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
         input_wavs=list(args.session_input_wav),
         expected_tokens=list(args.session_expected_token),
     )
+    native_model_turn_end_ok = len(completed) == args.sessions and all(
+        item.get("native_model_turn_end_ok") is True for item in completed
+    )
+    model_turn_end_count = sum(
+        count
+        for item in completed
+        if isinstance((count := item.get("model_turn_end_count")), int) and not isinstance(count, bool)
+    )
     result = {
         "ok": (
             not failures
@@ -614,6 +623,8 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
         "session_count": args.sessions,
         "identity_isolation_ok": identity_isolation_ok,
         "semantic_isolation_ok": semantic_isolation_ok,
+        "native_model_turn_end_ok": native_model_turn_end_ok,
+        "model_turn_end_count": model_turn_end_count,
         "resume": resume_result,
         "takeover": takeover_result,
         "expiry": lifecycle_result["expiry"],

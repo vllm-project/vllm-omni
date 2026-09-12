@@ -23,6 +23,21 @@ REALTIME_OUTPUT_AUDIO_FORMATS = _state.REALTIME_OUTPUT_AUDIO_FORMATS
 RealtimeSessionState = _state.RealtimeSessionState
 _RealtimeResponseState = _state._RealtimeResponseState
 
+# The conversation owns completed items (including playback/truncation marks).
+# Only small recent terminal identities, never another copy of their bodies,
+# belong to the output projector. Unknown deltas cannot reopen retired state.
+_COMPLETED_RESPONSE_LIMIT = 256
+_RESPONSE_EVENTS = frozenset(
+    {
+        "response.created",
+        "response.speak",
+        "response.output_audio.delta",
+        "response.text.delta",
+        "response.done",
+        "response.output_item.done",
+    }
+)
+
 
 class NativeRealtimeSessionProtocol(
     RealtimeInputTranslator,
@@ -105,9 +120,31 @@ class NativeRealtimeSessionProtocol(
             return json.dumps(translated)
 
     def encode_outbound_event(self, data: dict[str, Any]) -> list[dict[str, object]]:
+        response_id = data.get("response_id")
+        event_type = data.get("type")
+        if event_type in _RESPONSE_EVENTS and isinstance(response_id, str) and response_id:
+            if response_id in self._completed_response_ids:
+                return []
+            if event_type == "response.created":
+                self._has_response_lifecycle = True
+                if response_id in self._response_states:
+                    return []
+            elif self._has_response_lifecycle and response_id not in self._response_states:
+                # In the serving protocol, only response.created can admit a
+                # response. This also fences deltas older than the bounded
+                # terminal cache. Standalone legacy projection without created
+                # events retains its existing implicit-first-response behavior.
+                return []
         payloads = self._from_duplex_event(data)
         for payload in payloads:
             self._attach_event_id(payload)
+        for key, state in tuple(self._response_states.items()):
+            if state.done_emitted:
+                self._response_states.pop(key)
+                if isinstance(key, str):
+                    self._completed_response_ids[key] = None
+        while len(self._completed_response_ids) > _COMPLETED_RESPONSE_LIMIT:
+            self._completed_response_ids.popitem(last=False)
         return payloads
 
     @staticmethod

@@ -8,7 +8,10 @@ from vllm_omni.entrypoints.duplex.protocol import DuplexCapabilities
 
 def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
     """The MiniCPM-o 4.5 native-duplex preset of the generic capability payload."""
+    from vllm_omni.engine.kv_append import scheduler_native_append_available
+
     supports_multi_session = max_sessions > 1
+    native_append = scheduler_native_append_available()
     return DuplexCapabilities(
         supports_model_native_turn_policy=True,
         supports_barge_in=True,
@@ -20,7 +23,8 @@ def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
         supports_core_kv_lease=False,
         supports_model_internal_state=True,
         supports_stage_resumption=True,
-        supports_scheduler_native_append=False,
+        supports_scheduler_native_append=native_append,
+        supports_prompt_replay=native_append,
         supports_core_resumable_request=True,
         supports_stage_connector_handoff=True,
         supports_independent_io_streams=True,
@@ -39,6 +43,9 @@ def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
         signal_sources=["model_native", "client_event", "server_policy"],
         stage_handoff_transport="scheduler_data_plane",
         chunk_period_ms=1000,
+        adapter_id="minicpmo45",
+        runtime_extension_id="minicpmo45",
+        stage_count=3,
         # Barge-in latency depends on client chunking and lacks hardware E2E
         # measurement, so do not advertise an invented target.
         target_barge_in_latency_ms=None,

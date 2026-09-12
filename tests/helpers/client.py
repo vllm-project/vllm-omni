@@ -34,6 +34,7 @@ from tests.helpers.assertions import (
     assert_http_error,
     assert_images_generations_response,
     assert_omni_response,
+    assert_realtime_duplex_audio_result,
     collect_at_success_rate,
 )
 from tests.helpers.media import (
@@ -391,6 +392,56 @@ def _merge_diffusion_responses(parts: list[DiffusionResponse]) -> DiffusionRespo
 
 
 class OnlineOmniClient:
+    def send_realtime_duplex_audio_request(self, request_config: dict[str, Any]) -> dict[str, Any]:
+        """Exercise a real native-duplex audio request, including typed failures."""
+        from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, build_realtime_url, wait_for
+
+        async def run():
+            cfg = request_config
+            url = build_realtime_url(
+                self.base_url.replace("http://", "ws://") + "/v1/realtime?duplex=1",
+                cfg["model"],
+                autostart=False,
+                session_id=cfg["session_id"],
+            )
+            async with RealtimeDuplexClient(url) as client:
+                try:
+                    await client.configure(
+                        cfg["model"],
+                        session_id=cfg["session_id"],
+                        ref_audio=cfg.get("ref_audio"),
+                        temperature=0.0,
+                        extra_body={"emit_duplex_control_results": True},
+                    )
+                    await wait_for(
+                        lambda: client.events.count("session.updated") > 0, timeout_s=30, label="session.updated"
+                    )
+                    await client.stream_pcm16(cfg["pcm16"], realtime=True)
+                    await client.commit()
+
+                    def terminal():
+                        if client.events.errors() or client.events.count("response.done"):
+                            return True
+                        client.raise_if_reader_stopped()
+                        return False
+
+                    await wait_for(terminal, timeout_s=cfg.get("timeout_s", 90), label="duplex response or error")
+                    if not client.events.errors():
+                        await client.acknowledge_playback()
+                    await client.close_session()
+                finally:
+                    if cfg.get("artifact_dir"):
+                        directory = Path(cfg["artifact_dir"])
+                        directory.mkdir(parents=True, exist_ok=True)
+                        (directory / "events.jsonl").write_text(
+                            "\n".join(json.dumps(event) for event in client.events.events), encoding="utf-8"
+                        )
+                return {"events": list(client.events.events), "audio_bytes": len(client.events.audio_bytes())}
+
+        result = asyncio.run(run())
+        assert_realtime_duplex_audio_result(result, expected_error=request_config.get("expected_error"))
+        return result
+
     def __init__(
         self,
         host: str = "127.0.0.1",

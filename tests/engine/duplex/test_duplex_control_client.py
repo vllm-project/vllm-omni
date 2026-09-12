@@ -23,7 +23,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _Transport:
     def __init__(self) -> None:
-        self.calls = []
+        self.calls: list[tuple[object, TouchDuplexSessionMessage | ResumeDuplexSessionMessage, dict[str, object]]] = []
 
     def execute(self, key, message, **kwargs):
         self.calls.append((key, message, kwargs))

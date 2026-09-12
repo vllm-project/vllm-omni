@@ -58,6 +58,7 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        self.streaming_prompt_continuous = False
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -86,7 +87,7 @@ class OmniRequest(Request):
         Returns:
             OmniRequest instance created from the engine core request
         """
-        return cls(
+        result = cls(
             request_id=request.request_id,
             # Optional external request ID for tracking
             external_req_id=request.external_req_id,
@@ -111,6 +112,8 @@ class OmniRequest(Request):
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
         )
+        result.streaming_prompt_continuous = bool(getattr(request, "streaming_prompt_continuous", False))
+        return result
 
 
 @dataclass

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from base64 import b64decode
 from binascii import Error as BinasciiError
+from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, cast
 
 from vllm.sampling_params import SamplingParams
@@ -127,8 +129,19 @@ def build_duplex_data_plane_prompt(
     payload: object,
     final: bool,
 ) -> dict[str, Any]:
-    token_budget = duplex_scheduler_token_budget(payload)
-    if seq <= 1:
+    control = isinstance(payload, dict) and payload.get("gander_control") is True
+    if control:
+        ids = payload.get("token_ids")
+        replay = payload.get("gander_replay") is True
+        wake = payload.get("gander_wake") is True
+        if not isinstance(ids, list) or len(ids) > 1500 or (not replay and ((not ids and not wake) or seq <= 1)):
+            raise ValueError("Gander context append requires initialized session and bounded token ids")
+        token_budget = len(ids) + (1 if seq == 1 else 3)
+        if seq == 1:
+            token_budget += duplex_first_append_context_reserve(runtime_config)
+    else:
+        token_budget = duplex_scheduler_token_budget(payload)
+    if not control and seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
@@ -136,8 +149,11 @@ def build_duplex_data_plane_prompt(
             token_budget = context_reserve + first_units * 12 - 1 + _duplex_vision_tokens(payload)
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
-    if final and duplex_payload_is_exact_chunks(payload):
-        token_budget += 12
+    if isinstance(payload, dict) and payload.get("gander_replay"):
+        token_budget += max(0, len(payload.get("gander_replay_output_ids", [])) - 1)
+    # final arms the model's turn-end fence; it does not build another audio
+    # unit. Reserving an extra 12 slots here used to execute phantom padding
+    # before every committed tail (25 scheduled tokens for 13 real embeddings).
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
@@ -163,6 +179,8 @@ def build_duplex_data_plane_prompt(
                 "incarnation": fence.incarnation,
                 "epoch": fence.epoch,
                 "seq": seq,
+                "gander_unit_id": (payload.get("gander_unit_id") if isinstance(payload, dict) else None)
+                or f"u{fence.epoch}-{seq}",
                 "turn_id": fence.turn_id,
                 "response_seq": fence.response_seq,
                 "turn_seq": turn_seq,
@@ -170,6 +188,7 @@ def build_duplex_data_plane_prompt(
                 "payload": payload,
                 "final": final,
                 "data_plane": True,
+                "recovery_replay": False,
                 "session_config": dict(session_config),
                 "runtime_config": dict(runtime_config),
                 "scheduler_token_budget": token_budget,
@@ -215,10 +234,10 @@ def _first_completion(output: object) -> object | None:
 
 def _multimodal_output(output: object, completion: object | None) -> dict[str, Any]:
     metadata = getattr(output, "multimodal_output", None)
-    if isinstance(metadata, dict):
-        return metadata
+    if isinstance(metadata, Mapping):
+        return dict(metadata)
     metadata = getattr(completion, "multimodal_output", None) if completion is not None else None
-    return metadata if isinstance(metadata, dict) else {}
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
 
 
 def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:
@@ -235,7 +254,12 @@ def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:
         if not isinstance(source, dict):
             continue
         for key, value in source.items():
-            token_id = _coerce_int(value)
+            if isinstance(key, str) and key.startswith("gander_"):
+                from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import latest_int
+
+                token_id = latest_int(value)
+            else:
+                token_id = _coerce_int(value)
             if isinstance(key, str) and token_id is not None and token_id >= 0:
                 token_ids[key] = token_id
     return token_ids
@@ -262,12 +286,20 @@ def _stage_config_value(runtime_config: dict[str, Any], key: str, stage_id: int)
 
 
 class MiniCPMO45DuplexRuntimeExtension:
+    adapter_id = "minicpmo45"
+    runtime_extension_id = "minicpmo45"
+
     def configure_sampling_params(
         self,
         *,
         runtime_config: dict[str, Any],
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]:
+        path = runtime_config.get("gander_tokenizer_path")
+        if isinstance(path, str):
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import tokenizer_for
+
+            self._gander_tokenizer = tokenizer_for(path)
         configured: list[object] = []
         for stage_id, default in enumerate(defaults):
             max_tokens = _coerce_int(_stage_config_value(runtime_config, "duplex_stage_max_tokens", stage_id))
@@ -319,6 +351,175 @@ class MiniCPMO45DuplexRuntimeExtension:
             )
         )
 
+    @staticmethod
+    def automatic_rollover_allowed(payload, runtime_config):
+        return not (
+            runtime_config.get("gander_enabled")
+            and isinstance(payload, dict)
+            and payload.get("gander_defer_rollover") is True
+        )
+
+    @staticmethod
+    def context_window_due(prompts, runtime_config):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import should_rollover
+
+        return bool(runtime_config.get("gander_enabled")) and should_rollover(prompts, runtime_config)
+
+    @staticmethod
+    def select_context_window(prompts, runtime_config):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import select_units, unit_id
+
+        if not runtime_config.get("gander_enabled"):
+            return None
+        retained = {unit_id(p) for p in select_units(prompts, runtime_config, compact=True)}
+        return tuple(i for i, p in enumerate(prompts) if unit_id(p) in retained)
+
+    @staticmethod
+    def can_evict_context_unit(prompt):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import metadata
+
+        return not metadata(prompt).get("gander_pinned", False)
+
+    def prepare_context_replay(self, *, prompt, request_id, initial, runtime_config, fence, recovery_replay=True):
+        if not runtime_config or not runtime_config.get("gander_enabled"):
+            return self.prepare_recovery_prompt(prompt=prompt, request_id=request_id, initial=initial)
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import metadata
+
+        old = metadata(prompt)
+        payload = deepcopy(old["payload"])
+        payload.update(
+            gander_replay=recovery_replay,
+            force_listen=True if recovery_replay else bool(payload.get("force_listen", False)),
+            gander_replay_output_ids=list(old.get("gander_output_ids", [])) if recovery_replay else [],
+            context_version=int(runtime_config.get("gander_context_version", 0)),
+        )
+        seq = int(old["seq"])
+        rebuilt = build_duplex_data_plane_prompt(
+            request_id=request_id,
+            fence=fence or old["fence"],
+            session_config=old["session_config"],
+            runtime_config=runtime_config,
+            seq=1 if initial else max(2, seq),
+            turn_seq=int(old.get("turn_seq", seq)),
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            payload=payload,
+            final=False,
+        )
+        metadata(rebuilt).update(
+            seq=seq, gander_unit_id=old.get("gander_unit_id"), gander_output_ids=list(old.get("gander_output_ids", []))
+        )
+        return rebuilt
+
+    def plan_context_replacement(self, **kwargs):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import make_plan
+
+        if not kwargs["runtime_config"].get("gander_enabled"):
+            raise ValueError("context replacement is only enabled for Gander")
+        return make_plan(**kwargs)
+
+    @staticmethod
+    def describe_context(prompts):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import describe
+
+        return [describe(p) for p in prompts]
+
+    def finalize_context_unit(self, *, prompts, output, segment_token_ids, segment_output_metadata):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import current_unit, latest_int
+
+        completion = _first_completion(output)
+        output_meta = _multimodal_output(output, completion)
+        if any(
+            latest_int(source.get(key))
+            for source in (output_meta, segment_output_metadata)
+            for key in ("duplex_recovery_replay", "meta.duplex_recovery_replay")
+        ):
+            return None
+        ids = _special_token_ids(segment_output_metadata)
+        ids.update(_special_token_ids(output_meta))
+        seq = ids.get("gander_append_seq")
+        if seq is None:
+            return None
+        candidates = [
+            list(segment_token_ids),
+            _completion_token_ids(completion),
+            _coerce_int_list(getattr(completion, "cumulative_token_ids", None)),
+        ]
+        all_ids = max(candidates, key=len)
+        terminal = latest_int(getattr(completion, "stop_reason", None))
+        if terminal is None and all_ids:
+            terminal = all_ids[-1]
+        if terminal is None:
+            return None
+        unit = current_unit(all_ids, ids, finished=True)
+        if not unit or unit[-1] != terminal:
+            unit.append(terminal)
+        from vllm_omni.engine.duplex.contracts import DuplexContextOutput
+
+        return DuplexContextOutput(unit_sequence=seq, data={"output_ids": unit})
+
+    @staticmethod
+    def context_unit_sequence(prompt):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import metadata
+
+        return metadata(prompt).get("seq")
+
+    @staticmethod
+    def apply_context_output(prompt, output):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import metadata
+
+        updated = deepcopy(dict(prompt))
+        metadata(updated)["gander_output_ids"] = list(output.data["output_ids"])
+        return updated
+
+    def prepare_recovery_prompt(
+        self,
+        *,
+        prompt: dict[str, Any],
+        request_id: str,
+        initial: bool,
+    ) -> dict[str, Any]:
+        """Rebase a journal unit onto a new physical scheduler request.
+
+        A rollover may discard the original first append.  The first retained
+        unit must therefore reserve the model's session-prefix embeddings even
+        though its logical ``seq`` remains unchanged for fencing/idempotency.
+        """
+        copied = deepcopy(prompt)
+        model_buffer = copied.get("model_intermediate_buffer")
+        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+        if not isinstance(duplex, dict):
+            raise ValueError("MiniCPM-o recovery journal entry has no duplex metadata")
+        fence = duplex.get("fence")
+        if not isinstance(fence, DuplexFence):
+            raise ValueError("MiniCPM-o recovery journal entry has no typed fence")
+        try:
+            mode = DuplexInputMode(duplex["mode"])
+            seq = int(duplex["seq"])
+            turn_seq = int(duplex["turn_seq"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("MiniCPM-o recovery journal entry has invalid sequence metadata") from exc
+        session_config = duplex.get("session_config")
+        runtime_config = duplex.get("runtime_config")
+        payload = duplex.get("payload")
+        if not isinstance(session_config, dict) or not isinstance(runtime_config, dict):
+            raise ValueError("MiniCPM-o recovery journal entry has invalid runtime configuration")
+        rebuilt = build_duplex_data_plane_prompt(
+            request_id=request_id,
+            fence=fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            seq=(1 if initial else seq),
+            turn_seq=turn_seq,
+            mode=mode,
+            payload=payload,
+            final=bool(duplex.get("final")),
+        )
+        rebuilt_duplex = rebuilt["model_intermediate_buffer"]["duplex"]
+        # Preserve logical ordering even when the physical first unit is
+        # materialized with first-append token budgeting.
+        rebuilt_duplex["seq"] = seq
+        return rebuilt
+
     def decide_output(
         self,
         *,
@@ -336,13 +537,48 @@ class MiniCPMO45DuplexRuntimeExtension:
         output_metadata = _multimodal_output(output, completion)
         special_token_ids = _special_token_ids(segment_output_metadata)
         special_token_ids.update(_special_token_ids(output_metadata))
+        if "tool_call_token_id" in special_token_ids:
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import current_unit
+
+            # A DELTA completion / segment may contain only the final token.
+            # Tool parsing needs the whole current unit, including its opener.
+            candidates = [list(segment_token_ids), _completion_token_ids(completion)]
+            candidates.append(_coerce_int_list(getattr(completion, "cumulative_token_ids", None)))
+            tokens = current_unit(max(candidates, key=len), special_token_ids, finished=True)
+            if tokens and tokens[0] == special_token_ids["tool_call_token_id"]:
+                tokenizer = getattr(self, "_gander_tokenizer", None)
+                if tokenizer is None:
+                    raise RuntimeError("Gander tool output tokenizer is unavailable")
+                raw = tokenizer.decode(tokens, skip_special_tokens=False)
+                import hashlib
+
+                identity = f"{getattr(output, 'request_id', '')}:{special_token_ids.get('gander_append_seq')}:{raw}"
+                return DuplexOutputDecision(
+                    action=DuplexOutputAction.DIRECT_RESPONSE,
+                    # Serving ends the turn for silent tool units as well.
+                    # Advance before already-queued input can produce speech.
+                    ends_model_turn=True,
+                    metadata={
+                        **output_metadata,
+                        **{f"meta.{k}": v for k, v in special_token_ids.items()},
+                        "duplex_direct_response": True,
+                        "gander_tool_text": raw,
+                        "gander_call_id": "call_" + hashlib.sha256(identity.encode()).hexdigest()[:24],
+                    },
+                )
+
         listen_id = special_token_ids.get("listen_token_id")
         if listen_id is None:
             return None
 
         stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
-        if _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
+        final_token = _coerce_int(stop_reason)
+        if final_token is None and token_ids:
+            final_token = token_ids[-1]
+        interrupt_id = special_token_ids.get("interrupt_token_id")
+        interrupted = interrupt_id is not None and final_token == interrupt_id
+        if final_token != listen_id and not interrupted:
             return None
 
         metadata = dict(output_metadata)
@@ -351,7 +587,7 @@ class MiniCPMO45DuplexRuntimeExtension:
         metadata.update(
             {
                 "duplex_direct_response": True,
-                "duplex_native_decision": "listen",
+                "duplex_native_decision": "interrupt" if interrupted else "listen",
                 "model_listen": True,
                 "listen_source": "model_listen",
             }
@@ -359,6 +595,7 @@ class MiniCPMO45DuplexRuntimeExtension:
         return DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
             metadata=metadata,
+            ends_model_turn=interrupted,
         )
 
 

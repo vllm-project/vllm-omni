@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import TypeAlias
 
 from vllm.logger import init_logger
@@ -133,14 +134,34 @@ class CorrelatedRpcClient:
         timeout_message: str,
         block_on_submit: bool = False,
     ) -> EngineQueueMessage:
+        deadline = None if timeout is None else time.monotonic() + timeout
         waiter = self._router.register(key)
         try:
             if block_on_submit:
-                self._request_queue.put(message)
+                while True:
+                    # A full bounded queue must not hide a fatal broadcast or
+                    # close, including calls with no caller-specified deadline.
+                    try:
+                        result = waiter.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        if isinstance(result, ErrorMessage):
+                            raise RuntimeError(result.error)
+                        return result
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise TimeoutError(timeout_message)
+                    try:
+                        self._request_queue.put(message, timeout=0.05 if remaining is None else min(0.05, remaining))
+                        break
+                    except queue.Full:
+                        continue
             else:
                 self._request_queue.put_nowait(message)
             try:
-                result = waiter.get(timeout=timeout)
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                result = waiter.get(timeout=remaining)
             except queue.Empty as exc:
                 raise TimeoutError(timeout_message) from exc
             if isinstance(result, ErrorMessage):

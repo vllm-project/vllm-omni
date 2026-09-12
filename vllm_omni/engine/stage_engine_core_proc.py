@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -87,8 +90,45 @@ class StageEngineCoreProc(EngineCoreProc):
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
+        scheduler_request.model_intermediate_buffer = request.model_intermediate_buffer
+        scheduler_request.streaming_prompt_continuous = request.streaming_prompt_continuous
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
+
+    def get_streaming_prompt_metrics(self, request_id: str) -> Any:
+        """Expose the scheduler metric utility through EngineCore RPC.
+
+        vLLM 0.28 resolves ``call_utility_async`` methods on EngineCore rather
+        than directly on its scheduler.  Keep the transport contract stable
+        across both utility-dispatch layouts by making EngineCore the explicit
+        façade and leaving request mutation on the scheduler thread.
+        """
+        return self.scheduler.get_streaming_prompt_metrics(request_id)
+
+    def append_streaming_prompt_unit(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        model_intermediate_buffer: dict[str, Any] | None,
+        operation_id: str | None,
+        operation_fingerprint: bytes | None,
+        sampling_params: Any = None,
+    ) -> Any:
+        """Atomically append one idempotent unit on the scheduler thread."""
+        if sampling_params is not None:
+            import msgspec
+            from vllm.sampling_params import SamplingParams
+
+            if not isinstance(sampling_params, SamplingParams):
+                sampling_params = msgspec.convert(sampling_params, type=SamplingParams)
+        return self.scheduler.append_streaming_prompt_unit(
+            request_id,
+            token_ids,
+            model_intermediate_buffer,
+            operation_id=operation_id,
+            operation_fingerprint=operation_fingerprint,
+            sampling_params=sampling_params,
+        )
 
     @staticmethod
     def run_stage_core(

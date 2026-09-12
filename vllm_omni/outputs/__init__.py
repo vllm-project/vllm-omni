@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,12 +55,15 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
             to the orchestrator output processor.
     """
 
-    multimodal_outputs: list[dict[str, object]] | None = None
-    inter_stage_outputs: list[dict[str, Any] | None] | None = None
+    # A scheduled row can legitimately have no payload for this step. Readers
+    # borrow these collections; the producing runner owns their mutable lists.
+    multimodal_outputs: Sequence[Mapping[str, object] | None] | None = None
+    inter_stage_outputs: Sequence[Mapping[str, object] | None] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    model_input_errors: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
