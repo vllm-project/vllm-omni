@@ -177,3 +177,108 @@ def test_pcm_commit_reservation_rollback_restores_residual_audio():
     )
     assert retried.payload is not None
     assert base64.b64decode(retried.payload["audio"]) == (base64.b64decode(original["audio"]) + b"\x00" * (8_000 * 4))
+
+
+def _frame_payload(samples: int, frames: list[str]) -> dict[str, object]:
+    payload = pcm_payload(samples)
+    payload["video_frames"] = frames
+    return payload
+
+
+def test_append_attaches_every_frame_of_the_unit_closing_append():
+    """A base frame and its stacked composite arrive on one append and must
+    enter the same model unit (official ``frame_list``), not one per unit."""
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    emitted = buffer.append(_frame_payload(16_000, ["base-0", "stack-0"]), chunk_period_ms=1_000)
+
+    assert emitted is not None
+    assert emitted["video_frames"] == ["base-0", "stack-0"]
+    assert buffer._frame_queue == []
+
+
+def test_stacked_frames_do_not_accumulate_across_units():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    attached: list[list[str]] = []
+
+    for unit in range(64):
+        emitted = buffer.append(
+            _frame_payload(16_000, [f"base-{unit}", f"stack-{unit}"]),
+            chunk_period_ms=1_000,
+        )
+        assert emitted is not None
+        attached.append(list(emitted["video_frames"]))
+
+    assert attached[0] == ["base-0", "stack-0"]
+    assert attached[-1] == ["base-63", "stack-63"]
+    assert buffer._frame_queue == []
+
+
+def test_frames_from_partial_appends_ride_the_unit_they_close():
+    """200 ms client chunks: the frames arrive with the 5th chunk of each
+    second and attach to the unit that chunk completes, one group per unit."""
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    emitted_units: list[dict[str, object]] = []
+    for unit in range(3):
+        for chunk in range(5):
+            frames = [f"base-{unit}", f"stack-{unit}"] if chunk == 4 else []
+            emitted = buffer.append(_frame_payload(3_200, frames), chunk_period_ms=1_000)
+            if emitted is not None:
+                emitted_units.append(emitted)
+
+    assert [unit["video_frames"] for unit in emitted_units] == [
+        ["base-0", "stack-0"],
+        ["base-1", "stack-1"],
+        ["base-2", "stack-2"],
+    ]
+    assert buffer._frame_queue == []
+
+
+def test_single_frame_per_unit_still_attaches_one_frame_per_unit():
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    first = buffer.append(_frame_payload(16_000, ["base-0"]), chunk_period_ms=1_000)
+    second = buffer.append(_frame_payload(16_000, ["base-1"]), chunk_period_ms=1_000)
+
+    assert first is not None and first["video_frames"] == ["base-0"]
+    assert second is not None and second["video_frames"] == ["base-1"]
+
+
+def test_frame_groups_stay_queued_when_audio_outruns_units():
+    """Two appends land before one unit closes: the later group waits for the
+    next unit instead of merging into the first."""
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    assert buffer.append(_frame_payload(8_000, ["base-0", "stack-0"]), chunk_period_ms=1_000) is None
+    first = buffer.append(_frame_payload(16_000, ["base-1", "stack-1"]), chunk_period_ms=1_000)
+    second = buffer.append(pcm_payload(8_000), chunk_period_ms=1_000)
+
+    assert first is not None and first["video_frames"] == ["base-0", "stack-0"]
+    assert second is not None and second["video_frames"] == ["base-1", "stack-1"]
+    assert buffer._frame_queue == []
+
+
+def test_rollback_restores_frame_groups_in_wire_order():
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    first = buffer.prepare_append(
+        _frame_payload(16_000, ["base-0", "stack-0"]),
+        operation_id="append-0",
+        chunk_period_ms=1_000,
+    )
+    second = buffer.prepare_append(
+        _frame_payload(16_000, ["base-1", "stack-1"]),
+        operation_id="append-1",
+        chunk_period_ms=1_000,
+    )
+    assert first is not None and second is not None
+    assert first.payload is not None and first.payload["video_frames"] == ["base-0", "stack-0"]
+
+    first.rollback()
+
+    assert buffer._frame_queue == [["base-0", "stack-0"], ["base-1", "stack-1"]]
+    retried = buffer.flush(chunk_period_ms=1_000)
+    assert retried is not None
+    assert retried["video_frames"] == ["base-0", "stack-0"]
+    assert buffer._frame_queue == [["base-1", "stack-1"]]

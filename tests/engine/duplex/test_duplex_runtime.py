@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.runtime import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
+    _duplex_hd_slice_count,
     build_duplex_data_plane_prompt,
     duplex_scheduler_token_budget,
 )
@@ -481,3 +482,82 @@ def test_placeholder_budget_is_planned_inside_omni_engine_boundary():
     assert len(prompt["prompt_token_ids"]) == 16
     assert prompt["model_intermediate_buffer"]["duplex"]["fence"] == fence
     assert prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"] == 16
+
+
+def _jpeg_b64(width: int, height: int) -> str:
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (width, height), (32, 64, 96)).save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _pcm_unit_payload(frames: list[str]) -> dict[str, object]:
+    import base64
+
+    return {
+        "audio": base64.b64encode(b"\x00" * (16000 * 4)).decode("ascii"),
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "video_frames": frames,
+    }
+
+
+def test_duplex_scheduler_token_budget_one_frame_is_one_block():
+    audio_only = duplex_scheduler_token_budget(_pcm_unit_payload([]))
+    one_frame = duplex_scheduler_token_budget(_pcm_unit_payload([_jpeg_b64(960, 540)]))
+
+    assert one_frame - audio_only == 66
+
+
+@pytest.mark.parametrize(
+    ("base_size", "expected_blocks"),
+    [
+        ((960, 540), 4),  # official camera frame: source + 2 HD patches + composite
+        ((540, 960), 4),  # portrait phone capture
+        ((640, 360), 4),
+        ((448, 448), 2),  # fits one tile: the processor does not slice it
+        ((320, 240), 2),
+    ],
+)
+def test_duplex_scheduler_token_budget_matches_stage0_hd_slicing(base_size, expected_blocks):
+    """A stacked pair is processed with max_slice_nums=[2, 1]; the budget must
+    equal the blocks Stage0 builds for that base-frame size."""
+    audio_only = duplex_scheduler_token_budget(_pcm_unit_payload([]))
+    pair = duplex_scheduler_token_budget(_pcm_unit_payload([_jpeg_b64(*base_size), _jpeg_b64(448, 448)]))
+
+    assert pair - audio_only == expected_blocks * 66
+
+
+@pytest.mark.parametrize(
+    ("size", "expected_patches"),
+    [
+        # multiple = min(ceil(w * h / 448**2), max_slice_nums); <= 1 is never sliced.
+        ((448, 448), 0),  # exactly one tile
+        ((320, 240), 0),  # smaller than one tile
+        ((447, 449), 0),  # just under one tile
+        ((449, 449), 2),  # just over: the processor cuts a 2-tile grid
+        ((640, 360), 2),
+        ((960, 540), 2),  # official camera frame
+        ((540, 960), 2),  # same frame rotated
+        ((1920, 1080), 2),  # capped by max_slice_nums=2, not by area
+    ],
+)
+def test_duplex_hd_slice_count_matches_official_grid(size, expected_patches):
+    """Lock the port of ``MiniCPMVImageProcessor.get_sliced_grid``.
+
+    Stage0 slices a stacked unit with ``max_slice_nums=[2, 1]``, so the patch
+    count for the base frame decides the scheduler budget. A frame that fits one
+    ``scale_resolution=448`` tile is not sliced at all.
+    """
+    assert _duplex_hd_slice_count(size, 2) == expected_patches
+
+
+def test_duplex_scheduler_token_budget_unreadable_base_frame_keeps_hd_fallback():
+    audio_only = duplex_scheduler_token_budget(_pcm_unit_payload([]))
+    pair = duplex_scheduler_token_budget(_pcm_unit_payload(["not-an-image", _jpeg_b64(448, 448)]))
+
+    assert pair - audio_only == 4 * 66

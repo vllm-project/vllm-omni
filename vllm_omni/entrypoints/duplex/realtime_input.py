@@ -1068,14 +1068,14 @@ class RealtimeInputTranslator(RealtimeStateOwner):
         Wire contract matches the official MiniCPM-o duplex loop: one base
         base64 JPEG per ~1 s audio chunk, optionally followed by that unit's
         stacked composite tiling the sub-frames captured inside it (at most 2
-        images either way). HD slicing (max_slice_nums > 1) is not implemented
-        by the duplex adapter yet and is rejected explicitly rather than
-        silently ignored; note official suggests it for composites
-        (``max_slice_nums=[2, 1]``), so stacked detail is capped at
-        scale_resolution until that lands.
+        images either way). A caller-supplied ``max_slice_nums`` is rejected
+        rather than silently ignored: slicing is Stage 0's decision here, and
+        Stage 0 already applies the official HD suggestion for a stacked unit
+        (``max_slice_nums=[2, 1]``). The wire simply does not let the client
+        choose it.
         """
         if max_slice_nums not in (None, 1):
-            return "max_slice_nums > 1 (HD slicing) is not implemented by the duplex Realtime adapter"
+            return "max_slice_nums is not selectable on the wire; Stage0 slices stacked units itself"
         if not isinstance(video_frames, list):
             return "video_frames must be a list of base64-encoded images"
         frames = [frame for frame in video_frames if frame is not None]

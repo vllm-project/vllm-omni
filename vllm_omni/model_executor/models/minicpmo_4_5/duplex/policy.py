@@ -26,10 +26,12 @@ class MiniCPMO45DuplexPolicy:
     SAMPLES_PER_AUDIO_TOKEN = 1600
     # Vision framing contract (omni duplex). Official streaming_prefill feeds
     # each frame as <image> + 64 resampler embeddings + </image> inside the
-    # unit, ahead of the unit's audio embeddings (max_slice_nums=1 in
-    # streaming, so exactly one 64-token block per frame). A unit may carry
-    # its base frame plus an optional stacked composite of the sub-frames
-    # captured inside that unit (2 blocks).
+    # unit, ahead of the unit's audio embeddings. A lone frame is one block.
+    # A unit carrying its base frame plus the stacked composite of the
+    # sub-frames captured inside it is processed with the official HD
+    # suggestion (max_slice_nums=[2, 1]): the base frame adds the patches the
+    # processor cuts for its size (two for a 960x540 capture, none for a frame
+    # that fits one 448x448 tile) and the composite adds one block.
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20

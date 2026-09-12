@@ -116,9 +116,12 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
-        # Omni duplex: queued camera frames (base64 JPEG), consumed FIFO at
-        # one frame per emitted model unit alongside the unit's audio.
-        self._frame_queue: list[str] = []
+        # Omni duplex: queued camera frames (base64 JPEG), grouped per client
+        # append and consumed FIFO at one group per emitted model unit. A
+        # group is the base frame plus its optional stacked composite (the
+        # wire contract allows at most 2 images per append); both must ride
+        # the same unit, mirroring official ``frame_list``.
+        self._frame_queue: list[list[str]] = []
 
     def clear(self) -> None:
         for reservation in self._reservations:
@@ -251,7 +254,9 @@ class MiniCPMO45PcmAppendBuffer:
         )
         frames_in = payload.get("video_frames")
         if isinstance(frames_in, list):
-            self._frame_queue.extend(frame for frame in frames_in if isinstance(frame, str) and frame)
+            frame_group = [frame for frame in frames_in if isinstance(frame, str) and frame]
+            if frame_group:
+                self._frame_queue.append(frame_group)
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         if not allow_emit:
             return None
@@ -284,16 +289,17 @@ class MiniCPMO45PcmAppendBuffer:
         out.pop("video_frames", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
-        # Omni duplex: attach at most one queued camera frame per emitted
-        # model unit (official cadence: one frame per 1 s chunk). The engine
-        # budgets 66 scheduler slots per attached frame from this payload.
-        # Official omni cadence is one frame per ~1 s chunk, and the first
-        # append consumes extra samples (1035 ms first window), so per-unit
-        # attachment could outrun the units Stage0 actually builds. Attach at
-        # most ONE frame per emitted payload; the rest stay queued.
+        # Omni duplex: attach at most one queued frame *group* per emitted
+        # model unit (official cadence: one ``frame_list`` per 1 s chunk). The
+        # engine budgets scheduler slots for every frame in this payload.
+        # The first append consumes extra samples (1035 ms first window), so
+        # per-unit attachment could outrun the units Stage0 actually builds.
+        # Attach ONE group per emitted payload; later groups stay queued. A
+        # group is what one client append carried (base frame + optional
+        # stacked composite), so the composite never lags its base frame.
         attached_frames: list[str] = []
         if emit_samples + pad_samples >= min_samples and self._frame_queue:
-            attached_frames = [self._frame_queue.pop(0)]
+            attached_frames = list(self._frame_queue.pop(0))
             out["video_frames"] = attached_frames
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
         out["is_speech"] = any(span.is_speech for span in reserved_spans)
@@ -400,9 +406,9 @@ class MiniCPMO45PcmAppendBuffer:
         restored = b"".join(item._raw for item in rolled_back)
         self._buffer[:0] = restored
         self._prepend_spans([span for item in rolled_back for span in item._spans])
-        restored_frames = [frame for item in rolled_back for frame in item._video_frames]
-        if restored_frames:
-            self._frame_queue[:0] = restored_frames
+        restored_groups = [list(item._video_frames) for item in rolled_back if item._video_frames]
+        if restored_groups:
+            self._frame_queue[:0] = restored_groups
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
         for item in rolled_back:
