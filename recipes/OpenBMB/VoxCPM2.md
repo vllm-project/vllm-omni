@@ -43,9 +43,90 @@ sufficient — no tensor parallelism is required.
 
 ## Hardware Support
 
-This recipe documents one tested 24 GB consumer-GPU configuration.
-Larger-VRAM (H20 / H100 / A100) and other vendor sections (ROCm, NPU) are
-welcome as community validation lands.
+This recipe documents tested single-card configurations for a 24 GB NVIDIA
+GPU and an Ascend Atlas A2.
+
+## Ascend NPU
+
+### 1 x Ascend 910B3 64GB (Atlas A2)
+
+VoxCPM2 runs on one Atlas A2 card with the standard deploy config. Keep
+`enforce_eager: true` for the outer vLLM model runner. The default config uses
+exact-signature NPUGraph capture for the tensor-only inner LocDiT forward.
+
+#### Environment
+
+- Hardware: 1 x Ascend 910B3 64GB (Atlas A2)
+- Container: `quay.nju.edu.cn/ascend/vllm-omni:v0.28.0`
+- vLLM: 0.28.0
+- vLLM-Omni: current `main`
+- Model: `openbmb/VoxCPM2`, bfloat16
+
+#### Command
+
+Expose one physical NPU to the container, then start the server normally. The
+visible card is addressed as logical device `0` by `voxcpm2.yaml`.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=5
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+vllm serve /path/to/VoxCPM2 --omni \
+    --host 0.0.0.0 --port 8000
+```
+
+#### Performance validation
+
+The component timer used one warmup followed by five measured Chinese TTS
+requests. Both paths used the same prompt, model, and runtime config; the graph
+patch was the only runtime difference. Each decode step executes nine LocDiT
+estimator calls, so per-call and per-step measurements compare the same amount
+of model work even when generated audio duration differs. Values below are
+mean ± sample standard deviation.
+
+| path | CFM estimator / call | decode / step | forward / step |
+| ---- | -------------------- | ------------- | -------------- |
+| Eager LocDiT | 18.83 ± 0.53 ms | 193.88 ± 5.55 ms | 265.34 ± 7.24 ms |
+| Inner LocDiT NPUGraph | 4.911 ± 0.000 ms | 49.39 ± 0.02 ms | 120.89 ± 0.77 ms |
+
+The inner LocDiT graph reduces CFM estimator latency by about **73.9%**,
+complete decode-step latency by about **74.5%**, and normalized end-to-end RTF
+from `1.756 ± 0.053` to `0.818 ± 0.008` (**53.4%**). In a deterministic
+eager-versus-graph run, the generated 48 kHz PCM was
+byte-identical (`MAE=0`, `max error=0`). The first call for each tensor
+signature runs eagerly and captures a graph; following calls replay it.
+
+An online A/B used the OpenAI-compatible speech endpoint with one warmup and
+three measured repeats at each concurrency. TTFP is client-observed time to
+the first response bytes. Audio throughput is generated audio duration divided
+by test wall time. All requests returned HTTP 200.
+
+| concurrency | eager TTFP (s) | graph TTFP (s) | eager RTF | graph RTF | eager audio throughput | graph audio throughput |
+| ----------- | -------------- | -------------- | --------- | --------- | ---------------------- | ---------------------- |
+| 1 | 6.194 ± 0.809 | 3.050 ± 0.394 | 1.661 ± 0.013 | 0.818 ± 0.007 | 0.602x ± 0.005 | 1.223x ± 0.011 |
+| 4 | 7.846 ± 1.034 | 4.156 ± 0.465 | 1.983 ± 0.034 | 1.051 ± 0.006 | 1.804x ± 0.166 | 3.392x ± 0.273 |
+| 8 | 8.700 ± 0.306 | 4.921 ± 0.347 | 2.193 ± 0.023 | 1.238 ± 0.034 | 3.022x ± 0.194 | 5.347x ± 0.467 |
+| 16 | 18.612 ± 0.537 | 8.869 ± 0.108 | 4.873 ± 0.183 | 2.326 ± 0.043 | 2.226x ± 0.104 | 4.592x ± 0.141 |
+
+The graph reduced mean TTFP and RTF by 43.4%–52.3% and increased audio
+throughput by 76.9%–106.3%. The default `max_num_seqs` is eight, so the
+16-request result includes queueing for a second admission wave rather than
+representing pure operator throughput.
+
+The optimization is enabled automatically on Ascend. If the required NPUGraph
+APIs are unavailable, the estimator logs a warning and remains in eager mode.
+
+Only the five-tensor LocDiT estimator call is captured. Request-owned state,
+CFM noise and Euler scheduling, feature encoding, and AudioVAE decoding remain
+eager. The default eight-entry limit covers batch sizes up to the deploy
+config's `max_num_seqs: 8`; unseen signatures after that limit fall back to
+eager execution.
+
+Do not set `enforce_eager: false` for VoxCPM2 on Ascend yet. Outer ACL Graph
+captures the language-model runner, but the request-owned VoxCPM2 state has
+dynamic prefill/decode shapes; replay can therefore feed an empty captured row
+into a non-empty residual state and fail at `aclnnCat`. This restriction is
+independent of the safe, tensor-only inner LocDiT NPUGraph described above.
 
 ## GPU
 
@@ -88,8 +169,8 @@ Pass `--deploy-config <path>` to override.
 #### Verification
 
 **Server cold-start**: ~60 s from `vllm serve` to `Application startup
-complete` (subprocess fork + vLLM 0.21 init + model load + flashinfer JIT
-+ torch.compile of LocDiT / feat_encoder / AudioVAE + CUDA-Graph warmup).
+complete` (subprocess fork + vLLM 0.21 init + model load + flashinfer JIT and
+torch.compile of LocDiT / feat_encoder / AudioVAE + CUDA-Graph warmup).
 The first request after startup pays a small additional cost; steady-state
 requests are much faster.
 
@@ -199,7 +280,7 @@ after a one-off ~28 s engine init:
 | ---- | -------- | --------- | ----- | ------------------------------------------------ |
 | #1   | 6.72 s   | 11.97 s   | 1.782 | cold: torch.compile + CUDA-Graph capture         |
 | #2   | 6.24 s   | 11.43 s   | 1.831 | still runtime warmup                             |
-| #3   | 6.88 s   | 0.82 s    | 0.120 | ⚡ steady-state                                   |
+| #3   | 6.88 s   | 0.82 s    | 0.120 | steady-state                                     |
 | #4   | 6.56 s   | 0.78 s    | 0.119 | steady-state                                     |
 | #5   | 5.76 s   | 0.70 s    | 0.121 | steady-state                                     |
 
@@ -231,7 +312,7 @@ Same 5-call methodology as the zero-shot table, this time with a
 | ---- | -------- | --------- | ----- | ------------------------------------------------ |
 | #1   | 5.44 s   | 12.38 s   | 2.276 | cold: compile + CUDA-Graph capture + ref encode  |
 | #2   | 5.12 s   | 2.47 s    | 0.482 | most warmup done                                 |
-| #3   | 5.44 s   | 0.76 s    | 0.139 | ⚡ steady-state                                   |
+| #3   | 5.44 s   | 0.76 s    | 0.139 | steady-state                                     |
 | #4   | 4.96 s   | 0.68 s    | 0.137 | steady-state                                     |
 | #5   | 5.28 s   | 0.71 s    | 0.134 | steady-state                                     |
 

@@ -111,7 +111,11 @@ class _VoxCPM2RuntimeConfig:
             return bool(value)
         if isinstance(default, int) and not isinstance(default, bool):
             value = int(value)
-            if key in {"audio_emit_every", "vae_decode_every", "batched_fsq_fusion_max_batch"}:
+            if key in {
+                "audio_emit_every",
+                "vae_decode_every",
+                "batched_fsq_fusion_max_batch",
+            }:
                 return max(1, value)
             return value
         if isinstance(default, float):

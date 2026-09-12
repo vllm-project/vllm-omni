@@ -72,6 +72,11 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             apply_model_patches(self.model_config)
         NPUModelRunner.load_model(self, *args, **kwargs)
+        from vllm_omni.platforms.npu.models.voxcpm2_talker import (
+            setup_voxcpm2_loc_dit_npu_graph,
+        )
+
+        setup_voxcpm2_loc_dit_npu_graph(self.model)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
