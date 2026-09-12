@@ -74,8 +74,8 @@ def estimator_cache(monkeypatch):
         staticmethod(_shortcut),
     )
 
-    mock_tcfg = SimpleNamespace(codec_frame_rate=CODEC_FRAME_RATE, codec_language_id=None, spk_is_dialect=None)
-    return {"test_model": (MagicMock(), mock_tcfg, None)}
+    mock_tcfg = SimpleNamespace(codec_language_id=None, spk_is_dialect=None)
+    return {"test_model": (MagicMock(), mock_tcfg, CODEC_FRAME_RATE)}
 
 
 def _run(cache: dict, ref_audio: str) -> int | None:
