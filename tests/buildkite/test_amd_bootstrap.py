@@ -136,7 +136,7 @@ def test_label_lookup_selects_tiers(tmp_path, labels, expected_levels):
     ] == expected_levels
 
 
-@pytest.mark.parametrize("debug_test_yaml", ["ready,ready", "nightly", ", ,", " \t"])
+@pytest.mark.parametrize("debug_test_yaml", ["ready,ready", "nightly,nightly", ", ,", " \t"])
 def test_invalid_debug_override_fails_without_label_lookup(tmp_path, debug_test_yaml):
     result = _run_bootstrap(tmp_path, debug_test_yaml=debug_test_yaml, curl_status=22)
 
