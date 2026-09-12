@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Gradio demo for Qwen3-TTS with gapless streaming audio playback.
 
 Uses a custom AudioWorklet-based player for gap-free streaming,
@@ -351,7 +354,7 @@ def generate_speech(
         raise gr.Error(f"Failed to decode audio: {e}")
 
 
-def create_app(api_base: str):
+def create_app(api_base: str, task_type: str = "CustomVoice"):
     """Create the FastAPI app with streaming proxy + Gradio UI."""
     fastapi_app = FastAPI()
 
@@ -463,10 +466,11 @@ def create_app(api_base: str):
                     lines=4,
                 )
                 with gr.Row():
-                    task_type = gr.Radio(
+                    task_type_input = gr.Radio(
                         choices=TASK_TYPES,
-                        value="CustomVoice",
+                        value=task_type,
                         label="Task Type",
+                        interactive=False,
                         scale=2,
                     )
                     language = gr.Dropdown(
@@ -479,17 +483,21 @@ def create_app(api_base: str):
                     choices=voices,
                     value=voices[0] if voices else None,
                     label="speaker",
-                    visible=True,
+                    visible=task_type == "CustomVoice",
                     allow_custom_value=True,
                 )
                 instructions = gr.Textbox(
                     label="Instructions",
                     placeholder="e.g., Speak with excitement / A warm, friendly female voice",
                     lines=2,
-                    visible=True,
-                    info="Optional style/emotion instructions",
+                    visible=task_type != "Base",
+                    info=(
+                        "Required: describe the voice style"
+                        if task_type == "VoiceDesign"
+                        else "Optional style/emotion instructions"
+                    ),
                 )
-                with gr.Column(visible=False) as ref_group:
+                with gr.Column(visible=task_type == "Base") as ref_group:
                     ref_audio = gr.Audio(
                         label="Reference Audio (upload for voice cloning)",
                         type="numpy",
@@ -563,7 +571,7 @@ def create_app(api_base: str):
                     autoplay=True,
                     visible=False,
                 )
-                with gr.Column(visible=True) as examples_cv:
+                with gr.Column(visible=task_type == "CustomVoice") as examples_cv:
                     gr.Examples(
                         examples=[
                             [
@@ -588,7 +596,7 @@ def create_app(api_base: str):
                         inputs=[text_input, voice, language, instructions],
                         label="examples",
                     )
-                with gr.Column(visible=False) as examples_vd:
+                with gr.Column(visible=task_type == "VoiceDesign") as examples_vd:
                     gr.Examples(
                         examples=[
                             [
@@ -605,7 +613,7 @@ def create_app(api_base: str):
                         inputs=[text_input, language, instructions],
                         label="examples",
                     )
-                with gr.Column(visible=False) as examples_base:
+                with gr.Column(visible=task_type == "Base") as examples_base:
                     gr.Examples(
                         examples=[
                             [
@@ -653,9 +661,9 @@ def create_app(api_base: str):
                 gr.update(visible=is_base),  # examples_base
             )
 
-        task_type.change(
+        task_type_input.change(
             fn=on_task_change,
-            inputs=[task_type],
+            inputs=[task_type_input],
             outputs=[
                 voice,
                 instructions,
@@ -703,7 +711,7 @@ def create_app(api_base: str):
 
         all_inputs = [
             text_input,
-            task_type,
+            task_type_input,
             voice,
             language,
             instructions,
@@ -788,6 +796,9 @@ def parse_args():
         description="Gradio demo for Qwen3-TTS with gapless AudioWorklet streaming.",
     )
     add_common_args(parser)
+    parser.add_argument(
+        "--task-type", choices=TASK_TYPES, default="CustomVoice", help="Task matching the served checkpoint"
+    )
     return parser.parse_args()
 
 
@@ -796,7 +807,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
     print(f"Connecting to vLLM server at: {args.api_base}")
 
-    app = create_app(args.api_base)
+    app = create_app(args.api_base, task_type=args.task_type)
 
     import uvicorn
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Launch both vLLM server and Gradio demo for Qwen3-TTS
 #
 # Usage:
@@ -179,7 +182,7 @@ fi
 echo ""
 echo "Starting Gradio demo..."
 cd "$SCRIPT_DIR"
-GRADIO_CMD=("python" "gradio_demo.py" "--api-base" "$API_BASE" "--host" "$GRADIO_IP" "--port" "$GRADIO_PORT")
+GRADIO_CMD=("python" "gradio_demo.py" "--api-base" "$API_BASE" "--host" "$GRADIO_IP" "--port" "$GRADIO_PORT" "--task-type" "$TASK_TYPE")
 if [ "$GRADIO_SHARE" = true ]; then
     GRADIO_CMD+=("--share")
 fi

@@ -8,25 +8,28 @@ to generate audio from text using Qwen3-TTS models.
 
 Examples:
     # CustomVoice task (predefined speaker)
-    python openai_speech_client.py --text "Hello, how are you?" --voice vivian
+    python openai_speech_client.py --text "Hello, how are you?" --speaker vivian
 
     # CustomVoice with emotion instruction
-    python openai_speech_client.py --text "I'm so happy!" --voice vivian \
+    python openai_speech_client.py --text "I'm so happy!" --speaker vivian \
         --instructions "Speak with excitement"
 
     # VoiceDesign task (voice from description)
     python openai_speech_client.py --text "Hello world" \
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
         --task-type VoiceDesign \
         --instructions "A warm, friendly female voice"
 
     # Base task (voice cloning)
     python openai_speech_client.py --text "Hello world" \
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
         --task-type Base \
         --ref-audio "https://example.com/reference.wav" \
         --ref-text "This is the reference transcript"
 
     # Base task with pre-computed speaker embedding
     python openai_speech_client.py --text "Hello world" \
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
         --task-type Base \
         --speaker-embedding embedding.json
 """
