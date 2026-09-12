@@ -509,3 +509,15 @@ def test_lora_loader_mixin_lora_is_fused_property(mocker: MockerFixture):
     assert pipeline2.lora_is_fused is False
     pipeline2.lora_is_fused = True
     assert pipeline2.lora_is_fused is True
+
+
+def test_prepare_lora_delta_with_compute_device():
+    base_key = "blocks.0.attn.to_q"
+    state_dict = {
+        f"{base_key}.lora_A.weight": torch.ones(RANK, HEAD_DIM),
+        f"{base_key}.lora_B.weight": torch.ones(HEAD_DIM, RANK),
+    }
+    delta, used_keys = _prepare_lora_delta(state_dict, base_key, compute_device=torch.device("cpu"))
+    assert delta is not None
+    assert delta.shape == (HEAD_DIM, HEAD_DIM)
+    assert len(used_keys) == 2

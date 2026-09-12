@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from itertools import chain
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any
@@ -14,14 +14,12 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from vllm.logger import init_logger
 
-from .block_discovery import get_blocks_from_dit
-from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT
+from .config import TEXT_ENCODER_COMPONENT
 from .offload_plan import OffloadPlan
 from .tensor_utils import set_tensor_storage
 
 if TYPE_CHECKING:
-    from .base import OffloadConfig
-    from .module_collector import PipelineModules
+    from .plan_resolver import BlockStack, ResolvedComponent, ResolvedOffloadPlan
 
 logger = init_logger(__name__)
 
@@ -76,30 +74,25 @@ def get_encoder_block_groups(
 
 
 def iter_streamable_dits(
-    modules: PipelineModules,
-    config: OffloadConfig,
+    resolved: ResolvedOffloadPlan,
     device: torch.device,
-    plan: OffloadPlan | None,
-) -> Iterator[tuple[str, nn.Module, list[str], list[nn.Module]]]:
-    """Yield selected DiTs whose block metadata resolves successfully."""
-    if not config.offloads(DIT_COMPONENT):
-        return
-    for name, module in zip(modules.dit_names, modules.dits):
-        logger.info("Applying hooks on %s (%s)", name, module.__class__.__name__)
-        planned_attrs = None if plan is None else plan.block_attrs.get(name)
-        block_attrs, blocks = get_blocks_from_dit(module, planned_attrs)
-        if blocks:
-            yield name, module, block_attrs, blocks
+) -> Iterator[tuple[ResolvedComponent, BlockStack]]:
+    """Yield selected DiTs that resolved to a streamable block stack."""
+    for component in resolved.dits:
+        if not component.selected:
             continue
-        if config.components is not None:
-            raise ValueError(f"Selected DiT {name!r} has no streamable layerwise-offload blocks")
-        logger.warning("Target layers (blocks) not found. Skipping offloading on %s (%s)", name, type(module).__name__)
-        module.to(device)
+        logger.info("Applying hooks on %s (%s)", component.path, component.module.__class__.__name__)
+        if not component.stacks:
+            # The resolver already warned; a legacy selection keeps the
+            # unstreamable DiT resident instead of failing the run.
+            component.module.to(device)
+            continue
+        yield component, component.stacks[0]
 
 
 def move_non_block_state_to_device(
     module: nn.Module,
-    block_groups: list[nn.ModuleList],
+    block_groups: Sequence[Sequence[nn.Module]],
     device: torch.device,
 ) -> None:
     """Keep component state outside streamed block lists resident on device."""
@@ -120,7 +113,7 @@ def move_non_block_state_to_device(
 def set_encoder_layerwise_state(
     module: nn.Module,
     hooks: list[Any],
-    block_groups: list[nn.ModuleList],
+    block_groups: Sequence[Sequence[nn.Module]],
 ) -> None:
     """Publish the backend-neutral state used by encoder stage lifecycles."""
     module._omni_layerwise_hooks = hooks
@@ -163,59 +156,38 @@ def prepare_component(
 
 
 def prepare_pipeline_components(
-    modules: PipelineModules,
-    config: OffloadConfig,
-    plan: OffloadPlan | None,
+    resolved: ResolvedOffloadPlan,
     *,
     device: torch.device,
     staged_components: list[nn.Module],
-    enable_encoder_blocks: Callable[[nn.Module, str, OffloadPlan | None, bool], bool],
+    enable_encoder_blocks: Callable[[ResolvedComponent], bool],
 ) -> None:
     """Apply the shared encoder/VAE/resident placement policy."""
-    if config.components is not None and config.offloads(TEXT_ENCODER_COMPONENT):
-        selected_encoder_names = [name for name in modules.encoder_names if config.offloads_encoder(name, plan)]
-        if not selected_encoder_names:
-            raise ValueError("No text encoder modules found for selected text_encoder offload")
-
-    if plan is not None:
-        for encoder, name in zip(modules.encoders, modules.encoder_names):
-            if config.should_offload_encoder(name, plan) and name in plan.on_demand_component_paths:
-                validate_on_demand_component(encoder, name)
-
-    for encoder, name in zip(modules.encoders, modules.encoder_names):
-        selected = config.should_offload_encoder(name, plan)
-        stage_on_demand = bool(selected and plan is not None and name in plan.on_demand_component_paths)
-        blockwise = selected and enable_encoder_blocks(encoder, name, plan, stage_on_demand)
-        if stage_on_demand and not blockwise and config.uses_allgather(TEXT_ENCODER_COMPONENT):
-            raise ValueError(
-                f"Text encoder {name!r} cannot use AllGather without a model-declared streamable block plan"
-            )
-        if selected and config.components is not None and not (blockwise or stage_on_demand):
-            raise ValueError(f"Selected text encoder {name!r} requires a model-declared streamable or on-demand plan")
+    for component in resolved.encoders:
+        blockwise = bool(component.stacks) and enable_encoder_blocks(component)
         prepare_component(
-            encoder,
-            name,
+            component.module,
+            component.path,
             device=device,
-            stage_on_demand=stage_on_demand,
+            stage_on_demand=component.on_demand,
             blockwise=blockwise,
             staged_components=staged_components,
         )
 
-    for vae, name in zip(modules.vaes, modules.vae_names):
-        legacy_staged = config.components is None and plan is not None and name in plan.on_demand_component_paths
+    for component in resolved.vaes:
         prepare_component(
-            vae,
-            name,
+            component.module,
+            component.path,
             device=device,
-            stage_on_demand=legacy_staged,
+            stage_on_demand=component.on_demand,
             blockwise=False,
             staged_components=staged_components,
         )
 
-    for name, module in zip(modules.resident_names, modules.resident_modules):
-        module.to(device)
-        logger.debug("Moved resident module %s to %s", name, device)
+    for component in resolved.residents:
+        component.module.to(device)
+        logger.debug("Moved resident module %s to %s", component.path, device)
 
-    if not config.offloads(DIT_COMPONENT):
-        for dit in modules.dits:
-            dit.to(device)
+    for component in resolved.dits:
+        if not component.selected:
+            component.module.to(device)

@@ -4,7 +4,7 @@
 
 import asyncio
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -62,7 +62,7 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
             encode_reference_audio,
         )
 
-        wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+        wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
         artifact_key = self._get_resolved_ref_audio_artifact_key(cache_key)
         wav = np.asarray(wav_list, dtype=np.float32)
         ref_codes_delayed, cache_hit, inflight_wait = await self._resolve_higgs_audio_v3_ref_codes(
@@ -109,7 +109,7 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
 
         task = self._higgs_audio_v3_ref_code_inflight.get(artifact_key)
         if task is not None:
-            return (await task).clone(), False, True
+            return (await asyncio.shield(task)).clone(), False, True
 
         async def _encode_and_cache() -> torch.Tensor:
             ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, sr)
@@ -120,11 +120,15 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
 
         task = asyncio.create_task(_encode_and_cache())
         self._higgs_audio_v3_ref_code_inflight[artifact_key] = task
-        try:
-            return (await task).clone(), False, False
-        finally:
-            if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is task:
+
+        def _retire(t: asyncio.Task[torch.Tensor]) -> None:
+            if not t.cancelled():
+                t.exception()
+            if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is t:
                 self._higgs_audio_v3_ref_code_inflight.pop(artifact_key, None)
+
+        task.add_done_callback(_retire)
+        return (await asyncio.shield(task)).clone(), False, False
 
     def _get_higgs_audio_v3_ref_codes(self, artifact_key: str | None) -> torch.Tensor | None:
         if not artifact_key:

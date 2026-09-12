@@ -42,6 +42,7 @@ recipes/
 | -------- | ------ | ---------- |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
+| [`black-forest-labs/FLUX.1-schnell.md`](./black-forest-labs/FLUX.1-schnell.md) | Offline text-to-image generation with CPU offload | 1x NVIDIA GeForce RTX 5090 32GB |
 | [`Boogu/Boogu-Image.md`](./Boogu/Boogu-Image.md) | Text-to-image online serving (Boogu-Image-0.1-Base) | 1x A100/H100 40GB+ |
 | [`BosonAI/Higgs-Audio-V3-TTS.md`](./BosonAI/Higgs-Audio-V3-TTS.md) | Online + offline multilingual TTS with voice cloning | 1x H100 80GB |
 | [`ByteDance/Lance.md`](./ByteDance/Lance.md) | Unified AR+diffusion: text/img/video gen + understanding (Lance 3B) | 1x B300 / A100 80GB |
@@ -54,6 +55,7 @@ recipes/
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
 | [`MiniMaxAI/MiniMax-H3.md`](./MiniMaxAI/MiniMax-H3.md) | T2VA, FL2VA, image+audio Ref2VA, and multi-video Ref2VA serving | 1x GPU with CPU offload / 4x B300 |
+| [`MiniMaxAI/MiniMax-H3-Spark-GB10.md`](./MiniMaxAI/MiniMax-H3-Spark-GB10.md) | MiniMax H3 T2VA and Ref2VA on DGX Spark | 1x or 2x DGX Spark (GB10) |
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU |
@@ -82,6 +84,7 @@ recipes/
 | [`SenseNova/SenseNova-U1.md`](./SenseNova/SenseNova-U1.md) | Unified image generation and understanding | 1x or 2x H200 / 1x AMD MI300X |
 | [`SenseNova/SenseNova-U1.5.md`](./SenseNova/SenseNova-U1.5.md) | Unified image generation and understanding, with an 8-step distilled LoRA | 1x A800 80GB |
 | [`StabilityAI/Stable-Audio-Open.md`](./StabilityAI/Stable-Audio-Open.md) | Offline + online text-to-audio generation (Stable Audio Open) | 1x RTX 4090 24GB / 1x AMD MI300X |
+| [`Tencent/AuK-H100.md`](./Tencent/AuK-H100.md) | Offline instruction-driven TTS, speech editing, enhancement and separation (AuK base and Flash) | 1x H100 80GB |
 | [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md) | Online serving for audio chat | 1x A100 80GB |
 | [`Tencent/HunyuanImage-3.0-Instruct.md`](./Tencent/HunyuanImage-3.0-Instruct.md) | DiT-only text-to-image serving and benchmark, including ModelOpt mixed FP8/NVFP4 | 4x H100/H800 80GB / 2x B200 |
 | [`Wan-AI/Wan2.2-T2V.md`](./Wan-AI/Wan2.2-T2V.md) | Text-to-video serving (Wan2.2 14B) with Skip-Softmax sparse attention | 1x datacenter Blackwell (B200/B300) |
