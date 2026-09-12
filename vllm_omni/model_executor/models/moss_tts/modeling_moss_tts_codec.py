@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -76,6 +77,10 @@ class _MossCodecStreamSession:
             raise RuntimeError("The streaming codec does not implement a decoder state pool.")
         with torch.no_grad():
             initialize_state_pool(self._state_capacity, scratch_capacity)
+        # CUDA-only streaming-decode graph wrapper (no per-module gain on NPU:
+        # AscendCompiler can't fuse the codec and NPUGraph replay == eager, so
+        # NPU runs eager decode_streaming_tensors, which takes the B==1 slice
+        # fast path via the slot0 arg below).
         if batch_sizes and frame_sizes and self._device.type == "cuda":
             self._cudagraph_wrapper = CUDAGraphStreamingDecoderWrapper(
                 codec,
@@ -188,11 +193,20 @@ class _MossCodecStreamSession:
                 device=self._device,
             )
             valid_rows = torch.ones(len(slots), dtype=torch.bool, device=self._device)
+            # B==1 slice fast path: pass the single active slot as a python int
+            # (slots[0], NO .item() -> no host sync, async-safe at concurrency).
+            # RingKVCache.complete takes a contiguous *view* of the cache instead
+            # of a gather+writeback. None for B>1 (general gather path). Opt out
+            # via MOSS_CODEC_SLICE=0.
+            slot0: int | None = None
+            if self._device.type == "npu" and len(slots) == 1 and os.environ.get("MOSS_CODEC_SLICE", "1") != "0":
+                slot0 = int(slots[0])
             result = self._codec.decode_streaming_batch(
                 codes_step,
                 codes_lengths,
                 state_slot_ids,
                 valid_rows,
+                slot0=slot0,
             )
             if result.audio is None:
                 return {}
