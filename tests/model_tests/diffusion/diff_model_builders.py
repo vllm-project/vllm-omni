@@ -256,6 +256,20 @@ def tiny_flux_kontext_builder() -> str:
     )
 
 
+def tiny_sdxl_builder() -> str:
+    # The UNet's architecture (block_out_channels, transformer_layers_per_block, etc.)
+    # is hardcoded in SDXLUNet2DConditionModel rather than read from config, so it
+    # can't be shrunk here; only the two CLIP text encoders are reduced.
+    return build_tiny_from_configs(
+        "StableDiffusionXLPipeline",
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        transform={
+            "text_encoder": _shrink_flux_clip_text_encoder,
+            "text_encoder_2": _shrink_flux_clip_text_encoder,
+        },
+    )
+
+
 def tiny_flux2_builder() -> str:
     def shrink_text_encoder(config: dict) -> dict:
         config["tie_word_embeddings"] = False
