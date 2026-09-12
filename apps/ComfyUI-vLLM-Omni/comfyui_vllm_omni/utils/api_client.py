@@ -265,6 +265,7 @@ class VLLMOmniClient:
         height: int,
         num_frames: int,
         fps: int,
+        generate_sound: bool = False,
         negative_prompt: str | None = None,
         frame: torch.Tensor | None = None,
         references: dict | None = None,
@@ -284,6 +285,10 @@ class VLLMOmniClient:
         form.add_field("height", str(height))
         form.add_field("num_frames", str(num_frames))
         form.add_field("fps", str(fps))
+        form.add_field(
+            "generate_sound",
+            "true" if generate_sound else "false",
+        )
         if negative_prompt:
             form.add_field("negative_prompt", negative_prompt)
         if sampling_params is not None:
