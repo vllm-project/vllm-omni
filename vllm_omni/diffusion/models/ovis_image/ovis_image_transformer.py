@@ -16,25 +16,187 @@
 # limitations under the License.
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import FeedForward
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed
+from diffusers.models.embeddings import (
+    CombinedTimestepLabelEmbeddings,
+    TimestepEmbedding,
+    Timesteps,
+    get_1d_rotary_pos_embed,
+)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZeroSingle
 from diffusers.utils import is_torch_npu_available
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+def _safe_quant_config(quant_config: "QuantizationConfig | None") -> "QuantizationConfig | None":
+    """Return quant_config only if it is safe to propagate here, else None.
+
+    Dual-stream transformer_blocks, norm modulation layers, and norm_out are
+    kept at full precision for FP8 (see #2728). Offline quantization (e.g.
+    INC/AutoRound W4A16) needs the config propagated so packed weights load
+    correctly.
+    """
+    if quant_config is None:
+        return None
+    from vllm.model_executor.layers.quantization.inc import INCConfig
+
+    if isinstance(quant_config, INCConfig):
+        return quant_config
+    return None
+
+
+class AdaLayerNormZero(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_embeddings: int | None = None,
+        norm_type="layer_norm",
+        bias=True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        if num_embeddings is not None:
+            self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
+        else:
+            self.emb = None
+
+        self.silu = nn.SiLU()
+        self.linear = ReplicatedLinear(
+            embedding_dim, 6 * embedding_dim, bias=bias, quant_config=quant_config, prefix=f"{prefix}.linear"
+        )
+        if norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            raise ValueError(f"Unsupported `norm_type` ({norm_type})")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor | None = None,
+        class_labels: torch.LongTensor | None = None,
+        hidden_dtype: torch.dtype | None = None,
+        emb: torch.Tensor | None = None,
+    ):
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+
+        emb, _ = self.linear(self.silu(emb))
+
+        chunks = emb.chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
+
+        x = self.norm(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class SwiGLU(nn.Module):
+    def __init__(
+        self,
+        dim_in: int,
+        inner_dim: int,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim_in, inner_dim * 2, bias=bias, gather_output=False, quant_config=quant_config, prefix=f"{prefix}.proj"
+        )
+        self.activation = nn.SiLU()
+
+    def forward(self, hidden_states):
+        # Weight layout: [hidden_local, gate_local] interleaved within each TP shard
+        hidden_states, _ = self.proj(hidden_states)
+        hidden_states, gate = hidden_states.chunk(2, dim=-1)
+        out = hidden_states * self.activation(gate)
+        return out
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int | None = None,
+        mult: int = 4,
+        dropout: float = 0.0,
+        activation_fn: str = "swiglu",
+        final_dropout: bool = False,
+        inner_dim=None,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        if inner_dim is None:
+            inner_dim = int(dim * mult)
+        dim_out = dim_out if dim_out is not None else dim
+
+        if activation_fn == "swiglu":
+            act_fn = SwiGLU(dim, inner_dim, bias=bias, quant_config=quant_config, prefix=f"{prefix}.net.0")
+        else:
+            raise ValueError(f"Unsupported activation function type: {activation_fn}")
+
+        self.net = nn.ModuleList([])
+        self.net.append(act_fn)
+        self.net.append(nn.Dropout(dropout))
+        self.net.append(
+            RowParallelLinear(
+                inner_dim,
+                dim_out,
+                bias=bias,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
+            )
+        )
+
+        if final_dropout:
+            self.net.append(nn.Dropout(dropout))
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        for layer in self.net:
+            if isinstance(layer, RowParallelLinear):
+                # Contiguous for FP8 quantization in RowParallelLinear
+                hidden_states, _ = layer(hidden_states.contiguous())
+            else:
+                output = layer(hidden_states)
+                if isinstance(output, tuple):
+                    hidden_states = output[0]
+                else:
+                    hidden_states = output
+        return hidden_states
 
 
 class OvisImageAttention(nn.Module):
@@ -52,6 +214,8 @@ class OvisImageAttention(nn.Module):
         out_dim: int = None,
         context_pre_only: bool | None = None,
         pre_only: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -63,7 +227,7 @@ class OvisImageAttention(nn.Module):
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.context_pre_only = context_pre_only
         self.pre_only = pre_only
-        self.heads = out_dim // dim_head if out_dim is not None else heads
+        self.heads = heads
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
@@ -74,13 +238,23 @@ class OvisImageAttention(nn.Module):
             hidden_size=query_dim,
             head_size=self.head_dim,
             total_num_heads=self.heads,
-            disable_tp=True,
             bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
 
         if not self.pre_only:
             self.to_out = nn.ModuleList([])
-            self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
+            self.to_out.append(
+                RowParallelLinear(
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
+            )
             self.to_out.append(nn.Dropout(dropout))
 
         if self.added_kv_proj_dim is not None:
@@ -91,15 +265,23 @@ class OvisImageAttention(nn.Module):
                 hidden_size=self.added_kv_proj_dim,
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
-                disable_tp=True,
                 bias=added_proj_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.add_kv_proj",
             )
 
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(
+                input_size=self.inner_dim,
+                output_size=query_dim,
+                bias=out_bias,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
+            )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
-            num_heads=heads,
+            num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
@@ -112,24 +294,29 @@ class OvisImageAttention(nn.Module):
         image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Ensure contiguous for FP8 quantized linear layers
+        hidden_states = hidden_states.contiguous()
         qkv, _ = self.to_qkv(hidden_states)
 
+        local_num_heads = self.to_qkv.num_heads
+        head_dim = self.head_dim
         query, key, value = qkv.chunk(3, dim=-1)
 
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (local_num_heads, head_dim))
+        key = key.unflatten(-1, (local_num_heads, head_dim))
+        value = value.unflatten(-1, (local_num_heads, head_dim))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
 
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
+            encoder_query = encoder_query.unflatten(-1, (local_num_heads, head_dim))
+            encoder_key = encoder_key.unflatten(-1, (local_num_heads, head_dim))
+            encoder_value = encoder_value.unflatten(-1, (local_num_heads, head_dim))
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
@@ -152,14 +339,16 @@ class OvisImageAttention(nn.Module):
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
-
         if encoder_hidden_states is not None:
-            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            enc_len = encoder_hidden_states.shape[1]
+            encoder_hidden_states, hidden_states = (
+                hidden_states[:, :enc_len],
+                hidden_states[:, enc_len:],
             )
-            hidden_states = self.to_out[0](hidden_states)
+            # Contiguous for FP8 quantization in RowParallelLinear
+            hidden_states, _ = self.to_out[0](hidden_states.contiguous())
             hidden_states = self.to_out[1](hidden_states)
-            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states.contiguous())
 
             return hidden_states, encoder_hidden_states
         else:
@@ -167,14 +356,36 @@ class OvisImageAttention(nn.Module):
 
 
 class OvisImageSingleTransformerBlock(nn.Module):
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        mlp_ratio: float = 4.0,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim * 2)
+        self.proj_mlp = ColumnParallelLinear(
+            dim,
+            self.mlp_hidden_dim * 2,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_mlp",
+        )
         self.act_mlp = nn.SiLU()
-        self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
+        self.proj_out = RowParallelLinear(
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_out",
+        )
 
         self.attn = OvisImageAttention(
             query_dim=dim,
@@ -184,6 +395,8 @@ class OvisImageSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -195,14 +408,16 @@ class OvisImageSingleTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        residual = hidden_states
-        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states, mlp_hidden_gate = torch.split(
-            self.proj_mlp(norm_hidden_states), [self.mlp_hidden_dim, self.mlp_hidden_dim], dim=-1
-        )
-        mlp_hidden_states = self.act_mlp(mlp_hidden_gate) * mlp_hidden_states
+        combined_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        residual = combined_states
+
+        norm_hidden_states, gate = self.norm(combined_states, emb=temb)
+
+        proj_mlp_output, _ = self.proj_mlp(norm_hidden_states)
+        mlp_hidden, mlp_gate = proj_mlp_output.chunk(2, dim=-1)
+        mlp_hidden_states = self.act_mlp(mlp_gate) * mlp_hidden
+
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
@@ -210,10 +425,14 @@ class OvisImageSingleTransformerBlock(nn.Module):
             **joint_attention_kwargs,
         )
 
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-        gate = gate.unsqueeze(1)
-        hidden_states = gate * self.proj_out(hidden_states)
-        hidden_states = residual + hidden_states
+        combined_features = torch.cat([attn_output, mlp_hidden_states], dim=-1)
+        # Contiguous for FP8 quantization in RowParallelLinear
+        proj_output, _ = self.proj_out(combined_features.contiguous())
+
+        proj_output = gate.unsqueeze(1) * proj_output
+
+        hidden_states = residual + proj_output
+
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -229,11 +448,15 @@ class OvisImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
-        self.norm1 = AdaLayerNormZero(dim)
-        self.norm1_context = AdaLayerNormZero(dim)
+        self.norm1 = AdaLayerNormZero(dim, quant_config=_safe_quant_config(quant_config), prefix=f"{prefix}.norm1")
+        self.norm1_context = AdaLayerNormZero(
+            dim, quant_config=_safe_quant_config(quant_config), prefix=f"{prefix}.norm1_context"
+        )
 
         self.attn = OvisImageAttention(
             query_dim=dim,
@@ -244,13 +467,19 @@ class OvisImageTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="swiglu")
+        self.ff = FeedForward(
+            dim=dim, dim_out=dim, activation_fn="swiglu", quant_config=quant_config, prefix=f"{prefix}.ff"
+        )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="swiglu")
+        self.ff_context = FeedForward(
+            dim=dim, dim_out=dim, activation_fn="swiglu", quant_config=quant_config, prefix=f"{prefix}.ff_context"
+        )
 
     def forward(
         self,
@@ -367,6 +596,10 @@ class OvisImageTransformer2DModel(nn.Module):
 
     _repeated_blocks = ["OvisImageTransformerBlock", "OvisImageSingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
 
     def __init__(
         self,
@@ -380,6 +613,7 @@ class OvisImageTransformer2DModel(nn.Module):
         num_attention_heads: int = 24,
         joint_attention_dim: int = 2048,
         axes_dims_rope: tuple[int] = (16, 56, 56),
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         model_config = od_config.tf_model_config
@@ -402,8 +636,10 @@ class OvisImageTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=_safe_quant_config(quant_config),
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -413,8 +649,10 @@ class OvisImageTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
-                for _ in range(num_single_layers)
+                for i in range(num_single_layers)
             ]
         )
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
@@ -526,18 +764,70 @@ class OvisImageTransformer2DModel(nn.Module):
                 params_dict[name] = buffer
 
         loaded_params: set[str] = set()
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
         for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+            # 1. Single Block proj_out (RowParallelLinear) weight restructuring
+            if "single_transformer_blocks" in name and "proj_out.weight" in name:
+                if tp_size > 1:
+                    w_attn, w_mlp = loaded_weight.split([self.inner_dim, self.inner_dim * 4], dim=1)
+                    w_attn_local = w_attn.chunk(tp_size, dim=1)[tp_rank]
+                    w_mlp_local = w_mlp.chunk(tp_size, dim=1)[tp_rank]
+                    local_weight = torch.cat([w_attn_local, w_mlp_local], dim=1)
+
+                    if name in params_dict:
+                        params_dict[name].data.copy_(local_weight)
+                        loaded_params.add(name)
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+
+            # 2. All SwiGLU linear layers weight/bias restructuring
+            if ("net.0.proj.weight" in name) or ("proj_mlp.weight" in name):
+                if tp_size > 1:
+                    w_hidden, w_gate = loaded_weight.chunk(2, dim=0)
+                    w_h_local = w_hidden.chunk(tp_size, dim=0)[tp_rank]
+                    w_g_local = w_gate.chunk(tp_size, dim=0)[tp_rank]
+                    local_weight = torch.cat([w_h_local, w_g_local], dim=0)
+
+                    if name in params_dict:
+                        params_dict[name].data.copy_(local_weight)
+                        loaded_params.add(name)
+                    continue
+
+            if ("net.0.proj.bias" in name) or ("proj_mlp.bias" in name):
+                if tp_size > 1:
+                    b_hidden, b_gate = loaded_weight.chunk(2, dim=0)
+                    b_h_local = b_hidden.chunk(tp_size, dim=0)[tp_rank]
+                    b_g_local = b_gate.chunk(tp_size, dim=0)[tp_rank]
+                    local_bias = torch.cat([b_h_local, b_g_local], dim=0)
+
+                    if name in params_dict:
+                        params_dict[name].data.copy_(local_bias)
+                        loaded_params.add(name)
+                    continue
+
+            # 3. Stacked QKV weight loading
+            found_stacked = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name in name:
+                    target_param_name = name.replace(weight_name, param_name)
+                    if target_param_name in params_dict:
+                        param = params_dict[target_param_name]
+                        param.weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(target_param_name)
+                        found_stacked = True
+                        break
+            if found_stacked:
+                continue
+
+            # 4. Standard parameter loading
+            if name not in params_dict:
+                logger.warning("Unexpected parameter in checkpoint: %s", name)
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

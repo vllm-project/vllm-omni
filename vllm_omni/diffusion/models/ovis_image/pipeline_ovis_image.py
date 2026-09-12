@@ -202,7 +202,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
             model, subfolder="tokenizer", local_files_only=local_files_only
         )
 
-        self.transformer = OvisImageTransformer2DModel(od_config=od_config)
+        self.transformer = OvisImageTransformer2DModel(od_config=od_config, quant_config=od_config.quantization_config)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
 
