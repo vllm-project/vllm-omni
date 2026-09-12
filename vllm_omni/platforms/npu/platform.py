@@ -59,6 +59,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.utils import adapt_patch
 
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.models.cosyvoice3 import apply_cosyvoice3_patches
         from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
             apply_minicpmo_4_5_code2wav_patch,
         )
@@ -70,6 +71,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         )
 
         adapt_patch(is_global_patch=True)
+        apply_cosyvoice3_patches()
         apply_minicpmo_4_5_code2wav_patch()
         apply_qwen3_tts_patches()
         apply_qwen3_tts_tokenizer_v2_patch()

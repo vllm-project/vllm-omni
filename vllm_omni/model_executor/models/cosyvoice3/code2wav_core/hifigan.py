@@ -380,6 +380,9 @@ class HiFTGenerator(nn.Module):
     https://arxiv.org/abs/2309.09493
     """
 
+    # Enabled by platform setup when native complex STFT/ISTFT is unavailable.
+    _stft_on_cpu = False
+
     def __init__(
         self,
         in_channels: int = 80,
@@ -489,6 +492,9 @@ class HiFTGenerator(nn.Module):
             block.remove_weight_norm()
 
     def _stft(self, x):
+        target_device, target_dtype = x.device, x.dtype
+        if self._stft_on_cpu:
+            x = x.to(device="cpu", dtype=torch.float32)
         spec = torch.stft(
             x,
             self.istft_params["n_fft"],
@@ -498,9 +504,17 @@ class HiFTGenerator(nn.Module):
             return_complex=True,
         )
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
+        if self._stft_on_cpu:
+            spec = spec.to(device=target_device, dtype=target_dtype)
         return spec[..., 0], spec[..., 1]
 
     def _istft(self, magnitude, phase):
+        target_device, target_dtype = magnitude.device, magnitude.dtype
+        if self._stft_on_cpu:
+            # Build the complex spectrum on CPU too: NPU complex operations
+            # are not required by the fallback path.
+            magnitude = magnitude.to(device="cpu", dtype=torch.float32)
+            phase = phase.to(device="cpu", dtype=torch.float32)
         magnitude = torch.clip(magnitude, max=1e2)
         real = magnitude * torch.cos(phase)
         img = magnitude * torch.sin(phase)
@@ -511,9 +525,13 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             window=self._get_stft_window(magnitude),
         )
+        if self._stft_on_cpu:
+            inverse_transform = inverse_transform.to(device=target_device, dtype=target_dtype)
         return inverse_transform
 
     def _get_stft_window(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._stft_on_cpu:
+            return self.stft_window.to(device="cpu", dtype=torch.float32)
         if self.stft_window.device != tensor.device:
             self.stft_window = self.stft_window.to(tensor.device)
         return self.stft_window
