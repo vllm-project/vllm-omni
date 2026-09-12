@@ -32,23 +32,23 @@ def _transfer_manager(
     pre_lookahead_frames: int = 0,
     stream_scale_factor: int = 1,
     max_chunk_frames: int | None = None,
+    left_context_frames: int | None = None,
 ):
     if max_chunk_frames is None:
         max_chunk_frames = chunk_frames
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_pre_lookahead_frames": pre_lookahead_frames,
+        "codec_max_chunk_frames": max_chunk_frames,
+        "codec_stream_scale_factor": stream_scale_factor,
+        "codec_vocab_size": 6561,
+    }
+    if left_context_frames is not None:
+        extra["codec_left_context_frames"] = left_context_frames
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_pre_lookahead_frames": pre_lookahead_frames,
-                    "codec_max_chunk_frames": max_chunk_frames,
-                    "codec_stream_scale_factor": stream_scale_factor,
-                    "codec_vocab_size": 6561,
-                }
-            }
-        ),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -325,6 +325,67 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
     assert payload_ready is not None
     assert payload_ready.codes.audio.tolist() == [8, 9, 10, 11]
     assert payload_ready.meta.left_context_size == 0
+
+
+def _run_chunk(transfer_manager, request, *, finished: bool = False):
+    return talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=finished,
+    )
+
+
+def _never_finished() -> bool:
+    return False
+
+
+def _feed_chunks(transfer_manager, req_id: str, emitted_counts, *, finish_last: bool = False):
+    """Drive one request through chunks whose talker output grows to each count."""
+    request = SimpleNamespace(
+        external_req_id=req_id,
+        output_token_ids=[],
+        additional_information={},
+        is_finished=_never_finished,
+    )
+    payloads = []
+    last = len(emitted_counts) - 1
+    for i, count in enumerate(emitted_counts):
+        request.output_token_ids = list(range(1, count + 1))
+        payloads.append(_run_chunk(transfer_manager, request, finished=finish_last and i == last))
+    return payloads
+
+
+def test_talker2code2wav_async_chunk_slides_flow_window_after_context_cap():
+    transfer_manager = _transfer_manager(left_context_frames=3)
+    payload1, payload2, payload3 = _feed_chunks(transfer_manager, "rid-window", [2, 4, 6])
+
+    # Before the cap engages the full prefix is sent (legacy behavior).
+    assert payload1.codes.audio.tolist() == [1, 2]
+    assert payload1.meta.left_context_size == 0
+    assert payload2.codes.audio.tolist() == [1, 2, 3, 4]
+    assert payload2.meta.left_context_size == 2
+    # emitted=4 > cap=3: the window slides, dropping token index 0.
+    assert payload3.codes.audio.tolist() == [2, 3, 4, 5, 6]
+    assert payload3.meta.left_context_size == 3
+
+
+def test_talker2code2wav_async_chunk_final_flush_respects_flow_window():
+    transfer_manager = _transfer_manager(left_context_frames=3)
+    payload_final = _feed_chunks(transfer_manager, "rid-window-final", [2, 4, 6, 7], finish_last=True)[-1]
+
+    # emitted=6, cap=3: final flush sends 3 context tokens + the new tail.
+    assert payload_final.meta.finished.item() is True
+    assert payload_final.codes.audio.tolist() == [4, 5, 6, 7]
+    assert payload_final.meta.left_context_size == 3
+
+
+def test_talker2code2wav_async_chunk_flow_window_disabled_sends_full_prefix():
+    transfer_manager = _transfer_manager(left_context_frames=0)
+    payload3 = _feed_chunks(transfer_manager, "rid-window-off", [2, 4, 6])[-1]
+
+    assert payload3.codes.audio.tolist() == [1, 2, 3, 4, 5, 6]
+    assert payload3.meta.left_context_size == 4
 
 
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():
