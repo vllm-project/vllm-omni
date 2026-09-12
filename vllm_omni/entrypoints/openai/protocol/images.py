@@ -21,10 +21,6 @@ from pydantic import BaseModel, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 
-# Bound int request fields to avoid overflow issues.
-_INT64_MIN = -(2**63)
-_INT64_MAX = 2**63 - 1
-
 _IMAGE_FILE_METADATA = {
     "jpg": ("jpg", "image/jpeg"),
     "jpeg": ("jpeg", "image/jpeg"),
@@ -74,6 +70,13 @@ class ImageGenerationRequest(BaseModel):
         description="Number of output layers for layered image models. Supported range: 2-10.",
     )
 
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, v):
+        if not v or not v.strip():
+            raise ValueError("prompt must be a non-empty string")
+        return v
+
     @field_validator("size")
     @classmethod
     def validate_size(cls, v):
@@ -102,6 +105,13 @@ class ImageGenerationRequest(BaseModel):
     def validate_layers(cls, v):
         """Validate the layers parameter for layered image models."""
         return validate_layered_layers(v)
+
+    @field_validator("negative_prompt", "system_prompt")
+    @classmethod
+    def validate_optional_string_fields(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("field must be a non-empty string or null")
+        return v
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
@@ -148,7 +158,7 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
-    seed: int | None = Field(default=None, ge=_INT64_MIN, le=_INT64_MAX, description="Random seed for reproducibility")
+    seed: int | None = Field(default=None, ge=0, le=4294967295, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
@@ -179,6 +189,14 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Return stage metrics for benchmark clients.",
     )
+
+    @field_validator("output_format")
+    @classmethod
+    def validate_output_format(cls, v):
+        valid = {"png", "jpeg", "webp"}
+        if v is not None and v not in valid:
+            raise ValueError(f"output_format must be one of {sorted(valid)}, got: '{v}'")
+        return v
 
 
 class ImageData(BaseModel):
