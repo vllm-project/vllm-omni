@@ -50,6 +50,7 @@ from vllm_omni.diffusion.models.interface import (
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
     supports_step_execution,
+    supports_step_request_cleanup,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
@@ -931,7 +932,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             current_omni_platform.synchronize()
         finally:
             for request_id in request_ids:
-                self.state_cache.pop(request_id, None)
+                self._retire_step_state(request_id)
             self.input_batch = None
             del runner_output
             gc.collect()
@@ -985,11 +986,24 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _retire_step_state(self, request_id: str) -> None:
+        """Drop a stepwise request's state and notify the pipeline.
+
+        Terminal path for a step request (success, failure, interrupt, or
+        scheduler-side finish/abort): remove the runner-owned
+        ``StepRequestState`` and, when the pipeline implements the optional
+        cleanup hook, let it release per-request resources (e.g.
+        session-manager K/V) that would otherwise be retained.
+        """
+        state = self.state_cache.pop(request_id, None)
+        if state is not None and self.pipeline is not None and supports_step_request_cleanup(self.pipeline):
+            self.pipeline.release_step_state(state)
+
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
         finished_req_ids = scheduler_output.finished_req_ids
         for request_id in finished_req_ids:
-            self.state_cache.pop(request_id, None)
+            self._retire_step_state(request_id)
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1035,7 +1049,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 resolved.append(state)
         except Exception:
             for request_id in new_request_ids:
-                self.state_cache.pop(request_id, None)
+                self._retire_step_state(request_id)
             raise
 
         return resolved, new_request_ids
@@ -1074,7 +1088,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 # (or a future pipeline that omits the guard) does not leave
                 # the process group half-way through a new request.
                 if _dit_any_rank_failed(per_req_exc is not None):
-                    self.state_cache.pop(state.request_id, None)
+                    self._retire_step_state(state.request_id)
                     if per_req_exc is None:
                         per_req_exc = RuntimeError(
                             f"Stepwise preparation failed on another DiT rank for {state.request_id}"
@@ -1127,7 +1141,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         for state in states:
             if interrupted or state.request_denoise_completed:
-                self.state_cache.pop(state.request_id, None)
+                self._retire_step_state(state.request_id)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1340,7 +1354,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
-                            self.state_cache.pop(req.request_id, None)
+                            self._retire_step_state(req.request_id)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,

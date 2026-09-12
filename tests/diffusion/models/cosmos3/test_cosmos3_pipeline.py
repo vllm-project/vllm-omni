@@ -286,6 +286,7 @@ def make_cosmos3_pipeline():
         pipeline._cosmos3_branch_caches = None
         pipeline._cache_dit_requires_paired_cfg = False
         pipeline._sound_tokenizer = None
+        pipeline._memory_manager = None
         pipeline.progress_bar = passthrough_progress_bar
         return pipeline
 
@@ -2908,3 +2909,666 @@ class TestForwardRouting:
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))
+
+
+# ---------------------------------------------------------------------------
+# Step execution tests (SupportsStepExecution protocol)
+# ---------------------------------------------------------------------------
+
+
+class _StepState(SimpleNamespace):
+    """Test state that mimics StepRequestState's total_steps / denoise_completed."""
+
+    @property
+    def total_steps(self) -> int:
+        if self.timesteps is None:
+            return 0
+        if isinstance(self.timesteps, torch.Tensor):
+            return int(self.timesteps.shape[0]) if self.timesteps.ndim > 0 else 1
+        return len(self.timesteps)
+
+    @property
+    def denoise_completed(self) -> bool:
+        return self.step_index >= self.total_steps
+
+
+def _make_step_state(
+    request_id: str,
+    sp: SimpleNamespace,
+    prompt: Any,
+) -> _StepState:
+    return _StepState(
+        request_id=request_id,
+        sampling=sp,
+        prompt=prompt,
+        latents=None,
+        timesteps=None,
+        step_index=0,
+        do_true_cfg=False,
+        prompt_embeds=None,
+        extra={},
+    )
+
+
+def test_pipeline_declares_step_execution() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+    from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
+
+    # Avoid loading model weights; protocol membership depends on the class contract.
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+
+    assert pipeline.supports_step_execution is True
+    assert supports_step_execution(pipeline) is True
+    assert isinstance(pipeline, SupportsStepExecution) is True
+
+
+def test_prepare_encode_populates_t2i_state(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_inference_steps=2,
+        guidance_scale=7.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-t2i-1", sp, {"prompt": "a cat", "modalities": ["image"]})
+    pipeline.prepare_encode(state)
+
+    assert state.latents is not None
+    assert state.timesteps is not None
+    assert state.step_index == 0
+    assert state.do_true_cfg is False
+    assert state.prompt_embeds is not None
+    extra = state.extra
+    assert extra["p"].is_t2i is True
+    assert extra["cond_ids"] is not None
+    assert extra["uncond_ids"] is not None
+    assert extra["shared_kwargs"]["fps"] == 24.0
+    assert extra["_current_latents"] is state.latents
+
+
+def test_prepare_encode_populates_t2v_state(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=6.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-t2v-1", sp, {"prompt": "a dog running", "modalities": ["video"]})
+    pipeline.prepare_encode(state)
+
+    assert state.latents is not None
+    assert state.latents.ndim == 5  # [B, C, T, H, W]
+    extra = state.extra
+    assert extra["p"].is_t2i is False
+    assert extra["velocity_mask"] is None
+    assert extra["image_latent"] is None
+
+
+def test_denoise_step_returns_noise_pred(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_inference_steps=2,
+        guidance_scale=7.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-denoise-1", sp, {"prompt": "a cat", "modalities": ["image"]})
+    pipeline.prepare_encode(state)
+
+    input_batch = SimpleNamespace(request_ids=["step-denoise-1"])
+    noise_pred = pipeline.denoise_step(input_batch, states=[state])
+
+    assert noise_pred is not None
+    assert isinstance(noise_pred, torch.Tensor)
+
+
+def test_step_scheduler_advances_latents(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_inference_steps=2,
+        guidance_scale=7.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-sched-1", sp, {"prompt": "a cat", "modalities": ["image"]})
+    pipeline.prepare_encode(state)
+
+    input_batch = SimpleNamespace(request_ids=["step-sched-1"])
+    noise_pred = pipeline.denoise_step(input_batch, states=[state])
+    original_latents = state.latents.clone()
+    pipeline.step_scheduler(state, noise_pred)
+
+    assert state.step_index == 1
+    assert not torch.equal(state.latents, original_latents)
+
+
+def test_post_decode_returns_image_for_t2i(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_inference_steps=2,
+        guidance_scale=7.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-decode-1", sp, {"prompt": "a cat", "modalities": ["image"]})
+    pipeline.prepare_encode(state)
+
+    # Run full denoise loop
+    num_steps = state.total_steps
+    for _ in range(num_steps):
+        input_batch = SimpleNamespace(request_ids=["step-decode-1"])
+        noise_pred = pipeline.denoise_step(input_batch, states=[state])
+        pipeline.step_scheduler(state, noise_pred)
+
+    assert state.denoise_completed
+    result = pipeline.post_decode(state)
+    assert result.output is not None
+    assert "image" in result.output
+
+
+def test_post_decode_returns_video_for_t2v(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=6.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-decode-2", sp, {"prompt": "a dog running", "modalities": ["video"]})
+    pipeline.prepare_encode(state)
+
+    num_steps = state.total_steps
+    for _ in range(num_steps):
+        input_batch = SimpleNamespace(request_ids=["step-decode-2"])
+        noise_pred = pipeline.denoise_step(input_batch, states=[state])
+        pipeline.step_scheduler(state, noise_pred)
+
+    assert state.denoise_completed
+    result = pipeline.post_decode(state)
+    assert "video" in result.output
+
+
+def test_step_execution_rejects_transfer(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+
+    sp = make_sampling_params(
+        extra_args={"edge": {"control_path": "/tmp/control.mp4"}},
+    )
+    state = _make_step_state("step-transfer-1", sp, {"prompt": "x", "modalities": ["video"]})
+    with pytest.raises(ValueError, match="transfer inference is not supported in step execution mode"):
+        pipeline.prepare_encode(state)
+
+
+def test_step_execution_cleanup_clears_state(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_inference_steps=2,
+        guidance_scale=7.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-cleanup-1", sp, {"prompt": "a cat", "modalities": ["image"]})
+    pipeline.prepare_encode(state)
+    assert state.extra  # populated by prepare_encode
+
+    num_steps = state.total_steps
+    for _ in range(num_steps):
+        input_batch = SimpleNamespace(request_ids=["step-cleanup-1"])
+        noise_pred = pipeline.denoise_step(input_batch, states=[state])
+        pipeline.step_scheduler(state, noise_pred)
+
+    pipeline.post_decode(state)
+    # post_decode releases per-request tensors: state.extra is cleared so the
+    # runner can drop the state without GPU-memory leaks.
+    assert not state.extra
+
+
+def test_denoise_step_rejects_multi_request(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_inference_steps=2,
+        guidance_scale=7.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-multi-1", sp, {"prompt": "a cat", "modalities": ["image"]})
+    pipeline.prepare_encode(state)
+
+    input_batch = SimpleNamespace(request_ids=["step-multi-1", "step-multi-2"])
+    with pytest.raises(NotImplementedError, match="single active request"):
+        pipeline.denoise_step(input_batch, states=[state])
+
+
+def test_denoise_step_packs_multimodal_pred_and_scheduler_unpacks(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    # No-CFG path (guidance 1.0) so the stub transformer is called once and
+    # returns its native tuple (video, action, sound).
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-pack-1", sp, {"prompt": "a dog", "modalities": ["video"]})
+    pipeline.prepare_encode(state)
+
+    extra = state.extra
+    extra["action_latents"] = torch.randn(1, 2, 2, 2, 2)
+    extra["sound_latents"] = torch.randn(1, 2, 3, 2, 2)
+
+    input_batch = SimpleNamespace(request_ids=["step-pack-1"])
+    noise_pred = pipeline.denoise_step(input_batch, states=[state])
+
+    # denoise_step must return a single batch-dim tensor so the runner can
+    # slice noise_pred[offset:offset + row_num] without losing modalities.
+    assert isinstance(noise_pred, torch.Tensor)
+    expected_numel = (
+        extra["_current_latents"].numel() + extra["action_latents"].numel() + extra["sound_latents"].numel()
+    )
+    assert noise_pred.shape == (1, expected_numel)
+    assert extra["_pred_shapes"] == [
+        extra["_current_latents"].shape,
+        extra["action_latents"].shape,
+        extra["sound_latents"].shape,
+    ]
+
+    # Simulate the runner's per-request batch-dim slice, then verify
+    # step_scheduler unpacks the packed tensor into per-modality predictions.
+    sliced = noise_pred[0:1]
+    original_latents = state.latents.clone()
+    pipeline.step_scheduler(state, sliced)
+
+    assert state.step_index == 1
+    assert not torch.equal(state.latents, original_latents)
+
+
+def test_step_states_use_isolated_schedulers(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp_a = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    state_a = _make_step_state("step-iso-a", sp_a, {"prompt": "a", "modalities": ["video"]})
+    pipeline.prepare_encode(state_a)
+
+    sp_b = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=4,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    state_b = _make_step_state("step-iso-b", sp_b, {"prompt": "b", "modalities": ["video"]})
+    pipeline.prepare_encode(state_b)
+
+    # Each request snapshots its own timesteps/scheduler; preparing B must not
+    # clobber A's schedule (FlowUniPC holds mutable multistep state).
+    assert len(state_a.extra["timesteps"]) == 2
+    assert len(state_b.extra["timesteps"]) == 4
+    assert state_a.extra["req_scheduler"] is not pipeline.scheduler
+    assert state_a.extra["req_scheduler"] is not state_b.extra["req_scheduler"]
+
+    input_a = SimpleNamespace(request_ids=["step-iso-a"])
+    noise_pred_a = pipeline.denoise_step(input_a, states=[state_a])
+    pipeline.step_scheduler(state_a, noise_pred_a)
+    assert state_a.step_index == 1
+    assert state_b.step_index == 0
+
+
+def test_step_execution_rejects_robolab_observation(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+
+    sp = make_sampling_params(extra_args={"observation": {"prompt": "stack the cube"}})
+    state = _make_step_state("step-robolab-1", sp, {"prompt": "x", "modalities": ["video"]})
+    with pytest.raises(NotImplementedError, match="RoboLab/OpenPI observation"):
+        pipeline.prepare_encode(state)
+
+
+def test_step_execution_requires_single_output_per_prompt(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_inference_steps=2,
+        guidance_scale=7.0,
+        guidance_scale_provided=True,
+        num_outputs_per_prompt=2,
+    )
+    state = _make_step_state("step-nout-1", sp, {"prompt": "a cat", "modalities": ["image"]})
+    with pytest.raises(NotImplementedError, match="num_outputs_per_prompt == 1"):
+        pipeline.prepare_encode(state)
+
+
+def test_step_execution_rejects_max_num_seqs_gt1_at_init() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    with pytest.raises(ValueError, match="requires max_num_seqs=1"):
+        Cosmos3OmniDiffusersPipeline._validate_step_execution_config(
+            SimpleNamespace(step_execution=True, max_num_seqs=2)
+        )
+    # Step mode off, or single-seq step mode: both fine.
+    Cosmos3OmniDiffusersPipeline._validate_step_execution_config(SimpleNamespace(step_execution=False, max_num_seqs=8))
+    Cosmos3OmniDiffusersPipeline._validate_step_execution_config(SimpleNamespace(step_execution=True, max_num_seqs=1))
+
+
+@pytest.mark.parametrize(
+    "modalities",
+    [None, ["image", "video"], ["image", "hologram"]],
+)
+def test_step_prepare_encode_validates_modalities(make_cosmos3_pipeline, modalities) -> None:
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    prompt: dict[str, Any] = {"prompt": "a dog"}
+    if modalities is not None:
+        prompt["modalities"] = modalities
+    state = _make_step_state("step-modal-1", sp, prompt)
+
+    if modalities is None:
+        # Absent/None modalities are legacy T2V requests: no error, video mode.
+        pipeline.prepare_encode(state)
+        assert state.extra["p"].is_t2i is False
+    else:
+        with pytest.raises(ValueError, match="modalit"):
+            pipeline.prepare_encode(state)
+
+
+def test_step_execution_runner_level_round_trip(make_cosmos3_pipeline) -> None:
+    """Full runner-style loop: StepRequestState -> InputBatch.make_batch ->
+    denoise_step -> per-request batch-dim slicing -> step_scheduler ->
+    post_decode, using the real runner data structures (not hand-rolled
+    SimpleNamespace batches)."""
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    state = StepRequestState(
+        request_id="runner-e2e-1",
+        sampling=sp,
+        prompt={"prompt": "a dog running", "modalities": ["video"]},
+    )
+    pipeline.prepare_encode(state)
+    assert state.latents is not None and state.timesteps is not None
+
+    for _ in range(state.total_steps):
+        input_batch = InputBatch.make_batch([state])
+        noise_pred = pipeline.denoise_step(input_batch, states=[state])
+        # Runner-style per-request slicing along the batch dimension.
+        row_num = state.latents.shape[0]
+        pipeline.step_scheduler(state, noise_pred[0:row_num])
+
+    assert state.denoise_completed
+    result = pipeline.post_decode(state)
+    assert "video" in result.output
+    assert not state.extra
+
+
+# ---------------------------------------------------------------------------
+# Step-execution terminal cleanup (SupportsStepRequestCleanup protocol)
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_declares_step_request_cleanup() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+    from vllm_omni.diffusion.models.interface import (
+        SupportsStepRequestCleanup,
+        supports_step_request_cleanup,
+    )
+
+    # Avoid loading model weights; protocol membership depends on the class contract.
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+
+    assert supports_step_request_cleanup(pipeline) is True
+    assert isinstance(pipeline, SupportsStepRequestCleanup) is True
+
+
+def _enable_session_state_manager(pipeline: Any) -> SessionStateManager:
+    """Route the pipeline's UND K/V through a real SessionStateManager."""
+    manager = SessionStateManager(max_sessions=8)
+    pipeline._memory_manager = manager
+    return manager
+
+
+def _run_one_denoise_step(pipeline: Any, state: Any) -> None:
+    input_batch = SimpleNamespace(request_ids=[state.request_id])
+    noise_pred = pipeline.denoise_step(input_batch, states=[state])
+    pipeline.step_scheduler(state, noise_pred)
+
+
+def test_release_step_state_drops_session_on_abort(make_cosmos3_pipeline) -> None:
+    """A request aborted mid-denoising must not leave GPU K/V in the session manager.
+
+    Regression for the count-based-eviction leak: the runner retires the state
+    without post_decode(), and release_step_state() is its terminal hook.
+    """
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+    manager = _enable_session_state_manager(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-abort-1", sp, {"prompt": "a dog", "modalities": ["video"]})
+    pipeline.prepare_encode(state)
+
+    session_id = state.extra["session_id"]
+    assert session_id in manager  # K/V session registered by prepare_encode
+
+    # Abort mid-denoising: no post_decode, the runner retires the state directly.
+    _run_one_denoise_step(pipeline, state)
+    pipeline.release_step_state(state)
+
+    assert session_id not in manager  # released, not left for count-based eviction
+    assert not state.extra
+    # The transformer's cached_kv aliases the session tensors (via
+    # _kv_load_und); dropping the session alone would leave them pinned.
+    assert pipeline.transformer.cached_kv is None
+    assert pipeline.transformer.cached_freqs_gen is None
+    # Idempotent: the runner may invoke the hook again on another terminal path.
+    pipeline.release_step_state(state)
+
+
+def test_release_step_state_drops_session_on_step_failure(make_cosmos3_pipeline) -> None:
+    """A per-request exception during the step loop must release the session K/V."""
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+    manager = _enable_session_state_manager(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-fail-1", sp, {"prompt": "a dog", "modalities": ["video"]})
+    pipeline.prepare_encode(state)
+
+    session_id = state.extra["session_id"]
+    assert session_id in manager
+
+    def _explode(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("denoise exploded")
+
+    pipeline.step_scheduler = _explode
+    with pytest.raises(RuntimeError, match="denoise exploded"):
+        _run_one_denoise_step(pipeline, state)
+
+    # Runner-side per-request failure path retires the state.
+    pipeline.release_step_state(state)
+
+    assert session_id not in manager
+    assert not state.extra
+    assert pipeline.transformer.cached_kv is None
+    assert pipeline.transformer.cached_freqs_gen is None
+
+
+def test_post_decode_success_releases_session_with_manager_enabled(make_cosmos3_pipeline) -> None:
+    """The success path keeps releasing the session when the manager is enabled."""
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+    manager = _enable_session_state_manager(pipeline)
+
+    sp = make_sampling_params(
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+    )
+    state = _make_step_state("step-session-ok-1", sp, {"prompt": "a dog", "modalities": ["video"]})
+    pipeline.prepare_encode(state)
+
+    session_id = state.extra["session_id"]
+    assert session_id in manager
+
+    for _ in range(state.total_steps):
+        _run_one_denoise_step(pipeline, state)
+    pipeline.post_decode(state)
+
+    assert session_id not in manager
+    assert not state.extra
+    assert pipeline.transformer.cached_kv is None
+    assert pipeline.transformer.cached_freqs_gen is None
+
+
+# ---------------------------------------------------------------------------
+# Step-execution action input parity with forward()
+# ---------------------------------------------------------------------------
+
+
+def test_step_execution_accepts_extra_args_action_video_parity_with_forward(
+    make_cosmos3_pipeline,
+) -> None:
+    """extra_args['action_video'] conditioning must resolve identically in forward() and step mode.
+
+    forward() resolves the extra_args fallback before validation; the step path
+    previously only read preprocessed_video, so the same valid request failed.
+    Both paths must share the resolution, including the height/width defaults
+    derived from the conditioning tensor.
+    """
+    pipeline = make_cosmos3_pipeline()
+    _capture_tokenize_calls(pipeline)
+    pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_prepare_action_video(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        video, mode, height, width, num_frames = args[:5]
+        captured.append(
+            {
+                "video": video.clone(),
+                "mode": mode,
+                "height": height,
+                "width": width,
+                "num_frames": num_frames,
+            }
+        )
+        return (torch.zeros(1, 2, 1, 1, 1), torch.ones(1, 1, 1, 1, 1), torch.zeros(1, 2, 1, 1, 1))
+
+    def fake_diffuse(**kwargs: Any) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if kwargs.get("action_latents") is not None:
+            return kwargs["latents"], kwargs["action_latents"]
+        return kwargs["latents"]
+
+    pipeline._prepare_latents_action_video = fake_prepare_action_video
+    pipeline.diffuse = fake_diffuse
+    pipeline._decode_latents = lambda latents: latents
+
+    action_video = torch.zeros(3, 5, 16, 32)  # [3, T, H, W]; sp leaves height/width unset
+    prompt = {"prompt": "What actions were taken?", "modalities": ["video"]}
+    sp = make_sampling_params(
+        num_frames=5,
+        num_inference_steps=2,
+        extra_args={
+            "action_mode": "inverse_dynamics",
+            "action_chunk_size": 4,
+            "raw_action_dim": 2,
+            "domain_name": "bridge_orig_lerobot",
+            "action_video": action_video,
+        },
+    )
+
+    # forward() path: resolves extra_args["action_video"] before validation.
+    pipeline.forward(make_request_batch(prompt, sp))
+    assert len(captured) == 1
+
+    # Step path: same request, no preprocessed_video in additional_information.
+    state = _make_step_state("step-action-parity-1", sp, prompt)
+    pipeline.prepare_encode(state)
+    assert len(captured) == 2
+
+    forward_call, step_call = captured
+    assert forward_call["mode"] == step_call["mode"] == "inverse_dynamics"
+    # Both normalize [3, T, H, W] -> [1, 3, T, H, W] and align frames to num_frames.
+    assert forward_call["video"].shape == step_call["video"].shape == (1, 3, 5, 16, 32)
+    assert torch.equal(forward_call["video"], step_call["video"])
+    # Height/width default to the conditioning tensor's dimensions in both paths.
+    assert forward_call["height"] == step_call["height"] == 16
+    assert forward_call["width"] == step_call["width"] == 32
+    assert forward_call["num_frames"] == step_call["num_frames"] == 5

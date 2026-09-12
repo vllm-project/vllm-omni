@@ -116,6 +116,29 @@ class SupportsStepExecution(Protocol):
 
 
 @runtime_checkable
+class SupportsStepRequestCleanup(Protocol):
+    """Optional step-execution hook for per-request terminal cleanup.
+
+    The runner calls ``release_step_state()`` on every terminal path for a
+    stepwise request — success, per-request failure, interruption, and
+    scheduler-side finish/abort — so pipelines can release per-request GPU
+    resources (e.g. session-manager K/V) that outlive the runner-owned
+    ``StepRequestState``. The hook must be idempotent: it may be invoked more
+    than once for the same request.
+    """
+
+    def release_step_state(self, state: StepRequestState, **kwargs: Any) -> None:
+        """Release per-request resources owned by the pipeline."""
+        ...
+
+
+def supports_step_request_cleanup(pipeline: object) -> TypeGuard[SupportsStepRequestCleanup]:
+    """Return whether `pipeline` implements the optional step cleanup hook."""
+
+    return isinstance(pipeline, SupportsStepRequestCleanup)
+
+
+@runtime_checkable
 class SupportsComponentDiscovery(Protocol):
     """Declares which submodules serve as pipeline components.
 
