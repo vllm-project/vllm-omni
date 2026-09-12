@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,15 @@ _HEAD_DIM = 2
 _HEADS = 3
 _INNER = _HEAD_DIM * _HEADS  # attention inner size
 _FFN = 5
+
+
+@dataclass
+class _OffloadConfig:
+    enable_cpu_offload: bool = False
+    enable_layerwise_offload: bool = False
+    enable_distributed_layerwise_offload: bool = False
+    diffusion_attention_backend: str = ""
+    parallel_config: object | None = None
 
 
 def _factors(out_dim: int, in_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -412,18 +422,54 @@ def test_a_request_may_not_carry_a_lora_on_a_fused_server(tmp_path):
         _check_request(fusion, _sampling(lora_request=SimpleNamespace(lora_int_id=1)))
 
 
-def test_offload_is_refused_because_it_bypasses_the_fusion(tmp_path):
+def test_model_cpu_offload_keeps_checkpoint_fusion_enabled(tmp_path):
     fusion = _fusion(tmp_path)
-    for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload"):
-        # A host-weight plan installs the transformer without load_weights(),
-        # so the fusion and its completeness check would both be skipped.
-        with pytest.raises(ValueError, match="cannot be combined with"):
-            fusion.check_serving_contract(
-                partition="fl2va",
-                od_config=SimpleNamespace(**{flag: True}),
-                video_shift=12.0,
-                audio_shift=3.0,
-            )
+
+    # Model-level CPU offload is installed after the ordinary checkpoint load,
+    # so FastH3 still fuses every adapter delta and validates completeness.
+    fusion.check_serving_contract(
+        partition="fl2va",
+        od_config=_OffloadConfig(enable_cpu_offload=True),
+        video_shift=12.0,
+        audio_shift=3.0,
+    )
+
+
+def test_model_cpu_offload_remains_dense_only(tmp_path):
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+
+    with pytest.raises(ValueError, match="Dense / Data-Free"):
+        _load(sparse.parent).check_serving_contract(
+            partition="fl2va",
+            od_config=_OffloadConfig(
+                enable_cpu_offload=True,
+                diffusion_attention_backend="FASTVIDEO_VSA",
+            ),
+            video_shift=12.0,
+            audio_shift=3.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "offload_config",
+    [
+        pytest.param(_OffloadConfig(enable_layerwise_offload=True), id="layerwise"),
+        pytest.param(_OffloadConfig(enable_distributed_layerwise_offload=True), id="distributed-layerwise"),
+    ],
+)
+def test_layerwise_offload_is_refused_because_it_bypasses_the_fusion(offload_config, tmp_path):
+    fusion = _fusion(tmp_path)
+
+    # Layerwise host-weight paths can install the transformer without
+    # load_weights(), so the fusion and its completeness check would be skipped.
+    with pytest.raises(ValueError, match="cannot be combined with"):
+        fusion.check_serving_contract(
+            partition="fl2va",
+            od_config=offload_config,
+            video_shift=12.0,
+            audio_shift=3.0,
+        )
 
 
 def test_adopting_the_contract_refuses_a_vsa_variant_and_ref2va(tmp_path):
