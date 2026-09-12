@@ -9,7 +9,6 @@ computed fresh each forward pass (no persistent KV cache).
 
 from __future__ import annotations
 
-import math
 import threading
 from functools import lru_cache
 
@@ -29,17 +28,17 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
 
 
 @lru_cache(maxsize=1)
-def _load_quant_ops():
+def _load_sd_ops():
     try:
-        import torch_npu
-        from mindiesd.layers.quant.block_quant import fa_block_quant_preprocess
+        import torch_npu  # noqa: F401  # availability check: registers NPU ops
+        from mindiesd.quantization.layer import fp8_rotate_quant_fa_op
         from msmodelslim.processor.quarot.common.quarot_utils import QuaRotMode, create_rot
     except ImportError as e:
         raise ImportError(
             "fp8_rotate_quant_fa requires torch_npu, MindIE-SD (mindiesd), and MSModelSlim. "
             "See https://gitcode.com/Ascend/MindIE-SD and https://gitcode.com/Ascend/msmodelslim"
         ) from e
-    return torch_npu, fa_block_quant_preprocess, QuaRotMode, create_rot
+    return fp8_rotate_quant_fa_op, QuaRotMode, create_rot
 
 
 def _get_rot_matrix(
@@ -72,15 +71,13 @@ def fp8_rotate_quant_fa(
         query: Query tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
         key: Key tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
         value: Value tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
-        layout: ``BNSD`` or ``BSND`` for ``npu_fused_infer_attention_score_v2``.
+        layout: Input/output tensor layout, either ``BNSD`` or ``BSND``.
         softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
 
     Returns:
         Attention output in the same layout as inputs.
     """
-    torch_npu, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
-
-    out_dtype = query.dtype
+    fp8_op, qua_rot_mode, create_rot = _load_sd_ops()
     device = query.device
 
     if layout == "BNSD":
@@ -91,37 +88,5 @@ def fp8_rotate_quant_fa(
         raise ValueError(f"fp8_rotate_quant_fa: unsupported layout {layout!r}, expected BNSD or BSND")
 
     rot = _get_rot_matrix(device, query.dtype, d, qua_rot_mode, create_rot)
-    q_f = torch.matmul(query, rot)
-    k_f = torch.matmul(key, rot)
 
-    q, q_scale = fa_block_quant_preprocess(q_f, block_size=128, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-    k, k_scale = fa_block_quant_preprocess(k_f, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-    v, v_scale = fa_block_quant_preprocess(value, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-
-    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
-
-    out = torch_npu.npu_fused_infer_attention_score_v2(
-        q,
-        k,
-        v,
-        input_layout=layout,
-        num_query_heads=n,
-        softmax_scale=scale,
-        pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
-        next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
-        query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
-        key_quant_mode=7,  # Same quant mode as query branch.
-        value_quant_mode=7,  # Same quant mode as key/query branches.
-        dequant_scale_query=q_scale,
-        dequant_scale_key=k_scale,
-        dequant_scale_value=v_scale,
-        out_dtype=out_dtype,
-    )[0]
-
-    if out.shape[2] != s:
-        if layout == "BNSD":
-            out = out[:, :, :s, :]
-        elif layout == "BSND":
-            out = out[:, :s, :, :]
-
-    return out
+    return fp8_op(query, key, value, q_rot=rot, k_rot=rot, layout=layout, softmax_scale=softmax_scale)
