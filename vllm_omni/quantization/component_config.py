@@ -146,7 +146,7 @@ class ComponentQuantizationConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ComponentQuantizationConfig:
-        raise NotImplementedError("Use build_quant_config() instead")
+        raise NotImplementedError("Use build_quantization_config() instead")
 
     def get_config_filenames(self) -> list[str]:
         return []

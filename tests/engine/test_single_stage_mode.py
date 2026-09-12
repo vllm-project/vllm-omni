@@ -35,17 +35,25 @@ from vllm_omni.engine.stage_runtime import DistStageRuntime, StageRuntime
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.fixture(autouse=True)
+def _no_checkpoint_quantization(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_runtime.read_checkpoint_quantization_config",
+        lambda _model: None,
+    )
+
+
 def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
     """Return a lightweight stage config mock."""
     return SimpleNamespace(
         stage_id=stage_id,
         stage_type=stage_type,
         runtime=SimpleNamespace(devices="0"),
-        engine_args=SimpleNamespace(
-            async_chunk=False,
-            model_stage=None,
-            engine_output_type=None,
-        ),
+        engine_args={
+            "async_chunk": False,
+            "model_stage": None,
+            "engine_output_type": None,
+        },
     )
 
 
@@ -83,7 +91,10 @@ def _make_llm_plan(
                 stage_connector_spec={},
                 omni_kv_connector=(None, None, None),
                 stage_vllm_config=vllm_config
-                or SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)),
+                or SimpleNamespace(
+                    quant_config=None,
+                    parallel_config=SimpleNamespace(data_parallel_size_local=1),
+                ),
                 executor_class=object,
                 engine_args_dict={},
             )
@@ -643,7 +654,11 @@ class TestSingleStageInitialization:
         monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
         monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
-        monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_, **__: (SimpleNamespace(), object))
+        monkeypatch.setattr(
+            runtime_mod,
+            "build_vllm_config",
+            lambda *_, **__: (SimpleNamespace(quant_config=None), object),
+        )
         try:
             stage_plans = runtime._build_logical_stage_init_plans(None, [1, 1], {})
         finally:
@@ -746,7 +761,10 @@ class TestSingleStageInitialization:
         monkeypatch.setattr(
             runtime_mod,
             "build_vllm_config",
-            lambda *_, **__: (SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)), object),
+            lambda *_, **__: (
+                SimpleNamespace(quant_config=None, parallel_config=SimpleNamespace(data_parallel_size_local=1)),
+                object,
+            ),
         )
         try:
             stage_plans = runtime._build_logical_stage_init_plans(None, [1], {})
@@ -909,7 +927,9 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
 
-        fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1))
+        fake_vllm_config = SimpleNamespace(
+            quant_config=None, parallel_config=SimpleNamespace(data_parallel_size_local=1)
+        )
         fake_addresses = SimpleNamespace(
             inputs=["tcp://in"], outputs=["tcp://out"], frontend_stats_publish_address=None
         )
@@ -996,7 +1016,9 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
 
-        fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1))
+        fake_vllm_config = SimpleNamespace(
+            quant_config=None, parallel_config=SimpleNamespace(data_parallel_size_local=1)
+        )
         fake_addresses = SimpleNamespace(
             inputs=["tcp://in"], outputs=["tcp://out"], frontend_stats_publish_address=None
         )
@@ -1048,7 +1070,7 @@ class TestSingleStageReplicaInitialization:
         runtime._coordinator_runtime = None
         runtime._stage_configs = []
 
-        fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace())
+        fake_vllm_config = SimpleNamespace(quant_config=None, parallel_config=SimpleNamespace())
         fake_addresses = SimpleNamespace(
             inputs=["tcp://in"], outputs=["tcp://out"], frontend_stats_publish_address=None
         )

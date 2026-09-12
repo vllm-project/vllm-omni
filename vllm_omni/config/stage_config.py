@@ -447,7 +447,6 @@ class StageDeployConfig:
     lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
-    diffusion_quantization_config: str | None = None
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None

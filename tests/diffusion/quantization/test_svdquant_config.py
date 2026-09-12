@@ -13,7 +13,7 @@ from vllm.model_executor.layers.linear import (
 from vllm_omni.quantization import svdquant_config
 from vllm_omni.quantization.factory import (
     SUPPORTED_QUANTIZATION_METHODS,
-    build_quant_config,
+    build_quantization_config,
 )
 from vllm_omni.quantization.svdquant_config import (
     DiffusionSVDQuantConfig,
@@ -56,7 +56,7 @@ def test_config_rejects_unsupported_phase1_options(
 
 
 def test_factory_builds_svdquant_with_extra_checkpoint_fields() -> None:
-    config = build_quant_config(
+    config = build_quantization_config(
         {
             "quant_method": "svdquant",
             "rank": 16,

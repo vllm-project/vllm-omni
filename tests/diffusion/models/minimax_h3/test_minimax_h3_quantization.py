@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -6,6 +7,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+
+from vllm_omni.quantization import build_quantization_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -238,10 +241,9 @@ def test_pipeline_resolves_transformer_component_quant_config():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _resolve_component_quant_config,
     )
-    from vllm_omni.quantization import build_quant_config
 
     ignored_layers = ["blocks.0.attn.qkv_proj"]
-    component_config = build_quant_config(
+    component_config = build_quantization_config(
         {
             "transformer": {
                 "method": "fp8",

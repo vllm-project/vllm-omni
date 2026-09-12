@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -35,7 +35,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 )
 def test_build_quant_config_torchao_checkpoint(transformer_spec):
     quantization = pytest.importorskip("torchao.quantization")
-    result = build_quant_config({"transformer": transformer_spec})
+    result = build_quantization_config({"transformer": transformer_spec})
 
     assert isinstance(result, ComponentQuantizationConfig)
     transformer = result.resolve("transformer")
@@ -51,7 +51,7 @@ def test_build_quant_config_torchao_runtime():
     from vllm.model_executor.layers.quantization.torchao import TorchAOConfig
 
     torchao_config = object()
-    result = build_quant_config("torchao", torchao_config=torchao_config)
+    result = build_quantization_config({"method": "torchao", "torchao_config": torchao_config})
 
     assert isinstance(result, TorchAOConfig)
     assert result.torchao_config is torchao_config

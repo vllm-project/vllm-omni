@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for BitsAndBytes quantization config."""
 
 import importlib.util
@@ -13,10 +13,10 @@ from torch.nn import Module, Parameter
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
 
@@ -43,18 +43,20 @@ def _ensure_bitsandbytes_importable(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_bitsandbytes_config_creation():
     """Test that BitsAndBytes config can be created."""
-    config = build_quant_config("bitsandbytes")
+    config = build_quantization_config("bitsandbytes")
     assert config is not None
     assert config.get_name() == "bitsandbytes"
 
 
 def test_bitsandbytes_config_with_custom_params():
     """Test BitsAndBytes config with custom parameters."""
-    config = build_quant_config(
-        "bitsandbytes",
-        quant_type="fp4",
-        compress_statistics=False,
-        ignored_layers=["to_out"],
+    config = build_quantization_config(
+        {
+            "method": "bitsandbytes",
+            "quant_type": "fp4",
+            "compress_statistics": False,
+            "ignored_layers": ["to_out"],
+        }
     )
     assert config is not None
     assert config.quant_type == "fp4"
@@ -67,37 +69,11 @@ def test_supported_methods():
     assert "bitsandbytes" in SUPPORTED_QUANTIZATION_METHODS
 
 
-def test_quantization_integration():
-    """Test end-to-end quantization flow through OmniDiffusionConfig."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    config = OmniDiffusionConfig(model="test", quantization_config="bitsandbytes")
-    assert config.quantization_config is not None
-    assert config.quantization_config.get_name() == "bitsandbytes"
-
-    config2 = OmniDiffusionConfig(
-        model="test",
-        quantization_config={
-            "method": "bitsandbytes",
-            "quant_type": "nf4",
-            "compress_statistics": True,
-        },
-    )
-    assert config2.quantization_config is not None
-    assert config2.quantization_config.get_name() == "bitsandbytes"
-    assert config2.quantization_config.quant_type == "nf4"
-    assert config2.quantization_config.compress_statistics is True
-
-
-def test_quantization_dict_not_mutated():
+def test_build_quantization_config_dict_not_mutated():
     """Test that passing a dict to quantization_config doesn't mutate it."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
     original_dict = {"method": "bitsandbytes", "quant_type": "nf4"}
     dict_copy = original_dict.copy()
-
-    OmniDiffusionConfig(model="test", quantization_config=original_dict)
-
+    build_quantization_config(original_dict)
     assert original_dict == dict_copy
 
 
@@ -105,7 +81,7 @@ def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
     """Test get_quant_method routing for CUDA."""
     from vllm_omni.quantization.bitsandbytes_config import BnBOnlineLinearMethod
 
-    config = build_quant_config("bitsandbytes")
+    config = build_quantization_config("bitsandbytes")
 
     def _fake_init(self, quant_config):
         pass

@@ -28,7 +28,7 @@ The quantization path is split across the following layers:
 
 | Layer | Responsibility | Source |
 | --- | --- | --- |
-| Public API | Exposes `build_quant_config`, component routing, and backend registration | `vllm_omni/quantization/__init__.py` |
+| Public API | Exposes `build_quantization_config`, component routing, and backend registration | `vllm_omni/quantization/__init__.py` |
 | Factory | Normalizes method names, selects Omni overrides or vLLM registry backends, detects ModelOpt configs, and reconciles checkpoint metadata | `vllm_omni/quantization/factory.py` |
 | Component router | Resolves a quantization config from a layer prefix using longest-prefix matching | `vllm_omni/quantization/component_config.py` |
 | Method configs | Implement `QuantizationConfig` and select the platform-specific linear method | `vllm_omni/quantization/*_config.py` |
@@ -41,17 +41,14 @@ The runtime contract remains vLLM's `QuantizationConfig`:
 user/CLI or model config
           |
           v
-OmniDiffusionConfig.quantization_config
+build_quantization_config()
           |
-          +--> build_quant_config()
-          |        |
-          |        +--> Omni override
-          |        +--> vLLM registry backend
-          |        +--> ComponentQuantizationConfig
+          +--> vLLM registry backend
+          +--> ComponentQuantizationConfig
           |
-          +--> checkpoint metadata reconciliation
+          +--> stage init plan
           |
-          +--> diffusion worker / vLLM config
+          +--> vLLM config / OmniDiffusionConfig
           |
           +--> model layers call get_quant_method(layer, prefix)
 ```
@@ -61,18 +58,18 @@ The model layer receives either a method implementation or `None`. Returning
 
 ## Configuration resolution
 
-`build_quant_config()` accepts the following forms:
+`build_quantization_config()` accepts the following forms:
 
 | Input | Resolution |
 | --- | --- |
 | `None` or `"none"` | Disable quantization. |
-| Method string, such as `"fp8"` | Resolve an Omni override first, then the vLLM quantization registry. |
+| Method string, such as `"fp8"` | Resolve the registered config through vLLM's quantization registry. |
 | Flat dictionary with `method` or `quant_method` | Normalize the method and construct its `QuantizationConfig`. |
 | Per-component dictionary | Construct a `ComponentQuantizationConfig`. |
 | Existing `QuantizationConfig` | Pass through without rebuilding it. |
 
-Method aliases are normalized case-insensitively, with `-` and `_` treated as
-equivalent. `auto-round` and `auto_round` use the Omni INC/AutoRound adapter.
+Canonical method names are preserved. Only `auto-round` and `auto_round` are
+normalized to the Omni INC/AutoRound adapter.
 ModelOpt checkpoint metadata is detected from its method, producer metadata, or
 `quant_algo`, then mapped to the corresponding vLLM ModelOpt configuration.
 
@@ -82,11 +79,10 @@ pipeline. It affects only layers supported by that component's quantization
 method; it does not rewrite arbitrary `torch.nn` modules. A per-component
 dictionary narrows this global scope through runtime layer-prefix routing.
 
-The factory uses Omni-specific overrides for methods whose diffusion behavior
-or platform dispatch is not provided by the vLLM registry. The current override
-set includes INT8, BitsAndBytes, MXFP8, MXFP4, MXFP4 dual-scale, INC/AutoRound,
-and TorchAO. Other methods, such as FP8, GGUF, and ModelOpt, are resolved through
-vLLM's registry when their configuration is compatible.
+Omni-specific configs register into vLLM's registry, replacing the upstream
+definition where Omni needs custom behavior outside of the original implementation.
+The registered set includes INT8, BitsAndBytes, MXFP8, MXFP4, MXFP4 dual-scale,
+INC/AutoRound, SVDQuant, and TorchAO. Other methods, such as FP8, GGUF, and ModelOpt, are resolved through vLLM's registry when their configuration is compatible.
 
 ## Per-component routing
 
@@ -131,7 +127,7 @@ Method configuration owns the mode flag, for example
 configuration's `get_quant_method()` selects the corresponding linear method.
 
 For pipelines with transformer-specific `config.json` files, such as cascade
-models, `resolve_quant_config_from_disk()` reconciles the active configuration
+models, `resolve_quantization_config_from_disk()` reconciles the active configuration
 with each transformer's checkpoint metadata. Its invariants are:
 
 - If no active configuration exists, valid checkpoint metadata can be used for
@@ -210,20 +206,15 @@ Contributors should follow this sequence:
    its `QuantizeMethodBase`/linear method in `vllm_omni/quantization/`.
 3. Implement `get_name()`, supported activation dtypes, minimum capability,
    checkpoint parsing, ignored-layer handling, and `get_quant_method()`.
-4. Add a lazy factory override in `factory.py`. Keep optional platform
-   dependencies out of package import paths and normalize aliases to one
-   canonical method name.
+4. Register the config with vLLM's `register_quantization_config`. Import its
+   module from `register_omni_quantization_configs()` so registration occurs at
+   the explicit Omni setup boundary.
 5. If the method is pre-quantized, define the checkpoint metadata and the
    serialized loading path before adding an online path.
 6. Add model-specific component routing only when the model contains stages
    that must use different policies.
 7. Document user-visible configuration in the quantization user guide and keep
    implementation rationale here.
-
-The public factory registration hook,
-`register_quantization_override(method, builder)`, is intended for integrations
-that need to register an Omni-compatible builder without changing the vLLM
-registry.
 
 ## Validation
 

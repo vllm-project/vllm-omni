@@ -217,7 +217,6 @@ def test_build_vllm_config_proceeds_on_consistent_layout():
             stage_init_utils.OmniEngineArgs, "create_engine_config", return_value=fake_config
         ) as create_engine_config,
         mock.patch.object(stage_init_utils.Executor, "get_class", return_value=sentinel_executor),
-        mock.patch.object(stage_init_utils.OmniINCConfig, "maybe_upgrade", side_effect=lambda quant: quant),
     ):
         vllm_config, executor_class = build_vllm_config(
             stage,

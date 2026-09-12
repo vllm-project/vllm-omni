@@ -80,7 +80,10 @@ from vllm_omni.engine.stage_runtime import (
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.entrypoints.utils import (
+    _apply_stage_engine_arg_overrides,
+    parse_stage_overrides,
+)
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -1066,7 +1069,10 @@ class AsyncOmniEngine:
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 
-        return cast(str, config_path), stage_configs
+        for cfg in stage_configs:
+            cfg["engine_args"] = _apply_stage_engine_arg_overrides(cfg, kwargs)
+
+        return config_path, stage_configs
 
     # ==================== Public API ====================
 
