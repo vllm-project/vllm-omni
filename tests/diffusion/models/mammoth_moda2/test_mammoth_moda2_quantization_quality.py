@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gc
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -72,7 +73,7 @@ def _extract_image_and_worker_peak(outputs) -> tuple[torch.Tensor, float]:
                 continue
             for completion in completions:
                 multimodal = getattr(completion, "multimodal_output", None)
-                if not isinstance(multimodal, dict) or "image" not in multimodal:
+                if not isinstance(multimodal, Mapping) or "image" not in multimodal:
                     continue
                 images = multimodal["image"]
                 image = images[0] if isinstance(images, list) else images
