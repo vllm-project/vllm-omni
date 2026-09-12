@@ -184,6 +184,7 @@ class OmniSchedulerMixin:
 
     def _finish_streaming_session_update(self, session: Request, update: StreamingUpdate) -> None:
         """Install payload metadata and send an updated session to admission."""
+        session.max_tokens = update.max_tokens
         session.additional_information = update.additional_information or None
         session.model_intermediate_buffer = getattr(
             update,
