@@ -15,8 +15,19 @@ from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--split", default="all")
+    parser.add_argument(
+        "--dataset",
+        default=DEFAULT_DATASET,
+        help=(
+            "Hugging Face dataset id, a JSON/JSONL manifest, or a local Hugging Face "
+            "dataset mirror. A local directory must use a single configuration whose "
+            "data files are named after the RTD_*/PR_* splits "
+            "(data/<SPLIT>-00000-of-00001.parquet); a single .parquet file is also "
+            "accepted. --split filters the rows by their preserved split identity, so "
+            "rows without identity fail loudly."
+        ),
+    )
+    parser.add_argument("--split", default="all", help="Restrict to one split (e.g. RTD_OCR) or 'all'.")
     parser.add_argument("--family", choices=("all", "rtd", "pr"), default="all")
     parser.add_argument("--media-root")
     parser.add_argument("--limit", type=int)
