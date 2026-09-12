@@ -31,6 +31,7 @@ vllm_omni/outputs/duplex.py                    typed output decision envelope
 ```
 
 For their architecture and validation scope, see
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md) and
 [`docs/design/fullduplex-personaplex.md`](../../../docs/design/fullduplex-personaplex.md).
 PersonaPlex's single-process demo tier (browser client, standalone Moshi-web
 server, `core/`-scaffold adapter) was demo-only and was removed rather than

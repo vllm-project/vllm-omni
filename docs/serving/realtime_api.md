@@ -5,8 +5,8 @@ receive incremental transcription and synthesized response audio. This is a
 turn-based streaming API: it starts one generation over an audio stream and
 finishes after the client closes that input stream.
 
-For a model that listens while it is already speaking, use the duplex serving
-configuration described in `docs/serving/gander.md`.
+For a model that listens while it is already speaking, use the
+[Full-Duplex API](full_duplex_api.md) instead.
 
 ## Quick Start
 

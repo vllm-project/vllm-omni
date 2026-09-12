@@ -48,6 +48,7 @@ answer is saved as `response_1_cancelled.wav`, a completed one as
 duration per answer.
 
 Companion: the runtime architecture lives in
+[`docs/design/fullduplex.md`](../../docs/design/fullduplex.md); the client
 API is `vllm_omni.clients.duplex.DuplexClient`, documented with the wire
 protocol in
 [`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md).

@@ -6,6 +6,7 @@ Inputs can include text, image, audio, or video; outputs are text and optional
 
 For the native duplex runtime architecture, lifecycle invariants,
 capability boundary, and validation scope, see
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md); for the
 `DuplexClient` API and the `/v1/realtime?duplex=1` wire protocol, see
 [`docs/serving/realtime_duplex_api.md`](../../../docs/serving/realtime_duplex_api.md).
 

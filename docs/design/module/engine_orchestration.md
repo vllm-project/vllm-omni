@@ -28,6 +28,7 @@ related_code_paths:
   - vllm_omni/engine/stage_pool.py
   - vllm_omni/outputs/output_processor.py
   - vllm_omni/distributed/omni_coordinator/**
+  # Duplex kernel design is owned by ../fullduplex.md; listed here because the
   # orchestrator hosts the duplex control plane.
   - vllm_omni/engine/duplex/**
 depends_on:

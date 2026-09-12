@@ -11,6 +11,7 @@ API server.
 
 PersonaPlex no longer ships a standalone compatibility server: it is served
 through the unified duplex path (`vllm_omni/deploy/personaplex.yaml`) over
+[`WS /v1/realtime?duplex=1`](full_duplex_api.md); see the
 [PersonaPlex example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/personaplex)
 for its clients.
 
