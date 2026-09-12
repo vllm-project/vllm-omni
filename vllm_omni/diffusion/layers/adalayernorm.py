@@ -17,6 +17,37 @@ logger = init_logger(__name__)
 _HAS_MINDIESD = find_spec("mindiesd") is not None
 
 
+def apply_layernorm_scale_shift(
+    layernorm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    fused: bool = True,
+) -> torch.Tensor:
+    """
+    Apply adaptive LayerNorm modulation.
+    Semantically computes:
+        layernorm(x) * (1 + scale) + shift
+    The parameter `scale` and `shift` should be either 2D `[batch, hidden]` or 3D `[batch, 1, hidden]`.
+    On NPU, this function prefers the `mindiesd.layernorm_scale_shift` fused kernel when available.
+    Otherwise it falls back to the native PyTorch implementation.
+    """
+    if _HAS_MINDIESD and x.device.type == "npu":
+        try:
+            from mindiesd import layernorm_scale_shift
+
+            return layernorm_scale_shift(layernorm, x, scale, shift, fused=fused)
+        except ImportError as e:
+            logger.warning_once(f"mindiesd import failed, falling back to native layernorm: {e}")
+
+    if scale.dim() == 2:
+        scale = scale[:, None]
+    if shift.dim() == 2:
+        shift = shift[:, None]
+
+    return layernorm(x) * (1 + scale) + shift
+
+
 class AdaLayerNorm(CustomOp):
     """
     AdaLayerNorm:
@@ -109,7 +140,7 @@ class AdaLayerNormZero(nn.Module):
         if isinstance(emb, tuple):
             emb = emb[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
-        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        x = apply_layernorm_scale_shift(self.norm, x, scale_msa, shift_msa)
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
@@ -142,7 +173,7 @@ class AdaLayerNormZeroSingle(nn.Module):
         if isinstance(emb, tuple):
             emb = emb[0]
         shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
-        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        x = apply_layernorm_scale_shift(self.norm, x, scale_msa, shift_msa)
         return x, gate_msa
 
 
@@ -174,5 +205,4 @@ class AdaLayerNormContinuous(nn.Module):
         if isinstance(emb, tuple):
             emb = emb[0]
         scale, shift = torch.chunk(emb, 2, dim=1)
-        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
-        return x
+        return apply_layernorm_scale_shift(self.norm, x, scale, shift)
