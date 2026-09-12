@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
+import importlib
+import inspect
 from collections.abc import Callable
 from functools import cache, lru_cache
 from typing import Any
@@ -209,6 +211,87 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
     return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
 
 
+@cache
+def _external_fa3_varlen() -> tuple[FlashAttnFn, frozenset[str]]:
+    """Resolve standalone FA3 package layouts without device-specific policy."""
+    error = None
+    for module_name in ("fa3_fwd_interface", "flash_attn_interface", "flash_attn_3.interface"):
+        try:
+            func = importlib.import_module(module_name).flash_attn_varlen_func
+        except (ImportError, AttributeError) as exc:
+            error = exc
+            continue
+        return func, frozenset(inspect.signature(func).parameters)
+    raise ImportError("A standalone FlashAttention-3 varlen interface is required") from error
+
+
+def flash_attn_3_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    deterministic: bool = False,
+    sinks: torch.Tensor | None = None,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Call standalone FA3 with an output-only or packed ``(output, LSE)`` contract.
+
+    Providers name the LSE request either ``return_attn_probs`` or
+    ``return_softmax_lse``. Native sinks require explicit provider support; this
+    helper does not emulate sinks or select an accelerator platform.
+    """
+    func, parameters = _external_fa3_varlen()
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": int(max_seqlen_q),
+        "max_seqlen_k": int(max_seqlen_k),
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+    }
+    for name, value in (("softcap", max(float(softcap), 0.0)), ("deterministic", deterministic)):
+        if name in parameters:
+            kwargs[name] = value
+        elif value:
+            raise NotImplementedError(f"This FlashAttention-3 provider does not support {name}")
+    if sinks is not None:
+        if "sinks" not in parameters:
+            raise NotImplementedError("This FlashAttention-3 provider does not support native sinks")
+        kwargs["sinks"] = sinks
+    if return_softmax_lse:
+        if "return_attn_probs" in parameters:
+            kwargs["return_attn_probs"] = True
+        elif "return_softmax_lse" in parameters:
+            kwargs["return_softmax_lse"] = True
+        else:
+            raise NotImplementedError("This FlashAttention-3 provider does not expose an LSE return option")
+    result = func(**kwargs)
+    if not return_softmax_lse:
+        out = result[0] if isinstance(result, tuple) and result else result
+        if not isinstance(out, torch.Tensor):
+            raise RuntimeError("FlashAttention-3 must return an output tensor")
+        return out
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise RuntimeError("FlashAttention-3 must return (output, softmax_lse) when LSE is requested")
+    out, lse = result[:2]
+    if not isinstance(out, torch.Tensor) or not isinstance(lse, torch.Tensor):
+        raise RuntimeError("FlashAttention-3 output and softmax_lse must be tensors")
+    expected_shape = (q.shape[1], q.shape[0])
+    if lse.shape != expected_shape:
+        raise RuntimeError(f"Expected packed softmax_lse shape {expected_shape}, got {tuple(lse.shape)}")
+    return out, lse
+
+
 def vllm_flash_attn_varlen_with_lse(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -224,9 +307,31 @@ def vllm_flash_attn_varlen_with_lse(
     deterministic: bool = False,
     fa_version: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run packed vLLM FlashAttention and retain LSE for post-processing."""
+    """Run packed attention with LSE, preferring vLLM's versioned backend.
 
-    from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
+    When the bundled API is not installed, standalone FA3 supplies the same
+    contract. Explicit FA2/FA4 requests are never redirected to FA3.
+    """
+
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
+    except ImportError:
+        if fa_version not in (None, 3):
+            raise
+        return flash_attn_3_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            softcap=softcap,
+            causal=causal,
+            deterministic=deterministic,
+            return_softmax_lse=True,
+        )
 
     version = resolve_vllm_flash_attn_version(fa_version)
     out, lse = vllm_flash_attn_varlen_func(
