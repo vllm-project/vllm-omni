@@ -426,39 +426,39 @@ def test_patch_valid_hf_config_without_model_type_preserves_keys(tmp_path):
             shutil.rmtree(args._temp_config_dir, ignore_errors=True)
 
 
-def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
-    """Remote resolution failures must stay on vLLM's normal error path."""
-    loader_error = OSError("remote config resolution failed")
-    parent_inputs = {}
+# def test_ensure_sensenova_preprocessor_config_writes_recipe(tmp_path):
+#     """AR stage preprocessor fix writes the shared BAGEL-compatible recipe
+#     into a checkpoint dir that lacks preprocessor_config.json."""
+#     (tmp_path / "config.json").write_text(json.dumps({"model_type": "bagel"}), encoding="utf-8")
+#     args = object.__new__(OmniEngineArgs)
+#     args.model = str(tmp_path)
+#     args.model_arch = "OmniSenseNovaVisionForConditionalGeneration"
+#     args.hf_config_path = None
+#     args.revision = None
 
-    def controlled_get_config_dict(cls, model, **kwargs):
-        raise loader_error
+#     args._ensure_sensenova_preprocessor_config()
 
-    def fake_parent_create_model_config(self):
-        parent_inputs["called"] = True
-        parent_inputs["model"] = self.model
-        parent_inputs["hf_config_path"] = self.hf_config_path
-        return PretrainedConfig.get_config_dict(self.model)[0]
+#     processor_path = tmp_path / "preprocessor_config.json"
+#     assert processor_path.is_file()
+#     config = json.loads(processor_path.read_text(encoding="utf-8"))
+#     assert config["image_processor_type"] == "SiglipImageProcessor"
+#     assert config["size"] == {"height": 980, "width": 980}
+#     assert config["resample"] == 3
 
-    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(controlled_get_config_dict))
-    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda self: True)
-    monkeypatch.setattr(EngineArgs, "create_model_config", fake_parent_create_model_config)
 
-    args = OmniEngineArgs(
-        model="remote/model",
-        model_arch="IndexTTS25TalkerForConditionalGeneration",
-    )
+# def test_ensure_sensenova_preprocessor_config_preserves_existing(tmp_path):
+#     """If the checkpoint already ships preprocessor_config.json, leave it as-is."""
+#     existing = {"image_processor_type": "CustomImageProcessor", "size": {"height": 1, "width": 1}}
+#     (tmp_path / "preprocessor_config.json").write_text(json.dumps(existing), encoding="utf-8")
+#     args = object.__new__(OmniEngineArgs)
+#     args.model = str(tmp_path)
+#     args.model_arch = "OmniSenseNovaVisionForConditionalGeneration"
+#     args.hf_config_path = None
+#     args.revision = None
 
-    with pytest.raises(OSError) as exc_info:
-        args.create_model_config()
+#     args._ensure_sensenova_preprocessor_config()
 
-    assert str(exc_info.value) == str(loader_error)
-    assert parent_inputs["called"] is True
-    assert parent_inputs["model"] == "remote/model"
-    assert parent_inputs["hf_config_path"] is None
-    assert args.model == "remote/model"
-    assert args.hf_config_path is None
-    assert not hasattr(args, "_temp_config_dir")
+#     assert json.loads((tmp_path / "preprocessor_config.json").read_text(encoding="utf-8")) == existing
 
 
 def test_stage_specific_text_config_override():

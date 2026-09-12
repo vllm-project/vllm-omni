@@ -30,6 +30,11 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
     "OmniVoiceModel": "omnivoice",
+    # SenseNova-Vision-7B-MoT ships a metadata-only config.json (no model_type,
+    # no architectures). It is a BAGEL-fork, so model_type=bagel resolves the
+    # vLLM BagelConfig class; the real QCenet/SigLIP params live in sibling
+    # llm_config.json / vit_config.json which _patch_empty_hf_config merges in.
+    "OmniSenseNovaVisionForConditionalGeneration": "bagel",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
     # the HF config without manual overrides.
@@ -298,6 +303,54 @@ class OmniEngineArgs(EngineArgs):
         self._temp_config_dir = temp_dir
         logger.info("Patched empty HF config with model_type=%s at %s", model_type, temp_dir)
 
+    def _merge_sensenova_split_configs(self) -> None:
+        """Merge SenseNova-Vision-7B-MoT's llm_config.json / vit_config.json
+        into the current patched config directory as nested llm_config/
+        vit_config keys so BagelConfig can build the real sub-configs."""
+        # TODO: maybe create a new HF checkpoint with merged config will be better than merge it on the fly every time.
+        from vllm_omni.model_executor.models.sensenova_vision.configuration_sensenova_vision import (
+            merge_sensenova_split_configs,
+        )
+
+        merge_sensenova_split_configs(self.model, self.hf_config_path)
+
+    def _ensure_sensenova_preprocessor_config(self) -> None:
+        """Make sure the AR stage's checkpoint dir ships a BAGEL-compatible
+        ``preprocessor_config.json``.
+
+        The SenseNova-Vision-7B-MoT checkpoint ships no
+        ``preprocessor_config.json`` (BAGEL does), and stage-0 (AR thinker)
+        loads ``OmniBagelProcessor`` from ``model_config.model`` during
+        MultiModalBudget profiling. vLLM/transformers resolve that path to
+        the same checkpoint dir (local dir or HF snapshot), so writing the
+        shared recipe there directly is sufficient — no model-path redirect
+        and no extra temp dir.
+        """
+        from vllm_omni.model_executor.models.sensenova_vision.configuration_sensenova_vision import (
+            ensure_sensenova_preprocessor_config,
+        )
+
+        model = self.model
+        if os.path.exists(model):
+            model_path = model
+        else:
+            from vllm_omni.model_executor.model_loader.weight_utils import (
+                download_weights_from_hf_specific,
+            )
+
+            model_path = download_weights_from_hf_specific(
+                model,
+                None,
+                ["*"],
+                revision=self.revision,
+            )
+
+        if os.path.isfile(os.path.join(model_path, "preprocessor_config.json")):
+            # Checkpoint already ships the file; nothing to patch.
+            return
+
+        ensure_sensenova_preprocessor_config(model_path)
+
     def create_model_config(self) -> OmniModelConfig:
         """Create an OmniModelConfig from these engine arguments.
         Returns:
@@ -348,8 +401,34 @@ class OmniEngineArgs(EngineArgs):
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
 
-        tokenizer = cast(str | None, getattr(self, "tokenizer", None))
+            # SenseNova-Vision-7B-MoT stores its real Qwen2/SigLIP params in
+            # sibling llm_config.json / vit_config.json (BAGEL-fork layout) while
+            # config.json is metadata-only. Merge those into the patched config
+            # so BagelConfig builds proper Qwen2Config/SiglipVisionConfig from
+            # the nested llm_config/vit_config keys instead of empty defaults.
+            if self.model_arch == "OmniSenseNovaVisionForConditionalGeneration":
+                self._merge_sensenova_split_configs()
+                # The checkpoint ships no preprocessor_config.json; ensure the
+                # shared BAGEL-compatible recipe exists in the checkpoint dir so
+                # OmniBagelProcessor can load for the AR stage.
+                self._ensure_sensenova_preprocessor_config()
+                # Make AutoTokenizer.from_pretrained resolve
+                # VLLMSenseNovaVisionTokenizer (id-preserving) before the engine
+                # loads the processor/engine tokenizer. The checkpoint's
+                # tokenizer_config.json declares tokenizer_class=
+                # "VLLMSenseNovaVisionTokenizer" on the hub; the in-process
+                # registration makes that resolvable without writing the source
+                # file into the checkpoint dir. Without it, AutoTokenizer
+                # renumbers the 2033 added tokens past the 152064 embedding rows
+                # and placeholder/marker ids (e.g. <|image_pad|>, <|fim_middle|>,
+                # <|vision_start|>, <|vision_end|>) go out of range.
+                from vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision import (
+                    register_vllm_sensenova_vision_tokenizer,
+                )
 
+                register_vllm_sensenova_vision_tokenizer()
+
+        tokenizer = cast(str | None, getattr(self, "tokenizer", None))
         # NemotronVoiceChat: the checkpoint's only tokenizer subfolder is the
         # auxiliary rnnt_tokenizer/ (ASR loss vocab), which the generic
         # subfolder auto-detect below would wrongly pick up. The text tokenizer

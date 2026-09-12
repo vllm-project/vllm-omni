@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Base worker class for vLLM-Omni with device-level GPU memory profiling."""
 
 from __future__ import annotations
@@ -131,25 +134,66 @@ class OmniGPUWorkerBase(GPUWorker):
         # true here). Mirror upstream so the omni override keeps it populated.
         self.total_consumed = profile_result.total_consumed
 
-        profiled_usage = (
-            int(self.model_runner.model_memory_usage)
-            + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
-        )
-        self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
-        logger.debug(
-            "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
-            os.getpid(),
-            self.local_rank,
-            format_gib(self.requested_memory),
-            format_gib(profiled_usage),
-            format_gib(self.available_kv_cache_memory_bytes),
-        )
-        logger.info_once(
-            "Available KV cache memory: %s GiB (device-level profiling)",
-            format_gib(self.available_kv_cache_memory_bytes),
-            scope="local",
-        )
+        # HACK: temp fix for NVML memory profiling bug
+        process_memory = None
+        from vllm_omni.entrypoints.utils import detect_pid_host
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory, is_process_scoped_memory_available
+
+        if is_process_scoped_memory_available() and detect_pid_host():
+            process_memory = get_process_gpu_memory(self.local_rank)
+            # A per-process NVML reading is only trustworthy when it actually
+            # attributed memory to THIS process. ``None`` (NVML unavailable /
+            # PID not matched, e.g. container PID namespace) and ``0`` (no
+            # compute process matched the PID) both mean we cannot measure
+            # real usage — and the model weights are already resident, so a
+            # literal 0 is never legitimate here. Treat both as unmeasurable
+            # and fall back to the profiled usage so the KV-cache budget
+            # subtracts the weights/activations already allocated.
+            if process_memory is not None and process_memory <= 0:
+                logger.debug(
+                    "Process-scoped memory unavailable for PID %d (NVML reported %r); using profiling fallback",
+                    os.getpid(),
+                    process_memory,
+                )
+                process_memory = None
+
+        if process_memory is not None:
+            # NVML available: use per-process memory
+            self.available_kv_cache_memory_bytes = max(0, self.requested_memory - process_memory)
+            logger.debug(
+                "Process-scoped memory (PID %d, GPU %d): requested=%s, used=%s, available=%s",
+                os.getpid(),
+                self.local_rank,
+                format_gib(self.requested_memory),
+                format_gib(process_memory),
+                format_gib(self.available_kv_cache_memory_bytes),
+            )
+            logger.info_once(
+                "Available KV cache memory: %s GiB (process-scoped)",
+                format_gib(self.available_kv_cache_memory_bytes),
+                scope="local",
+            )
+        else:
+            # NVML unavailable: use profiling data as conservative fallback
+            profiled_usage = (
+                int(self.model_runner.model_memory_usage)
+                + profile_result.torch_peak_increase
+                + profile_result.non_torch_increase
+            )
+            self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
+            logger.debug(
+                "Profiling fallback (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
+                os.getpid(),
+                self.local_rank,
+                format_gib(self.requested_memory),
+                format_gib(profiled_usage),
+                format_gib(self.available_kv_cache_memory_bytes),
+            )
+            logger.info_once(
+                "Available KV cache memory: %s GiB (profiling fallback)",
+                format_gib(self.available_kv_cache_memory_bytes),
+                scope="local",
+            )
 
         return int(self.available_kv_cache_memory_bytes)
 
