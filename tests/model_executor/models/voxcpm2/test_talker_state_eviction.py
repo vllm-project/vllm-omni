@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for VoxCPM2 talker per-request state lifecycle."""
 
 from __future__ import annotations
@@ -72,6 +72,80 @@ def _seed_cached_decode(talker, req_id: str):
 
 
 class TestStateEvictionContract:
+    def test_eager_optimizations_do_not_require_torch_inductor(self, monkeypatch) -> None:
+        from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
+
+        class FakeEstimator:
+            pass
+
+        class FakeFeatDecoder:
+            def __init__(self, estimator) -> None:
+                self.estimator = estimator
+                self.mean_mode = False
+
+        class FakeTTS:
+            def __init__(self, estimator) -> None:
+                self.feat_decoder = FakeFeatDecoder(estimator)
+
+        talker = _make_bare_talker()
+        estimator = FakeEstimator()
+        talker._tts = FakeTTS(estimator)
+        _, _, RuntimeConfig = _voxcpm2_talker_mod()
+        talker._runtime_config = RuntimeConfig()
+        talker._enable_torch_compile = False
+
+        applied: list[str] = []
+
+        def install_qkv(*_args, **_kwargs) -> int:
+            applied.append("qkv")
+            return 12
+
+        def install_mlp(*_args, **_kwargs) -> int:
+            applied.append("mlp")
+            return 12
+
+        def install_zero_dt(*_args, **_kwargs) -> bool:
+            applied.append("zero_dt")
+            return True
+
+        monkeypatch.setattr(
+            tk,
+            "_install_locdit_fused_qkv",
+            install_qkv,
+        )
+        monkeypatch.setattr(
+            tk,
+            "_install_locdit_fused_mlp",
+            install_mlp,
+        )
+        monkeypatch.setattr(
+            tk,
+            "_install_locdit_zero_dt_cache",
+            install_zero_dt,
+        )
+
+        talker._setup_execution_optimizations()
+
+        assert applied == ["qkv", "mlp", "zero_dt"]
+        assert talker._eager_optimizations_applied is True
+        assert not hasattr(estimator, "_compiled")
+
+    def test_profiler_drops_invalid_accelerator_graph_events(self, monkeypatch) -> None:
+        from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
+
+        timer = tk._PerfTimer(enabled=False)
+        timer._enabled = True
+
+        class InvalidEvent:
+            def elapsed_time(self, _end) -> float:
+                raise RuntimeError("event recorder null")
+
+        timer._pairs.append(("captured", InvalidEvent(), object()))
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+        assert timer.breakdown() == ""
+        assert timer._pairs == []
+
     def test_runtime_config_normalizes_mutually_exclusive_paths(self) -> None:
         _, _, RuntimeConfig = _voxcpm2_talker_mod()
 
@@ -295,6 +369,7 @@ class TestChunkedPrefillContract:
         talker._get_multichar_zh_split = lambda: {}
         talker._perf = _NoopPerf()
         talker._enable_torch_compile = False
+        talker._setup_execution_optimizations = lambda: None
         talker._setup_cfm_buffers = lambda: None
         talker._run_cfm_for_state = lambda *_args: torch.ones(1, 1, 4)
 
