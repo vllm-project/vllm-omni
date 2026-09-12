@@ -15,8 +15,6 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni]
 
-_SKIP_ISSUE_3649 = pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3649")
-
 
 def _minimal_chat_json(omni_server: OmniServer) -> dict[str, object]:
     """Minimal valid chat body; individual tests override one offending field."""
@@ -115,9 +113,8 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         pytest.param(
             "modalities_list_bad",
             400,
-            ("modalities", "value_error", ""),
+            ("modalities", "list of strings"),
             id="modalities_list_bad_element",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "response_format_json_schema_incomplete",
@@ -125,7 +122,7 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             ("response_format", "BadRequestError", "json_schema"),
             id="invalid_response_format_json_schema",
         ),
-        pytest.param("logprobs_wrong_type", 400, "logprobs", id="logprobs_wrong_type", marks=_SKIP_ISSUE_3649),
+        pytest.param("logprobs_wrong_type", 400, ("logprobs", "boolean"), id="logprobs_wrong_type"),
         pytest.param(
             "logprobs_top_without_enabled",
             400,
