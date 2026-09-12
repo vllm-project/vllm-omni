@@ -3,6 +3,8 @@
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 import math
+from collections.abc import Iterable
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -12,12 +14,20 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
+from vllm.config import get_current_vllm_config
+from vllm.forward_context import (
+    is_forward_context_available as is_vllm_forward_context_available,
+)
+from vllm.forward_context import set_forward_context as set_vllm_forward_context
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.utils.fa import (
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
 )
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -32,7 +42,8 @@ LINGBOT_VIDEO_FP32_MODULES = (
     "norm_post_ffn",
     "norm_out",
     "norm_out_modulation",
-    "router",
+    "gate",
+    "e_score_correction_bias",
 )
 
 
@@ -296,95 +307,9 @@ class LingBotVideoMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class LingBotVideoRouter(nn.Module):
-    """Token-choice top-k router used by the LingBot MoE checkpoints.
-
-    Selection uses the bias-corrected score, while the gating weights use the
-    original score. This asymmetry matches the reference LingBot inference path.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_experts: int,
-        top_k: int,
-        score_func: str,
-        norm_topk_prob: bool,
-        n_group: int | None,
-        topk_group: int | None,
-        route_scale: float,
-    ):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.score_func = score_func
-        self.norm_topk_prob = norm_topk_prob
-        self.n_group = n_group
-        self.topk_group = topk_group
-        self.route_scale = route_scale
-        self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
-        self.register_buffer(
-            "e_score_correction_bias",
-            torch.zeros(num_experts),
-            persistent=True,
-        )
-
-    def _group_limited_topk(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
-        if self.n_group is None or self.topk_group is None:
-            raise ValueError("group-limited top-k requires n_group and topk_group.")
-        seq_len = scores_for_choice.shape[0]
-        experts_per_group = self.num_experts // self.n_group
-        grouped = scores_for_choice.view(seq_len, self.n_group, experts_per_group)
-        group_scores = grouped.topk(2, dim=-1)[0].sum(dim=-1)
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = group_mask.unsqueeze(-1).expand(seq_len, self.n_group, experts_per_group).reshape(seq_len, -1)
-        masked = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
-        return torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
-
-    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.amp.autocast(tokens.device.type, enabled=False):
-            logits = F.linear(tokens.float(), self.weight.float())
-        if self.score_func == "softmax":
-            scores = F.softmax(logits, dim=-1)
-        elif self.score_func == "sigmoid":
-            scores = logits.sigmoid()
-        else:
-            raise ValueError(f"Unsupported LingBot router score_func: {self.score_func!r}.")
-
-        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
-        if self.n_group is not None and self.n_group > 1:
-            top_indices = self._group_limited_topk(scores_for_choice)
-        else:
-            top_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-        top_scores = scores.gather(1, top_indices)
-        if self.top_k > 1 and self.norm_topk_prob:
-            top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
-        top_scores = top_scores * self.route_scale
-        return top_indices, top_scores.to(tokens.dtype)
-
-
-class LingBotVideoGroupedExperts(nn.Module):
-    """Grouped expert weights.
-
-    Weight layout matches the reference checkpoint:
-    w1 [E, I, H], w2 [E, H, I], w3 [E, I, H].
-    """
-
-    def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.num_experts = num_experts
-        self.w1 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
-        self.w3 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-
-
-def _round_up_to_multiple(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
 class LingBotVideoSparseMoeBlock(nn.Module):
+    """LingBot routing semantics backed by vLLM's common FusedMoE path."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -397,21 +322,45 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         topk_group: int | None,
         routed_scaling_factor: float,
         n_shared_experts: int | None,
+        *,
+        prefix: str = "lingbot_video.experts",
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
-        self.router = LingBotVideoRouter(
+        gate = GateLinear(
             hidden_size,
             num_experts,
-            top_k,
-            score_func,
-            norm_topk_prob,
-            n_group,
-            topk_group,
-            routed_scaling_factor,
+            bias=False,
+            out_dtype=torch.float32,
+            params_dtype=torch.float32,
+            force_fp32_compute=True,
+            prefix=f"{prefix}.gate",
         )
-        self.experts = LingBotVideoGroupedExperts(num_experts, hidden_size, moe_intermediate_size)
+        correction_bias = nn.Parameter(
+            torch.zeros(num_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.experts = FusedMoE(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=moe_intermediate_size,
+            renormalize=norm_topk_prob,
+            use_grouped_topk=n_group is not None and n_group > 1,
+            num_expert_group=n_group,
+            topk_group=topk_group,
+            scoring_func=score_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=correction_bias,
+            activation="silu",
+            gate=gate,
+            ckpt_names=("w1", "w2", "w3"),
+            tp_size=1,
+            dp_size=1,
+            pcp_size=1,
+            prefix=prefix,
+        )
         self.shared_experts = None
         if n_shared_experts is not None and n_shared_experts > 0:
             self.shared_experts = LingBotVideoMLP(
@@ -419,166 +368,23 @@ class LingBotVideoSparseMoeBlock(nn.Module):
                 moe_intermediate_size * n_shared_experts,
             )
 
-    @staticmethod
-    def _reorder_tokens(
-        tokens: torch.Tensor,
-        top_scores: torch.Tensor,
-        top_indices: torch.Tensor,
-        num_experts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-        num_tokens = tokens.shape[0]
-        top_k = top_indices.shape[1]
-        flat_scores = top_scores.reshape(-1)
-        flat_indices = top_indices.reshape(-1)
-        active_positions = torch.where(flat_scores != 0)[0]
-        active_experts = flat_indices[active_positions]
-
-        counts = torch.zeros(num_experts, device=tokens.device, dtype=torch.int64)
-        counts.scatter_add_(
-            0,
-            active_experts,
-            torch.ones_like(active_experts, dtype=torch.int64),
-        )
-
-        sort_order = torch.argsort(active_experts, stable=True)
-        sorted_positions = active_positions[sort_order]
-        sorted_scores = flat_scores[sorted_positions]
-        original_token_idx = sorted_positions // top_k
-        permuted_tokens = tokens[original_token_idx]
-        return permuted_tokens, counts, sorted_positions, sorted_scores, num_tokens, top_k
-
-    @staticmethod
-    def _pad_grouped_tokens(
-        tokens: torch.Tensor,
-        counts: torch.Tensor,
-        align: int = 8,
-    ) -> tuple[torch.Size, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_tokens = tokens.shape[0]
-        num_experts = int(counts.shape[0])
-        max_len = _round_up_to_multiple(num_tokens + num_experts * align, align)
-        counts_i64 = counts.to(torch.int64)
-        total_per_expert = torch.clamp_min(counts_i64, align)
-        aligned_counts_i64 = (total_per_expert + align - 1) // align * align
-        write_offsets = torch.cumsum(aligned_counts_i64, dim=0) - aligned_counts_i64
-        end_offsets = torch.cumsum(aligned_counts_i64, dim=0)
-        start_indices = torch.cumsum(counts_i64, dim=0) - counts_i64
-
-        slots = torch.arange(max_len, dtype=torch.int64, device=tokens.device)
-        expert_idx = torch.bucketize(slots, end_offsets, right=True)
-        valid_expert = expert_idx < num_experts
-        safe_expert_idx = expert_idx.clamp(max=num_experts - 1)
-        local_idx = slots - write_offsets[safe_expert_idx]
-        source_idx = start_indices[safe_expert_idx] + local_idx
-        valid = valid_expert & (local_idx < counts_i64[safe_expert_idx])
-        fill = torch.full_like(source_idx, num_tokens)
-        permuted_indices = torch.where(valid, source_idx, fill)
-
-        tokens_with_pad = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1],))))
-        input_shape = tokens_with_pad.shape
-        return (
-            input_shape,
-            tokens_with_pad[permuted_indices],
-            permuted_indices,
-            aligned_counts_i64.to(torch.int32),
-        )
-
-    @staticmethod
-    def _unpad_grouped_tokens(
-        output: torch.Tensor,
-        input_shape: torch.Size,
-        permuted_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        unpermuted = output.new_empty(input_shape)
-        unpermuted[permuted_indices, :] = output
-        return unpermuted[:-1]
-
-    def _run_experts_for_loop(self, tokens: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        count_list = counts.tolist()
-        splits = torch.split(tokens, count_list, dim=0)
-        outputs = []
-        for expert_idx, expert_tokens in enumerate(splits):
-            if expert_tokens.numel() == 0:
-                continue
-            h = F.silu(expert_tokens @ self.experts.w1[expert_idx].transpose(-2, -1))
-            h = h * (expert_tokens @ self.experts.w3[expert_idx].transpose(-2, -1))
-            h = h @ self.experts.w2[expert_idx].transpose(-2, -1)
-            outputs.append(h)
-        if not outputs:
-            return tokens.new_zeros(tokens.shape)
-        return torch.cat(outputs, dim=0)
-
-    def _run_grouped_experts(self, tokens: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        if not hasattr(torch, "_grouped_mm") or tokens.device.type != "cuda":
-            return self._run_experts_for_loop(tokens, counts)
-        input_shape, padded_tokens, permuted_indices, aligned_counts = self._pad_grouped_tokens(tokens, counts)
-        offsets = torch.cumsum(aligned_counts, dim=0, dtype=torch.int32)
-        h = F.silu(
-            torch._grouped_mm(
-                padded_tokens.bfloat16(),
-                self.experts.w1.bfloat16().transpose(-2, -1),
-                offs=offsets,
+    @torch.compiler.disable
+    def _run_routed_experts(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Run the opaque common MoE op with a valid vLLM forward context."""
+        context = (
+            nullcontext()
+            if is_vllm_forward_context_available()
+            else set_vllm_forward_context(
+                attn_metadata=None,
+                vllm_config=get_current_vllm_config(),
+                num_tokens=tokens.shape[0],
             )
         )
-        h = h * torch._grouped_mm(
-            padded_tokens.bfloat16(),
-            self.experts.w3.bfloat16().transpose(-2, -1),
-            offs=offsets,
-        )
-        out = torch._grouped_mm(
-            h,
-            self.experts.w2.bfloat16().transpose(-2, -1),
-            offs=offsets,
-        ).type_as(padded_tokens)
-        return self._unpad_grouped_tokens(out, input_shape, permuted_indices)
-
-    @staticmethod
-    def _restore_tokens(
-        expert_output: torch.Tensor,
-        sorted_positions: torch.Tensor,
-        sorted_scores: torch.Tensor,
-        num_tokens: int,
-        top_k: int,
-    ) -> torch.Tensor:
-        hidden_size = expert_output.shape[-1]
-        unsorted = torch.zeros(
-            (num_tokens * top_k, hidden_size),
-            dtype=expert_output.dtype,
-            device=expert_output.device,
-        )
-        unsorted[sorted_positions] = expert_output
-        unsorted = unsorted.reshape(num_tokens, top_k, hidden_size)
-
-        scores_unsorted = torch.zeros(
-            num_tokens * top_k,
-            dtype=sorted_scores.dtype,
-            device=sorted_scores.device,
-        )
-        scores_unsorted[sorted_positions] = sorted_scores
-        scores_unsorted = scores_unsorted.reshape(num_tokens, top_k, 1)
-        return (unsorted.float() * scores_unsorted).sum(dim=1).to(expert_output.dtype)
-
-    def _run_selected_experts(
-        self,
-        tokens: torch.Tensor,
-        top_scores: torch.Tensor,
-        top_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        (
-            permuted_tokens,
-            counts,
-            sorted_positions,
-            sorted_scores,
-            num_tokens,
-            top_k,
-        ) = self._reorder_tokens(tokens, top_scores, top_indices, self.router.num_experts)
-        expert_output = self._run_grouped_experts(permuted_tokens, counts)
-        return self._restore_tokens(
-            expert_output,
-            sorted_positions,
-            sorted_scores,
-            num_tokens,
-            top_k,
-        )
+        with context:
+            return self.experts(
+                hidden_states=tokens,
+                router_logits=tokens,
+            )
 
     def forward(
         self,
@@ -587,14 +393,16 @@ class LingBotVideoSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         tokens = hidden_states.reshape(-1, self.hidden_size)
-        top_indices, top_scores = self.router(tokens)
         if padding_mask is not None:
-            mask = padding_mask.unsqueeze(-1).to(top_scores.dtype)
-            top_scores = top_scores * mask
-            top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-9)
-            top_scores = top_scores * self.router.route_scale
-
-        out = self._run_selected_experts(tokens, top_scores, top_indices)
+            # The caller only supplies this mask when padding is present, so
+            # compaction avoids a device-to-host all-valid branch.
+            valid_indices = torch.where(padding_mask.bool())[0]
+            valid_tokens = tokens.index_select(0, valid_indices)
+            valid_output = self._run_routed_experts(valid_tokens)
+            out = tokens.new_zeros(tokens.shape)
+            out.index_copy_(0, valid_indices, valid_output)
+        else:
+            out = self._run_routed_experts(tokens)
         out = out.reshape(batch_size, -1, self.hidden_size)
         if self.shared_experts is not None:
             out = out + self.shared_experts(hidden_states)
@@ -622,6 +430,8 @@ class LingBotVideoBlock(nn.Module):
         topk_group,
         routed_scaling_factor,
         layer_idx: int,
+        *,
+        prefix: str = "lingbot_video.block",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -646,6 +456,7 @@ class LingBotVideoBlock(nn.Module):
                 topk_group=topk_group,
                 routed_scaling_factor=routed_scaling_factor,
                 n_shared_experts=n_shared_experts,
+                prefix=f"{prefix}.ffn.experts",
             )
         else:
             self.ffn = LingBotVideoMLP(h, intermediate_size)
@@ -762,6 +573,7 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         n_group: int | None = None,
         topk_group: int | None = None,
         routed_scaling_factor: float = 1.0,
+        prefix: str = "transformer",
     ):
         super().__init__()
         head_dim = hidden_size // num_attention_heads
@@ -795,6 +607,7 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                     topk_group=topk_group,
                     routed_scaling_factor=routed_scaling_factor,
                     layer_idx=i,
+                    prefix=f"{prefix}.blocks.{i}",
                 )
                 for i in range(depth)
             ]
@@ -802,6 +615,49 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         self.norm_out = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=norm_eps)
         self.norm_out_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
         self.proj_out = nn.Linear(hidden_size, math.prod(patch_size) * out_channels)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load LingBot checkpoints and pack aggregate w1/w3 into w13."""
+        params = dict(self.named_parameters())
+        tensors = {**dict(self.named_buffers()), **params}
+        loaded: set[str] = set()
+
+        for name, weight in weights:
+            if name.endswith((".ffn.experts.w1", ".ffn.experts.w2", ".ffn.experts.w3")):
+                source_prefix, shard_id = name.rsplit(".", 1)
+                target_suffix = "w2_weight" if shard_id == "w2" else "w13_weight"
+                target_name = f"{source_prefix}.routed_experts.{target_suffix}"
+                param = params[target_name]
+                weight_loader = getattr(param, "weight_loader")
+                for expert_id, expert_weight in enumerate(weight):
+                    weight_loader(
+                        param,
+                        expert_weight,
+                        target_name,
+                        shard_id,
+                        expert_id,
+                    )
+                loaded.add(target_name)
+                continue
+
+            if name.endswith(".ffn.router.weight"):
+                target_name = name.replace(".ffn.router.weight", ".ffn.experts.gate.weight")
+            elif name.endswith(".ffn.router.e_score_correction_bias"):
+                target_name = name.replace(
+                    ".ffn.router.e_score_correction_bias",
+                    ".ffn.experts.routed_experts.e_score_correction_bias",
+                )
+            else:
+                target_name = name
+
+            target = tensors.get(target_name)
+            if target is None:
+                raise KeyError(f"LingBot checkpoint tensor {name!r} does not map to a model parameter or buffer.")
+            weight_loader = getattr(target, "weight_loader", default_weight_loader)
+            weight_loader(target, weight)
+            loaded.add(target_name)
+
+        return loaded
 
     def forward(
         self,

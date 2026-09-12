@@ -71,6 +71,88 @@ def test_component_discovery_declarations():
     assert LingBotVideoPipeline.max_outputs_per_prompt == 1
 
 
+def test_constructor_declares_native_transformer_weight_source(mocker):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    transformer = nn.Linear(2, 2)
+    transformer_factory = mocker.patch.object(
+        module,
+        "LingBotVideoTransformer3DModel",
+        return_value=transformer,
+    )
+    config_helper = mocker.patch.object(
+        module,
+        "get_transformer_config_kwargs",
+        return_value={"depth": 0},
+    )
+    mocker.patch.object(module, "get_local_device", return_value=torch.device("cpu"))
+    mocker.patch.object(
+        module.Qwen3VLForConditionalGeneration,
+        "from_pretrained",
+        return_value=nn.Linear(2, 2),
+    )
+    mocker.patch.object(
+        module.Qwen3VLProcessor,
+        "from_pretrained",
+        return_value=object(),
+    )
+    mocker.patch.object(
+        module.AutoencoderKLWan,
+        "from_pretrained",
+        return_value=nn.Linear(2, 2),
+    )
+    mocker.patch.object(
+        module.FlowUniPCMultistepScheduler,
+        "from_pretrained",
+        return_value=object(),
+    )
+    od_config = SimpleNamespace(
+        model="/tmp/lingbot-model",
+        revision="test-revision",
+        dtype=torch.bfloat16,
+        model_config={},
+        tf_model_config=object(),
+    )
+
+    pipeline = module.LingBotVideoPipeline(od_config=od_config)
+
+    config_helper.assert_called_once_with(
+        od_config.tf_model_config,
+        module.LingBotVideoTransformer3DModel,
+    )
+    transformer_factory.assert_called_once_with(
+        depth=0,
+        prefix="transformer",
+    )
+    assert pipeline.transformer is transformer
+    assert len(pipeline.weights_sources) == 1
+    source = pipeline.weights_sources[0]
+    assert source.model_or_path == od_config.model
+    assert source.subfolder == "transformer"
+    assert source.revision == "test-revision"
+    assert source.prefix == "transformer."
+
+
+def test_load_weights_delegates_to_auto_loader(mocker):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    pipeline = _make_pipeline()
+    loader = mocker.MagicMock()
+    loader.load_weights.return_value = {"transformer.blocks.0.weight"}
+    loader_factory = mocker.patch.object(
+        module,
+        "AutoWeightsLoader",
+        return_value=loader,
+    )
+    weights = [("transformer.blocks.0.weight", torch.ones(1))]
+
+    loaded = pipeline.load_weights(iter(weights))
+
+    loader_factory.assert_called_once_with(pipeline)
+    loader.load_weights.assert_called_once()
+    assert loaded == {"transformer.blocks.0.weight"}
+
+
 def test_extra_body_params_include_video_flow_shift_alias():
     from vllm_omni.model_extras import get_extra_body_params
 
@@ -564,11 +646,3 @@ def test_forward_marks_unsupported_output_count_as_client_error():
         pipeline.forward(request)
 
     assert exc_info.value.status_code == 400
-
-
-def test_load_weights_rejects_external_weight_stream():
-    pipeline = _make_pipeline()
-
-    assert pipeline.load_weights([]) == set()
-    with pytest.raises(RuntimeError, match="components are loaded directly"):
-        pipeline.load_weights([("transformer.weight", torch.zeros(1))])
