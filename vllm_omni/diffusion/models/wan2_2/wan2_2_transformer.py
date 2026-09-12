@@ -18,7 +18,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
@@ -45,6 +45,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.mxfp4_config import NPUMxfp4LinearMethod
 
 logger = init_logger(__name__)
 
@@ -985,6 +986,59 @@ class WanTransformer3DModel(nn.Module):
         # ROPE helper
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
+        self._validate_w4a8_fallback_layers(quant_config)
+
+    def _validate_w4a8_fallback_layers(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject checkpoint aliases/typos before loading weights or running inference."""
+        requested = tuple(getattr(quant_config, "w4a8_fallback_layers", []))
+        self._w4a8_fallback_layers = requested
+        self._local_w4a8_fallback_layers: tuple[str, ...] = ()
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        missing = [name for name, module in modules.items() if isinstance(module, PPMissingLayer)]
+        local = [name for name in requested if not any(name.startswith(prefix + ".") for prefix in missing)]
+        self._local_w4a8_fallback_layers = tuple(local)
+        invalid = [name for name in local if not isinstance(modules.get(name), LinearBase)]
+        if invalid:
+            raise ValueError(
+                "w4a8_fallback_layers requires exact runtime Linear paths relative to each Wan transformer; "
+                f"unknown/non-Linear paths: {invalid}. Use attn1.to_qkv for fused self-attention, "
+                "not checkpoint attn1.to_q/to_k/to_v names."
+            )
+
+    def _log_w4a8_fallback_load_summary(self, component_name: str) -> None:
+        """Log post-load transforms/cache readiness, not numerical acceptance."""
+        requested = self._w4a8_fallback_layers
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        local = self._local_w4a8_fallback_layers
+        selected = [name for name in local if getattr(modules[name].quant_method, "w4a8_fallback_layer", False)]
+        bf16 = [name for name in local if name not in selected]
+        processed = [
+            name for name in selected if getattr(modules[name], "_already_called_process_weights_after_loading", False)
+        ]
+        processing_state = (
+            "not-required" if not selected else "ready" if len(processed) == len(selected) else "not-ready"
+        )
+
+        def qualified(names: Iterable[str]) -> list[str]:
+            return [f"{component_name}.{name}" for name in names]
+
+        logger.info(
+            "Wan W4A8 post-load summary: component=%s; selected=%d %s; BF16 overrides=%d %s; "
+            "weight/A8 processing state=%s (%d/%d selected layers processed); other PP ranks=%d",
+            component_name,
+            len(selected),
+            qualified(selected),
+            len(bf16),
+            qualified(bf16),
+            processing_state,
+            len(processed),
+            len(selected),
+            len(requested) - len(local),
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1155,7 +1209,22 @@ class WanTransformer3DModel(nn.Module):
         }
 
         params_dict = dict(self.named_parameters())
+        single_scale_prefixes = {
+            name
+            for name, module in self.named_modules()
+            if isinstance(getattr(module, "quant_method", None), NPUMxfp4LinearMethod)
+        }
+
+        def reject_dualscale_tensor(name: str) -> None:
+            if name.endswith(".weight_dual_scale") and name.rsplit(".", 1)[0] in single_scale_prefixes:
+                raise ValueError(
+                    f"Single-scale mxfp4 cannot load DualScale tensor {name}; "
+                    "changing quant_method does not convert a checkpoint."
+                )
+
         loaded_params: set[str] = set()
+        loaded_qkv_shards: dict[str, set[str]] = {}
+        qkv_smooth_scales: dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
             name = weight_name_remapping.get(name, name)
@@ -1166,15 +1235,32 @@ class WanTransformer3DModel(nn.Module):
             # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
             # through to the else branch and are loaded directly.
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if f"{weight_name}." not in original_name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
+                lookup_name = original_name.replace(f"{weight_name}.", f"{param_name}.", 1)
+                reject_dualscale_tensor(lookup_name)
                 # Skip weights that belong to PP stages other than this one
                 if is_pp_missing_parameter(lookup_name, self) or lookup_name not in params_dict:
                     break
                 param = params_dict[lookup_name]
+                if lookup_name.endswith(".mul_scale"):
+                    previous_scale = qkv_smooth_scales.get(lookup_name)
+                    if previous_scale is not None and not torch.equal(previous_scale, loaded_weight):
+                        raise ValueError(f"Fused Q/K/V must share the same Smooth tensor: {lookup_name}")
+                    if previous_scale is None:
+                        qkv_smooth_scales[lookup_name] = loaded_weight.clone()
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(original_name)
+                if getattr(param, "output_dim", None) is None and not getattr(param, "needs_scalar_to_array", False):
+                    # Shared input-channel Smooth is a complete tensor even
+                    # when supplied under a single Q/K/V source name.
+                    loaded_params.add(lookup_name)
+                else:
+                    shards = loaded_qkv_shards.setdefault(lookup_name, set())
+                    shards.add(shard_id)
+                    if shards == {"q", "k", "v"}:
+                        loaded_params.add(lookup_name)
                 break
             else:
                 # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
@@ -1198,6 +1284,7 @@ class WanTransformer3DModel(nn.Module):
                 if is_pp_missing_parameter(lookup_name, self):
                     continue
 
+                reject_dualscale_tensor(lookup_name)
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
                     continue
@@ -1222,8 +1309,6 @@ class WanTransformer3DModel(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-            loaded_params.add(original_name)
-            loaded_params.add(lookup_name)
+                loaded_params.update((original_name, lookup_name))
 
         return loaded_params

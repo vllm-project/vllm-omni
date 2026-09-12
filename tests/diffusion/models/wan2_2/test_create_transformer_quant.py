@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for transformer quant-config auto-detection.
 
 The loader path at pipeline_wan2_2.py carries two quantization contracts:
@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import create_transformer_from_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -381,3 +382,169 @@ def test_pipeline_cascade_mxfp4_dualscale_each_transformer_gets_correct_ignored_
 
     # od_config must remain unchanged — _create_transformer does not modify it.
     assert od_config.quantization_config is None
+
+
+def _construct_quantized_pipeline(pipeline_kind, active, disk_quant_config, tmp_path, monkeypatch):
+    import json
+
+    import torch
+
+    import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v as i2v_module
+    import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace as vace_module
+
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.is_npu", lambda: True)
+    for component in ("transformer", "transformer_2"):
+        directory = tmp_path / component
+        directory.mkdir()
+        config = dict(_MIN_CFG)
+        if disk_quant_config is not None:
+            config["quantization_config"] = disk_quant_config
+        (directory / "config.json").write_text(json.dumps(config))
+    (tmp_path / "model_index.json").write_text(json.dumps({"transformer_2": ["diffusers", "WanTransformer3DModel"]}))
+
+    class FakeComponent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(scale_factor_temporal=4, scale_factor_spatial=8)
+
+    class FakeTransformer(FakeComponent):
+        def __init__(self, quant_config=None, **kwargs):
+            super().__init__()
+            self.received_quant_config = quant_config
+
+    for module in (wan22_module, i2v_module):
+        monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+        monkeypatch.setattr(module, "prefetch_subfolders", lambda *args, **kwargs: None)
+        monkeypatch.setattr(module, "from_pretrained_with_prefetch", lambda *args, **kwargs: FakeComponent())
+    monkeypatch.setattr(wan22_module, "WanTransformer3DModel", FakeTransformer)
+    monkeypatch.setattr(vace_module, "WanVACETransformer3DModel", FakeTransformer)
+    pipeline_cls = {
+        "t2v": wan22_module.Wan22Pipeline,
+        "i2v": i2v_module.Wan22I2VPipeline,
+        "vace": vace_module.Wan22VACEPipeline,
+    }[pipeline_kind]
+    monkeypatch.setattr(pipeline_cls, "setup_diffusion_pipeline_profiler", lambda *args, **kwargs: None)
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        dtype=torch.bfloat16,
+        quantization_config=active,
+        boundary_ratio=0.875,
+        flow_shift=12.0,
+        enable_diffusion_pipeline_profiler=False,
+    )
+    pipeline = pipeline_cls(od_config=od_config)
+    return pipeline
+
+
+@pytest.mark.parametrize("pipeline_kind", ["t2v", "i2v", "vace"])
+@pytest.mark.parametrize("method, flag", [("mxfp4", "is_checkpoint_mxfp4_serialized")])
+@pytest.mark.parametrize("offline", [False, True])
+def test_pipeline_constructor_routes_each_expert_quantization(
+    pipeline_kind, method, flag, offline, tmp_path, monkeypatch, mocker
+):
+    """Run the actual pipeline constructors, expert factories and quant-method dispatch."""
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+    from vllm_omni.quantization import build_quant_config
+
+    active = build_quant_config(
+        {
+            "transformer": {
+                "method": method,
+                "w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"],
+                "w4a8_fallback_steps": [0, 1],
+            },
+            "transformer_2": {
+                "method": method,
+                "w4a8_fallback_layers": ["blocks.11.attn1.to_qkv"],
+                "w4a8_fallback_steps": [],
+            },
+        }
+    )
+    disk_quant_config = None
+    if offline:
+        disk_quant_config = {
+            "quant_method": method,
+            flag: True,
+            "ignored_layers": ["blocks.12.ffn.net_2"],
+            "w4a8_fallback_layers": ["blocks.9.attn1.to_qkv"],
+            "w4a8_fallback_steps": [9],
+        }
+    pipeline = _construct_quantized_pipeline(pipeline_kind, active, disk_quant_config, tmp_path, monkeypatch)
+    for index, transformer in enumerate((pipeline.transformer, pipeline.transformer_2)):
+        received = transformer.received_quant_config
+        assert received.get_name() == method
+        assert getattr(received, flag) == offline
+        assert received.w4a8_fallback_steps == ([0, 1] if index == 0 else [])
+        selected = f"blocks.{10 + index}.attn1.to_qkv"
+        other = f"blocks.{11 - index}.attn1.to_qkv"
+        assert received.w4a8_fallback_layers == [selected]
+        assert received.get_quant_method(mocker.Mock(spec=LinearBase), selected).w4a8_fallback_layer
+        assert not received.get_quant_method(mocker.Mock(spec=LinearBase), other).w4a8_fallback_layer
+        if offline:
+            assert isinstance(
+                received.get_quant_method(mocker.Mock(spec=LinearBase), "blocks.12.ffn.net_2"), UnquantizedLinearMethod
+            )
+    assert pipeline.od_config.quantization_config is active
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_pipeline_disabled_component_requires_unquantized_checkpoint(explicit_none, monkeypatch):
+    from vllm_omni.quantization import build_quant_config
+
+    FakeTransformer, captured = _make_fake_transformer()
+    monkeypatch.setattr(wan22_module, "WanTransformer3DModel", FakeTransformer)
+    components = {"transformer": {"method": "mxfp4"}, "transformer_2": None} if explicit_none else {"vae": None}
+    active = build_quant_config(components)
+    pipeline = _FakePipeline(OmniDiffusionConfig(model="", quantization_config=active))
+    pipeline._create_transformer(_MIN_CFG, component="transformer_2")
+    assert captured[-1].get("quant_config") is None
+    with pytest.raises(ValueError, match="disabled for component 'transformer_2'"):
+        pipeline._create_transformer(
+            {**_MIN_CFG, "quantization_config": {"quant_method": "mxfp4", "is_checkpoint_mxfp4_serialized": True}},
+            component="transformer_2",
+        )
+
+
+def test_pipeline_component_default_reaches_expert_factory(monkeypatch):
+    from vllm_omni.quantization import build_quant_config
+
+    FakeTransformer, captured = _make_fake_transformer()
+    monkeypatch.setattr(wan22_module, "WanTransformer3DModel", FakeTransformer)
+    active = build_quant_config({"default": {"method": "mxfp4", "w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"]}})
+    pipeline = _FakePipeline(OmniDiffusionConfig(model="", quantization_config=active))
+    pipeline._create_transformer(_MIN_CFG, component="transformer_2")
+    assert captured[-1]["quant_config"] is active.default_config
+
+
+@pytest.mark.parametrize("pipeline_kind", ["t2v", "i2v", "vace"])
+@pytest.mark.parametrize(
+    "configured_expert, with_default",
+    [
+        ("transformer", False),
+        ("transformer", True),
+        ("transformer_2", False),
+        ("transformer_2", True),
+    ],
+)
+def test_pipeline_partial_expert_config_does_not_match_sibling(
+    pipeline_kind, configured_expert, with_default, tmp_path, monkeypatch
+):
+    from vllm_omni.quantization import build_quant_config
+
+    component_spec = {
+        configured_expert: {"method": "mxfp4", "w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"]},
+    }
+    if with_default:
+        component_spec["default"] = {"method": "mxfp4", "w4a8_fallback_layers": ["blocks.11.attn1.to_qkv"]}
+    active = build_quant_config(component_spec)
+    pipeline = _construct_quantized_pipeline(pipeline_kind, active, None, tmp_path, monkeypatch)
+    sibling = "transformer_2" if configured_expert == "transformer" else "transformer"
+    selected = getattr(pipeline, configured_expert).received_quant_config
+    other = getattr(pipeline, sibling).received_quant_config
+    assert selected is active.component_configs[configured_expert]
+    assert other is active.default_config
+    if with_default:
+        assert other.w4a8_fallback_layers == ["blocks.11.attn1.to_qkv"]
+    else:
+        assert other is None

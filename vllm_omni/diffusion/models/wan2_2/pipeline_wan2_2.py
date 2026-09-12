@@ -59,11 +59,15 @@ FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
-        return FlowUniPCMultistepScheduler(
+        # Native Wan builds unshifted training sigma endpoints, then applies
+        # the requested shift once when setting the inference timesteps.
+        scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
+        scheduler.set_shift(flow_shift)
+        return scheduler
     if sample_solver == "euler":
         return WanEulerScheduler(
             num_train_timesteps=1000,
@@ -177,8 +181,39 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
+def resolve_wan_transformer_quant_config(
+    config: dict, quant_config: QuantizationConfig | None, component: str
+) -> QuantizationConfig | None:
+    """Resolve the expert before applying its checkpoint's storage contract."""
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    # Wan experts are siblings: "transformer_2" must not inherit "transformer"
+    # through the generic layer-prefix resolver. Select the whole expert name.
+    resolved = (
+        quant_config.component_configs.get(component, quant_config.default_config)
+        if isinstance(quant_config, ComponentQuantizationConfig)
+        else quant_config
+    )
+    disabled = isinstance(quant_config, ComponentQuantizationConfig) and resolved is None
+    if getattr(resolved, "native_checkpoint_path", None) is not None and config.get("quantization_config"):
+        raise ValueError("native_checkpoint_path requires an unquantized BF16 Diffusers model as the original source")
+    checkpoint_config = resolve_quant_config_from_disk(resolved, config.get("quantization_config"))
+    if disabled and checkpoint_config is not None:
+        raise ValueError(
+            f"Quantization is disabled for component {component!r}, but its checkpoint declares quantization. "
+            "Use a BF16 checkpoint for this component or enable its matching quantization method."
+        )
+    return checkpoint_config
+
+
 def create_transformer_from_config(
-    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+    prefix: str = "",
+    *,
+    component: str = "transformer",
+    original_model_path: str | None = None,
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -214,17 +249,20 @@ def create_transformer_from_config(
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
 
-    if "quantization_config" in config:
-        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+    quant_config = resolve_wan_transformer_quant_config(config, quant_config, component)
+    if getattr(quant_config, "native_checkpoint_path", None) is not None:
+        from vllm_omni.diffusion.model_loader.checkpoint_adapters.mxfp4_native import prepare_native_mxfp4
 
-        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
+        quant_config = prepare_native_mxfp4(quant_config, original_model_path, component)
 
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
     if prefix:
         kwargs["prefix"] = prefix
 
-    return WanTransformer3DModel(**kwargs)
+    transformer = WanTransformer3DModel(**kwargs)
+    transformer._native_mxfp4_checkpoint = getattr(quant_config, "native_checkpoint", None)
+    return transformer
 
 
 def get_wan22_post_process_func(
@@ -458,13 +496,13 @@ class Wan22Pipeline(
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
-            self.transformer = self._create_transformer(transformer_config)
+            self.transformer = self._create_transformer(transformer_config, component="transformer")
         else:
             self.transformer = None
 
         if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = self._create_transformer(transformer_2_config)
+            self.transformer_2 = self._create_transformer(transformer_2_config, component="transformer_2")
         else:
             self.transformer_2 = None
 
@@ -502,10 +540,15 @@ class Wan22Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+    def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_transformer_from_config(config, quant_config=quant_config)
+        return create_transformer_from_config(
+            config,
+            quant_config=quant_config,
+            component=component,
+            original_model_path=getattr(self.od_config, "model", None),
+        )
 
     @property
     def guidance_scale(self):
