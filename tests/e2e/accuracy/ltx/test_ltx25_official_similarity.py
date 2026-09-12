@@ -127,6 +127,30 @@ def test_ltx_reference_runner_unwraps_flattened_pipeline_output() -> None:
     assert _omni_worker_peak_memory_mb([output]) == 12_345.0
 
 
+def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
+    from .run_ltx25_reference import _connector_weight_files
+
+    connector_root = tmp_path / "connectors"
+    connector_root.mkdir()
+    single_file = connector_root / "diffusion_pytorch_model.safetensors"
+    shard_1 = connector_root / "diffusion_pytorch_model-00001-of-00002.safetensors"
+    shard_2 = connector_root / "diffusion_pytorch_model-00002-of-00002.safetensors"
+    for path in (single_file, shard_1, shard_2):
+        path.touch()
+    (connector_root / "diffusion_pytorch_model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "audio_connector.weight": shard_2.name,
+                    "video_connector.weight": shard_1.name,
+                }
+            }
+        )
+    )
+
+    assert _connector_weight_files(tmp_path) == [shard_1, shard_2]
+
+
 def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> None:
     start = time.perf_counter()
     subprocess.run(command, env=env, timeout=timeout, check=True)

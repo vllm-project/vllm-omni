@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Example script for text-to-audio generation with diffusion audio models.
 
 This script supports:
   * Stable Audio Open (`stabilityai/stable-audio-open-1.0`) — text-to-audio.
+  * LTX-2.5 (`Lightricks/LTX-2.5-Diffusers`) — text-to-audio with
+    `--model-class-name LTX2TextToAudioPipeline`.
 
 Model-specific generation knobs can be passed via `--extra-body` and are
 merged into `sampling_params.extra_args`.
@@ -49,7 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default="stabilityai/stable-audio-open-1.0",
-        help="Audio diffusion model name or local path. Supported: stabilityai/stable-audio-open-1.0.",
+        help="Audio diffusion model name or local path.",
+    )
+    parser.add_argument(
+        "--model-class-name",
+        default=None,
+        help="Explicit diffusion pipeline class (for example, LTX2TextToAudioPipeline).",
     )
     parser.add_argument(
         "--prompt",
@@ -269,6 +276,8 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         enable_layerwise_offload=args.enable_layerwise_offload,
     )
+    if args.model_class_name:
+        omni_kwargs["model_class_name"] = args.model_class_name
     omni = Omni(**omni_kwargs)
 
     diffusion_params = OmniDiffusionSamplingParams(
@@ -321,6 +330,7 @@ def main():
     audio = request_output.multimodal_output.get("audio")
     if audio is None:
         raise ValueError("No audio output found in request_output")
+    output_sample_rate = int(request_output.multimodal_output.get("audio_sample_rate", args.sample_rate))
 
     if isinstance(audio, torch.Tensor):
         audio = audio.cpu().float().numpy()
@@ -330,25 +340,25 @@ def main():
         # [batch, channels, samples]
         if args.num_waveforms <= 1:
             audio_data = audio[0].T  # [samples, channels]
-            save_audio(audio_data, str(output_path), args.sample_rate)
+            save_audio(audio_data, str(output_path), output_sample_rate)
             print(f"Saved generated audio to {output_path}")
         else:
             for idx in range(audio.shape[0]):
                 audio_data = audio[idx].T  # [samples, channels]
                 save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-                save_audio(audio_data, str(save_path), args.sample_rate)
+                save_audio(audio_data, str(save_path), output_sample_rate)
                 print(f"Saved generated audio to {save_path}")
     elif audio.ndim == 2:
         # [channels, samples]
         audio_data = audio.T  # [samples, channels]
-        save_audio(audio_data, str(output_path), args.sample_rate)
+        save_audio(audio_data, str(output_path), output_sample_rate)
         print(f"Saved generated audio to {output_path}")
     else:
         # [samples] - mono audio
-        save_audio(audio, str(output_path), args.sample_rate)
+        save_audio(audio, str(output_path), output_sample_rate)
         print(f"Saved generated audio to {output_path}")
 
-    print(f"\nGenerated ~{args.audio_length}s of audio at {args.sample_rate} Hz")
+    print(f"\nGenerated ~{args.audio_length}s of audio at {output_sample_rate} Hz")
 
 
 if __name__ == "__main__":

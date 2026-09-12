@@ -378,6 +378,16 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         default=0.0,
         description="Audio start time in seconds",
     )
+    num_frames: int | None = Field(
+        default=None,
+        ge=1,
+        description="Exact generation frame count for pipelines that support frame-based duration",
+    )
+    frame_rate: float | None = Field(
+        default=None,
+        gt=0,
+        description="Frame rate used with num_frames by pipelines that support frame-based duration",
+    )
     negative_prompt: str | None = Field(
         default=None,
         description="Negative prompt for classifier-free guidance",
@@ -393,6 +403,22 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         ge=1,
         le=1000,
         description="Number of inference steps",
+    )
+    audio_cfg_scale: float | None = Field(
+        default=None,
+        description="LTX audio classifier-free guidance scale",
+    )
+    audio_stg_scale: float | None = Field(
+        default=None,
+        description="LTX audio spatio-temporal guidance scale",
+    )
+    audio_rescale_scale: float | None = Field(
+        default=None,
+        description="LTX audio guidance rescale scale",
+    )
+    sigmas: list[float] | None = Field(
+        default=None,
+        description="Custom LTX denoising sigma schedule",
     )
     seed: int | None = Field(
         default=None,

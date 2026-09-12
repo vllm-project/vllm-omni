@@ -311,6 +311,8 @@ steps:
             pytest -sv
             tests/e2e/online_serving/test_ltx.py
             tests/e2e/online_serving/test_ltx25.py
+            tests/e2e/online_serving/test_ltx25_audio.py
+            tests/e2e/offline_inference/test_ltx25_audio.py
             tests/e2e/accuracy/ltx/test_ltx_official_similarity.py
             tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py
             -m "slow and diffusion and H100 and cards_1"

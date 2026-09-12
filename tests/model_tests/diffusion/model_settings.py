@@ -49,6 +49,13 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
     ),
+    "LTX2TextToAudioPipeline": DiffusionModelTestOpts(
+        model="Lightricks/LTX-2",
+        builder=diff_model_builders.tiny_ltx2_audio_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_AUDIO],
+        check_multi_output=False,
+        check_determinism=False,
+    ),
     "SanaVideoPipeline": DiffusionModelTestOpts(
         model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
         builder=diff_model_builders.tiny_sana_video_builder,
