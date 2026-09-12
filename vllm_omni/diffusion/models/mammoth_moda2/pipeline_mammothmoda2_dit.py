@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -191,8 +193,12 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         text_mask = questions_mask & ~(visual_token_mask | gen_token_mask)
         image_mask = answers_mask & gen_token_mask
 
-        text_cond = full_hidden_states[text_mask].to(dtype=torch.float32).contiguous()
-        image_cond = full_hidden_states[image_mask].to(dtype=torch.float32).contiguous()
+        # Keep the transferred representation compact until the final device/dtype
+        # conversion in ``forward``.  The masks are dtype-independent, and an
+        # unconditional host-side float32 expansion here would otherwise double both
+        # the selected-condition staging footprint and BF16 H2D traffic.
+        text_cond = full_hidden_states[text_mask].contiguous()
+        image_cond = full_hidden_states[image_mask].contiguous()
         return text_cond, image_cond
 
     @torch.inference_mode()

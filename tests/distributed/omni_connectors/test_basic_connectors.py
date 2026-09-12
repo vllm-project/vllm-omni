@@ -33,6 +33,18 @@ def test_tensor_serialization():
     assert torch.equal(tensor, deserialized)
 
 
+def test_bfloat16_tensor_serialization():
+    """The raw tensor serializer preserves the Mammoth BF16 wire dtype."""
+    import torch
+
+    tensor = torch.tensor([[1.0, -2.5], [3.25, 4.5]], dtype=torch.bfloat16)
+    serialized = OmniSerializer.serialize({"text_prompt_embeds": tensor})
+    deserialized = OmniSerializer.deserialize(serialized)
+
+    assert deserialized["text_prompt_embeds"].dtype == torch.bfloat16
+    assert torch.equal(deserialized["text_prompt_embeds"], tensor)
+
+
 def test_noncontiguous_tensor_serialization():
     """Test torch.Tensor serialization for strided views."""
     import torch
