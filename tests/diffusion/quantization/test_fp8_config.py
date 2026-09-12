@@ -17,6 +17,57 @@ def test_build_quant_config_fp8():
     assert config.activation_scheme == "dynamic"
 
 
+def test_build_quant_config_fp8_per_block_online_shorthand():
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Static128BlockSym,
+    )
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8_per_block")
+
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args.linear is not None
+    assert config.args.linear.weight == kFp8Static128BlockSym
+    assert config.args.moe is not None
+    assert config.args.moe.weight == kFp8Static128BlockSym
+
+
+def test_build_quant_config_online_explicit_linear_config():
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Static128BlockSym,
+    )
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config(
+        {
+            "method": "online",
+            "linear": "fp8_per_block",
+            "ignore": ["vae"],
+        }
+    )
+
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args.linear is not None
+    assert config.args.linear.weight == kFp8Static128BlockSym
+    assert config.args.moe is None
+    assert config.ignored_layers == ["vae"]
+
+
+def test_build_quant_config_online_requires_spec():
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="Online quantization requires"):
+        build_quant_config("online")
+
+
 def test_build_quant_config_none():
     from vllm_omni.quantization import build_quant_config
 
@@ -160,6 +211,23 @@ def test_integration_string():
     config = OmniDiffusionConfig(model="test", quantization_config="fp8")
     assert config.quantization_config is not None
     assert config.quantization_config.get_name() == "fp8"
+
+
+def test_integration_online_shorthand():
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Static128BlockSym,
+    )
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    config = OmniDiffusionConfig(model="test", quantization_config="fp8_per_block")
+
+    assert isinstance(config.quantization_config, OnlineQuantizationConfig)
+    assert config.quantization_config.args.linear is not None
+    assert config.quantization_config.args.linear.weight == kFp8Static128BlockSym
 
 
 def test_integration_dict():

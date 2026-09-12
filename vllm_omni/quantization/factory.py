@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from types import ModuleType
 from typing import Any
 
+from vllm.config.quantization import resolve_quantization_config
 from vllm.logger import init_logger
 
 
@@ -329,6 +330,14 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
         raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
 
     config_cls = get_quantization_config(method)
+
+    if config_cls.get_name() == "online":
+        args = resolve_quantization_config(method, kwargs or None)
+        if args is None:
+            raise ValueError(
+                "Online quantization requires a shorthand such as 'fp8_per_block' or an explicit linear/moe config."
+            )
+        return config_cls(args=args)
 
     try:
         return config_cls(**kwargs)
