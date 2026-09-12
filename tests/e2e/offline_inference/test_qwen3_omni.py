@@ -20,7 +20,7 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
-thinker_only_models = ["Qwen/Qwen3-Omni-30B-A3B-Captioner"]
+thinker_only_models = ["Qwen/Qwen3-Omni-30B-A3B-Captioner", "Qwen/Qwen3-Omni-30B-A3B-Thinking"]
 
 # Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
 # platforms: section. Only CUDA needs an extra enforce_eager tweak.
