@@ -19,12 +19,14 @@ from tests.model_tests.diffusion.config_types import (
 from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
 from tests.model_tests.diffusion.task_runners import (
     run_and_validate_online_determinism,
+    run_and_validate_online_image_edits,
     run_and_validate_online_image_to_image_request,
     run_and_validate_online_image_to_video_request,
     run_and_validate_online_multi_output,
     run_and_validate_online_text_to_image_request,
     run_and_validate_online_text_to_video_request,
 )
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
 # NOTE : Hardware marks are added dynamically based on test requirements
 pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
@@ -66,6 +68,21 @@ def test_online_on_supported_tasks(
                     run_and_validate_online_text_to_image_request(server, client)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:
                     run_and_validate_online_image_to_image_request(server, client)
+                    max_multimodal_image_inputs = (
+                        get_diffusion_model_metadata(model_name).max_multimodal_image_inputs or 1
+                    )
+                    image_counts = [1]
+                    if max_multimodal_image_inputs != 1:
+                        image_counts.append(max_multimodal_image_inputs)
+                    image_counts.append(max_multimodal_image_inputs + 1)
+                    for num_images in image_counts:
+                        with subtests.test(api="/v1/images/edits", num_images=num_images):
+                            run_and_validate_online_image_edits(
+                                server,
+                                client,
+                                num_images=num_images,
+                                max_multimodal_image_inputs=max_multimodal_image_inputs,
+                            )
                 elif task_type == DiffusionTasks.TEXT_TO_VIDEO:
                     run_and_validate_online_text_to_video_request(server, client)
                 elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
