@@ -53,7 +53,7 @@ docker run --rm \
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone -b v0.29.0 https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.29.0rc1 https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e . --no-build-isolation
 # or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
