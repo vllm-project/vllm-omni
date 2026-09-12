@@ -12,6 +12,7 @@ MagiCompiler and external Triton runtime dependencies.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 
 import torch
@@ -19,7 +20,12 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.layers.mhc import MHCMix, MHCPostResidual, sinkhorn_knopp
+
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
+
+_mhc_post_residual = MHCPostResidual()
+_mhc_mix = MHCMix()
 
 
 def swiglu7(
@@ -329,14 +335,6 @@ class ElementWiseFourierEmbed(nn.Module):
 MHCTensorTuple = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
-def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float) -> torch.Tensor:
-    matrix = torch.exp(matrix_logits - matrix_logits.amax(dim=(-2, -1), keepdim=True))
-    for _ in range(iterations):
-        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon)
-        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon)
-    return matrix
-
-
 class MHCHandler:
     """Exact four-stream manifold-constrained hyper-connection math."""
 
@@ -397,13 +395,23 @@ class MHCHandler:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         alpha_post, bias_post, post_logits = post
         alpha_residual, bias_residual, residual_logits = residual
-        post_coefficients = 2.0 * torch.sigmoid(alpha_post * self.matmul_scale * post_logits + bias_post.unsqueeze(0))
-        residual_matrix = sinkhorn_knopp(
-            alpha_residual * self.matmul_scale * residual_logits.float() + bias_residual.unsqueeze(0).float(),
-            self.sinkhorn_iterations,
-            self.sinkhorn_epsilon,
+        prepare = (
+            _mhc_post_residual
+            if not torch.compiler.is_compiling() and os.environ.get("MAGI2_USE_FUSED_MHC", "0") == "1"
+            else _mhc_post_residual.forward_native
         )
-        return post_coefficients.to(out_dtype), residual_matrix.to(out_dtype)
+        return prepare(
+            post_logits,
+            residual_logits,
+            alpha_post,
+            bias_post,
+            alpha_residual,
+            bias_residual,
+            scale=self.matmul_scale,
+            iterations=self.sinkhorn_iterations,
+            epsilon=self.sinkhorn_epsilon,
+            out_dtype=out_dtype,
+        )
 
     def hyper_connect(
         self,
@@ -415,9 +423,12 @@ class MHCHandler:
         self._check_multi(residual_streams)
         if branch_output.ndim != 2 or branch_output.shape[-1] != self.hidden_size:
             raise ValueError("invalid mHC branch-output shape")
-        branch = torch.einsum("tn,tc->tnc", post_coefficients, branch_output)
-        mixed = torch.einsum("tij,tjc->tic", residual_matrix, residual_streams)
-        return mixed + branch
+        mix = (
+            _mhc_mix
+            if not torch.compiler.is_compiling() and os.environ.get("MAGI2_USE_FUSED_MHC", "0") == "1"
+            else _mhc_mix.forward_native
+        )
+        return mix(residual_streams, branch_output, post_coefficients, residual_matrix)
 
     def _check_multi(self, tensor: torch.Tensor) -> None:
         expected = (self.num_streams, self.hidden_size)
