@@ -27,6 +27,27 @@ The `adapter_config.json` file contains metadata about the LoRA adapter, includi
 - `lora_alpha`: LoRA alpha scaling factor
 - `target_modules`: List of module names to apply LoRA to
 
+### SenseNova-U1 Official LoRAs
+
+The official `sensenova/SenseNova-U1-8B-MoT-LoRAs` release uses a single-file
+layout with `lora_down`, `lora_up`, and per-layer `alpha` tensors. Convert the
+checkpoint to the PEFT directory layout before passing it to vLLM-Omni:
+
+```bash
+hf download sensenova/SenseNova-U1-8B-MoT-LoRAs \
+  SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors \
+  --local-dir /path/to/sensenova-lora
+
+python tools/sensenova_u1/convert_lora_to_peft.py \
+  /path/to/sensenova-lora/SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors \
+  /path/to/sensenova-lora/peft
+```
+
+Use `/path/to/sensenova-lora/peft` as `lora_path` or in a `LoRARequest`. The
+converter validates that every target has paired weights and that the adapter
+uses a single rank and alpha before writing `adapter_model.safetensors` and
+`adapter_config.json`.
+
 ## Quick Start
 
 ### Offline Inference
