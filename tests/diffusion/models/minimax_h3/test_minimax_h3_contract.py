@@ -1035,6 +1035,56 @@ def test_packed_attention_rejects_backends_without_multi_doc_capability(backend_
         )
 
 
+def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
+    """Regression for the #5543 follow-up crash fixed in #7235.
+
+    MiniMax-H3 pads every packed request to a multiple of 64 rows, so any
+    non-64-aligned length reaches this path with used < packed_total. Before
+    RAINFUSION_ATTN advertised supports_prefix_kv_slicing, the model built a
+    padding mask here that _assert_metadata_compatible then rejected at the
+    first sparse layer. This drives the real backend class (not a fake flag)
+    through the packed path; both the sparse dispatch and the dense fallback
+    share this metadata construction and neither ever reads attn_mask.
+    """
+    from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
+        RainFusionAttentionBackend,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = RainFusionAttentionBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        # One request: 5 valid rows padded to the 8-row alignment boundary.
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+
+
 def test_reference_image_resize_contract():
     from PIL import Image
 

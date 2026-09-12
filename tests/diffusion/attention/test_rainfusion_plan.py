@@ -139,7 +139,7 @@ def test_validate_available_rejects_legacy_mindiesd(monkeypatch):
     def sparse_attention(query, key, value, **kwargs):
         return query
 
-    mindiesd.sparse_attention = sparse_attention
+    mindiesd.sparse_attention = sparse_attention  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
     monkeypatch.setattr("importlib.util.find_spec", lambda _: object())
 
@@ -153,11 +153,23 @@ def test_validate_available_accepts_new_mindiesd(monkeypatch):
     def sparse_attention(query, key, value, *, video_spans=None, **kwargs):
         return query
 
-    mindiesd.sparse_attention = sparse_attention
+    mindiesd.sparse_attention = sparse_attention  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
     monkeypatch.setattr("importlib.util.find_spec", lambda _: object())
 
     RainFusionAttentionBackend.validate_available()
+
+
+def test_prefix_kv_slicing_contract_is_pinned():
+    # Regression pin for the #5543 packed-padding crash: reverting the flag
+    # would pass CI while reintroducing the ValueError for non-64-aligned
+    # requests. Both halves of the contract must hold together — the impl
+    # trims [real, pad] packed tensors to the valid prefix itself (so it may
+    # advertise prefix slicing) and it never reads attn_mask (so it must keep
+    # refusing one), which is what lets the model skip materializing the
+    # padding mask that _assert_metadata_compatible would reject.
+    assert RainFusionAttentionBackend.supports_prefix_kv_slicing is True
+    assert RainFusionAttentionBackend.supports_attention_mask() is False
 
 
 @pytest.mark.parametrize("grid", [(4, 24, 40), (1, 24, 40)])
@@ -300,7 +312,7 @@ def _fake_mindiesd_module():
     import types
 
     fake = types.ModuleType("mindiesd")
-    fake.sparse_attention = lambda *args, **kwargs: None
+    fake.sparse_attention = lambda *args, **kwargs: None  # type: ignore[attr-defined]
     return fake
 
 
