@@ -476,7 +476,7 @@ class OmniMRotaryEmbedding(_BaseMRotaryEmbedding):
             idx += len(new_src_item) - new_src_item_len
 
         llm_positions = torch.cat(llm_pos_ids_list, dim=1)
-        mrope_position_delta = torch.cat(llm_pos_ids_list, dim=1).max() + 1 - len(src_item)
+        mrope_position_delta = llm_positions.max() + 1 - len(src_item)
         llm_positions = llm_positions[:, context_len:seq_len]
 
         return llm_positions, mrope_position_delta
