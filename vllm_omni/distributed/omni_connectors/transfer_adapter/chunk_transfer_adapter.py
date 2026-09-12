@@ -16,6 +16,12 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.metrics.duplex_frame_timing import (
+    duplex_frame_timing_enabled,
+    log_frame_timing,
+    pop_chunk_put_age_ms,
+    record_chunk_put,
+)
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -479,6 +485,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
+        timing_on = duplex_frame_timing_enabled()
+        get_t0 = time.perf_counter() if timing_on else 0.0
         try:
             result = self.connector.get(
                 str(target_stage_id),
@@ -497,6 +505,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
+
+        if timing_on:
+            log_frame_timing(
+                "connector_get",
+                key=connector_get_key,
+                stage=stage_id,
+                bytes=int(result[1]) if isinstance(result, tuple) else 0,
+                wrap_ms=(time.perf_counter() - get_t0) * 1e3,
+                handoff_ms=pop_chunk_put_age_ms(connector_get_key),
+            )
 
         with self._receiver_state_lock:
             # cleanup_receiver() can run while connector.get() is in flight.
@@ -789,12 +807,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
             return
 
+        timing_on = duplex_frame_timing_enabled()
+        put_t0 = time.perf_counter() if timing_on else 0.0
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+        if timing_on:
+            record_chunk_put(connector_put_key)
+            log_frame_timing(
+                "connector_put",
+                key=connector_put_key,
+                stage=stage_id,
+                ok=bool(success),
+                bytes=int(size or 0),
+                wrap_ms=(time.perf_counter() - put_t0) * 1e3,
+            )
 
         with self._sender_state_lock:
             if sender_token is not None:

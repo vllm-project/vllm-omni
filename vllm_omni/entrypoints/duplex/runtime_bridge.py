@@ -24,6 +24,11 @@ from vllm_omni.entrypoints.duplex.runtime_adapter import (
     coerce_int,
     payload_turn_id,
 )
+from vllm_omni.metrics.duplex_frame_timing import (
+    duplex_frame_timing_enabled,
+    get_tick_pacer,
+    log_frame_timing,
+)
 
 logger = init_logger(__name__)
 
@@ -745,7 +750,26 @@ class NativeRuntimeBridgeMixin:
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context(session)
+        timing_on = duplex_frame_timing_enabled()
         for native_result in self._serving_runtime_adapter.data_plane.project(result, context=context):
+            if timing_on and isinstance(native_result, dict):
+                duration_ms = native_result.get("audio_duration_ms")
+                if isinstance(duration_ms, (int, float)) and duration_ms > 0:
+                    period_ms = session.capabilities.chunk_period_ms or 80
+                    frames = max(1, round(duration_ms / period_ms))
+                    jitter_s, drift_s = get_tick_pacer("emit", session.session_id, period_ms / 1000).observe(
+                        ticks=frames
+                    )
+                    log_frame_timing(
+                        "audio_emit",
+                        session=session.session_id,
+                        epoch=session.epoch,
+                        request_id=request_id,
+                        frames=frames,
+                        duration_ms=duration_ms,
+                        jitter_ms=None if jitter_s is None else jitter_s * 1e3,
+                        drift_ms=drift_s * 1e3,
+                    )
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                 send_json,
                 native_result,
