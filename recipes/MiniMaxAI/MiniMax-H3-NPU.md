@@ -9,24 +9,15 @@
 - Model: [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3)
 - Tasks: T2VA, FL2VA, and Ref2VA
 - Mode: OpenAI-compatible `/v1/videos` HTTP serving
-- Hardware: Atlas 800I A3
+- Hardware: Atlas 800I A2 / Atlas 800I A3
 - Maintainer: Community
-
-This recipe adapts [MiniMax-H3.md](MiniMax-H3.md) for Ascend NPU
-environments. Differences from the GPU path:
-
-- Runs on a CPU-only (aarch64) PyTorch build with `torch_npu`; no CUDA
-  runtime is present.
-- Audio loading does **not** require TorchCodec (whose aarch64 wheels are
-  built against CUDA torch and fail to load on CPU-only builds). vLLM-Omni
-  automatically falls back to soundfile / ffmpeg for wav/mp3/m4a/mp4 audio
-  inputs.
 
 ## Prerequisites
 
 ### Checkpoint
 
-Same as the GPU recipe — Hugging Face access approval is required. Authenticate
+Same as the [GPU recipe](MiniMax-H3.md) — Hugging Face access approval is
+required. Authenticate
 once; `vllm serve` downloads the required nested components automatically:
 
 ```bash
@@ -36,28 +27,27 @@ export MODEL=MiniMaxAI/MiniMax-H3
 
 ### Environment
 
+See the
+[official NPU installation guide](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/npu/#build-wheel-from-source)
+for details. As a quick start, the
+[vllm_omni image registry](https://quay.io/repository/ascend/vllm-omni?tab=info)
+provides base images for Atlas 800I A2 / Atlas 800I A3 — for example, pull the
+Atlas 800I A3 image `quay.io/atlas-ci/vllm-ascend:v0.26.0-a3`, which ships the
+following versions:
+
 - Ascend driver & firmware: 25.5.1
-- CANN toolkit: 9.0.1
+- CANN toolkit: 9.1.0
 - Python: 3.12
-- PyTorch: 2.10.0+cpu
-- torch_npu: 2.10.0.post2
-- Install vLLM-Omni from a checkout with MiniMax H3 support:
+- PyTorch: 2.10.0
+- torch_npu: 2.10.0
 
-```bash
-uv venv
-source .venv/bin/activate
-uv pip install -e .
-```
-
-Install the **mindie-sd** operator library to enable Ascend-optimized fused
-operators (`adalayernorm`, etc.) and the RainFusion `rf_v2` block-sparse
-attention kernel:
+Install **[MindIE-SD from source](https://gitcode.com/Ascend/MindIE-SD/blob/dev/examples/minimax-h3/infer.md)**. The optimizations in
+this recipe — the FLASH_ATTN backend, the optional LaserAttention fused
+kernel, and the RainFusion `rf_v2` block-sparse attention — rely on
+MindIE-SD's fused inference attention operators.
 
 ```bash
 git clone https://gitcode.com/Ascend/MindIE-SD.git && cd MindIE-SD
-
-# Comment out the tik_ops build step (not needed for this use case)
-sed -i 's|^\(\s*\)source ${current_script_dir}/build_tik_ops.sh|\1# source ${current_script_dir}/build_tik_ops.sh|' build/build_ops.sh
 
 python setup.py bdist_wheel
 cd dist
@@ -73,27 +63,36 @@ pip install mindiesd-*.whl
 
 ## Start a server
 
-Pass the repository ID directly. The pipeline loads the two nested DiTs while
-sharing the tokenizer, processor, text encoder, and VAEs from `FL2VA`.
+Pass the repository ID directly. `MiniMaxAI/MiniMax-H3` bundles the `FL2VA`
+and `Ref2VA` weight sets as subdirectories, and the server cannot infer from
+the repository ID alone which one to load. `--task-type` selects the startup
+partition: `t2va` / `fl2va` loads the `FL2VA` weights, `ref2va` loads the
+`Ref2VA` weights. Each service loads one task-specific DiT together with the
+tokenizer, processor, text encoder, and VAEs from the selected partition.
 
-### Multi-NPU: 768P combined-service configuration
+### Atlas 800I A2 / Atlas 800I A3
 
-Use Ulysses sequence parallelism degree 8, text-encoder tensor parallelism
-degree 8, native tiled VAE patch parallelism degree 8, and distributed
-layerwise offload:
+The recommended 8-NPU server command below uses Ulysses sequence parallelism
+degree 8, text-encoder tensor parallelism degree 8, distributed layerwise
+offload, and native tiled VAE patch parallelism degree 8.
+
+#### Recommended configuration (Atlas 800I A2 / A3)
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PORT=9098
 export MODEL=MiniMaxAI/MiniMax-H3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
 export PYTHONDONTWRITEBYTECODE=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export MINDIE_SD_FA_TYPE="ascend_laser_attention"
+export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
   --port "${PORT}" \
+  --task-type t2va \
   --trust-remote-code \
   --num-gpus 8 \
   --usp 8 \
@@ -103,6 +102,20 @@ vllm serve "${MODEL}" \
   --vae-parallel-mode tile \
   --vae-use-tiling \
   --vae-patch-parallel-size 8 \
+  --diffusion-attention-config '{"default": {"backend": "RAINFUSION_ATTN",
+      "block_sparse": {"sparsity": 0.8, "start_step": 12}}}'
+```
+
+Keep `--ring 1` when using RainFusion: the `rf_v2` kernel ranks key blocks
+over the whole sequence, so ring parallelism would split away the keys it
+needs. Scale with `--usp` instead.
+
+When starting the Ref2VA service, load the `Ref2VA` weights with
+`--task-type ref2va` and replace the `--diffusion-attention-config` flag above
+with:
+
+```bash
+  --task-type ref2va \
   --diffusion-attention-backend FLASH_ATTN
 ```
 
@@ -110,13 +123,42 @@ Do not add `--enforce-eager`. The first request includes regional
 compilation; warm the server once before measuring steady-state latency.
 H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 
-The same endpoint accepts `task=t2va`, `task=fl2va`, and `task=ref2va`; no
-partition restart is required. Layerwise offload applies to both DiTs.
+An `FL2VA` partition service accepts `task=t2va` and `task=fl2va`; a `Ref2VA`
+partition service accepts `task=ref2va`. Switching partitions requires a
+separate service process or a restart with the corresponding `--task-type`.
+Layerwise offload applies to the active DiT.
 
-On Atlas 800I A3 (64 GB HBM per device) the combined service does not fit at
-768P without offloading or sharding: use distributed layerwise offload (as
-above) or HSDP — see
+On Atlas 800I A3 (64 GB HBM per device), use distributed layerwise offload (as
+above) for the validated 768P deployment — see
 [§ Memory and attention optimizations](#memory-and-attention-optimizations-a3).
+
+#### Other optional performance optimizations
+
+The following subsections list only the **incremental or replacement flags**
+relative to the [Recommended configuration](#recommended-configuration-atlas-800i-a2--a3);
+environment variables and all other server flags remain unchanged.
+
+##### Enable Cache-DiT
+
+Append the following flags to the end of the server command to enable DiT
+block caching with TaylorSeer extrapolation:
+
+```bash
+  --cache-backend cache_dit \
+  --enable-cache-dit-summary \
+  --cache-config '{"Fn_compute_blocks":2,"Bn_compute_blocks":1,"max_warmup_steps":4,"residual_diff_threshold":0.4,"max_continuous_cached_steps":4,"enable_taylorseer":true,"taylorseer_order":2}'
+```
+
+##### Enable INT8 online quantization
+
+Append `--diffusion-quantization-config '{"transformer":{"method":"int8"}}'`
+after `--text-encoder-tp-size 8`, and append `--dlo-no-use-allgather` for
+distributed layerwise offload:
+
+```bash
+  --diffusion-quantization-config '{"transformer":{"method":"int8"}}' \
+  --dlo-no-use-allgather
+```
 
 ### CPU MP4 response encoding (Atlas A2)
 
@@ -133,35 +175,12 @@ time, 1344x768 at 24 fps, and 5, 8.7, and 15 second requests. This optimization
 only changes CPU MP4 response encoding; it does not change DiT execution or
 stage 0.
 
-### Optional optimizations
-
-Two independent optimizations may be enabled on top of the configuration
-above. Both are validated for T2VA only.
-
-**RainFusion block-sparse attention** — switch the attention backend, keeping
-every other flag unchanged:
-
-```bash
-  --diffusion-attention-backend RAINFUSION_ATTN
-```
-
-**INT8 online quantization** — add one flag to the server command above:
-
-```bash
-  --quantization int8
-```
-
-Keep `--ring 1` when using RainFusion: the `rf_v2` kernel ranks key blocks
-over the whole sequence, so ring parallelism would split away the keys it
-needs. Scale with `--usp` instead.
-
 ## Memory and attention optimizations (A3)
 
-### Fitting 768P into 64 GB HBM: distributed layerwise offload or HSDP
+### Fitting 768P into 64 GB HBM: distributed layerwise offload
 
-Each Atlas 800I A3 NPU has 64 GB of HBM, which is not enough for the
-combined MiniMax-H3 service at 768P. Enable **one** of the following at
-server startup:
+Each Atlas 800I A3 NPU has 64 GB of HBM. For the validated 768P deployment,
+enable **one** of the following at server startup:
 
 **Distributed layerwise offload** — DiT layers are offloaded with parameters
 gathered across the parallel group instead of replicated per rank:
@@ -169,24 +188,6 @@ gathered across the parallel group instead of replicated per rank:
 ```bash
   --enable-distributed-layerwise-offload
 ```
-
-Measured peak NPU memory is about 45 GB per device for Ref2VA with a 13.88 s
-input video generating a 15 s 768P (1344x768) output video. Host (CPU) memory
-usage is high with this option.
-
-**HSDP** — hybrid sharded data parallelism for the DiT parameters. The
-multi-stream memory-reuse knob is mandatory with this flag:
-
-```bash
-export MULTI_STREAM_MEMORY_REUSE=2
-```
-
-```bash
-  --use-hsdp
-```
-
-Host memory usage is small, but large shapes may still OOM; HBM usage
-optimizations for this path are ongoing.
 
 ### FLASH_ATTN backend with MindIE-SD
 
@@ -211,7 +212,6 @@ exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
 kernel's fp16 workspace cannot overflow on outlier activations. Measured
 speedup numbers will be added here.
 
-
 ## HTTP API examples
 
 The request format is identical to the GPU recipe; see
@@ -226,8 +226,8 @@ The validated resolution on NPU is 768P (e.g. 1344x768).
 
 ## Validated NPU evidence
 
-Measured on an Atlas 800I A3 server (8x NPU) with CANN 9.0.1,
-PyTorch 2.10.0+cpu, and torch_npu 2.10.0.post2, using the multi-NPU
+Measured on an Atlas 800I A3 server (8x NPU) with CANN 9.1.0,
+PyTorch 2.10.0+cpu, and torch_npu 2.10.0.post2, using the recommended
 configuration above:
 
 | Workload | Configuration |
@@ -237,6 +237,23 @@ configuration above:
 
 These measurements describe the validated shapes rather than a general
 throughput guarantee.
+
+## Performance benchmark (Atlas 800I A3)
+
+| NPUs | Workload | Parallelism | Precision | Input | Output | E2E (s) | Per step (s) |
+| ---: | --- | --- | ---: | --- | --- | ---: | ---: |
+| 8 | T2VA | TP8 + USP8, DLO | bf16 | prompt | 768P, 5s | 97.84 | 1.87 |
+| 8 | T2VA | TP8 + USP8, DLO | bf16 | prompt | 768P, 10s | 245.77 | 4.75 |
+| 8 | T2VA | TP8 + USP8, DLO | bf16 | prompt | 768P, 15s | 448.19 | 8.75 |
+| 8 | FL2VA | TP8 + USP8, DLO | bf16 | prompt + first frame | 768P, 5s | 117.23 | 2.18 |
+| 8 | FL2VA | TP8 + USP8, DLO | bf16 | prompt + first frame | 768P, 10s | 278.94 | 5.43 |
+| 8 | FL2VA | TP8 + USP8, DLO | bf16 | prompt + first frame | 768P, 15s | 489.05 | 9.61 |
+| 8 | Ref2VA | TP8 + USP8, DLO | bf16 | prompt + 5s reference video | 768P, 5s | 343.95 | 6.55 |
+| 8 | Ref2VA | TP8 + USP8, DLO | bf16 | prompt + 10s reference video | 768P, 10s | 1088.93 | 21.40 |
+| 8 | Ref2VA | TP8 + USP8, DLO | bf16 | prompt + 15s reference video | 768P, 15s | 2333.15 | 46.60 |
+
+All the figures above were measured with the
+[Recommended configuration](#recommended-configuration-atlas-800i-a2--a3).
 
 ## Known limitations
 
