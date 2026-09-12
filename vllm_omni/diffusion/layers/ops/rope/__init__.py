@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Compatibility exports for the shared Q/K RMSNorm + RoPE operation.
+"""Shared rotary-position operations for diffusion models."""
 
-The canonical implementation lives under :mod:`vllm_omni.diffusion.layers.ops`.
-Keep this module as a forwarding shim for existing consumers of the original
-import path.
-"""
-
-from vllm_omni.diffusion.layers.ops import (
+from vllm_omni.diffusion.layers.ops.rope.qk_norm_rope import (
     fused_qk_norm_rope,
     fused_qk_norm_rope_min_tokens,
     fused_qk_norm_rope_supported,
