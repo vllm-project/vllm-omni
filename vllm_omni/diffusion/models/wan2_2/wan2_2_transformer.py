@@ -984,7 +984,7 @@ class WanTransformer3DModel(nn.Module):
 
         # ROPE helper
         self._cached_rope_emb = None
-        self._cached_rope_resolution = None
+        self._cached_rope_key = None
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1009,12 +1009,13 @@ class WanTransformer3DModel(nn.Module):
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
         current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
-        if self._cached_rope_resolution == current_rope_resolution and self._cached_rope_emb is not None:
+        cache_key = (*current_rope_resolution, hidden_states.device, hidden_states.dtype)
+        if self._cached_rope_key == cache_key and self._cached_rope_emb is not None:
             rotary_emb = self._cached_rope_emb
         else:
             freqs_cos, freqs_sin = self.rope(hidden_states)
             rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
-            self._hidden_states_shape = hidden_states.shape
+            self._cached_rope_key = cache_key
             self._cached_rope_emb = rotary_emb
 
         if is_pipeline_first_stage():
