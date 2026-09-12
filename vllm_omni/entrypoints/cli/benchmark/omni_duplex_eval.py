@@ -5,13 +5,23 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
+import sys
 from pathlib import Path
+
+from vllm.benchmarks.serve import TaskType
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, load_samples
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import generate_sample
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
+    DuplexGenerationResult,
+    generate_sample_with_metrics,
+)
+from vllm_omni.benchmarks.metrics.metrics import build_stage_metrics_from_snapshots, print_stage_metrics
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
+
+_STAGE_PERCENTILE_METRICS = ["ttft", "tpot", "itl", "audio_ttfp", "audio_duration"]
+_STAGE_PERCENTILES = [99.0]
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -37,6 +47,11 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     generate.add_argument("--clock", choices=("media",), default="media")
     generate.add_argument("--concurrency", type=int, default=1)
     generate.add_argument("--overwrite", action="store_true")
+    generate.add_argument(
+        "--print-stage",
+        action="store_true",
+        help="Print aggregated per-stage metrics from samples generated in this run.",
+    )
     evaluate = actions.add_parser("evaluate")
     _common(evaluate)
     evaluate.add_argument("--response-root", required=True)
@@ -71,12 +86,12 @@ def run(args: argparse.Namespace) -> int:
         if args.concurrency < 1:
             raise ValueError("--concurrency must be at least 1")
 
-        async def generate() -> None:
+        async def generate() -> list[DuplexGenerationResult]:
             semaphore = asyncio.Semaphore(args.concurrency)
 
-            async def generate_one(sample) -> None:
+            async def generate_one(sample) -> DuplexGenerationResult:
                 async with semaphore:
-                    await generate_sample(
+                    return await generate_sample_with_metrics(
                         sample,
                         url=args.url,
                         model=args.model,
@@ -87,11 +102,36 @@ def run(args: argparse.Namespace) -> int:
                         pace=args.pace,
                         clock=args.clock,
                         overwrite=args.overwrite,
+                        collect_stage_metrics=args.print_stage,
                     )
 
-            await asyncio.gather(*(generate_one(sample) for sample in samples))
+            return await asyncio.gather(*(generate_one(sample) for sample in samples))
 
-        asyncio.run(generate())
+        results = asyncio.run(generate())
+        if args.print_stage:
+            skipped = sum(not result.generated for result in results)
+            if skipped:
+                print(
+                    f"Stage metrics are unavailable for {skipped} skipped sample(s); "
+                    "use --overwrite to regenerate them.",
+                    file=sys.stderr,
+                )
+            snapshots = [
+                stage_snapshot
+                for result in results
+                if result.generated
+                for stage_snapshot in result.stage_metrics_by_response.values()
+            ]
+            stages = build_stage_metrics_from_snapshots(snapshots)
+            if not stages and any(result.generated for result in results):
+                print("No stage metrics were returned for samples generated in this run.", file=sys.stderr)
+            for stage in stages:
+                print_stage_metrics(
+                    TaskType.GENERATION,
+                    _STAGE_PERCENTILE_METRICS,
+                    _STAGE_PERCENTILES,
+                    stage,
+                )
         return 0
 
     if args.eval_workers < 1:

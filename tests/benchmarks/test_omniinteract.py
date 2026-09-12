@@ -23,7 +23,7 @@ from vllm.benchmarks.serve import TaskType
 from vllm_omni.benchmarks import omniinteract as oi
 from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
-from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
+from vllm_omni.benchmarks.metrics.metrics import _build_stage_metrics_from_outputs, calculate_metrics
 from vllm_omni.benchmarks.patch import patch as benchmark_patch
 from vllm_omni.clients.duplex import EventCollector
 from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
@@ -723,6 +723,98 @@ async def test_adapter_reports_exact_or_weighted_token_timing(
     assert output.itl == expected_itl
     assert output.text_latency == pytest.approx(expected_text_latency)
     assert output.tpot_measured is expected_tpot_measured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("print_stage", [False, True])
+async def test_adapter_preserves_multi_turn_stage_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], print_stage: bool
+):
+    case, options = _case(tmp_path), _session_options(tmp_path)
+    request = _request(case, options)
+    request.omniinteract_prepared_input = data.OmniInteractPreparedInput(
+        1.0, b"pcm", ("frame",), "data:audio/wav;base64,ref"
+    )
+    collector = EventCollector()
+    stage0 = {"stage_name": "thinker", "final_output_type": "text", "output_unit_type": "token"}
+    stage1 = {
+        "stage_name": "audio",
+        "final_output_type": "audio",
+        "output_unit_type": "audio",
+        "audio_duration_s": 0.5,
+        "audio_frames": 12000,
+    }
+    snapshots = [
+        ("r1", {"0": {**stage0, "num_tokens_out": 5}, "1": stage1}),
+        ("r1", {"0": {**stage0, "num_tokens_out": 20, "vllm_ttft_ms": 100.0}}),
+        ("r2", {"0": {**stage0, "num_tokens_out": 30, "vllm_ttft_ms": 300.0}}),
+        ("r3", {}),
+        ("r4", {"1": stage1}),
+    ]
+    for index, (response_id, stage_snapshot) in enumerate(snapshots):
+        if response_id not in collector.response_ids:
+            collector.add(_created(response_id), received_at_s=float(index))
+        if index == 0:
+            event = {
+                "type": "response.output_text.delta",
+                "response_id": response_id,
+                "delta": "hello",
+                "metadata": {"vllm_omni": {"stage_metrics": stage_snapshot}},
+            }
+        else:
+            event = {
+                "type": "response.done",
+                "response": {"id": response_id, "metadata": {"vllm_omni": {"stage_metrics": stage_snapshot}}},
+            }
+        collector.add(event, received_at_s=index + 0.5)
+
+    async def run(*args, **kwargs):
+        result = oi.OmniInteractCaseResult(case.subset, str(case.video_path), str(options.output_root), success=True)
+        oi._populate_response_metrics(result, collector, stream_start=0.0)
+        return result
+
+    monkeypatch.setattr(benchmark_patch, "run_omniinteract_case", run)
+    output = await benchmark_patch.async_request_openai_realtime_duplex(request, session=None)
+    assert output.success, output.error
+    assert output.output_tokens == 50
+    assert output.stage_metrics_by_response == {
+        "r1": {"0": snapshots[1][1]["0"], "1": stage1},
+        "r2": snapshots[2][1],
+        "r4": snapshots[4][1],
+    }
+    stages = _build_stage_metrics_from_outputs([output])
+    assert [stage.stage_id for stage in stages] == [0, 1]
+    assert stages[0].stage_name == "thinker"
+    assert stages[0].total_output == 50
+    assert stages[0].vllm_ttfts == [0.1, 0.3]
+    assert stages[0].ttfts == []
+    assert stages[0].stage_gen_times_ms == []
+    assert stages[0].postprocess_times_ms == []
+    assert stages[1].audio_durations == [0.5, 0.5]
+    assert stages[1].audio_frames == [12000, 12000]
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["ttft"],
+        max_concurrency=1,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+        print_stage=print_stage,
+    )
+    assert metrics.completed == 1
+    assert metrics.request_throughput == pytest.approx(0.1)
+    stdout = capsys.readouterr().out
+    assert ("Stage Benchmark Result" in stdout) is print_stage
+    if print_stage:
+        assert "thinker" in stdout
+        assert "Stage generated tokens:" in stdout
+        assert "200.00" in stdout
 
 
 def test_batch_finalization_publishes_only_measured_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

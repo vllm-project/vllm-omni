@@ -21,7 +21,7 @@ from vllm_omni.entrypoints.cli.benchmark.omni_duplex_eval import OmniDuplexEvalS
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
-def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+def _write_manifest(tmp_path: Path) -> Path:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
         json.dumps(
@@ -36,6 +36,32 @@ def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytes
         ),
         encoding="utf-8",
     )
+    return manifest
+
+
+def _generate_args(manifest: Path, response_root: Path, *extra: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    return parser.parse_args(
+        [
+            "generate",
+            "--dataset",
+            str(manifest),
+            "--family",
+            "pr",
+            "--model",
+            "mock",
+            "--ref-audio",
+            str(manifest),
+            "--response-root",
+            str(response_root),
+            *extra,
+        ]
+    )
+
+
+def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    manifest = _write_manifest(tmp_path)
     response_root = tmp_path / "responses"
     score_root = tmp_path / "scores"
 
@@ -44,7 +70,7 @@ def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytes
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps([{"sentence": "It moved.", "start": 0, "end": 1}]), encoding="utf-8")
         output.with_name(output.stem + ".meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
-        return output
+        return runner.DuplexGenerationResult(output, {}, generated=True)
 
     class FakeJudge:
         def __init__(self, *args, **kwargs):
@@ -53,7 +79,7 @@ def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytes
         def chat(self, *args, **kwargs):
             return '{"success_score": 1, "is_relevant": 1}'
 
-    monkeypatch.setattr(cli, "generate_sample", fake_generate)
+    monkeypatch.setattr(cli, "generate_sample_with_metrics", fake_generate)
     monkeypatch.setattr(cli, "DuplexJudge", FakeJudge)
 
     parser = argparse.ArgumentParser()
@@ -97,6 +123,109 @@ def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytes
     assert summary["pr"]["mean_all_success"] == 1.0
 
 
+def test_cli_print_stage_aggregates_generated_responses_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    manifest = _write_manifest(tmp_path)
+
+    async def fake_generate(sample, *, output_root, collect_stage_metrics, **kwargs):
+        assert collect_stage_metrics is True
+        output = Path(output_root) / sample.split / f"{sample.id}.json"
+        snapshot = {
+            "stage_name": "thinker",
+            "final_output_type": "text",
+            "output_unit_type": "text",
+        }
+        return runner.DuplexGenerationResult(
+            output,
+            {
+                "response-1": {
+                    "0": {
+                        **snapshot,
+                        "num_tokens_out": 20,
+                        "serving_time_to_first_output_ms": 100.0,
+                    }
+                },
+                "response-2": {
+                    "0": {
+                        **snapshot,
+                        "num_tokens_out": 30,
+                        "serving_time_to_first_output_ms": 300.0,
+                    }
+                },
+            },
+            generated=True,
+        )
+
+    monkeypatch.setattr(cli, "generate_sample_with_metrics", fake_generate)
+    OmniDuplexEvalSubcommand.cmd(_generate_args(manifest, tmp_path / "responses", "--print-stage"))
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("Stage 0 (thinker)") == 1
+    assert "Stage generated tokens:" in captured.out
+    assert "50" in captured.out
+    assert "Mean Serving TTFT (ms):" in captured.out
+    assert "200.00" in captured.out
+
+
+def test_cli_print_stage_explains_skipped_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
+    manifest = _write_manifest(tmp_path)
+
+    async def fake_generate(sample, *, output_root, **kwargs):
+        output = Path(output_root) / sample.split / f"{sample.id}.json"
+        return runner.DuplexGenerationResult(output, {}, generated=False)
+
+    monkeypatch.setattr(cli, "generate_sample_with_metrics", fake_generate)
+    OmniDuplexEvalSubcommand.cmd(_generate_args(manifest, tmp_path / "responses", "--print-stage"))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "use --overwrite to regenerate" in captured.err
+    assert "No stage metrics were returned" not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_generate_with_metrics_marks_existing_output_as_skipped(tmp_path: Path):
+    output = tmp_path / "responses" / "PR_correction" / "sample.json"
+    output.parent.mkdir(parents=True)
+    output.write_text("[]", encoding="utf-8")
+    sample = DuplexSample(
+        "sample",
+        "PR_correction",
+        "pr",
+        "correction",
+        tmp_path / "missing-video.mp4",
+        tmp_path / "missing-audio.wav",
+    )
+
+    result = await runner.generate_sample_with_metrics(
+        sample,
+        url="ws://127.0.0.1:1/v1/realtime?duplex=1",
+        model="mock",
+        ref_audio=tmp_path / "missing-ref.wav",
+        output_root=tmp_path / "responses",
+        collect_stage_metrics=True,
+    )
+
+    assert result.output_path == output
+    assert result.generated is False
+    assert result.stage_metrics_by_response == {}
+
+
+@pytest.mark.asyncio
+async def test_generate_sample_returns_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    output = tmp_path / "response.json"
+
+    async def fake_generate(*args, **kwargs):
+        return runner.DuplexGenerationResult(output, {}, generated=True)
+
+    monkeypatch.setattr(runner, "generate_sample_with_metrics", fake_generate)
+    result = await runner.generate_sample(
+        None, url="ws://unused", model="mock", ref_audio="unused", output_root=tmp_path
+    )
+
+    assert result == output
+
+
 @pytest.mark.asyncio
 async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import websockets
@@ -127,7 +256,23 @@ async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path
                     )
                 )
             elif event["type"] == "input_audio_buffer.commit":
-                await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r1"}}))
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "response.done",
+                            "response": {"id": "r1"},
+                            "vllm_omni": {
+                                "stage_metrics": {
+                                    "0": {
+                                        "stage_name": "thinker",
+                                        "final_output_type": "text",
+                                        "num_tokens_out": 4,
+                                    }
+                                }
+                            },
+                        }
+                    )
+                )
             elif event["type"] == "session.close":
                 await websocket.send(json.dumps({"type": "session.closed"}))
                 return
@@ -144,18 +289,31 @@ async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path
 
     async with websockets.serve(handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
-        output = await runner.generate_sample(
+        result = await runner.generate_sample_with_metrics(
             sample,
             url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
             model="mock",
             ref_audio=ref,
             output_root=tmp_path / "responses",
+            collect_stage_metrics=True,
         )
 
+    output = result.output_path
     assert json.loads(output.read_text(encoding="utf-8")) == [{"sentence": "Done.", "start": 0.8, "end": 0.8}]
     meta = json.loads(output.with_name("sample.meta.json").read_text(encoding="utf-8"))
     assert meta["response_done"] is True
     assert meta["drain_timeout"] is None
+    session_update = next(event for event in received if event["type"] == "session.update")
+    assert session_update["session"]["extra_body"]["return_stage_metrics"] is True
+    assert result.stage_metrics_by_response == {
+        "r1": {
+            "0": {
+                "stage_name": "thinker",
+                "final_output_type": "text",
+                "num_tokens_out": 4,
+            }
+        }
+    }
     assert any(event["type"] == "playback.ack" for event in received)
 
 

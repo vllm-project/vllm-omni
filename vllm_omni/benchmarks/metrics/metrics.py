@@ -669,26 +669,36 @@ def print_stage_metrics(
 def _build_stage_metrics_from_outputs(
     outputs: list[RequestFuncOutput],
 ) -> list[StageBenchmarkMetrics]:
-    """Aggregate per ``stage_id`` using ``stage_metrics`` snapshots from the client."""
-    buckets: dict[str, list[tuple[RequestFuncOutput, dict]]] = defaultdict(list)
+    """Aggregate final snapshots per stage, with one sample per duplex response."""
+    snapshots: list[dict[str, dict]] = []
     for out in outputs:
         if not getattr(out, "success", False):
             continue
-        smap = getattr(out, "stage_metrics", None) or {}
-        if not isinstance(smap, dict) or not smap:
-            continue
+        by_response = getattr(out, "stage_metrics_by_response", None)
+        # An empty per-response mapping must not fall back to stage_metrics.
+        output_snapshots = by_response.values() if by_response is not None else [getattr(out, "stage_metrics", None)]
+        snapshots.extend(smap for smap in output_snapshots if isinstance(smap, dict))
+    return build_stage_metrics_from_snapshots(snapshots)
+
+
+def build_stage_metrics_from_snapshots(
+    snapshots: Sequence[dict[str, dict]],
+) -> list[StageBenchmarkMetrics]:
+    """Aggregate stage snapshots, treating every mapping as one response."""
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for smap in snapshots:
         for sid, info in smap.items():
             if isinstance(info, dict):
-                buckets[str(sid)].append((out, info))
+                buckets[str(sid)].append(info)
 
     result: list[StageBenchmarkMetrics] = []
     for sid in sorted(buckets.keys(), key=lambda x: int(x)):
         rows = buckets[sid]
         stage_id_int = int(sid)
-        stage_name = str((rows[0][1] or {}).get("stage_name") or f"stage_{stage_id_int}")
-        final_output_type = str((rows[0][1] or {}).get("final_output_type") or "unknown")
+        stage_name = str((rows[0] or {}).get("stage_name") or f"stage_{stage_id_int}")
+        final_output_type = str((rows[0] or {}).get("final_output_type") or "unknown")
         output_unit_types = [
-            str((info or {}).get("output_unit_type") or "") for _, info in rows if (info or {}).get("output_unit_type")
+            str((info or {}).get("output_unit_type") or "") for info in rows if (info or {}).get("output_unit_type")
         ]
         output_unit_type = output_unit_types[0] if output_unit_types else "other"
 
@@ -703,25 +713,29 @@ def _build_stage_metrics_from_outputs(
         vllm_ttfts: list[float] = []
         vllm_tpots: list[float] = []
         vllm_itls: list[float] = []
-        stage_gen_times_ms = [float((info or {}).get(defs.STAGE_GEN_TIME_MS) or 0.0) for _, info in rows]
-        postprocess_times_ms = [float((info or {}).get(defs.POSTPROCESS_TIME_MS) or 0.0) for _, info in rows]
-        output_unit_count = sum(int((info or {}).get(defs.OUTPUT_UNIT_COUNT) or 0) for _, info in rows)
+        stage_gen_times_ms = [
+            float(info[defs.STAGE_GEN_TIME_MS]) for info in rows if info.get(defs.STAGE_GEN_TIME_MS) is not None
+        ]
+        postprocess_times_ms = [
+            float(info[defs.POSTPROCESS_TIME_MS]) for info in rows if info.get(defs.POSTPROCESS_TIME_MS) is not None
+        ]
+        output_unit_count = sum(int((info or {}).get(defs.OUTPUT_UNIT_COUNT) or 0) for info in rows)
         inter_output_latencies_ms: list[float] = []
         serving_time_to_first_outputs_ms: list[float] = []
         time_per_output_units_ms: list[float] = []
         if is_text_stage or is_internal_stream_stage:
             serving_time_to_first_outputs_ms = [
                 float((info or {}).get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS) or 0.0)
-                for _, info in rows
+                for info in rows
                 if (info or {}).get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS) is not None
             ]
             time_per_output_units_ms = [
                 float((info or {}).get(defs.TIME_PER_OUTPUT_UNIT_MS) or 0.0)
-                for _, info in rows
+                for info in rows
                 if int((info or {}).get(defs.OUTPUT_UNIT_COUNT) or 0) > 1
                 and (info or {}).get(defs.TIME_PER_OUTPUT_UNIT_MS) is not None
             ]
-            for _, info in rows:
+            for info in rows:
                 values = (info or {}).get(defs.INTER_OUTPUT_LATENCIES_MS)
                 if isinstance(values, list):
                     inter_output_latencies_ms.extend(float(v or 0.0) for v in values)
@@ -729,7 +743,7 @@ def _build_stage_metrics_from_outputs(
                     inter_output_latencies_ms.append(float((info or {}).get(defs.INTER_OUTPUT_LATENCY_MS) or 0.0))
 
         if is_text_stage:
-            for _, info in rows:
+            for info in rows:
                 ttft_ms = float((info or {}).get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS) or 0.0)
                 if ttft_ms > 0:
                     ttfts.append(ttft_ms / 1000.0)
@@ -752,14 +766,14 @@ def _build_stage_metrics_from_outputs(
                     vllm_itls.extend(float(v or 0.0) / 1000.0 for v in vllm_values)
                 elif (info or {}).get(defs.VLLM_ITL_MS) is not None:
                     vllm_itls.append(float((info or {}).get(defs.VLLM_ITL_MS) or 0.0) / 1000.0)
-            total_output = sum(int((info or {}).get(defs.NUM_TOKENS_OUT) or 0) for _, info in rows)
+            total_output = sum(int((info or {}).get(defs.NUM_TOKENS_OUT) or 0) for info in rows)
 
         audio_ttfps: list[float] = []
         audio_durations: list[float] = []
         audio_frames: list[int] = []
         missing_audio_duration_count = 0
         if is_audio_stage:
-            for _, info in rows:
+            for info in rows:
                 audio_ttfp_ms = float((info or {}).get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS) or 0.0)
                 if audio_ttfp_ms > 0:
                     audio_ttfps.append(audio_ttfp_ms / 1000.0)

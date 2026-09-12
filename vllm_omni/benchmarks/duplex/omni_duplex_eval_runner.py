@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +20,21 @@ from .omni_duplex_eval_clock import extract_timed_sentences
 from .omni_duplex_eval_media import iter_av_units, iter_jpegs, materialize_media, read_audio_pcm16, video_duration
 
 
+@dataclass(frozen=True)
+class DuplexGenerationResult:
+    """Artifacts and in-memory metrics produced by one generation run."""
+
+    output_path: Path
+    stage_metrics_by_response: dict[str, dict[str, dict[str, object]]]
+    generated: bool
+
+
 def _ref_audio(path: str | Path) -> str:
     value = Path(path).expanduser().read_bytes()
     return "data:audio/wav;base64," + base64.b64encode(value).decode("ascii")
 
 
-async def generate_sample(
+async def generate_sample_with_metrics(
     sample: Any,
     *,
     url: str,
@@ -37,11 +47,12 @@ async def generate_sample(
     clock: str = "media",
     overwrite: bool = False,
     unit_ms: int = 1000,
-) -> Path:
+    collect_stage_metrics: bool = False,
+) -> DuplexGenerationResult:
     output = Path(output_root) / sample.split / f"{sample.id}.json"
     meta_path = output.with_name(output.stem + ".meta.json")
     if output.exists() and not overwrite:
-        return output
+        return DuplexGenerationResult(output, {}, generated=False)
     if mix != "question":
         raise NotImplementedError("v1 supports mix=question; soundtrack mixing is reserved for P1")
     media_dir = output.parent / ".media"
@@ -58,7 +69,12 @@ async def generate_sample(
     drain_timeout = None
     close_timeout = None
     async with client:
-        await client.configure(model, ref_audio=_ref_audio(ref_audio), instructions="Streaming Omni Conversation.")
+        await client.configure(
+            model,
+            ref_audio=_ref_audio(ref_audio),
+            instructions="Streaming Omni Conversation.",
+            extra_body={"return_stage_metrics": True} if collect_stage_metrics else None,
+        )
         ack_task = asyncio.create_task(_ack_playback(client))
         try:
             await client.stream_av_units(iter_av_units(pcm, frames, unit_ms=unit_ms), realtime=realtime)
@@ -84,6 +100,13 @@ async def generate_sample(
         except TimeoutError as exc:
             close_timeout = str(exc)
         events = list(client.events.events)
+        stage_metrics_by_response: dict[str, dict[str, dict[str, object]]] = {}
+        if collect_stage_metrics:
+            for response_id in client.events.response_ids:
+                timing = client.events.timing_summary(after_s=0.0, response_id=response_id)
+                snapshots = timing.get("stage_metrics")
+                if isinstance(snapshots, dict):
+                    stage_metrics_by_response[response_id] = snapshots
     timed = [sentence.as_dict() for sentence in extract_timed_sentences(events, clock=clock)]
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(timed, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -102,7 +125,38 @@ async def generate_sample(
         "ref_audio_sha256": hashlib.sha256(Path(ref_audio).read_bytes()).hexdigest(),
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return output
+    return DuplexGenerationResult(output, stage_metrics_by_response, generated=True)
+
+
+async def generate_sample(
+    sample: Any,
+    *,
+    url: str,
+    model: str,
+    ref_audio: str | Path,
+    output_root: str | Path,
+    fps: float = 1.0,
+    mix: str = "question",
+    pace: str = "realtime",
+    clock: str = "media",
+    overwrite: bool = False,
+    unit_ms: int = 1000,
+) -> Path:
+    """Generate one response artifact while preserving the original Path API."""
+    result = await generate_sample_with_metrics(
+        sample,
+        url=url,
+        model=model,
+        ref_audio=ref_audio,
+        output_root=output_root,
+        fps=fps,
+        mix=mix,
+        pace=pace,
+        clock=clock,
+        overwrite=overwrite,
+        unit_ms=unit_ms,
+    )
+    return result.output_path
 
 
 async def _ack_playback(client: RealtimeDuplexClient) -> None:
