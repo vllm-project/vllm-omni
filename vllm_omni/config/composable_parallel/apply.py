@@ -197,7 +197,9 @@ def _check_devices(runtime: dict[str, Any], cfg: OmniParallelConfig, *, role: Ro
     )
 
 
-def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> None:
+def _apply_to_stage(
+    stage: Any, cfg: OmniParallelConfig, *, role: RoleKey, validate_devices: bool = True
+) -> None:
     engine_args = stage.yaml_engine_args
     runtime = stage.yaml_runtime
 
@@ -210,12 +212,15 @@ def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> No
     if "stage_replica" in declared:
         _set_num_replicas(runtime, cfg.stage_replica_size, role=role)
 
-    _check_devices(runtime, cfg, role=role)
+    if validate_devices:
+        _check_devices(runtime, cfg, role=role)
 
 
 def apply_strategy_specs(
     stages: list[Any],
     strategy_specs: Mapping[RoleKey, Sequence[StrategySpec]],
+    *,
+    validate_devices: bool = True,
 ) -> StrategyApplyResult:
     """Overlay per-role strategy specs onto a merged stage list.
 
@@ -224,6 +229,10 @@ def apply_strategy_specs(
         strategy_specs: maps a role (a ``model_stage`` name, e.g. ``"thinker"``)
             to that stage's stack of ``StrategySpec`` (one per declared mesh
             axis). Role keys are ``model_stage`` names (str).
+        validate_devices: run the pre-spawn device-count check against the
+            deploy-time (pre-CLI-override) ``devices``. Leave on for direct
+            callers; pass ``False`` when per-stage CLI overrides are merged
+            after this overlay and the caller re-checks devices post-merge.
 
     Returns:
         A :class:`StrategyApplyResult` with the mutated stages and the derived
@@ -232,8 +241,9 @@ def apply_strategy_specs(
     Raises:
         StrategyApplyError: a role matched zero or multiple stages, a derived
             value conflicts with an explicit deploy value (including two roles
-            deriving different ``omni_lb_policy`` values), or a stage's device
-            count is inconsistent with its world size.
+            deriving different ``omni_lb_policy`` values), or -- when
+            ``validate_devices=True`` -- a stage's device count is inconsistent
+            with its world size.
         AxisTranslationError: the spec stack is invalid/unsupported.
         NotImplementedError: the spec stack requests routing not built yet.
     """
@@ -244,7 +254,7 @@ def apply_strategy_specs(
     for key, specs in strategy_specs.items():
         stage = _resolve_stage(stages, key)
         cfg = translate_strategy_stack(specs)
-        _apply_to_stage(stage, cfg, role=key)
+        _apply_to_stage(stage, cfg, role=key, validate_devices=validate_devices)
         result.per_role_config[key] = cfg
         stage_id = getattr(stage, "stage_id", None)
         if stage_id is not None:
