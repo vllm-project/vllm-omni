@@ -90,6 +90,13 @@ depends on the installed kernels and model path.
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on` or `off`; default `on` | Streaming video output; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `on`. | Experimental |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast` or `slow`; default `fast` | Streaming video audio deltas; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `fast`. | Experimental |
 
+### NIXL stage transfer
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; default `3600` | Unclaimed producer payload expiry; connector construction | Nonempty environment value overrides `lease_seconds`; empty falls back to config/default. Invalid floats raise `ValueError`. Claimed READ allocations never expire by time. | Experimental |
+| `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; default `300` | Receiver READ wait; connector construction | Nonempty environment value overrides `transfer_timeout_s`; empty falls back to config/default. Invalid floats raise `ValueError`. Timeout does not cancel DMA or release active allocations. | Experimental |
+
 ### Server storage
 
 Storage names use Pydantic's nested-settings delimiter (`__`). They are read
