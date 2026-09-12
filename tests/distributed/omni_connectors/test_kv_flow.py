@@ -133,6 +133,7 @@ def test_manager_extraction(kv_config, mock_connector, common_constants):
     assert data["request_id"] == req_id
     assert "layer_blocks" in data
     assert len(data["layer_blocks"]["key_cache"]) == num_layers
+    assert data["metadata"]["_kv_payload_contract"] == 1
 
     # Verify shape of extracted tensor: [seq_len, heads, dim]
     # Note: Manager detaches and moves to CPU
@@ -183,6 +184,94 @@ def test_from_bytes_uses_explicit_layer_index_descriptor():
     data = KVCacheTransferData.from_bytes(payload_with_explicit_index)
 
     assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
+
+
+def _contract_payload(
+    *,
+    request_id: str = "req-contract",
+    num_layers: int = 2,
+    seq_len: int = 5,
+    block_size: int = 4,
+) -> dict:
+    key_cache = [torch.randn(seq_len, 2, 3) for _ in range(num_layers)]
+    value_cache = [torch.randn(seq_len, 2, 3) for _ in range(num_layers)]
+    return {
+        "request_id": request_id,
+        "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
+        "block_ids": list(range((seq_len + block_size - 1) // block_size)),
+        "metadata": {
+            "_kv_payload_contract": 1,
+            "num_layers": num_layers,
+            "seq_len": seq_len,
+            "block_size": block_size,
+        },
+    }
+
+
+def test_kv_payload_contract_accepts_complete_payload():
+    payload = _contract_payload()
+    KVCacheTransferData.validate_payload_contract(payload, "req-contract")
+
+
+def test_kv_payload_contract_keeps_legacy_payload_compatible():
+    payload = _contract_payload()
+    del payload["metadata"]["_kv_payload_contract"]
+    payload["layer_blocks"]["value_cache"][0] = None
+    KVCacheTransferData.validate_payload_contract(payload, "req-contract")
+
+
+def test_kv_payload_contract_cannot_be_downgraded():
+    payload = _contract_payload()
+    del payload["metadata"]["_kv_payload_contract"]
+    with pytest.raises(ValueError, match="removed during rank merge or slicing"):
+        KVCacheTransferData.validate_payload_contract(
+            payload,
+            "req-contract",
+            require_contract=True,
+        )
+
+
+def test_manager_extraction_owns_payload_contract_metadata(kv_config, common_constants):
+    block_size = common_constants["block_size"]
+    seq_len = common_constants["seq_len"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    kv_caches = [torch.randn(2, 3, block_size, num_heads, head_dim) for _ in range(common_constants["num_layers"])]
+
+    data = OmniKVTransferManager(kv_config)._extract_kv_cache(
+        common_constants["req_id"],
+        block_ids=[0, 1, 2],
+        seq_len=seq_len,
+        kv_caches=kv_caches,
+        block_size=block_size,
+        cache_dtype="float32",
+        custom_metadata={"_kv_payload_contract": 999},
+    )
+
+    assert data is not None
+    assert data.metadata["_kv_payload_contract"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (lambda payload: payload["metadata"].update(_kv_payload_contract=2), "Unsupported"),
+        (lambda payload: payload.update(request_id="wrong"), "request ID mismatch"),
+        (lambda payload: payload["metadata"].update(num_layers=3), "Incomplete KV payload layers"),
+        (lambda payload: payload["metadata"].update(seq_len=9), "block table"),
+        (lambda payload: payload["layer_blocks"]["value_cache"].pop(), "Incomplete KV payload layers"),
+        (lambda payload: payload["layer_blocks"]["value_cache"].__setitem__(0, None), "missing key or value"),
+        (
+            lambda payload: payload["layer_blocks"]["value_cache"].__setitem__(0, torch.randn(5, 1, 3)),
+            "mismatched K/V shapes",
+        ),
+    ],
+)
+def test_kv_payload_contract_rejects_incomplete_payload(mutate, error):
+    payload = _contract_payload()
+    mutate(payload)
+    with pytest.raises(ValueError, match=error):
+        KVCacheTransferData.validate_payload_contract(payload, "req-contract")
 
 
 def test_update_sender_info_uses_configured_source_stage():
@@ -275,8 +364,8 @@ def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_const
         assert data["layer_blocks"]["value_cache"][idx].shape == expected_shape
 
 
-def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector, common_constants):
-    """Mismatched key/value block counts should not crash extraction."""
+def test_manager_extraction_rejects_incomplete_kv_blocks(kv_config, mock_connector, common_constants):
+    """Never send a compacted KV sequence when a requested block is unavailable."""
     block_size = common_constants["block_size"]
     num_heads = common_constants["num_heads"]
     head_dim = common_constants["head_dim"]
@@ -286,7 +375,7 @@ def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector
     value_blocks = torch.randn(2, block_size, num_heads, head_dim)
     kv_caches = [(key_blocks, value_blocks)]
 
-    finished_reqs = {req_id: {"block_ids": [0, 1, 2], "seq_len": 32}}
+    finished_reqs = {req_id: {"block_ids": [0, 1, 2], "seq_len": 3 * block_size}}
 
     manager = OmniKVTransferManager(kv_config)
     manager._connector = mock_connector
@@ -296,12 +385,81 @@ def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector
 
     full_request_id = f"omni_stage1_to_stage2_kv_cache_{req_id}"
     expected_key = f"stage1->stage2:{full_request_id}"
-    assert expected_key in mock_connector.store
+    assert expected_key not in mock_connector.store
 
-    data = _decode_stored_payload(mock_connector.store[expected_key])
-    expected_shape = (2 * block_size, num_heads, head_dim)
-    assert data["layer_blocks"]["key_cache"][0].shape == expected_shape
-    assert data["layer_blocks"]["value_cache"][0].shape == expected_shape
+
+def test_manager_extraction_ignores_unneeded_trailing_block_ids(kv_config, common_constants):
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    req_id = common_constants["req_id"]
+
+    key_blocks = torch.arange(3 * block_size * num_heads * head_dim, dtype=torch.float32).reshape(
+        3, block_size, num_heads, head_dim
+    )
+    value_blocks = -key_blocks
+    manager = OmniKVTransferManager(kv_config)
+
+    data = manager._extract_kv_cache(
+        req_id,
+        block_ids=[2, 0, 99],
+        seq_len=2 * block_size,
+        kv_caches=[(key_blocks, value_blocks)],
+        block_size=block_size,
+        cache_dtype="float32",
+    )
+
+    assert data is not None
+    assert data.block_ids == [2, 0]
+    assert torch.equal(data.layer_blocks["key_cache"][0], torch.cat((key_blocks[2], key_blocks[0])))
+    assert torch.equal(data.layer_blocks["value_cache"][0], torch.cat((value_blocks[2], value_blocks[0])))
+
+
+@pytest.mark.parametrize("block_ids", [[0], [0, 2]])
+def test_manager_extraction_rejects_missing_required_block(
+    kv_config,
+    common_constants,
+    block_ids,
+):
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    req_id = common_constants["req_id"]
+    key_blocks = torch.randn(2, block_size, num_heads, head_dim)
+    value_blocks = torch.randn(2, block_size, num_heads, head_dim)
+
+    data = OmniKVTransferManager(kv_config)._extract_kv_cache(
+        req_id,
+        block_ids=block_ids,
+        seq_len=2 * block_size,
+        kv_caches=[(key_blocks, value_blocks)],
+        block_size=block_size,
+        cache_dtype="float32",
+    )
+
+    assert data is None
+
+
+def test_manager_extraction_rejects_missing_layer(kv_config, common_constants):
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    req_id = common_constants["req_id"]
+    valid_layer = (
+        torch.randn(1, block_size, num_heads, head_dim),
+        torch.randn(1, block_size, num_heads, head_dim),
+    )
+
+    data = OmniKVTransferManager(kv_config)._extract_kv_cache(
+        req_id,
+        block_ids=[0],
+        seq_len=block_size,
+        kv_caches=[valid_layer, "invalid-layer"],
+        block_size=block_size,
+        cache_dtype="float32",
+    )
+
+    assert data is None
 
 
 @pytest.mark.parametrize(
@@ -410,6 +568,26 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     assert len(req.past_key_values.key_cache) == num_layers
     assert torch.allclose(req.past_key_values.key_cache[0], key_cache[0])
     assert req.kv_metadata["seq_len"] == seq_len
+
+
+def test_manager_reception_rejects_invalid_contract_without_injecting(kv_config, mock_connector):
+    req_id = "req-invalid-contract"
+    data_to_receive = _contract_payload(request_id=req_id)
+    data_to_receive["layer_blocks"]["value_cache"][0] = None
+    store_key = f"stage1->stage2:omni_stage1_to_stage2_kv_cache_{req_id}"
+    mock_connector.store[store_key] = data_to_receive
+
+    manager = OmniKVTransferManager(kv_config)
+    manager._connector = mock_connector
+    req = OmniDiffusionRequest(
+        prompt="test-invalid-contract",
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_id=req_id,
+    )
+
+    assert manager.receive_kv_cache(req, target_device=torch.device("cpu")) is False
+    assert not hasattr(req, "past_key_values")
+    assert not hasattr(req, "kv_metadata")
 
 
 def test_manager_reception_prefers_parent_request_id_for_batched_request(kv_config, mock_connector, common_constants):

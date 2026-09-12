@@ -99,6 +99,8 @@ class _TransferTopoConfig:
 
 # Placeholder for the heavy primary KV in the side-payload dict; receiver swaps in the rebuilt object from the blob.
 _KV_PLACEHOLDER = "__kv_placeholder__"
+_KV_PAYLOAD_CONTRACT_KEY = "_kv_payload_contract"
+_KV_PAYLOAD_CONTRACT_VERSION = 1
 
 _SAFE_TORCH_DTYPES = {
     name: dtype
@@ -150,6 +152,74 @@ class KVCacheTransferData:
     layer_blocks: dict[str, Any]
     block_ids: list[int]
     metadata: dict[str, Any]
+
+    @staticmethod
+    def validate_payload_contract(
+        data: dict[str, Any],
+        expected_request_id: str,
+        *,
+        require_contract: bool = False,
+    ) -> None:
+        """Validate a versioned, complete KV payload before model injection.
+
+        Payloads without a contract predate this protocol and remain accepted
+        for rolling-upgrade compatibility.
+        """
+        metadata = data.get("metadata")
+        contract = metadata.get(_KV_PAYLOAD_CONTRACT_KEY) if isinstance(metadata, dict) else None
+        if contract is None:
+            if require_contract:
+                raise ValueError("KV payload contract was removed during rank merge or slicing")
+            return
+        if contract != _KV_PAYLOAD_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported KV payload contract version: {contract}")
+        if data.get("request_id") != expected_request_id:
+            raise ValueError(
+                f"KV payload request ID mismatch: expected {expected_request_id!r}, got {data.get('request_id')!r}"
+            )
+
+        num_layers = metadata.get("num_layers")
+        seq_len = metadata.get("seq_len")
+        block_size = metadata.get("block_size")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers <= 0:
+            raise ValueError(f"Invalid KV payload num_layers: {num_layers!r}")
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
+            raise ValueError(f"Invalid KV payload seq_len: {seq_len!r}")
+        if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size <= 0:
+            raise ValueError(f"Invalid KV payload block_size: {block_size!r}")
+
+        block_ids = data.get("block_ids")
+        required_blocks = (seq_len + block_size - 1) // block_size
+        if not isinstance(block_ids, list) or len(block_ids) < required_blocks:
+            actual_blocks = len(block_ids) if isinstance(block_ids, list) else type(block_ids).__name__
+            raise ValueError(f"Incomplete KV payload block table: need {required_blocks} blocks, got {actual_blocks}")
+
+        layer_blocks = data.get("layer_blocks")
+        if not isinstance(layer_blocks, dict):
+            raise ValueError("KV payload is missing layer_blocks")
+        key_cache = layer_blocks.get("key_cache")
+        value_cache = layer_blocks.get("value_cache")
+        if not isinstance(key_cache, list) or not isinstance(value_cache, list):
+            raise ValueError("KV payload key_cache and value_cache must be lists")
+        if len(key_cache) != num_layers or len(value_cache) != num_layers:
+            raise ValueError(
+                f"Incomplete KV payload layers: expected {num_layers}, "
+                f"got key={len(key_cache)} value={len(value_cache)}"
+            )
+
+        for layer_idx, (key, value) in enumerate(zip(key_cache, value_cache, strict=True)):
+            if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+                raise ValueError(f"KV payload layer {layer_idx} is missing key or value tensor")
+            if key.shape != value.shape:
+                raise ValueError(
+                    f"KV payload layer {layer_idx} has mismatched K/V shapes: "
+                    f"key={tuple(key.shape)} value={tuple(value.shape)}"
+                )
+            if key.ndim < 1 or key.shape[0] != seq_len:
+                raise ValueError(
+                    f"KV payload layer {layer_idx} has invalid token dimension: "
+                    f"expected {seq_len}, got {tuple(key.shape)}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -1050,12 +1120,29 @@ class OmniKVTransferManager:
             cache_dtype: Data type of the cache
             custom_metadata: Optional custom metadata to include
 
-        Note: If key/value block counts differ, extraction uses only the overlapping
-        block range. Extra key/value blocks are ignored, so returned KV may be partial.
-
         Returns:
             KVCacheTransferData if extraction successful, None otherwise
         """
+        if block_size <= 0:
+            logger.warning("Request %s has invalid KV block size %s", req_id, block_size)
+            return None
+        if seq_len <= 0:
+            logger.warning("Request %s has invalid KV sequence length %s", req_id, seq_len)
+            return None
+
+        required_block_count = (seq_len + block_size - 1) // block_size
+        if len(block_ids) < required_block_count:
+            logger.warning(
+                "Request %s needs %s KV blocks for seq_len=%s and block_size=%s, but only %s block IDs were provided",
+                req_id,
+                required_block_count,
+                seq_len,
+                block_size,
+                len(block_ids),
+            )
+            return None
+        required_block_ids = block_ids[:required_block_count]
+
         num_layers = len(kv_caches)
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
@@ -1063,47 +1150,62 @@ class OmniKVTransferManager:
         for layer_idx, layer_kv in enumerate(kv_caches):
             kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx, block_size=block_size)
             if kv_pair is None:
-                continue
+                logger.warning(
+                    "Rejecting incomplete KV extraction for request %s: layer %s could not be normalized",
+                    req_id,
+                    layer_idx,
+                )
+                return None
             key_blocks, value_blocks = kv_pair
 
+            available_blocks = min(key_blocks.shape[0], value_blocks.shape[0])
             if key_blocks.shape[0] != value_blocks.shape[0]:
                 logger.warning(
-                    f"Layer {layer_idx} for request {req_id} has mismatched KV block counts: "
-                    f"key={key_blocks.shape[0]}, value={value_blocks.shape[0]}; using shared range"
+                    "Layer %s for request %s has mismatched KV block counts: key=%s, value=%s",
+                    layer_idx,
+                    req_id,
+                    key_blocks.shape[0],
+                    value_blocks.shape[0],
                 )
 
-            # Validate block IDs - shape: [num_blocks, block_size, n_heads, head_dim]
-            max_block = min(key_blocks.shape[0], value_blocks.shape[0]) - 1
-            valid_ids = [bid for bid in block_ids if 0 <= bid <= max_block]
-            if not valid_ids:
-                continue
+            invalid_ids = [block_id for block_id in required_block_ids if not 0 <= block_id < available_blocks]
+            if invalid_ids:
+                logger.warning(
+                    "Rejecting incomplete KV extraction for request %s: layer %s cannot provide block IDs %s "
+                    "(available blocks=%s)",
+                    req_id,
+                    layer_idx,
+                    invalid_ids,
+                    available_blocks,
+                )
+                return None
 
             # Extract and reshape: [n_blocks, block_size, n_heads, head_dim]
             # -> [seq_len, n_heads, head_dim]
-            selected_k = key_blocks[valid_ids]
-            selected_v = value_blocks[valid_ids]
+            selected_k = key_blocks[required_block_ids]
+            selected_v = value_blocks[required_block_ids]
             flat_k = selected_k.flatten(0, 1)
             flat_v = selected_v.flatten(0, 1)
-            if seq_len < flat_k.shape[0]:
-                flat_k = flat_k[:seq_len]
-                flat_v = flat_v[:seq_len]
+            flat_k = flat_k[:seq_len]
+            flat_v = flat_v[:seq_len]
 
             key_cache[layer_idx] = flat_k.detach().contiguous()
             value_cache[layer_idx] = flat_v.detach().contiguous()
 
-        if not any(k is not None for k in key_cache):
+        if not key_cache:
             return None
 
         return KVCacheTransferData(
             request_id=req_id,
             layer_blocks={"key_cache": key_cache, "value_cache": value_cache},
-            block_ids=block_ids,
+            block_ids=required_block_ids,
             metadata={
+                **(custom_metadata or {}),
                 "block_size": block_size,
                 "num_layers": num_layers,
                 "dtype": str(cache_dtype),
                 "seq_len": seq_len,
-                **(custom_metadata or {}),
+                _KV_PAYLOAD_CONTRACT_KEY: _KV_PAYLOAD_CONTRACT_VERSION,
             },
         )
 
@@ -1484,6 +1586,7 @@ class OmniKVTransferManager:
                     else:
                         data = raw_data
 
+                    KVCacheTransferData.validate_payload_contract(data, request_id)
                     received_payloads[get_key] = (data, size)
                     pending_pairs.remove((get_key, from_rank))
 
@@ -1492,12 +1595,21 @@ class OmniKVTransferManager:
                     link_ms = (time.perf_counter() - link_start) * 1000
                     ordered_payloads = [received_payloads[key][0] for key, _ in recv_key_pairs]
                     total_size = sum(received_payloads[key][1] for key, _ in recv_key_pairs)
+                    require_contract = any(
+                        isinstance(payload.get("metadata"), dict) and _KV_PAYLOAD_CONTRACT_KEY in payload["metadata"]
+                        for payload in ordered_payloads
+                    )
 
                     if len(ordered_payloads) == 1:
                         data = ordered_payloads[0]
                     else:
                         data = merge_received_rank_shards(ordered_payloads, merger=self.kv_payload_merger)
                     data = slice_received_rank_shard(data, topo, slicer=self.kv_payload_slicer)
+                    KVCacheTransferData.validate_payload_contract(
+                        data,
+                        request_id,
+                        require_contract=require_contract,
+                    )
 
                     needs_clone = bool(deferred_memory)
                     try:
