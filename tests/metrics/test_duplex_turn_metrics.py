@@ -91,6 +91,15 @@ def test_is_duplex_resource_request_id_matches_engine_format() -> None:
     assert not is_duplex_resource_request_id(None)
 
 
+def test_finalize_turn_metrics_noops_for_non_resource_request() -> None:
+    """Abort/finalize on ordinary AR requests must not touch their state."""
+    request_states = {"req-1-aaaa": SimpleNamespace(duplex_turn=None)}
+    client = _client(request_states=request_states, num_stages=2)
+    assert client.finalize_turn_metrics("req-1-aaaa", reason="abort") is False
+    # A duplex resource id with no registered state is also a no-op.
+    assert client.finalize_turn_metrics(_request_id(), reason="abort") is False
+
+
 def test_accumulate_appends_segments_collapse_at_finalize() -> None:
     turn = DuplexTurnMetrics(
         request_id=_request_id(),

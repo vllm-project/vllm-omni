@@ -339,6 +339,10 @@ class DuplexRequestClient:
 
     def finalize_turn_metrics(self, request_id: str, *, reason: str) -> bool:
         """Log one duplex turn table. No-op when already finalized or missing."""
+        # Only native duplex stage resource ids own per-turn metrics; ordinary
+        # AR requests must not touch their request states here (see begin_turn_metrics).
+        if not is_duplex_resource_request_id(request_id):
+            return False
         req_state = self.output_port.request_states.get(request_id)
         if req_state is None:
             return False
