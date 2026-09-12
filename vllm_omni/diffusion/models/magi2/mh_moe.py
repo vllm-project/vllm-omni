@@ -276,23 +276,61 @@ def _deterministic_scatter(
     gather_ids: torch.Tensor,
     expert_offsets: torch.Tensor,
 ) -> torch.Tensor:
+    """Scatter sorted expert output back to per-head token rows.
+
+    scatter_add_ accumulates duplicate destinations with atomics, so its order
+    varies between launches and breaks the deterministic=True contract.  The
+    sorted layout already groups each destination's contributions contiguously;
+    sorting by destination once and reducing the runs with a fixed-order prefix
+    scan makes the result bitwise reproducible instead.
+    """
     num_flat_experts = expert_offsets.numel() - 1
     experts_per_head = num_flat_experts // reference.shape[1]
     expert_lengths = torch.diff(expert_offsets)
     head_values = torch.arange(num_flat_experts, device=gather_ids.device) // experts_per_head
     head_ids = torch.repeat_interleave(head_values, expert_lengths)
     scatter_ids = gather_ids.long() * reference.shape[1] + head_ids.long()
+    dest_order = torch.argsort(scatter_ids, stable=True)
+    sorted_scatter_ids = scatter_ids[dest_order]
+    sorted_expert_sums = sorted_output[dest_order].float()
+    is_group_start = torch.cat(
+        (
+            torch.ones(1, dtype=torch.bool, device=gather_ids.device),
+            sorted_scatter_ids[1:] != sorted_scatter_ids[:-1],
+        )
+    )
+    group_rows = sorted_scatter_ids[is_group_start]
+    group_ends = torch.where(is_group_start)[0]
+    group_end_exclusive = torch.cat((group_ends[1:], group_ends.new_tensor([sorted_scatter_ids.numel()])))
+    # Reduce contiguous same-destination runs with a fixed-order prefix scan;
+    # a scan along the contiguous axis is the fast CUDA path.
+    prefix_transposed = torch.cumsum(sorted_expert_sums.t().contiguous(), dim=1)
+    grouped = prefix_transposed[:, group_end_exclusive - 1]
+    if grouped.shape[1] > 1:
+        grouped[:, 1:] -= prefix_transposed[:, group_end_exclusive[:-1] - 1]
     output = torch.zeros_like(reference).view(-1, reference.shape[-1])
-    output.scatter_add_(0, scatter_ids[:, None].expand_as(sorted_output), sorted_output.to(output.dtype))
+    output[group_rows] = grouped.t().to(output.dtype)
     return output.view_as(reference)
 
 
 def _select_block_config() -> tuple[int, int, int, int, int]:
-    """Return the reference kernel config, capped for pre-Blackwell GPUs."""
+    """Return the fused MH-MoE launch config.
+
+    Config is (block_t, block_dh, block_de, num_stages, num_warps).  A 128-token
+    tile needs roughly 122 KB of shared memory, so it is only used where the
+    per-block budget admits a multi-stage pipeline: Blackwell at 2 stages and
+    Hopper (H100/H200) at 3, where it about doubles expert throughput at the
+    released MAGI-2 dimensions.  Pre-Hopper parts keep the portable 64-token
+    config.
+    """
 
     capability = current_omni_platform.get_device_capability()
-    if capability is not None and capability.major >= 10:  # Blackwell
+    if capability is None:
+        return (64, 64, 32, 2, 4)
+    if capability.major >= 10:  # Blackwell
         return (128, 64, 32, 2, 8)
+    if capability.major == 9:  # Hopper (H100 / H200)
+        return (128, 64, 32, 3, 8)
     # BLOCK_T=128 needs 122,880 bytes of shared memory and is not safe on the
     # qualified L20X path.  This is the reference kernel's portable config.
     return (64, 64, 32, 2, 4)
