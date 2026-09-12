@@ -131,6 +131,8 @@ source_file_dependencies:
 
   # --- features ---
   diffusion_distributed_attention:
+    - tests/diffusion/models/qwen_image/test_qwen_image_cfg_l2.py
+    - vllm_omni/diffusion/layers/cfg_l2.py
     - tests/diffusion/distributed/
     - tests/diffusion/attention/test_attention_sp.py
     - vllm_omni/diffusion/distributed/
