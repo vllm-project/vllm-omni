@@ -29,17 +29,24 @@ class PromptEmbedsPayload(msgspec.Struct):
 class AdditionalInformationEntry(msgspec.Struct):
     """One entry of additional_information.
 
-    Three supported forms are encoded:
-      - tensor: data/shape/dtype
+    Four supported forms are encoded:
+      - tensor: tensor_data/tensor_shape/tensor_dtype
+      - audio: audio_data/audio_shape/audio_dtype/audio_sr (as [(np.ndarray, sr)])
       - list: a Python list (msgspec-serializable)
       - scalar: a Python scalar (msgspec-serializable)
-    Exactly one of (tensor_data, list_data, scalar_data) should be non-None.
+    Exactly one of (tensor_data, audio_data, list_data, scalar_data) should be non-None.
     """
 
     # Tensor form
     tensor_data: bytes | None = None
     tensor_shape: list[int] | None = None
     tensor_dtype: str | None = None
+
+    # Audio form (decoded as (np.ndarray, sample_rate) tuple)
+    audio_data: bytes | None = None
+    audio_shape: list[int] | None = None
+    audio_dtype: str | None = None
+    audio_sr: int | float | None = None
 
     # List form
     list_data: list[Any] | None = None

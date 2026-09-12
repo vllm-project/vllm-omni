@@ -391,6 +391,17 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     )
 
 
+def _serialize_audio(wav: np.ndarray, sr: int | float) -> AdditionalInformationEntry:
+    from vllm_omni.engine import AdditionalInformationEntry
+
+    return AdditionalInformationEntry(
+        audio_data=wav.tobytes(),
+        audio_shape=list(wav.shape),
+        audio_dtype=wav.dtype.str,
+        audio_sr=sr,
+    )
+
+
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
     dtype_name = entry.tensor_dtype or "float32"
     dtype = getattr(torch, dtype_name, None)
@@ -404,6 +415,13 @@ def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
 
     data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
     return data.view(dtype).reshape(entry.tensor_shape)
+
+
+def _deserialize_audio(entry: AdditionalInformationEntry) -> list[tuple[np.ndarray, int | float]]:
+    dt = np.dtype(entry.audio_dtype)
+    arr = np.frombuffer(entry.audio_data, dtype=dt)  # type: ignore[arg-type]
+    arr = arr.reshape(entry.audio_shape).copy()
+    return [(arr, entry.audio_sr)]  # type: ignore[return-value]
 
 
 def serialize_payload(
@@ -425,6 +443,15 @@ def serialize_payload(
     for key, value in flat.items():
         if isinstance(value, torch.Tensor):
             entries[key] = _serialize_tensor(value)
+        elif (
+            isinstance(value, list)
+            and len(value) == 1
+            and isinstance(value[0], tuple)
+            and len(value[0]) == 2
+            and isinstance(value[0][0], np.ndarray)
+            and isinstance(value[0][1], (int, float))
+        ):
+            entries[key] = _serialize_audio(value[0][0], value[0][1])
         elif isinstance(value, list):
             entries[key] = AdditionalInformationEntry(list_data=value)
         elif value is not None:
@@ -444,7 +471,9 @@ def deserialize_payload(
     flat: dict[str, Any] = {}
 
     for key, entry in wire.entries.items():
-        if entry.tensor_data is not None:
+        if entry.audio_data is not None:
+            flat[key] = _deserialize_audio(entry)
+        elif entry.tensor_data is not None:
             flat[key] = _deserialize_tensor(entry)
         elif entry.list_data is not None:
             flat[key] = entry.list_data
