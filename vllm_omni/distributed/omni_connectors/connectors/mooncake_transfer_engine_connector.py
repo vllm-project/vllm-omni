@@ -133,6 +133,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         }
 
         self.config = config
+        self.stage_id = config.get("stage_id", -1)
         host_config = config.get("host")
         host_value = "auto" if host_config is None else str(host_config)
         # Default sender/receiver bootstrap to a routable local IP so the
