@@ -56,6 +56,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.v1.attention.backend import AttentionType
 
+from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
@@ -1859,6 +1860,28 @@ class HunYuanAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         bsz, q_len, hidden_size = hidden_states.size()
+
+        # [issue #4690 1.1] Overlap the Ulysses forward all-to-all with the QKV
+        # projection. Only the strict-mode SP image-gen steady-state path is handled;
+        # returns None (-> fall through to the baseline path) otherwise.
+        if (
+            envs.VLLM_OMNI_HUNYUAN_OVERLAP_QKV
+            and kwargs.get("mode", "gen_text") == "gen_image"
+            and self.image_attn.sp_size > 1
+            and not kwargs.get("uncond_cfg_prefill", False)
+            and kwargs.get("past_key_value", None) is None
+        ):
+            from vllm_omni.diffusion.models.hunyuan_image3.overlap_qkv_a2a import image_self_attention_overlap
+
+            try:
+                ov = image_self_attention_overlap(self, hidden_states, attention_mask, custom_pos_emb, **kwargs)
+            except Exception as e:  # safety: never break generation, fall back to baseline
+                logger.warning_once(f"[overlap_qkv_a2a] fell back to baseline image_attn: {e!r}")
+                ov = None
+            if ov is not None:
+                output, _ = self.o_proj(ov.reshape(bsz * q_len, -1))
+                return output.reshape(bsz, q_len, -1), None, None
+
         hidden_states = hidden_states.reshape(-1, hidden_size)
         qkv, _ = self.qkv_proj(hidden_states)
         qkv = qkv.reshape(bsz, q_len, -1)

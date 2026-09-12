@@ -28,6 +28,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    # [HunyuanImage3 only] Overlap the Ulysses forward all-to-all with the QKV
+    # projection GEMM: split the fused qkv_proj into Q/K/V and issue each tensor's
+    # all-to-all asynchronously so it overlaps the next tensor's projection.
+    # Default 0 (off); only takes effect on the HunyuanImage3 image-gen path.
+    "VLLM_OMNI_HUNYUAN_OVERLAP_QKV": lambda: bool(int(os.getenv("VLLM_OMNI_HUNYUAN_OVERLAP_QKV", "0"))),
 }
 
 
