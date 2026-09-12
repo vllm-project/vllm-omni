@@ -311,13 +311,19 @@ work unmodified. The overlap falls into the three tiers used by the event catalo
 | Direction | Messages |
 | --- | --- |
 | Client → server | `session.update`, `input_audio_buffer.append` / `.commit` / `.clear`, `conversation.item.create` / `.retrieve` / `.truncate` / `.delete`, `response.create`, `response.cancel`, `output_audio_buffer.clear` (OpenAI: WebRTC-only; here also a WebSocket event) |
-| Server → client | `error` (same `{type, code, message, event_id, param}` envelope and the same classes `invalid_request_error` / `server_error` / `rate_limit_error`), `session.created`, `session.updated`, `input_audio_buffer.committed` / `.cleared` / `.speech_started` / `.speech_stopped`, `conversation.item.created` / `.added` / `.done` / `.deleted` / `.retrieved` / `.truncated`, `conversation.item.input_audio_transcription.completed`, `response.created`, `response.done`, `response.output_item.added` / `.done`, `response.content_part.added` / `.done`, `response.audio.delta` / `.done`, `response.audio_transcript.delta` / `.done`, `response.output_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, `rate_limits.updated`, `output_audio_buffer.cleared` |
+| Server → client | `error` (same `{type, code, message, event_id, param}` envelope and the same classes `invalid_request_error` / `server_error` / `rate_limit_error`), `session.created`, `session.updated`, `input_audio_buffer.committed` / `.cleared` / `.speech_started` / `.speech_stopped`, `conversation.item.created` / `.added` / `.done` / `.deleted` / `.retrieved` / `.truncated`, `conversation.item.input_audio_transcription.completed`, `response.created`, `response.done`, `response.output_item.added` / `.done`, `response.content_part.added` / `.done`, `response.output_audio.delta` / `.done`, `response.output_audio_transcript.delta` / `.done`, `response.output_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, `rate_limits.updated`, `output_audio_buffer.cleared` |
 | Session fields | `model`, `modalities` / `output_modalities`, `instructions`, `voice`, `input_audio_format` / `output_audio_format` (beta spelling) **and** `audio.input.format` / `audio.output.format` objects (GA spelling), `turn_detection.server_vad {threshold, prefix_padding_ms, silence_duration_ms}`, `input_audio_transcription`, `input_audio_noise_reduction`, `tools`, `tool_choice`, `temperature`, `max_response_output_tokens`, `speed`, `tracing` |
 | Object shapes | `realtime.session`, `realtime.item`, `realtime.response`; item content parts `input_text` / `input_audio` / `output_text` / `output_audio`; `function_call` and `function_call_output` items; `previous_item_id` chaining; `output_index` / `content_index` addressing |
 | Sequencing | `response.created → output_item.added → content_part.added → deltas → *.done → content_part.done → output_item.done → response.done → rate_limits.updated`; `speech_started → speech_stopped → committed` |
 
-The server deliberately emits and accepts **both** the beta and the GA
-spellings at once (`response.audio.delta` alongside `output_modalities`,
+Audio/transcript output uses only the current (non-beta) OpenAI event names
+(`response.output_audio.delta`, not the deprecated `response.audio.delta`),
+matching `openai.types.realtime` in the official `openai` Python SDK and what
+clients built against it (e.g. `livekit-plugins-openai`'s non-Azure code path)
+expect; a client still on the old beta SDK types would not recognize these
+events. Session fields and `conversation.item.*` events, in contrast, are
+deliberately dual: the server emits and accepts **both** the beta and the GA
+spellings at once (`output_modalities` alongside `modalities`,
 `conversation.item.added` alongside `conversation.item.created`) so either
 generation of OpenAI client parses the stream.
 
@@ -329,7 +335,7 @@ A stock client ignores the extra keys; the extensions are additive.
 | --- | --- |
 | `session.created` / `session.updated` | top-level `incarnation`, `attachment_generation`, `resume_token`; inside `session`: `state`, `turn_state`, `epoch`, `turn_id`, `active_request_id`, `active_response_id`, `active_response_turn_id`, `overlap_policy`, `overlap_*_ms/rms`, `playback_commit_policy`, `playback`, `capabilities`, `ref_audio`, `extra_body`, `idle_timeout_s`, `response_format` |
 | `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
-| `response.audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback}` |
+| `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback}` |
 | `response.speak` (inserted before the first delta) | not an OpenAI event, but rides the OpenAI response envelope (`response_id`, `item_id`, `output_index`, `content_index`) |
 | `input_audio_buffer.append` | `is_speech`, `video_frames` (+ `max_slice_nums`), `duration_ms`, `audio_end_ms`, per-event `format` / `sample_rate_hz` |
 | `input_audio_buffer.commit` | `final`, `response_create`, `is_speech:false` (silence declaration) |
@@ -443,12 +449,12 @@ table lives in the normative contract section of [Full-Duplex Runtime (MiniCPM-o
 | `response.output_item.added` | 1 | Assistant item (or `function_call` item) attached to the response. |
 | `response.content_part.added` | 1 | Audio/text content part opened on the assistant item. |
 | `response.speak` | 3 | Model chose to speak (native lane); at most once per response, before the first audio delta. |
-| `response.audio.delta` | 2 | One ordered audio chunk. OpenAI name; adds `format`, `sample_rate_hz`, `metadata{epoch, model_speak, end_of_turn, audio_text_marks, playback}`. |
-| `response.audio_transcript.delta` | 1 | Transcript text paired one-to-one with each audio delta. |
+| `response.output_audio.delta` | 2 | One ordered audio chunk. OpenAI name; adds `format`, `sample_rate_hz`, `metadata{epoch, model_speak, end_of_turn, audio_text_marks, playback}`. |
+| `response.output_audio_transcript.delta` | 1 | Transcript text paired one-to-one with each audio delta. |
 | `response.output_text.delta` | 1 | Text delta for text-modality responses. |
 | `response.output_text.done` | 1 | Final text of a text-modality response. |
-| `response.audio.done` | 1 | Audio stream closed for the response. |
-| `response.audio_transcript.done` | 1 | Full transcript (concatenation of the deltas). |
+| `response.output_audio.done` | 1 | Audio stream closed for the response. |
+| `response.output_audio_transcript.done` | 1 | Full transcript (concatenation of the deltas). |
 | `response.content_part.done` | 1 | Content part finalized with its transcript/text. |
 | `response.output_item.done` | 1 | Assistant item finalized. |
 | `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `cancelled` \| `failed`. OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
@@ -902,11 +908,11 @@ deferred commit during an active response (`event.response_create_deferred`)
 }
 ```
 
-`S→C response.audio.delta` (one ~1 s unit, 24 kHz PCM16)
+`S→C response.output_audio.delta` (one ~1 s unit, 24 kHz PCM16)
 
 ```json
 {
-  "type": "response.audio.delta",
+  "type": "response.output_audio.delta",
   "response_id": "resp_01",
   "item_id": "item_resp_01",
   "output_index": 0,
@@ -926,10 +932,10 @@ deferred commit during an active response (`event.response_create_deferred`)
 }
 ```
 
-`S→C response.audio_transcript.delta` (exactly one per audio delta)
+`S→C response.output_audio_transcript.delta` (exactly one per audio delta)
 
 ```json
-{"type": "response.audio_transcript.delta", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "delta": "It is sunny"}
+{"type": "response.output_audio_transcript.delta", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "delta": "It is sunny"}
 ```
 
 `S→C response.output_text.delta` / `response.output_text.done` (text modality)
@@ -942,14 +948,14 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "response.output_text.done", "response_id": "resp_02", "item_id": "item_resp_02", "output_index": 0, "content_index": 0, "text": "Tomorrow looks cloudy."}
 ```
 
-`S→C response.audio.done` / `response.audio_transcript.done`
+`S→C response.output_audio.done` / `response.output_audio_transcript.done`
 
 ```json
-{"type": "response.audio.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0}
+{"type": "response.output_audio.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0}
 ```
 
 ```json
-{"type": "response.audio_transcript.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "transcript": "It is sunny, 24 degrees."}
+{"type": "response.output_audio_transcript.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "transcript": "It is sunny, 24 degrees."}
 ```
 
 `S→C response.content_part.done`
@@ -1191,8 +1197,8 @@ Realtime projector renames and fans out these events before they reach a
 | `session.create` (`open_session`, `session.config`) | first `session.update` |
 | `input.committed` | `conversation.item.added` / `conversation.item.created`, `input_audio_buffer.committed`, `conversation.item.input_audio_transcription.completed`, `conversation.item.done` |
 | `input.cancelled` | `input_audio_buffer.cleared` |
-| `response.output_audio.delta` (with `audio_transcript`) | optional `response.speak`, then `response.audio.delta` and `response.audio_transcript.delta` |
-| `response.output_audio.done` / `response.output_text.done` | `response.audio.done` / `response.output_text.done` |
+| `response.output_audio.delta` (with `audio_transcript`) | optional `response.speak`, then `response.output_audio.delta` and `response.output_audio_transcript.delta` |
+| `response.output_audio.done` / `response.output_text.done` | `response.output_audio.done` / `response.output_text.done` |
 | `response.text.delta` | `response.output_text.delta` |
 | `response.message` (chat-fallback raw chunk) | passed through |
 | `audio.cancelled` | optional `output_audio_buffer.cleared`, then the cancelled terminal events and `response.done` with `status: "cancelled"` |

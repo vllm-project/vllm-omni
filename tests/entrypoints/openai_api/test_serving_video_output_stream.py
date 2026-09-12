@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for `/v1/realtime/video` WebSocket video output streaming."""
 
 from __future__ import annotations
@@ -7,12 +7,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator, Callable
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
@@ -957,3 +958,30 @@ class TestStreamingVideoOutputPromptUpdate:
                 "transition_chunks": 2,
             },
         )
+
+
+class TestStreamingVideoOutputExtraParams:
+    """extra_params handling when building streaming generation inputs."""
+
+    @staticmethod
+    def _handler() -> OmniStreamingVideoOutputHandler:
+        handler = object.__new__(OmniStreamingVideoOutputHandler)
+        handler._engine_client = SimpleNamespace(default_sampling_params_list=[])
+        return handler
+
+    async def test_preencode_mp4_is_rejected_for_streaming_sessions(self):
+        """Worker-side pre-encoding emits one progressive MP4 the fMP4 encoder cannot consume."""
+        request = VideoGenerationRequest(prompt="p", extra_params={"preencode_mp4": True})
+
+        with pytest.raises(HTTPException) as excinfo:
+            await self._handler()._build_prompt_and_sampling_params(request)
+
+        assert excinfo.value.status_code == HTTPStatus.BAD_REQUEST.value
+        assert "preencode_mp4" in excinfo.value.detail
+
+    async def test_other_extra_params_still_reach_the_engine(self):
+        request = VideoGenerationRequest(prompt="p", extra_params={"flow_shift": 3.0})
+
+        _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
+
+        assert gen_params.extra_args["flow_shift"] == 3.0

@@ -469,6 +469,7 @@ class StageDeployConfig:
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
+    video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
@@ -482,6 +483,7 @@ class StageDeployConfig:
 
     # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
+    enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
@@ -1145,10 +1147,22 @@ class StageConfig:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
             reconcile_diffusion_attention_overrides(engine_args, runtime_overrides)
 
-        # CLI overrides take precedence over YAML defaults
+        # CLI overrides take precedence over YAML defaults. Most dict-valued
+        # overrides are deep-merged so a partial CLI dict (e.g. --no-guardrails
+        # riding on ``model_config``) layers onto the deploy YAML instead of
+        # clobbering sibling keys such as ``policy_server_config`` — the same
+        # rationale as the platform-overlay deep-merge. Legacy atomic mappings
+        # are handled explicitly below.
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                engine_args[key] = value
+                existing = engine_args.get(key)
+                # ``omni_kv_config`` is an atomic legacy override: callers use
+                # a partial mapping to replace the topology-provided transfer
+                # role, rather than to add fields to it.
+                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                    engine_args[key] = _get_recursively_merged_dict(existing, value)
+                else:
+                    engine_args[key] = value
 
         # Topology-owned capabilities stay on the StagePipelineConfig values
         # already materialized into yaml_engine_args. ``--stage-overrides`` and

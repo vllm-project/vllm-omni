@@ -39,3 +39,9 @@ class ClientRequestState:
         # without re-querying stage_pools.
         self.audio_emit_stage_id: int | None = None
         self.audio_emit_replica_id: int | None = None
+        # De-dup set for metric messages: OmniBase populates this in
+        # ``_handle_output_message`` / ``_process_single_result`` so the same
+        # ``id(msg)`` isn't counted twice into per-request metrics. Kept on
+        # the request state (not a class-level dict) so it is released with
+        # the state — see #6462 / #6561.
+        self.consumed_metric_message_ids: set[int] = set()

@@ -7,7 +7,7 @@ from __future__ import annotations
 import io
 import queue
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from typing import Any, cast
 
@@ -15,6 +15,27 @@ import av
 import numpy as np
 
 _CHUNKED_MP4_DONE = object()
+
+
+def normalize_preencode_batch_frames(value: Any) -> int:
+    """Validate the request's MP4 transfer/encoding batch threshold."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("preencode_batch_frames must be a positive integer")
+    return value
+
+
+def normalize_video_codec_options(value: Any) -> dict[str, str] | None:
+    """Coerce a request's ``video_codec_options`` into PyAV's str->str contract.
+
+    The value reaches a worker straight from ``extra_params``, so reject a
+    non-mapping here rather than letting it fail inside the encoder after the
+    decode has already run.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("video_codec_options must be a JSON object of encoder option names to values")
+    return {str(key): str(item) for key, item in value.items()}
 
 
 def _validate_video_chunk(chunk: np.ndarray, *, width: int, height: int) -> None:
@@ -231,6 +252,18 @@ class FragmentedMP4Muxer:
         self._buf.seek(0)
         self._buf.truncate()
         return chunk
+
+
+def count_mp4_frames(video_bytes: bytes) -> int | None:
+    """Read an MP4's frame count from its sample table, without decoding it."""
+    if not video_bytes:
+        return None
+    try:
+        with cast(Any, av.open(io.BytesIO(video_bytes), format="mp4")) as container:
+            frames = int(container.streams.video[0].frames)
+    except Exception:
+        return None
+    return frames or None
 
 
 def finalize_streaming_video_bytes(

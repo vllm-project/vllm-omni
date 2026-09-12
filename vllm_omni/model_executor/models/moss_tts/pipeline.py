@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
 """Pipeline topology for all MOSS-TTS variants (2-stage: talker → codec)."""
+
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -102,6 +107,10 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [151645],
+                # The worker connector streams codes directly to the codec.
+                # This internal stage only needs to publish its terminal
+                # result; codec audio output remains incremental.
+                "output_kind": RequestOutputKind.FINAL_ONLY,
             },
             recompute_preemption="fail",
         ),

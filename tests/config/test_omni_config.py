@@ -215,6 +215,16 @@ def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_s
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
+@pytest.mark.parametrize("disabled", [True, False])
+def test_frontend_log_stats_flag_is_not_an_unowned_stage_argument(disabled):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    config = _from_pipeline_key("dots_tts", cli_overrides={"disable_log_stats": disabled})
+    assert config.stage_configs
+    engine_args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
+    assert "disable_log_stats" not in engine_args
+
+
 def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime_bridge():
     omni_config = _from_pipeline_key(
         "qwen3_tts",
@@ -259,6 +269,44 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
 
     with pytest.raises(ValueError, match=rf"no structured config owner: {unowned_field}"):
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+_MODEL_CLI_FLAGS = {
+    "served_model_name": "omni",
+    "allowed_local_media_path": "/data",
+    "allowed_media_domains": ["example.com"],
+    "max_logprobs": 7,
+    "logprobs_mode": "processed_logprobs",
+    "mm_processor_kwargs": {"max_slice_nums": 1},
+    "mm_processor_cache_type": "shm",
+    "hf_token": "hf_test",
+    "hf_config_path": "/models/config",
+    "generation_config": "vllm",
+    "override_generation_config": {"temperature": 0.5},
+    "enable_prompt_embeds": True,
+}
+
+
+@pytest.mark.parametrize("model_type", ["minicpmo_4_5", "qwen3_tts"])
+@pytest.mark.parametrize(("field", "value"), list(_MODEL_CLI_FLAGS.items()), ids=list(_MODEL_CLI_FLAGS))
+def test_from_pipeline_config_owns_model_cli_fields(model_type, field, value):
+    config = _from_pipeline_key(model_type, cli_overrides={field: value})
+
+    for stage in config.stage_configs:
+        assert getattr(stage.model_config, field) == value
+
+
+def test_model_cli_fields_reach_typed_engine_args(monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    # Worker discovery requires hardware support; this test covers config transport.
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    config = _from_pipeline_key("minicpmo_4_5", cli_overrides=dict(_MODEL_CLI_FLAGS))
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
+
+    assert {field: engine_args.get(field) for field in _MODEL_CLI_FLAGS} == _MODEL_CLI_FLAGS
 
 
 @pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
@@ -741,6 +789,7 @@ def test_sub_config_fields_match_structured_scopes():
         "max_cudagraph_capture_size",
         "enable_flashinfer_autotune",
         "enable_multithread_weight_load",
+        "enable_broadcast_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
         # Per-stage checkpoint resolution for repos whose stages live in
@@ -750,6 +799,18 @@ def test_sub_config_fields_match_structured_scopes():
         "tokenizer_subdir",
         "requires_full_payload_input",
         "recompute_preemption",
+        "served_model_name",
+        "allowed_local_media_path",
+        "allowed_media_domains",
+        "max_logprobs",
+        "logprobs_mode",
+        "mm_processor_kwargs",
+        "mm_processor_cache_type",
+        "hf_token",
+        "hf_config_path",
+        "generation_config",
+        "override_generation_config",
+        "enable_prompt_embeds",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
@@ -1568,6 +1629,61 @@ def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
 
     assert cfg.quantization_config is not None
     assert cfg.quantization_config.get_name() == "int8"
+
+
+def test_video_output_transport_mapping_is_normalized() -> None:
+    from vllm_omni.diffusion.data import VideoOutputTransportConfig
+
+    cfg = omni_config_module._DiffusionConfigProjection(
+        video_output_transport={"enable_device_postprocess": True},
+    )
+
+    assert isinstance(cfg.video_output_transport, VideoOutputTransportConfig)
+    assert cfg.video_output_transport.enable_device_postprocess is True
+
+
+def test_omni_diffusion_config_normalizes_video_output_transport_mapping() -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, VideoOutputTransportConfig
+
+    cfg = OmniDiffusionConfig(
+        model=None,
+        video_output_transport={"enable_device_postprocess": True},
+    )
+
+    assert isinstance(cfg.video_output_transport, VideoOutputTransportConfig)
+    assert cfg.video_output_transport.enable_device_postprocess is True
+
+
+def test_video_output_transport_rejects_non_boolean_flag() -> None:
+    from vllm_omni.diffusion.data import VideoOutputTransportConfig
+
+    with pytest.raises(TypeError, match="enable_device_postprocess must be a bool"):
+        VideoOutputTransportConfig(enable_device_postprocess="true")  # type: ignore[arg-type]
+
+
+def test_video_output_transport_survives_stage_override_filtering() -> None:
+    from vllm_omni.config.stage_config import build_stage_runtime_overrides, deploy_runtime_override_keys
+
+    transport = {"enable_device_postprocess": True}
+    overrides = build_stage_runtime_overrides(0, {"video_output_transport": transport})
+
+    assert "video_output_transport" in deploy_runtime_override_keys()
+    assert overrides["video_output_transport"] == transport
+
+
+def test_video_output_transport_reaches_default_diffusion_stage() -> None:
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    transport = {"enable_device_postprocess": True}
+    stages = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "model": "unused",
+            "model_class_name": "UnknownPipeline",
+            "video_output_transport": transport,
+        }
+    )
+
+    assert stages[0]["engine_args"]["video_output_transport"] == transport
 
 
 def test_compact_offload_config_reaches_terminal_config(monkeypatch):

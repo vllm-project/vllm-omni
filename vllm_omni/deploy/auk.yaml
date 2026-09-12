@@ -1,0 +1,51 @@
+# AuK deploy: thinker encoder (stage 0) + rectified-flow DiT (stage 1).
+# Topology declared in vllm_omni/model_executor/models/auk/pipeline.py.
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py). trust_remote_code,
+# enable_prefix_caching and enable_chunked_prefill are pipeline-wide
+# DeployConfig fields and apply to both stages.
+#
+# The ODE runs over the whole target segment, so there is nothing to stream
+# between the stages: async_chunk stays off.
+async_chunk: false
+trust_remote_code: true
+# Prefix caching must stay off: a cache hit skips the prefix positions, and
+# the fused [tokens, 2048] condition needs every position of the prompt.
+# Chunked prefill works (the runner concatenates the per-chunk hidden states)
+# but measured no wall-time gain, since the encoder is a few percent of a
+# request, and it costs bit-exact reproducibility across scheduling.
+enable_prefix_caching: false
+enable_chunked_prefill: false
+
+stages:
+  # Stage 0: Qwen2.5-Omni thinker as a frozen text encoder.
+  # Prefill only — one sampled token, discarded downstream. eager because the
+  # fused-hidden forward walks the decoder layers itself and so bypasses the
+  # compiled graph.
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.45
+    enforce_eager: true
+    max_num_batched_tokens: 32768
+    # AuK takes text plus at most one clip; no image or video tower is built.
+    limit_mm_per_prompt: {audio: 1}
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      detokenize: false
+      seed: 0
+
+  # Stage 1: AuKPipeline (DiT + BigVGAN-flow VAE encoder and decoder).
+  # Shares GPU 0 with the encoder; 32 Euler steps at CFG 2.0 is the Base
+  # recipe, and AuK-Flash overrides both with its distilled 4-step grid.
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+    default_sampling_params:
+      seed: 0
+      num_inference_steps: 32
+      guidance_scale: 2.0

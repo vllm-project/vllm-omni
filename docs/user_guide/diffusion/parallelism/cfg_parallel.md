@@ -19,6 +19,12 @@ CFG-Parallel accelerates diffusion models by distributing positive and negative 
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
+Distilled Cosmos3 checkpoints, including `nvidia/Cosmos3-Super-Image2Video-4Step`,
+run without CFG and reject `--cfg-parallel-size` greater than 1 at startup.
+Use `--ulysses-degree 2` for two-GPU inference. These checkpoints always use
+`guidance_scale=1.0`; other explicitly requested values produce a warning, and
+`negative_prompt` does not affect generation.
+
 ---
 
 ## Quick Start

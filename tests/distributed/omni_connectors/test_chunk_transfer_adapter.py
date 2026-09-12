@@ -2526,6 +2526,356 @@ def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
     assert order == ["adapter", "super"]
 
 
+def _parked_sender_scheduler(adapter, session):
+    """A minimal OmniARScheduler holding one parked streaming session."""
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.input_coordinator = None
+    scheduler.requests = {session.request_id: session}
+    scheduler.running = []
+    scheduler.waiting = DummyWaitingQueue()
+    scheduler.skipped_waiting = DummyWaitingQueue([session])
+    scheduler.num_waiting_for_streaming_input = 1
+    scheduler.finished_req_ids_dict = {}
+
+    def _free_request(self, request, delay_free_blocks=False):
+        del delay_free_blocks
+        self.requests.pop(request.request_id, None)
+        return None, None
+
+    scheduler._free_request = MethodType(_free_request, scheduler)
+    return scheduler
+
+
+@pytest.mark.parametrize("send_first_chunk", [False, True])
+def test_parked_streaming_final_update_emits_downstream_terminal(build_adapter, send_first_chunk):
+    """#6670: a final update on a parked sender must terminate the receiver.
+
+    Upstream turns "final update while parked in WAITING_FOR_STREAMING_REQ"
+    into a silent local abort. The downstream stage only learns a stream ended
+    from a chunk carrying ``finished``, so the abort used to leave it in
+    WAITING_FOR_CHUNK until the 600s input deadline.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    session = _req(
+        "req-parked-final",
+        RequestStatus.WAITING_FOR_STREAMING_REQ,
+        external_req_id="ext-parked-final",
+    )
+    session.resumable = True
+    session._omni_segment_generation = 0
+    # A segment stop queues its boundary before the final update arrives.
+    # The downstream request is already prewarmed even if the sender has not
+    # dequeued this first task, so it still needs a terminal in both cases.
+    adapter.save_async(None, session, is_segment_finished=True)
+    assert session.external_req_id not in adapter.put_req_chunk
+    if send_first_chunk:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+        connector.put.reset_mock()
+
+    scheduler = _parked_sender_scheduler(adapter, session)
+
+    final_update = _req(session.request_id, RequestStatus.WAITING)
+    final_update.resumable = False
+    OmniARScheduler.add_request(scheduler, final_update)
+
+    # Local teardown happened...
+    assert session.request_id not in scheduler.requests
+    # ...but only after a terminal chunk was queued for the next stage.
+    assert session.status == RequestStatus.FINISHED_STOPPED
+    assert any(task["is_finished"] for task in adapter._pending_save_reqs)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["put_key"] == f"ext-parked-final_1_{int(send_first_chunk)}"
+    payload = connector.put.call_args.kwargs["data"]
+    assert bool(payload.meta.finished.item()) is True
+    assert bool(payload.meta.is_segment_finished.item()) is False
+
+
+def test_queued_terminal_chunk_survives_sender_cleanup(build_adapter):
+    """#6670: ``cleanup_sender`` must not discard an already-queued terminal."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-terminal", RequestStatus.FINISHED_STOPPED, external_req_id="ext-terminal")
+    request.resumable = False
+
+    adapter.save_async(None, request, is_segment_finished=False)
+    assert len(adapter._pending_save_reqs) == 1
+
+    # The scheduler tears the request down before the save_loop drains.
+    adapter.cleanup_sender("ext-terminal")
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    connector.put.assert_called_once()
+    assert bool(connector.put.call_args.kwargs["data"].meta.finished.item()) is True
+    # The terminal put reclaims the generation it kept alive.
+    assert "ext-terminal" not in adapter._sender_tokens
+
+
+def test_non_terminal_chunk_is_still_dropped_by_sender_cleanup(build_adapter):
+    """The #6670 fence is terminal-only: ordinary queued chunks still drop."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-mid", RequestStatus.RUNNING, external_req_id="ext-mid")
+    request.resumable = True
+
+    adapter.save_async(None, request, is_segment_finished=False)
+    adapter.cleanup_sender("ext-mid")
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    connector.put.assert_not_called()
+
+
+def test_final_update_on_non_sender_stage_keeps_upstream_abort(build_adapter):
+    """A final stage never put a chunk, so it must keep the upstream path."""
+    adapter, _connector = build_adapter(stage_id=2, model_mode="generation")
+    session = _req(
+        "req-final-stage",
+        RequestStatus.WAITING_FOR_STREAMING_REQ,
+        external_req_id="ext-final-stage",
+    )
+    session.resumable = True
+    scheduler = _parked_sender_scheduler(adapter, session)
+
+    final_update = _req(session.request_id, RequestStatus.WAITING)
+    final_update.resumable = False
+
+    with patch.object(VLLMScheduler, "add_request") as base_add:
+        OmniARScheduler.add_request(scheduler, final_update)
+
+    base_add.assert_called_once()
+    assert not adapter._pending_save_reqs
+
+
+def _queue_terminal(
+    adapter,
+    external_req_id: str,
+    req_id: str = "req-terminal",
+    segment_generation: int = 0,
+) -> None:
+    """Queue one request-terminal chunk on the adapter's save queue.
+
+    ``segment_generation`` must match the adapter's dedup watermark, which a
+    preceding segment stop advances; otherwise ``save_async`` drops the chunk
+    as a late duplicate.
+    """
+    request = _req(req_id, RequestStatus.FINISHED_STOPPED, external_req_id=external_req_id)
+    request.resumable = False
+    request._omni_segment_generation = segment_generation
+    adapter.save_async(None, request, is_segment_finished=False)
+
+
+def _assert_terminal_put(connector) -> None:
+    connector.put.assert_called_once()
+    assert bool(connector.put.call_args.kwargs["data"].meta.finished.item()) is True
+
+
+def test_terminal_chunk_survives_cleanup_after_dequeue(build_adapter):
+    """#6670: the fence must hold across the connector handoff, not just the queue.
+
+    ``_finish_parked_streaming_session`` queues the terminal and then calls
+    ``finish_requests``, so ``cleanup_sender`` can land *after* the save_loop
+    has already dequeued the terminal. Releasing the fence at dequeue left
+    that interleaving cancelling the chunk before ``put`` -- the same lost
+    terminal, and the same downstream WAITING_FOR_CHUNK hang.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-late-cleanup")
+    task = adapter._pending_save_reqs.popleft()
+
+    real_send = adapter._send_single_request_for_generation
+
+    def send_with_cleanup_in_flight(inner_task, sender_token=None):
+        # The scheduler thread reaches cleanup_sender here: the save_loop owns
+        # the terminal but has not handed it to the connector yet.
+        adapter.cleanup_sender("ext-late-cleanup")
+        return real_send(inner_task, sender_token)
+
+    adapter._send_single_request_for_generation = send_with_cleanup_in_flight
+    adapter._send_single_request(task)
+
+    _assert_terminal_put(connector)
+    # The generation the fence kept alive is reclaimed, not leaked.
+    assert "ext-late-cleanup" not in adapter._sender_tokens
+    assert "ext-late-cleanup" not in adapter.put_req_chunk
+
+
+def test_terminal_chunk_survives_cleanup_racing_an_inflight_sibling(build_adapter):
+    """#6670: an in-flight ordinary chunk must not reclaim a fenced generation.
+
+    ``_send_single_request``'s ``finally`` also tears a cancelled generation
+    down. If the stop and the abort both land while an earlier chunk is on the
+    wire, that teardown would unregister the token and the queued terminal
+    would then fail the identity check.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    running = _req("req-sibling", RequestStatus.RUNNING, external_req_id="ext-sibling")
+    running.resumable = True
+    adapter.save_async(None, running, is_segment_finished=True)
+    ordinary_task = adapter._pending_save_reqs.popleft()
+
+    real_send = adapter._send_single_request_for_generation
+
+    def send_then_stop_and_abort(inner_task, sender_token=None):
+        result = real_send(inner_task, sender_token)
+        # Terminal stop and abort both land while this chunk is on the wire.
+        # The segment stop above already armed the next segment's watermark.
+        _queue_terminal(adapter, "ext-sibling", req_id="req-sibling", segment_generation=1)
+        adapter.cleanup_sender("ext-sibling")
+        return result
+
+    adapter._send_single_request_for_generation = send_then_stop_and_abort
+    adapter._send_single_request(ordinary_task)
+    adapter._send_single_request_for_generation = real_send
+
+    assert len(adapter._pending_save_reqs) == 1
+    connector.put.reset_mock()
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    _assert_terminal_put(connector)
+    assert "ext-sibling" not in adapter._sender_tokens
+
+
+@pytest.mark.parametrize("finish_inside_put", [False, True])
+def test_successful_put_keeps_terminal_chunk_sequence(build_adapter, finish_inside_put):
+    """A cleanup during put must not reuse a key already consumed downstream."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    receiver, receiver_connector = build_adapter(stage_id=2, model_mode="generation")
+    session = _req("req-sequence", RequestStatus.WAITING_FOR_STREAMING_REQ, external_req_id="ext-sequence")
+    session.resumable = True
+    session._omni_segment_generation = 0
+    scheduler = _parked_sender_scheduler(adapter, session)
+    final_update = _req(session.request_id, RequestStatus.WAITING)
+    final_update.resumable = False
+    downstream = _req("req-downstream", RequestStatus.WAITING, external_req_id=session.external_req_id)
+    receiver.request_ids_mapping[downstream.request_id] = session.external_req_id
+    payloads = {}
+
+    def receive_next():
+        entry = _dequeue_load_entry(receiver, downstream)
+        return receiver._poll_single_request(entry)
+
+    def put_then_finish(**kwargs):
+        payload = kwargs["data"]
+        payloads[kwargs["put_key"]] = {
+            "meta": {
+                "finished": bool(payload.meta.finished.item()),
+                "is_segment_finished": bool(payload.meta.is_segment_finished.item()),
+            }
+        }
+        if not payload.meta.finished.item():
+            # Consume the ordinary boundary while put is still in flight.
+            assert receive_next()
+            if finish_inside_put:
+                scheduler.add_request(final_update)
+        return True, 1, {}
+
+    def get_by_key(_from_stage, _to_stage, key):
+        payload = payloads.pop(key, None)
+        return (payload, 1) if payload is not None else None
+
+    connector.put.side_effect = put_then_finish
+    receiver_connector.get.side_effect = get_by_key
+    adapter.save_async(None, session, is_segment_finished=True)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    if not finish_inside_put:
+        scheduler.add_request(final_update)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert [call.kwargs["put_key"] for call in connector.put.call_args_list] == ["ext-sequence_1_0", "ext-sequence_1_1"]
+    assert receive_next()
+    assert downstream.request_id in receiver.upstream_exhausted_requests
+    assert not payloads
+    assert session.external_req_id not in adapter._sender_tokens
+
+
+def test_late_successful_put_cannot_advance_replacement_generation(build_adapter):
+    """The post-put guard must retain identity checks while relaxing cancellation."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-old", RequestStatus.RUNNING, external_req_id="ext-replaced")
+    request.resumable = True
+    adapter.save_async(None, request, is_segment_finished=True)
+    task = adapter._pending_save_reqs.popleft()
+    old_token = task["sender_token"]
+    replacement_token = type(old_token)()
+
+    def replace_during_put(**kwargs):
+        # Model a completion that no longer owns its external id. The old
+        # terminal fence must never authorize writes to the successor's state.
+        with adapter._sender_state_lock:
+            old_token.cancelled = True
+            old_token.terminal_pending = True
+            adapter._sender_tokens[request.external_req_id] = replacement_token
+            adapter.put_req_chunk[request.external_req_id] = 4
+            adapter.ramp_chunk_count[request.external_req_id] = 2
+        return True, 1, {}
+
+    connector.put.side_effect = replace_during_put
+    adapter._send_single_request(task)
+    assert adapter._sender_tokens[request.external_req_id] is replacement_token
+    assert adapter.put_req_chunk[request.external_req_id] == 4
+    assert adapter.ramp_chunk_count[request.external_req_id] == 2
+
+
+def test_new_request_cannot_join_a_generation_with_a_queued_terminal(build_adapter):
+    """#6670: the fence must not readmit a request reusing the external id.
+
+    ``save_async`` rejects chunks whose generation is ``cancelled``; that is
+    what stops a new request from inheriting a retiring generation's token and
+    chunk counters. Deferring the reclaim must not also defer that retirement.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-shared", req_id="req-old")
+    adapter.cleanup_sender("ext-shared")
+
+    newcomer = _req("req-new", RequestStatus.RUNNING, external_req_id="ext-shared")
+    newcomer.resumable = True
+    adapter.save_async(None, newcomer, is_segment_finished=True)
+
+    # Rejected loudly, so the scheduler fails the newcomer now instead of its
+    # chunks being silently discarded at send time.
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.collect_failed_send_request_ids() == {"req-new": "previous sender generation is still draining"}
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    _assert_terminal_put(connector)
+    assert "ext-shared" not in adapter._sender_tokens
+
+
+def test_failed_terminal_put_runs_the_deferred_cleanup(build_adapter):
+    """#6670: a silent connector drop must not strand the deferred cleanup.
+
+    ``connector.put`` returning False skips the success path that would have
+    called ``cleanup``. The reclaim ``cleanup_sender`` handed over is owed on
+    that path too, or the whole per-request sender state leaks for good.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-put-failed")
+    adapter.cleanup_sender("ext-put-failed")
+    connector.put.return_value = (False, 0, {})
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert "ext-put-failed" not in adapter._sender_tokens
+    assert "ext-put-failed" not in adapter.put_req_chunk
+
+
+def test_raising_terminal_put_runs_the_deferred_cleanup(build_adapter):
+    """#6670: the same reclaim is owed when the connector raises."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-put-raised")
+    adapter.cleanup_sender("ext-put-raised")
+    connector.put.side_effect = RuntimeError("connector down")
+
+    # ``save_loop`` catches this and records a send failure.
+    with pytest.raises(RuntimeError):
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert "ext-put-raised" not in adapter._sender_tokens
+    assert "ext-put-raised" not in adapter.put_req_chunk
+
+
 def test_wire_round_trip_struct_to_dict_contract():
     """Pin the wire contract: encoding ``OmniPayloadStruct`` and decoding it
     yields a dict equivalent to ``to_dict(struct)``.

@@ -48,7 +48,7 @@ class StageRequestStats:
     finish_reason: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, float] = None
+    diffusion_metrics: dict[str, float] | None = None
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
@@ -181,11 +181,11 @@ class OrchestratorAggregator:
         self.e2e_total_ms = 0.0
         self.e2e_total_tokens = 0
         self.e2e_count = 0
-        self.e2e_done = set()
+        self.e2e_done: set[str] = set()
         self.wall_start_ts = float(wall_start_ts)
         self.last_finish_ts = float(wall_start_ts)
-        self.stage_first_ts = [None for _ in range(self.num_stages)]
-        self.stage_last_ts = [None for _ in range(self.num_stages)]
+        self.stage_first_ts: list[float | None] = [None for _ in range(self.num_stages)]
+        self.stage_last_ts: list[float | None] = [None for _ in range(self.num_stages)]
         self.accumulated_gen_time_ms: defaultdict[str, defaultdict[int, float]] = defaultdict(
             lambda: defaultdict(float)
         )  # {request_id: {stage_id:accumulated_gen_time_ms}}
@@ -618,6 +618,7 @@ class OrchestratorAggregator:
         final_output_type: str | None = None,
     ) -> None:
         stats = self._as_stage_request_stats(stage_id, req_id, metrics, final_output_type)
+        assert stats.stage_id is not None
         self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_out)
         if stats.stage_id == 0:
             self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_in)
@@ -656,6 +657,7 @@ class OrchestratorAggregator:
     _MS_TO_S: dict[str, str] = {
         "preprocess_time_ms": "preprocess_time_s",
         "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+        "output_ready_wait_time_ms": "output_ready_wait_time_s",
         "postprocess_time_ms": "postprocess_time_s",
         "vae_decode_time_ms": "vae_decode_time_s",
         "forward_time_ms": "forward_time_s",
@@ -774,10 +776,8 @@ class OrchestratorAggregator:
             final_stage_id_map = self.final_stage_id_for_e2e
 
         stage_wall_time_ms = [
-            ((self.stage_last_ts[i] - self.stage_first_ts[i]) * 1000.0)
-            if (self.stage_first_ts[i] is not None and self.stage_last_ts[i] is not None)
-            else 0.0
-            for i in range(self.num_stages)
+            ((last - first) * 1000.0) if first is not None and last is not None else 0.0
+            for first, last in zip(self.stage_first_ts, self.stage_last_ts, strict=True)
         ]
 
         overall_summary = {

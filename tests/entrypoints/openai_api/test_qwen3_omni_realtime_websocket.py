@@ -22,6 +22,7 @@ import wave
 import pytest
 import websockets
 
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
@@ -174,7 +175,7 @@ async def _run_realtime_audio_roundtrip(
             if event_type == "session.created":
                 continue
 
-            if event_type == "response.audio.delta":
+            if event_type == "response.output_audio.delta":
                 delta_events += 1
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
@@ -194,7 +195,7 @@ async def _run_realtime_audio_roundtrip(
                 final_text = event.get("text", "") or "".join(text_chunks)
                 continue
 
-            if event_type == "response.audio.done":
+            if event_type == "response.output_audio.done":
                 break
 
             if event_type == "error":
@@ -306,10 +307,15 @@ def _synthetic_pcm16_input(
     return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
 
 
+def _server_vad_pcm16_input() -> bytes:
+    """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
+    return _pcm16_mono_16k_from_wav_bytes(validated_input_wav().read_bytes())
+
+
 def _assert_realtime_smoke(result: dict) -> None:
     out_pcm = result["output_pcm"]
     assert result["delta_events"] >= 1
-    assert out_pcm, "No output PCM from response.audio.delta"
+    assert out_pcm, "No output PCM from response.output_audio.delta"
     assert len(out_pcm) % 2 == 0
     assert len(out_pcm) >= 4096, "Output audio unexpectedly small"
     assert result["output_sample_rate"] > 0
@@ -382,7 +388,7 @@ class TestQwen3OmniRealtimeWebSocket:
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
     def test_long_audio_response_completes_async_chunk(self, omni_server) -> None:
-        """Regression for #6474: long async-chunk audio must emit response.audio.done."""
+        """Regression for #6474: long async-chunk audio must emit response.output_audio.done."""
         issue_6474_pcm16 = _synthetic_pcm16_input(
             phrase_text=ISSUE_6474_SYNTH_PHRASE_TEXT,
         )
@@ -408,7 +414,6 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_server_vad_server_params, indirect=True)
-    @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/7279")
     def test_server_vad_multi_turn_without_client_commit(
         self,
         cached_silero_vad_artifact: str,
@@ -420,7 +425,7 @@ class TestQwen3OmniRealtimeWebSocket:
         assert deploy.session_mode == "turn"
         assert deploy.async_chunk is True
         assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
-        pcm16 = _synthetic_pcm16_input()
+        pcm16 = _server_vad_pcm16_input()
 
         turns = asyncio.run(
             _run_server_vad_audio_roundtrips(
@@ -434,19 +439,28 @@ class TestQwen3OmniRealtimeWebSocket:
         )
 
         assert len(turns) == 2
+        updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
+        effective_turn_detection = updated_session["audio"]["input"]["turn_detection"]
+        assert effective_turn_detection["type"] == "server_vad"
+        assert effective_turn_detection["silence_duration_ms"] == 500
+        assert effective_turn_detection["create_response"] is True
+        assert effective_turn_detection["interrupt_response"] is False
         required_sequence = [
             "input_audio_buffer.speech_started",
             "input_audio_buffer.speech_stopped",
             "input_audio_buffer.committed",
             "response.created",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.done",
         ]
         input_item_ids: list[str] = []
         response_ids: list[str] = []
         for events in turns:
             event_types = [event["type"] for event in events]
+            for event_type in required_sequence:
+                if event_type != "response.output_audio.delta":
+                    assert event_types.count(event_type) == 1, event_types
             positions = [event_types.index(event_type) for event_type in required_sequence]
             assert positions == sorted(positions)
 
@@ -457,9 +471,27 @@ class TestQwen3OmniRealtimeWebSocket:
             done = next(event for event in events if event["type"] == "response.done")["response"]
 
             assert started["item_id"] == stopped["item_id"] == committed["item_id"]
+            input_item_id = committed["item_id"]
+            history_events = [
+                event
+                for event in events
+                if event["type"] in {"conversation.item.added", "conversation.item.done"}
+                and event["item"]["id"] == input_item_id
+            ]
+            assert [event["type"] for event in history_events] == [
+                "conversation.item.added",
+                "conversation.item.done",
+            ]
+            assert all(event["item"]["role"] == "user" for event in history_events)
+            output_pcm = b"".join(
+                base64.b64decode(event["delta"])
+                for event in events
+                if event["type"] == "response.output_audio.delta" and event.get("delta")
+            )
+            assert output_pcm
             assert created["id"] == done["id"]
             assert done["status"] == "completed"
-            input_item_ids.append(committed["item_id"])
+            input_item_ids.append(input_item_id)
             response_ids.append(created["id"])
 
         assert len(set(input_item_ids)) == 2

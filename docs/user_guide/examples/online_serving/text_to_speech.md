@@ -120,6 +120,15 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Streaming is on by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path.
 
+Cross-request Stage-1 flow batching is opt-in. Enable it in the server environment when concurrent requests should share a flow-estimator call:
+
+```bash
+export COSYVOICE3_BATCH_FLOW=1
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
+```
+
+Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+
 ### CLI client
 
 The client defaults to the official upstream zero-shot prompt, so it runs without extra flags:

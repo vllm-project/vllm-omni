@@ -1,16 +1,18 @@
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.28.0
+# Keep the ROCm runtime aligned with the vLLM release targeted by
+# docker/Dockerfile.ci. A stale base image can build successfully while failing
+# at runtime when vLLM-Omni imports APIs added by the newer vLLM release.
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.29.0
 FROM ${BASE_IMAGE} AS base
 
-# Declare a variable to know if we want to use the nightly build or the stable build.
 # NOTE: REMINDER to vLLM-Omni rebase maintainer
-# Remember to set `USE_NIGHTLY_BUILD` to 0, when switching back to stable vLLM docker image
-# 1. If vLLM-omni maintainer is forced to use custom commits
-#    during rebasing, they can change the two variables
-# 2. Whenever vLLM upstream has released a stable version,
-#    we should swap over to use stable release ASAP.
-#    We should avoid relying on custom commits.
+# BASE_IMAGE pins the default prebuilt runtime when USE_NIGHTLY_BUILD=0.
+# VLLM_VERSION_OR_COMMIT_HASH is consumed only by the opt-in source rebuild when
+# USE_NIGHTLY_BUILD=1. Keep both aligned with docker/Dockerfile.ci's
+# VLLM_BASE_TAG. This is enforced by tests/buildkite/test_rocm_dockerfile.py. An
+# intentional custom source pin must update that regression in the same change,
+# and should return to the stable release as soon as one is available.
 ARG USE_NIGHTLY_BUILD=0
-ARG VLLM_VERSION_OR_COMMIT_HASH=v0.28.0
+ARG VLLM_VERSION_OR_COMMIT_HASH=v0.29.0
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
@@ -37,6 +39,10 @@ RUN if [ "${USE_NIGHTLY_BUILD}" = "1" ]; then \
         cd ../ && \
         rm -rf vllm/.git; \
     fi
+
+# Fail during image construction instead of letting every AMD test fail at
+# runtime when the base image and vLLM-Omni target incompatible vLLM APIs.
+RUN python3 -c "import vllm; from vllm.v1.kv_cache_interface import compute_layout_strides; from vllm.v1.kv_cache_layout import KVCacheLayout; print(f'Validated vLLM {vllm.__version__}')"
 
 # Build TorchCodec after any optional nightly vLLM reinstall so it targets the
 # final torch/ROCm ABI. Keep this layer before COPY . so source changes do not

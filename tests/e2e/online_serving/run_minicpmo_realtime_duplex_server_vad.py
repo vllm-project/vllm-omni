@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import base64
 from pathlib import Path
 
@@ -41,7 +44,10 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
             next(e for e in client.events.events if e.get("type") == "response.created")
         )
         assert target_id
-        await until(lambda: _events(client.events.events, target_id, "response.audio.delta"), "response.audio.delta")
+        await until(
+            lambda: _events(client.events.events, target_id, "response.output_audio.delta"),
+            "response.output_audio.delta",
+        )
         cursor = len(client.events.events)
         await client.stream_pcm16(interrupt + bytes(16_000 * 2 * 800 // 1000), chunk_ms=args.chunk_ms, realtime=True)
         await until(lambda: _events(client.events.events, target_id, "response.done"), "cancelled response.done")
@@ -64,10 +70,11 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
     terminal = done[0] if len(done) == 1 else None
     trailing = events[events.index(terminal) + 1 :] if terminal is not None else events
     stale = any(
-        e.get("type") == "response.audio.delta" and RealtimeEventCollector.response_id(e) == target_id for e in trailing
+        e.get("type") == "response.output_audio.delta" and RealtimeEventCollector.response_id(e) == target_id
+        for e in trailing
     )
     followup_audio = any(
-        e.get("type") == "response.audio.delta" and RealtimeEventCollector.response_id(e) != target_id
+        e.get("type") == "response.output_audio.delta" and RealtimeEventCollector.response_id(e) != target_id
         for e in events[cursor:]
     )
     ok = (
