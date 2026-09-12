@@ -153,6 +153,25 @@ def _new_groups(
     return tuple(groups)
 
 
+@contextmanager
+def _record_scalar_all_gathers():
+    """Count metadata collectives while still executing the real operation."""
+
+    scalar_calls = []
+    original_all_gather = dist.all_gather
+
+    def counted_all_gather(output_tensors, input_tensor, *args, **kwargs):
+        if input_tensor.numel() == 1 and all(tensor.numel() == 1 for tensor in output_tensors):
+            scalar_calls.append(1)
+        return original_all_gather(output_tensors, input_tensor, *args, **kwargs)
+
+    dist.all_gather = counted_all_gather
+    try:
+        yield scalar_calls
+    finally:
+        dist.all_gather = original_all_gather
+
+
 def _distributed_worker(rank: int, rendezvous: str) -> None:
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -194,8 +213,10 @@ def _distributed_worker(rank: int, rendezvous: str) -> None:
             with _patched_groups(tp_group, sp_group):
                 model = Magi2PreviewTransformer(_tiny_config())
                 assert model.load_weights(checkpoint) == set(model.state_dict())
-                with torch.no_grad():
-                    actual = model(*inputs)
+                with _record_scalar_all_gathers() as scalar_all_gathers:
+                    with torch.no_grad():
+                        actual = model(*inputs)
+                assert not scalar_all_gathers, f"{layout_name} performed redundant per-layer sequence-size collectives"
 
             max_abs_error = (actual - expected).abs().max()
             dist.all_reduce(max_abs_error, op=dist.ReduceOp.MAX)
