@@ -190,7 +190,7 @@ def test_abort_async_tolerates_request_queue_close_during_shutdown(
     engine._shutdown_called = False
 
     class ClosingRequestQueue:
-        def put(self, item) -> None:
+        def put(self, item, block=True, timeout=None) -> None:
             del item
             engine._shutdown_called = True
             raise SyntheticSyncQueueShutDownError
@@ -216,7 +216,7 @@ def test_abort_async_surfaces_request_queue_close_while_engine_is_live(
         pass
 
     class ClosedRequestQueue:
-        def put(self, item) -> None:
+        def put(self, item, block=True, timeout=None) -> None:
             del item
             raise SyntheticSyncQueueShutDownError
 
