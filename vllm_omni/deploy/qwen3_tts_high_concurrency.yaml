@@ -108,3 +108,9 @@ platforms:
     stages:
       - stage_id: 0
         enforce_eager: true
+      - stage_id: 1
+        additional_config:
+          # NPU Code2Wav decoder compute dtype: fp32 (default), bf16, fp16.
+          # FP32 preserves the original precision; lower precision may affect audio quality.
+          # 310P always uses its platform FP16 override regardless of this setting.
+          code2wav_dtype: fp32

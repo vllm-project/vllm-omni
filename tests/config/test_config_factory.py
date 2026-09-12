@@ -2583,6 +2583,36 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    def test_qwen3_tts_npu_default_code2wav_dtype_is_fp32(self, deploy_name):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        deploy = _apply_platform_overrides(deploy, platform="npu")
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+
+        # Read the shipped value without injecting a test override: changing
+        # either deploy profile to a lower-precision default must fail here.
+        assert stages[1].yaml_engine_args["additional_config"]["code2wav_dtype"] == "fp32"
+        assert "code2wav_dtype" not in stages[0].yaml_engine_args.get("additional_config", {})
+
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    @pytest.mark.parametrize("dtype", ["fp32", "bf16", "fp16"])
+    def test_qwen3_tts_npu_propagates_explicit_code2wav_dtype(self, deploy_name, dtype):
+        deploy_path = Path(get_deploy_config_path(deploy_name))
+
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.platforms is not None
+        npu_stages = deploy.platforms["npu"]["stages"]
+        code2wav = next((stage for stage in npu_stages if stage["stage_id"] == 1), None)
+        if code2wav is None:
+            code2wav = {"stage_id": 1}
+            npu_stages.append(code2wav)
+        code2wav["additional_config"] = {"code2wav_dtype": dtype}
+        deploy = _apply_platform_overrides(deploy, platform="npu")
+
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+        assert "code2wav_dtype" not in stages[0].yaml_engine_args.get("additional_config", {})
+        assert stages[1].yaml_engine_args["additional_config"]["code2wav_dtype"] == dtype
+
     def test_higgs_audio_v3_rocm_uses_triton_attention(self):
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
