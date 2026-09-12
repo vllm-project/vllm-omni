@@ -351,7 +351,7 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     ar_stage = omni_config.stage_by_id(0)
     dit_stage = omni_config.stage_by_id(1)
 
-    assert ar_stage.execution_type == StageExecutionType.LLM_AR
+    assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
     assert legacy_args[0]["kv_cache_dtype"] == "fp8_e4m3"
     assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
     assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
