@@ -32,6 +32,16 @@ class _SenderGeneration:
     def __init__(self) -> None:
         self.in_flight = False
         self.cancelled = False
+        # A request-terminal chunk is queued but not yet on the wire. The
+        # downstream stage has no other way to learn the stream ended -- it
+        # polls the connector and parks in WAITING_FOR_CHUNK until a chunk
+        # carrying ``finished`` arrives -- so cleanup must not discard it.
+        # See vllm-project/vllm-omni#6670.
+        self.terminal_pending = False
+        # ``cleanup_sender`` asked to reclaim this generation while the fence
+        # was up. The terminal task owes that cleanup once it is done with the
+        # connector -- on every exit path, including a failed or raising put.
+        self.cleanup_deferred = False
 
 
 class _LoadEntry:
@@ -51,13 +61,21 @@ class _LoadEntry:
         return self.request.external_req_id
 
 
-def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int]:
-    """Return the effective Talker context limit and recompute window."""
+def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int, bool]:
+    """Return the Talker context limit and streaming recompute policy."""
     max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+    if getattr(model_config, "hf_config_name", None) != "tts_config":
+        return max_model_len, 0, False
     hf_config = getattr(model_config, "hf_config", None)
     tts_config = getattr(hf_config, "tts_config", None)
-    if tts_config is None and getattr(hf_config, "model_type", None) == "minicpmtts":
+    if tts_config is None:
         tts_config = hf_config
+    if isinstance(tts_config, Mapping):
+        tts_model_type = tts_config.get("model_type")
+    else:
+        tts_model_type = getattr(tts_config, "model_type", None)
+    if tts_model_type not in {"conditional_chattts", "minicpmtts"}:
+        return max_model_len, 0, False
     tts_max_model_len = (
         tts_config.get("max_position_embeddings", 0)
         if isinstance(tts_config, Mapping)
@@ -71,11 +89,17 @@ def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int
         if isinstance(tts_config, Mapping)
         else getattr(tts_config, "attention_type", None)
     )
-    # Official MiniCPMTTS supports both full_attention and
-    # sliding_recompute. Only an explicit Talker-stage policy enables the
-    # latter; native duplex alone must not override checkpoint semantics.
-    previous_chunks = 1 if attention_type == "sliding_recompute" else 0
-    return max_model_len, previous_chunks
+    if tts_config is not None and attention_type is None:
+        attention_type = "full_attention"
+    # ``full_attention`` keeps the complete prompt until its next condition
+    # would exceed the Talker context. It then falls back to the same supported
+    # one-previous-chunk recompute recipe. An explicitly configured
+    # ``sliding_recompute`` applies that recipe at every condition boundary.
+    if attention_type == "sliding_recompute":
+        return max_model_len, 1, False
+    if attention_type == "full_attention":
+        return max_model_len, 1, True
+    return max_model_len, 0, False
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -113,9 +137,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._registered_load_entries: dict[str, _LoadEntry] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._max_model_len, self._streaming_prompt_previous_chunks = _resolve_talker_streaming_prompt_config(
-            model_config
-        )
+        (
+            self._max_model_len,
+            self._streaming_prompt_previous_chunks,
+            self._streaming_prompt_recompute_on_capacity,
+        ) = _resolve_talker_streaming_prompt_config(model_config)
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
@@ -305,6 +331,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._processor_accepts_step_tokens[processor] = accepts
         return accepts
 
+    def has_active_sender(self, external_req_id: str) -> bool:
+        """Whether this request owns a sender, including work still queued.
+
+        ``save_async`` registers the generation before the background thread
+        can send its first chunk. Chunk counters are initialized later and
+        cannot determine whether a prewarmed receiver needs a terminal.
+        """
+        with self._sender_state_lock:
+            sender_token = self._sender_tokens.get(external_req_id)
+            return sender_token is not None and not sender_token.cancelled
+
     def save_async(
         self,
         multimodal_output: dict[str, Any] | None = None,
@@ -313,6 +350,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         new_token_ids: Iterable[int] | None = None,
         confirmed_num_computed_tokens: int | None = None,
         segment_generation: int | None = None,
+        force_request_finished: bool = False,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -336,8 +374,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 before a streaming transition can mutate ``request``
             segment_generation: generation captured before a resumable stop
                 can apply a queued update to the mutable request
+            force_request_finished: send this chunk as the request terminal
+                even though ``request`` is not in a finished status yet. The
+                scheduler needs this when it ends a *parked* streaming session:
+                the terminal has to be enqueued before ``finish_requests``,
+                because ``finish_requests`` skips requests that already report
+                ``is_finished()``. See ``_finish_parked_streaming_session``.
         """
-        is_finished = request.is_finished() and not request.resumable
+        is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
         external_req_id = request.external_req_id
@@ -398,6 +442,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self._sender_tokens[external_req_id] = sender_token
                 task["sender_token"] = sender_token
                 self._pending_save_reqs.append(task)
+                if is_finished:
+                    # Fence this generation against cleanup until the terminal
+                    # chunk has been handed to the connector (#6670).
+                    sender_token.terminal_pending = True
                 if is_segment_finished:
                     # The queued FIFO item now owns the old segment. Start the next
                     # segment's deduplication watermark before the worker sends it.
@@ -608,32 +656,71 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if sender_token is None:
             self._send_single_request_for_generation(task)
             return
+        is_terminal_task = bool(task.get("is_finished"))
         with self._sender_state_lock:
             is_current = self._sender_tokens.get(external_req_id) is sender_token
-            if is_current and not sender_token.cancelled:
+            # ``cancelled`` does not veto a terminal chunk. It is the
+            # downstream stage's only end-of-stream signal, so dropping it
+            # leaves that stage parked in WAITING_FOR_CHUNK until the input
+            # deadline -- the hang this fence exists to prevent (#6670).
+            # Losing ownership of the external id still vetoes: the state the
+            # chunk describes then belongs to a different generation.
+            if is_current and (is_terminal_task or not sender_token.cancelled):
                 sender_token.in_flight = True
             else:
                 is_current = False
         if not is_current:
             logger.debug("Discarding stale queued chunk for aborted request %s", external_req_id)
+            if is_terminal_task:
+                self._release_terminal_fence(external_req_id, sender_token)
             return
         try:
             self._send_single_request_for_generation(task, sender_token)
         finally:
+            if is_terminal_task:
+                # Drop the fence and run the cleanup it deferred, whether the
+                # put succeeded, reported failure, or raised. Until this runs,
+                # the block below must not reclaim the generation either.
+                self._release_terminal_fence(external_req_id, sender_token)
             with self._sender_state_lock:
                 if self._sender_tokens.get(external_req_id) is sender_token:
                     sender_token.in_flight = False
-                    if sender_token.cancelled:
+                    if sender_token.cancelled and not sender_token.terminal_pending:
                         self._sender_tokens.pop(external_req_id, None)
                         self._clear_sender_state_locked(external_req_id)
+
+    def _release_terminal_fence(self, external_req_id: str, sender_token: _SenderGeneration) -> None:
+        """Drop the terminal fence and run the cleanup it deferred.
+
+        Called on every exit path of a terminal task. ``cleanup_sender``
+        cannot reclaim a generation whose terminal chunk is still queued, so
+        it records the request on the token instead; without this the only
+        path that ever replayed it was a *successful* put, and a connector
+        failure leaked the whole per-request sender state (#6670).
+        """
+        with self._sender_state_lock:
+            sender_token.terminal_pending = False
+            deferred = sender_token.cleanup_deferred
+            sender_token.cleanup_deferred = False
+            # A generation that no longer owns the external id was already
+            # reclaimed by whoever replaced it; cleaning now would clear the
+            # successor's state.
+            still_current = self._sender_tokens.get(external_req_id) is sender_token
+        if deferred and still_current:
+            self.cleanup_sender(external_req_id)
 
     def _sender_generation_is_active(
         self,
         external_req_id: str,
         sender_token: _SenderGeneration,
+        *,
+        is_terminal: bool = False,
     ) -> bool:
         with self._sender_state_lock:
-            return self._sender_tokens.get(external_req_id) is sender_token and not sender_token.cancelled
+            if self._sender_tokens.get(external_req_id) is not sender_token:
+                return False
+            # Terminal chunks outlive cancellation -- see _send_single_request.
+            return is_terminal or not sender_token.cancelled
 
     def _send_single_request_for_generation(
         self,
@@ -696,7 +783,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
-        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+        if sender_token is not None and not self._sender_generation_is_active(
+            external_req_id, sender_token, is_terminal=is_finished
+        ):
             logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
             return
 
@@ -707,16 +796,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             data=payload_data,
         )
 
-        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
-            # cleanup_sender() may cancel this generation while put() is
-            # blocked. Do not let that stale completion recreate state for a
-            # request whose cleanup is already in progress.
-            logger.debug("Ignoring completed put for cancelled request %s", external_req_id)
-            return
+        with self._sender_state_lock:
+            if sender_token is not None:
+                still_current = self._sender_tokens.get(external_req_id) is sender_token
+                retiring_without_terminal = sender_token.cancelled and not (
+                    is_finished or sender_token.terminal_pending
+                )
+                if not still_current or retiring_without_terminal:
+                    logger.debug("Ignoring completed put for retired request %s", external_req_id)
+                    return
+            if success:
+                # A receiver may already have consumed this key while put was
+                # in flight. Even if cleanup retired this generation, its
+                # pending terminal must use the next key. Check ownership and
+                # advance counters under the same lock so a stale completion
+                # cannot modify a successor's state.
+                self.put_req_chunk[external_req_id] += 1
+                self.ramp_chunk_count[external_req_id] += 1
 
         if success:
-            self.put_req_chunk[external_req_id] += 1
-            self.ramp_chunk_count[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             # Sender uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
@@ -846,6 +944,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if sender_token is None:
                 self._clear_sender_state_locked(external_req_id)
                 return
+            if sender_token.terminal_pending:
+                # A request-terminal chunk is still queued. Reclaiming the
+                # state now would drop it, and the downstream stage would sit
+                # in WAITING_FOR_CHUNK until VLLM_OMNI_INPUT_WAIT_TIMEOUT_S
+                # with no way to know the stream ended (#6670). Retire the
+                # generation anyway -- ``save_async`` rejects new chunks on
+                # ``cancelled``, which is what keeps a request reusing this
+                # external id from joining a generation that is going away --
+                # and hand the reclaim to the terminal task.
+                sender_token.cancelled = True
+                sender_token.cleanup_deferred = True
+                return
             sender_token.cancelled = True
             if sender_token.in_flight:
                 # The sender's finally block is the first point where no
@@ -962,6 +1072,99 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
 
+    def update_streaming_prompt_for_condition(
+        self,
+        payload_data: dict[str, Any],
+        request: Request,
+        *,
+        update_prompt: bool,
+    ) -> bool | None:
+        """Track one Talker condition and optionally update its prompt.
+
+        Returns ``None`` when the payload is not governed by the Talker
+        streaming-window contract. Otherwise returns whether the prompt was
+        replaced, as opposed to extended in place.
+        """
+        if self._streaming_prompt_previous_chunks != 1:
+            return None
+        meta = payload_data.get("meta")
+        if not isinstance(meta, dict):
+            return None
+        condition_len = meta.get("next_stage_prompt_len")
+        if not isinstance(condition_len, int) or isinstance(condition_len, bool) or condition_len <= 0:
+            return None
+
+        request_id = request.request_id
+        previous_condition_seq = self._streaming_condition_seqs.get(request_id)
+        previous_condition_len = self._streaming_condition_lengths.get(request_id)
+        if (previous_condition_seq is None) != (previous_condition_len is None):
+            raise ValueError("streaming Talker condition tracking is incomplete")
+        if previous_condition_seq is None and not self.receives_chunks:
+            # A sender-only Talker is admitted with its first real condition,
+            # before this adapter observes any StreamingUpdate. Seed that
+            # condition as sequence zero from the active request so its first
+            # continuation follows the same lifecycle as receiver stages.
+            initial_info = getattr(request, "model_intermediate_buffer", None)
+            initial_meta = initial_info.get("meta") if isinstance(initial_info, dict) else None
+            initial_condition_len = (
+                initial_meta.get("next_stage_prompt_len") if isinstance(initial_meta, dict) else None
+            )
+            initial_condition_seq = (
+                initial_meta.get("streaming_condition_seq") if isinstance(initial_meta, dict) else None
+            )
+            if (
+                isinstance(initial_info, dict)
+                and initial_info.get("native_duplex") is True
+                and isinstance(initial_condition_len, int)
+                and not isinstance(initial_condition_len, bool)
+                and initial_condition_len > 0
+                and isinstance(initial_condition_seq, int)
+                and not isinstance(initial_condition_seq, bool)
+                and initial_condition_seq == 0
+            ):
+                if initial_condition_len != request.num_prompt_tokens:
+                    raise ValueError(
+                        "initial streaming Talker condition length does not match its prompt: "
+                        f"condition={initial_condition_len}, prompt={request.num_prompt_tokens}"
+                    )
+                previous_condition_seq = initial_condition_seq
+                previous_condition_len = initial_condition_len
+        supplied_condition_seq = meta.get("streaming_condition_seq")
+        if supplied_condition_seq is None:
+            if payload_data.get("native_duplex") is True and not self.receives_chunks:
+                raise ValueError("native duplex Talker condition is missing streaming_condition_seq")
+            condition_seq = previous_condition_seq + 1 if previous_condition_seq is not None else 0
+            meta["streaming_condition_seq"] = condition_seq
+        elif (
+            not isinstance(supplied_condition_seq, int)
+            or isinstance(supplied_condition_seq, bool)
+            or supplied_condition_seq < 0
+        ):
+            raise ValueError("streaming_condition_seq must be a non-negative integer")
+        else:
+            condition_seq = supplied_condition_seq
+        expected_condition_seq = previous_condition_seq + 1 if previous_condition_seq is not None else 0
+        if condition_seq != expected_condition_seq:
+            raise ValueError(
+                "native duplex Talker condition sequence is not contiguous: "
+                f"expected={expected_condition_seq}, received={condition_seq}"
+            )
+        replaced = False
+        if update_prompt:
+            replaced = construct_next_stage_streaming_input_prompt(
+                payload_data,
+                request,
+                max_model_len=self._max_model_len,
+                previous_condition_len=previous_condition_len,
+                previous_condition_seq=previous_condition_seq,
+                condition_seq=condition_seq,
+                recompute_previous_chunks=self._streaming_prompt_previous_chunks,
+                recompute_on_capacity=self._streaming_prompt_recompute_on_capacity,
+            )
+        self._streaming_condition_lengths[request_id] = condition_len
+        self._streaming_condition_seqs[request_id] = condition_seq
+        return replaced
+
     def _apply_pending_ar_prompt_updates(self, scheduler_requests: dict[str, Request] | None) -> None:
         """Finalize ready AR prompt updates on the scheduler thread."""
         for request_id in tuple(self.requests_with_ready_chunks):
@@ -981,41 +1184,37 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     continue
 
                 request.additional_information = payload_data
-                meta = payload_data.get("meta")
-                meta = meta if isinstance(meta, dict) else {}
-                previous_condition_seq = self._streaming_condition_seqs.get(request_id)
-                condition_seq = previous_condition_seq + 1 if previous_condition_seq is not None else 0
                 is_window_condition = window_condition_len is not None
                 if is_window_condition:
-                    meta["streaming_condition_seq"] = condition_seq
-                if is_window_condition:
+                    previous_condition_seq = self._streaming_condition_seqs.get(request_id)
+                    meta = payload_data.get("meta")
+                    assert isinstance(meta, dict)
                     update_prompt = bool(
                         was_resumable
                         and (previous_condition_seq is not None or meta.get("replace_streaming_prompt") is True)
                     )
                 try:
-                    if update_prompt:
+                    replaced = self.update_streaming_prompt_for_condition(
+                        payload_data,
+                        request,
+                        update_prompt=update_prompt,
+                    )
+                    if replaced is None and update_prompt:
+                        # Non-window AR receivers still use the generic
+                        # prompt-extension contract from the base adapter.
                         replaced = construct_next_stage_streaming_input_prompt(
                             payload_data,
                             request,
                             max_model_len=self._max_model_len,
-                            previous_condition_len=self._streaming_condition_lengths.get(request_id),
-                            previous_condition_seq=previous_condition_seq,
-                            condition_seq=condition_seq,
-                            recompute_previous_chunks=self._streaming_prompt_previous_chunks,
                         )
-                        if replaced:
-                            self.replaced_streaming_prompt_ids.add(request_id)
+                    if replaced:
+                        self.replaced_streaming_prompt_ids.add(request_id)
                 except ValueError as exc:
                     # The connector chunk was consumed, so retrying would skip
                     # this transition and desynchronize Talker. Let the
                     # scheduler fail it.
                     self.record_receive_failure(request_id, str(exc))
                     continue
-
-                if window_condition_len is not None:
-                    self._streaming_condition_lengths[request_id] = window_condition_len
-                    self._streaming_condition_seqs[request_id] = condition_seq
 
     def _requeue_replaced_prompts(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         """Move a replaced running prompt back through scheduler admission."""

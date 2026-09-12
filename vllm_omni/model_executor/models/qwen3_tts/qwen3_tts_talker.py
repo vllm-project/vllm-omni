@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
@@ -1100,10 +1103,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             subfolder="speech_tokenizer",
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
-        enc_loaded = AutoWeightsLoader(
-            self,
-            skip_prefixes=["decoder."],
-        ).load_weights(subfolder_weights)
+        enc_loaded = AutoWeightsLoader(self).load_weights(
+            subfolder_weights, mapper=WeightsMapper(orig_to_new_prefix={"decoder.": None})
+        )
         loaded |= enc_loaded
 
         # AutoWeightsLoader only loads parameters; the encoder's VQ

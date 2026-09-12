@@ -213,7 +213,7 @@ class DemoState:
                 item_id = item.get("id")
                 if isinstance(item_id, str) and item_id not in self.assistant_item_ids:
                     self.assistant_item_ids.append(item_id)
-        elif event_type == "response.audio.delta":
+        elif event_type == "response.output_audio.delta":
             delta = event.get("delta") or event.get("audio")
             if isinstance(delta, str) and delta:
                 try:
@@ -386,8 +386,8 @@ class DemoState:
             "response.output_item.added",
             "response.content_part.added",
             "response.speak",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.content_part.done",
             "response.output_item.done",
             "response.done",
@@ -402,8 +402,8 @@ class DemoState:
             )
             if index is None and event_type not in {
                 "response.speak",
-                "response.audio.delta",
-                "response.audio.done",
+                "response.output_audio.delta",
+                "response.output_audio.done",
             }:
                 return {}
             if index is not None:
@@ -451,13 +451,13 @@ class DemoState:
             "response.output_item.added",
             "response.content_part.added",
             "response.speak",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.content_part.done",
             "response.output_item.done",
             "response.done",
         ]
-        if "response.audio.delta" not in indices_by_type:
+        if "response.output_audio.delta" not in indices_by_type:
             listen_index = self.first_index(
                 "response.listen",
                 lambda event: (
@@ -515,7 +515,7 @@ class DemoState:
 
     def model_speak_before_audio_ok(self) -> bool:
         speak_index = self.first_index("response.speak")
-        audio_index = self.first_index("response.audio.delta")
+        audio_index = self.first_index("response.output_audio.delta")
         return speak_index is not None and audio_index is not None and speak_index < audio_index
 
     def response_done(self, response_id: str | None) -> bool:
@@ -532,7 +532,7 @@ class DemoState:
         return sum(
             1
             for event in self.events
-            if event.get("type") == "response.audio.delta" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio.delta" and self._event_response_id(event) == response_id
         )
 
     def response_playback_sent_ms(self, response_id: str | None) -> int:
@@ -565,14 +565,16 @@ class DemoState:
         return "".join(
             str(event.get("delta", ""))
             for event in self.events
-            if event.get("type") == "response.audio_transcript.delta" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio_transcript.delta"
+            and self._event_response_id(event) == response_id
         )
 
     def response_transcript_done(self, response_id: str) -> list[str]:
         return [
             str(event.get("transcript", ""))
             for event in self.events
-            if event.get("type") == "response.audio_transcript.done" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio_transcript.done"
+            and self._event_response_id(event) == response_id
         ]
 
     def completed_response_ids(self) -> list[str]:
@@ -603,7 +605,7 @@ class DemoState:
             return 0
         stale = 0
         for index, event in enumerate(self.events):
-            if event.get("type") != "response.audio.delta":
+            if event.get("type") != "response.output_audio.delta":
                 continue
             metadata = event.get("metadata")
             if not isinstance(metadata, dict):
@@ -1126,7 +1128,7 @@ async def _send_clean_turn(
             state,
             lambda: state.response_audio_delta_count(response_id) > 0,
             timeout_s=timeout_s,
-            label=f"{transcript} response.audio.delta",
+            label=f"{transcript} response.output_audio.delta",
         )
     await _wait_for(
         state,
@@ -1341,7 +1343,7 @@ async def _send_listen_only_overlap_pair(
         state,
         lambda: state.response_audio_delta_count(first_response_id) > 0,
         timeout_s=timeout_s,
-        label=f"{transcripts[0]} response.audio.delta",
+        label=f"{transcripts[0]} response.output_audio.delta",
     )
     if state.response_done(first_response_id):
         raise RuntimeError("first response completed before overlap input could start")
@@ -1600,7 +1602,9 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         transcript_hints_enabled=transcript_hints_enabled and not continuous_input,
     )
     model_speak_event_ok = state.model_speak_before_audio_ok()
-    realtime_audio_lifecycle_ok = state.count("response.audio.delta") > 0 and state.count("response.audio.done") > 0
+    realtime_audio_lifecycle_ok = (
+        state.count("response.output_audio.delta") > 0 and state.count("response.output_audio.done") > 0
+    )
     completed_response_ids = state.completed_response_ids()
     observed_turn_response_ids = [response_id for response_id in turn_response_ids if isinstance(response_id, str)]
     expected_empty_response_ids = {
@@ -1625,7 +1629,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         state.count("response.created") == state.count("response.done")
         and len(state.response_ids) == len(completed_response_ids)
         and len(completed_response_ids) == len(set(completed_response_ids))
-        and state.count("response.audio.done") <= state.count("response.done")
+        and state.count("response.output_audio.done") <= state.count("response.done")
         and _response_cardinality_ok(
             completed_response_ids,
             expected_turns=expected_turns,

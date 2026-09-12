@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Text-only WebSocket client for `/v1/realtime/video`.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""WebSocket client for `/v1/realtime/video`.
 
 The client prints a line for every binary video chunk it receives and writes
 the received bytes to disk when the session finishes or is interrupted.
-Image/reference input is intentionally not supported in this example yet.
+``--image-reference`` sends a first frame for image-conditioned models such as
+LingBot-World 2.0; text-only models need no image.
 
 Requirements:
     pip install av websockets
@@ -13,9 +14,11 @@ Requirements:
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import io
 import json
+import mimetypes
 import os
 import time
 from dataclasses import dataclass
@@ -51,6 +54,18 @@ class ScheduledPromptUpdate:
     at: float
     prompt: str
     transition_chunks: int
+
+
+def _image_reference(value: str) -> dict[str, Any]:
+    """Accept an http(s) URL as-is, or inline a local image as a data URL."""
+    if value.startswith(("http://", "https://", "data:")):
+        return {"image_url": value}
+    path = Path(value)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"--image-reference is neither a URL nor a readable file: {value}")
+    media_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode()
+    return {"image_url": f"data:{media_type};base64,{encoded}"}
 
 
 def _parse_extra_params(value: str) -> dict[str, Any]:
@@ -116,6 +131,7 @@ def build_session_start(args: argparse.Namespace) -> dict[str, Any]:
         "prompt": args.prompt,
     }
 
+    _maybe_set(payload, "image_reference", args.image_reference)
     _maybe_set(payload, "negative_prompt", args.negative_prompt)
     _maybe_set(payload, "width", args.width)
     _maybe_set(payload, "height", args.height)
@@ -362,6 +378,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=16, help="Frames per second")
     parser.add_argument("--num-frames", type=int, default=429, help="Number of generated frames")
 
+    parser.add_argument(
+        "--image-reference",
+        type=_image_reference,
+        default=None,
+        help="First frame for image-conditioned models: a local image path or an http(s) URL.",
+    )
     parser.add_argument("--negative-prompt", default=None, help="Negative prompt")
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Number of diffusion steps")
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Classifier-free guidance scale")
@@ -383,36 +405,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSON object merged into extra_params; overrides preset keys on conflict.",
     )
+    # Midway prompt updates are pipeline-specific: a model that does not implement
+    # them (LingBot-World, for one) rejects the whole session on the first one, so
+    # nothing is scheduled unless the caller asks for it.
     parser.add_argument(
         "--prompt-updates",
         type=_parse_prompt_updates,
-        default=json.dumps(
-            [
-                {
-                    "at": 4,
-                    "prompt": (
-                        "An underwater tornado appears and affects the ocean floor in a dramatic and chaotic scene. "
-                        "The water is murky, swirling violently, carrying debris and marine life into the vortex. "
-                        "The tropical fish on the scene all swim in panic, trying to avoid the powerful currents. "
-                        "The camera remains stationary, capturing the intensity of the underwater tornado as it disrupts the serene ocean floor. "
-                        "Close-up shot emphasizing the turbulent motion and destruction."
-                    ),
-                },
-                {
-                    "at": 11,
-                    "prompt": (
-                        "The swirling underwater vortex now seizes a heavy, encrusted treasure chest, its lid flapping open as it is smashed onto the ocean floor. "
-                        "Gold coins and silver trinkets spill out, glittering briefly in the murky water before being swept instantly into the violent funnel. "
-                        "The heavy wooden box tumbles end over end, colliding with floating rocks and adding to the debris field. "
-                        "Swirling sediment and bubbles surround the spilling fortune, highlighting the chaotic power of the storm as it ravages the seabed. "
-                        "Close-up shot emphasizing the turbulent motion and destruction."
-                    ),
-                    # "transition_chunks": 3,
-                },
-            ]
-        ),
+        default=[],
         help=(
-            "JSON array of scheduled prompt updates. Each object requires "
+            "JSON array of scheduled prompt updates; none are sent by default. "
+            "Each object requires "
             "'at' (seconds after video.start) and 'prompt'. Optional "
             f"'transition_chunks' defaults to {DEFAULT_TRANSITION_CHUNKS}."
         ),

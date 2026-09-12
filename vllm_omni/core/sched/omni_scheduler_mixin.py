@@ -107,6 +107,17 @@ class OmniSchedulerMixin:
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
+        # Every omni worker forces the v1 model runner (the v2 runner carries no
+        # omni hooks), so the scheduler has to agree or the two disagree about
+        # what the SchedulerOutput carries. vLLM 0.29 defaults this to v2 where
+        # 0.28 did not, so the scheduler took its v2 fast path -- the one that
+        # deliberately omits resumed-request token ids -- while the v1 runner
+        # still read them, and resuming a request raised ``KeyError: <req_id>``
+        # in ``_update_states``.
+        if getattr(self, "use_v2_model_runner", False):
+            logger.warning("OMNI scheduler forces v1 model runner for omni hooks.")
+            self.use_v2_model_runner = False
+
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = (
             OmniChunkTransferAdapter(self.vllm_config) if getattr(model_config, "async_chunk", False) else None
@@ -147,8 +158,8 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
-    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
-        """Replace a downstream stage's placeholder with its next payload."""
+    def _reset_streaming_session_replacement_state(self, session: Request) -> None:
+        """Fence transport and async state that belongs to an old prompt."""
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
@@ -156,8 +167,6 @@ class OmniSchedulerMixin:
             watermark = getattr(adapter, "requests_num_chunks_sent", None)
             if watermark is not None:
                 watermark.pop(session.external_req_id, None)
-        session._output_token_ids.clear()
-        session._all_token_ids.clear()
         # In-flight outputs from the previous segment were optimistically
         # scheduled (async lookahead). Mark them stale so update_from_output
         # drops them instead of underflowing num_output_placeholders
@@ -172,18 +181,15 @@ class OmniSchedulerMixin:
         session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
-        new_prompt = update.prompt_token_ids or ()
-        session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
-        session.prompt_token_ids = new_prompt
+
+    def _finish_streaming_session_update(self, session: Request, update: StreamingUpdate) -> None:
+        """Install payload metadata and send an updated session to admission."""
         session.additional_information = update.additional_information or None
         session.model_intermediate_buffer = getattr(
             update,
             "model_intermediate_buffer",
             None,
         )
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(new_prompt)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -194,6 +200,19 @@ class OmniSchedulerMixin:
             self._enqueue_waiting_request(session)
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+        """Replace a downstream stage's placeholder with its next payload."""
+        self._reset_streaming_session_replacement_state(session)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = new_prompt
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(new_prompt)
+        self._finish_streaming_session_update(session, update)
 
     def _release_replaced_streaming_prompt_cache(self, session: Request) -> None:
         """Discard cache state that belongs to a replaced prompt."""
@@ -272,7 +291,7 @@ class OmniSchedulerMixin:
             self._log_failed_chunk_sends()
 
     def _process_chunk_receive_failures(self) -> None:
-        """Fail requests whose consumed async chunk violated its contract."""
+        """Fail requests whose consumed streaming input violated its contract."""
         adapter = getattr(self, "chunk_transfer_adapter", None)
         collector = getattr(adapter, "collect_failed_receive_request_ids", None)
         if collector is None:
@@ -282,7 +301,7 @@ class OmniSchedulerMixin:
         if not present_ids:
             return
         logger.error(
-            "Marking %d request(s) as FINISHED_ERROR after invalid connector input: %s",
+            "Marking %d request(s) as FINISHED_ERROR after invalid streaming input: %s",
             len(present_ids),
             {request_id: failures[request_id] for request_id in sorted(present_ids)},
         )
@@ -668,6 +687,68 @@ class OmniSchedulerMixin:
         if (output := next(iter(engine_core_outputs.values()), None)) is None:
             engine_core_outputs[0] = output = EngineCoreOutputs()
         output.scheduler_stats = stats
+
+    def add_request(self, request: Request) -> None:
+        """Route a terminal streaming update that lands on a parked session.
+
+        Upstream ``Scheduler.add_request`` turns "final update (``resumable``
+        is False) arrives while the session sits in
+        ``WAITING_FOR_STREAMING_REQ``" into a local
+        ``finish_requests(FINISHED_ABORTED)``. That is fine for a stage whose
+        output the orchestrator forwards, but an async-chunk *sender* also
+        owes its downstream stage a terminal chunk: the receiver learns that a
+        stream ended only from a connector payload carrying ``finished``, and
+        an abort emits none. The downstream stage then parks in
+        ``WAITING_FOR_CHUNK`` until ``VLLM_OMNI_INPUT_WAIT_TIMEOUT_S`` (600s by
+        default), long after the client's own deadline -- the realtime
+        async-chunk hang in vllm-project/vllm-omni#6670.
+
+        Whether this races is timing, not configuration: the stage parks only
+        when its own stop beats both the upstream terminal chunk and the
+        orchestrator's terminal update, a window of tens of milliseconds at
+        the end of the last segment. Emit the terminal chunk here so the
+        downstream stage terminates on the payload path either way.
+        """
+        existing = self.requests.get(request.request_id)
+        if existing is not None and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
+            if adapter is not None:
+                self._finish_parked_streaming_session(existing, adapter)
+                return
+        super().add_request(request)
+
+    def _adapter_owing_terminal(self, request: Request) -> OmniChunkTransferAdapter | None:
+        """The adapter that owes *request*'s downstream stage a terminal chunk.
+
+        Sender ownership starts when the first chunk is queued, before the
+        background thread initializes its chunk counter. A prewarmed receiver
+        needs a terminal even if that first chunk has not been sent yet.
+        Final stages never queue sends, so they never match.
+        """
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return None
+        external_req_id = getattr(request, "external_req_id", None) or request.request_id
+        return adapter if adapter.has_active_sender(external_req_id) else None
+
+    def _finish_parked_streaming_session(self, request: Request, adapter: OmniChunkTransferAdapter) -> None:
+        """End a parked async-chunk session with a downstream terminal chunk."""
+        request.resumable = False
+        # A segment stop already advanced the adapter's dedup watermark to
+        # ``generation + 1`` for the segment that never arrived. Claim that
+        # generation, exactly as ``_update_request_as_session`` would have,
+        # or ``save_async`` drops this chunk as a late duplicate.
+        request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
+        # ``force_request_finished``: the terminal must be enqueued *before*
+        # ``finish_requests``, which skips requests that already report
+        # ``is_finished()``.
+        adapter.save_async(
+            None,
+            request,
+            is_segment_finished=False,
+            force_request_finished=True,
+        )
+        self.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
 
     def finish_requests(
         self,

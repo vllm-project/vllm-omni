@@ -1,5 +1,8 @@
 # ruff: noqa: E501
+import importlib.util
+import sys
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 import torch
@@ -10,13 +13,15 @@ from transformers import CLIPModel, CLIPProcessor
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
+from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import get_ar_input_builder, get_ar_tokenizer_validator, get_model_class_name
 from vllm_omni.platforms import current_omni_platform
 
 PROMPT = "A brown and white dog is running on the grass"
 MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
-DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3.yaml")
+DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image_3_moe.yaml")
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
@@ -328,6 +333,15 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
     return _extract_generated_image(outputs)
 
 
+# A floor for "this is recognizably the same generation" against each
+# case's precomputed reference embedding, not a quality bar -- catches a
+# gross migration regression (wrong/blank/garbage image, or the wrong
+# system prompt applied) without being flaky on run-to-run sampling noise.
+# Matches the threshold test_shared_script_ar_path_reaches_generation uses
+# for its own (seed=1234, en_recaption) comparison below.
+MIN_SEMANTIC_SIMILARITY = 0.5
+
+
 @pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
 @pytest.mark.parametrize("system_prompt_name,use_system_prompt,expected_embedding", SYSTEM_PROMPT_CASES)
 def test_system_prompt_scores(
@@ -342,3 +356,109 @@ def test_system_prompt_scores(
     score = compare_semantic(expected_embedding, generated_image, clip_model, clip_processor)
 
     print(f"{system_prompt_name}: CLIP cosine similarity = {score:.6f}")
+    assert score >= MIN_SEMANTIC_SIMILARITY, (
+        f"{system_prompt_name}: CLIP similarity {score:.4f} is below "
+        f"{MIN_SEMANTIC_SIMILARITY} against the reference (seed=1234) embedding -- "
+        "the migrated path may have diverged from the reference HunyuanImage-3.0 "
+        f"output for use_system_prompt={use_system_prompt!r}."
+    )
+
+
+def _load_text_to_image_module():
+    """Dynamically load the shared example script by file path (``examples/``
+    is not an installed package) so this test can call its real
+    ``_apply_ar_stage_inputs`` instead of re-implementing its logic."""
+    repo_root = Path(__file__).resolve().parents[3]
+    path = repo_root / "examples/offline_inference/text_to_image/text_to_image.py"
+    spec = importlib.util.spec_from_file_location("_e2e_shared_text_to_image", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
+def test_shared_script_ar_path_reaches_generation(
+    omni: Omni,
+    clip_bundle: tuple[CLIPModel, CLIPProcessor],
+) -> None:
+    """Exercise the path this PR actually migrates HunyuanImage-3.0 onto:
+
+        get_model_class_name -> get_ar_input_builder -> _apply_ar_stage_inputs
+        -> Omni.generate()
+
+    using the *real* model_extras registry lookup (keyed on the engine's
+    live ``model_class_name``) and the shared ``text_to_image.py``'s own
+    helper -- not the hand-constructed ``sampling_params.extra_args`` that
+    ``_generate_image``/``test_system_prompt_scores`` above use, which never
+    touch the registry or the AR-tokenizer-loading path at all. This is the
+    one gap those tests leave: a regression in the registry key (the bug
+    this PR fixes), in ``_apply_ar_stage_inputs``, or in the
+    ``ar_tokenizer_validator`` wiring would not fail any of them.
+
+    Reuses the ``en_recaption`` reference embedding from
+    ``test_system_prompt_scores`` so this also asserts the migrated path
+    produces the *same* output as the hand-constructed one, not just "didn't
+    crash."
+    """
+    text_to_image = _load_text_to_image_module()
+    clip_model, clip_processor = clip_bundle
+
+    model_class_name = get_model_class_name(omni)
+    ar_input_builder = get_ar_input_builder(model_class_name)
+    assert ar_input_builder is not None, (
+        f"get_ar_input_builder({model_class_name!r}) returned None for the running "
+        "engine -- this is exactly the registry-key regression this PR fixes "
+        "(spec registered under the wrong model_class_name), and it would "
+        "silently skip AR-stage input building entirely."
+    )
+
+    generator_device = current_omni_platform.device_type or "cuda"
+    diffusion_params = OmniDiffusionSamplingParams(
+        seed=1234,
+        generator=torch.Generator(device=generator_device).manual_seed(1234),
+        num_outputs_per_prompt=1,
+    )
+    defaults = list(omni.default_sampling_params_list or [])
+    sampling_params_list = [clone_sampling_params(p) for p in defaults]
+    for idx, params in enumerate(sampling_params_list):
+        if isinstance(params, OmniDiffusionSamplingParams):
+            sampling_params_list[idx] = diffusion_params
+
+    prompt_dict: dict[str, object] = {"prompt": PROMPT, "modalities": ["image"]}
+    text_to_image._apply_ar_stage_inputs(
+        ar_input_builder,
+        model=MODEL_NAME,
+        prompt_text=PROMPT,
+        extra_body={"use_system_prompt": "en_recaption"},
+        num_images=0,
+        height=None,
+        width=None,
+        prompt_dict=prompt_dict,
+        sampling_params_list=sampling_params_list,
+        trust_remote_code=True,
+        # validate_special_token_ids now tolerates tokens the loaded tokenizer
+        # doesn't recognize at all (unk_token_id) instead of requiring every
+        # entry in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS to be present, so this is
+        # safe against MODEL_NAME's base checkpoint missing the Instruct-only
+        # <img_ratio_33>/<img_ratio_36> tokens. Wiring it here exercises the
+        # real production path (get_ar_tokenizer_validator via the registry),
+        # not just the isolated fake-tokenizer coverage in test_prompt_utils.py
+        # / test_shared_script_ar_integration.py.
+        validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
+    )
+
+    outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
+    generated_image = _extract_generated_image(outputs)
+    score = compare_semantic(SYSTEM_EN_RECAPTION, generated_image, clip_model, clip_processor)
+    print(f"shared-script AR path (en_recaption): CLIP cosine similarity = {score:.6f}")
+    # test_system_prompt_scores now asserts this same (seed=1234, en_recaption)
+    # case through the hand-constructed extra_args path against the same
+    # module-level MIN_SEMANTIC_SIMILARITY floor, so this reuses it too rather
+    # than picking an independent threshold for the same comparison.
+    assert score >= MIN_SEMANTIC_SIMILARITY, (
+        f"shared-script AR path (en_recaption) CLIP similarity {score:.4f} is below "
+        f"{MIN_SEMANTIC_SIMILARITY} -- the migrated get_ar_input_builder path may have "
+        "diverged from the reference HunyuanImage-3.0 output for this prompt/system-prompt."
+    )

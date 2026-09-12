@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Streaming Mimi codec for PersonaPlex (moshi-free).
 
 Frame-clocked duplex needs a codec that encodes/decodes exactly one 80 ms frame
@@ -288,9 +288,10 @@ class PersonaPlexMimiCodec(nn.Module):
 
     def __init__(self, hf_repo: str = DEFAULT_HF_REPO, checkpoint: str | None = None, device: str = "cuda") -> None:
         super().__init__()
-        from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
         from transformers import MimiConfig, MimiModel
+
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         self.device = torch.device(device)
 
@@ -300,7 +301,7 @@ class PersonaPlexMimiCodec(nn.Module):
         # transformer stacks remain absent because the streaming implementations
         # below replace them with the checkpoint's fused QKV layout.
         if checkpoint is None:
-            checkpoint = hf_hub_download(
+            checkpoint = hf_api().hf_hub_download(
                 "nvidia/personaplex-7b-v1",
                 "tokenizer-e351c8d8-checkpoint125.safetensors",
             )

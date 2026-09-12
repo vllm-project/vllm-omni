@@ -353,6 +353,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     input: str = Field(
         description="Text prompt describing the audio to generate",
     )
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, v):
+        if not v or not v.strip():
+            raise ValueError("input cannot be empty")
+        return v
+
     model: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
@@ -363,6 +371,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     stream_format: Literal["sse", "audio"] | None = "audio"
     audio_length: float | None = Field(
         default=None,
+        gt=0,
         description="Audio length in seconds",
     )
     audio_start: float | None = Field(
@@ -375,12 +384,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     )
     guidance_scale: float | None = Field(
         default=None,
+        ge=0,
+        le=1000,
         description="Guidance scale for diffusion models",
     )
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,
-        le=_INT64_MAX,
+        le=1000,
         description="Number of inference steps",
     )
     seed: int | None = Field(
@@ -576,6 +587,22 @@ class StreamingSpeechSessionConfig(BaseModel):
             "base64-encoded PCM plus aligned word timestamps. Requires the server to be "
             "launched with --forced-aligner. When false, audio is sent as raw binary "
             "frames (existing behavior)."
+        ),
+    )
+    seed: int | None = Field(
+        default=None,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
+        description="Random seed forwarded to /v1/audio/speech for this session.",
+    )
+    split_granularity: Literal["none", "sentence", "clause"] = Field(
+        default="none",
+        description=(
+            "How incoming input.text is segmented before TTS. 'none' (default) "
+            "buffers until input.done and runs one request, matching the "
+            "long-form timbre-continuity path. 'sentence' emits a request at "
+            "each sentence boundary (Latin .!? plus CJK/Indic/Arabic marks). "
+            "'clause' also splits on commas/semicolons for lower TTFA."
         ),
     )
 

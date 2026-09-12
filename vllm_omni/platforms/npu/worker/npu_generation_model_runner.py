@@ -166,7 +166,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        self._dummy_run(1, skip_gdn_state_update=True)
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
@@ -636,6 +636,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         randomize_inputs: bool = False,
+        skip_gdn_state_update: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.is_valid_runtime_mode()
@@ -768,7 +769,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
-                    self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                    if skip_gdn_state_update:
+                        self.gdn_query_start_loc.np.fill(0)
+                    else:
+                        self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -786,6 +790,12 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 # rows as well so device-side metadata does not see stale block ids.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+                # Invalidate slots before backends copy metadata for dummy execution.
+                if not is_graph_capturing:
+                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                        blk_table = self.input_batch.block_table[kv_cache_gid]
+                        blk_table.slot_mapping.gpu.fill_(-1)
+
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -796,11 +806,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                     for_cudagraph_capture=is_graph_capturing,
                     num_scheduled_tokens_np=num_scheduled_tokens,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    skip_gdn_state_update=skip_gdn_state_update,
                 )
-                if not is_graph_capturing:
-                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                        blk_table = self.input_batch.block_table[kv_cache_gid]
-                        blk_table.slot_mapping.gpu.fill_(-1)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,

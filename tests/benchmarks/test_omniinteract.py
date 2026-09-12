@@ -65,7 +65,7 @@ def _audio(
     value: int = 1,
 ) -> dict[str, object]:
     event: dict[str, object] = {
-        "type": "response.audio.delta",
+        "type": "response.output_audio.delta",
         "response_id": response_id,
         "format": "pcm16",
         "delta": base64.b64encode(bytes((value, 0)) * samples).decode(),
@@ -76,7 +76,7 @@ def _audio(
 
 
 def _text(response_id: str = "r1", value: str = "hello") -> dict[str, object]:
-    return {"type": "response.audio_transcript.delta", "response_id": response_id, "delta": value}
+    return {"type": "response.output_audio_transcript.delta", "response_id": response_id, "delta": value}
 
 
 def _listen(*, buffering: bool = False) -> dict[str, object]:
@@ -427,7 +427,7 @@ def test_artifacts_publish_official_bundle_and_sparse_deferred_state(tmp_path: P
     assert result.success and result.eligible_for_official_eval
     assert summary["scene_type"] == "multi_turn"
     assert context and context.spans
-    assert all("delta" not in event for event in context.events if event["type"] == "response.audio.delta")
+    assert all("delta" not in event for event in context.events if event["type"] == "response.output_audio.delta")
     oi.publish_deferred_case_artifacts(tmp_path / "out", case, result)
     directory = oi._output_dir(tmp_path / "out", case)
     assert all((directory / name).is_file() for name in oi.SUCCESS_ARTIFACTS)

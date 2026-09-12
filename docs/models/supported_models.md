@@ -64,9 +64,11 @@ th {
 | `LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `LongCatVideoAvatarPipeline` | LongCat-Video-Avatar-1.5 A2V/AI2V (native single-speaker and multi-speaker AI2V/AVC) | `meituan-longcat/LongCat-Video-Avatar-1.5` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/meituan-longcat/LongCat-Video-Avatar-1.5.md) |
 | `BooguImagePipeline` | Boogu-Image | `Boogu/Boogu-Image-0.1-Base`, `Boogu/Boogu-Image-0.1-Edit`, `Boogu/Boogu-Image-0.1-Edit-Turbo` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Boogu/Boogu-Image.md) |
+| `BooguImageTurboPipeline` | Boogu-Image Turbo distilled T2I | `Boogu/Boogu-Image-0.1-Turbo` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Boogu/Boogu-Image.md) |
 | `StableDiffusionXLPipeline` | Stable-Diffusion-XL | `stabilityai/stable-diffusion-xl-base-1.0` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✅︎ | ✅︎ | | ✅︎ | — |
+| `AuKForConditionalGeneration` | AuK / AuK-Flash (instruction-driven speech generation and editing) | `tencent/AuK`, `tencent/AuK-Flash` (with `Qwen/Qwen2.5-Omni-3B`; assemble with `tools/prepare_auk_checkpoint.py`) | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/AuK-H100.md) |
 | `OmniVoiceModel` | OmniVoice | `k2-fsa/OmniVoice` | ✅︎ | | | ✅︎ | — |
 | `VoxCPM2TalkerForConditionalGeneration` | VoxCPM2 | `openbmb/VoxCPM2` | ✅︎ | | | ✅︎ | — |
 | `DotsTTSForConditionalGeneration` | dots.tts | `dots-studio/dots.tts-soar` | ✅︎ | | | | — |
@@ -96,6 +98,7 @@ th {
 | `MiMoV2ASRForCausalLM` | MiMo-V2.5-ASR | `XiaomiMiMo/MiMo-V2.5-ASR` | ✅︎ | ✅︎ | | | — |
 | `Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | ✅︎ | ✅︎ | | | — |
 | `FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✅︎ | ✅︎ | | ✅︎ | — |
+| `Audio8TTSSlowARForConditionalGeneration` | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✅︎ | | | | — |
 | `SenseNovaU1Pipeline` | SenseNova-U1 (DiT-only), SenseNova-U1.5 | `SenseNova/SenseNova-U1-8B-MoT`, `sensenova/SenseNova-U1.5-8B-MoT` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SenseNova/SenseNova-U1.5.md) |
 | `LancePipeline` | Lance | `bytedance-research/Lance` | ✅︎ | | | | — |
 | `HunyuanVideo15Pipeline` | HunyuanVideo-1.5-T2V | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | ✅︎ | ✅︎ | | | — |

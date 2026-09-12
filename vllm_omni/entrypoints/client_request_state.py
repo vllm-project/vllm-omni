@@ -54,3 +54,9 @@ class ClientRequestState:
         self.duplex_turn_pending: list = []
         # Next turn t0: first append/commit, else first buffered stage snapshot.
         self.duplex_turn_arrival_ts: float | None = None
+        # De-dup set for metric messages: OmniBase populates this in
+        # ``_handle_output_message`` / ``_process_single_result`` so the same
+        # ``id(msg)`` isn't counted twice into per-request metrics. Kept on
+        # the request state (not a class-level dict) so it is released with
+        # the state — see #6462 / #6561.
+        self.consumed_metric_message_ids: set[int] = set()
