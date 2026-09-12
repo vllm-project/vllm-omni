@@ -33,6 +33,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.device_cache import release_request_cache
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     load_wan_weights_with_optional_gate,
@@ -1409,7 +1410,7 @@ class Wan22S2VPipeline(
             # ---- Decode this clip ----
             if self._should_release_dit_before_decode():
                 self.transformer.to("cpu")
-                current_omni_platform.empty_cache()
+                release_request_cache(current_omni_platform)
 
             if not (drop_first_motion and r == 0):
                 decode_latents = torch.cat([motion_latents, latents], dim=2)
@@ -1462,8 +1463,7 @@ class Wan22S2VPipeline(
             clips.append(clip_video.cpu())
 
             # Free VRAM between clips
-            if current_omni_platform.is_available():
-                current_omni_platform.empty_cache()
+            release_request_cache(current_omni_platform)
 
         # ---- Concatenate all clips ----
         output = torch.cat(clips, dim=2)  # [B, C, T_total, H, W]

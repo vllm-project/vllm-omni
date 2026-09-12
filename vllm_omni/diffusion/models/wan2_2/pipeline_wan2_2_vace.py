@@ -25,6 +25,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.wan2_2.device_cache import release_request_cache
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
@@ -720,8 +721,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
 
         self._current_timestep = None
 
-        if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
+        release_request_cache(current_omni_platform)
 
         # Trim reference frames from output before decoding
         # (reference images were prepended as extra temporal frames)
