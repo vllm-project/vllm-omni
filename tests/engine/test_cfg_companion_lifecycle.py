@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Deterministic tests for the CFG-companion output lifecycle.
 
 Regression suite for the companion-output race behind the nightly Bagel
@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
-from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage
+from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage, StageSubmissionMessage
 from vllm_omni.engine.orchestrator import Orchestrator
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -80,8 +80,10 @@ class _FakePool:
 
     def __init__(self, stage_type: str = "diffusion") -> None:
         self.stage_type = stage_type
+        self.final_output = False
         self.stage_client = SimpleNamespace(requires_multimodal_data=False, custom_process_input_func=None)
         self.aborted: list[list[str]] = []
+        self.submitted: list[str] = []
 
     def live_replica_ids(self) -> list[int]:
         # Single always-live replica: these tests cover CFG bundling, not
@@ -90,6 +92,10 @@ class _FakePool:
 
     async def abort_requests(self, request_ids):
         self.aborted.append(list(request_ids))
+
+    async def submit_initial(self, request_id, *_args, **_kwargs):
+        self.submitted.append(request_id)
+        return 0
 
     def release_bindings(self, request_ids):
         pass
@@ -119,7 +125,38 @@ def _req_state(final_stage_id: int = 1) -> SimpleNamespace:
         running_counter_registered=False,
         prompt={"prompt": "x"},
         pipeline_timings={},
+        duplex_identity=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_parent_output_before_companion_message_is_not_forwarded(mocker):
+    """A queued CFG companion must block its parent even when the parent
+    finishes before the companion message is handled."""
+    orch = _make_orchestrator()
+    await orch._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="p",
+            prompt=mocker.Mock(resumable=False, mm_features=None),
+            original_prompt={"prompt": "x"},
+            output_prompt_text=None,
+            sampling_params_list=[object(), object()],
+            final_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+            cfg_companion_ids={"neg": "p__neg"},
+        )
+    )
+    state = orch.request_states["p"]
+    assert orch.stage_pools[0].submitted == ["p"]
+
+    forward = mocker.patch.object(orch, "_forward_to_next_stage", new=mocker.AsyncMock())
+    output = mocker.Mock(request_id="p", finished=True, kv_transfer_params=None)
+    await orch._route_output(0, 0, output, state, None)
+
+    forward.assert_not_awaited()
 
 
 @pytest.mark.asyncio
