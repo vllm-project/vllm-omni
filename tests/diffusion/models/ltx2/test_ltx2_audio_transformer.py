@@ -13,8 +13,87 @@ from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import (
     LTX2AudioTransformerBlock,
     LTX2AudioTransformerModel,
 )
+from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformerBlock
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("audio_cross_attn_mod", [False, True])
+@pytest.mark.parametrize("use_stg_mask", [False, True])
+def test_ltx_audio_block_matches_full_transformer_audio_branch(audio_cross_attn_mod, use_stg_mask):
+    """The projected block must preserve the full model's audio-only numerics."""
+    torch.manual_seed(0)
+    dim = 8
+    full_block = LTX2VideoTransformerBlock(
+        dim=dim,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        cross_attention_dim=dim,
+        audio_dim=dim,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=4,
+        audio_cross_attention_dim=dim,
+        audio_cross_attn_adaln=audio_cross_attn_mod,
+    )
+    audio_block = LTX2AudioTransformerBlock(
+        audio_dim=dim,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=4,
+        audio_cross_attention_dim=dim,
+        audio_cross_attn_adaln=audio_cross_attn_mod,
+    )
+    audio_state = audio_block.state_dict()
+    full_state = full_block.state_dict()
+    audio_block.load_state_dict({name: full_state[name] for name in audio_state}, strict=True)
+
+    batch_size = 2
+    audio_tokens = 4
+    video_tokens = 3
+    text_tokens = 5
+    num_mod_params = 9 if audio_cross_attn_mod else 6
+    video_hidden_states = torch.randn(batch_size, video_tokens, dim)
+    audio_hidden_states = torch.randn(batch_size, audio_tokens, dim)
+    video_context = torch.randn(batch_size, text_tokens, dim)
+    audio_context = torch.randn(batch_size, text_tokens, dim)
+    temb_video = torch.randn(batch_size, video_tokens, 6 * dim)
+    temb_audio = torch.randn(batch_size, audio_tokens, num_mod_params * dim)
+    temb_prompt_audio = torch.randn(batch_size, text_tokens, 2 * dim) if audio_cross_attn_mod else None
+    audio_encoder_attention_mask = torch.tensor(
+        [[[0.0, 0.0, 0.0, -10_000.0, -10_000.0]]] * audio_tokens,
+    ).expand(batch_size, -1, -1)
+    audio_self_attention_mask = torch.zeros(batch_size, audio_tokens, audio_tokens)
+    audio_self_attention_mask[:, :, -1] = -10_000.0
+    stg_mask = torch.tensor([[[1.0], [0.0], [1.0], [0.0]]]).expand(batch_size, -1, -1) if use_stg_mask else None
+
+    _, full_audio = full_block(
+        video_hidden_states,
+        audio_hidden_states.clone(),
+        video_context,
+        audio_context.clone(),
+        temb_video,
+        temb_audio,
+        torch.zeros(batch_size, video_tokens, 4 * dim),
+        torch.zeros(batch_size, audio_tokens, 4 * dim),
+        torch.zeros(batch_size, video_tokens, dim),
+        torch.zeros(batch_size, audio_tokens, dim),
+        temb_prompt_audio=temb_prompt_audio,
+        audio_encoder_attention_mask=audio_encoder_attention_mask,
+        audio_self_attention_mask=audio_self_attention_mask,
+        audio_self_attention_perturbation_mask=stg_mask,
+        use_a2v_cross_attention=False,
+        use_v2a_cross_attention=False,
+    )
+    projected_audio = audio_block(
+        audio_hidden_states.clone(),
+        audio_context.clone(),
+        temb_audio=temb_audio,
+        temb_prompt_audio=temb_prompt_audio,
+        audio_encoder_attention_mask=audio_encoder_attention_mask,
+        audio_self_attention_mask=audio_self_attention_mask,
+        audio_self_attention_perturbation_mask=stg_mask,
+    )
+
+    torch.testing.assert_close(projected_audio, full_audio, rtol=0.0, atol=0.0)
 
 
 def test_ltx_audio_block_contains_only_audio_and_text_paths(monkeypatch):
