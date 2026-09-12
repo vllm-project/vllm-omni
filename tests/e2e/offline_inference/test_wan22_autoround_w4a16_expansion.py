@@ -20,7 +20,6 @@ import torch
 from PIL import Image
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.monitor import DeviceMemoryMonitor
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -92,13 +91,16 @@ def _create_test_image(width: int = WIDTH, height: int = HEIGHT) -> Image.Image:
 
 
 def _generate_i2v_video(offline_client, prompt: str = "A cat sitting on a table, smooth motion") -> tuple:
-    """Generate one I2V video, return (frames, peak_memory_mb)."""
+    """Generate one I2V video, return (frames, peak_memory_mb).
+
+    ``peak_memory_mb`` is read from the engine output (``peak_memory_mb`` on the
+    diffusion output), which is measured inside the diffusion stage worker. A
+    local ``DeviceMemoryMonitor`` would be useless here: the diffusion model runs
+    in a separate stage subprocess, so the test process only ever sees its own
+    (orchestrator) memory.
+    """
     gc.collect()
     current_omni_platform.empty_cache()
-    device_index = current_omni_platform.current_device()
-    current_omni_platform.reset_peak_memory_stats()
-    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
-    monitor.start()
 
     image = _create_test_image()
     response = offline_client.send_diffusion_request(
@@ -109,9 +111,6 @@ def _generate_i2v_video(offline_client, prompt: str = "A cat sitting on a table,
         },
     )
 
-    peak = monitor.peak_used_mb
-    monitor.stop()
-
     assert response.success, "Request failed"
     assert response.images is not None and len(response.images) > 0, "Expected image output"
     frames = response.images[0]
@@ -119,17 +118,13 @@ def _generate_i2v_video(offline_client, prompt: str = "A cat sitting on a table,
     gc.collect()
     current_omni_platform.empty_cache()
 
-    return frames, peak
+    return frames, response.peak_memory_mb
 
 
 def _generate_t2v_video(offline_client, prompt: str = "A cat sitting on a table") -> tuple:
     """Generate one T2V video, return (frames, peak_memory_mb)."""
     gc.collect()
     current_omni_platform.empty_cache()
-    device_index = current_omni_platform.current_device()
-    current_omni_platform.reset_peak_memory_stats()
-    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
-    monitor.start()
 
     response = offline_client.send_diffusion_request(
         {
@@ -138,9 +133,6 @@ def _generate_t2v_video(offline_client, prompt: str = "A cat sitting on a table"
         },
     )
 
-    peak = monitor.peak_used_mb
-    monitor.stop()
-
     assert response.success, "Request failed"
     assert response.images is not None and len(response.images) > 0, "Expected image output"
     frames = response.images[0]
@@ -148,7 +140,7 @@ def _generate_t2v_video(offline_client, prompt: str = "A cat sitting on a table"
     gc.collect()
     current_omni_platform.empty_cache()
 
-    return frames, peak
+    return frames, response.peak_memory_mb
 
 
 # ------------------------------------------------------------------
@@ -240,6 +232,12 @@ def test_wan22_i2v_autoround_w4a16_memory_savings():
     quant_peak = _memory_results["quant_i2v"]
     baseline_peak = _memory_results["baseline_i2v"]
 
+    # The engine must have reported the stage-worker peak; a zero value means the
+    # output did not carry peak_memory_mb and the comparison below is meaningless.
+    assert quant_peak > 0 and baseline_peak > 0, (
+        f"peak_memory_mb not populated by the engine (quant={quant_peak:.0f}, baseline={baseline_peak:.0f})"
+    )
+
     savings = baseline_peak - quant_peak
     print(f"\nQuantized I2V (W4A16) peak memory: {quant_peak:.0f} MB")
     print(f"Baseline I2V (BF16) peak memory:   {baseline_peak:.0f} MB")
@@ -296,6 +294,12 @@ def test_wan22_t2v_autoround_w4a16_memory_savings():
     """Assert quantized T2V model uses meaningfully less memory than BF16 baseline."""
     quant_peak = _memory_results["quant_t2v"]
     baseline_peak = _memory_results["baseline_t2v"]
+
+    # The engine must have reported the stage-worker peak; a zero value means the
+    # output did not carry peak_memory_mb and the comparison below is meaningless.
+    assert quant_peak > 0 and baseline_peak > 0, (
+        f"peak_memory_mb not populated by the engine (quant={quant_peak:.0f}, baseline={baseline_peak:.0f})"
+    )
 
     savings = baseline_peak - quant_peak
     print(f"\nQuantized T2V (W4A16) peak memory: {quant_peak:.0f} MB")
