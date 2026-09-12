@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 L4 expansion coverage for ``robbyant/lingbot-video-dense-1.3b``.
 
-This file remains dense-only. Basic T2I/T2V/TI2V serving for both dense and MoE
-checkpoints is covered by ``test_lingbot_video.py`` and
-``test_lingbot_video_moe.py``. Distributed feature rows belong in follow-up
-PRs.
+Basic T2I/T2V/TI2V serving is covered by ``test_lingbot_video.py`` and
+``test_lingbot_video_moe.py``. CFG2 covers both dense and MoE checkpoints with
+Cache-DiT disabled and enabled.
 """
 
 import json
@@ -16,7 +15,7 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, OpenAIClientHandler
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -82,3 +81,52 @@ def test_batch_cfg_extra_params(omni_server: OmniServer, openai_client: OpenAICl
         },
     }
     openai_client.send_video_diffusion_request(request_config)
+
+
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--model-class-name",
+                    "LingBotVideoPipeline",
+                    "--cfg-parallel-size",
+                    "2",
+                    "--cache-backend",
+                    cache_backend,
+                ],
+            ),
+            id=f"{variant}-cfg2-{cache_backend}",
+            marks=[*hardware_marks(res={"cuda": "H100"}, num_cards=2), *marks],
+        )
+        for variant, model in [
+            ("dense", MODEL),
+            ("moe", "robbyant/lingbot-video-moe-30b-a3b"),
+        ]
+        for cache_backend, marks in [("none", []), ("cache_dit", [pytest.mark.cache])]
+    ],
+    indirect=True,
+)
+def test_cfg_parallel(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    request_config = {
+        "model": omni_server.model,
+        "form_data": {
+            "model": omni_server.model,
+            "prompt": PROMPT,
+            "negative_prompt": NEGATIVE_PROMPT,
+            "height": 192,
+            "width": 320,
+            "num_frames": 9,
+            "fps": 24,
+            "num_inference_steps": 8,
+            "guidance_scale": 3.0,
+            "flow_shift": 3.0,
+            "seed": 42,
+        },
+    }
+    # A second request exercises the runner's per-request cache refresh.
+    for _ in range(2):
+        online_client.send_video_diffusion_request(request_config)
