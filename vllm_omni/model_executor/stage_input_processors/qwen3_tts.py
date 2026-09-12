@@ -14,6 +14,9 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
     to_dict,
 )
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
+)
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     AdaptiveChunkController,
     compute_adaptive_emit,
@@ -31,6 +34,31 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _request_tts_text_tokens(request: Any) -> int | None:
+    """Return the request's normalized text token count (n_k), or None.
+
+    Reads the precomputed text ids carried in ``additional_information``
+    (``PRECOMPUTED_TEXT_IDS_KEY``). Returns None when only the raw string is
+    available, in which case Code2Wav logs rho without n_k.
+    """
+    additional_information = getattr(request, "additional_information", None)
+    if additional_information is None or not hasattr(additional_information, "entries"):
+        return None
+    entries = additional_information.entries
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get(PRECOMPUTED_TEXT_IDS_KEY)
+    if entry is None:
+        return None
+    ids = getattr(entry, "list_data", None)
+    if not isinstance(ids, (list, tuple)) or not ids:
+        return None
+    # ``list_data`` is ``[assistant_token_ids_for_len]`` (a single list of ids).
+    text_ids = ids[0] if len(ids) == 1 and isinstance(ids[0], (list, tuple)) else ids
+    count = len(text_ids) if isinstance(text_ids, (list, tuple)) else 0
+    return count or None
 
 
 def _qwen3_tts_degenerate_finished_payload():
@@ -358,6 +386,9 @@ def talker2code2wav_async_chunk(
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
+    segment_text_tokens = _request_tts_text_tokens(request)
+    if segment_text_tokens is not None:
+        meta.segment_text_tokens = segment_text_tokens
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
@@ -584,6 +615,9 @@ def talker2code2wav_full_payload(
     # async-chunk path, which already ships left_context_size in-band.
     if ref_code is not None and ref_frames > 0:
         meta["left_context_size"] = ref_frames
+    segment_text_tokens = _request_tts_text_tokens(request)
+    if segment_text_tokens is not None:
+        meta["segment_text_tokens"] = segment_text_tokens
     return {
         "codes": {"audio": codec_codes},
         "meta": meta,

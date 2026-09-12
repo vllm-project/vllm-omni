@@ -52,6 +52,105 @@ def _codec_ids_from_payload_or_input(
     return input_ids.reshape(-1).to(dtype=torch.long)
 
 
+class _SegmentRhoTracker:
+    """Per-request rho = acoustic frames (A_k) / text tokens (n_k) accounting.
+
+    Accumulates realized codec frames and decode forwards per request and
+    logs the ratio at segment/request boundaries. Segments are delimited by
+    the scheduler's ``is_segment_finished`` flag; n_k arrives via the
+    payload meta (``segment_text_tokens``). Disabled on the non-async-chunk
+    path, where the ramp is static.
+    """
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self._stats: dict[str, dict[str, int]] = {}
+
+    def observe_chunk(self, req_id: str, acoustic_frames: int, text_tokens: int) -> None:
+        """Accumulate one decode chunk's realized frames and forward."""
+        if not self.enabled or acoustic_frames <= 0:
+            return
+        stats = self._stats.setdefault(req_id, {"seg_frames": 0, "seg_forwards": 0, "seg_text_tokens": 0})
+        stats["seg_frames"] += acoustic_frames
+        stats["seg_forwards"] += 1
+        # max() keeps n_k idempotent under repeat delivery.
+        if text_tokens > 0:
+            stats["seg_text_tokens"] = max(stats["seg_text_tokens"], text_tokens)
+
+    def flush_empty_payload(self, runtime_infos: Any) -> None:
+        """Flush finish flags carried by payloads with no frames.
+
+        The talker adapter ends a request with an empty-finished payload, so
+        forward() returns before the boundary-cleanup loop; the flags must be
+        honored here or the trailing segment is never logged.
+        """
+        if not self.enabled:
+            return
+        for info in runtime_infos or []:
+            if not isinstance(info, dict):
+                continue
+            meta = info.get("meta", {})
+            if not isinstance(meta, dict):
+                continue
+            req_id = meta.get("request_id")
+            if isinstance(req_id, list):
+                req_id = req_id[0] if req_id else None
+            if req_id is None:
+                continue
+            finished = bool(meta.get("finished", False))
+            segment_finished = bool(meta.get("is_segment_finished", False))
+            if finished or segment_finished:
+                self.on_boundary(str(req_id), finished=finished, segment_finished=segment_finished)
+
+    def on_boundary(self, req_id: str, *, finished: bool, segment_finished: bool) -> None:
+        """Log and clear stats at a segment or request boundary.
+
+        A segment ending exactly at request end is logged once by the
+        request branch.
+        """
+        if not self.enabled:
+            return
+        if segment_finished and not finished:
+            self._log_segment(req_id, reset=True)
+        if finished:
+            self._log_segment(req_id, reset=False)
+            self._stats.pop(req_id, None)
+
+    def on_request_finished(self, req_id: str) -> None:
+        """Flush the trailing segment when the runner reports the request finished.
+
+        The talker adapter's final empty-finished payload may never reach
+        this stage, so the trailing segment is flushed here.
+        """
+        self.on_boundary(req_id, finished=True, segment_finished=False)
+
+    def _log_segment(self, req_id: str, *, reset: bool) -> None:
+        """Log one segment's rho, zeroing the counters when ``reset``."""
+        stats = self._stats.get(req_id)
+        if stats is None or stats["seg_forwards"] == 0:
+            return
+        if stats["seg_text_tokens"] > 0:
+            logger.info(
+                "Qwen3-TTS segment rho: req=%s frames=%d forwards=%d text_tokens=%d rho=%.3f",
+                req_id,
+                stats["seg_frames"],
+                stats["seg_forwards"],
+                stats["seg_text_tokens"],
+                stats["seg_frames"] / stats["seg_text_tokens"],
+            )
+        else:
+            logger.info(
+                "Qwen3-TTS segment rho: req=%s frames=%d forwards=%d text_tokens=n/a",
+                req_id,
+                stats["seg_frames"],
+                stats["seg_forwards"],
+            )
+        if reset:
+            stats["seg_frames"] = 0
+            stats["seg_forwards"] = 0
+            stats["seg_text_tokens"] = 0
+
+
 class Qwen3TTSCode2Wav(nn.Module):
     """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
     Consumes frame-aligned codec tokens from input_ids and decodes waveform
@@ -95,6 +194,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_decoded_frames = 0
         self._batch_stats_actual_frames: Counter[int] = Counter()
         self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
+
+        # Per-segment rho observability (#6496): realized acoustic decode
+        # steps per text token, logged at segment boundaries.
+        self._rho_stats = _SegmentRhoTracker(enabled=self._async_chunk)
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -223,6 +326,7 @@ class Qwen3TTSCode2Wav(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
             self._decoder_state_cache.pop(req_id, None)
+            self._rho_stats.on_request_finished(req_id)
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
@@ -273,6 +377,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
 
         if input_ids is None or input_ids.numel() == 0:
+            self._rho_stats.flush_empty_payload(runtime_additional_information)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
@@ -292,6 +397,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_included = [False] * len(request_ids_list)
         finished_flags = [False] * len(request_ids_list)
+        segment_text_tokens = [0] * len(request_ids_list)
 
         def _meta_int(value: Any) -> int:
             if isinstance(value, list):
@@ -335,6 +441,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                     ref_context_included[i] = _meta_bool(meta["ref_context_included"])
                 if "finished" in meta:
                     finished_flags[i] = _meta_bool(meta["finished"])
+                if "segment_text_tokens" in meta:
+                    segment_text_tokens[i] = _meta_int(meta["segment_text_tokens"])
 
         # Normal runner calls provide scheduler-side IDs, which are also used
         # by scheduler_output.finished_req_ids. Direct forward calls and CUDA
@@ -376,6 +484,14 @@ class Qwen3TTSCode2Wav(nn.Module):
             if is_new_state and ref_req_id is not None and ref_ctx_frames > 0:
                 if not ref_context_included[i] or frames < ref_ctx_frames:
                     raise ValueError("Qwen3-TTS async_chunk first ICL chunk must include its declared reference prefix")
+            if state_req_id is not None and not state_req_id.startswith(_DUMMY_REQUEST_ID):
+                # A_k: codec frames produced by this segment's text; ref-context
+                # frames are the ICL speaker prefix, so exclude them.
+                self._rho_stats.observe_chunk(
+                    state_req_id,
+                    frames - (ref_context_size[i] if ref_context_included[i] else 0),
+                    text_tokens=segment_text_tokens[i],
+                )
             valid_codes_qf.append((state_req_id, codes_qf))
             if state_req_id is not None:
                 state = self._decoder_state_cache.get(state_req_id)
@@ -414,6 +530,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             ):
                 if req_id is not None and (finished or segment_finished):
                     self._decoder_state_cache.pop(req_id, None)
+                    self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -510,6 +627,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         ):
             if req_id is not None and (finished or segment_finished):
                 self._decoder_state_cache.pop(req_id, None)
+                self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
 
         return OmniOutput(
             text_hidden_states=None,

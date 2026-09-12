@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,9 +9,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.data_entry_keys import to_dict
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
     Qwen3TTSCode2Wav,
 )
+from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_async_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -708,3 +712,210 @@ def test_invalid_decode_chunking_is_rejected():
 
     with pytest.raises(ValueError, match="decode_chunk_frames=0"):
         _load_weights_noop(model)
+
+
+def _rho_meta(*, request_id: str = "rid", **meta: object) -> list[dict[str, object]]:
+    """Build a single-request runtime meta dict for rho-stat tests."""
+    payload = {"request_id": request_id, "left_context_size": 0}
+    payload.update(meta)
+    return [{"meta": payload}]
+
+
+def _mock_logged_messages(mock_logger: object) -> list[str]:
+    """Re-apply %-style formatting to the messages a patched logger recorded."""
+    messages: list[str] = []
+    for call in mock_logger.info.call_args_list:
+        args = call.args
+        if not args:
+            messages.append("")
+        elif len(args) == 1:
+            messages.append(str(args[0]))
+        else:
+            messages.append(str(args[0]) % args[1:])
+    return messages
+
+
+def test_rho_stats_accumulate_across_forwards_and_reset_on_segment_finish():
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(segment_text_tokens=8),
+    )
+    model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),  # 6 codec frames
+        runtime_additional_information=_rho_meta(),
+    )
+    assert model._rho_stats._stats["rid"] == {"seg_frames": 10, "seg_forwards": 2, "seg_text_tokens": 8}
+
+    # Segment boundary: the final chunk (2 frames) is accumulated first, so the
+    # logged ratio is 12 frames / 8 text tokens = 1.5, then counters reset.
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(4, dtype=torch.long),  # 2 codec frames
+            runtime_additional_information=_rho_meta(is_segment_finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    assert model._rho_stats._stats["rid"] == {"seg_frames": 0, "seg_forwards": 0, "seg_text_tokens": 0}
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=1.500" in text for text in logged)
+
+
+def test_rho_stats_disabled_without_async_chunk():
+    model = _make_model(async_chunk=False)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),
+        runtime_additional_information=_rho_meta(segment_text_tokens=8),
+    )
+    assert model._rho_stats._stats == {}
+
+
+def test_rho_stats_excludes_ref_context_frames():
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 frames, 2 of them ref context
+        runtime_additional_information=_rho_meta(
+            ref_context_size=2,
+            ref_context_included=True,
+            segment_text_tokens=6,
+        ),
+    )
+    assert model._rho_stats._stats["rid"] == {"seg_frames": 2, "seg_forwards": 1, "seg_text_tokens": 6}
+
+
+def test_rho_stats_flushes_partial_segment_on_early_return_finish():
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(segment_text_tokens=10),
+    )
+
+    # Malformed final payload (length not divisible by num_quantizers) with
+    # finished=True: no valid codes, so forward() returns via the early
+    # boundary-cleanup path and must still flush the partial segment.
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(3, dtype=torch.long),
+            runtime_additional_information=_rho_meta(finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    # 4 frames / 10 text tokens = 0.4, then the entry is dropped.
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.400" in text for text in logged)
+
+
+def test_rho_stats_flush_on_empty_finished_input():
+    """The talker adapter ends a request with an empty-finished payload.
+
+    input_ids is empty, so forward() returns before the boundary-cleanup
+    loop; the empty-input path must still honor the finish flag and flush the
+    trailing segment.
+    """
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(segment_text_tokens=8),
+    )
+    assert model._rho_stats._stats["rid"] == {"seg_frames": 4, "seg_forwards": 1, "seg_text_tokens": 8}
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.tensor([], dtype=torch.long),  # empty-finished sentinel
+            runtime_additional_information=_rho_meta(finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    # 4 frames / 8 text tokens = 0.5, then the entry is dropped.
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.500" in text for text in logged)
+
+
+def test_rho_stats_flush_on_requests_finished():
+    """The trailing segment is logged when the runner reports the request finished.
+
+    The final empty-finished payload may never reach this stage, so
+    on_requests_finished must flush it.
+    """
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(segment_text_tokens=4),
+    )
+    assert "rid" in model._rho_stats._stats
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.on_requests_finished(["rid"])
+    # 4 frames / 4 text tokens = 1.0, then the entry is dropped.
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=1.000" in text for text in logged)
+
+
+def _producer_request(rid: str, n_text_ids: int) -> SimpleNamespace:
+    entry = SimpleNamespace(list_data=[list(range(n_text_ids))])
+    return SimpleNamespace(
+        external_req_id=rid,
+        is_finished=lambda: False,
+        additional_information=SimpleNamespace(entries={PRECOMPUTED_TEXT_IDS_KEY: entry}),
+    )
+
+
+def _producer_transfer_manager(rid: str, n_frames: int) -> SimpleNamespace:
+    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 25, "initial_codec_chunk_frames": 0}
+    tm = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        scheduler_max_num_seqs=8,
+        put_req_chunk=defaultdict(int),
+        ramp_chunk_count=defaultdict(int),
+        request_payload={},
+        connector=SimpleNamespace(config={"extra": extra}),
+    )
+    tm.code_prompt_token_ids[rid] = [[1, 2, 3, 4][:] for _ in range(n_frames)]
+    return tm
+
+
+def test_producer_payload_feeds_rho_logging_end_to_end():
+    """The real producer payload drives rho logging without further translation.
+
+    Joins the two halves tested separately: the stage-input processor writes
+    n_k into the payload meta and Code2Wav must consume the serialized
+    payload (to_dict shape) and log rho = realized frames / n_k.
+    """
+    rid = "seam-rid"
+    empty_codes = {"codes": {"audio": torch.zeros((0,))}}
+    chunk_payload = talker2code2wav_async_chunk(
+        transfer_manager=_producer_transfer_manager(rid, n_frames=2),
+        multimodal_output=empty_codes,
+        request=_producer_request(rid, n_text_ids=12),
+        is_finished=False,
+    )
+    finished_payload = talker2code2wav_async_chunk(
+        transfer_manager=_producer_transfer_manager(rid, n_frames=2),
+        multimodal_output=empty_codes,
+        request=_producer_request(rid, n_text_ids=12),
+        is_finished=True,
+    )
+    model = _make_model(async_chunk=True)
+
+    chunk_dict = to_dict(chunk_payload)
+    assert chunk_dict["meta"]["segment_text_tokens"] == 12
+    model.forward(
+        input_ids=torch.tensor(chunk_dict["codes"]["audio"], dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=[chunk_dict],
+    )
+    assert model._rho_stats._stats[rid]["seg_frames"] == 4
+    assert model._rho_stats._stats[rid]["seg_text_tokens"] == 12
+
+    finished_dict = to_dict(finished_payload)
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.tensor(finished_dict["codes"]["audio"], dtype=torch.long),
+            runtime_additional_information=[finished_dict],
+        )
+    # 4 + 4 frames / 12 text tokens = 0.667, then the entry is dropped.
+    assert rid not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.667" in text for text in logged)

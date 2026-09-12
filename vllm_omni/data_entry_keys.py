@@ -221,6 +221,7 @@ class MetaStruct(_StructBase):
     audio_seed: int | None = None
     token_role_ids: torch.Tensor | None = None
     minimax_h3_prepared_reference_videos: str | None = None
+    segment_text_tokens: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

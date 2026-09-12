@@ -10,7 +10,10 @@ import torch
 import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 
-from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import Qwen3TTSCode2Wav
+from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
+    Qwen3TTSCode2Wav,
+    _SegmentRhoTracker,
+)
 from vllm_omni.model_executor.models.qwen3_tts.segmented_graph_wrapper import CUDAGraphDecoderWrapper
 from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2DecoderConfig,
@@ -146,6 +149,7 @@ def test_code2wav_full_graph_dummy_forward_uses_exact_batched_decode(monkeypatch
     model._logged_codec_stats = True
     model._logged_malformed_codec_lengths = set()
     model._batch_stats_enabled = False
+    model._rho_stats = _SegmentRhoTracker(enabled=False)
     model._batch_stats_log_every = 0
     model._batch_stats_forwards = 0
 
