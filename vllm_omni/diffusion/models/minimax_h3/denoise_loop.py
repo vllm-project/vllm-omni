@@ -26,6 +26,7 @@ from vllm_omni.platforms import current_omni_platform
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
+    minimax_h3_validate_finite_tensors_enabled,
 )
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
@@ -308,6 +309,7 @@ def minimax_h3_denoise_loop(
     update = positive.update_mask_dev
     audio_update = positive.audio_update_mask_dev
 
+    validate_finite_tensors = minimax_h3_validate_finite_tensors_enabled()
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
@@ -340,8 +342,15 @@ def minimax_h3_denoise_loop(
                 video_rows[update],
                 mv_video_t,
                 torch.tensor(t_v, dtype=torch.float32, device=device),
+                validate_finite_tensors=validate_finite_tensors,
             )
-            new_target = minimax_h3_euler_eta0_step(video_rows[update], x0_video, sigma_curr=s_v, sigma_next=s_v_next)
+            new_target = minimax_h3_euler_eta0_step(
+                video_rows[update],
+                x0_video,
+                sigma_curr=s_v,
+                sigma_next=s_v_next,
+                validate_finite_tensors=validate_finite_tensors,
+            )
             video_rows = video_rows.clone()
             video_rows[update] = new_target
             if cond_anchor is not None:
@@ -351,9 +360,14 @@ def minimax_h3_denoise_loop(
                 audio_rows[audio_update],
                 mv_audio_t,
                 torch.tensor(t_a, dtype=torch.float32, device=device),
+                validate_finite_tensors=validate_finite_tensors,
             )
             new_audio = minimax_h3_euler_eta0_step(
-                audio_rows[audio_update], x0_audio, sigma_curr=s_a, sigma_next=s_a_next
+                audio_rows[audio_update],
+                x0_audio,
+                sigma_curr=s_a,
+                sigma_next=s_a_next,
+                validate_finite_tensors=validate_finite_tensors,
             )
             audio_rows = audio_rows.clone()
             audio_rows[audio_update] = new_audio

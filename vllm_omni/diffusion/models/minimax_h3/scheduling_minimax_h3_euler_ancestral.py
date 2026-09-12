@@ -2,9 +2,23 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
+
+MINIMAX_H3_VALIDATE_FINITE_TENSORS_ENV = "VLLM_OMNI_H3_VALIDATE_FINITE_TENSORS"
+
+
+def minimax_h3_validate_finite_tensors_enabled() -> bool:
+    value = os.getenv(MINIMAX_H3_VALIDATE_FINITE_TENSORS_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_validate_finite_tensors(value: bool | None) -> bool:
+    if value is None:
+        return minimax_h3_validate_finite_tensors_enabled()
+    return bool(value)
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -50,6 +64,8 @@ def minimax_h3_rf_v_to_x0(
     xt: torch.Tensor,
     v: torch.Tensor,
     timestep: torch.Tensor,
+    *,
+    validate_finite_tensors: bool | None = None,
 ) -> torch.Tensor:
     if xt.shape != v.shape:
         raise ValueError(f"xt and v shapes must match, got {xt.shape} vs {v.shape}")
@@ -57,15 +73,18 @@ def minimax_h3_rf_v_to_x0(
         raise ValueError("xt must be a floating point tensor")
     if not torch.is_floating_point(v):
         raise ValueError("v must be a floating point tensor")
-    _require_finite_tensor(xt, "xt")
-    _require_finite_tensor(v, "v")
+    validate_finite_tensors = _resolve_validate_finite_tensors(validate_finite_tensors)
+    if validate_finite_tensors:
+        _require_finite_tensor(xt, "xt")
+        _require_finite_tensor(v, "v")
     _validate_unit_timestep(timestep, "timestep")
     cond_t = timestep.to(device=xt.device, dtype=xt.dtype)
     while cond_t.ndim < xt.ndim:
         cond_t = cond_t.unsqueeze(-1)
     sigma_t = 1 - cond_t
     x0 = xt + sigma_t * v
-    _require_finite_tensor(x0, "x0")
+    if validate_finite_tensors:
+        _require_finite_tensor(x0, "x0")
     return x0
 
 
@@ -75,6 +94,7 @@ def minimax_h3_euler_eta0_step(
     *,
     sigma_curr: float,
     sigma_next: float,
+    validate_finite_tensors: bool | None = None,
 ) -> torch.Tensor:
     if state.shape != denoised.shape:
         raise ValueError(f"state and denoised shapes must match, got {state.shape} vs {denoised.shape}")
@@ -82,8 +102,10 @@ def minimax_h3_euler_eta0_step(
         raise ValueError("state must be a floating point tensor")
     if not torch.is_floating_point(denoised):
         raise ValueError("denoised must be a floating point tensor")
-    _require_finite_tensor(state, "state")
-    _require_finite_tensor(denoised, "denoised")
+    validate_finite_tensors = _resolve_validate_finite_tensors(validate_finite_tensors)
+    if validate_finite_tensors:
+        _require_finite_tensor(state, "state")
+        _require_finite_tensor(denoised, "denoised")
     sigma_curr = _validate_sigma(sigma_curr, "sigma_curr")
     sigma_next = _validate_sigma(sigma_next, "sigma_next")
     if sigma_curr == 0.0:
@@ -98,7 +120,8 @@ def minimax_h3_euler_eta0_step(
     sigma_ratio = sigma_next_t / sigma_curr_t
     out = sigma_ratio * state.to(dtype=compute_dtype) + (1.0 - sigma_ratio) * denoised.to(dtype=compute_dtype)
     out = out.to(dtype=state.dtype)
-    _require_finite_tensor(out, "euler_eta0_step output")
+    if validate_finite_tensors:
+        _require_finite_tensor(out, "euler_eta0_step output")
     return out
 
 
@@ -127,6 +150,7 @@ class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
         audio_sigma_curr: float | None = None,
         audio_sigma_next: float | None = None,
     ) -> dict[str, torch.Tensor]:
+        validate_finite_tensors = minimax_h3_validate_finite_tensors_enabled()
         visual_timestep = timestep if video_timestep is None else video_timestep
         audio_timestep = timestep if audio_timestep is None else audio_timestep
         visual_sigma_curr = sigma_curr if video_sigma_curr is None else video_sigma_curr
@@ -148,11 +172,13 @@ class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
             input_visual_latent,
             noise_pred_visual,
             visual_timestep,
+            validate_finite_tensors=validate_finite_tensors,
         )
         denoised_audio = minimax_h3_rf_v_to_x0(
             input_audio_latent,
             noise_pred_audio,
             audio_timestep,
+            validate_finite_tensors=validate_finite_tensors,
         )
         return {
             "output_visual_latent": minimax_h3_euler_eta0_step(
@@ -160,12 +186,14 @@ class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
                 denoised_visual,
                 sigma_curr=visual_sigma_curr,
                 sigma_next=visual_sigma_next,
+                validate_finite_tensors=validate_finite_tensors,
             ),
             "output_audio_latent": minimax_h3_euler_eta0_step(
                 input_audio_latent,
                 denoised_audio,
                 sigma_curr=audio_sigma_curr,
                 sigma_next=audio_sigma_next,
+                validate_finite_tensors=validate_finite_tensors,
             ),
         }
 
@@ -173,7 +201,9 @@ class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
 EntryClass = MiniMaxH3EulerAncestralEta0SchedulerAdapter
 
 __all__ = [
+    "MINIMAX_H3_VALIDATE_FINITE_TENSORS_ENV",
     "MiniMaxH3EulerAncestralEta0SchedulerAdapter",
     "minimax_h3_euler_eta0_step",
     "minimax_h3_rf_v_to_x0",
+    "minimax_h3_validate_finite_tensors_enabled",
 ]
