@@ -13,11 +13,13 @@ Two groups:
    CFG handling, and reshape logic can be verified numerically on CPU.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from transformers import Qwen3VLConfig
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
 
@@ -56,9 +58,13 @@ def mock_dependencies(mocker, monkeypatch):
         f"{_MODULE}.FlowMatchEulerDiscreteScheduler.from_pretrained",
         lambda *a, **k: mock_scheduler,
     )
-    monkeypatch.setattr(
+    mllm_loader = mocker.patch(
         f"{_MODULE}.Qwen3VLForConditionalGeneration.from_pretrained",
-        lambda *a, **k: mllm_wrapper,
+        return_value=mllm_wrapper,
+    )
+    mllm_config_loader = mocker.patch(
+        f"{_MODULE}.Qwen3VLConfig.from_pretrained",
+        return_value=Qwen3VLConfig(),
     )
     monkeypatch.setattr(
         f"{_MODULE}.Qwen3VLProcessor.from_pretrained",
@@ -74,12 +80,16 @@ def mock_dependencies(mocker, monkeypatch):
     mock_transformer_cls.return_value = mock_transformer_instance
     monkeypatch.setattr(f"{_MODULE}.BooguImageTransformer2DModel", mock_transformer_cls)
 
-    # Treat the dummy model id as a local path: skips hub prefetch.
-    mocker.patch("os.path.exists", return_value=True)
+    # Treat only the dummy model id as local. Other filesystem checks (for
+    # example lazy imports in the quantization registry) must remain real.
+    path_exists = os.path.exists
+    mocker.patch("os.path.exists", side_effect=lambda path: str(path).startswith("dummy-boogu") or path_exists(path))
 
     return {
         "inner_encoder": inner_encoder,
         "mllm_wrapper": mllm_wrapper,
+        "mllm_loader": mllm_loader,
+        "mllm_config_loader": mllm_config_loader,
         "processor": mock_processor,
         "vae": mock_vae,
         "scheduler": mock_scheduler,
@@ -128,6 +138,8 @@ def test_constructor_wires_components(boogu_pipeline, mock_dependencies):
     assert boogu_pipeline.vae_scale_factor == 8
     assert boogu_pipeline.default_sample_size == 128
     assert hasattr(boogu_pipeline, "load_weights")
+    assert mock_dependencies["mllm_loader"].call_args.kwargs["quantization_config"] is None
+    mock_dependencies["mllm_config_loader"].assert_not_called()
 
 
 def test_constructor_strips_mllm_lm_head(boogu_pipeline, mock_dependencies):
@@ -188,7 +200,7 @@ def test_constructor_weights_sources(boogu_pipeline):
     assert source.fall_back_to_pt is True
 
 
-def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
+def test_constructor_routes_transformer_config_with_unsupported_mllm_config(mock_dependencies, mocker):
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
@@ -208,6 +220,76 @@ def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
     kwargs = mock_dependencies["transformer_cls"].call_args.kwargs
     assert kwargs["quant_config"] is transformer_config
     assert kwargs["prefix"] == "transformer"
+    # Unsupported MLLM methods retain the HF checkpoint loading path.
+    assert mock_dependencies["mllm_loader"].call_args.kwargs["quantization_config"] is None
+    mock_dependencies["mllm_config_loader"].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("quantization_config", "quantize_mllm"),
+    [
+        pytest.param("fp8", True, id="global-fp8"),
+        pytest.param({"mllm": None, "transformer": "fp8"}, False, id="dit-only-fp8"),
+    ],
+)
+def test_constructor_routes_mllm_hf_quantization(mock_dependencies, quantization_config, quantize_mllm):
+    from transformers import FineGrainedFP8Config
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config=quantization_config,
+    )
+    BooguImagePipeline(od_config=od_config)
+
+    hf_quant_config = mock_dependencies["mllm_loader"].call_args.kwargs["quantization_config"]
+    if quantize_mllm:
+        assert isinstance(hf_quant_config, FineGrainedFP8Config)
+        assert hf_quant_config.activation_scheme == "dynamic"
+        assert hf_quant_config.modules_to_not_convert == ["lm_head", "model.visual"]
+    else:
+        assert hf_quant_config is None
+        mock_dependencies["mllm_config_loader"].assert_not_called()
+    assert isinstance(mock_dependencies["transformer_cls"].call_args.kwargs["quant_config"], Fp8Config)
+
+
+def test_mllm_hf_quantization_maps_only_mllm_ignored_layers(mock_dependencies):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import _get_mllm_hf_quantization_config
+
+    quant_config = Fp8Config(
+        ignored_layers=["mllm.language_model.layers.0.self_attn.q_proj", "transformer.blocks.0.attn.to_q"]
+    )
+    hf_quant_config = _get_mllm_hf_quantization_config(quant_config, "dummy-boogu", True)
+
+    assert hf_quant_config.modules_to_not_convert == [
+        "lm_head",
+        "model.visual",
+        "model.language_model.layers.0.self_attn.q_proj",
+    ]
+
+
+def test_constructor_preserves_serialized_mllm_quantization(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    mock_dependencies["mllm_config_loader"].return_value = Qwen3VLConfig(
+        quantization_config={"quant_method": "fp8", "modules_to_not_convert": ["model.visual"]}
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu-fp8",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config="fp8",
+    )
+    BooguImagePipeline(od_config=od_config)
+
+    # No override: HF reads the serialized checkpoint's scales and skip list.
+    assert mock_dependencies["mllm_loader"].call_args.kwargs["quantization_config"] is None
 
 
 @pytest.mark.parametrize(

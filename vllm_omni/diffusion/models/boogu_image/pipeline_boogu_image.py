@@ -34,8 +34,11 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from transformers import FineGrainedFP8Config, Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from transformers.utils.quantization_config import QuantizationConfigMixin
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -68,6 +71,38 @@ _MAX_VLM_INPUT_PIL_PIXELS = 384 * 384
 _MAX_VLM_INPUT_PIL_SIDE_LENGTH = 384 * 2
 _MAX_INPUT_IMAGE_PIXELS = 2048 * 2048
 _MAX_INPUT_IMAGE_SIDE_LENGTH = 2048 * 2
+
+
+def _get_mllm_hf_quantization_config(
+    quant_config: QuantizationConfig | None,
+    model_path: str,
+    local_files_only: bool,
+    revision: str | None = None,
+) -> QuantizationConfigMixin | None:
+    """Build an HF quantization override while preserving checkpoint quantization.
+    Replace with native vLLM quantization once a dedicated encoder is available.
+    """
+    if quant_config is None:
+        return None
+
+    if not isinstance(quant_config, Fp8Config):
+        return None
+
+    config = Qwen3VLConfig.from_pretrained(
+        model_path, subfolder="mllm", local_files_only=local_files_only, revision=revision
+    )
+    # Let HF use the checkpoint's quantization settings, including its skip list.
+    if getattr(config, "quantization_config", None):
+        return None
+
+    modules_to_not_convert = ["lm_head", "model.visual"]
+    for layer_name in quant_config.ignored_layers:
+        if layer_name.startswith("mllm."):
+            modules_to_not_convert.append(layer_name.replace("mllm.", "model.", 1))
+    return FineGrainedFP8Config(
+        activation_scheme="dynamic",
+        modules_to_not_convert=modules_to_not_convert,
+    )
 
 
 def _load_vae_scale_factor(model_path: str) -> int:
@@ -243,6 +278,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         self.od_config = od_config
         self._raise_unsupported_features()
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
+        mllm_quant_config = resolve_component_quant_config(od_config.quantization_config, "mllm")
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -273,7 +309,12 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             local_files_only=local_files_only,
             revision=od_config.revision,
         )
-
+        mllm_hf_quant_config = _get_mllm_hf_quantization_config(
+            quant_config=mllm_quant_config,
+            model_path=model,
+            local_files_only=local_files_only,
+            revision=od_config.revision,
+        )
         mllm = from_pretrained_with_prefetch(
             Qwen3VLForConditionalGeneration.from_pretrained,
             model,
@@ -282,6 +323,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             local_files_only=local_files_only,
             torch_dtype=od_config.dtype,
             revision=od_config.revision,
+            quantization_config=mllm_hf_quant_config,
         )
         # Upstream reuses the full VLM as an optional instruction rewriter and
         # encodes with its inner model (no ``lm_head``); the rewriter is not
