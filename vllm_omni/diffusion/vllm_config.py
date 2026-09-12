@@ -205,12 +205,16 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     parallel_config = od_config.parallel_config
     vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
     vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
-    if parallel_config.enable_expert_parallel and od_config.is_moe:
+    head_ep = bool(getattr(od_config, "use_head_expert_parallel", False))
+    if parallel_config.enable_expert_parallel and od_config.is_moe and not head_ep:
+        assert parallel_config.data_parallel_size is not None
         vllm_config.parallel_config.data_parallel_size = (
             parallel_config.data_parallel_size * parallel_config.cfg_parallel_size
         )
         vllm_config.parallel_config.prefill_context_parallel_size = parallel_config.sequence_parallel_size
-    vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel
+    if head_ep:
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+    vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel and not head_ep
 
     vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
     vllm_config.quant_config = od_config.quantization_config
