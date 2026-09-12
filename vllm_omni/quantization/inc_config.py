@@ -74,10 +74,17 @@ class OmniINCConfig(INCConfig):
         """Get quantization method, handling AutoRound MXFP8 as a special case."""
         # Check if this is an AutoRound MXFP8 checkpoint (data_type="mx_fp")
         if hasattr(self, "data_type") and self.data_type == "mx_fp" and self.weight_bits == 8:
-            from vllm.model_executor.layers.linear import LinearBase
+            from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
             if isinstance(layer, LinearBase):
-                return IncMxfp8OfflineLinearMethod()
+                # Respect block_name_to_quantize: only quantize the transformer blocks
+                # (noise_refiner/context_refiner/layers), NOT the text encoder or other
+                # components. Reuse the parent INCConfigParser to decide, matching the
+                # parent INCConfig.get_quant_method behavior for MXFP4.
+                layer_config = self.config_parser.resolve(layer, prefix)
+                if layer_config.quantized:
+                    return IncMxfp8OfflineLinearMethod()
+                return UnquantizedLinearMethod()
             return None
 
         # Otherwise, use parent INCConfig logic
