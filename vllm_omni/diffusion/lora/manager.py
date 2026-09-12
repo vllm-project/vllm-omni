@@ -556,9 +556,9 @@ class DiffusionLoRAManager:
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
-        lora_names_by_id = (
-            {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
-        )
+        # Track bindings unconditionally. The zero-binding guard below needs this
+        # bookkeeping on every pipeline, not only the ones that supply a validator.
+        lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
 
         def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
@@ -675,6 +675,13 @@ class DiffusionLoRAManager:
                 lora_weights.lora_a.shape,
                 lora_weights.lora_b.shape,
                 scale,
+            )
+
+        if not bound_lora_names:
+            raise ValueError(
+                f"LoRA adapter {lora_model.id} applies to no layer: expected target modules in "
+                f"{sorted(self._expected_lora_modules)} but received {sorted(lora_model.loras)}. "
+                "Activating it would leave the base model unchanged."
             )
 
         if callable(binding_validator):

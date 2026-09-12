@@ -108,7 +108,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 sent += 1
                 await asyncio.sleep(0.08)
             # Wait for the pipeline's first audio output so every stage ran.
-            saw_audio = await _recv_until(lambda e: e.get("type") == "response.audio.delta", 30)
+            saw_audio = await _recv_until(lambda e: e.get("type") == "response.output_audio.delta", 30)
             # Close the session EXPLICITLY: a bare websocket close parks the
             # session in its disconnect grace window, where it would keep
             # occupying the max_sessions=1 slot and block the first client.

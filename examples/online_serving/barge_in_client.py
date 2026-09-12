@@ -65,7 +65,7 @@ from vllm_omni.clients.duplex import (  # noqa: E402
 )
 
 _TRANSCRIPT_DELTA_EVENTS = {
-    "response.audio_transcript.delta",
+    "response.output_audio_transcript.delta",
     "response.output_text.delta",
     "response.text.delta",
 }
