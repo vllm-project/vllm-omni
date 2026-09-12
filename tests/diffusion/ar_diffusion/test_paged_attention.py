@@ -20,6 +20,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention as paged_attention_module
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -60,7 +61,26 @@ def _dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     return torch.einsum("bhqk,bkhd->bqhd", probs, value)
 
 
-def _gpu_flash_attn_usable() -> bool:
+def _paged_attn_device() -> torch.device | None:
+    """The accelerator whose paged FlashAttention this build can actually run.
+
+    ``ar_diffusion_paged_attention`` dispatches on ``device.type``, so the
+    numerical test has to follow whichever accelerator is present. XPU is
+    checked first because its kernel has no CUDA-style driver caveat: an
+    importable varlen entry point plus a visible device is the whole
+    requirement.
+    """
+    if torch.xpu.is_available():
+        from vllm.v1.attention.backends import fa_utils
+
+        if fa_utils.is_flash_attn_varlen_func_available():
+            return torch.device("xpu")
+    if _cuda_flash_attn_usable():
+        return torch.device("cuda")
+    return None
+
+
+def _cuda_flash_attn_usable() -> bool:
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
@@ -236,13 +256,16 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
 
 
-@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
+_PAGED_ATTN_DEVICE = _paged_attn_device()
+
+
+@pytest.mark.skipif(_PAGED_ATTN_DEVICE is None, reason="a usable accelerator FlashAttention is required")
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 @pytest.mark.parametrize("commit_current", [False, True])
 def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len, commit_current):
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = _PAGED_ATTN_DEVICE
     dtype = torch.float16
     kv, st = make_state(dtype=dtype, device=device, window_chunks=2)
 
@@ -296,6 +319,12 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
         causal=False,
     )
     assert torch.equal(paged, direct)
+
+    # Matching the dense reference is necessary but not sufficient: the dense
+    # Python reference matches it too. Assert the accelerator kernel is what
+    # produced this, so a silent regression back to the reference fails here
+    # instead of passing slowly.
+    assert paged_attention_module.ar_diffusion_paged_attention_backend == device.type
 
     new_k = torch.cat([history_k, current_k], dim=1)[:, -kv.spec.sliding_window :]
     new_v = torch.cat([history_v, current_v], dim=1)[:, -kv.spec.sliding_window :]
