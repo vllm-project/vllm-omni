@@ -9168,3 +9168,111 @@ async def test_minicpmo_native_duplex_idle_timeout_closes_runtime_with_timeout_r
     assert ws.sent_types() == ["session.created", "session.closed"]
     assert ws.sent[-1]["reason"] == "timeout"
     assert engine.closed == [("sid-native-timeout", "timeout")]
+
+
+def _timing_handler_and_session(
+    append_result: dict[str, object] | None = None,
+) -> tuple[OmniDuplexSessionHandler, DuplexSession, MiniCPMO45ServingSessionState]:
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient(append_result=append_result)),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-timing",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = minicpmo45_native_capabilities()
+    session.bind_request("duplex-sid-timing-e0-stage0")
+    return handler, session, handler._runtime_session_state(session)
+
+
+async def _noop_send(_payload: object) -> None:
+    pass
+
+
+@pytest.mark.asyncio
+async def test_append_acceptance_callback_runs_before_terminal_output():
+    # The acceptance callback fires inside _append_runtime_input after the RPC
+    # is accepted but before returned output events are processed, so a
+    # terminal event clears the timing state without the append restoring it.
+    handler, session, native = _timing_handler_and_session(
+        append_result={
+            "operation": "append",
+            "session_id": "sid-timing",
+            "ok": True,
+            "unsupported_count": 0,
+            "error_count": 0,
+            "stage_results": [
+                {
+                    "result": {
+                        "data_plane_append": True,
+                        "request_id": "duplex-sid-timing-e0-stage0",
+                        "response_stage_id": 1,
+                    }
+                }
+            ],
+            "data_plane_outputs": [
+                _duplex_tts_output(
+                    request_id="duplex-sid-timing-e0-stage0",
+                    samples=0,
+                    finished=True,
+                    tts_is_last_chunk=True,
+                    turn_end=True,
+                    text="",
+                    token_ids=[151645],
+                )
+            ],
+        }
+    )
+
+    accepted: list[float] = []
+
+    def on_append_accepted(submit_time: float) -> None:
+        accepted.append(submit_time)
+        native.last_native_submit_monotonic = submit_time
+        native.silence_deadline_monotonic = 2.0
+
+    append_ok, _ = await handler._append_runtime_input(
+        session,
+        handler._native_silence_unit_payload(),
+        final=False,
+        send_json=_noop_send,
+        mode="append_audio_chunk",
+        expected_epoch=session.epoch,
+        on_append_accepted=on_append_accepted,
+    )
+    assert append_ok is True
+    assert len(accepted) == 1
+    # The terminal event cleared the chain; the append must not restore it.
+    assert native.last_native_submit_monotonic is None
+    assert native.silence_deadline_monotonic is None
+
+
+@pytest.mark.asyncio
+async def test_failed_append_does_not_call_acceptance_callback(monkeypatch):
+    handler, session, native = _timing_handler_and_session()
+    accepted: list[float] = []
+
+    async def _fail_append(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("append failed")
+
+    monkeypatch.setattr(
+        handler._chat_service.engine_client,
+        "append_duplex_input_async",
+        _fail_append,
+    )
+
+    append_ok, _ = await handler._append_runtime_input(
+        session,
+        handler._native_silence_unit_payload(),
+        final=False,
+        send_json=_noop_send,
+        mode="append_audio_chunk",
+        expected_epoch=session.epoch,
+        on_append_accepted=accepted.append,
+    )
+    assert append_ok is False
+    assert accepted == []
+    assert native.last_native_submit_monotonic is None
+    assert native.silence_deadline_monotonic is None

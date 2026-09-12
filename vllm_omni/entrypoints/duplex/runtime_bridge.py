@@ -6,7 +6,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 
@@ -107,6 +108,7 @@ class NativeRuntimeBridgeMixin:
         send_json,
         mode: str = "append_tokens",
         expected_epoch: int | None = None,
+        on_append_accepted: Callable[[float], None] | None = None,
     ) -> tuple[bool, bool]:
         if not session.capabilities.supports_input_append:
             return True, False
@@ -146,6 +148,7 @@ class NativeRuntimeBridgeMixin:
                 append_kwargs["collect_outputs"] = bool(
                     getattr(self._serving_runtime_adapter, "collect_outputs_on_append", False)
                 )
+            submit_time = time.monotonic()
             result = await append_input(session.session_id, **append_kwargs)
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -162,6 +165,10 @@ class NativeRuntimeBridgeMixin:
             return False, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        # Commit timing state before returned output events can clear the
+        # silence-continuation chain (e.g. a terminal turn-end).
+        if on_append_accepted is not None:
+            on_append_accepted(submit_time)
         await self._send_runtime_control_if_needed(send_json, result, session=session)
         request_id, _ = self._data_plane_request_info(result) if isinstance(result, dict) else (None, None)
         if request_id is not None:

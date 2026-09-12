@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import binascii
 import json
+import time
 import uuid
 from contextlib import suppress
 from copy import deepcopy
@@ -55,6 +56,38 @@ from vllm_omni.entrypoints.duplex.websocket import (
 logger = init_logger(__name__)
 
 _MAX_EVENT_BYTES = 15 * 1024 * 1024
+
+
+def compute_silence_continuation_deadline(
+    *,
+    chunk_period_s: float,
+    now: float,
+    last_submit: float | None,
+    current_deadline: float | None,
+) -> tuple[float, float]:
+    """Return the silence continuation schedule ``(delay_s, next_silence_deadline)``.
+
+    The first continuation anchors to the latest accepted append's submission
+    time (``last_submit + chunk_period_s``), falling back to ``now`` when no
+    submission exists. Later continuations advance from the current deadline
+    instead of from ``now``, so pipeline processing time does not accumulate
+    as timer drift. When the schedule is more than one period overdue it is
+    stale: one continuation submits immediately and the schedule restarts
+    from ``now`` (``next_silence_deadline = now + chunk_period_s``) instead of
+    firing a burst of catch-ups.
+
+    ``delay_s`` is the wait before this continuation and
+    ``next_silence_deadline`` the deadline for the following one.
+    """
+    if current_deadline is None:
+        base = last_submit if last_submit is not None else now
+        deadline = base + chunk_period_s
+    else:
+        deadline = current_deadline
+    if now - deadline > chunk_period_s:
+        deadline = now
+    delay_s = max(0.0, deadline - now)
+    return delay_s, deadline + chunk_period_s
 
 
 class DuplexSessionRunnerMixin:
@@ -447,6 +480,7 @@ class DuplexSessionRunnerMixin:
             operation_id: str | None = None,
             retained_committed_payload: dict[str, object] | None = None,
             silence_continuation: bool = False,
+            next_silence_deadline: float | None = None,
             before_append=None,
         ) -> asyncio.Task[bool] | None:
             if session is None:
@@ -483,6 +517,13 @@ class DuplexSessionRunnerMixin:
             async def _run() -> bool:
                 nonlocal runtime_closed
                 try:
+
+                    def _on_append_accepted(submit_time: float) -> None:
+                        # Commit timing state once the runtime accepts the
+                        # append; a real (non-silence) input re-anchors it.
+                        native.last_native_submit_monotonic = submit_time
+                        native.silence_deadline_monotonic = next_silence_deadline if silence_continuation else None
+
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
                         payload,
@@ -491,6 +532,7 @@ class DuplexSessionRunnerMixin:
                         send_json=emit_event,
                         mode="append_audio_chunk",
                         expected_epoch=append_epoch,
+                        on_append_accepted=_on_append_accepted,
                     )
                     if append_ok:
                         native.native_context_locked = True
@@ -680,26 +722,36 @@ class DuplexSessionRunnerMixin:
             append_tail = actor.native_append_tail
             if (append_tail is None or append_tail.done()) and real_native_input_waiting():
                 return False
-            continuation_delay_s = max(
+            chunk_period_s = max(
                 0.0,
                 float(session.capabilities.chunk_period_ms or 1000) / 1000.0,
             )
-            if continuation_delay_s > 0:
-                await asyncio.sleep(continuation_delay_s)
-                if (
-                    actor.native_append_tail is not append_tail
-                    or ((append_tail is None or append_tail.done()) and real_native_input_waiting())
-                    or self._native_silence_continuation_is_stale(
-                        session,
-                        request_id=request_id,
-                        response_id=response_id,
-                        response_owned=response_owned,
-                        expected_epoch=expected_epoch,
-                        expected_incarnation=expected_incarnation,
-                        expected_model_turn_id=expected_model_turn_id,
-                    )
-                ):
-                    return False
+            # Align the next silence unit to submission_time_N + chunk_period
+            # and sleep only the remaining budget. The deadline is stored by
+            # _run() when the append actually submits, so skipped or stale
+            # continuations never advance the clock.
+            delay_s, next_silence_deadline = compute_silence_continuation_deadline(
+                chunk_period_s=chunk_period_s,
+                now=time.monotonic(),
+                last_submit=native.last_native_submit_monotonic,
+                current_deadline=native.silence_deadline_monotonic,
+            )
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            if (
+                actor.native_append_tail is not append_tail
+                or ((append_tail is None or append_tail.done()) and real_native_input_waiting())
+                or self._native_silence_continuation_is_stale(
+                    session,
+                    request_id=request_id,
+                    response_id=response_id,
+                    response_owned=response_owned,
+                    expected_epoch=expected_epoch,
+                    expected_incarnation=expected_incarnation,
+                    expected_model_turn_id=expected_model_turn_id,
+                )
+            ):
+                return False
 
             def _still_valid() -> bool:
                 return not real_native_input_waiting() and not self._native_silence_continuation_is_stale(
@@ -717,6 +769,7 @@ class DuplexSessionRunnerMixin:
                 payload,
                 final=False,
                 silence_continuation=True,
+                next_silence_deadline=next_silence_deadline,
                 before_append=_still_valid,
             )
             if task is None:
