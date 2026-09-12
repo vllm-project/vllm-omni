@@ -14,6 +14,7 @@ list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
+| AuK | `tencent/AuK`, `tencent/AuK-Flash` (assembled with `tools/prepare_auk_checkpoint.py`) | 2 (thinker encoder + DiT) | ✓ | — | instruction-driven editing, enhancement, separation; no example script (use `vllm_omni.model_extras.auk`) | 24 kHz |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |

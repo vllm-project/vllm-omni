@@ -60,7 +60,7 @@ def test_post_commit_decision_accepts_drained_speak_after_commit_ack():
     events = [
         {"type": "input_audio_buffer.committed"},
         {"type": "response.created", "response": {"id": "resp-a"}},
-        {"type": "response.audio.delta", "response_id": "resp-a", "delta": "AAAA"},
+        {"type": "response.output_audio.delta", "response_id": "resp-a", "delta": "AAAA"},
         {"type": "response.done", "response_id": "resp-a"},
     ]
 
@@ -267,7 +267,7 @@ def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, 
 
     writer.handle(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(first_pcm).decode("ascii"),
             "sample_rate_hz": 24_000,
@@ -275,14 +275,14 @@ def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, 
     )
     writer.handle(
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": "resp-a",
             "delta": "你好",
         }
     )
     writer.handle(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(second_pcm).decode("ascii"),
             "sample_rate_hz": 24_000,

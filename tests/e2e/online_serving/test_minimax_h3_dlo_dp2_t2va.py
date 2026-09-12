@@ -111,7 +111,6 @@ def _run_t2va_request(client: OpenAIClientHandler, seed: int) -> bytes:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.slow
 @pytest.mark.parametrize(
     "omni_server",
     [
