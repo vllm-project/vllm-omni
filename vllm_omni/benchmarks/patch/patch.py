@@ -2998,6 +2998,21 @@ async def benchmark(
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics
+        for session_key, result_key in (
+            ("global_ttft_ms", "mean_duplex_global_ttft_ms"),
+            ("global_ttfp_ms", "mean_duplex_global_ttfp_ms"),
+            ("global_rtf", "mean_duplex_global_rtf"),
+        ):
+            values = [
+                float(value)
+                for metric in duplex_session_metrics
+                if isinstance((value := metric.get(session_key)), int | float)
+                and not isinstance(value, bool)
+                and np.isfinite(value)
+                and value >= 0
+            ]
+            if values:
+                result[result_key] = sum(values) / len(values)
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
 

@@ -1,16 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+"""CLI for Omni-DuplexEval generate / evaluate / summarize.
+
+``generate`` still writes per-sample timed sentences and ``*.meta.json``.
+Duplex performance metrics are written to ``<response-root>/duplex_metrics.json``.
+Skipped samples keep previously recorded rows; incoming ``(split, sample_id)``
+rows replace the matching ones, then ``mean_duplex_global_*`` is recomputed.
+"""
+
 import argparse
 import asyncio
 import concurrent.futures
 import json
 from pathlib import Path
 
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, load_samples
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, DuplexSample, load_samples
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
-from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import generate_sample
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import GenerateSampleResult, generate_sample
+from vllm_omni.benchmarks.duplex_session_metrics import (
+    DUPLEX_METRICS_FILENAME,
+    merge_duplex_metrics_report,
+    read_duplex_metrics_report,
+)
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
 
 
@@ -54,6 +67,26 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     summarize.add_argument("--score-root", required=True)
 
 
+def _write_duplex_metrics(response_root: str | Path, results: list[GenerateSampleResult]) -> Path:
+    request_metrics = [metric for result in results for metric in result.request_metrics]
+    session_metrics = [result.session_metrics for result in results if result.session_metrics]
+    path = Path(response_root) / DUPLEX_METRICS_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            merge_duplex_metrics_report(
+                read_duplex_metrics_report(path),
+                request_metrics=request_metrics,
+                session_metrics=session_metrics,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def run(args: argparse.Namespace) -> int:
     if args.action == "summarize":
         print(json.dumps(summarize_scores(args.score_root), ensure_ascii=False, indent=2))
@@ -71,12 +104,12 @@ def run(args: argparse.Namespace) -> int:
         if args.concurrency < 1:
             raise ValueError("--concurrency must be at least 1")
 
-        async def generate() -> None:
+        async def generate() -> list[GenerateSampleResult]:
             semaphore = asyncio.Semaphore(args.concurrency)
 
-            async def generate_one(sample) -> None:
+            async def generate_one(sample: DuplexSample) -> GenerateSampleResult:
                 async with semaphore:
-                    await generate_sample(
+                    return await generate_sample(
                         sample,
                         url=args.url,
                         model=args.model,
@@ -89,16 +122,16 @@ def run(args: argparse.Namespace) -> int:
                         overwrite=args.overwrite,
                     )
 
-            await asyncio.gather(*(generate_one(sample) for sample in samples))
+            return list(await asyncio.gather(*(generate_one(sample) for sample in samples)))
 
-        asyncio.run(generate())
+        _write_duplex_metrics(args.response_root, asyncio.run(generate()))
         return 0
 
     if args.eval_workers < 1:
         raise ValueError("--eval-workers must be at least 1")
     judge = DuplexJudge(args.judge_base_url, args.judge_model, api_key=args.judge_api_key)
 
-    def evaluate_one(sample) -> None:
+    def evaluate_one(sample: DuplexSample) -> None:
         response_path = Path(args.response_root) / sample.split / f"{sample.id}.json"
         score_path = Path(args.score_root) / sample.split / f"{sample.id}.json"
         if score_path.exists() and not args.overwrite:

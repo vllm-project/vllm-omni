@@ -736,11 +736,157 @@ def test_event_collector_reports_engine_token_and_audio_intervals():
         "measurement_origin": {
             "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
             "ttfp": "input_audio_buffer.commit client send to first audio packet",
+            "tpot": "Stage-0 engine mean time per output token",
         },
         "ttft_ms": 250.0,
         "ttfp_ms": 300.0,
         "audio_generation_ms": 460.0,
         "audio_duration_ms": 240.0,
+        "tpot_ms": 15.0,
+    }
+
+
+def test_session_summary_omits_unmeasured_zero_tpot():
+    summary = summarize_session_request_metrics(
+        [
+            {"ttft_ms": 100.0, "tpot_ms": 0.0},
+            {"ttft_ms": 200.0, "tpot_ms": None},
+        ],
+        session_id="session",
+    )
+
+    assert summary["mean_ttft_ms"] == 150.0
+    assert "mean_tpot_ms" not in summary
+
+
+def test_event_collector_reports_global_metrics_across_responses():
+    collector = EventCollector()
+    for response_id, created_at_s, text_at_s, audio_times, durations in (
+        ("resp-a", 10.1, 10.2, (10.3, 10.4), (100, 200)),
+        ("resp-b", 12.1, 12.2, (12.3, 12.5), (150, 300)),
+    ):
+        collector.add(
+            {"type": "response.created", "response": {"id": response_id}},
+            received_at_s=created_at_s,
+        )
+        collector.add(
+            {
+                "type": "response.audio_transcript.delta",
+                "response_id": response_id,
+                "delta": response_id,
+            },
+            received_at_s=text_at_s,
+        )
+        for received_at_s, duration_ms in zip(audio_times, durations, strict=True):
+            collector.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": response_id,
+                    "delta": base64.b64encode(b"audio").decode("ascii"),
+                    "sample_rate_hz": 16_000,
+                    "metadata": {"audio_duration_ms": duration_ms},
+                },
+                received_at_s=received_at_s,
+            )
+
+    metrics = collector.global_timing_summary(
+        after_s=10.0,
+        window_started_at_s=10.0,
+        response_ids=["resp-a", "resp-b"],
+        measurement_origin={
+            "ttft": "input stream start to first non-empty text delta",
+            "ttfp": "input stream start to first audio packet",
+            "rtf": "input stream start-to-last-audio receive time divided by total emitted audio duration",
+        },
+    )
+
+    assert metrics == {
+        "source": "client_monotonic_receive",
+        "response_ids": ["resp-a", "resp-b"],
+        "measurement_origin": {
+            "ttft": "input stream start to first non-empty text delta",
+            "ttfp": "input stream start to first audio packet",
+            "rtf": "input stream start-to-last-audio receive time divided by total emitted audio duration",
+        },
+        "ttft_ms": 200.0,
+        "ttfp_ms": 300.0,
+        "audio_generation_ms": 2500.0,
+        "audio_duration_ms": 500.0,
+    }
+
+
+def test_event_collector_prefers_server_request_start_for_ttf():
+    collector = EventCollector()
+    collector.add(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-a",
+                "metadata": {
+                    "duplex_event": {
+                        "response_request_metrics": {
+                            "source": "server_monotonic_request_start",
+                            "measurement_origin": {
+                                "ttft": "native request start to first text output",
+                                "ttfp": "native request start to first audio output",
+                            },
+                            "ttft_ms": 125.0,
+                            "ttfp_ms": 175.0,
+                        }
+                    }
+                },
+            },
+        },
+        received_at_s=10.0,
+    )
+    stage_metrics = {
+        "0": {
+            "num_tokens_out": 4,
+            "vllm_ttft_ms": 120.0,
+            "vllm_tpot_ms": 15.0,
+            "vllm_itl_ms": 14.0,
+            "vllm_itls_ms": [10.0, 14.0, 18.0],
+        }
+    }
+    for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
+        collector.add(
+            {
+                "type": "response.audio.delta",
+                "response_id": "resp-a",
+                "delta": base64.b64encode(b"audio").decode("ascii"),
+                "sample_rate_hz": 16_000,
+                "metadata": {
+                    "audio_duration_ms": cumulative_audio_ms,
+                    "vllm_omni": {"stage_metrics": stage_metrics},
+                },
+            },
+            received_at_s=received_at_s,
+        )
+    collector.add(
+        {"type": "response.audio_transcript.delta", "response_id": "resp-a", "delta": "hello"},
+        received_at_s=10.15,
+    )
+
+    timing = collector.timing_summary(
+        after_s=10.0,
+        input_committed_at_s=9.9,
+        response_id="resp-a",
+    )
+
+    assert timing["request_metrics"] == {
+        "source": "server_request_start_and_client_receive",
+        "measurement_origin": {
+            "ttft": "native request start to first text output",
+            "ttfp": "native request start to first audio output",
+            "tpot": "Stage-0 engine mean time per output token",
+        },
+        "ttft_ms": 125.0,
+        "ttfp_ms": 175.0,
+        "audio_generation_ms": 460.0,
+        "audio_duration_ms": 240.0,
+        "response_created_to_first_text_ms": 150.0,
+        "response_created_to_first_audio_ms": 200.0,
+        "tpot_ms": 15.0,
     }
 
 

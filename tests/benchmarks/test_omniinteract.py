@@ -148,6 +148,72 @@ def _successful_output(
     return case, collector, result
 
 
+def test_response_metrics_include_engine_tpot_and_global_stream_window():
+    first_audio = _audio("r1")
+    first_audio["metadata"] = {
+        "audio_duration_ms": 100,
+        "vllm_omni": {
+            "stage_metrics": {
+                "0": {
+                    "num_tokens_out": 3,
+                    "vllm_tpot_ms": 10.0,
+                    "vllm_itls_ms": [10.0, 10.0],
+                }
+            }
+        },
+    }
+    second_audio = _audio("r2")
+    second_audio["metadata"] = {
+        "audio_duration_ms": 200,
+        "vllm_omni": {
+            "stage_metrics": {
+                "0": {
+                    "num_tokens_out": 2,
+                    "vllm_tpot_ms": 20.0,
+                    "vllm_itls_ms": [20.0],
+                }
+            }
+        },
+    }
+    collector = _collector(
+        (_created("r1"), 10.1),
+        (_text("r1", "first"), 10.2),
+        (first_audio, 10.3),
+        (_done("r1"), 10.4),
+        (_created("r2"), 12.1),
+        (_text("r2", "second"), 12.2),
+        (second_audio, 12.5),
+        (_done("r2"), 12.6),
+    )
+    result = oi.OmniInteractCaseResult("1q1a", "video.mp4", "", session_id="session")
+
+    oi._populate_response_metrics(result, collector, stream_start=10.0)
+
+    assert result.output_tokens == 5
+    assert [metric["tpot_ms"] for metric in result.duplex_request_metrics] == [10.0, 20.0]
+    assert result.duplex_session_metrics == {
+        "session_id": "session",
+        "audio_turn_count": 2,
+        "mean_ttft_ms": 100.0,
+        "mean_tpot_ms": 15.0,
+        "mean_ttfp_ms": 300.0,
+        "mean_rtf": 2.0,
+        "global_ttft_ms": 200.0,
+        "global_ttfp_ms": 300.0,
+        "global_rtf": 8.333333,
+        "global_audio_generation_ms": 2500.0,
+        "global_audio_duration_ms": 300.0,
+        "global_measurement_origin": {
+            "ttft": "input stream start to first non-empty text delta",
+            "ttfp": "input stream start to first audio packet",
+            "rtf": (
+                "input stream start-to-last-audio receive time divided by total emitted audio duration; "
+                "includes concurrent realtime input"
+            ),
+        },
+    }
+
+
 def _write_success(
     root: Path,
     case: data.OmniInteractCase,

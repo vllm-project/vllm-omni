@@ -1248,6 +1248,15 @@ def _rounded_ms(value: float) -> float:
     return round(float(value), 3)
 
 
+def _finite_number(value: object, *, nonnegative: bool = False) -> float | None:
+    if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(float(value)):
+        return None
+    number = float(value)
+    if nonnegative and number < 0:
+        return None
+    return number
+
+
 def _interval_summary(values: list[float]) -> dict[str, float | int]:
     clean = sorted(_rounded_ms(value) for value in values if math.isfinite(value) and value >= 0)
     if not clean:
@@ -1282,6 +1291,34 @@ def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
         stage_metrics = candidate.get("stage_metrics")
         if isinstance(stage_metrics, dict):
             return stage_metrics
+    return None
+
+
+def _event_response_request_metrics(event: dict[str, object]) -> dict[str, object] | None:
+    direct_metrics = event.get("response_request_metrics")
+    if isinstance(direct_metrics, dict):
+        return direct_metrics
+    candidates: list[object] = [event.get("vllm_omni")]
+    metadata = event.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend((metadata, metadata.get("vllm_omni"), metadata.get("duplex_event")))
+    response = event.get("response")
+    if isinstance(response, dict):
+        response_metadata = response.get("metadata")
+        if isinstance(response_metadata, dict):
+            candidates.extend(
+                (
+                    response_metadata,
+                    response_metadata.get("vllm_omni"),
+                    response_metadata.get("duplex_event"),
+                )
+            )
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        request_metrics = candidate.get("response_request_metrics")
+        if isinstance(request_metrics, dict):
+            return request_metrics
     return None
 
 
@@ -1379,6 +1416,85 @@ class EventCollector:
                 return received_at_s
         return None
 
+    def global_timing_summary(
+        self,
+        *,
+        after_s: float,
+        window_started_at_s: float,
+        response_ids: list[str],
+        measurement_origin: dict[str, str],
+    ) -> dict[str, object]:
+        """Summarize one client-observed timing window across responses.
+
+        Returns raw measurements only. Derived metrics such as RTF are computed
+        by the caller — e.g. with ``vllm_omni.metrics.definitions.compute_audio_rtf``.
+        """
+        selected_response_ids = set(response_ids)
+        first_text_received_at_s: float | None = None
+        audio_received_at_s: list[float] = []
+        response_audio_duration_ms: dict[str, float] = {}
+
+        for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
+            if received_at_s < after_s:
+                continue
+            response_id = self.response_id(event)
+            if response_id is None or response_id not in selected_response_ids:
+                continue
+            if (
+                event.get("type")
+                in {
+                    "response.audio_transcript.delta",
+                    "response.output_text.delta",
+                    "response.text.delta",
+                }
+                and isinstance(event.get("delta"), str)
+                and bool(event["delta"])
+                and first_text_received_at_s is None
+            ):
+                first_text_received_at_s = received_at_s
+            if event.get("type") not in _AUDIO_DELTA_TYPES:
+                continue
+            delta = event.get("delta") or event.get("audio")
+            if not isinstance(delta, str) or not delta:
+                continue
+            audio_received_at_s.append(received_at_s)
+            metadata = event.get("metadata")
+            duration_ms = metadata.get("audio_duration_ms") if isinstance(metadata, dict) else None
+            parsed_duration_ms = _finite_number(duration_ms, nonnegative=True)
+            if parsed_duration_ms is not None:
+                response_audio_duration_ms[response_id] = max(
+                    response_audio_duration_ms.get(response_id, 0.0),
+                    parsed_duration_ms,
+                )
+
+        if not audio_received_at_s:
+            return {}
+
+        audio_duration_ms = sum(
+            response_audio_duration_ms.get(
+                response_id,
+                self._format_for_bytes().duration_ms(len(self.audio_bytes(response_id))),
+            )
+            for response_id in response_ids
+        )
+        audio_generation_ms = max(
+            0.0,
+            (audio_received_at_s[-1] - window_started_at_s) * 1000.0,
+        )
+        return {
+            "source": "client_monotonic_receive",
+            "response_ids": list(response_ids),
+            "measurement_origin": dict(measurement_origin),
+            "ttft_ms": (
+                _rounded_ms((first_text_received_at_s - window_started_at_s) * 1000.0)
+                if first_text_received_at_s is not None
+                else None
+            ),
+            "ttfp_ms": _rounded_ms((audio_received_at_s[0] - window_started_at_s) * 1000.0),
+            "audio_generation_ms": _rounded_ms(audio_generation_ms),
+            "audio_duration_ms": _rounded_ms(audio_duration_ms),
+        }
+
     def timing_summary(
         self,
         *,
@@ -1389,6 +1505,7 @@ class EventCollector:
     ) -> dict[str, object]:
         """Summarize engine token metrics and client-observed audio cadence."""
         stage0_metrics: dict[str, object] | None = None
+        response_request_metrics: dict[str, object] = {}
         response_created_at_s: float | None = None
         first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
@@ -1418,6 +1535,10 @@ class EventCollector:
             stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
             if isinstance(stage0, dict):
                 stage0_metrics = stage0
+
+            event_request_metrics = _event_response_request_metrics(event)
+            if event_request_metrics is not None:
+                response_request_metrics.update(event_request_metrics)
 
             if event.get("type") not in _AUDIO_DELTA_TYPES:
                 continue
@@ -1478,6 +1599,31 @@ class EventCollector:
             }
             request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
             if request_started_at_s is not None:
+                default_measurement_origin = (
+                    {
+                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                    }
+                    if input_committed_at_s is not None
+                    else {
+                        "ttft": "response.created client receive to first non-empty text delta",
+                        "ttfp": "response.created client receive to first audio packet",
+                    }
+                )
+                resolved_measurement_origin = {
+                    **default_measurement_origin,
+                    **(measurement_origin or {}),
+                }
+                if stage0_metrics is not None:
+                    resolved_measurement_origin["tpot"] = "Stage-0 engine mean time per output token"
+                server_ttft_ms = _finite_number(response_request_metrics.get("ttft_ms"), nonnegative=True)
+                server_ttfp_ms = _finite_number(response_request_metrics.get("ttfp_ms"), nonnegative=True)
+                server_origins = response_request_metrics.get("measurement_origin")
+                if isinstance(server_origins, dict):
+                    if server_ttft_ms is not None and isinstance(server_origins.get("ttft"), str):
+                        resolved_measurement_origin["ttft"] = server_origins["ttft"]
+                    if server_ttfp_ms is not None and isinstance(server_origins.get("ttfp"), str):
+                        resolved_measurement_origin["ttfp"] = server_origins["ttfp"]
                 audio_duration_ms = (
                     max(cumulative_audio_ms)
                     if cumulative_audio_ms
@@ -1493,21 +1639,49 @@ class EventCollector:
                 # compute_audio_rtf — so metric definitions stay out of this
                 # dependency-free client module.
                 result["request_metrics"] = {
-                    "source": "client_monotonic_receive",
-                    "measurement_origin": measurement_origin
-                    or {
-                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
-                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
-                    },
-                    "ttft_ms": (
-                        _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
-                        if first_text_received_at_s is not None
-                        else None
+                    "source": (
+                        "server_request_start_and_client_receive"
+                        if server_ttft_ms is not None or server_ttfp_ms is not None
+                        else "client_monotonic_receive"
                     ),
-                    "ttfp_ms": _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0),
+                    "measurement_origin": resolved_measurement_origin,
+                    "ttft_ms": (
+                        server_ttft_ms
+                        if server_ttft_ms is not None
+                        else (
+                            _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
+                            if first_text_received_at_s is not None
+                            else None
+                        )
+                    ),
+                    "ttfp_ms": (
+                        server_ttfp_ms
+                        if server_ttfp_ms is not None
+                        else _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0)
+                    ),
                     "audio_generation_ms": _rounded_ms(audio_generation_ms),
                     "audio_duration_ms": _rounded_ms(audio_duration_ms),
                 }
+                if server_ttft_ms is not None or server_ttfp_ms is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["response_created_to_first_text_ms"] = (
+                        _rounded_ms((first_text_received_at_s - response_created_at_s) * 1000.0)
+                        if first_text_received_at_s is not None and response_created_at_s is not None
+                        else None
+                    )
+                    request_metrics["response_created_to_first_audio_ms"] = (
+                        _rounded_ms((audio_received_at_s[0] - response_created_at_s) * 1000.0)
+                        if response_created_at_s is not None
+                        else None
+                    )
+                if stage0_metrics is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["tpot_ms"] = _finite_number(
+                        stage0_metrics.get("vllm_tpot_ms"),
+                        nonnegative=True,
+                    )
         return result
 
     def _format_for_bytes(self) -> AudioFormat:
@@ -1640,30 +1814,37 @@ def summarize_session_request_metrics(
     *,
     session_id: str | None,
 ) -> dict[str, object]:
-    """Average client-observed metrics across turns that emitted audio.
+    """Average client- and engine-observed metrics across audio responses.
 
     ``request_metrics`` entries are caller-assembled dicts; keys that are
     absent or non-numeric in an entry are simply skipped. ``rtf`` is not
     produced by :meth:`EventCollector.timing_summary` (which reports raw data
     only) — callers that want ``mean_rtf`` add an ``rtf`` value per turn,
-    e.g. via ``vllm_omni.metrics.definitions.compute_audio_rtf``.
+    e.g. via ``vllm_omni.metrics.definitions.compute_audio_rtf``. Zero or
+    missing ``tpot_ms`` values are omitted from ``mean_tpot_ms``.
     """
 
-    def mean(metric: str, *, digits: int = 3) -> float | None:
+    def mean(metric: str, *, digits: int = 3, positive: bool = False) -> float | None:
         values = [
             float(request[metric])
             for request in request_metrics
-            if isinstance(request.get(metric), int | float) and math.isfinite(float(request[metric]))
+            if isinstance(request.get(metric), int | float)
+            and not isinstance(request.get(metric), bool)
+            and math.isfinite(float(request[metric]))
+            and (not positive or float(request[metric]) > 0)
         ]
         return round(sum(values) / len(values), digits) if values else None
 
-    return {
+    summary: dict[str, object] = {
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
         "mean_ttft_ms": mean("ttft_ms"),
         "mean_ttfp_ms": mean("ttfp_ms"),
         "mean_rtf": mean("rtf", digits=6),
     }
+    if (mean_tpot_ms := mean("tpot_ms", positive=True)) is not None:
+        summary["mean_tpot_ms"] = mean_tpot_ms
+    return summary
 
 
 async def acknowledge_collected_playback(client: DuplexClient, collector: EventCollector) -> None:

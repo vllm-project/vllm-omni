@@ -8761,19 +8761,82 @@ async def test_minicpmo_native_duplex_continuous_speak_reuses_active_response_un
     assert session.turn_id == 1
 
 
+def test_response_timing_binds_latest_request_start_for_model_turn():
+    session = DuplexSession(
+        session_id="sid-response-request-timing",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.mark_model_turn_request_started(0, 10.0)
+    session.mark_model_turn_request_started(0, 11.0)
+    session.begin_response(turn_id=0)
+
+    assert session.mark_response_first_outputs(
+        observed_at_s=11.2,
+        has_text=True,
+        has_audio=False,
+    )["ttft_ms"] == pytest.approx(200.0)
+
+    session.mark_model_turn_request_started(0, 12.0)
+    assert session.mark_response_first_outputs(
+        observed_at_s=12.3,
+        has_text=False,
+        has_audio=True,
+    )["ttfp_ms"] == pytest.approx(1300.0)
+
+
+def test_response_tpot_fallback_ignores_single_token_segment():
+    session = DuplexSession(
+        session_id="sid-response-tpot",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.begin_response(turn_id=0)
+
+    first_metrics = session.accumulate_response_stage_metrics({"0": {"num_tokens_out": 1, "vllm_tpot_ms": 900.0}})
+    assert "vllm_tpot_ms" not in first_metrics["0"]
+
+    second_metrics = session.accumulate_response_stage_metrics({"0": {"num_tokens_out": 2, "vllm_tpot_ms": 15.0}})
+    assert second_metrics["0"]["num_tokens_out"] == 3
+    assert second_metrics["0"]["vllm_tpot_ms"] == 15.0
+
+
+def test_response_tpot_keeps_token_weighted_value_when_itls_exist():
+    session = DuplexSession(
+        session_id="sid-response-tpot-multi-token",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.begin_response(turn_id=0)
+    metrics = session.accumulate_response_stage_metrics(
+        {
+            "0": {
+                "num_tokens_out": 4,
+                "vllm_tpot_ms": 10.0,
+                "vllm_itls_ms": [30.0],
+            }
+        }
+    )
+    assert metrics["0"]["vllm_itls_ms"] == [30.0]
+    assert metrics["0"]["vllm_itl_ms"] == 30.0
+    assert metrics["0"]["vllm_tpot_ms"] == 10.0
+
+
 @pytest.mark.asyncio
-async def test_continuous_response_metrics_accumulate_only_owned_model_units():
+async def test_continuous_response_metrics_accumulate_only_owned_model_units(monkeypatch):
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
     session = DuplexSession(
         session_id="sid-response-metrics",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.mark_model_turn_request_started(0, 10.0)
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.duplex.runtime_bridge.time.monotonic",
+        lambda: 10.25,
     )
     sent: list[dict[str, Any]] = []
 
     async def send_json(payload: dict[str, Any]) -> None:
         sent.append(payload)
 
-    async def emit(*, text: str, audio: str, tokens: int, ttft_ms: float, itls: list[float]) -> None:
+    async def emit(*, text: str, audio: str, tokens: int, ttft_ms: float, itls: list[float], tpot_ms: float) -> None:
         await handler._send_one_native_duplex_event(
             send_json,
             {
@@ -8792,7 +8855,7 @@ async def test_continuous_response_metrics_accumulate_only_owned_model_units():
                         "num_tokens_out": tokens,
                         "stage_gen_time_ms": 80.0,
                         "vllm_ttft_ms": ttft_ms,
-                        "vllm_tpot_ms": 9.0,
+                        "vllm_tpot_ms": tpot_ms,
                         "vllm_itls_ms": itls,
                     }
                 },
@@ -8800,21 +8863,32 @@ async def test_continuous_response_metrics_accumulate_only_owned_model_units():
             session=session,
         )
 
-    await emit(text="first", audio="audio-a", tokens=4, ttft_ms=50.0, itls=[10.0, 11.0])
-    await emit(text="second", audio="audio-b", tokens=6, ttft_ms=70.0, itls=[12.0, 13.0, 14.0])
+    await emit(text="first", audio="audio-a", tokens=3, ttft_ms=50.0, itls=[10.0, 11.0], tpot_ms=10.5)
+    await emit(text="second", audio="audio-b", tokens=4, ttft_ms=70.0, itls=[12.0, 13.0, 14.0], tpot_ms=13.0)
 
     deltas = [payload for payload in sent if payload.get("type") == "response.output_audio.delta"]
     assert len(deltas) == 2
     first_metrics = deltas[0]["vllm_omni"]["stage_metrics"]["0"]
     second_metrics = deltas[1]["vllm_omni"]["stage_metrics"]["0"]
-    assert first_metrics["num_tokens_out"] == 4
-    assert second_metrics["num_tokens_out"] == 10
+    assert first_metrics["num_tokens_out"] == 3
+    assert first_metrics["vllm_tpot_ms"] == pytest.approx(10.5)
+    assert deltas[0]["vllm_omni"]["response_request_metrics"] == {
+        "source": "server_monotonic_request_start",
+        "measurement_origin": {
+            "ttft": "native model-turn request execution start to first non-empty text output",
+            "ttfp": "native model-turn request execution start to first audio output",
+        },
+        "ttft_ms": 250.0,
+        "ttfp_ms": 250.0,
+    }
+    assert second_metrics["num_tokens_out"] == 7
     assert second_metrics["vllm_ttft_ms"] == 50.0
     assert second_metrics["vllm_itls_ms"] == [10.0, 11.0, 12.0, 13.0, 14.0]
+    assert second_metrics["vllm_tpot_ms"] == pytest.approx(12.0)
 
     first_response_id = deltas[0]["response_id"]
     session.end_response()
-    await emit(text="third", audio="audio-c", tokens=3, ttft_ms=90.0, itls=[15.0, 16.0])
+    await emit(text="third", audio="audio-c", tokens=3, ttft_ms=90.0, itls=[15.0, 16.0], tpot_ms=15.5)
 
     third_delta = [payload for payload in sent if payload.get("type") == "response.output_audio.delta"][-1]
     third_metrics = third_delta["vllm_omni"]["stage_metrics"]["0"]
@@ -8822,6 +8896,7 @@ async def test_continuous_response_metrics_accumulate_only_owned_model_units():
     assert third_metrics["num_tokens_out"] == 3
     assert third_metrics["vllm_ttft_ms"] == 90.0
     assert third_metrics["vllm_itls_ms"] == [15.0, 16.0]
+    assert third_metrics["vllm_tpot_ms"] == pytest.approx(15.5)
 
 
 @pytest.mark.asyncio
