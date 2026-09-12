@@ -119,9 +119,11 @@ class SDPAImpl(AttentionImpl):
             key = key.repeat_interleave(repeat_num, dim=1)
             value = value.repeat_interleave(repeat_num, dim=1)
             enable_gqa = False
-            logger.debug(
-                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
-            )
+            # Dynamo can't trace logger calls under fullgraph.
+            if not torch.compiler.is_compiling():
+                logger.debug(
+                    "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
+                )
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
             key,

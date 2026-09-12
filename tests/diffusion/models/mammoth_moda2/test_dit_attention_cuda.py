@@ -52,28 +52,61 @@ def test_real_shape_matches_previous_arithmetic_bf16(seq):
     assert diff.mean().item() < 1e-3, diff.mean().item()
 
 
-def test_empty_text_stream_on_the_default_backend():
+def test_empty_text_stream_skipped_by_apply_refiners():
     """The recipe's text-to-image request with text_guidance_scale > 1 runs the
-    context refiner on a zero-token unconditional prompt. Before the guard this
-    raised ``RuntimeError: step must be nonzero`` from the FA varlen fallback."""
+    context refiner on a zero-token unconditional prompt. The block-level guard
+    was removed so ``TransformerBlock.forward`` stays fullgraph-clean under
+    torch.compile; the skip now lives in ``Transformer2DModel._apply_refiners``,
+    which runs in eager Python and can safely test ``.shape[1] > 0``. Assert
+    that path returns the empty text tensor unchanged instead of running the
+    (backend-crashing) block on a zero-length sequence."""
+    from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
+
     torch.manual_seed(0)
-    block = (
-        TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5, modulation=False)
+    # Shrunk config: only exercise the context_refiner path; construction cost
+    # is kept minimal because we never run the noise/main layers here.
+    model = (
+        Transformer2DModel(
+            patch_size=2,
+            in_channels=16,
+            hidden_size=192,
+            num_layers=1,
+            num_refiner_layers=1,
+            num_attention_heads=6,
+            num_kv_heads=2,
+            multiple_of=32,
+            ffn_dim_multiplier=1.0,
+            norm_eps=1e-5,
+            axes_dim_rope=(16, 8, 8),
+            axes_lens=(64, 64, 64),
+            text_feat_dim=64,
+        )
         .cuda()
         .to(torch.bfloat16)
         .eval()
     )
-    hidden = torch.randn(1, 0, DIM, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(1, 0, dtype=torch.bool, device="cuda")
-    angles = torch.rand(1, 0, block.head_dim, device="cuda")
+    text_hidden_states = torch.randn(1, 0, model.hidden_size, device="cuda", dtype=torch.bfloat16)
+    text_attention_mask = torch.ones(1, 0, dtype=torch.bool, device="cuda")
+    context_rotary_emb = (
+        torch.zeros(1, 0, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+        torch.zeros(1, 0, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+    )
+    img_tokens = torch.randn(1, 16, model.hidden_size, device="cuda", dtype=torch.bfloat16)
+    img_mask = torch.ones(1, 16, dtype=torch.bool, device="cuda")
+    noise_rotary_emb = (
+        torch.zeros(1, 16, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+        torch.zeros(1, 16, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+    )
+    temb = torch.randn(1, min(model.hidden_size, 1024), device="cuda", dtype=torch.bfloat16)
+
     with torch.no_grad():
-        out = block.attn(
-            hidden_states=hidden,
-            encoder_hidden_states=hidden,
-            attention_mask=mask,
-            image_rotary_emb=(angles.cos().to(torch.bfloat16), angles.sin().to(torch.bfloat16)),
+        out_text, _ = model._apply_refiners(
+            text_hidden_states, text_attention_mask, context_rotary_emb, img_tokens, img_mask, noise_rotary_emb, temb
         )
-    assert out.shape == (1, 0, DIM)
+    # Empty text stream is returned unchanged: the block-level backend crash on
+    # zero-length varlen is avoided because ``_apply_refiners`` skips the loop.
+    assert out_text.shape == (1, 0, model.hidden_size)
+    assert torch.equal(out_text, text_hidden_states)
 
 
 @pytest.mark.parametrize(
