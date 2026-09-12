@@ -38,6 +38,11 @@ from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cache.cachedit import (
+    CacheDiTBackend,
+    CacheDiTRequestSpec,
+    RequestScopedCacheDiTRuntime,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -68,6 +73,23 @@ _MAX_VLM_INPUT_PIL_PIXELS = 384 * 384
 _MAX_VLM_INPUT_PIL_SIDE_LENGTH = 384 * 2
 _MAX_INPUT_IMAGE_PIXELS = 2048 * 2048
 _MAX_INPUT_IMAGE_SIDE_LENGTH = 2048 * 2
+
+_BOOGU_CACHE_SINGLE_KEY = "boogu-single-pass"
+_BOOGU_CACHE_PAIRED_KEY = "boogu-paired-cfg"
+
+
+def _cache_dit_prediction_count(
+    task_type: str,
+    text_guidance_scale: float,
+    image_guidance_scale: float,
+) -> int:
+    if task_type == "ti2i" and text_guidance_scale > 1.0 and image_guidance_scale > 1.0:
+        return 3
+    if text_guidance_scale > 1.0:
+        return 2
+    if task_type == "ti2i" and image_guidance_scale > 1.0:
+        return 2
+    return 1
 
 
 def _load_vae_scale_factor(model_path: str) -> int:
@@ -241,6 +263,8 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        self._cache_dit_separate_cfg = True
+        self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
         self._raise_unsupported_features()
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.weights_sources = [
@@ -332,10 +356,50 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
         if parallel_config.use_hsdp:
             raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
-        if self.od_config.cache_backend not in (None, "", "none"):
+        cache_backend = str(self.od_config.cache_backend or "none").lower()
+        if cache_backend == "cache_dit" and (parallel_config.cfg_parallel_size or 1) > 1:
+            raise NotImplementedError("CFG parallelism with Cache-DiT is not supported by BooguImagePipeline.")
+        if cache_backend not in ("", "none", "cache_dit"):
             raise NotImplementedError(
                 f"Cache backend '{self.od_config.cache_backend}' is not supported by BooguImagePipeline."
             )
+
+    def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
+        self._cache_dit_runtime.adopt(
+            backend,
+            installation_key=_BOOGU_CACHE_PAIRED_KEY,
+        )
+
+    def is_cache_dit_enabled(self) -> bool:
+        return self._cache_dit_runtime.is_enabled
+
+    def _prepare_cache_dit_request(
+        self,
+        *,
+        num_inference_steps: int,
+        prediction_count: int,
+    ) -> None:
+        cache_backend = str(self.od_config.cache_backend or "none").lower()
+        if cache_backend != "cache_dit":
+            return
+
+        if prediction_count == 3:
+            logger.warning(
+                "Boogu double guidance uses three transformer predictions per step; "
+                "running this request without Cache-DiT."
+            )
+            self._cache_dit_runtime.prepare(None)
+            return
+
+        self._cache_dit_separate_cfg = prediction_count == 2
+        installation_key = _BOOGU_CACHE_PAIRED_KEY if prediction_count == 2 else _BOOGU_CACHE_SINGLE_KEY
+        self._cache_dit_runtime.prepare(
+            CacheDiTRequestSpec(
+                installation_key=installation_key,
+                cache_config=self.od_config.cache_config,
+                num_inference_steps=num_inference_steps,
+            )
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -946,6 +1010,16 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             )
         if not has_reference:
             image_guidance_scale = 1.0
+
+        prediction_count = _cache_dit_prediction_count(
+            task_type,
+            text_guidance_scale,
+            image_guidance_scale,
+        )
+        self._prepare_cache_dit_request(
+            num_inference_steps=num_inference_steps,
+            prediction_count=prediction_count,
+        )
 
         # Negative instruction embeddings are needed whenever text guidance is
         # active (t2i text CFG, ti2i text-only, and ti2i double guidance).

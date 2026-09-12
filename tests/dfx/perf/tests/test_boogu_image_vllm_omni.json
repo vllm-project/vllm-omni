@@ -35,6 +35,55 @@
         ]
     },
     {
+        "test_name": "test_boogu_image_cache_dit_single_device",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H100"
+                    },
+                    "num_cards": 1
+                }
+            },
+            "full_model",
+            "diffusion"
+        ],
+        "description": "Single-device Base T2I Cache-DiT row for controlled comparison with the dense 512x512, 28-step baseline.",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Boogu/Boogu-Image-0.1-Base",
+            "serve_args": {
+                "cache-backend": "cache_dit",
+                "cache-config": {
+                    "max_warmup_steps": 4,
+                    "max_continuous_cached_steps": 6,
+                    "residual_diff_threshold": 0.12
+                },
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps28_cache_dit",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 28,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "warmup-requests": 2,
+                "warmup-concurrency": 1,
+                "warmup-num-inference-steps": 28,
+                "enable-negative-prompt": true,
+                "extra-body": {
+                    "guidance_scale": 4.0,
+                    "seed": 42
+                }
+            }
+        ]
+    },
+    {
         "test_name": "test_boogu_image_cfg_parallel_2",
         "mark": [
             {

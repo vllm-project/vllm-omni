@@ -19,7 +19,12 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.data import (
+    DiffusionCacheConfig,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+    TransformerConfig,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -221,8 +226,12 @@ def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
             "none",
             "HSDP",
         ),
-        (DiffusionParallelConfig(), "cache_dit", "Cache backend 'cache_dit'"),
         (DiffusionParallelConfig(), "tea_cache", "Cache backend 'tea_cache'"),
+        (
+            DiffusionParallelConfig(cfg_parallel_size=2),
+            "cache_dit",
+            "CFG parallelism with Cache-DiT",
+        ),
     ],
 )
 def test_constructor_rejects_unsupported_execution_modes(
@@ -250,6 +259,24 @@ def test_constructor_rejects_unsupported_execution_modes(
     mock_dependencies["mllm_wrapper"].model.to.assert_not_called()
 
 
+def test_constructor_accepts_cache_dit_on_single_gpu(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(),
+        cache_backend="cache_dit",
+    )
+
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    assert pipeline.od_config.cache_backend == "cache_dit"
+
+
 @pytest.mark.parametrize("cfg_parallel_size", [2, 3])
 def test_constructor_accepts_cfg_parallel(mock_dependencies, cfg_parallel_size):
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
@@ -268,6 +295,88 @@ def test_constructor_accepts_cfg_parallel(mock_dependencies, cfg_parallel_size):
     assert pipeline.od_config.parallel_config.cfg_parallel_size == cfg_parallel_size
     assert hasattr(pipeline, "predict_noise_maybe_with_cfg")
     assert hasattr(pipeline, "predict_noise_with_multi_branch_cfg")
+
+
+@pytest.mark.parametrize(
+    ("task_type", "text_scale", "image_scale", "expected"),
+    [
+        ("t2i", 1.0, 1.0, 1),
+        ("t2i", 4.0, 1.0, 2),
+        ("ti2i", 1.0, 1.0, 1),
+        ("ti2i", 5.0, 1.0, 2),
+        ("ti2i", 1.0, 2.0, 2),
+        ("ti2i", 5.0, 2.0, 3),
+    ],
+)
+def test_cache_dit_prediction_count(task_type, text_scale, image_scale, expected):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        _cache_dit_prediction_count,
+    )
+
+    assert _cache_dit_prediction_count(task_type, text_scale, image_scale) == expected
+
+
+@pytest.mark.parametrize(
+    ("prediction_count", "expected_key", "expected_separate_cfg"),
+    [
+        (1, "boogu-single-pass", False),
+        (2, "boogu-paired-cfg", True),
+        (3, None, None),
+    ],
+)
+def test_prepare_cache_dit_request_selects_safe_profile(
+    prediction_count,
+    expected_key,
+    expected_separate_cfg,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    prepared = []
+    cache_config = DiffusionCacheConfig()
+    pipeline = object.__new__(BooguImagePipeline)
+    pipeline.od_config = SimpleNamespace(
+        cache_backend="cache_dit",
+        cache_config=cache_config,
+    )
+    pipeline._cache_dit_runtime = SimpleNamespace(prepare=prepared.append)
+    pipeline._cache_dit_separate_cfg = True
+
+    pipeline._prepare_cache_dit_request(
+        num_inference_steps=28,
+        prediction_count=prediction_count,
+    )
+
+    assert len(prepared) == 1
+    spec = prepared[0]
+    if expected_key is None:
+        assert spec is None
+    else:
+        assert spec.installation_key == expected_key
+        assert spec.cache_config is cache_config
+        assert spec.num_inference_steps == 28
+        assert pipeline._cache_dit_separate_cfg is expected_separate_cfg
+
+
+def test_pipeline_adopts_startup_cache_dit_backend(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(),
+        cache_backend="cache_dit",
+    )
+    pipeline = BooguImagePipeline(od_config=od_config)
+    backend = SimpleNamespace(is_enabled=lambda: True)
+
+    pipeline.adopt_cache_dit_backend(backend)
+
+    assert pipeline.is_cache_dit_enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +663,10 @@ def _make_forward_pipeline(pipeline_cls=None):
     pipeline.vae = _FakeDecodeVAE()
     pipeline.vae_scale_factor = 8
     pipeline.default_sample_size = 128
+    pipeline.od_config = SimpleNamespace(
+        cache_backend="none",
+        cache_config=DiffusionCacheConfig(),
+    )
     return pipeline
 
 
@@ -621,6 +734,34 @@ def test_forward_cfg_off_when_guidance_one():
     assert len(cfg_calls) == 2
     assert all(call["do_true_cfg"] is False for call in cfg_calls)
     assert all(call["negative_kwargs"] is None for call in cfg_calls)
+
+
+def test_forward_prepares_single_pass_cache_dit_profile():
+    pipeline = _make_forward_pipeline()
+    prepared = []
+    cache_config = DiffusionCacheConfig()
+    pipeline.od_config = SimpleNamespace(
+        cache_backend="cache_dit",
+        cache_config=cache_config,
+    )
+    pipeline._cache_dit_runtime = SimpleNamespace(prepare=prepared.append)
+    pipeline._cache_dit_separate_cfg = True
+    req = _make_request_batch(
+        "a cat",
+        height=64,
+        width=64,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+    )
+    req.sampling_params.guidance_scale_provided = True
+
+    pipeline.forward(req)
+
+    assert len(prepared) == 1
+    spec = prepared[0]
+    assert spec.installation_key == "boogu-single-pass"
+    assert spec.cache_config is cache_config
+    assert spec.num_inference_steps == 2
 
 
 def test_double_guidance_combine_matches_legacy_formula():
@@ -1190,6 +1331,10 @@ def _make_edit_forward_pipeline():
     pipeline.vae = _EditForwardVAE()
     pipeline.vae_scale_factor = 8
     pipeline.default_sample_size = 128
+    pipeline.od_config = SimpleNamespace(
+        cache_backend="none",
+        cache_config=DiffusionCacheConfig(),
+    )
     return pipeline
 
 
