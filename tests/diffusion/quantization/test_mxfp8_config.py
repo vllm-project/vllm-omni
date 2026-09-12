@@ -204,6 +204,48 @@ def test_get_quant_method_non_linear_returns_none(monkeypatch: pytest.MonkeyPatc
     assert config.get_quant_method(norm_layer, "blocks.0.norm1") is None
 
 
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_offline_weight_scale_loads_input_partition_columns(
+    mocker: MockerFixture,
+    tp_rank: int,
+):
+    """RowParallel weight scales must load the rank-local K-group columns."""
+    from vllm_omni.quantization.mxfp8_config import (
+        DiffusionMXFP8Config,
+        NPUMxfp8LinearMethod,
+    )
+
+    mocker.patch(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+        return_value=tp_rank,
+    )
+    mocker.patch(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        return_value=2,
+    )
+    layer = torch.nn.Module()
+    method = NPUMxfp8LinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True))
+    method.create_weights(
+        layer,
+        input_size_per_partition=1536,
+        output_partition_sizes=[4096],
+        input_size=3072,
+        output_size=4096,
+        params_dtype=torch.float8_e4m3fn,
+        weight_loader=lambda param, loaded_weight: param.load_row_parallel_weight(loaded_weight),
+    )
+
+    assert layer.weight_scale.shape == (4096, 48)
+    assert layer.weight_scale.input_dim == 1
+    assert layer.weight_scale.output_dim == 0
+
+    full_scale = torch.arange(96, dtype=torch.uint8).unsqueeze(0).expand(4096, -1)
+    layer.weight_scale.weight_loader(layer.weight_scale, full_scale)
+
+    expected = full_scale[:, tp_rank * 48 : (tp_rank + 1) * 48]
+    torch.testing.assert_close(layer.weight_scale, expected)
+
+
 # ---------------------------------------------------------------------------
 # MXFPLinearMethodBase.apply() — reshape skeleton (CPU, no NPU)
 # ---------------------------------------------------------------------------
