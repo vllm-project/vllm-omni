@@ -968,9 +968,9 @@ def calculate_metrics(
         if "ttft" in goodput_config_dict:
             valid_metrics.append(goodput_ttfts)
             slo_values.append(goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "audio_ttft" in goodput_config_dict:
+        if "audio_ttfp" in goodput_config_dict:
             valid_metrics.append(goodput_audio_ttfps)
-            slo_values.append(goodput_config_dict["audio_ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
+            slo_values.append(goodput_config_dict["audio_ttfp"] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
             slo_values.append(goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION)

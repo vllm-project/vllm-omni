@@ -361,7 +361,7 @@ def test_duplex_goodput_does_not_pair_measurements_from_different_requests():
     audio_only.ttft, audio_only.audio_ttfp = 0.0, 0.2
     audio_only.duplex_session_metrics = {"mean_ttft_ms": None, "mean_ttfp_ms": 200.0, "mean_rtf": None}
 
-    metrics = _calculate_test_metrics([text_only, audio_only], {"ttft": 500.0, "audio_ttft": 500.0})
+    metrics = _calculate_test_metrics([text_only, audio_only], {"ttft": 500.0, "audio_ttfp": 500.0})
 
     assert metrics.request_goodput == 0.0
 
@@ -590,3 +590,11 @@ def test_image_with_generated_text_still_reports_text_result(capsys):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+@pytest.mark.parametrize("slo_ms, expected", [(100.0, 0.0), (300.0, 1.0)])
+def test_audio_ttfp_goodput_slo(slo_ms, expected):
+    output = _make_output(100)
+    output.audio_ttfp = 0.2
+    metrics = _calculate_test_metrics([output], {"audio_ttfp": slo_ms})
+    assert metrics.request_goodput == expected
