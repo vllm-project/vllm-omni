@@ -93,6 +93,17 @@ def apply_rotary_emb(
     rotary_dim = cos.shape[-1] * 2
     if rotary_dim > x.shape[-1]:
         raise ValueError(f"RoPE dimension {rotary_dim} exceeds head dimension {x.shape[-1]}")
+    if not interleaved and cos.shape == sin.shape:
+        # Broadcast each table across the two rotary halves instead of
+        # materializing duplicated tables. Keep the original dtype promotion
+        # and arithmetic order, including negation before multiplication.
+        x_rot = x[..., :rotary_dim]
+        pairs = x_rot.unflatten(-1, (2, cos.shape[-1]))
+        rotated_pairs = rotate_half(x_rot).unflatten(-1, (2, cos.shape[-1]))
+        rotated = (pairs * cos.unsqueeze(-2).unsqueeze(-2) + rotated_pairs * sin.unsqueeze(-2).unsqueeze(-2)).flatten(
+            -2
+        )
+        return torch.cat((rotated, x[..., rotary_dim:]), dim=-1)
     if interleaved:
         cos = cos.unsqueeze(-2).repeat_interleave(2, dim=-1)
         sin = sin.unsqueeze(-2).repeat_interleave(2, dim=-1)
