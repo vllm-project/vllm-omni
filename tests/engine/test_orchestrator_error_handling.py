@@ -22,6 +22,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
 
 from vllm_omni.engine.duplex.contracts import (
+    DuplexContextOutput,
     DuplexInputMode,
     DuplexRequestIdentity,
     DuplexRuntimeCapabilities,
@@ -31,12 +32,14 @@ from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     EngineQueueMessage,
     ErrorMessage,
+    OutputMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    StreamingSegmentState,
     cleanup_request_artifact_dirs,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
@@ -693,6 +696,82 @@ async def test_handle_dead_replica_preserves_committed_native_session_for_lazy_r
         assert session.recovery_required is True
         assert session.resource_request_ids() == []
         assert [append.operation_id for append in session.replay_appends] == ["operation-1"]
+    finally:
+        for queue_ in queues:
+            queue_.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aggregate", [False, True], ids=["entry-limit", "journal-limit"])
+async def test_duplex_output_journal_overflow_is_request_scoped(aggregate) -> None:
+    """Generated history may outgrow an accepted input; fail A, still route B.
+
+    Only the model completion is supplied: real Gander output application,
+    session byte accounting, control-plane finalization and cleanup are used.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
+
+    class CompletedUnitExtension(MiniCPMO45DuplexRuntimeExtension):
+        def finalize_context_unit(self, **kwargs):
+            return DuplexContextOutput(unit_sequence=1, data={"output_ids": list(range(8))})
+
+    queues = (janus.Queue(), janus.Queue(), janus.Queue())
+    client = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator = Orchestrator(
+        request_async_queue=queues[0].async_q,
+        output_async_queue=queues[1].async_q,
+        rpc_async_queue=queues[2].async_q,
+        stage_pools=_build_stage_pools([[client]]),
+        enable_duplex_control=True,
+        duplex_runtime_extension=CompletedUnitExtension(),
+    )
+    try:
+        pool = orchestrator.stage_pools[0]
+        fence = DuplexFence("sid-budget")
+        session = orchestrator.duplex_sessions.open_session(fence)
+        session.bind_stage_request(0, "A", fence=fence)
+        for seq in range(1, 3 if aggregate else 2):
+            session.record_replay_append(
+                session.prepare_replay_append(
+                    operation_id=f"op{seq}",
+                    operation_fingerprint=b"x" * 32,
+                    prompt={
+                        "prompt_token_ids": [1],
+                        "model_intermediate_buffer": {"duplex": {"seq": seq, "gander_output_ids": []}},
+                    },
+                )
+            )
+        session.recovery_max_replay_bytes = session.replay_byte_count + 1
+        original_journal = tuple(session.replay_appends)
+        for request_id in ("A", "B"):
+            state = OrchestratorRequestState(request_id=request_id, sampling_params_list=[_sampling_params()])
+            state.stage_submit_ts[0] = time.time()
+            if request_id == "A":
+                state.duplex_identity = DuplexRequestIdentity(session_id=fence.session_id, fence=fence)
+                state.streaming.enabled = True
+                state.streaming.segments[0] = StreamingSegmentState(finished=True)
+            orchestrator.request_states[request_id] = state
+            pool._request_bindings[request_id] = 0
+
+        await orchestrator._handle_processed_outputs(
+            0, 0, [_build_request_output("A", finished=False), _build_request_output("B")]
+        )
+
+        messages = []
+        while not queues[1].async_q.empty():
+            messages.append(queues[1].async_q.get_nowait())
+        errors = [message for message in messages if isinstance(message, ErrorMessage)]
+        assert len(errors) == 1
+        assert errors[0].request_id == "A" and not errors[0].fatal
+        assert errors[0].error_type == "duplex_context_output_error"
+        expected = "capacity_exhausted" if aggregate else "entry_too_large"
+        assert expected in errors[0].error
+        assert any(isinstance(message, OutputMessage) and message.request_id == "B" for message in messages)
+        assert orchestrator.duplex_sessions.get(fence.session_id) is None
+        assert "A" not in orchestrator.request_states
+        assert pool.get_bound_replica_id("A") is None
+        assert tuple(session.replay_appends) == original_journal
+        assert not orchestrator._shutdown_event.is_set()
     finally:
         for queue_ in queues:
             queue_.close()

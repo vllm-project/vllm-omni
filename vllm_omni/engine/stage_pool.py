@@ -1268,7 +1268,7 @@ class StagePool:
             else:
                 raise RuntimeError(f"invalid streaming prompt append result for {request_id}: {append_result!r}")
             self._native_append_operations[request_id] = (*operation_signature, "completed")
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             # The core utility may have committed just before its reply was
             # lost. Keep output processing registered while that unit runs;
             # the same operation_id can be retried once it parks again.
@@ -1408,7 +1408,7 @@ class StagePool:
             raise TimeoutError(message)
         try:
             return await asyncio.wait_for(awaitable, timeout=remaining)
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise TimeoutError(message) from exc
 
     async def submit_interaction(
@@ -1632,7 +1632,7 @@ class StagePool:
             )
             if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
                 raise
-            if isinstance(exc, TimeoutError):
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
             else:
                 error = str(exc) or repr(exc)

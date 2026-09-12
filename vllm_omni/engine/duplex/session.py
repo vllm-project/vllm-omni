@@ -18,6 +18,11 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexInputMode,
     DuplexRuntimeCapabilities,
 )
+from vllm_omni.engine.duplex.fence import (
+    DuplexFenceMismatchError,
+    validate_cancel_fences,
+    validate_fence,
+)
 from vllm_omni.engine.duplex.lease import (
     DuplexLeaseActivity,
     DuplexLeaseConfig,
@@ -31,13 +36,6 @@ _APPEND_TOMBSTONE_LIMIT = 65536
 
 def _default_capabilities() -> DuplexRuntimeCapabilities:
     return DuplexRuntimeCapabilities()
-
-
-class DuplexFenceMismatchError(RuntimeError):
-    def __init__(self, expected: DuplexFence, actual: DuplexFence) -> None:
-        super().__init__(f"duplex fence mismatch: expected {expected!r}, got {actual!r}")
-        self.expected = expected
-        self.actual = actual
 
 
 @dataclass
@@ -139,34 +137,6 @@ class DuplexReplayAppend:
 
 
 @dataclass(frozen=True, slots=True)
-class DuplexGenerationSnapshot:
-    resource_generation: int
-    context_tokens: int
-    context_limit: int | None
-    replay_token_count: int
-    replay_byte_count: int
-    replay_append_count: int
-    compaction_count: int
-    dropped_append_count: int
-    dropped_token_count: int
-    dropped_byte_count: int
-    rebuild_count: int
-    last_recovery_reason: str | None
-
-
-@dataclass
-class _DuplexGenerationStats:
-    context_tokens: int = 0
-    context_limit: int | None = None
-    compaction_count: int = 0
-    dropped_append_count: int = 0
-    dropped_token_count: int = 0
-    dropped_byte_count: int = 0
-    rebuild_count: int = 0
-    last_recovery_reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class DuplexContextLedgerSnapshot:
     """Read-only context lifecycle view; it never becomes a second state owner."""
 
@@ -182,7 +152,6 @@ class DuplexContextLedgerSnapshot:
     completed_append_count: int
     recovery_required: bool
     recovery_reason: str | None
-    generation_history: tuple[DuplexGenerationSnapshot, ...] = ()
 
     @property
     def context_utilization(self) -> float | None:
@@ -303,8 +272,6 @@ class DuplexSessionRuntimeState:
     recovery_reason: str | None = None
     scheduler_context_tokens: int = 0
     scheduler_context_limit: int | None = None
-    generation_history_limit: int = 8
-    _generation_stats: OrderedDict[int, _DuplexGenerationStats] = field(default_factory=OrderedDict, repr=False)
 
     def __post_init__(self) -> None:
         if self.completed_append_limit <= 0:
@@ -315,23 +282,11 @@ class DuplexSessionRuntimeState:
             raise ValueError("duplex rollover trigger fraction must be in [0, 1)")
         if self.rollover_retain_tokens <= 0:
             raise ValueError("duplex rollover retain tokens must be positive")
-        if self.generation_history_limit <= 0:
-            raise ValueError("generation_history_limit must be positive")
         if self.rollover_trigger_fraction > 0 and self.rollover_retain_tokens >= self.recovery_max_replay_tokens:
             raise ValueError(
                 "duplex rollover retain tokens must be smaller than the recovery replay token limit "
                 "when rollover is enabled"
             )
-        self._ensure_generation_stats()
-
-    def _ensure_generation_stats(self) -> _DuplexGenerationStats:
-        stats = self._generation_stats.get(self.resource_generation)
-        if stats is None:
-            stats = _DuplexGenerationStats()
-            self._generation_stats[self.resource_generation] = stats
-            while len(self._generation_stats) > self.generation_history_limit:
-                self._generation_stats.popitem(last=False)
-        return stats
 
     @property
     def session_id(self) -> str:
@@ -339,26 +294,6 @@ class DuplexSessionRuntimeState:
 
     def context_ledger(self) -> DuplexContextLedgerSnapshot:
         """Expose context facts without duplicating mutation ownership."""
-        current = self._ensure_generation_stats()
-        current.context_tokens = self.scheduler_context_tokens
-        current.context_limit = self.scheduler_context_limit
-        history = tuple(
-            DuplexGenerationSnapshot(
-                resource_generation=generation,
-                context_tokens=stats.context_tokens,
-                context_limit=stats.context_limit,
-                replay_token_count=(self.replay_token_count if generation == self.resource_generation else 0),
-                replay_byte_count=(self.replay_byte_count if generation == self.resource_generation else 0),
-                replay_append_count=(len(self.replay_appends) if generation == self.resource_generation else 0),
-                compaction_count=stats.compaction_count,
-                dropped_append_count=stats.dropped_append_count,
-                dropped_token_count=stats.dropped_token_count,
-                dropped_byte_count=stats.dropped_byte_count,
-                rebuild_count=stats.rebuild_count,
-                last_recovery_reason=stats.last_recovery_reason,
-            )
-            for generation, stats in self._generation_stats.items()
-        )
         return DuplexContextLedgerSnapshot(
             session_id=self.session_id,
             fence=self.fence,
@@ -372,7 +307,6 @@ class DuplexSessionRuntimeState:
             completed_append_count=len(self.completed_appends),
             recovery_required=self.recovery_required,
             recovery_reason=self.recovery_reason,
-            generation_history=history,
         )
 
     @property
@@ -384,14 +318,7 @@ class DuplexSessionRuntimeState:
         return self.fence.turn_id
 
     def _validate_fence(self, fence: DuplexFence) -> None:
-        if fence.session_id != self.session_id or fence.incarnation != self.fence.incarnation:
-            raise DuplexFenceMismatchError(self.fence, fence)
-        current = self.fence
-        if fence.epoch < current.epoch or (
-            fence.epoch == current.epoch
-            and (fence.turn_id < current.turn_id or fence.response_seq < current.response_seq)
-        ):
-            raise DuplexFenceMismatchError(current, fence)
+        validate_fence(self.fence, fence)
 
     def accept_fence(self, fence: DuplexFence) -> None:
         self._validate_fence(fence)
@@ -408,9 +335,6 @@ class DuplexSessionRuntimeState:
             self.recovery_reason = None
             self.scheduler_context_tokens = 0
             self.scheduler_context_limit = None
-            self._generation_stats.clear()
-            self.resource_generation = 0
-            self._ensure_generation_stats()
         self.fence = fence
 
     def prepare_replay_append(
@@ -457,9 +381,6 @@ class DuplexSessionRuntimeState:
         trigger = max(1, int(self.scheduler_context_limit * self.rollover_trigger_fraction))
         return self.scheduler_context_tokens + append.token_count >= trigger
 
-    def context_rollover_needed(self, append: DuplexReplayAppend) -> bool:
-        return self.recovery_required or self.replay_window_rollover_needed(append)
-
     def compacted_replay_appends(self) -> list[DuplexReplayAppend]:
         retained: list[DuplexReplayAppend] = []
         retained_tokens = 0
@@ -488,23 +409,10 @@ class DuplexSessionRuntimeState:
     def begin_resource_generation(
         self,
         retained_appends: Iterable[DuplexReplayAppend],
-        *,
-        reason: str,
     ) -> None:
-        """Atomically roll physical context and account for whole-unit compaction."""
-        previous = tuple(self.replay_appends)
-        retained = tuple(retained_appends)
-        retained_ids = {item.operation_id for item in retained}
-        dropped = [item for item in previous if item.operation_id not in retained_ids]
+        """Start a new physical context while preserving logical append identity."""
+        self.replace_replay_journal(retained_appends)
         self.resource_generation += 1
-        self.replace_replay_journal(retained)
-        stats = self._ensure_generation_stats()
-        stats.compaction_count += 1
-        stats.dropped_append_count += len(dropped)
-        stats.dropped_token_count += sum(item.token_count for item in dropped)
-        stats.dropped_byte_count += sum(item.byte_count for item in dropped)
-        stats.rebuild_count += 1
-        stats.last_recovery_reason = reason
         self.scheduler_context_tokens = 0
         self.scheduler_context_limit = None
 
@@ -514,7 +422,6 @@ class DuplexSessionRuntimeState:
         self.replay_appends.append(append)
         self.replay_token_count += append.token_count
         self.replay_byte_count += append.byte_count
-        self._ensure_generation_stats()
 
     def clear_replay_journal(self) -> None:
         self.replay_appends.clear()
@@ -536,9 +443,6 @@ class DuplexSessionRuntimeState:
         self.scheduler_context_tokens = max(int(tokens), 0)
         if limit is not None and limit > 0:
             self.scheduler_context_limit = int(limit)
-        stats = self._ensure_generation_stats()
-        stats.context_tokens = self.scheduler_context_tokens
-        stats.context_limit = self.scheduler_context_limit
 
     def touch(self, fence: DuplexFence, activity: DuplexLeaseActivity) -> None:
         self._validate_fence(fence)
@@ -767,19 +671,9 @@ class DuplexSessionRuntimeState:
 
     def prepare_cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
         """Advance the cancellation fence without dropping cleanup records."""
-        if cancelled_fence.session_id != self.session_id or cancelled_fence.incarnation != self.fence.incarnation:
-            raise DuplexFenceMismatchError(self.fence, cancelled_fence)
-        if (
-            next_fence.session_id != self.session_id
-            or next_fence.incarnation != self.fence.incarnation
-            or next_fence.epoch <= cancelled_fence.epoch
-        ):
-            raise DuplexFenceMismatchError(cancelled_fence, next_fence)
+        validate_cancel_fences(self.fence, cancelled_fence, next_fence)
         current_key = (self.fence.epoch, self.fence.turn_id, self.fence.response_seq)
-        cancelled_key = (cancelled_fence.epoch, cancelled_fence.turn_id, cancelled_fence.response_seq)
         next_key = (next_fence.epoch, next_fence.turn_id, next_fence.response_seq)
-        if cancelled_key > current_key:
-            raise DuplexFenceMismatchError(self.fence, cancelled_fence)
         if next_key > current_key:
             self.accept_fence(next_fence)
         return self.resource_request_ids(cancelled_fence)
@@ -857,10 +751,6 @@ class DuplexSessionRuntimeManager:
     def iter_sessions(self) -> tuple[DuplexSessionRuntimeState, ...]:
         """Return a stable snapshot without exposing the mutable session map."""
         return tuple(self._sessions.values())
-
-    def context_ledgers(self) -> tuple[DuplexContextLedgerSnapshot, ...]:
-        """Return read-only context views for diagnostics and bounded metrics."""
-        return tuple(session.context_ledger() for session in self._sessions.values())
 
     def open_session(
         self,

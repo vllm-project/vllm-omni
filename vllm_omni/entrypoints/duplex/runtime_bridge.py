@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
@@ -18,6 +19,7 @@ from vllm.logger import init_logger
 from vllm_omni.engine.duplex.control_client import DuplexControlRequestError
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.runtime import duplex_data_plane_request_info
+from vllm_omni.entrypoints.duplex.open_attempt import RuntimeOpenAttempts
 from vllm_omni.entrypoints.duplex.protocol import (
     DuplexSession,
     DuplexSessionState,
@@ -37,6 +39,8 @@ logger = init_logger(__name__)
 
 class NativeRuntimeBridgeMixin:
     """Bridge serving sessions to native runtime control and data-plane APIs."""
+
+    _runtime_open_attempts: RuntimeOpenAttempts | None = None
 
     _NATIVE_RUNTIME_CONTROL_CONTRACT = {
         "open_duplex_session_async": ("fence",),
@@ -66,22 +70,50 @@ class NativeRuntimeBridgeMixin:
         if not callable(open_session):
             return True
         try:
+            fence = DuplexFence(
+                session.session_id,
+                epoch=session.epoch,
+                turn_id=session.turn_id,
+                incarnation=session.incarnation,
+            )
+            timeout = handler._runtime_control_timeout_s(session)
             open_kwargs = {
                 "session_mode": "duplex",
                 "capabilities": session.capabilities.as_dict(),
                 "session_config": session.config.as_dict(),
-                "timeout": handler._runtime_control_timeout_s(session),
+                "timeout": timeout,
             }
             if handler._callable_accepts_keyword(open_session, "runtime_config"):
                 open_kwargs["runtime_config"] = dict(session.runtime_config)
             if handler._callable_accepts_keyword(open_session, "fence"):
-                open_kwargs["fence"] = DuplexFence(
-                    session.session_id,
-                    epoch=session.epoch,
-                    turn_id=session.turn_id,
-                    incarnation=session.incarnation,
-                )
-            result = await open_session(session.session_id, **open_kwargs)
+                open_kwargs["fence"] = fence
+            close_open = getattr(handler._chat_service.engine_client, "close_duplex_session_async", None)
+
+            async def compensate_open() -> bool:
+                if not callable(close_open):
+                    return False
+                try:
+                    closed = await close_open(fence.session_id, fence=fence, reason="open_abandoned", timeout=timeout)
+                except DuplexControlRequestError as exc:
+                    if exc.code in {"unknown_session", "not_found", "stale_fence"}:
+                        return True
+                    raise
+                return not (isinstance(closed, dict) and handler._runtime_control_failed(closed))
+
+            if self._runtime_open_attempts is None:
+                self._runtime_open_attempts = RuntimeOpenAttempts()
+            result = await self._runtime_open_attempts.execute(
+                fence,
+                lambda: open_session(fence.session_id, **open_kwargs),
+                compensate_open,
+                is_success=lambda result: (
+                    not (
+                        isinstance(result, dict)
+                        and session.capabilities.implementation_level == "model_native_duplex"
+                        and handler._runtime_control_failed(result)
+                    )
+                ),
+            )
         except Exception as exc:
             if isinstance(exc, DuplexControlRequestError) and exc.code == "resource_exhausted":
                 logger.info("Duplex runtime session admission rejected: %s", exc)
@@ -762,7 +794,7 @@ class NativeRuntimeBridgeMixin:
         raw = session.config.extra_body.get("duplex_control_timeout_s") or session.config.extra_body.get(
             "runtime_control_timeout_s"
         )
-        if isinstance(raw, int | float) and raw > 0:
+        if isinstance(raw, int | float) and math.isfinite(raw) and raw > 0:
             return float(raw)
         if session.capabilities.implementation_level == "model_native_duplex":
             return 60.0

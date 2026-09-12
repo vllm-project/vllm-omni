@@ -44,6 +44,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_data_plane_request_info,
     duplex_resource_request_id,
 )
+from vllm_omni.engine.duplex.fence import preemption_covers, validate_cancel_fences, validate_fence
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity, DuplexLeaseConfig
 from vllm_omni.engine.duplex.messages import (
     AppendDuplexInputMessage,
@@ -77,6 +78,10 @@ DuplexCommand = (
     | TouchDuplexSessionMessage
     | ResumeDuplexSessionMessage
 )
+
+
+class DuplexContextOutputError(RuntimeError):
+    """A session's generated context could not be retained for future replay."""
 
 
 class DuplexControlPreemptedError(RuntimeError):
@@ -292,12 +297,32 @@ class DuplexControlPlane:
         preempt_reason = self._preempt_reason(message)
         preempted_tasks: tuple[asyncio.Task[None], ...] = ()
         if preempt_reason is not None:
+            try:
+                can_preempt = self._validate_preemption(message)
+            except (DuplexFenceMismatchError, ValueError) as exc:
+                # Reject before changing the tail or cancelling live work.
+                task = asyncio.create_task(
+                    self.put_result(
+                        message.control_id,
+                        fence=message.fence,
+                        operation=self._message_operation(message),
+                        session_id=session_id,
+                        stage_results=[],
+                        error=exc,
+                    )
+                )
+                self._register_control_task(task, message, count_append=False, update_tail=False)
+                return
             preempted_tasks = tuple(self._session_control_tasks.get(session_id, ()))
             for prior_task in preempted_tasks:
                 if prior_task.done():
                     continue
                 prior_message = self._control_task_messages.get(prior_task)
                 if not isinstance(prior_message, AppendDuplexInputMessage):
+                    continue
+                if not can_preempt or not preemption_covers(
+                    message.fence, prior_message.fence, close=isinstance(message, CloseDuplexSessionMessage)
+                ):
                     continue
                 # A prior cancel may already have interrupted this append and
                 # the task may now be publishing its correlated cancellation
@@ -361,6 +386,36 @@ class DuplexControlPlane:
             name=f"duplex-control-{session_id}-{message.control_id}",
         )
         self._register_control_task(task, message, count_append=is_append, update_tail=True)
+
+    def _validate_preemption(self, message: DuplexCommand) -> bool:
+        """Validate the control identity without advancing or cancelling it."""
+        if message.session_id != message.fence.session_id:
+            raise ValueError("duplex control session_id does not match its fence")
+        if isinstance(message, SignalDuplexTurnMessage) and message.next_fence is None:
+            raise ValueError(f"{message.event} requires next_fence")
+        session = self.sessions.get(message.session_id)
+        current = session.fence if session is not None else None
+        if current is None:
+            # Preserve open -> append -> close arriving in one queue drain.
+            # An arbitrary append is not authority for an unopened session.
+            current = next(
+                (
+                    queued.fence
+                    for task, queued in reversed(tuple(self._control_task_messages.items()))
+                    if not task.done()
+                    and isinstance(queued, OpenDuplexSessionMessage)
+                    and queued.session_id == message.session_id
+                ),
+                None,
+            )
+        if current is None:
+            return False
+        if isinstance(message, CloseDuplexSessionMessage):
+            validate_fence(current, message.fence)
+        elif isinstance(message, SignalDuplexTurnMessage):
+            assert message.next_fence is not None
+            validate_cancel_fences(current, message.fence, message.next_fence)
+        return True
 
     @staticmethod
     def _message_operation(message: object) -> str:
@@ -581,8 +636,6 @@ class DuplexControlPlane:
         self,
         session_id: str,
         scheduler_metrics: Mapping[str, int | float | bool | str],
-        *,
-        reset: bool = False,
     ) -> None:
         raw_tokens = scheduler_metrics.get("omni_context_tokens", scheduler_metrics.get("num_prompt_tokens", 0))
         raw_limit = scheduler_metrics.get("omni_context_limit")
@@ -914,6 +967,7 @@ class DuplexControlPlane:
                 stage_results=[],
                 error=exc,
                 admission=admission,
+                not_accepted=session is None,
             )
         finally:
             self._sync_session_metrics()
@@ -1437,7 +1491,6 @@ class DuplexControlPlane:
 
         session.begin_resource_generation(
             replay_appends if replace_journal else session.replay_appends,
-            reason=recovery_reason,
         )
         session.mark_recovery_required(recovery_reason)
         self._sync_session_metrics()
@@ -1478,7 +1531,7 @@ class DuplexControlPlane:
                 if result.request_id != context.request_id or result.stage_id != 0:
                     raise RuntimeError("duplex recovery returned a mismatched submission result")
                 session.bind_stage_request(0, context.request_id, fence=session.fence)
-                self._record_scheduler_metrics(session.session_id, result.metrics, reset=index == 0)
+                self._record_scheduler_metrics(session.session_id, result.metrics)
         except BaseException as exc:
             session.mark_recovery_required(recovery_reason)
             new_request_ids = tuple(session.resource_request_ids())
@@ -1501,7 +1554,7 @@ class DuplexControlPlane:
             if isinstance(exc, asyncio.CancelledError):
                 raise
             self._metric("inc_duplex_kv_recovery", recovery_reason, "failure", 1)
-            retryable = isinstance(exc, (TimeoutError, ConnectionError)) or any(
+            retryable = isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError)) or any(
                 marker in str(exc).lower()
                 for marker in (
                     "unavailable",
@@ -1706,6 +1759,7 @@ class DuplexControlPlane:
             if message.event in cancel_events:
                 if effective_next_fence is None:
                     raise ValueError(f"{message.event} requires next_fence")
+                validate_cancel_fences(session.fence, message.fence, effective_next_fence)
                 cleanup_key = self._cleanup_key("cancel", message.fence)
                 pending = self._pending_control_cleanups.get(cleanup_key)
                 if pending is None:
@@ -2001,7 +2055,7 @@ class DuplexControlPlane:
             raise TimeoutError(f"duplex submission cleanup deadline expired for session {session_id}")
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise TimeoutError(f"duplex submission cleanup deadline expired for session {session_id}") from exc
 
     async def _run_submission_cleanup(self, pending: _PendingSubmissionCleanup) -> None:
@@ -2146,8 +2200,11 @@ class DuplexControlPlane:
         error: BaseException | str | None = None,
         admission: dict[str, object] | None = None,
         operation_id: str | None = None,
+        not_accepted: bool = False,
     ) -> None:
         control_error = self._control_error(error) if error is not None else None
+        if control_error is not None and not_accepted:
+            control_error.acceptance = "not_accepted"
         if control_error is not None:
             stage_results = [
                 {
@@ -2243,7 +2300,7 @@ class DuplexControlPlane:
         elif isinstance(error, (TypeError, ValueError)):
             code = "invalid_argument"
             retryable = False
-        elif isinstance(error, TimeoutError):
+        elif isinstance(error, (TimeoutError, asyncio.TimeoutError)):
             code = "timeout"
             retryable = True
         else:
@@ -2289,16 +2346,22 @@ class DuplexControlPlane:
             return None
         finalize = getattr(self._extension, "finalize_context_unit", None)
         if stage_id == 0 and context.segment_finished and callable(finalize):
-            updated = finalize(
-                prompts=tuple(item.prompt for item in session.replay_appends),
-                output=output,
-                segment_token_ids=context.segment_token_ids,
-                segment_output_metadata=dict(context.segment_output_metadata),
-            )
-            if updated is not None:
-                if not isinstance(updated, DuplexContextOutput):
-                    raise TypeError("invalid model context output")
-                self._record_context_output(session, updated)
+            try:
+                updated = finalize(
+                    prompts=tuple(item.prompt for item in session.replay_appends),
+                    output=output,
+                    segment_token_ids=context.segment_token_ids,
+                    segment_output_metadata=dict(context.segment_output_metadata),
+                )
+                if updated is not None:
+                    if not isinstance(updated, DuplexContextOutput):
+                        raise TypeError("invalid model context output")
+                    self._record_context_output(session, updated)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                # Input admission cannot predict the size of generated output.
+                # Never continue with incomplete replay, or kill other sessions
+                # because this session exhausted its journal budget.
+                raise DuplexContextOutputError(str(exc)) from exc
         decision = self._extension.decide_output(
             stage_id=stage_id,
             final_stage_id=context.final_stage_id,

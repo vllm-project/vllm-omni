@@ -48,7 +48,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
 )
-from vllm_omni.engine.duplex.control_plane import DuplexControlPlane
+from vllm_omni.engine.duplex.control_plane import DuplexContextOutputError, DuplexControlPlane
 from vllm_omni.engine.duplex.lease import DuplexLeaseConfig
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.session import (
@@ -2217,7 +2217,18 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
-        duplex_output_decision = self._duplex_output_decision(stage_id, output, req_state)
+        try:
+            duplex_output_decision = self._duplex_output_decision(stage_id, output, req_state)
+        except DuplexContextOutputError as exc:
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                str(exc),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                error_type="duplex_context_output_error",
+                close_duplex_sessions=True,
+            )
+            return
         if duplex_output_decision is not None:
             await self._emit_duplex_direct_output(
                 stage_id,

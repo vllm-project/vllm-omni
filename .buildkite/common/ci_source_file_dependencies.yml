@@ -248,6 +248,7 @@ source_file_dependencies:
     - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
     - tests/assets/minicpmo_4_5/
     - tests/clients/
+    - tests/engine/duplex/
     - tests/entrypoints/duplex/
     - tests/model_executor/models/minicpmo_4_5/duplex/
 

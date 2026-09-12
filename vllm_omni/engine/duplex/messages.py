@@ -102,6 +102,7 @@ class DuplexControlError(EngineQueueMessage, kw_only=True):
     code: str
     message: str
     retryable: bool = False
+    acceptance: Literal["not_accepted", "unknown"] = "unknown"
 
 
 class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):

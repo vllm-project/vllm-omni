@@ -39,6 +39,7 @@ class DuplexControlRequestError(RuntimeError):
         self.result = result
         self.code = str(error_data.get("code") or "internal_error")
         self.retryable = bool(error_data.get("retryable", False))
+        self.acceptance = error_data.get("acceptance", "unknown")
         accepted_fence = result.get("accepted_fence")
         self.accepted_fence = accepted_fence if isinstance(accepted_fence, DuplexFence) else None
         lease_generation = result.get("lease_generation")
@@ -88,6 +89,7 @@ class DuplexControlClient:
                     "code": result_message.error.code,
                     "message": result_message.error.message,
                     "retryable": result_message.error.retryable,
+                    "acceptance": result_message.error.acceptance,
                 }
                 if result_message.error is not None
                 else None
