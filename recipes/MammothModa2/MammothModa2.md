@@ -170,6 +170,52 @@ The first request took 85.224 seconds. The AR stage generated 4,161 visual token
 
 The output was a valid 1024 by 1024 RGB PNG.
 
+#### Tensor parallelism for the AR stage
+
+The figures above are one cold request on an MI300X. Measured separately on
+4x H100 80GB (single node, vLLM 0.28.0, torch 2.13.0+cu130, commit `51cf142b`,
+same 1024x1024 / 50-step / guidance-4.0 / seed-42 workload), sharding stage 0
+and leaving stage 1 at TP=1 on device 0:
+
+| | TP=1 | TP=2 | TP=4 |
+| --- | --- | --- | --- |
+| end-to-end P50 (s) | 68.85 | 78.08 | 79.90 |
+| end-to-end P100 (s) | 69.55 | 78.49 | 81.95 |
+| AR stage P50 (s) | 59.42 | 68.70 | 70.55 |
+| DiT plus stage transfer P50 (s) | 9.39 | 9.38 | 9.36 |
+| cold first request (s) | 69.61 | 90.66 | 90.05 |
+| engine startup (s) | 180.0 | 266.8 | 298.2 |
+| peak whole-device memory, device 0 (GiB) | 51.13 | 52.63 | 53.02 |
+| GPU-seconds per image | 68.9 | 156.2 | 319.6 |
+| available KV cache (GiB) | 16.73 | 27.89 | 33.38 |
+| KV cache size (tokens) | 156,656 | 522,144 | 1,249,952 |
+| max concurrency at 8,192 tokens per request | 19.12x | 63.74x | 152.58x |
+
+Warmup 1, measured 8, P50 and P100 over the warm population only; the cold
+request is listed separately rather than folded in. Generated tokens (4,160),
+stage-output rows (4,194) and inference steps (50) were identical across all
+three columns. The DiT row moves by 0.3% because stage 1 is unchanged between
+columns, which isolates the rest of the difference to AR sharding.
+
+**Tensor parallelism costs latency here and buys capacity.** The AR stage
+decodes 4,160 tokens one at a time under the shipped `max_num_seqs: 1`, so it is
+latency-bound and the per-layer all-reduce costs more than splitting the compute
+saves: 0.88x at TP=2, 0.86x at TP=4, with GPU-seconds per image rising 4.6x. The
+communication cost is paid on entering TP, not on scaling it — TP=1 to TP=2
+loses 13%, TP=2 to TP=4 another 2%. What TP does deliver is room: sharding the
+21.4 GiB of AR weights frees enough of the 0.5 budget to grow the KV cache 8x
+in tokens, which is what a concurrent deployment needs.
+
+So prefer TP=1 for single-request latency, and raise the degree to fit
+concurrency or a larger model rather than to make one image faster. Throughput
+under concurrency is not measured here: `max_num_seqs: 1` makes it degenerate,
+and a real figure needs continuous batching.
+
+Note for 80 GiB cards: the 106.57 GiB sample above is an MI300X figure, and most
+of it is KV cache that `gpu_memory_utilization: 0.5` reserves in proportion to
+the device. The same configuration peaks at 51.13 GiB on an H100 80GB and needs
+no change to run.
+
 ## MammothModa2-Dev unified inference
 
 MammothModa2-Dev uses a Qwen3-VL AR backbone, while MammothModa2-Preview uses
