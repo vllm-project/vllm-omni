@@ -172,6 +172,67 @@ steps:
               pytest -s -v tests/engine/test_async_omni_engine_abort.py
       '
 
+- label: "ROCm · Entrypoints GPU Coverage (R2-02)"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  timeout_in_minutes: 30
+  env:
+    VLLM_WORKER_MULTIPROC_METHOD: spawn
+  artifact_paths:
+    - "artifacts/rocm-r2-02/**/*"
+  commands:
+    - mkdir -p artifacts/rocm-r2-02
+    - ps -eo pid=,ppid=,lstart=,stat=,comm= > artifacts/rocm-r2-02/processes-before.txt
+    - >-
+      pytest --collect-only -q
+      tests/entrypoints/
+      -m 'core_model and cuda and not
+      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+      --run-level "core_model"
+      2>&1 | tee artifacts/rocm-r2-02/collected-nodeids.txt
+    - >-
+      timeout --signal=TERM --kill-after=1m 25m
+      pytest -sv -ra
+      tests/entrypoints/
+      -m 'core_model and cuda and not
+      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+      --run-level "core_model"
+      --durations=0
+      --junitxml=artifacts/rocm-r2-02/pytest.xml
+      2>&1 | tee artifacts/rocm-r2-02/pytest.log
+    - tail -n 100 artifacts/rocm-r2-02/pytest.log > artifacts/rocm-r2-02/pytest-summary.txt
+    - |
+      sleep 5
+      ps -eo pid=,ppid=,lstart=,stat=,comm= > artifacts/rocm-r2-02/processes-after.txt
+      # Compare PID plus process start time so PID reuse cannot hide a leak.
+      # Double dollars preserve awk field references through Buildkite interpolation.
+      awk '
+        NR == FNR {
+          if ($$9 != "ps") {
+            baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+          }
+          next
+        }
+        $$9 != "ps" {
+          identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+          if (!(identity in baseline)) {
+            print
+            leaked = 1
+          }
+        }
+        END {
+          if (leaked) {
+            print "status=FAIL leaked_processes_detected=1"
+            exit 1
+          }
+          print "status=PASS leaked_processes=0"
+        }
+      ' artifacts/rocm-r2-02/processes-before.txt \
+        artifacts/rocm-r2-02/processes-after.txt \
+        2>&1 | tee artifacts/rocm-r2-02/process-cleanup.txt
+
 # - label: "Omni Model Test Qwen3-Omni"
 #   agent_pool: mi300_2
 #   depends_on: amd-build
