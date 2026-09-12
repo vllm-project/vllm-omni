@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -45,6 +45,12 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.qwen_select01_modulation import (
+    can_use_qwen_select01_triton,
+    fused_layernorm_select01,
+    fused_residual_layernorm_select01,
+    select01_modulation_native,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
@@ -807,41 +813,11 @@ class QwenImageTransformerBlock(nn.Module):
 
         self.zero_cond_t = zero_cond_t
 
-    def _modulate(self, mod_params, index=None):
+    def _modulate(self, mod_params):
         """Apply modulation to input tensor"""
         # shift: b d, scale: b d, gate: b d
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-
-        if index is not None:
-            # Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
-            # So shift, scale, gate have shape [2*actual_batch, d]
-            actual_batch = shift.size(0) // 2
-            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]  # each: [actual_batch, d]
-            scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
-            gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
-
-            # index: [b, l] where b is actual batch size
-            # Expand to [b, l, 1] to match feature dimension
-            index_expanded = index.unsqueeze(-1)  # [b, l, 1]
-
-            # Expand chunks to [b, 1, d] then broadcast to [b, l, d]
-            shift_0_exp = shift_0.unsqueeze(1)  # [b, 1, d]
-            shift_1_exp = shift_1.unsqueeze(1)  # [b, 1, d]
-            scale_0_exp = scale_0.unsqueeze(1)
-            scale_1_exp = scale_1.unsqueeze(1)
-            gate_0_exp = gate_0.unsqueeze(1)
-            gate_1_exp = gate_1.unsqueeze(1)
-
-            # Use torch.where to select based on index
-            shift_result = torch.where(index_expanded == 0, shift_0_exp, shift_1_exp)
-            scale_result = torch.where(index_expanded == 0, scale_0_exp, scale_1_exp)
-            gate_result = torch.where(index_expanded == 0, gate_0_exp, gate_1_exp)
-        else:
-            shift_result = shift.unsqueeze(1)
-            scale_result = scale.unsqueeze(1)
-            gate_result = gate.unsqueeze(1)
-
-        return scale_result, shift_result, gate_result
+        return scale.unsqueeze(1), shift.unsqueeze(1), gate.unsqueeze(1)
 
     def forward(
         self,
@@ -867,8 +843,22 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
-        img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        use_fused_select01 = modulate_index is not None and can_use_qwen_select01_triton(hidden_states)
+        if use_fused_select01:
+            img_modulated, img_gate1 = fused_layernorm_select01(
+                hidden_states,
+                img_mod1,
+                modulate_index,
+                self.img_norm1.eps,
+                self.img_norm1.layernorm.weight,
+                self.img_norm1.layernorm.bias,
+            )
+        elif modulate_index is not None:
+            img_scale1, img_shift1, img_gate1 = select01_modulation_native(img_mod1, modulate_index)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        else:
+            img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
         txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
@@ -893,12 +883,29 @@ class QwenImageTransformerBlock(nn.Module):
         img_attn_output, txt_attn_output = attn_output
 
         # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
+        hidden_states_before_attn = hidden_states
+        if not use_fused_select01:
+            hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
-        img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        if use_fused_select01:
+            img_modulated2, hidden_states, img_gate2 = fused_residual_layernorm_select01(
+                img_attn_output,
+                hidden_states_before_attn,
+                img_gate1,
+                img_mod2,
+                modulate_index,
+                self.img_norm2.eps,
+                self.img_norm2.layernorm.weight,
+                self.img_norm2.layernorm.bias,
+            )
+        elif modulate_index is not None:
+            img_scale2, img_shift2, img_gate2 = select01_modulation_native(img_mod2, modulate_index)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        else:
+            img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
 
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
