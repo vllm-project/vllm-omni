@@ -45,6 +45,28 @@ def test_isolated_import_ignores_conflicting_gpu_visibility(monkeypatch: pytest.
     _assert_isolated_import_succeeds("import vllm_omni.outputs")
 
 
+def test_shared_realtime_codec_does_not_import_duplex_runtime_or_api_server() -> None:
+    _assert_isolated_import_succeeds("""
+import sys
+
+# The root package already imports the lazy model registry via OmniModelConfig.
+# Check dependencies added by the shared codec, not existing package setup.
+import vllm_omni
+
+before = set(sys.modules)
+import vllm_omni.entrypoints.realtime.runner
+
+forbidden = (
+    "vllm_omni.entrypoints.duplex",
+    "vllm_omni.entrypoints.openai",
+    "vllm_omni.engine.duplex",
+    "vllm_omni.model_executor.models",
+)
+loaded = sorted(name for name in sys.modules.keys() - before if name.startswith(forbidden))
+assert not loaded, loaded
+""")
+
+
 def test_stable_engine_imports_load_duplex_kernel_eagerly() -> None:
     # The duplex kernel is imported eagerly by the stable engine modules.
     # Model-specific duplex adapters must still load only via the

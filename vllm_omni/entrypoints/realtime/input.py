@@ -4,26 +4,29 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import binascii
 from collections.abc import Callable
 from uuid import uuid4
 
 import numpy as np
+import pybase64 as base64
 
-from vllm_omni.entrypoints.duplex.audio import (
+from vllm_omni.entrypoints.realtime.audio import (
     convert_input_audio_with_rate,
     encode_float32_mono_wav_base64,
     validate_input_sample_rate_hz,
 )
-from vllm_omni.entrypoints.duplex.protocol import normalize_native_duplex_key
-from vllm_omni.entrypoints.duplex.realtime_state import (
+from vllm_omni.entrypoints.realtime.config import (
+    ServerVADConfig,
+    normalize_native_duplex_key,
+    parse_session_turn_detection,
+)
+from vllm_omni.entrypoints.realtime.state import (
     REALTIME_INPUT_AUDIO_FORMATS,
     REALTIME_OUTPUT_AUDIO_FORMATS,
     RealtimeStateOwner,
     realtime_default_sample_rate_hz,
 )
-from vllm_omni.entrypoints.duplex.server_vad import ServerVADConfig, parse_session_turn_detection
 
 
 class RealtimeInputTranslator(RealtimeStateOwner):

@@ -17,10 +17,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.messages import DuplexFence
-from vllm_omni.entrypoints.duplex.audio import (
-    convert_input_audio_with_rate,
-    validate_input_sample_rate_hz,
-)
 from vllm_omni.entrypoints.duplex.commit_policy import (
     CommitAction,
     CommitSnapshot,
@@ -32,9 +28,6 @@ from vllm_omni.entrypoints.duplex.protocol import (
     DuplexSession,
     DuplexSessionState,
     DuplexTurnEventType,
-)
-from vllm_omni.entrypoints.duplex.realtime_session import (
-    NativeRealtimeSessionProtocol,
 )
 from vllm_omni.entrypoints.duplex.runtime_adapter import (
     PcmAppendReservation,
@@ -50,6 +43,13 @@ from vllm_omni.entrypoints.duplex.websocket import (
     DuplexWebSocketActor,
     is_input_event,
     normalize_duplex_input_event,
+)
+from vllm_omni.entrypoints.realtime.audio import (
+    convert_input_audio_with_rate,
+    validate_input_sample_rate_hz,
+)
+from vllm_omni.entrypoints.realtime.session import (
+    RealtimeSessionProtocol as NativeRealtimeSessionProtocol,
 )
 
 logger = init_logger(__name__)
