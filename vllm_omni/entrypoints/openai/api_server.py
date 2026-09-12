@@ -1605,7 +1605,9 @@ def _build_image_generation_response(
     output_format = _choose_output_format(request.output_format or "png", None)
     image_data = [
         ImageData(
-            b64_json=encode_image_base64_with_compression(image, format=output_format),
+            b64_json=encode_image_base64_with_compression(
+                image, format=output_format, output_compression=request.output_compression
+            ),
             revised_prompt=None,
         )
         for image in images

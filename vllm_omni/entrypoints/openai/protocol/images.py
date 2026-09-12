@@ -175,6 +175,17 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
+    output_compression: int = Field(
+        default=100,
+        ge=0,
+        le=100,
+        description=(
+            "Compression level 0-100. For 'jpeg'/'webp' this is the encoder "
+            "quality. For 'png' 100 keeps the fastest, least-compressed "
+            "encode and lower values trade encode time for smaller payloads "
+            "(100 -> compress_level 0, 1 -> compress_level 9)."
+        ),
+    )
     return_stage_metrics: bool | None = Field(
         default=None,
         description="Return stage metrics for benchmark clients.",
