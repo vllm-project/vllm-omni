@@ -26,6 +26,12 @@ from .omni_duplex_eval_metrics import (
     temporal_window,
 )
 
+# Safe default frame budget for the judge's content pass. 16 matches the
+# original Qwen2.5-VL image-token calibration; it stays the default so existing
+# callers are byte-for-byte unaffected, while Qwen3-Omni callers can pass a
+# different ``content_frame_limit`` (design §5.6b).
+CONTENT_FRAME_LIMIT = 16
+
 
 def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -50,6 +56,7 @@ def evaluate_sample(
     judge_video_mode: str = "video_url",
     window_size: float = 10.0,
     allow_invalid_clock: bool = False,
+    content_frame_limit: int = CONTENT_FRAME_LIMIT,
 ) -> dict[str, Any]:
     raw = _read(response_path)
     meta = (
@@ -105,7 +112,7 @@ def evaluate_sample(
             )
         content_frames = None
         if judge_video_mode == "frame-sample":
-            content_frames = _extract_frames(video_path, _content_frame_times(duration))
+            content_frames = _extract_frames(video_path, _content_frame_times(duration, max_frames=content_frame_limit))
         content = parse_judge_json(
             judge.content(
                 build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2]),
@@ -175,8 +182,14 @@ def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
     return frames
 
 
-def _content_frame_times(duration: float) -> list[float]:
-    """Sample the full video at approximately one frame every three seconds."""
+def _content_frame_times(duration: float, *, max_frames: int = CONTENT_FRAME_LIMIT) -> list[float]:
+    """Sample the full video at approximately one frame every three seconds.
+
+    ``max_frames`` bounds the frame count to a judge-specific image-token
+    budget. The default mirrors the original Qwen2.5-VL calibration, so
+    ``max_frames=CONTENT_FRAME_LIMIT`` reproduces the previous sequence
+    element-for-element (design §5.6b / test T7).
+    """
     if duration <= 0:
         return []
     times = []
@@ -184,11 +197,10 @@ def _content_frame_times(duration: float) -> list[float]:
     while timestamp < duration:
         times.append(min(timestamp, max(0.0, duration - 0.01)))
         timestamp += 3.0
-    # Qwen2.5-VL has a finite per-request image-token budget. Preserve
-    # coverage while bounding long clips to a safely portable frame count.
-    if len(times) > 16:
-        stride = (len(times) - 1) / 15
-        times = [times[round(i * stride)] for i in range(16)]
+    # Preserve coverage while bounding long clips to the caller's budget.
+    if max_frames > 1 and len(times) > max_frames:
+        stride = (len(times) - 1) / (max_frames - 1)
+        times = [times[round(i * stride)] for i in range(max_frames)]
     return times
 
 

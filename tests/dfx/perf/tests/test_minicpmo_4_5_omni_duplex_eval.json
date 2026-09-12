@@ -1,0 +1,148 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_omni_duplex_eval",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100",
+            "npu": "A3"
+          },
+          "num_cards": 2
+        }
+      },
+      "local_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "judge_server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/qwen3_omni_moe_thinking.yaml",
+        "--trust-remote-code"
+      ],
+      "required": true
+    },
+    "benchmark_params": [
+      {
+        "name": "rtd_ocr",
+        "dataset_name": "omni-duplex-eval",
+        "dataset_path": "${BENCHMARK_ASSETS}/omni-duplex-eval/mirror-v1",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          6
+        ],
+        "max_concurrency": [
+          2
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "duplex_eval_split": "RTD_OCR",
+        "duplex_eval_limit": 8,
+        "duplex_eval_exclude_ids": [
+          "517",
+          "565"
+        ],
+        "duplex_eval_media_root": "${BENCHMARK_ASSETS}/omni-duplex-eval/mirror-v1/media",
+        "duplex_eval_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
+        "duplex_eval_output_dir": "tests/dfx/perf/results/omni-duplex-eval/responses/RTD_OCR",
+        "duplex_eval_score_dir": "tests/dfx/perf/results/omni-duplex-eval/scores/RTD_OCR",
+        "percentile-metrics": "e2el",
+        "duplex_eval_judge_video_mode": "frame-sample",
+        "duplex_eval_judge_fps": 2,
+        "duplex_eval_judge_modalities": [
+          "text"
+        ],
+        "duplex_eval_content_frame_limit": 24,
+        "duplex_eval_eval_workers": 2,
+        "duplex_eval_judge_model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "duplex_eval_exclude_ids_pending": [
+          "583 (RTD_OCR row_idx 23; judge-stage failure; split verified via HF datasets-server)",
+          "584 (RTD_OCR row_idx 24; judge-stage failure; split verified via HF datasets-server)",
+          "585 (RTD_OCR row_idx 25; judge-stage failure; split verified via HF datasets-server)",
+          "590 (RTD_OCR row_idx 30; judge-stage failure; split verified via HF datasets-server)",
+          "393 (RTD_world_knowledge row_idx 33; judge-stage failure; split NOT selected in this case -> no-op, kept as placeholder only)"
+        ]
+      },
+      {
+        "name": "rtd_omni",
+        "dataset_name": "omni-duplex-eval",
+        "dataset_path": "${BENCHMARK_ASSETS}/omni-duplex-eval/mirror-v1",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          6
+        ],
+        "max_concurrency": [
+          2
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "duplex_eval_split": "RTD_Omni",
+        "duplex_eval_limit": 8,
+        "duplex_eval_exclude_ids": [
+          "517",
+          "565"
+        ],
+        "duplex_eval_media_root": "${BENCHMARK_ASSETS}/omni-duplex-eval/mirror-v1/media",
+        "duplex_eval_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
+        "duplex_eval_output_dir": "tests/dfx/perf/results/omni-duplex-eval/responses/RTD_Omni",
+        "duplex_eval_score_dir": "tests/dfx/perf/results/omni-duplex-eval/scores/RTD_Omni",
+        "percentile-metrics": "e2el",
+        "duplex_eval_judge_video_mode": "frame-sample",
+        "duplex_eval_judge_fps": 2,
+        "duplex_eval_judge_modalities": [
+          "text"
+        ],
+        "duplex_eval_content_frame_limit": 24,
+        "duplex_eval_eval_workers": 2,
+        "duplex_eval_judge_model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "duplex_eval_exclude_ids_pending": []
+      },
+      {
+        "name": "rtd_interaction_relation",
+        "dataset_name": "omni-duplex-eval",
+        "dataset_path": "${BENCHMARK_ASSETS}/omni-duplex-eval/mirror-v1",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          6
+        ],
+        "max_concurrency": [
+          2
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "duplex_eval_split": "RTD_interaction_relation",
+        "duplex_eval_limit": 8,
+        "duplex_eval_exclude_ids": [
+          "517",
+          "565"
+        ],
+        "duplex_eval_media_root": "${BENCHMARK_ASSETS}/omni-duplex-eval/mirror-v1/media",
+        "duplex_eval_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
+        "duplex_eval_output_dir": "tests/dfx/perf/results/omni-duplex-eval/responses/RTD_interaction_relation",
+        "duplex_eval_score_dir": "tests/dfx/perf/results/omni-duplex-eval/scores/RTD_interaction_relation",
+        "percentile-metrics": "e2el",
+        "duplex_eval_judge_video_mode": "frame-sample",
+        "duplex_eval_judge_fps": 2,
+        "duplex_eval_judge_modalities": [
+          "text"
+        ],
+        "duplex_eval_content_frame_limit": 24,
+        "duplex_eval_eval_workers": 2,
+        "duplex_eval_judge_model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "duplex_eval_exclude_ids_pending": []
+      }
+    ]
+  }
+]

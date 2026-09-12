@@ -3,9 +3,18 @@
 
 """Dataset and split normalization for Omni-DuplexEval.
 
-The loader accepts a Hugging Face dataset id, a JSON/JSONL manifest, or an
+The loader accepts a Hugging Face dataset id, a local Hugging Face dataset
+layout (a directory or a ``.parquet`` file), a JSON/JSONL manifest, or an
 already materialized iterable.  Media is deliberately resolved at use time so
 the benchmark remains usable in air-gapped environments.
+
+Local directory mirrors are expected to follow a Hugging Face dataset layout
+with one ``data/<config>`` subfolder per split (config names are the RTD_*/PR_*
+split names), so each split's identity survives ``datasets.load_dataset``.
+Pointing the loader at a bare ``data/`` directory that Hugging Face collapses
+into a single ``train`` split only works when every row already carries its own
+``split``/``subset``/``config`` or ``family``/``task_type`` identity; otherwise
+the loader raises a clear error that explains the required layout.
 """
 
 from __future__ import annotations
@@ -68,6 +77,22 @@ def family_for_split(split: str, task_type: str | None = None) -> str:
     raise ValueError(f"cannot infer benchmark family from split {split!r}")
 
 
+def _identity_error(split: str, sample_id: str, *, family: bool) -> str:
+    """Build an actionable error for a row whose family/task cannot be derived."""
+    subject = "family" if family else "proactive-reminder task type"
+    label = f" for sample {sample_id!r}" if sample_id else ""
+    detail = (
+        "the split is not an RTD_*/PR_* name and no per-row 'task_type' is present"
+        if family
+        else "no per-row 'task_type' is present"
+    )
+    return (
+        f"cannot infer the Omni-DuplexEval {subject}{label} from split {split!r}: {detail}. "
+        "Load a local Omni-DuplexEval mirror laid out with one Hugging Face config per "
+        "split (RTD_*/PR_*), or add per-row 'family'/'task_type'/'split' columns."
+    )
+
+
 def _value(row: dict[str, Any], *keys: str, default: Any = None) -> Any:
     for key in keys:
         if key in row and row[key] is not None:
@@ -102,12 +127,25 @@ class DuplexSample:
     @classmethod
     def from_row(cls, row: dict[str, Any], *, split: str | None = None, media_root: Path | None = None) -> DuplexSample:
         chosen_split = str(split or _value(row, "split", "subset", "config", default=""))
+        sample_id = str(_value(row, "id", "sample_id", "uid", "name", default=""))
         task_value = _value(row, "task_type", "task", "type")
-        family = str(_value(row, "family", default="") or family_for_split(chosen_split, task_value))
+        family_value = _value(row, "family", default="")
+        if family_value:
+            family = str(family_value)
+        else:
+            try:
+                family = family_for_split(chosen_split, task_value)
+            except ValueError as exc:
+                raise ValueError(_identity_error(chosen_split, sample_id, family=True)) from exc
         task = None
         if family == "pr":
-            task = canonical_task_type(str(task_value)) if task_value else task_type_for_split(chosen_split)
-        sample_id = str(_value(row, "id", "sample_id", "uid", "name", default=""))
+            if task_value:
+                task = canonical_task_type(str(task_value))
+            else:
+                try:
+                    task = task_type_for_split(chosen_split)
+                except ValueError as exc:
+                    raise ValueError(_identity_error(chosen_split, sample_id, family=False)) from exc
         video = _value(row, "video", "video_path", "video_file")
         audio = _value(row, "question_audio", "audio", "question_wav")
         if media_root:
@@ -148,6 +186,45 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
     return payload
 
 
+def _rows_from_hf(dataset: str, *, split: str | None) -> list[dict[str, Any]]:
+    """Load rows from a Hugging Face dataset id or a local dataset layout.
+
+    ``datasets.load_dataset`` accepts a remote id, a local dataset directory
+    (``dataset_info.json`` + ``data/*.parquet``) and, via the ``parquet``
+    builder, a single ``.parquet`` file, which keeps the benchmark usable
+    offline with a locally mirrored copy of the dataset.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "datasets is required to load a Hugging Face dataset id or a local "
+            "dataset directory/parquet file; use a local JSON/JSONL manifest instead"
+        ) from exc
+    load_kwargs: dict[str, Any] = {}
+    if split and split != "all":
+        load_kwargs["split"] = split
+    if Path(dataset).suffix.lower() == ".parquet":
+        loaded = load_dataset("parquet", data_files=dataset, **load_kwargs)
+    else:
+        loaded = load_dataset(dataset, **load_kwargs)
+    if isinstance(loaded, dict):
+        rows = []
+        for name, table in loaded.items():
+            for row in table:
+                item = dict(row)
+                # Hugging Face collapses a config-less local directory (bare
+                # ``data/`` mirror) into a single generic split (``train``).
+                # Keep a row's own split identity (split/subset/config) so
+                # family inference is not poisoned by that generic name; only
+                # stamp the split when the row does not identify itself.
+                if not any(item.get(key) for key in ("split", "subset", "config")):
+                    item["split"] = name
+                rows.append(item)
+        return rows
+    return [dict(row) for row in loaded]
+
+
 def load_samples(
     dataset: str | Path | Iterable[dict[str, Any]] = DEFAULT_DATASET,
     *,
@@ -157,25 +234,29 @@ def load_samples(
     limit: int | None = None,
     ids: Iterable[str] | None = None,
 ) -> list[DuplexSample]:
-    if isinstance(dataset, (str, Path)) and Path(str(dataset)).exists():
-        rows = _read_manifest(Path(str(dataset)))
-    elif not isinstance(dataset, (str, Path)):
-        rows = list(dataset)
-    else:
-        try:
-            from datasets import load_dataset
-        except ImportError as exc:
-            raise RuntimeError("datasets is required for Hugging Face loading; use a local manifest instead") from exc
-        kwargs: dict[str, Any] = {}
-        if split and split != "all":
-            kwargs["split"] = split
-        loaded = load_dataset(str(dataset), **kwargs)
-        if isinstance(loaded, dict):
-            rows = []
-            for name, table in loaded.items():
-                rows.extend({**dict(row), "split": name} for row in table)
+    if isinstance(dataset, str | Path):
+        path = Path(str(dataset))
+        if path.exists():
+            # A directory or a ``.parquet`` file is a Hugging Face dataset
+            # layout (e.g. a locally mirrored Omni-DuplexEval snapshot); only
+            # single JSON/JSONL files are parsed as manifests.  Routing by path
+            # shape instead of mere existence lets local Hugging Face datasets
+            # load through ``datasets.load_dataset``.
+            if path.is_dir() or path.suffix.lower() == ".parquet":
+                rows = _rows_from_hf(str(path), split=split)
+            else:
+                try:
+                    rows = _read_manifest(path)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError(
+                        f"cannot load dataset from {str(path)!r}: expected a "
+                        "JSON/JSONL manifest file, a local Hugging Face dataset "
+                        "directory, or a single .parquet file"
+                    ) from exc
         else:
-            rows = [dict(row) for row in loaded]
+            rows = _rows_from_hf(str(dataset), split=split)
+    else:
+        rows = list(dataset)
     wanted = set(str(item) for item in ids) if ids else None
     root = Path(media_root).expanduser() if media_root else None
     result = []
