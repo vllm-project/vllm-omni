@@ -7,6 +7,10 @@ from typing import Any, Generic, Literal, TypeVar
 
 import torch
 
+from vllm_omni.diffusion.attention.capabilities import (
+    ExecutionContext,
+    ExecutionPathResult,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -132,6 +136,15 @@ class AttentionBackend(ABC):
 
         return False
 
+    @classmethod
+    def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
+        """Return conservative pre-construction capabilities.
+
+        Unmigrated backends remain advisory so introducing the contract cannot
+        reject an execution path that works today.
+        """
+        return ExecutionPathResult.unmigrated(cls.get_name(), context)
+
 
 @dataclass(frozen=True, slots=True)
 class QueryRange:
@@ -217,6 +230,9 @@ class AttentionMetadata:
     #     the packed cu_seqlens tensors.
     #   "valid_kv_length": int — contiguous valid K/V prefix length for a
     #     backend that advertises supports_prefix_kv_slicing.
+    #   "attention_mask_mode": "none" | "padding" | "arbitrary" — producer
+    #     assertion used by capability planning. "none" means a present mask
+    #     is semantically a no-op; absent means its contents are runtime-dependent.
     #   "npu_attn_varlen": bool — model opt-in for the NPU packed varlen path
     #     (TND npu_fusion_attention driven by cu_seqlens, mask never read).
     #     Requires the [real, pad] two-document packing contract; see
@@ -275,6 +291,21 @@ class AttentionImpl(ABC, Generic[T]):
         if kv_cache_dtype is None:
             return True
         return kv_cache_dtype in cls._supported_kv_cache_dtypes.get(platform_key, set())
+
+    def resolve_execution_path(
+        self,
+        context: ExecutionContext,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None,
+    ) -> ExecutionPathResult:
+        """Resolve the complete path after backend initialization.
+
+        Subclasses report verified results; this inspection API does not enforce them.
+        """
+        del query, key, value, attn_metadata
+        return ExecutionPathResult.unmigrated(type(self).__name__, context)
 
     def forward(
         self,

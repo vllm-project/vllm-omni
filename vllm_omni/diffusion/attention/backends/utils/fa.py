@@ -59,6 +59,8 @@ def is_flash_attn_4_available() -> bool:
 # Bind via aliases so mypy does not treat each candidate import as a redefinition.
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
+IS_FLASH_ATTN_4 = False
+IS_AITER = False
 
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
@@ -71,6 +73,7 @@ if current_omni_platform.is_rocm():
 
             flash_attn_func = _fa_func
             flash_attn_varlen_func = _fa_varlen
+            IS_AITER = True
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_xpu():
@@ -102,6 +105,7 @@ else:
 
                 flash_attn_func = _fa_func
                 flash_attn_varlen_func = _fa_varlen
+                IS_FLASH_ATTN_4 = True
                 logger.info("Using CuTe FlashAttention-4 on Blackwell")
             except Exception as exc:
                 # Optional FA4 dependencies may be present but ABI-incompatible
@@ -164,6 +168,27 @@ else:
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+
+
+def validate_fa4_head_dims(head_dim: int, head_dim_v: int, alignment: int) -> bool:
+    """Use the selected FA4 implementation's constraints during path resolution.
+
+    Return False when its validator is unavailable; propagate kernel validation
+    errors for the backend to report. Keep the private FA4 API dependency here,
+    rather than duplicating architecture/version-specific dimension rules.
+    This is a planning-time call, never part of compiled tensor execution.
+    """
+    try:
+        from flash_attn.cute.interface import _get_device_arch, _validate_head_dims
+    except ImportError:
+        return False
+
+    arch = _get_device_arch() // 10
+    # FA4 routes SM80/SM120 through separate kernels and bypasses this validator.
+    if arch not in (9, 10, 11):
+        return False
+    _validate_head_dims(head_dim, head_dim_v, arch, alignment)
+    return True
 
 
 def _choose_vllm_flash_attn_version(
