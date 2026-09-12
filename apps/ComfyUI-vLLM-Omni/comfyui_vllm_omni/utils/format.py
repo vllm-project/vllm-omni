@@ -129,7 +129,33 @@ def image_tensor_to_base64(tensor: torch.Tensor, filename: str = "image.png") ->
     return f"data:{mime_type};base64,{base64_str}"
 
 
-def video_to_bytes(video: VideoInput, filename: str = "video.mp4", *, format: str | None = None) -> BytesIO:
+def mask_tensor_to_png_bytes(mask: torch.Tensor, filename: str = "mask.png") -> BytesIO:
+    """Encode one ComfyUI MASK frame as a thresholded grayscale PNG."""
+    if mask.ndim == 3:
+        if mask.shape[0] != 1:
+            raise ValueError("Static mask accepts one frame; use mask_video for temporal masks.")
+        mask = mask[0]
+    elif mask.ndim != 2:
+        raise ValueError(f"Expected MASK shape (H, W) or (1, H, W), got {tuple(mask.shape)}.")
+    if not torch.isfinite(mask).all():
+        raise ValueError("Mask values must all be finite.")
+
+    mask_array = ((mask.detach().cpu() > 0.5).numpy().astype(np.uint8)) * 255
+    output_buffer = BytesIO()
+    output_buffer.name = filename
+    Image.fromarray(mask_array).save(output_buffer, format="PNG")
+    output_buffer.seek(0)
+    return output_buffer
+
+
+def video_to_bytes(
+    video: VideoInput,
+    filename: str = "video.mp4",
+    *,
+    format: str | None = None,
+    codec: str | None = None,
+    crf: float | None = None,
+) -> BytesIO:
     """Write ``video`` into a named buffer.
 
     Without ``format``, ComfyUI keeps a loaded file's own container (MKV/WebM
@@ -137,10 +163,14 @@ def video_to_bytes(video: VideoInput, filename: str = "video.mp4", *, format: st
     """
     output_buffer = BytesIO()
     output_buffer.name = filename
-    if format is None:
-        video.save_to(output_buffer)
-    else:
-        video.save_to(output_buffer, format=format)
+    save_options = {}
+    if format is not None:
+        save_options["format"] = format
+    if codec is not None:
+        save_options["codec"] = codec
+    if crf is not None:
+        save_options["crf"] = crf
+    video.save_to(output_buffer, **save_options)
     output_buffer.seek(0)
     return output_buffer
 
