@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Hook-based TeaCache implementation for vLLM-Omni.
@@ -122,7 +122,15 @@ class TeaCacheHook(ModelHook):
         #   - cfg_rank 0: positive branch
         #   - cfg_rank > 0: negative branch
         # Without CFG-parallel, branches alternate within a single rank
-        if getattr(module, "do_true_cfg", False):
+        cache_branch_hint = getattr(module, "cache_branch_hint", None)
+        if cache_branch_hint is not None:
+            # Model explicitly identifies which guidance branch this forward
+            # call belongs to (e.g. Boogu-Image's cond+ref / neg+ref /
+            # neg+no-ref triple for double guidance). Required whenever more
+            # than two differently-shaped branches are issued per step, since
+            # the 2-way alternation below cannot tell them apart.
+            cache_branch = cache_branch_hint
+        elif getattr(module, "do_true_cfg", False):
             cfg_parallel_size = get_classifier_free_guidance_world_size()
             if cfg_parallel_size > 1:
                 cfg_rank = get_classifier_free_guidance_rank()

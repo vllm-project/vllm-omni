@@ -332,7 +332,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
         if parallel_config.use_hsdp:
             raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
-        if self.od_config.cache_backend not in (None, "", "none"):
+        if self.od_config.cache_backend not in (None, "", "none", "tea_cache"):
             raise NotImplementedError(
                 f"Cache backend '{self.od_config.cache_backend}' is not supported by BooguImagePipeline."
             )
@@ -576,15 +576,31 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         return height, width, ori_height, ori_width
 
     def predict(
-        self, t, latents, instruction_embeds, freqs_real, instruction_attention_mask, ref_image_hidden_states=None
+        self,
+        t,
+        latents,
+        instruction_embeds,
+        freqs_real,
+        instruction_attention_mask,
+        ref_image_hidden_states=None,
+        cache_branch=None,
     ):
         """One transformer velocity prediction (upstream ``predict``).
 
         ``ref_image_hidden_states`` is ``None`` for text-to-image, or the
         per-sample reference latents (``list[list[Tensor[C, H, W]]]``) for the
         image-editing path.
+
+        ``cache_branch`` tells TeaCacheHook which guidance branch this call
+        belongs to. Presence/absence of the reference latents changes the
+        joint token length, so branches that differ only by that (e.g. the
+        neg+ref vs. neg+no-ref pair in double guidance) must carry distinct
+        identities -- otherwise the hook's default positive/negative
+        alternation would reuse a residual cached for a differently-shaped
+        call.
         """
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
+        self.transformer.cache_branch_hint = cache_branch
         return self.transformer(
             latents,
             timestep,
@@ -950,6 +966,9 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         # Negative instruction embeddings are needed whenever text guidance is
         # active (t2i text CFG, ti2i text-only, and ti2i double guidance).
         do_classifier_free_guidance = text_guidance_scale > 1.0
+        # Lets TeaCache alternate cache state across the sequential CFG
+        # branches issued as separate `predict()` calls below.
+        self.transformer.do_true_cfg = do_classifier_free_guidance or image_guidance_scale > 1.0
 
         batch_size = len(prompt)
 
@@ -1060,10 +1079,14 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                     freqs_real=freqs_real,
                     instruction_attention_mask=instruction_attention_mask,
                     ref_image_hidden_states=ref_latents,
+                    cache_branch="positive",
                 )
 
                 if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
                     # Double guidance: 3 predictions (cond+ref, neg+ref, neg+no-ref).
+                    # The two negative-branch calls differ in whether the
+                    # reference latents are present, so they need distinct
+                    # cache identities (see ``predict``'s cache_branch note).
                     negative_with_reference_kwargs = dict(
                         t=t,
                         latents=latents,
@@ -1071,6 +1094,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                         freqs_real=freqs_real,
                         instruction_attention_mask=negative_instruction_attention_mask,
                         ref_image_hidden_states=ref_latents,
+                        cache_branch="negative_ref",
                     )
                     uncond_kwargs = dict(
                         t=t,
@@ -1079,6 +1103,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                         freqs_real=freqs_real,
                         instruction_attention_mask=negative_instruction_attention_mask,
                         ref_image_hidden_states=None,
+                        cache_branch="negative_noref",
                     )
                     model_pred = self.predict_noise_with_multi_branch_cfg(
                         do_true_cfg=True,
@@ -1095,6 +1120,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                         freqs_real=freqs_real,
                         instruction_attention_mask=negative_instruction_attention_mask,
                         ref_image_hidden_states=ref_latents,
+                        cache_branch="negative_ref",
                     )
                     model_pred = self.predict_noise_maybe_with_cfg(
                         do_true_cfg=True,
@@ -1105,7 +1131,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                     )
                 elif task_type == "ti2i" and image_gs > 1.0:
                     # Image-only ti2i guidance: drop the reference in the uncond pred.
-                    negative_kwargs = dict(positive_kwargs, ref_image_hidden_states=None)
+                    negative_kwargs = dict(positive_kwargs, ref_image_hidden_states=None, cache_branch="positive_noref")
                     model_pred = self.predict_noise_maybe_with_cfg(
                         do_true_cfg=True,
                         true_cfg_scale=image_gs,
@@ -1122,6 +1148,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                         freqs_real=freqs_real,
                         instruction_attention_mask=negative_instruction_attention_mask,
                         ref_image_hidden_states=None,
+                        cache_branch="negative_noref",
                     )
                     model_pred = self.predict_noise_maybe_with_cfg(
                         do_true_cfg=True,
