@@ -2174,66 +2174,47 @@ class MiniMaxH3Pipeline(
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
 
-        Audio is decoded first so the incremental mux session can attach its audio
-        stream before temporal video chunks arrive. The callback receives committed
-        float32 ``BCTHW`` frames, performs the requested-size crop and uint8
-        conversion in the worker, then applies bounded backpressure to the encoder.
-        """
-        from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder
+        Audio is decoded first so the incremental mux session can attach its
+        audio stream before temporal video chunks arrive. Everything after a
+        chunk is committed -- crop, quantization, transfer, encoding -- is the
+        shared consumer's job; this method only supplies what is specific to
+        H3: the audio waveform, the requested-size crop, and the fixed rate.
 
-        if batch_frames <= 0:
-            raise ValueError("batch_frames must be positive")
+        Every rank of a distributed VAE group drives the temporal collectives,
+        but only the output owner receives chunks, so a peer rank returns empty
+        bytes -- the pre-encoded counterpart of the empty tensor the full
+        decode leaves there.
+        """
+        from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4 as decode_chunks_to_mp4
 
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         audio_np = audio.detach().float().cpu().numpy()
         if audio_np.ndim == 3 and audio_np.shape[0] == 1:
             audio_np = audio_np[0]
-        encoder = ChunkedMP4Encoder(
-            width=width,
-            height=height,
-            fps=MINIMAX_H3_FPS,
-            audio_waveform=audio_np,
-            audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
-            max_pending=max_pending,
-            video_codec_options=video_codec_options,
-        )
 
-        pending_chunks: list[torch.Tensor] = []
-        pending_frames = 0
-
-        def flush_pending() -> None:
-            nonlocal pending_frames
-            if not pending_chunks:
-                return
-            batched = torch.cat(pending_chunks, dim=1)
-            encoder.push(batched[0].cpu().numpy())
-            pending_chunks.clear()
-            pending_frames = 0
-
-        def on_chunk(frames: torch.Tensor) -> None:
-            nonlocal pending_frames
-            prepared = _prepare_minimax_h3_video_output(frames[..., :height, :width])
-            if prepared.shape[0] != 1:
-                raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
-            pending_chunks.append(prepared)
-            pending_frames += int(prepared.shape[1])
-            if pending_frames >= batch_frames:
-                flush_pending()
-
-        try:
-            with self._component_on_device(self.video_vae):
-                with current_omni_platform.create_autocast_context(
-                    device_type=self.device.type,
-                    dtype=torch.float16,
-                    enabled=True,
-                ):
-                    self.video_vae.decode_with_chunks(video_latent, on_chunk=on_chunk)
-            flush_pending()
-            return encoder.finish()
-        except BaseException:
-            encoder.abort()
-            raise
+        with self._component_on_device(self.video_vae):
+            with current_omni_platform.create_autocast_context(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=True,
+            ):
+                videos = decode_chunks_to_mp4(
+                    self.video_vae,
+                    video_latent,
+                    fps=MINIMAX_H3_FPS,
+                    audio_waveforms=[audio_np],
+                    audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                    batch_frames=batch_frames,
+                    max_pending=max_pending,
+                    video_codec_options=video_codec_options,
+                    crop=(height, width),
+                )
+        if not videos:
+            return b""
+        if len(videos) != 1:
+            raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
+        return videos[0]
 
     def decode(
         self,
