@@ -194,6 +194,21 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "seed=42"
 ```
 
+### MP4 Encoding Configuration
+
+By default, the server uses a balanced encoding preset when saving or returning MP4 files. If you prioritize speed (e.g., for online serving where end-to-end latency matters) or storage (e.g., smaller file sizes), you can override the video codec options by passing an `extra_params` JSON string.
+
+For example, to use the `ultrafast` preset for minimal encoding latency:
+
+```bash
+curl -X POST http://localhost:8091/v1/videos \
+  -F "prompt=A bear playing with yarn, smooth motion" \
+  -F "input_reference=@/path/to/qwen-bear.png" \
+  -F 'extra_params={"video_codec_options": {"preset": "ultrafast", "crf": "23", "threads": "0"}}'
+```
+
+Alternatively, you could use `"preset": "medium"` or `"preset": "slow"` for better compression.
+
 Frame interpolation is also available for supported Wan2.2 I2V requests. See
 [Frame Interpolation](../../diffusion/frame_interpolation.md) for worker-side
 execution details and feature constraints.

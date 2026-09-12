@@ -239,6 +239,21 @@ curl -X POST http://localhost:8091/v1/videos \
 
 `sample_solver` is supported by Wan2.2 online serving through the existing `extra_params` field, which is merged into the pipeline `extra_args`. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
 
+### MP4 Encoding Configuration
+
+By default, the server uses a balanced encoding preset when saving or returning MP4 files. If you prioritize speed (e.g., for online serving where end-to-end latency matters) or storage (e.g., smaller file sizes), you can override the video codec options by passing an `extra_params` JSON string.
+
+For example, to use the `ultrafast` preset for minimal encoding latency:
+
+```bash
+curl -X POST http://localhost:8091/v1/videos \
+  -F "prompt=A bear playing with yarn, smooth motion" \
+  -F "input_reference=@/path/to/qwen-bear.png" \
+  -F 'extra_params={"video_codec_options": {"preset": "ultrafast", "crf": "23", "threads": "0"}}'
+```
+
+Alternatively, you could use `"preset": "medium"` or `"preset": "slow"` for better compression.
+
 ## Create Response Format
 
 `POST /v1/videos` returns a job record, not inline base64 video data.
