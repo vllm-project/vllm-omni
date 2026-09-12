@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 if TYPE_CHECKING:
@@ -55,6 +56,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    seed_was_explicit: bool = field(init=False, repr=False)
     # Optional opaque, model-owned input prepared before Scheduler admission.
     # Model code validates its concrete type when consuming it on the Worker.
     prepared_layout: Any | None = None
@@ -83,6 +85,15 @@ class OmniDiffusionRequest:
         """Initialize dependent fields after dataclass initialization."""
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
+
+        self.seed_was_explicit = self.sampling_params.seed is not None
+
+        # Must run after seed_was_explicit above, which it reads, and before the
+        # fallback below, which would otherwise hide a missing seed behind a random
+        # one. Internal warmup requests are exempt: they are constructed by the
+        # engine itself and legitimately rely on that fallback.
+        if not self.is_dummy_run():
+            validate_batch_invariant_diffusion_request(self)
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.
