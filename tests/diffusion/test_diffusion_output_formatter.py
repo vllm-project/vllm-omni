@@ -114,6 +114,10 @@ def test_formatter_normalizes_payload_metadata_envelope(
                     "raw_action_dim": 2,
                     "action_mode": "policy",
                     "domain_id": 7,
+                    "horizon": 2,
+                    "action_dim": 2,
+                    "valid_steps": 2,
+                    "action_space": "joint_position",
                 },
                 "common": {
                     "action_only_output": True,
@@ -135,6 +139,10 @@ def test_formatter_normalizes_payload_metadata_envelope(
             "raw_action_dim": 2,
             "action_mode": "policy",
             "domain_id": 7,
+            "horizon": 2,
+            "action_dim": 2,
+            "valid_steps": 2,
+            "action_space": "joint_position",
         },
         "common": {
             "action_only_output": True,
