@@ -439,6 +439,85 @@ def async_omni_stage_configs_only_client():
 
 
 @pytest.fixture
+def mammoth_moda2_test_client():
+    """MammothModa2-style pipeline: AR (llm) + generation-LLM DiT stage.
+
+    The DiT stage is ``stage_type == "llm"`` with ``final_output_type ==
+    "image"`` (no classical diffusion stage), which is exactly the topology
+    the MammothModa2 registry entry serves. Regression guard for the 503
+    (stage discovery) and the T2I envelope / max_tokens wiring.
+    """
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            stage_configs = [
+                SimpleNamespace(
+                    stage_type="llm",
+                    is_comprehension=False,
+                    engine_args=SimpleNamespace(model_arch="MammothModa2ForConditionalGeneration"),
+                ),
+                SimpleNamespace(
+                    stage_type="llm",
+                    is_comprehension=False,
+                    final_output=True,
+                    final_output_type="image",
+                    engine_args=SimpleNamespace(model_arch="MammothModa2ForConditionalGeneration"),
+                ),
+            ]
+            default_sampling_params_list = [
+                SamplingParams(temperature=1.0, max_tokens=16),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+    app = FastAPI()
+    app.include_router(router)
+
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="llm", final_output=True, final_output_type="image"),
+    ]
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="Mammoth/MammothModa2-Preview", model_path="Mammoth/MammothModa2-Preview")]
+    )
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":50, "generator_device":"cpu"}}',
+        max_generated_image_size=1024 * 1024,
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
 def streaming_image_edit_client():
     """Create a multi-stage client whose engine yields AR text before image output."""
     from fastapi import FastAPI
@@ -2383,3 +2462,101 @@ def test_image_edits_omitted_bot_task_stop_tokens_match_prompt_default(
         f"{ar_params.stop_token_ids} -- this is the full ratio range, meaning "
         "resolve_stop_token_ids disagreed with build_prompt_tokens's default."
     )
+
+
+def test_generate_images_mammoth_moda2_llm_dit_pipeline_accepted(mammoth_moda2_test_client):
+    """Regression: /v1/images/generations must not 503 on generation-LLM DiT stages.
+
+    MammothModa2's DiT stage is ``stage_type == "llm"`` with
+    ``final_output_type == "image"``; stage discovery previously required a
+    classical diffusion stage and returned 503 (issue #7199).
+    """
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert len(data["data"]) == 1
+
+
+def test_generate_images_mammoth_moda2_t2i_envelope_and_max_tokens(mammoth_moda2_test_client):
+    """Regression: the registry T2I builder drives the AR prompt + max_tokens.
+
+    The AR stage must receive the <|image start|>W*H<|image token|> envelope,
+    the structural additional_information, and max_tokens sized from the AR
+    grid (ar_height * (ar_width + 1) + 1) instead of SamplingParams' default.
+    """
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = mammoth_moda2_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["prompt"].endswith("<|image start|>64*64<|image token|>")
+    addi = captured_prompt["additional_information"]
+    assert addi["omni_task"] == ["t2i"]
+    assert addi["ar_width"] == [64]
+    assert addi["ar_height"] == [64]
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    assert captured[0].max_tokens == 64 * 65 + 1
+    assert captured[0].seed == 7
+
+
+def test_generate_images_mammoth_moda2_extra_args_routed_to_both_stages(mammoth_moda2_test_client):
+    """Regression: declared extra_body params reach AR and DiT extra_args.
+
+    text_guidance_scale / cfg_range / num_inference_steps are declared by the
+    MammothModa2 registry spec; the DiT stage (llm-typed) reads them from
+    sampling_params.extra_args, so the serving layer must route them there.
+    """
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+            "text_guidance_scale": 4.5,
+            "cfg_range": [0.0, 0.8],
+            "num_inference_steps": 30,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = mammoth_moda2_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    for stage_params in captured:
+        extra_args = getattr(stage_params, "extra_args", None) or {}
+        assert extra_args.get("text_guidance_scale") == 4.5
+        assert extra_args.get("cfg_range") == [0.0, 0.8]
+        assert extra_args.get("num_inference_steps") == 30
+
+
+def test_is_image_generation_stage_matrix():
+    """Unit-test the stage classifier used by the image serving endpoints."""
+    from vllm_omni.entrypoints.openai.utils import is_image_generation_stage
+
+    assert is_image_generation_stage(SimpleNamespace(stage_type="diffusion"))
+    assert is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type="image"))
+    assert is_image_generation_stage({"stage_type": "llm", "final_output": True, "final_output_type": "images"})
+    assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type="text"))
+    assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=False))
+    assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type=None))

@@ -28,7 +28,8 @@ from vllm.parser.utils import (
     count_chat_history_tool_calls as get_history_tool_calls_cnt,
 )
 
-from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args, ar_grid_max_tokens
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
     apply_normalized_diffusion_request_extra_args,
@@ -44,8 +45,10 @@ from vllm_omni.metrics.modality import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_extras import (
+    build_text_to_image_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    should_init_extra_args_for_non_diffusion_stages,
 )
 
 try:
@@ -138,6 +141,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     get_supported_speakers_from_hf_config,
+    is_image_generation_stage,
     is_single_stage_diffusion,
     parse_lora_request,
     resolve_diffusion_od_config,
@@ -369,14 +373,72 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         params: frozenset[str] = frozenset()
         try:
-            od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
-            if od_config is not None and getattr(od_config, "model_class_name", None):
-                params = get_extra_body_params(od_config.model_class_name)
+            try:
+                od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
+            except Exception:
+                od_config = None
+            model_class_name = getattr(od_config, "model_class_name", None) if od_config is not None else None
+            if model_class_name is None:
+                model_class_name = self._resolve_multistage_model_class_name(self.engine_client)
+            if model_class_name:
+                params = get_extra_body_params(model_class_name)
         except Exception as e:
             logger.warning("Failed to read model extra_body params: %s", e)
 
         self._diffusion_extra_body_params = params
         return params
+
+    def _resolve_multistage_model_class_name(self, engine: Any) -> str | None:
+        """Resolve the multistage pipeline's diffusion model class name.
+
+        Prefers the diffusion od_config (single source of truth for the
+        registry spec); falls back to the wrapper model arch declared on the
+        final image-output stage so multistage wrappers without a diffusion
+        od_config (e.g. MammothModa2's generation-LLM DiT stage) still resolve.
+        """
+        cached = getattr(self, "_multistage_model_class_name", None)
+        if cached is not None:
+            return cached
+
+        model_class_name: str | None = None
+        try:
+            od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
+            if od_config is not None:
+                model_class_name = getattr(od_config, "model_class_name", None)
+        except Exception as e:
+            logger.warning("Failed to read diffusion od_config model class: %s", e)
+
+        if model_class_name is None:
+            for stage_cfg in getattr(engine, "stage_configs", None) or []:
+                if not is_image_generation_stage(stage_cfg):
+                    continue
+                stage_engine_args = getattr(stage_cfg, "engine_args", None)
+                if stage_engine_args is None and hasattr(stage_cfg, "get"):
+                    try:
+                        stage_engine_args = stage_cfg.get("engine_args")
+                    except Exception:
+                        stage_engine_args = None
+                for attr in ("model_class_name", "model_arch"):
+                    model_class_name = None
+                    if isinstance(stage_engine_args, dict):
+                        model_class_name = stage_engine_args.get(attr)
+                    elif stage_engine_args is not None and hasattr(stage_engine_args, "get"):
+                        try:
+                            model_class_name = stage_engine_args.get(attr)
+                        except Exception:
+                            model_class_name = None
+                    elif stage_engine_args is not None:
+                        model_class_name = getattr(stage_engine_args, attr, None)
+                    if model_class_name is None:
+                        model_class_name = getattr(stage_cfg, attr, None)
+                    if model_class_name is not None:
+                        break
+                if model_class_name is not None:
+                    break
+
+        if model_class_name is not None:
+            self._multistage_model_class_name = model_class_name
+        return model_class_name
 
     def _normalize_diffusion_request_args(
         self,
@@ -3036,6 +3098,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 engine_prompt_data = {"image": reference_images}
 
+        ar_prompt_info: dict[str, Any] | None = None
+        model_class_name = self._resolve_multistage_model_class_name(engine)
+        has_diffusion_stage = any(get_stage_type(cfg) == "diffusion" for cfg in stage_configs)
+        if (
+            model_class_name is not None
+            and not has_diffusion_stage
+            and not reference_images
+            and bot_task is None
+            and use_system_prompt is None
+            and custom_system_prompt is None
+        ):
+            model_t2i_prompt = build_text_to_image_prompt(
+                model_class_name,
+                {"prompt": prompt, "negative_prompt": negative_prompt},
+                height=height,
+                width=width,
+            )
+            if model_t2i_prompt is not None and model_t2i_prompt.get("prompt") != prompt:
+                prompt = model_t2i_prompt["prompt"]
+                ar_prompt_info = model_t2i_prompt.get("additional_information")
+
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
         build_kwargs: dict[str, Any] = {}
@@ -3108,6 +3191,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
+        if ar_prompt_info is not None:
+            engine_prompt["additional_information"] = ar_prompt_info
 
         mm_processor_kwargs: dict[str, Any] = {}
         if height is not None:
@@ -3147,6 +3232,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # (None for DictConfig where is_comprehension is nested in engine_args).
             if stage_type == "llm" and ar_stop_token_ids is not None:
                 default_stage_params.stop_token_ids = ar_stop_token_ids
+
+            if stage_type == "llm" and idx == 0 and ar_prompt_info is not None:
+                if should_init_extra_args_for_non_diffusion_stages(model_class_name):
+                    extra_args = getattr(default_stage_params, "extra_args", None)
+                    if extra_args is None:
+                        extra_args = {}
+                        default_stage_params.extra_args = extra_args
+                    apply_declared_extra_args(
+                        default_stage_params,
+                        self._get_diffusion_extra_body_params(),
+                        extra_body,
+                    )
+                    seed_for_ar = extra_body.get("seed")
+                    if seed_for_ar is not None and hasattr(default_stage_params, "seed"):
+                        default_stage_params.seed = seed_for_ar
+                ar_width = int((ar_prompt_info.get("ar_width") or [0])[0])
+                ar_height = int((ar_prompt_info.get("ar_height") or [0])[0])
+                ar_grid_budget = ar_grid_max_tokens(ar_width, ar_height)
+                if ar_grid_budget is not None and hasattr(default_stage_params, "max_tokens"):
+                    default_stage_params.max_tokens = ar_grid_budget
 
             if (
                 comprehension_idx is not None
@@ -3197,6 +3302,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 default_stage_params.lora_scale = lora_scale
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
+            elif stage_type == "llm" and idx > 0 and is_image_generation_stage(stage_cfg):
+                self._set_if_supported(
+                    default_stage_params,
+                    height=height,
+                    width=width,
+                    seed=seed,
+                    generator_device=generator_device,
+                    num_outputs_per_prompt=num_outputs_per_prompt,
+                )
+                apply_declared_extra_args(
+                    default_stage_params,
+                    self._get_diffusion_extra_body_params(),
+                    extra_body,
+                )
 
         return engine_prompt, sampling_params_list
 
@@ -3387,31 +3506,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_id=request_id,
             )
 
-        images = getattr(result, "images", [])
+        # Generation-LLM DiT stages (e.g. MammothModa2) attach the decoded
+        # image to ``multimodal_output`` on the completion instead of the
+        # ``images`` field, so fall back to the shared extractor used by the
+        # offline example path before giving up.
+        images = getattr(result, "images", None) or extract_images_from_outputs(result)
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
         response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
         cot_output = None
-
-        req_out = result
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
-
-        req_out = result
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
 
         req_out = result
         if req_out:
