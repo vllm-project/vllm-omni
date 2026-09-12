@@ -13,7 +13,8 @@ from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -38,6 +39,28 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["gen_transformer"]
     _encoder_modules: ClassVar[list[str]] = ["gen_image_condition_refiner"]
     _vae_modules: ClassVar[list[str]] = ["gen_vae"]
+    stacked_params_mapping: ClassVar[list[tuple[str, str, int | str]]] = [
+        (
+            ".feed_forward.gate_up_proj",
+            ".feed_forward.linear_1",
+            0,
+        ),
+        (
+            ".feed_forward.gate_up_proj",
+            ".feed_forward.linear_3",
+            1,
+        ),
+        (
+            ".ffn.gate_up_proj",
+            ".ffn.linear_1",
+            0,
+        ),
+        (
+            ".ffn.gate_up_proj",
+            ".ffn.linear_3",
+            1,
+        ),
+    ]
 
     have_multimodal_outputs = True
 
@@ -407,5 +430,32 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        params_dict = dict(self.named_parameters())
+        params_dict.update(self.named_buffers())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # The DiT stage intentionally excludes the AR backbone and
+            # generation tokenizer from this composite checkpoint. This is
+            # equivalent to the two None entries in hf_to_vllm_mapper above.
+            if name.startswith(("llm_model.", "gen_tokenizer.")):
+                continue
+
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # linear_2 keeps its checkpoint/runtime name, so it and all
+                # other non-stacked parameters follow the ordinary path.
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+            loaded_params.add(name)
+
+        return loaded_params
