@@ -376,6 +376,9 @@ ba = "ba"
 SER = "SER"
 # NumPy ndarray.flags.writeable (canonical flag name, not "writable").
 writeable = "writeable"
+# ARPAbet phoneme symbol (Fish Speech phoneme-control token example, e.g.
+# "IY0"), not a typo of "IT".
+IY = "IY"
 # "convnet" abbreviates convolutional network. It appears in the vendored Fish
 # Speech DAC codec identifiers (convnet_type, transconvnet_type) and is not a
 # typo of "convent".
