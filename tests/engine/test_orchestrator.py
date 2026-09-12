@@ -320,6 +320,83 @@ def _sampling_params(max_tokens: int = 4) -> SamplingParams:
     return SamplingParams(max_tokens=max_tokens)
 
 
+def _pd_orchestrator(
+    connector_name: str,
+    *,
+    kv_prefill_params: dict[str, Any] | None = None,
+    bootstrap_addr: str | None = None,
+    prefill_engine_id: str | None = None,
+) -> Orchestrator:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_connector_name = connector_name
+    orchestrator._pd_bootstrap_addr = bootstrap_addr
+    orchestrator._pd_prefill_engine_id = prefill_engine_id
+    orchestrator._pd_kv_params = {}
+    if kv_prefill_params is not None:
+        orchestrator._pd_kv_params["req-1"] = kv_prefill_params
+    return orchestrator
+
+
+@pytest.mark.parametrize(
+    ("orchestrator", "expected_key", "expected_value"),
+    [
+        (
+            _pd_orchestrator(
+                "MooncakeConnector",
+                bootstrap_addr="http://127.0.0.1:25201",
+                prefill_engine_id="prefill-engine",
+            ),
+            "remote_bootstrap_addr",
+            "http://127.0.0.1:25201",
+        ),
+        (
+            _pd_orchestrator(
+                "NixlConnector",
+                kv_prefill_params={
+                    "remote_request_id": "prefill-request",
+                },
+            ),
+            "remote_request_id",
+            "prefill-request",
+        ),
+        (
+            _pd_orchestrator(
+                "CustomConnector",
+                kv_prefill_params={"remote_request_id": "prefill-request"},
+            ),
+            "remote_request_id",
+            "prefill-request",
+        ),
+    ],
+)
+def test_build_pd_decode_params_uses_connector_contract(orchestrator, expected_key, expected_value):
+    result = orchestrator._build_pd_decode_params("req-1", _sampling_params())
+    kv_params = result.extra_args["kv_transfer_params"]
+
+    assert kv_params[expected_key] == expected_value
+    assert kv_params["do_remote_prefill"] is True
+    assert kv_params["do_remote_decode"] is False
+
+
+@pytest.mark.parametrize(
+    ("orchestrator", "missing_key"),
+    [
+        (
+            _pd_orchestrator(
+                "MooncakeConnector",
+                bootstrap_addr="http://127.0.0.1:25201",
+            ),
+            "remote_engine_id",
+        ),
+        (_pd_orchestrator("NixlConnector"), "remote_request_id"),
+        (_pd_orchestrator("CustomConnector"), "remote_request_id"),
+    ],
+)
+def test_build_pd_decode_params_reports_missing_connector_metadata(orchestrator, missing_key):
+    with pytest.raises(RuntimeError, match=missing_key):
+        orchestrator._build_pd_decode_params("req-1", _sampling_params())
+
+
 def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
     return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None, finished_requests=None)
 
