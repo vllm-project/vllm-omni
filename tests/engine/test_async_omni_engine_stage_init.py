@@ -334,12 +334,16 @@ def test_initialize_local_diffusion_replica_scopes_runtime_env(monkeypatch):
     monkeypatch.delenv(runtime_env_var, raising=False)
     monkeypatch.setenv(device_env_var, "0,1")
 
-    captured: dict[str, str | None] = {}
+    captured: dict[str, object] = {}
     monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
 
-    def _capture_launch_diffusion_stage_replica(**_kwargs):
+    def _capture_launch_diffusion_stage_replica(**kwargs):
         captured["runtime_env"] = os.environ.get(runtime_env_var)
+        # The launcher scopes the device env itself, around the spawn only,
+        # so the runtime hands it the resolved devices instead of the env.
         captured["device_env"] = os.environ.get(device_env_var)
+        captured["stage_visible_devices"] = kwargs["stage_visible_devices"]
+        captured["spawn_device_lock"] = kwargs["spawn_device_lock"]
         raise RuntimeError("stop after capturing launch environment")
 
     monkeypatch.setattr(
@@ -353,7 +357,9 @@ def test_initialize_local_diffusion_replica_scopes_runtime_env(monkeypatch):
 
     assert captured == {
         "runtime_env": "stage-value",
-        "device_env": "0",
+        "device_env": "0,1",
+        "stage_visible_devices": "0",
+        "spawn_device_lock": runtime._spawn_device_lock,
     }
     assert runtime_env_var not in os.environ
     assert os.environ[device_env_var] == "0,1"
@@ -552,7 +558,7 @@ def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkey
 
     od_config = types.SimpleNamespace(max_num_seqs=4, parallel_config=types.SimpleNamespace(world_size=1))
     monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
-    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         startup_mod,
         "register_stage_with_omni_master",
@@ -628,7 +634,7 @@ def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(mo
         parallel_config=types.SimpleNamespace(world_size=1),
     )
     monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
-    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         startup_mod,
         "register_stage_with_omni_master",
@@ -1034,7 +1040,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    def _capture_acquire_device_locks(*_args):
+    def _capture_acquire_device_locks(*_args, **_kwargs):
         nonlocal captured_timeout
         captured_timeout = _args[2]
         return []
@@ -1066,6 +1072,528 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == stage_init_timeout
+
+
+def test_acquire_device_locks_prefers_explicit_visible_devices(monkeypatch):
+    """acquire_device_locks(visible_devices=...) must not read the device env."""
+    import vllm_omni.engine.stage_init_utils as init_utils
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env_var = current_omni_platform.device_control_env_var
+    # Poison the env: if the function reads it, it would lock device 7.
+    monkeypatch.setenv(device_env_var, "7")
+
+    locked: list[str] = []
+    real_open = os.open
+
+    def _capture_open(path, *args, **kwargs):
+        if isinstance(path, str) and "vllm_omni_device_" in path:
+            locked.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(init_utils.os, "open", _capture_open)
+
+    lock_fds = init_utils.acquire_device_locks(
+        0,
+        {"tensor_parallel_size": 1},
+        stage_init_timeout=5,
+        visible_devices="3",
+    )
+    try:
+        assert any("vllm_omni_device_3_init.lock" in p for p in locked)
+        assert not any("vllm_omni_device_7_init.lock" in p for p in locked)
+    finally:
+        init_utils.release_device_locks(lock_fds)
+
+
+def test_initialize_local_llm_replica_does_not_hold_spawn_lock_during_device_lock_wait(monkeypatch):
+    """Regression: the flock wait must run outside the spawn-env lock, or
+    colocated stages deadlock through lock-order inversion
+    (spawn-lock+flock vs flock+spawn-lock)."""
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=30,
+        async_chunk=False,
+    )
+
+    fake_vllm_config = types.SimpleNamespace()
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+
+    plan = ReplicaInitPlan(
+        replica_id=0,
+        num_replicas=1,
+        launch_mode="local",
+        stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="1,3")),
+        metadata=types.SimpleNamespace(stage_id=1, runtime_cfg={"devices": "1,3"}),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_vllm_config=fake_vllm_config,
+        executor_class=object,
+        engine_args_dict={},
+    )
+
+    observed: dict[str, object] = {}
+
+    def _fake_acquire_device_locks(*_args, **_kwargs):
+        # The deadlock happened exactly here: the flock wait ran while the
+        # spawn-env lock was held. Assert it is free at this point.
+        observed["spawn_lock_held"] = runtime._spawn_device_lock.locked()
+        observed["visible_devices"] = _kwargs.get("visible_devices")
+        return []
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", _fake_acquire_device_locks)
+    monkeypatch.setattr(
+        runtime_mod,
+        "resolve_stage_physical_devices",
+        lambda *_a, **_k: "1,3",
+    )
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**_kwargs):
+        yield StageReplicaResources(
+            manager=types.SimpleNamespace(shutdown=lambda: None),
+            addresses=fake_addresses,
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    runtime._initialize_local_llm_replica(plan, 30)
+
+    assert observed["spawn_lock_held"] is False
+    assert observed["visible_devices"] == "1,3"
+
+
+def test_initialize_local_llm_replica_parallel_path_skips_parent_device_lock(monkeypatch):
+    """With parallel_stage_init the engine-core child takes the SH/EX phase
+    locks itself, so the parent must not call acquire_device_locks at all (it
+    would self-deadlock waiting for the child's READY), and it must hand the
+    flag to the launcher so the child installs the phase-lock guard."""
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=30,
+        async_chunk=False,
+        parallel_stage_init=True,
+    )
+
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+    plan = ReplicaInitPlan(
+        replica_id=0,
+        num_replicas=1,
+        launch_mode="local",
+        stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="1")),
+        metadata=types.SimpleNamespace(stage_id=1, runtime_cfg={"devices": "1"}),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_vllm_config=types.SimpleNamespace(),
+        executor_class=object,
+        engine_args_dict={},
+    )
+
+    def _unexpected_acquire_device_locks(*_args, **_kwargs):
+        raise AssertionError("parent must not take device flocks when parallel_stage_init is enabled")
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", _unexpected_acquire_device_locks)
+    monkeypatch.setattr(runtime_mod, "resolve_stage_physical_devices", lambda *_a, **_k: "1")
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    launch_kwargs: dict[str, object] = {}
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**kwargs):
+        launch_kwargs.update(kwargs)
+        yield StageReplicaResources(
+            manager=types.SimpleNamespace(shutdown=lambda: None),
+            addresses=fake_addresses,
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    runtime._initialize_local_llm_replica(plan, 30)
+
+    assert launch_kwargs["omni_parallel_stage_init"] is True
+    assert launch_kwargs["spawn_device_lock"] is runtime._spawn_device_lock
+
+
+def test_parallel_replica_init_with_shared_device_does_not_deadlock(monkeypatch):
+    """End-to-end deadlock reproducer: two replicas with overlapping devices
+    initializing in parallel must both complete. Uses real flocks (high device
+    ids) and a fake launch that takes the spawn-env lock like the real path;
+    before the fix this timed out.
+    """
+    import threading
+
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=30,
+        async_chunk=False,
+    )
+
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+
+    def _make_plan(stage_id: int, devices: str, tp: int) -> ReplicaInitPlan:
+        return ReplicaInitPlan(
+            replica_id=0,
+            num_replicas=1,
+            launch_mode="local",
+            stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices=devices)),
+            metadata=types.SimpleNamespace(stage_id=stage_id, runtime_cfg={"devices": devices}),
+            stage_connector_spec={},
+            omni_kv_connector=(None, None, None),
+            stage_vllm_config=types.SimpleNamespace(),
+            executor_class=object,
+            engine_args_dict={"tensor_parallel_size": tp},
+        )
+
+    # High device ids so the real /tmp flock files never clash with real GPUs.
+    plans = {
+        0: ("101,102", 2),  # "thinker": locks devices 101+102
+        1: ("102", 1),  # "talker": colocated on device 102
+    }
+    device_map = {0: "101,102", 1: "102"}
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "resolve_stage_physical_devices",
+        lambda stage_id, *_a, **_k: device_map[stage_id],
+    )
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**kwargs):
+        # Mimic the real launcher: it enters scoped_spawn_device_env, which
+        # takes the spawn-env lock while the subprocess spawns.
+        spawn_lock = kwargs.get("spawn_device_lock")
+        expected_lock = getattr(runtime, "_spawn_device_lock", None)
+        assert expected_lock is not None and spawn_lock is expected_lock, (
+            "launch_stage_replica must still receive the runtime's own spawn-env lock. "
+            "If the wiring changed, fix this fake instead of relaxing the check: with a "
+            "different lock the two threads below never contend and this reproducer "
+            "silently stops exercising the deadlock."
+        )
+        with spawn_lock:
+            time.sleep(0.2)
+            yield StageReplicaResources(
+                manager=types.SimpleNamespace(shutdown=lambda: None),
+                addresses=fake_addresses,
+            )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    errors: list[BaseException] = []
+
+    def _init(stage_id: int) -> None:
+        devices, tp = plans[stage_id]
+        try:
+            runtime._initialize_local_llm_replica(_make_plan(stage_id, devices, tp), 30)
+        except BaseException as exc:  # pragma: no cover - surfaced via assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_init, args=(sid,), daemon=True) for sid in plans]
+    for t in threads:
+        t.start()
+    deadline = time.time() + 30
+    for t in threads:
+        t.join(timeout=max(0.1, deadline - time.time()))
+
+    stuck = [t for t in threads if t.is_alive()]
+    assert not stuck, "parallel replica init deadlocked (threads still waiting on locks after 30s)"
+    assert not errors, f"replica init raised: {errors!r}"
+
+
+def _patch_distributed_diffusion_launch(monkeypatch, *, on_spawn=None):
+    """Stub the distributed local diffusion launch around a fake proc manager.
+
+    ``on_spawn`` runs where the real ``StageDiffusionProcManager`` spawns its
+    child, i.e. inside the launcher's device-env scope.
+    """
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+
+    od_config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(world_size=1))
+    monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(
+        startup_mod,
+        "register_stage_with_omni_master",
+        lambda **kwargs: types.SimpleNamespace(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+        ),
+    )
+    proc_manager = types.SimpleNamespace(
+        addresses=types.SimpleNamespace(
+            inputs=["tcp://127.0.0.1:26002"],
+            outputs=["tcp://127.0.0.1:26003"],
+        ),
+        shutdown=lambda: None,
+    )
+
+    def _fake_proc_manager(**_kwargs):
+        if on_spawn is not None:
+            on_spawn()
+        return proc_manager
+
+    monkeypatch.setattr(proc_mod, "StageDiffusionProcManager", _fake_proc_manager)
+    monkeypatch.setattr(
+        client_mod.StageDiffusionClient,
+        "from_addresses",
+        lambda metadata, **kwargs: types.SimpleNamespace(shutdown=lambda: None),
+    )
+    return types.SimpleNamespace(
+        address="127.0.0.1",
+        port=25000,
+        release_route_port_reservations=lambda *args, **kwargs: None,
+    )
+
+
+def test_launch_diffusion_stage_replica_takes_device_locks_outside_spawn_env_lock(monkeypatch):
+    """The distributed local diffusion launch must wait for its device flocks
+    with the spawn-env lock free and an explicit device list, then hold the
+    lock (with the device env applied) only while the child spawns."""
+    import threading
+
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env_var = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env_var, "0,1")
+    spawn_lock = threading.Lock()
+    observed: dict[str, object] = {}
+
+    def _fake_acquire_device_locks(*_args, **kwargs):
+        observed["lock_held_during_flock"] = spawn_lock.locked()
+        observed["visible_devices"] = kwargs.get("visible_devices")
+        observed["device_env_during_flock"] = os.environ.get(device_env_var)
+        return []
+
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", _fake_acquire_device_locks)
+
+    def _on_spawn():
+        observed["lock_held_during_spawn"] = spawn_lock.locked()
+        observed["device_env_during_spawn"] = os.environ.get(device_env_var)
+
+    omni_master_server = _patch_distributed_diffusion_launch(monkeypatch, on_spawn=_on_spawn)
+
+    startup_mod.launch_diffusion_stage_replica(
+        model="dummy-model",
+        stage_config=types.SimpleNamespace(),
+        metadata=types.SimpleNamespace(stage_id=1),
+        stage_init_timeout=5,
+        use_inline=False,
+        omni_master_server=omni_master_server,
+        stage_visible_devices="1",
+        spawn_device_lock=spawn_lock,
+    )
+
+    assert observed == {
+        "lock_held_during_flock": False,
+        "visible_devices": "1",
+        "device_env_during_flock": "0,1",
+        "lock_held_during_spawn": True,
+        "device_env_during_spawn": "1",
+    }
+    assert os.environ[device_env_var] == "0,1"
+    assert not spawn_lock.locked()
+
+
+def test_launch_diffusion_stage_replica_scopes_colocated_init_under_spawn_env_lock(monkeypatch):
+    """Colocated diffusion (no master server) may initialize the device in this
+    process, so the whole init still runs with the device env applied."""
+    import threading
+
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env_var = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env_var, "0,1")
+    spawn_lock = threading.Lock()
+    observed: dict[str, object] = {}
+    sentinel_client = object()
+
+    def _fake_initialize_diffusion_stage(*_args, **_kwargs):
+        observed["lock_held"] = spawn_lock.locked()
+        observed["device_env"] = os.environ.get(device_env_var)
+        return sentinel_client
+
+    monkeypatch.setattr(startup_mod, "initialize_diffusion_stage", _fake_initialize_diffusion_stage)
+
+    client, resources = startup_mod.launch_diffusion_stage_replica(
+        model="dummy-model",
+        stage_config=types.SimpleNamespace(),
+        metadata=types.SimpleNamespace(stage_id=0),
+        stage_init_timeout=5,
+        use_inline=True,
+        stage_visible_devices="1",
+        spawn_device_lock=spawn_lock,
+    )
+
+    assert client is sentinel_client
+    assert resources.lock_fds == []
+    assert observed == {"lock_held": True, "device_env": "1"}
+    assert os.environ[device_env_var] == "0,1"
+    assert not spawn_lock.locked()
+
+
+def test_initialize_local_diffusion_replica_calls_launcher_with_spawn_env_lock_free(monkeypatch):
+    """The runtime must not wrap the diffusion launch in the spawn-env lock:
+    the launcher takes the flocks first and scopes the lock itself."""
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    runtime = _make_stage_runtime()
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+    monkeypatch.setattr(runtime_mod, "resolve_stage_physical_devices", lambda *_a, **_k: "3")
+    observed: dict[str, object] = {}
+
+    def _capture_launch_diffusion_stage_replica(**kwargs):
+        observed["spawn_lock_held"] = runtime._spawn_device_lock.locked()
+        observed["stage_visible_devices"] = kwargs["stage_visible_devices"]
+        observed["spawn_device_lock"] = kwargs["spawn_device_lock"]
+        return types.SimpleNamespace(), StageReplicaResources()
+
+    monkeypatch.setattr(runtime_mod, "launch_diffusion_stage_replica", _capture_launch_diffusion_stage_replica)
+
+    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
+
+    assert observed == {
+        "spawn_lock_held": False,
+        "stage_visible_devices": "3",
+        "spawn_device_lock": runtime._spawn_device_lock,
+    }
+
+
+def test_parallel_diffusion_and_llm_replica_init_with_shared_device_does_not_deadlock(monkeypatch):
+    """Deadlock reproducer across stage types: a distributed local diffusion
+    replica and an LLM replica on the same device initializing in parallel
+    must both complete. Uses real flocks (high device ids); the fakes take the
+    spawn-env lock where the real launchers do. Before the fix the diffusion
+    side waited for the flock while holding the spawn-env lock, and the LLM
+    side held the flock while waiting for the spawn-env lock.
+    """
+    import threading
+
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=60,
+        async_chunk=False,
+    )
+
+    # High device ids so the real /tmp flock files never clash with real GPUs.
+    shared_device = "103"
+    monkeypatch.setattr(runtime_mod, "resolve_stage_physical_devices", lambda *_a, **_k: shared_device)
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+
+    llm_plan = ReplicaInitPlan(
+        replica_id=0,
+        num_replicas=1,
+        launch_mode="local",
+        stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices=shared_device)),
+        metadata=types.SimpleNamespace(stage_id=0, runtime_cfg={"devices": shared_device}),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_vllm_config=types.SimpleNamespace(),
+        executor_class=object,
+        engine_args_dict={"tensor_parallel_size": 1},
+    )
+    diffusion_plan = _make_diffusion_plan(1, stage_id=1).replicas[0]
+    diffusion_plan.metadata.runtime_cfg = {"devices": shared_device}
+
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**kwargs):
+        spawn_lock = kwargs.get("spawn_device_lock")
+        assert spawn_lock is runtime._spawn_device_lock, (
+            "launch_stage_replica must receive the runtime's own spawn-env lock; "
+            "with a different lock the two threads never contend and this reproducer "
+            "silently stops exercising the deadlock."
+        )
+        with spawn_lock:
+            time.sleep(0.2)
+            yield StageReplicaResources(
+                manager=types.SimpleNamespace(shutdown=lambda: None),
+                addresses=fake_addresses,
+            )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    def _on_spawn():
+        assert runtime._spawn_device_lock.locked(), "diffusion spawn must run under the spawn-env lock"
+        time.sleep(0.2)
+
+    omni_master_server = _patch_distributed_diffusion_launch(monkeypatch, on_spawn=_on_spawn)
+    monkeypatch.setattr(runtime, "_get_omni_master_server", lambda: omni_master_server)
+
+    errors: list[BaseException] = []
+
+    def _init_llm() -> None:
+        try:
+            runtime._initialize_local_llm_replica(llm_plan, 60)
+        except BaseException as exc:  # pragma: no cover - surfaced via assertion
+            errors.append(exc)
+
+    def _init_diffusion() -> None:
+        try:
+            runtime._initialize_local_diffusion_replica(diffusion_plan, 60)
+        except BaseException as exc:  # pragma: no cover - surfaced via assertion
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_init_llm, daemon=True),
+        threading.Thread(target=_init_diffusion, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    deadline = time.time() + 30
+    for t in threads:
+        t.join(timeout=max(0.1, deadline - time.time()))
+
+    stuck = [t for t in threads if t.is_alive()]
+    assert not stuck, "diffusion + LLM replica init deadlocked (threads still waiting on locks after 30s)"
+    assert not errors, f"replica init raised: {errors!r}"
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):

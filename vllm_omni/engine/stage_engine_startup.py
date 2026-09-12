@@ -1566,22 +1566,31 @@ def launch_diffusion_stage_replica(
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
     omni_coordinator_address: str | None = None,
+    stage_visible_devices: str | None = None,
+    spawn_device_lock: threading.Lock | None = None,
 ) -> tuple[Any, StageReplicaResources]:
     """Launch a local diffusion stage replica.
 
     Colocated mode delegates to ``initialize_diffusion_stage``. Distributed
     local mode registers with ``OmniMasterServer`` and spawns a
     ``StageDiffusionProc`` that heartbeats to ``OmniCoordinator``.
+
+    ``stage_visible_devices`` and ``spawn_device_lock`` scope the device env
+    only around the steps that need it: the colocated init (an inline client
+    initializes the device in this process) and the ``StageDiffusionProc``
+    spawn (the child inherits the env). The device flock wait runs before the
+    scope is entered so it never happens under the process-wide spawn lock.
     """
     if omni_master_server is None:
-        client = initialize_diffusion_stage(
-            metadata.stage_id,
-            model,
-            stage_config,
-            metadata,
-            stage_init_timeout=stage_init_timeout,
-            use_inline=use_inline,
-        )
+        with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+            client = initialize_diffusion_stage(
+                metadata.stage_id,
+                model,
+                stage_config,
+                metadata,
+                stage_init_timeout=stage_init_timeout,
+                use_inline=use_inline,
+            )
         return client, StageReplicaResources()
 
     from vllm_omni.diffusion import stage_diffusion_proc
@@ -1594,10 +1603,15 @@ def launch_diffusion_stage_replica(
         world_size = max(1, int(world_size))
     except (TypeError, ValueError):
         world_size = 1
+    # Take the device flocks with an explicit device list, outside the spawn
+    # lock: a replica that already holds its flocks needs the spawn lock to
+    # launch, so waiting for a flock while holding the spawn lock inverts the
+    # lock order and can deadlock against it.
     lock_fds = acquire_device_locks(
         metadata.stage_id,
         {"tensor_parallel_size": world_size},
         stage_init_timeout,
+        visible_devices=stage_visible_devices,
     )
     proc_manager = None
     try:
@@ -1614,19 +1628,20 @@ def launch_diffusion_stage_replica(
             handshake=True,
             data=False,
         )
-        proc_manager = stage_diffusion_proc.StageDiffusionProcManager(
-            model=model,
-            od_config=od_config,
-            stage_init_timeout=stage_init_timeout,
-            handshake_address=registration.handshake_address,
-            addresses=EngineZmqAddresses(
-                inputs=[registration.input_address],
-                outputs=[registration.output_address],
-            ),
-            omni_coordinator_address=omni_coordinator_address,
-            omni_stage_id=metadata.stage_id,
-            omni_replica_id=replica_id,
-        )
+        with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+            proc_manager = stage_diffusion_proc.StageDiffusionProcManager(
+                model=model,
+                od_config=od_config,
+                stage_init_timeout=stage_init_timeout,
+                handshake_address=registration.handshake_address,
+                addresses=EngineZmqAddresses(
+                    inputs=[registration.input_address],
+                    outputs=[registration.output_address],
+                ),
+                omni_coordinator_address=omni_coordinator_address,
+                omni_stage_id=metadata.stage_id,
+                omni_replica_id=replica_id,
+            )
         omni_master_server.release_route_port_reservations(
             metadata.stage_id,
             replica_id,
