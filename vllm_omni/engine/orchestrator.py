@@ -30,7 +30,7 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
@@ -1136,6 +1136,7 @@ class Orchestrator:
             )
             if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
                 raw_terminal_request_ids.add(req_state.request_id)
+            await self._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
         iteration_stats = IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
         processed = await pool.process_llm_raw_outputs(
             replica_id,
@@ -1871,6 +1872,49 @@ class Orchestrator:
             return False
         req_state.finished_final_output_stage_ids.add(stage_id)
         return True
+
+    async def _report_duplex_session_request_error(
+        self,
+        stage_id: int,
+        replica_id: int | None,
+        eco: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Turn a scheduler-side error finish of a duplex session request into a request error.
+
+        A duplex session request is resumable, so its terminal outputs are
+        deliberately not turned into processed outputs
+        (``_finish_raw_terminal_requests`` skips duplex sessions), and vLLM's
+        output processor may already have dropped the request state by the
+        time the raw ``FinishReason.ERROR`` output arrives. Without this the
+        session never learns that its request is gone: the next append
+        re-creates the request from scratch and the session silently loses
+        its context. Deliver the error to the request's consumer instead so
+        the serving layer can fail and close the session.
+        """
+        if not self._is_duplex_session_request(req_state):
+            return
+        if getattr(eco, "finish_reason", None) != FinishReason.ERROR:
+            return
+        if getattr(eco, "is_segment_finished", False):
+            return
+        stop_reason = getattr(eco, "stop_reason", None)
+        error = stop_reason if isinstance(stop_reason, str) and stop_reason else "duplex session request failed"
+        logger.error(
+            "[Orchestrator] Duplex session request %s failed at stage-%s replica-%s: %s",
+            req_state.request_id,
+            stage_id,
+            replica_id,
+            error,
+        )
+        await self.output_async_queue.put(
+            ErrorMessage(
+                error=error,
+                fatal=False,
+                request_id=req_state.request_id,
+                stage_id=stage_id,
+            )
+        )
 
     async def _finish_raw_terminal_requests(
         self,

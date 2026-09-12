@@ -16,7 +16,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -116,6 +116,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        # Streaming sessions finished because their next prompt extension
+        # would exceed max_model_len: request_id -> (client_index, reason).
+        # Drained into an explicit FinishReason.ERROR output on the next
+        # update_from_output so the client learns why the session ended.
+        self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -704,6 +709,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             failed_kv_load_req_ids,
             outputs,
         )
+        self._emit_streaming_context_overflow_outputs(outputs)
         if self.chunk_transfer_adapter is not None:
             for request in failed_requests:
                 self.chunk_transfer_adapter.cleanup_receiver(request.request_id)
@@ -883,10 +889,127 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
+        if self._streaming_update_overflows(session, update):
+            return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
+    # serving side can map it to a stable error code.
+    STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
+
+    def _streaming_update_overflows(self, session: Request, update: StreamingUpdate) -> bool:
+        """Finish a streaming session whose next extension cannot fit the model.
+
+        Upstream ``_update_request_as_session`` appends the update to the
+        session prompt without checking ``max_model_len``. The worker's input
+        batch then fails to copy the prompt (``could not broadcast input array
+        from shape (N,) into shape (max_model_len,)``) and the EngineCore dies,
+        taking every session on the replica with it. A native duplex session
+        grows by tens to hundreds of tokens per second of input, so long
+        sessions reach this point in normal use.
+
+        The update is dropped and only this request is finished, right here:
+        a parked session does not make the engine schedule, so deferring the
+        finish to the next ``schedule()`` would leave the client waiting. The
+        reason is emitted with the terminal output (see
+        :meth:`_emit_streaming_context_overflow_outputs`).
+        """
+        max_model_len = getattr(self, "max_model_len", None)
+        if max_model_len is None:
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            max_model_len = getattr(model_config, "max_model_len", None)
+        if not max_model_len:
+            return False
+        new_tokens = len(update.prompt_token_ids or ())
+        # The extended prompt is the current prompt plus the computed output
+        # tokens upstream keeps, then the update: num_computed_tokens covers
+        # both when the prompt was fully computed.
+        projected = max(int(session.num_prompt_tokens), int(session.num_computed_tokens)) + new_tokens
+        if projected <= int(max_model_len):
+            return False
+        reason = (
+            f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
+            f"{projected} tokens, above max_model_len {int(max_model_len)}"
+        )
+        logger.error(
+            "[Omni] %s: %s; finishing the request instead of extending it",
+            session.request_id,
+            reason,
+        )
+        overflow = getattr(self, "_streaming_context_overflow", None)
+        if overflow is None:
+            overflow = self._streaming_context_overflow = {}
+        overflow[session.request_id] = (int(getattr(session, "client_index", 0) or 0), reason)
+        if session.is_finished():
+            # Reached from ``_handle_stopped_request`` with a queued update.
+            # ``update_from_output`` frees every request that call reports as
+            # finished, so finishing the session here too would free it twice.
+            # ``_handle_stopped_request`` below takes it out of admission and
+            # leaves the single free to the caller.
+            return True
+        self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
+        return True
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        """Do not resume a session whose queued update overflowed the model.
+
+        Upstream pops one queued ``StreamingUpdate``, applies it through
+        ``_update_request_as_session`` and then re-enqueues the request
+        unconditionally. When that update overflows, the request must not go
+        back into the waiting queue: it is terminal, and admission raises
+        ``RuntimeError: Invalid request status`` on anything that is neither
+        WAITING nor PREEMPTED, which would kill the EngineCore this guard
+        exists to keep alive.
+        """
+        overflow = getattr(self, "_streaming_context_overflow", None)
+        overflowed_before = bool(overflow) and request.request_id in overflow
+        finished = super()._handle_stopped_request(request)
+        if finished or overflowed_before:
+            return finished
+        overflow = getattr(self, "_streaming_context_overflow", None)
+        if not overflow or request.request_id not in overflow:
+            return finished
+        self._finish_overflowed_streaming_session(request)
+        return True
+
+    def _finish_overflowed_streaming_session(self, request: Request) -> None:
+        """Take a terminal session back out of admission.
+
+        Queues and status only. ``update_from_output`` frees every request
+        ``_handle_stopped_request`` reports as finished, so freeing here as
+        well deletes it from ``self.requests`` twice (``KeyError`` in
+        ``_free_blocks``) and skips the caller's input-coordinator cleanup.
+        """
+        self.waiting.remove_requests((request,))
+        self.skipped_waiting.remove_requests((request,))
+        if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        request.status = RequestStatus.FINISHED_ERROR
+        request.resumable = False
+
+    def _emit_streaming_context_overflow_outputs(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        """Turn recorded context overflows into explicit error outputs.
+
+        Without this the finished session would only get the synthesized
+        ``FinishReason.ABORT`` output, which a client cannot tell apart from
+        its own cancel.
+        """
+        overflow = getattr(self, "_streaming_context_overflow", None)
+        if not overflow:
+            return
+        for request_id, (client_index, reason) in list(overflow.items()):
+            outputs.setdefault(client_index, []).append(
+                OmniEngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason=reason,
+                )
+            )
+        overflow.clear()
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False

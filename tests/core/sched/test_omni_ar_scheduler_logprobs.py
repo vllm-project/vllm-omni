@@ -149,6 +149,9 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     for name in _MIXIN_UPDATE_HELPERS:
         setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
     scheduler._cleanup_kv_tracking = MethodType(OmniARScheduler._cleanup_kv_tracking, scheduler)
+    scheduler._emit_streaming_context_overflow_outputs = MethodType(
+        OmniARScheduler._emit_streaming_context_overflow_outputs, scheduler
+    )
     scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
     scheduler.make_stats = lambda *args, **kwargs: None
     return scheduler
