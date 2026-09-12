@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 from typing import Any
 
 import numpy as np
 import torch
+from huggingface_hub import hf_hub_download
 from vllm.config import LoadConfig
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
@@ -13,6 +15,7 @@ from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.glm_image.pipeline_glm_image import GlmImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -42,7 +45,7 @@ class DataCollectionHook(ModelHook):
         if len(outputs) > 1 and ctx.encoder_hidden_states is not None:
             ctx.encoder_hidden_states = outputs[1]
 
-        model_output_cpu = ctx.hidden_states.detach().float().cpu().numpy()
+        model_output_cpu = ctx.hidden_states.detach().cpu().float().numpy()
         self.current_trajectory.append((modulated_input_cpu, model_output_cpu))
         return ctx.postprocess(ctx.hidden_states)
 
@@ -132,14 +135,70 @@ class StableAudioAdapter(DefaultAdapter):
     model_class_name = "StableAudioPipeline"
 
 
+class GlmImageAdapter(DefaultAdapter):
+    """Adapter for GLM-Image model."""
+
+    @classmethod
+    def load_pipeline(cls, model_path: str, device: str, dtype: torch.dtype) -> Any:
+        od_config = OmniDiffusionConfig.from_kwargs(
+            model_class_name="GlmImagePipeline",
+            model=model_path,
+            dtype=dtype,
+        )
+
+        tf_config_path = _resolve_glm_transformer_config_path(model_path)
+        with open(tf_config_path) as f:
+            tf_cfg = json.load(f)
+        od_config.tf_model_config = TransformerConfig.from_dict(tf_cfg)
+
+        pipeline = GlmImagePipeline(od_config=od_config)
+        loader = DiffusersPipelineLoader(LoadConfig())
+        loader.load_weights(pipeline)
+
+        # Move only the modules present on this diffusion pipeline.
+        # This avoids using pipeline-wide .to(...) for coefficient estimation.
+        pipeline.transformer.to(device, dtype=dtype)
+        pipeline.vae.to(device, dtype=dtype)
+        pipeline.text_encoder.to(device, dtype=dtype)
+
+        return pipeline
+
+    @staticmethod
+    def get_transformer(pipeline: Any) -> tuple[Any, str]:
+        return pipeline.transformer, "GlmImageTransformer2DModel"
+
+
 _MODEL_ADAPTERS: dict[str, type] = {
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
+    "GlmImage": GlmImageAdapter,
     "Flux2": Flux2Adapter,
     "LongCat": LongCatAdapter,
 }
 
 _EPSILON = 1e-6
+
+
+def _resolve_glm_transformer_config_path(model_path: str) -> str:
+    if os.path.isdir(model_path):
+        return os.path.join(model_path, "transformer", "config.json")
+    return hf_hub_download(model_path, "transformer/config.json")
+
+
+def _build_glm_prior_token_ids(
+    pipeline: GlmImagePipeline,
+    seed: int | None,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    h_lat = height // pipeline.vae_scale_factor
+    w_lat = width // pipeline.vae_scale_factor
+    seq_len = (h_lat * w_lat) // (pipeline._patch_size**2)
+    vocab_size = pipeline.transformer.prior_token_embedding.num_embeddings
+    generator = torch.Generator(device="cpu")
+    if seed is not None:
+        generator.manual_seed(seed)
+    return torch.randint(0, vocab_size, (1, seq_len), generator=generator, dtype=torch.long)
 
 
 def calculate_relative_l1(tensor_current: np.ndarray, tensor_next: np.ndarray) -> float:
@@ -200,13 +259,32 @@ class TeaCacheCoefficientEstimator:
 
     def collect_from_prompt(self, prompt: str, **generate_kwargs):
         self.hook.start_collection()
+        sampling_params = OmniDiffusionSamplingParams(
+            num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
+            seed=generate_kwargs.get("seed", 42),
+        )
+
+        if self.transformer_type == "GlmImageTransformer2DModel":
+            height = generate_kwargs.get("height")
+            width = generate_kwargs.get("width")
+            if height is None:
+                height = self.pipeline.default_sample_size * self.pipeline.vae_scale_factor
+            if width is None:
+                width = self.pipeline.default_sample_size * self.pipeline.vae_scale_factor
+
+            sampling_params.height = height
+            sampling_params.width = width
+            sampling_params.extra_args["prior_token_ids"] = _build_glm_prior_token_ids(
+                self.pipeline,
+                sampling_params.seed,
+                height,
+                width,
+            )
+
         req = OmniDiffusionRequest(
             prompt=prompt,
             request_id="teacache-coefficient-estimator",
-            sampling_params=OmniDiffusionSamplingParams(
-                num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
-                seed=generate_kwargs.get("seed", 42),
-            ),
+            sampling_params=sampling_params,
         )
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -234,4 +312,12 @@ class TeaCacheCoefficientEstimator:
                 "No data collected for coefficient estimation. "
                 "Call collect_from_prompt() at least once before calling estimate()."
             )
-        return estimate_teacache_coefficients(self.collected_data, poly_order)
+        x = np.array(self.input_diffs, dtype=np.float64)
+        y = np.array(self.output_diffs, dtype=np.float64)
+
+        print("Data statistics:")
+        print(f"  Count: {len(x)}")
+        print(f"  Input Diffs (x): min={x.min():.4e}, max={x.max():.4e}, mean={x.mean():.4e}")
+        print(f"  Output Diffs (y): min={y.min():.4e}, max={y.max():.4e}, mean={y.mean():.4e}")
+
+        return np.polyfit(x, y, poly_order).tolist()
