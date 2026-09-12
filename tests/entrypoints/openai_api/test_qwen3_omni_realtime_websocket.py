@@ -175,7 +175,7 @@ async def _run_realtime_audio_roundtrip(
             if event_type == "session.created":
                 continue
 
-            if event_type == "response.audio.delta":
+            if event_type == "response.output_audio.delta":
                 delta_events += 1
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
@@ -195,7 +195,7 @@ async def _run_realtime_audio_roundtrip(
                 final_text = event.get("text", "") or "".join(text_chunks)
                 continue
 
-            if event_type == "response.audio.done":
+            if event_type == "response.output_audio.done":
                 break
 
             if event_type == "error":
@@ -315,7 +315,7 @@ def _server_vad_pcm16_input() -> bytes:
 def _assert_realtime_smoke(result: dict) -> None:
     out_pcm = result["output_pcm"]
     assert result["delta_events"] >= 1
-    assert out_pcm, "No output PCM from response.audio.delta"
+    assert out_pcm, "No output PCM from response.output_audio.delta"
     assert len(out_pcm) % 2 == 0
     assert len(out_pcm) >= 4096, "Output audio unexpectedly small"
     assert result["output_sample_rate"] > 0
@@ -388,7 +388,7 @@ class TestQwen3OmniRealtimeWebSocket:
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
     def test_long_audio_response_completes_async_chunk(self, omni_server) -> None:
-        """Regression for #6474: long async-chunk audio must emit response.audio.done."""
+        """Regression for #6474: long async-chunk audio must emit response.output_audio.done."""
         issue_6474_pcm16 = _synthetic_pcm16_input(
             phrase_text=ISSUE_6474_SYNTH_PHRASE_TEXT,
         )
@@ -450,8 +450,8 @@ class TestQwen3OmniRealtimeWebSocket:
             "input_audio_buffer.speech_stopped",
             "input_audio_buffer.committed",
             "response.created",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.done",
         ]
         input_item_ids: list[str] = []
@@ -459,7 +459,7 @@ class TestQwen3OmniRealtimeWebSocket:
         for events in turns:
             event_types = [event["type"] for event in events]
             for event_type in required_sequence:
-                if event_type != "response.audio.delta":
+                if event_type != "response.output_audio.delta":
                     assert event_types.count(event_type) == 1, event_types
             positions = [event_types.index(event_type) for event_type in required_sequence]
             assert positions == sorted(positions)
@@ -486,7 +486,7 @@ class TestQwen3OmniRealtimeWebSocket:
             output_pcm = b"".join(
                 base64.b64decode(event["delta"])
                 for event in events
-                if event["type"] == "response.audio.delta" and event.get("delta")
+                if event["type"] == "response.output_audio.delta" and event.get("delta")
             )
             assert output_pcm
             assert created["id"] == done["id"]

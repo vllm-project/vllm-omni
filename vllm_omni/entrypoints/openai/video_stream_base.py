@@ -21,8 +21,8 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
@@ -763,7 +763,7 @@ class OmniStreamingVideoHandler:
                         if b64:
                             await websocket.send_json(
                                 {
-                                    "type": "response.audio.delta",
+                                    "type": "response.output_audio.delta",
                                     "data": b64,
                                     "format": "wav",
                                 }
@@ -807,7 +807,7 @@ class OmniStreamingVideoHandler:
                     if b64:
                         await websocket.send_json(
                             {
-                                "type": "response.audio.delta",
+                                "type": "response.output_audio.delta",
                                 "data": b64,
                                 "format": "wav",
                             }
@@ -816,7 +816,7 @@ class OmniStreamingVideoHandler:
                     logger.exception("Failed to coalesce off-path audio")
 
             if audio_chunk_count > 0:
-                await websocket.send_json({"type": "response.audio.done"})
+                await websocket.send_json({"type": "response.output_audio.done"})
 
             response_text = "".join(text_parts)
             self.on_turn_complete(message_history, user_message, response_text)

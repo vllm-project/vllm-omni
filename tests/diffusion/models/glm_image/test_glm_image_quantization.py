@@ -399,15 +399,14 @@ class TestGlmImagePrepareModule:
         prepare = GlmImagePrepare(
             image_projector=projector,
             rope=rope,
-            patch_size=2,
         )
 
         # Test forward pass
         hidden_states = torch.randn(1, 16, 64, 64)  # [B, C, H, W]
         result = prepare(hidden_states)
 
-        assert len(result) == 5
-        hidden_out, rope_cos, rope_sin, height, width = result
+        assert len(result) == 3
+        hidden_out, rope_cos, rope_sin = result
         assert hidden_out.shape[0] == 1  # batch size
         assert hidden_out.shape[1] == 1024  # seq_len (32 * 32)
         assert hidden_out.shape[2] == 2560  # hidden_dim
