@@ -42,6 +42,12 @@ VIDEO_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
     num_frames=VIDEO_NUM_FRAMES,
     seed=42,
 )
+AUDIO_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
+    num_inference_steps=2,
+    num_frames=9,
+    frame_rate=24.0,
+    seed=42,
+)
 
 # Online extra_body for diffusion requests
 IMAGE_GEN_EXTRA_BODY = {
@@ -241,6 +247,16 @@ def run_and_validate_image_to_video_request(omni: Omni, check_t2v_divergence: bo
     )
 
 
+def run_and_validate_text_to_audio_request(omni: Omni):
+    outputs = omni.generate({"prompt": PROMPT}, AUDIO_GEN_SAMPLING_PARAMS)
+    assert len(outputs) == 1
+    audio = outputs[0].multimodal_output["audio"]
+    assert getattr(audio, "numel", lambda: len(audio))() > 0
+    sample_rate = outputs[0].multimodal_output.get("audio_sample_rate", outputs[0].multimodal_output.get("sr"))
+    assert sample_rate is not None
+    assert int(sample_rate) > 0
+
+
 def run_and_validate_determinism(omni: Omni, task_type: DiffusionTasks):
     """Checks for determinism, dispatching by task type."""
     if task_type == DiffusionTasks.TEXT_TO_IMAGE:
@@ -311,6 +327,25 @@ def _get_online_videos(responses: list[DiffusionResponse]) -> list:
     assert videos is not None
     assert len(videos) > 0
     return videos
+
+
+def run_and_validate_online_text_to_audio_request(server: OmniServer, client: OnlineOmniClient):
+    """Run and validate a text-to-audio request through the OpenAI endpoint."""
+    responses = client.send_audio_generate_http_request(
+        {
+            "model": server.model,
+            "input": PROMPT,
+            "response_format": "wav",
+            "num_frames": 9,
+            "frame_rate": 24.0,
+            "num_inference_steps": 2,
+            "seed": 42,
+        }
+    )
+    assert len(responses) == 1
+    response = responses[0]
+    assert response.status_code == 200
+    assert response.content
 
 
 ### Online task runners

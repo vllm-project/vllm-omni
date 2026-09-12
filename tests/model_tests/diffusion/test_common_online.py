@@ -22,6 +22,7 @@ from tests.model_tests.diffusion.task_runners import (
     run_and_validate_online_image_to_image_request,
     run_and_validate_online_image_to_video_request,
     run_and_validate_online_multi_output,
+    run_and_validate_online_text_to_audio_request,
     run_and_validate_online_text_to_image_request,
     run_and_validate_online_text_to_video_request,
 )
@@ -70,6 +71,8 @@ def test_online_on_supported_tasks(
                     run_and_validate_online_text_to_video_request(server, client)
                 elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
                     run_and_validate_online_image_to_video_request(server, client)
+                elif task_type == DiffusionTasks.TEXT_TO_AUDIO:
+                    run_and_validate_online_text_to_audio_request(server, client)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 

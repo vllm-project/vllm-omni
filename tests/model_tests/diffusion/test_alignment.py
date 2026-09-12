@@ -32,9 +32,6 @@ EXCLUDED_MODELS = [
     "WanDMDPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
-    # Dedicated unit coverage projects full LTX checkpoints onto an audio-only
-    # graph; a tiny checkpoint fixture is not available yet.
-    "LTX2TextToAudioPipeline",
     "LTX2DistilledOneStagePipeline",
     "LTX2DistilledTwoStagePipeline",
     "LTX2DistilledPipeline",

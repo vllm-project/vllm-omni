@@ -205,6 +205,21 @@ class TestRequestValidation:
         assert req.num_frames == 121
         assert req.frame_rate == 24.0
 
+    def test_ltx_audio_tuning_fields_are_accepted(self):
+        sigmas = [1.0, 0.5, 0.0]
+        req = OpenAICreateAudioGenerateRequest(
+            input="test",
+            audio_cfg_scale=7.0,
+            audio_stg_scale=0.0,
+            audio_rescale_scale=0.0,
+            sigmas=sigmas,
+        )
+
+        assert req.audio_cfg_scale == 7.0
+        assert req.audio_stg_scale == 0.0
+        assert req.audio_rescale_scale == 0.0
+        assert req.sigmas == sigmas
+
 
 # Constructor & Class Methods
 class TestConstructor:
@@ -340,6 +355,30 @@ class TestParameterWiring:
         sp = engine.generate.call_args[1]["sampling_params_list"][0]
         assert sp.extra_args["num_frames"] == 121
         assert sp.frame_rate == 24.0
+
+    @pytest.mark.asyncio
+    async def test_ltx_audio_tuning_fields_are_forwarded(self, server_and_engine):
+        server, engine = server_and_engine
+        sigmas = [1.0, 0.5, 0.0]
+        req = OpenAICreateAudioGenerateRequest(
+            input="test",
+            num_frames=121,
+            audio_cfg_scale=7.0,
+            audio_stg_scale=0.0,
+            audio_rescale_scale=0.0,
+            sigmas=sigmas,
+        )
+
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args == {
+            "num_frames": 121,
+            "audio_cfg_scale": 7.0,
+            "audio_stg_scale": 0.0,
+            "audio_rescale_scale": 0.0,
+            "sigmas": sigmas,
+        }
 
     @pytest.mark.asyncio
     async def test_audio_length_and_num_frames_are_both_forwarded(self, server_and_engine):

@@ -390,8 +390,7 @@ class LTX2AudioTransformerModel(nn.Module):
         for index, block in enumerate(self.transformer_blocks):
             perturbation_mask = perturbation_kwargs.get("audio_self_attention_mask")
             blocks = perturbation_kwargs.get("audio_self_attention_blocks")
-            routes_perturbation = getattr(block, "_routes_ltx2_audio_perturbation", False)
-            if not routes_perturbation and blocks is not None and index not in blocks:
+            if blocks is not None and index not in blocks:
                 perturbation_mask = None
             kwargs = {
                 "temb_audio": temb_audio,
@@ -401,8 +400,6 @@ class LTX2AudioTransformerModel(nn.Module):
                 "audio_self_attention_mask": audio_attention_mask,
                 "audio_self_attention_perturbation_mask": perturbation_mask,
             }
-            if routes_perturbation:
-                kwargs["audio_self_attention_perturbation_blocks"] = blocks
             audio_hidden_states = block(audio_hidden_states, audio_encoder_hidden_states, **kwargs)
 
         values = self.audio_scale_shift_table[None, None] + embedded_timestep[:, :, None]

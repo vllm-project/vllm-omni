@@ -104,6 +104,10 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 )
             if request.num_frames is not None:
                 audio_extra_args["num_frames"] = request.num_frames
+            for name in ("audio_cfg_scale", "audio_stg_scale", "audio_rescale_scale", "sigmas"):
+                value = getattr(request, name)
+                if value is not None:
+                    audio_extra_args[name] = value
             sampling_params_list[0].extra_args = audio_extra_args
             if request.frame_rate is not None:
                 sampling_params_list[0].frame_rate = request.frame_rate

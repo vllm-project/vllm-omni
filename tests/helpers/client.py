@@ -134,6 +134,7 @@ class HttpResponse:
     success: bool
     error_message: str | None = None
     json_body: dict[str, Any] | list[Any] | None = None
+    content: bytes = b""
 
 
 @dataclass
@@ -528,6 +529,7 @@ class OnlineOmniClient:
             success=ok,
             error_message=None if ok else (r.text[:8000] if r.text else None),
             json_body=payload,
+            content=r.content,
         )
 
     def send_health_http_request(

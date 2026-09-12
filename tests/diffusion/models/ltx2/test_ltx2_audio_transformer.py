@@ -147,6 +147,54 @@ def test_ltx_audio_transformer_forward_has_audio_only_signature(monkeypatch):
     assert torch.equal(prompt_timesteps[0], torch.full((2,), 500.0))
 
 
+def test_ltx_audio_transformer_routes_stg_mask_by_layer_without_block_opt_in(monkeypatch):
+    calls = []
+
+    class FakeBlock(nn.Module):
+        def __init__(self, **_kwargs):
+            super().__init__()
+
+        @property
+        def _routes_ltx2_audio_perturbation(self):
+            raise AssertionError("forward must not probe an undeclared routing extension")
+
+        def forward(self, audio_hidden_states, _audio_encoder_hidden_states, **kwargs):
+            calls.append(kwargs)
+            return audio_hidden_states
+
+    monkeypatch.setattr(ltx2_audio_transformer, "LTX2AudioTransformerBlock", FakeBlock)
+    model = LTX2AudioTransformerModel(
+        audio_in_channels=4,
+        audio_out_channels=4,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=4,
+        audio_cross_attention_dim=8,
+        caption_channels=8,
+        num_layers=2,
+        use_prompt_embeddings=False,
+    )
+    audio = torch.randn(1, 3, 4)
+    context = torch.randn(1, 2, 8)
+    perturbation_mask = torch.ones(1, 3)
+
+    model(
+        audio_hidden_states=audio,
+        audio_encoder_hidden_states=context,
+        audio_timestep=torch.full((1, 3), 500.0),
+        audio_num_frames=3,
+        attention_kwargs={
+            "ltx_perturbation_kwargs": {
+                "audio_self_attention_mask": perturbation_mask,
+                "audio_self_attention_blocks": (1,),
+            }
+        },
+    )
+
+    assert calls[0]["audio_self_attention_perturbation_mask"] is None
+    assert calls[1]["audio_self_attention_perturbation_mask"] is perturbation_mask
+    assert all("audio_self_attention_perturbation_blocks" not in kwargs for kwargs in calls)
+
+
 def test_ltx_audio_static_conditioning_matches_raw_path_and_is_request_scoped(monkeypatch):
     block_calls = []
 
