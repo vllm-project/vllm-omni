@@ -56,6 +56,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ovis_image",
         "OvisImagePipeline",
     ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
     "WanPipeline": (
         "wan2_2",
         "pipeline_wan2_2",
