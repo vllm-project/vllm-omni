@@ -105,6 +105,9 @@ smoke-test magnitudes, not a benchmark.
 ```bash
 uv pip install -e .
 # Includes soundfile, onnxruntime, x-transformers, einops via requirements.
+pip install s3tokenizer
+# Speech tokenizer used to extract tokens from reference audio. Not part of the
+# base install or of the published vllm/vllm-omni Docker image.
 ```
 
 Download the model snapshot:
