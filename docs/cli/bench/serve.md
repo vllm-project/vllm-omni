@@ -1,10 +1,19 @@
 # vLLM-Omni Benchmark CLI Guide
 
-The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
+The `vllm bench serve --omni` command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
 
 vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
+
+Currently these endpoints are available for `vllm bench serve --omni`:
+
+| Endpoint | Example models |
+| --- | --- |
+| /v1/chat/completions | Qwen3-Omni-30B-A3B-Instruct<br>BAGEL-7B-MoT<br>... |
+| /v1/images/edits | HunyuanImage-3.0-Instruct<br>... |
+
+ More endpoints are on the way.
 
 ## Basic Parameter Description
 
@@ -60,7 +69,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
                     '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
 - `--print-stage`
-Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
+Control whether or not per-stage benchmark metrics are printed. Disabled by default.
 
 - `--save-result`
 Specify to save benchmark results to a json file
@@ -596,18 +605,16 @@ Median AUDIO_RTF:                        0.26
 P99 AUDIO_RTF:                           0.27
 ```
 
-Explanation:
+Additional explanation of stage wise metrics:
 
 - stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
 
-- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to
-  the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage
-  for easier mapping.
+- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage for easier mapping.
 
-- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the
-  number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
+- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
 
-- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the
-  name ITL in text stage for easier mapping.
+- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the name ITL in text stage for easier mapping.
+
+Which block is printed (Text / Audio / Internal Stream) follows `_stage_modality_flags(final_output_type, output_unit_type)`. Internal-stream rows (TTFC/TPOP/ICL) depend on a streaming `output_unit_type` (often `stream`) and non-empty timing samples; see [modality troubleshooting](../../design/feature/multi_stage_benchmark.md#a-stage-appears-but-modality-specific-metrics-are-missing).
 
 </details>
