@@ -5,6 +5,9 @@ audio, or both. `kimi_audio.yaml` collects AR output before acoustic decoding;
 `kimi_audio_async_chunk.yaml` transfers semantic codes while AR is generating.
 Both use the same input path and acoustic networks.
 
+For direct Python inference without an HTTP server, see the
+[offline example](../../offline_inference/kimi_audio/README.md).
+
 Both deployments use the official inference example's audio sampling settings:
 `audio_temperature=0.8` and `audio_top_k=10`, with greedy text sampling.
 The two streams have separate settings; setting the text `temperature` to zero
