@@ -159,6 +159,84 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_h3_vsa_bhsd"):
 _fastvideo_h3_vsa_bhsd_op = torch.ops.vllm_omni.fastvideo_h3_vsa_bhsd
 
 
+def _flashinfer_h3_vsa_bshd_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_map: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Dispatch H3's blk64 VSA contract to the native FlashInfer kernel."""
+    from fastvideo_kernel.triton_kernels.index import map_to_index
+
+    q2k_idx, q2k_num = map_to_index(block_map)
+    q2k_idx = q2k_idx.to(torch.int32).contiguous()
+    q2k_num = q2k_num.to(torch.int32).contiguous()
+    block_sizes = variable_block_sizes.to(torch.int32).contiguous()
+
+    major, minor = torch.cuda.get_device_capability(query.device)
+    if (major, minor) in ((10, 0), (10, 3)):
+        if query.dtype != torch.bfloat16:
+            raise ValueError(f"FlashInfer SM100/SM103 blk64 VSA requires bfloat16, got {query.dtype}")
+        from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import bsa_attn_sm100_blk64_fwd
+
+        kernel = bsa_attn_sm100_blk64_fwd
+        kernel_name = "vsa_sm100_blk64_cuda"
+    elif (major, minor) in ((12, 0), (12, 1)):
+        from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import bsa_attn_sm120_blk64_fwd
+
+        kernel = bsa_attn_sm120_blk64_fwd
+        kernel_name = "vsa_sm120_blk64_cute_dsl"
+    else:
+        raise RuntimeError(
+            f"FlashInfer H3 blk64 VSA supports SM100/SM103 and SM120/SM121; current device is SM{major}{minor}"
+        )
+
+    logger.info_once("FASTVIDEO_VSA H3 compute kernel: FlashInfer %s", kernel_name)
+    output, _ = kernel(
+        query,
+        key,
+        value,
+        q2k_idx,
+        int(q2k_idx.shape[-1]),
+        block_sizes=block_sizes,
+        q2k_block_nums=q2k_num,
+        softmax_scale=softmax_scale,
+        return_lse=False,
+    )
+    return output
+
+
+if not hasattr(torch.ops.vllm_omni, "flashinfer_h3_vsa_bshd"):
+
+    @torch.library.custom_op("vllm_omni::flashinfer_h3_vsa_bshd", mutates_args=())
+    def _flashinfer_h3_vsa_bshd_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_map: torch.Tensor,
+        variable_block_sizes: torch.Tensor,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        return _flashinfer_h3_vsa_bshd_impl(
+            query,
+            key,
+            value,
+            block_map,
+            variable_block_sizes,
+            softmax_scale,
+        )
+
+    @_flashinfer_h3_vsa_bshd_op.register_fake
+    def _(query, key, value, block_map, variable_block_sizes, softmax_scale):
+        del key, value, block_map, variable_block_sizes, softmax_scale
+        return torch.empty_like(query)
+
+
+_flashinfer_h3_vsa_bshd_op = torch.ops.vllm_omni.flashinfer_h3_vsa_bshd
+
+
 @functools.lru_cache(maxsize=32)
 def _get_tile_partition_indices(
     dit_seq_shape: tuple[int, int, int],
@@ -389,6 +467,11 @@ class FastVideoVSAImpl(AttentionImpl):
         self.min_seq_len = int(backend_kwargs.get("min_seq_len", self.block_elements * 2))
         self.fallback_on_error = bool(backend_kwargs.get("fallback_on_error", True))
         self.disable_when_sp_active = bool(backend_kwargs.get("disable_when_sp_active", True))
+        self.h3_kernel_backend = str(backend_kwargs.get("h3_kernel_backend", "fastvideo")).lower()
+        if self.h3_kernel_backend not in {"fastvideo", "flashinfer"}:
+            raise ValueError(
+                f"FASTVIDEO_VSA h3_kernel_backend must be 'fastvideo' or 'flashinfer', got {self.h3_kernel_backend!r}"
+            )
 
         self.sdpa_fallback = SDPAImpl(
             num_heads=num_heads,
@@ -536,10 +619,10 @@ class FastVideoVSAImpl(AttentionImpl):
             prefix_segments, video_shape, query.device
         )
         logical_blocks = int(sizes.numel())
-        # The native sm100a kernel assigns pairs of query blocks to CTAs. Its
-        # contract requires an even block count; the synthetic partner is
-        # transport-only and is removed before returning.
-        pair_pad = logical_blocks % 2
+        # FastVideo's optional native sm100a kernel assigns pairs of query
+        # blocks to CTAs. FlashInfer's blk64 kernels do not require the
+        # transport-only partner.
+        pair_pad = logical_blocks % 2 if self.h3_kernel_backend == "fastvideo" else 0
         kernel_blocks = logical_blocks + pair_pad
         target_shape = (query.shape[0], kernel_blocks * 64, query.shape[2], query.shape[3])
         q_tiled = torch.zeros(target_shape, device=query.device, dtype=query.dtype)
@@ -560,7 +643,7 @@ class FastVideoVSAImpl(AttentionImpl):
 
         logger.info_once(
             "FASTVIDEO_VSA H3 routing: seq_len=%d, prefix_segments=%s, video_shape=%s, "
-            "prefix_blocks=%d, video_blocks=%d, topk=%d, kernel_blocks=%d",
+            "prefix_blocks=%d, video_blocks=%d, topk=%d, kernel_blocks=%d, compute_backend=%s",
             query.shape[1],
             prefix_segments,
             video_shape,
@@ -568,15 +651,27 @@ class FastVideoVSAImpl(AttentionImpl):
             video_blocks,
             min(self.topk, video_blocks),
             kernel_blocks,
+            self.h3_kernel_backend,
         )
-        output = _fastvideo_h3_vsa_bhsd_op(
-            q_tiled.contiguous(),
-            k_tiled.contiguous(),
-            v_tiled.contiguous(),
-            block_map.contiguous(),
-            kernel_sizes.contiguous(),
-            logical_blocks,
-        )[:, : logical_blocks * 64]
+        if self.h3_kernel_backend == "flashinfer":
+            output = _flashinfer_h3_vsa_bshd_op(
+                q_tiled.contiguous(),
+                k_tiled.contiguous(),
+                v_tiled.contiguous(),
+                block_map.contiguous(),
+                kernel_sizes.contiguous(),
+                self.softmax_scale,
+            )
+        else:
+            output = _fastvideo_h3_vsa_bhsd_op(
+                q_tiled.contiguous(),
+                k_tiled.contiguous(),
+                v_tiled.contiguous(),
+                block_map.contiguous(),
+                kernel_sizes.contiguous(),
+                logical_blocks,
+            )
+        output = output[:, : logical_blocks * 64]
 
         if gate is not None:
             gate_tiled = torch.zeros_like(q_tiled[:, : logical_blocks * 64])
@@ -623,7 +718,7 @@ class FastVideoVSAImpl(AttentionImpl):
                 # A CUDA fault poisons the process context; attempting SDPA
                 # afterwards obscures the original kernel failure and cannot
                 # recover the request.
-                if isinstance(exc, torch.AcceleratorError):
+                if self.h3_kernel_backend == "flashinfer" or isinstance(exc, torch.AcceleratorError):
                     raise
                 if not self.fallback_on_error:
                     raise
