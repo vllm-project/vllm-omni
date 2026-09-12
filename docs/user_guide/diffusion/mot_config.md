@@ -28,7 +28,7 @@ and their optimal Triton tile configurations:
 
 Config loading order (3-tier, see ops/mot_gemm.py):
     1. $VLLM_TUNED_CONFIG_FOLDER/<filename>  (env override)
-    2. This directory: vllm_omni/diffusion/layers/mot/configs/<filename>
+    2. This directory: vllm_omni/diffusion/models/bagel/mot/configs/<filename>
     3. Conservative default config (compiles everywhere, sub-optimal perf)
 
 If no config file matches the current device, a warning is printed with
@@ -39,7 +39,7 @@ To generate configs for your hardware:
     python benchmarks/kernels/mot_linear_benchmarks.py \
         --model ByteDance-Seed/BAGEL-7B-MoT \
         --tp-size 1 --dtype w16a16 --tune \
-        --save-dir vllm_omni/diffusion/layers/mot/configs/
+        --save-dir vllm_omni/diffusion/models/bagel/mot/configs/
 
 For multi-GPU tuning (uses Ray for parallel search):
 

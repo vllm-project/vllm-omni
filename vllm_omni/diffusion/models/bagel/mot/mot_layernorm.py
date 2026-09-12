@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: N803, E741
 """Mixture-of-Tokens (MoT) RMS Normalization layer.
 
@@ -68,7 +71,7 @@ class MoTRMSNorm(CustomOp):
             return ir.ops.rms_norm(x, self.weight.data, self.variance_epsilon)
 
         # gen mode – fused MoT Triton kernel
-        from vllm_omni.diffusion.layers.mot.ops.mot_rms_norm import (
+        from vllm_omni.diffusion.models.bagel.mot.ops.mot_rms_norm import (
             mot_rms_norm,
         )
 
