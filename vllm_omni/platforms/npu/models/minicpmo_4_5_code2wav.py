@@ -22,6 +22,7 @@ _original_build_backend = None
 _original_estimator_step = None
 _original_setup_batch = None
 _original_decode_batch = None
+_original_decode_ragged_batch = None
 _backend_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
 _ENABLE_KEY = "code2wav_enable_npu_graph"
 _MAX_GRAPHS_KEY = "code2wav_max_npu_graphs"
@@ -206,12 +207,35 @@ def _patched_decode_batch(
         )
 
 
+def _patched_decode_ragged_batch(
+    self,
+    tokens,
+    features,
+    states,
+    *,
+    last_chunks,
+):
+    assert _original_decode_ragged_batch is not None
+    device = tokens[0].device if tokens else features.speech_tokens.device
+    with _flow_execution_context(
+        device,
+        require_math=self in _backend_graph_runners,
+    ):
+        return _original_decode_ragged_batch(
+            self,
+            tokens,
+            features,
+            states,
+            last_chunks=last_chunks,
+        )
+
+
 def _patched_build_backend(self) -> None:
     if self.backend is not None:
         return
 
     extra = self._extra_config()
-    if bool(extra.get(_BF16_ATTENTION_CACHE_KEY, False)):
+    if _config_bool(extra.get(_BF16_ATTENTION_CACHE_KEY), False):
         raise ValueError(
             "MiniCPM-o Code2Wav code2wav_bfloat16_attention_cache is "
             "currently supported only on CUDA; leave it unset or false on NPU."
@@ -257,7 +281,8 @@ def _patched_build_backend(self) -> None:
 def apply_minicpmo_4_5_code2wav_patch() -> None:
     """Patch the generic Code2Wav backend builder with Ascend acceleration."""
     global _PATCHED, _original_build_backend
-    global _original_decode_batch, _original_estimator_step, _original_setup_batch
+    global _original_decode_batch, _original_decode_ragged_batch
+    global _original_estimator_step, _original_setup_batch
     if _PATCHED:
         return
 
@@ -272,10 +297,12 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     _original_estimator_step = BatchedToken2Wav._estimator_step
     _original_setup_batch = BatchedToken2Wav.setup_batch
     _original_decode_batch = BatchedToken2Wav.decode_batch
+    _original_decode_ragged_batch = BatchedToken2Wav.decode_ragged_batch
 
     MiniCPMO45Code2Wav._build_backend = _patched_build_backend  # type: ignore[method-assign]
     BatchedToken2Wav._estimator_step = _patched_estimator_step  # type: ignore[method-assign]
     BatchedToken2Wav.setup_batch = _patched_setup_batch  # type: ignore[method-assign]
     BatchedToken2Wav.decode_batch = _patched_decode_batch  # type: ignore[method-assign]
+    BatchedToken2Wav.decode_ragged_batch = _patched_decode_ragged_batch  # type: ignore[method-assign]
     _PATCHED = True
     logger.debug("Applied NPU patch for MiniCPM-o 4.5 Code2Wav")
