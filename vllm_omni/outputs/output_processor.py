@@ -95,6 +95,10 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        # Offset of detokenized tokens already sent under stream_interval > 1.
+        # Upstream RequestState no longer carries this member, so the
+        # stream-interval path in make_request_output() owns it here.
+        self.sent_tokens_offset: int = 0
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)

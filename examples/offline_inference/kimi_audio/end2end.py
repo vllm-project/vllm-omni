@@ -16,7 +16,9 @@ from vllm_omni.model_executor.models.kimi_audio.audio_processing import prepare_
 
 def main():
     parser = FlexibleArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="moonshotai/Kimi-Audio-7B-Instruct", help="Model ID or local checkpoint directory")
+    parser.add_argument(
+        "--model", default="moonshotai/Kimi-Audio-7B-Instruct", help="Model ID or local checkpoint directory"
+    )
     parser.add_argument("--glm-tokenizer-path", help="Optional local glm-4-voice-tokenizer snapshot")
     parser.add_argument(
         "--deploy-config",
@@ -88,7 +90,9 @@ def main():
                     rate = rate[-1] if isinstance(rate, list) else rate
                     sample_rate = int(torch.as_tensor(rate).item())
                     output_path = args.output_dir / f"audio-{audio_index}.wav"
-                    sf.write(output_path, audio.detach().float().cpu().reshape(-1).numpy(), sample_rate, subtype="PCM_16")
+                    sf.write(
+                        output_path, audio.detach().float().cpu().reshape(-1).numpy(), sample_rate, subtype="PCM_16"
+                    )
                     audio_index += 1
                     print(f"Audio: {output_path} ({sample_rate} Hz)")
         text_path = args.output_dir / "text.txt"

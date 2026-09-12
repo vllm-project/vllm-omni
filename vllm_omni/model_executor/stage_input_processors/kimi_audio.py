@@ -92,7 +92,7 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
         raise OmniClientError(str(exc)) from None
 
     payload = deserialize_payload(msgspec.convert(info["kimi_audio_input"], AdditionalInformationPayload))
-    special = KimiAudioSpecialTokens(**payload["special_tokens"])
+    special = KimiAudioSpecialTokens(**payload["meta"]["special_tokens"])
     # Only blanks are returned to the scheduler before completion, then one
     # msg_end. True text/audio IDs stay in the model's two histories, so the
     # native tokenizer's different EOS cannot prematurely end either stream.
@@ -135,12 +135,13 @@ def kimi_audio_to_decoder(
     """
     wire = prompt["model_intermediate_buffer"]["kimi_audio_input"]
     config = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
-    if config["output_type"] != "both":
+    meta = config["meta"]
+    if meta["output_type"] != "both":
         raise OmniClientError(
             "Kimi-Audio output_type='text' cannot feed the audio decoder; "
             "use output_type='both' for audio output or select only the text stage"
         )
-    offset, vocab_size = config["audio_token_offset"], config["audio_vocab_size"]
+    offset, vocab_size = meta["audio_token_offset"], meta["audio_vocab_size"]
     inputs = []
     for source in source_outputs:
         if not source.finished:
@@ -197,11 +198,12 @@ def kimi_audio_to_decoder_async_chunk(
         if "kimi_audio" not in state:
             wire = request.model_intermediate_buffer["kimi_audio_input"]
             config = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
-            if config["output_type"] != "both":
+            meta = config["meta"]
+            if meta["output_type"] != "both":
                 raise ValueError("Kimi-Audio audio streaming requires output_type='both'")
             state["kimi_audio"] = {
-                "offset": config["audio_token_offset"],
-                "vocab_size": config["audio_vocab_size"],
+                "offset": meta["audio_token_offset"],
+                "vocab_size": meta["audio_vocab_size"],
                 "chunk_seq": 0,
             }
         state = state["kimi_audio"]

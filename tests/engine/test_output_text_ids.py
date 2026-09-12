@@ -8,6 +8,7 @@ import pytest
 import torch
 from tokenizers import Tokenizer, decoders, models
 from transformers import PreTrainedTokenizerFast
+from vllm.outputs import CompletionOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.detokenizer import SlowIncrementalDetokenizer
@@ -62,7 +63,7 @@ def test_visible_text_delta_preserves_tail_and_scheduler_output(text_processor, 
     # Cover both a final step with text and audio continuing after text ends.
     # An empty delta must never fall back to decoding the scheduler's blank.
     chunks = [[1], [2, 3]] if final_text else [[1], [2, 3], []]
-    emitted = []
+    emitted: list[CompletionOutput] = []
     for index, ids in enumerate(chunks):
         core = OmniEngineCoreOutput(
             request_id="text",

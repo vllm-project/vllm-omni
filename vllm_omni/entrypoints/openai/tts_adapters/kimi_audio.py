@@ -7,7 +7,7 @@ conditioning. Verbatim fidelity requires validation with pretrained weights.
 Multimodal chat requests belong to a separate serving boundary.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
@@ -33,6 +33,12 @@ class KimiAudioAdapter(ARTTSAdapter):
     def stage_serves_speech(cls, model_stage: str | None, all_stage_keys: frozenset[str]) -> bool:
         return model_stage == "kimi_audio_ar" and "kimi_audio_decoder" in all_stage_keys
 
+    def _engine_client(self) -> Any:
+        client = self.ctx.engine_client
+        if client is None:
+            raise ValueError("Kimi-Audio speech serving requires an AR engine client")
+        return client
+
     def _load_codec_frame_rate(self) -> float:
         # Kimi uses the GLM frame rate, not a speech_tokenizer/config.json.
         return SAMPLE_RATE / SAMPLES_PER_TOKEN
@@ -40,7 +46,7 @@ class KimiAudioAdapter(ARTTSAdapter):
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input.strip():
             return "Kimi-Audio requires nonempty input text"
-        if request.is_streaming() and not getattr(self.ctx.engine_client.model_config, "async_chunk", False):
+        if request.is_streaming() and not getattr(self._engine_client().model_config, "async_chunk", False):
             return "Kimi-Audio streaming speech requires the kimi_audio_async_chunk.yaml deployment"
         if request.voice not in (None, "default"):
             return "Kimi-Audio has no selectable voices; omit voice or use 'default'"
@@ -83,8 +89,9 @@ class KimiAudioAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        model_config = self.ctx.engine_client.model_config
-        tokenizer = self.ctx.engine_client.renderer.get_tokenizer()
+        engine_client = self._engine_client()
+        model_config = engine_client.model_config
+        tokenizer = engine_client.renderer.get_tokenizer()
         # Like Step-Audio2, explicitly request reading rather than presenting
         # the input as a question for a conversational model to answer.
         messages = [

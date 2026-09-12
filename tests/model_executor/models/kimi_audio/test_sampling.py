@@ -43,7 +43,8 @@ def test_official_sampling_distributions_and_stream_trace(case, monkeypatch):
 
     request_generator = generator
     monkeypatch.setattr(torch, "multinomial", replay_draw)
-    text_history, audio_history = [], []
+    text_history: list[int] = []
+    audio_history: list[int] = []
     text_finished = False
     for index, expected_step in enumerate(expected["steps"]):
         logits = []

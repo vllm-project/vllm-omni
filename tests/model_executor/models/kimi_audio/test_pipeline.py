@@ -104,9 +104,7 @@ def test_deploy_admission_and_stage_bridge(output_type, final_stages, deploy_nam
             is_finished=lambda: False,
         )
         for code in range(60):
-            chunk = bridge(
-                transfer, {"codes": {"audio": torch.tensor([builder.audio_token_offset + code])}}, request
-            )
+            chunk = bridge(transfer, {"codes": {"audio": torch.tensor([builder.audio_token_offset + code])}}, request)
             if code == 30:
                 assert chunk.codes.audio.tolist() == [[i] for i in range(30)]
                 assert not chunk.meta.stream_finished.item()

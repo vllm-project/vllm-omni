@@ -101,10 +101,12 @@ def prepare_kimi_audio_inputs(
     placeholders = {}
     mm_audio = []
     payload = {
-        "output_type": output_type,
-        "special_tokens": asdict(prompt_builder.tokens),
-        "audio_token_offset": prompt_builder.audio_token_offset,
-        "audio_vocab_size": prompt_builder.audio_vocab_size,
+        "meta": {
+            "output_type": output_type,
+            "special_tokens": asdict(prompt_builder.tokens),
+            "audio_token_offset": prompt_builder.audio_token_offset,
+            "audio_vocab_size": prompt_builder.audio_vocab_size,
+        }
     }
     for index in sorted(audio_inputs):
         waveform = audio_inputs[index]

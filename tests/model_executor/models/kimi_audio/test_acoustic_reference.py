@@ -10,6 +10,7 @@ import json
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 import torch
@@ -64,7 +65,7 @@ def test_internal_streaming_acoustics_match_official(acoustic_files, monkeypatch
     pytest.importorskip("torchdyn")
     pytest.importorskip("timm")
     reference, tensors, fm_dir, vocoder_dir = acoustic_files
-    flash = ModuleType("flash_attn")
+    flash: Any = ModuleType("flash_attn")
     flash.flash_attn_varlen_func = cpu_flash_attention
     flash.flash_attn_varlen_qkvpacked_func = None  # Not used by the streaming path.
     monkeypatch.setitem(sys.modules, "flash_attn", flash)

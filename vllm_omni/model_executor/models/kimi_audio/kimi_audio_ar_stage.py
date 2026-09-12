@@ -798,6 +798,7 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
             if wire is None:
                 raise ValueError("Missing Kimi-Audio prepared input; use prepare_kimi_audio_inputs")
             payload = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
+            meta = payload["meta"]
             audio_ids = payload["audio_token_ids"]
             text_ids = payload["text_token_ids"]
             if not len(audio_ids) == len(text_ids) == prompt_len:
@@ -809,17 +810,17 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
                 last_end = stop
             update["kimi_audio_prompt"] = payload
             if generation is None:
-                KimiAudioSpecialTokens(**payload["special_tokens"])
-                if any(not 0 <= value < self.config.vocab_size for value in payload["special_tokens"].values()):
+                KimiAudioSpecialTokens(**meta["special_tokens"])
+                if any(not 0 <= value < self.config.vocab_size for value in meta["special_tokens"].values()):
                     raise ValueError("Kimi-Audio special tokens exceed the checkpoint vocabulary")
-                if payload["output_type"] not in ("text", "both"):
+                if meta["output_type"] not in ("text", "both"):
                     raise ValueError("Kimi-Audio requires output_type text/both")
                 generation = {
-                    "special_tokens": payload["special_tokens"],
+                    "special_tokens": meta["special_tokens"],
                     "seed": info_dict.get("_omni_seed"),
                     "max_tokens": info_dict.get("_omni_max_tokens"),
                     "prompt_len": prompt_len,
-                    "output_type": payload["output_type"],
+                    "output_type": meta["output_type"],
                     "text_history": [],
                     "audio_history": [],
                     "scheduler_history": [],

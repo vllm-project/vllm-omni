@@ -22,7 +22,7 @@ def precompute_freqs_cis(
     print(f"using rope base theta = {theta}, interpolation factor = {interpolation_factor}")
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
 
-    # ROPE type-A extention
+    # ROPE type-A extension
     # we choose to use interpolation rather than extrapolation for better position encoding
     # for scale purposes, t should be a float tensor
     t = torch.arange(end, device=freqs.device).float()

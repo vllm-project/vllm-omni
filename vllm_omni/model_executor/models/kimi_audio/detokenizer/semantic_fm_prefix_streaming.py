@@ -28,7 +28,6 @@ class StreamingSemanticFMWrapper:
         mel_std=None,
         device: torch.device = torch.device("cpu"),
     ) -> None:
-
         if use_cfg:
             raise ValueError("CFG is not supported by Kimi's streaming acoustic decoder")
         self.dtype = torch.bfloat16
@@ -137,7 +136,6 @@ class StreamingSemanticFMWrapper:
         max_kv_cache_tokens=900,
         use_cfg=False,
     ):
-
         # open yaml file
         with open(model_config) as f:
             config = yaml.safe_load(f)

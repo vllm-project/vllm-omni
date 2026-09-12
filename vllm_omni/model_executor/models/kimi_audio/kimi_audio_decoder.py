@@ -46,7 +46,7 @@ class KimiAudioDecoder(nn.Module):
         config = vllm_config.model_config.hf_config
         self.audio_vocab_size = config.vocab_size - config.kimia_token_offset
         self.detokenizer = None
-        self._streams: dict[str, tuple["PrefixStreamingFlowMatchingDetokenizer", int]] = {}
+        self._streams: dict[str, tuple[PrefixStreamingFlowMatchingDetokenizer, int]] = {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # This stage owns four acoustic files, not the root LLM checkpoint.

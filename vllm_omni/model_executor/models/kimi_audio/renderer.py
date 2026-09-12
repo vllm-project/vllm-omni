@@ -54,7 +54,9 @@ class KimiAudioRenderer(BaseRenderer):
         response_format = params.response_format
         if response_format is not None:
             format_type = (
-                response_format.get("type") if isinstance(response_format, dict) else getattr(response_format, "type", None)
+                response_format.get("type")
+                if isinstance(response_format, dict)
+                else getattr(response_format, "type", None)
             )
             if format_type != "text":
                 raise ValueError("Kimi-Audio does not support structured response formats")
@@ -88,7 +90,9 @@ class KimiAudioRenderer(BaseRenderer):
                 if part["type"] == "text" and not isinstance(part.get("text"), str):
                     raise ValueError("Kimi-Audio text content must be a string")
                 if part.get("uuid") is not None:
-                    raise ValueError("Kimi-Audio uses audio content for caching; supply audio data without uuid overrides")
+                    raise ValueError(
+                        "Kimi-Audio uses audio content for caching; supply audio data without uuid overrides"
+                    )
         return output_type
 
     def _build_prompt(self, conversation, mm_data, output_type):
@@ -173,8 +177,7 @@ class KimiAudioRenderer(BaseRenderer):
             raise ValueError("Kimi-Audio cannot truncate or pad one stream independently of the other")
         if params.max_output_tokens_param == "max_completion_tokens":
             raise ValueError(
-                "Kimi-Audio chat uses max_tokens; "
-                "the current Omni stage override does not read max_completion_tokens"
+                "Kimi-Audio chat uses max_tokens; the current Omni stage override does not read max_completion_tokens"
             )
         if params.needs_detokenization or params.return_token_offsets:
             raise ValueError("Kimi-Audio's scheduler IDs do not support prompt echo or character offsets")
