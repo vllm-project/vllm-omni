@@ -142,6 +142,28 @@ You can configure per-stage sampling parameters for multi-stage models.
 > Do not combine `frame` with `first_frame` or `last_frame`, and do not combine any frame input with
 > `references`. Task routing is automatic from which inputs you connect.
 
+> For MiniMax-H3 Fun ControlNet Union, connect a **MiniMax-H3 Control** node. It cannot be combined with `frame`, `first_frame`/`last_frame`, or `references` either.
+
+#### MiniMax-H3 Fun ControlNet Union
+
+The **MiniMax-H3 Control** node conditions generation on a prepared control video, and supports `canny`, `depth`, `hed`, `mlsd`, `pose` and `inpaint`. Connect its `control` output to **Generate Video**.
+
+| Input | Type | Notes |
+| --- | --- | --- |
+| `control_type` | enum | Which conditioning mode to request |
+| `strength` | `FLOAT` | Conditioning strength for the selected mode, 0-10, default 1 |
+| `control_video` | `VIDEO` | Required for the five structure modes, optional for `inpaint` |
+| `source_video` | `VIDEO` | Optional original video; requires a mask |
+| `mask` | `MASK` | Static mask for the whole clip; white/1 marks what to regenerate |
+| `mask_video` | `VIDEO` | Per-frame mask; mutually exclusive with `mask` |
+
+The server must be started with the Fun ControlNet checkpoint, otherwise it rejects the request with the control upload types it does accept.
+
+> [!TIP]
+> The node does not run any preprocessor. Build the control video in the workflow, for example `SDPose Keypoint Extractor` -> `SDPose Draw Keypoints` -> `Create Video` for `pose`, and pass an `IMAGE` batch through **Create Video** before connecting it.
+>
+> `inpaint` needs a mask. `source_video` without a mask, a structure mode without `control_video`, or `mask` together with `mask_video` are rejected before the request is sent.
+
 For MiniMax-H3 Ref2VA, **Video References** accepts up to 9 images (`image_1`–`image_9`),
 3 videos (`video_1`–`video_3`), and 3 audio clips (`audio_1`–`audio_3`), with at most
 12 connected inputs in total. Any mixture containing at least one image or video
@@ -308,6 +330,7 @@ Node tints and the title-bar mark are applied in `web/main.js`, keyed off each n
 ## Limitation and Non-Goals
 
 - Single server mode only. No automatic load balancing or failover.
+- Control conditioning is prepared client-side. The nodes upload prepared control, source and mask media; they neither run preprocessors nor load ControlNet weights in the ComfyUI process.
 - Features set is bounded to vLLM-Omni's online service capability, including
     - The types of models supported in online mode,
     - The types of sampling parameters supported in the online mode,
