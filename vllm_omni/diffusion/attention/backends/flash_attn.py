@@ -19,6 +19,45 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+if not hasattr(torch.ops.vllm_omni, "fa4_dense_attention"):
+
+    @torch.library.custom_op("vllm_omni::fa4_dense_attention", mutates_args=())
+    def _fa4_dense_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        softmax_scale: float,
+        causal: bool,
+        deterministic: bool,
+    ) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_func
+
+        if flash_attn_func is None:
+            raise RuntimeError("CuTe FlashAttention-4 is unavailable")
+        kwargs = {
+            "causal": causal,
+            "softmax_scale": softmax_scale,
+        }
+        if deterministic:
+            kwargs["deterministic"] = True
+        out = flash_attn_func(query, key, value, **kwargs)
+        return out[0] if isinstance(out, tuple) else out
+
+    @_fa4_dense_attention_op.register_fake
+    def _fa4_dense_attention_fake(
+        query,
+        key,
+        value,
+        softmax_scale,
+        causal,
+        deterministic,
+    ):
+        return torch.empty_like(query)
+
+
+_fa4_dense_attention_op = torch.ops.vllm_omni.fa4_dense_attention
+
+
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
@@ -388,6 +427,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
+            IS_FLASH_ATTN_4,
             flash_attn_func,
             flash_attn_varlen_func,
         )
@@ -457,6 +497,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         if flash_attn_func is not None:
+            if IS_FLASH_ATTN_4:
+                return _fa4_dense_attention_op(
+                    query,
+                    key,
+                    value,
+                    self.softmax_scale,
+                    self.causal,
+                    self.fa_deterministic,
+                )
             fa_kwargs = {
                 "causal": self.causal,
                 "softmax_scale": self.softmax_scale,
