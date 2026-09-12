@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
 import torch
+from msgspec.structs import replace
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
@@ -94,6 +95,10 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        # Offset of detokenized tokens already sent under stream_interval > 1.
+        # Upstream RequestState no longer carries this member, so the
+        # stream-interval path in make_request_output() owns it here.
+        self.sent_tokens_offset: int = 0
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
@@ -670,6 +675,27 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
                     mm_type = getattr(eco, "output_type", None) or default_mm_type
+                    text_ids = mm_output.get("ids.output") if isinstance(mm_output, Mapping) else None
+                    if text_ids is not None:
+                        # Some dual-stream models schedule control IDs while
+                        # emitting visible text separately(e.g. kimi audio).
+                        # This client-side view must not change the scheduler's
+                        # token history.
+                        if (
+                            not isinstance(text_ids, torch.Tensor)
+                            or text_ids.ndim != 1
+                            or (text_ids.numel() > 0 and text_ids.dtype not in (torch.int32, torch.int64))
+                        ):
+                            raise ValueError("ids.output must be a one-dimensional integer tensor")
+                        if text_ids.numel() == 0:
+                            # The runner tensorizes [] with an inferred float
+                            # dtype. Keep empty deltas from promoting token IDs
+                            # to floats during multimodal accumulation.
+                            mm_output = dict(mm_output)
+                            mm_output["ids.output"] = text_ids.to(dtype=torch.long)
+                        if not getattr(req_state.detokenizer, "include_stop_str_in_output", False):
+                            raise ValueError("ids.output requires detokenization with include_stop_str_in_output=True")
+                        eco = replace(eco, new_token_ids=text_ids.tolist())
                     req_state.add_multimodal_tensor(mm_output, mm_type)
 
             # Route: if no detokenizer and no pooling output, handle locally

@@ -1,0 +1,618 @@
+{
+  "source_revision": "349251e1d8f4f98d58fda59246381faecd7392e0",
+  "checkpoint_revision": "9a82a84c37ad9eb1307fb6ed8d7b397862ef9e6b",
+  "scope": "Official prompt methods and real text BPE; synthetic GLM codes and Whisper features. No model inference.",
+  "input_config": {
+    "audio_token_offset": 152064,
+    "audio_vocab_size": 16384,
+    "audio_delay": 6,
+    "continuous_feature_size": 5120
+  },
+  "special_tokens": {
+    "<|im_msg_end|>": 151645,
+    "<|im_media_begin|>": 151661,
+    "<|im_media_end|>": 151663,
+    "<|im_kimia_text_blank|>": 151666,
+    "<|im_kimia_text_eos|>": 151667,
+    "<|im_kimia_user_msg_start|>": 151670,
+    "<|im_kimia_assistant_msg_start|>": 151671,
+    "<|im_kimia_speech_ct_id|>": 151675,
+    "<|im_kimia_speech_ctd_id|>": 151676
+  },
+  "text_tokens": {
+    "你好，Kimi。": [
+      108386,
+      3837,
+      42,
+      24836,
+      1773
+    ],
+    "": [],
+    "<|im_kimia_user_msg_start|>": [
+      27,
+      91,
+      318,
+      4698,
+      318,
+      685,
+      3317,
+      6483,
+      4906,
+      91,
+      29
+    ],
+    "听到了什么？": [
+      49187,
+      99495,
+      99245,
+      11319
+    ],
+    "比较": [
+      99792
+    ],
+    "你好": [
+      108386
+    ],
+    "你好！": [
+      108386,
+      6313
+    ],
+    "请说。": [
+      14880,
+      36587,
+      1773
+    ],
+    "继续": [
+      100640
+    ],
+    "测试": [
+      81705
+    ]
+  },
+  "audio_inputs": {
+    "a": {
+      "codes": [
+        0,
+        1,
+        16383
+      ],
+      "feature_value": 1.0
+    },
+    "b": {
+      "codes": [
+        7,
+        4
+      ],
+      "feature_value": 2.0
+    }
+  },
+  "cases": [
+    {
+      "name": "text",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "你好，Kimi。"
+        }
+      ],
+      "output_type": "text",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        108386,
+        3837,
+        42,
+        24836,
+        1773,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151645,
+        151671
+      ],
+      "continuous_positions": [],
+      "feature_values": []
+    },
+    {
+      "name": "empty_text",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": ""
+        }
+      ],
+      "output_type": "both",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151645,
+        151671
+      ],
+      "continuous_positions": [],
+      "feature_values": []
+    },
+    {
+      "name": "literal_marker",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "<|im_kimia_user_msg_start|>"
+        }
+      ],
+      "output_type": "text",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        27,
+        91,
+        318,
+        4698,
+        318,
+        685,
+        3317,
+        6483,
+        4906,
+        91,
+        29,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151645,
+        151671
+      ],
+      "continuous_positions": [],
+      "feature_values": []
+    },
+    {
+      "name": "audio_text_output",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "audio",
+          "content": "a"
+        }
+      ],
+      "output_type": "text",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151661,
+        152064,
+        152065,
+        168447,
+        151663,
+        151675,
+        151645,
+        151671
+      ],
+      "continuous_positions": [
+        2,
+        3,
+        4
+      ],
+      "feature_values": [
+        1.0
+      ]
+    },
+    {
+      "name": "audio_both_output",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "audio",
+          "content": "a"
+        }
+      ],
+      "output_type": "both",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151661,
+        152064,
+        152065,
+        168447,
+        151663,
+        151676,
+        151645,
+        151671
+      ],
+      "continuous_positions": [
+        2,
+        3,
+        4
+      ],
+      "feature_values": [
+        1.0
+      ]
+    },
+    {
+      "name": "group_audio_then_text",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "audio",
+          "content": "a"
+        },
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "听到了什么？"
+        }
+      ],
+      "output_type": "both",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        49187,
+        99495,
+        99245,
+        11319,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151661,
+        152064,
+        152065,
+        168447,
+        151663,
+        151666,
+        151666,
+        151666,
+        151666,
+        151645,
+        151671
+      ],
+      "continuous_positions": [
+        2,
+        3,
+        4
+      ],
+      "feature_values": [
+        1.0
+      ]
+    },
+    {
+      "name": "group_text_two_audios",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "比较"
+        },
+        {
+          "role": "user",
+          "message_type": "audio",
+          "content": "a"
+        },
+        {
+          "role": "user",
+          "message_type": "audio",
+          "content": "b"
+        }
+      ],
+      "output_type": "text",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        99792,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151666,
+        151661,
+        152064,
+        152065,
+        168447,
+        151663,
+        151661,
+        152071,
+        152068,
+        151663,
+        151675,
+        151645,
+        151671
+      ],
+      "continuous_positions": [
+        3,
+        4,
+        5,
+        8,
+        9
+      ],
+      "feature_values": [
+        1.0,
+        2.0
+      ]
+    },
+    {
+      "name": "text_history",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "你好"
+        },
+        {
+          "role": "assistant",
+          "message_type": "text",
+          "content": "你好！"
+        },
+        {
+          "role": "assistant",
+          "message_type": "text",
+          "content": "请说。"
+        },
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "继续"
+        }
+      ],
+      "output_type": "text",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        108386,
+        151666,
+        151666,
+        108386,
+        6313,
+        151667,
+        14880,
+        36587,
+        1773,
+        151667,
+        151666,
+        151666,
+        100640,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151666,
+        151645,
+        151671,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151645,
+        151670,
+        151666,
+        151645,
+        151671
+      ],
+      "continuous_positions": [],
+      "feature_values": []
+    },
+    {
+      "name": "delayed_history",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "audio",
+          "content": "a"
+        },
+        {
+          "role": "assistant",
+          "message_type": "audio-text",
+          "content": [
+            "b",
+            "你好！"
+          ]
+        },
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "继续"
+        }
+      ],
+      "output_type": "both",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        108386,
+        6313,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        100640,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151661,
+        152064,
+        152065,
+        168447,
+        151663,
+        151676,
+        151645,
+        151671,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        152071,
+        152068,
+        151645,
+        151670,
+        151666,
+        151645,
+        151671
+      ],
+      "continuous_positions": [
+        2,
+        3,
+        4
+      ],
+      "feature_values": [
+        1.0
+      ]
+    },
+    {
+      "name": "assistant_audio",
+      "messages": [
+        {
+          "role": "assistant",
+          "message_type": "audio",
+          "content": "b"
+        }
+      ],
+      "output_type": "text",
+      "add_assistant_start_msg": false,
+      "text_token_ids": [
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666,
+        151666
+      ],
+      "audio_token_ids": [
+        151671,
+        151661,
+        152071,
+        152068,
+        151663,
+        151675,
+        151645
+      ],
+      "continuous_positions": [
+        2,
+        3
+      ],
+      "feature_values": [
+        2.0
+      ]
+    },
+    {
+      "name": "no_generation_prefix",
+      "messages": [
+        {
+          "role": "user",
+          "message_type": "text",
+          "content": "测试"
+        }
+      ],
+      "output_type": "both",
+      "add_assistant_start_msg": false,
+      "text_token_ids": [
+        151666,
+        81705,
+        151666
+      ],
+      "audio_token_ids": [
+        151670,
+        151666,
+        151645
+      ],
+      "continuous_positions": [],
+      "feature_values": []
+    },
+    {
+      "name": "empty_history",
+      "messages": [],
+      "output_type": "text",
+      "add_assistant_start_msg": true,
+      "text_token_ids": [
+        151666
+      ],
+      "audio_token_ids": [
+        151671
+      ],
+      "continuous_positions": [],
+      "feature_values": []
+    }
+  ]
+}

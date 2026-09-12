@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TTS model detection: registry-driven stage -> model-type resolution.
 
 ``serving_speech.py`` used to carry a hand-written 20-branch ladder mapping
@@ -153,6 +154,8 @@ _PIPELINE_STAGES = [
     "indextts2_5_talker",
     "indextts2_s2mel_decoder",
     "indextts2_talker",
+    "kimi_audio_ar",
+    "kimi_audio_decoder",
     "latent_generator",
     "llm",
     "minimax_music3_ar",
@@ -342,7 +345,7 @@ def test_audex_omni_requires_speech_decoder():
 
 def test_default_stage_serves_speech_is_unconditional():
     for name, cls in TTS_ADAPTER_REGISTRY.items():
-        if name == "audex":
+        if name in {"audex", "kimi_audio"}:
             continue
         for key in cls.stage_keys:
             assert cls.stage_serves_speech(key, frozenset({key})) is True
