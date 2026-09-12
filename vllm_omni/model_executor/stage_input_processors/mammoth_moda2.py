@@ -82,6 +82,15 @@ def ar2dit(
             )
         full_hidden_states = mm_output["latent"]
         hidden_total = int(full_hidden_states.shape[0])
+        expected_total = len(prompt_token_ids) + len(gen_token_ids)
+        if hidden_total > expected_total:
+            # The AR stage emits the full cumulative hidden states with every
+            # output. A request that finishes on a stop token emits twice (the
+            # EOS step and the final flush), and the generic LATENT
+            # accumulation concatenates the two snapshots. The final snapshot
+            # is the complete one, so keep only the trailing expected rows.
+            full_hidden_states = full_hidden_states[-expected_total:]
+            hidden_total = expected_total
         assert hidden_total == len(prompt_token_ids) + len(gen_token_ids), (
             f"Hidden states length mismatch: expected {len(prompt_token_ids) + len(gen_token_ids)}, got {hidden_total}"
         )

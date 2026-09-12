@@ -414,29 +414,18 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         if not self.extra_gen_vocab or self.gen_embed_tokens is None:
             return self.embed_tokens(input_ids)
 
-        gen_mask = input_ids >= int(self.gen_vocab_start_index)
-        if not gen_mask.any():
-            return self.embed_tokens(input_ids)
-        if gen_mask.all():
-            gen_ids = input_ids - int(self.gen_vocab_start_index)
-            return self.gen_embed_tokens(gen_ids)
-
-        flat_ids = input_ids.reshape(-1)
-        flat_mask = gen_mask.reshape(-1)
-        out = torch.empty(
-            (flat_ids.shape[0], self.config.hidden_size),
-            dtype=self.embed_tokens.weight.dtype,  # type: ignore[attr-defined]
-            device=flat_ids.device,
-        )
-
-        base_pos = torch.where(~flat_mask)[0]
-        gen_pos = torch.where(flat_mask)[0]
-        if base_pos.numel() > 0:
-            out[base_pos] = self.embed_tokens(flat_ids[base_pos])
-        if gen_pos.numel() > 0:
-            gen_ids = flat_ids[gen_pos] - int(self.gen_vocab_start_index)
-            out[gen_pos] = self.gen_embed_tokens(gen_ids)
-        return out.view(*input_ids.shape, -1).contiguous()
+        # Shape-static dual-vocab lookup: no host-side .any()/.all() branches and
+        # no data-dependent scatter, so the same code is safe under torch.compile,
+        # CUDA graph capture, and async input preparation. Ids are clamped to 0
+        # for the table they don't belong to; the discarded lane is masked out by
+        # the final select, keeping both gathers in-bounds by construction.
+        gen_start = int(self.gen_vocab_start_index)
+        gen_mask = input_ids >= gen_start
+        base_ids = torch.where(gen_mask, torch.zeros_like(input_ids), input_ids)
+        gen_ids = torch.where(gen_mask, input_ids - gen_start, torch.zeros_like(input_ids))
+        base_emb = self.embed_tokens(base_ids)
+        gen_emb = self.gen_embed_tokens(gen_ids)
+        return torch.where(gen_mask.unsqueeze(-1), gen_emb, base_emb)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)
