@@ -11,7 +11,9 @@ serialised through the queue.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
+from contextlib import suppress
 from typing import Any
 
 import numpy as np
@@ -33,49 +35,135 @@ from vllm_omni.diffusion.media import (
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
 _DIFFUSION_MEDIA_WIRE_TYPE = "diffusion_media_v1"
+_ZERO_COPY_SHM_ENV = "VLLM_OMNI_ZERO_COPY_SHM"
 
 # Sentinel so compute-then-assign packing can tell "field not packed" apart from
 # "field packed to None".
 _UNSET = object()
 
 
-def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
-    """Copy a contiguous NumPy-compatible array into shared memory."""
+def _zero_copy_shm_enabled() -> bool:
+    return os.getenv(_ZERO_COPY_SHM_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class _SharedMemoryLease:
+    """Keep an unlinked shared-memory mapping alive while array views use it."""
+
+    def __init__(self, shm: Any) -> None:
+        self.shm = shm
+
+    def __del__(self) -> None:
+        with suppress(BufferError):
+            self.shm.close()
+
+
+class _SharedMemoryArray(np.ndarray):
+    """An ndarray whose views retain the shared-memory mapping."""
+
+    _shm_lease: _SharedMemoryLease | None
+
+    def __array_finalize__(self, source: np.ndarray | None) -> None:
+        self._shm_lease = getattr(source, "_shm_lease", None)
+
+
+def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.ndarray, dict[str, Any]]:
     from multiprocessing import shared_memory
 
+    nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    array = np.ndarray(shape, dtype=dtype, buffer=shm.buf[:nbytes])
+    handle = {
+        "name": shm.name,
+        "shape": list(shape),
+        "numpy_dtype": str(dtype),
+        "nbytes": nbytes,
+    }
+    return shm, array, handle
+
+
+def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
+    """Copy a contiguous NumPy-compatible array into shared memory."""
     if array.dtype.hasobject:
         raise TypeError("NumPy object arrays cannot be transferred through raw shared memory")
 
     array = np.ascontiguousarray(array)
-    nbytes = array.nbytes
-    shm = shared_memory.SharedMemory(create=True, size=nbytes)
-    shm_array = np.ndarray(array.shape, dtype=array.dtype, buffer=shm.buf[:nbytes])
+    shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
     np.copyto(shm_array, array)
-    handle = {
-        "name": shm.name,
-        "shape": list(array.shape),
-        "numpy_dtype": str(array.dtype),
-        "nbytes": nbytes,
-    }
+    if _zero_copy_shm_enabled():
+        handle["borrow_on_unpack"] = True
+    del shm_array
     shm.close()
     return handle
 
 
 def _array_from_shm(handle: dict[str, Any]) -> np.ndarray:
-    """Copy an array from shared memory, then close and unlink its segment."""
+    """Materialize or borrow an array from shared memory and unlink its name."""
     from multiprocessing import shared_memory
 
     shm = shared_memory.SharedMemory(name=handle["name"])
+    array = np.ndarray(
+        handle["shape"],
+        dtype=np.dtype(handle["numpy_dtype"]),
+        buffer=shm.buf[: handle["nbytes"]],
+    )
+    if handle.get("borrow_on_unpack"):
+        borrowed = array.view(_SharedMemoryArray)
+        borrowed._shm_lease = _SharedMemoryLease(shm)
+        shm.unlink()
+        return borrowed
     try:
-        array = np.ndarray(
-            handle["shape"],
-            dtype=np.dtype(handle["numpy_dtype"]),
-            buffer=shm.buf[: handle["nbytes"]],
-        ).copy()
+        return array.copy()
     finally:
+        del array
         shm.close()
         shm.unlink()
-    return array
+
+
+def _cuda_registered_shm_copy(tensor: torch.Tensor, d2h_stream: torch.Stream) -> dict[str, Any]:
+    """Copy a CUDA tensor directly into a CUDA-registered POSIX SHM segment."""
+    original_dtype = tensor.dtype
+    source = tensor.detach()
+    if original_dtype == torch.bfloat16:
+        source = source.to(torch.float32)
+    numpy_dtype = torch.empty((), dtype=source.dtype).numpy().dtype
+    shm, shm_array, handle = _new_shm_array(tuple(source.shape), numpy_dtype)
+    host_tensor = torch.from_numpy(shm_array)
+    cudart = torch.cuda.cudart()
+    pointer = shm_array.ctypes.data
+    registered = False
+    succeeded = False
+    try:
+        error = cudart.cudaHostRegister(pointer, handle["nbytes"], 0)
+        if int(error) != 0:
+            raise RuntimeError(f"cudaHostRegister failed: {cudart.cudaGetErrorString(error)}")
+        registered = True
+        old_stream = torch.accelerator.current_stream()
+        torch.accelerator.set_stream(d2h_stream)
+        try:
+            host_tensor.copy_(source, non_blocking=True)
+        finally:
+            torch.accelerator.set_stream(old_stream)
+        d2h_stream.synchronize()
+        error = cudart.cudaHostUnregister(pointer)
+        registered = False
+        if int(error) != 0:
+            raise RuntimeError(f"cudaHostUnregister failed: {cudart.cudaGetErrorString(error)}")
+        handle["borrow_on_unpack"] = True
+        handle.update(
+            {
+                "__tensor_shm__": True,
+                "torch_dtype": str(original_dtype),
+            }
+        )
+        succeeded = True
+        return handle
+    finally:
+        if registered:
+            cudart.cudaHostUnregister(pointer)
+        del host_tensor, shm_array
+        shm.close()
+        if not succeeded:
+            shm.unlink()
 
 
 def _unlink_shm_handle(handle: dict[str, Any]) -> None:
@@ -123,6 +211,11 @@ def _tensor_to_shm(
     packed.
     """
     original_dtype = tensor.dtype
+    if d2h_stream is not None and _zero_copy_shm_enabled() and tensor.device.type == "cuda":
+        handle = _cuda_registered_shm_copy(tensor, d2h_stream)
+        if created is not None:
+            created.append(handle)
+        return handle
     if d2h_stream is not None:
         # Non-blocking D2H: copy on side stream to pinned CPU memory.
         old_stream = torch.accelerator.current_stream()
