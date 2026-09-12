@@ -278,6 +278,87 @@ async def test_registry_resume_delivery_failure_keeps_one_shot_old_token_recover
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("detached", [False, True], ids=["takeover", "reconnect"])
+@pytest.mark.parametrize("cancel_during", ["session.resumed", "replayed"])
+async def test_registry_cancelled_resume_delivery_keeps_token_recovery(detached: bool, cancel_during: str) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    delivery_started = asyncio.Event()
+    wire: list[dict[str, object]] = []
+
+    async def send(payload: dict[str, object]) -> None:
+        wire.append(payload)
+
+    async def close(reason: str) -> None:
+        del reason
+
+    async def blocked_send(payload: dict[str, object]) -> None:
+        if payload["type"] == cancel_during:
+            delivery_started.set()
+            await asyncio.Future()
+
+    created = await registry.create("sid-cancel", incarnation=0, send=send, close=close)
+    if detached:
+        assert await registry.detach("sid-cancel", attachment_generation=1)
+    await registry.send_event("sid-cancel", {"type": "replayed"})
+    task = asyncio.create_task(
+        registry.resume(
+            "sid-cancel",
+            incarnation=0,
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=blocked_send,
+            close=close,
+            activation_payload_factory=lambda token, generation: {
+                "type": "session.resumed",
+                "resume_token": token.plaintext,
+                "attachment_generation": generation,
+            },
+        )
+    )
+    try:
+        await asyncio.wait_for(delivery_started.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+
+        assert task.cancelled()
+        assert not await registry.is_current_attachment("sid-cancel", 2)
+        await registry.authenticate_resume(
+            "sid-cancel", incarnation=0, resume_token=created.resume_token.plaintext, last_received_server_event_seq=0
+        )
+        # No writes to the abandoned connection; the outbound lock is released
+        # and events accumulated while detached remain available to the retry.
+        wire.clear()
+        await asyncio.wait_for(registry.send_event("sid-cancel", {"type": "while_detached"}), timeout=2.0)
+        assert wire == []
+        recovered = await asyncio.wait_for(
+            registry.resume(
+                "sid-cancel",
+                incarnation=0,
+                resume_token=created.resume_token.plaintext,
+                last_received_server_event_seq=0,
+                send=send,
+                close=close,
+            ),
+            timeout=2.0,
+        )
+        assert recovered.attachment_generation == 3
+        assert [entry.payload["type"] for entry in recovered.replay_entries] == ["replayed", "while_detached"]
+        assert await registry.is_current_attachment("sid-cancel", 3)
+        with pytest.raises(InvalidResumeTokenError):
+            await registry.authenticate_resume(
+                "sid-cancel",
+                incarnation=0,
+                resume_token=created.resume_token.plaintext,
+                last_received_server_event_seq=0,
+            )
+    finally:
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2.0)
+        await registry.close("sid-cancel")
+
+
+@pytest.mark.asyncio
 async def test_registry_concurrent_resume_allows_exactly_one_rotated_token_winner() -> None:
     registry = DuplexSessionAttachmentRegistry(
         replay_ttl_s=60.0,

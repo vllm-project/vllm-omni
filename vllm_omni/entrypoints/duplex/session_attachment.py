@@ -397,7 +397,9 @@ class DuplexSessionAttachmentRegistry:
                     await send(dict(activation_payload_factory(rotated_token, attachment_generation)))
                     for entry in replay_entries:
                         await send(dict(entry.payload))
-                except Exception:
+                except (Exception, asyncio.CancelledError):
+                    # Cancelled delivery may not have reached the client either;
+                    # retain the existing recovery path and re-raise cancellation.
                     async with self._lock:
                         if (
                             self._sessions.get(session_id) is state
