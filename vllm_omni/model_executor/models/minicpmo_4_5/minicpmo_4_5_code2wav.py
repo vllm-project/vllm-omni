@@ -268,12 +268,48 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
+        self._default_prompt_normalized: tuple[str, str] | None = None
 
     @property
     def _default_prompt_wav(self) -> str:
         if self._prompt_wav_override is not None:
             return str(self._prompt_wav_override)
         return str(Path(self.model_path) / "assets" / "HT_ref_audio.wav")
+
+    def _normalized_default_prompt(self) -> tuple[str, str]:
+        """Fold the shipped default prompt onto the request-reference grid.
+
+        The shipped asset is 6.016 s and is loaded directly by token2wav, so a
+        request without a reference would otherwise keep a second L0 value a
+        couple of frames away from the normalized request references -- two
+        graph-key families instead of one. Returns ``(prompt_wav,
+        prompt_cache_id)``; if the asset cannot be read, the shipped path is
+        returned unchanged.
+        """
+        if self._default_prompt_normalized is not None:
+            return self._default_prompt_normalized
+        source = self._default_prompt_wav
+        fallback = (source, self._default_prompt_id)
+        try:
+            waveform, sample_rate_hz = sf.read(source, dtype="float32", always_2d=False)
+            normalized, target_sr = _normalize_reference(waveform, int(sample_rate_hz))
+        except Exception:
+            logger.warning("Could not normalize the default prompt %s; using it as-is", source)
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        if normalized.numel() == 0:
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        digest = sha256()
+        digest.update(normalized.numpy().tobytes())
+        digest.update(str(target_sr).encode())
+        cache_id = f"default-ref-{digest.hexdigest()[:24]}-{target_sr}"
+        path = Path(self._runtime_prompt_dir.name) / f"{cache_id}.wav"
+        if not path.is_file():
+            sf.write(path, normalized.numpy(), target_sr, format="WAV")
+        logger.info("Default prompt normalized onto the %.1fs grid: %s", _REF_MAX_SECONDS, path)
+        self._default_prompt_normalized = (str(path), cache_id)
+        return self._default_prompt_normalized
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
@@ -368,9 +404,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is not None:
             return entry.cache_id, entry.path, cache_key
 
+        default_wav, default_cache_id = self._normalized_default_prompt()
         return (
-            str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id)),
-            str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav)),
+            str(_scalar(meta.get("prompt_cache_id"), default_cache_id)),
+            str(_scalar(meta.get("prompt_wav"), default_wav)),
             None,
         )
 

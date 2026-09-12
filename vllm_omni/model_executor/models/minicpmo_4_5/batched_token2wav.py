@@ -639,6 +639,12 @@ class BatchedToken2Wav(nn.Module):
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
         x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
+        if pad_frames:
+            # The padded columns would otherwise carry real noise values, and the
+            # attention here is fully connected (`attn_mask=None`), so the real
+            # frames would attend to them. Zero them so padding only aligns the
+            # capture shape and contributes no content.
+            x[:, :, mel_frames:] = 0.0
         timeline = torch.linspace(
             0,
             1,
