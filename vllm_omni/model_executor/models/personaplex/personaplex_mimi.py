@@ -392,7 +392,7 @@ class PersonaPlexMimiCodec(nn.Module):
         x = self._run_stages(x, self._enc_stages)
         x = self.encoder_transformer.step(x.transpose(1, 2)).transpose(1, 2)
         x = self._downsample(x)
-        codes = self.model.quantizer.encode(x)  # [Q, B, T]
+        codes = self.model.quantizer.encode(x, num_quantizers=CODEBOOKS)  # [Q, B, T]
         return codes[:CODEBOOKS, :, 0].transpose(0, 1).contiguous()
 
     @torch.no_grad()
