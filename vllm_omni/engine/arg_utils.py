@@ -183,6 +183,10 @@ class OmniEngineArgs(EngineArgs):
     """
 
     stage_id: int = 0
+    # Per replica, per worker GPU total profiled envelope (GiB), not KV-only.
+    hbm_limit_gb: float | None = None
+    # Included in the total: graphs, transfers and unprofiled runtime slack.
+    hbm_reserved_gb: float = 2.0
     model_stage: str = "thinker"
     model_arch: str | None = None
     engine_output_type: str | None = None
@@ -244,6 +248,13 @@ class OmniEngineArgs(EngineArgs):
     sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        from vllm_omni.config.static_budget import budget_bytes
+
+        budget_bytes(self.hbm_limit_gb, self.hbm_reserved_gb)
+        if self.hbm_limit_gb is not None and self.worker_type == "generation":
+            raise ValueError("Static HBM currently requires an AR worker or profiled paged diffusion stage")
+        if self.hbm_limit_gb is not None and self.num_gpu_blocks_override is not None:
+            raise ValueError("hbm_limit_gb cannot be combined with num_gpu_blocks_override")
         if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
@@ -416,6 +427,8 @@ class OmniEngineArgs(EngineArgs):
             model_config=model_config,
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
+            hbm_limit_gb=self.hbm_limit_gb,
+            hbm_reserved_gb=self.hbm_reserved_gb,
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,

@@ -121,6 +121,10 @@ class OmniModelConfig(ModelConfig):
     """
 
     stage_id: int = 0
+    # Per replica, per worker GPU total profiled envelope (GiB), not KV-only.
+    hbm_limit_gb: float | None = None
+    # Included in the total: graphs, transfers and unprofiled runtime slack.
+    hbm_reserved_gb: float = 2.0
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False

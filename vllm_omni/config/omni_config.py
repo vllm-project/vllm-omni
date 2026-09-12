@@ -194,6 +194,8 @@ class _LoadEngineOverrides(TypedDict, total=False):
 
 
 class _CacheEngineOverrides(TypedDict, total=False):
+    hbm_limit_gb: float
+    hbm_reserved_gb: float
     kv_cache_memory_bytes: int
     gpu_memory_utilization: float
     enable_prefix_caching: bool
@@ -494,6 +496,8 @@ class OmniStageCacheConfig(_TrackExplicitConfigFields, VllmCacheConfig):
     vLLM-Omni diffusion-specific cache backends such as TeaCache and Cache-DiT.
     """
 
+    hbm_limit_gb: float | None = Field(default=None, gt=0)
+    hbm_reserved_gb: float = Field(default=2.0, ge=0)
     kv_cache_memory_bytes: int | None = Field(default=None, ge=0)
     # None preserves backend-owned defaults; explicit values still project.
     gpu_memory_utilization: float | None = Field(default=None, gt=0.0, le=1.0)
@@ -1049,6 +1053,8 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "omni_kv_config",
         "cfg_kv_collect_func",
         "max_num_seqs",
+        "hbm_limit_gb",
+        "hbm_reserved_gb",
         "kv_cache_memory_bytes",
         "gpu_memory_utilization",
         "max_num_batched_tokens",

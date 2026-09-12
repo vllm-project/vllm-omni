@@ -103,7 +103,15 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
+            limit = getattr(self.model_config, "hbm_limit_gb", None)
+            if limit is not None:
+                from vllm_omni.config.static_budget import initial_budget
+
+                self.requested_memory = initial_budget(
+                    limit, self.model_config.hbm_reserved_gb, init_snapshot.free_memory
+                )
+            else:
+                self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
         else:

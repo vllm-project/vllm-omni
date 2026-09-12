@@ -400,6 +400,10 @@ class StageDeployConfig:
     tensor_parallel_size: int | None = None
     enable_expert_parallel: bool | None = None
     gpu_memory_utilization: float | None = None
+    # Per replica, per worker GPU total profiled envelope (GiB), not KV-only.
+    hbm_limit_gb: float | None = None
+    # Included in the total: graphs, transfers and unprofiled runtime slack.
+    hbm_reserved_gb: float = 2.0
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
@@ -967,6 +971,12 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    from vllm_omni.config.static_budget import budget_bytes
+
+    limit = engine_args.get("hbm_limit_gb")
+    budget_bytes(limit, engine_args.get("hbm_reserved_gb", 2.0))
+    if limit is not None and engine_args.get("num_gpu_blocks_override") is not None:
+        raise ValueError("hbm_limit_gb cannot be combined with num_gpu_blocks_override")
     return engine_args
 
 

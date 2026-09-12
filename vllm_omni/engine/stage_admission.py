@@ -1,25 +1,15 @@
-"""Pre-launch admission control for parallel stage initialization.
+"""Pre-launch per-device admission for parallel init and static HBM budgets.
 
-When ``VllmOmniOrchestratorConfig.parallel_stage_init`` is enabled, several stage
-engine cores initialize concurrently and allocate KV cache / capture CUDA graphs
-independently. The SH/EX phase locks (``stage_phase_lock``) keep each *measurement*
-clean, but they cannot bound the *sum* of what all stages will allocate — two
-stages can each profile against a mostly-empty GPU, each compute a large KV
-budget, and then both allocate → OOM.
+With explicit hbm_limit_gb, sum total per-rank envelopes instead of utilization
+claims. Stage reserves are included in those totals. This is budget accounting,
+not a guarantee against unprofiled runtime peaks or unrelated allocations.
 
-Admission is the hard backstop for that: **before any stage launches**, prove for
-every physical device *g*::
-
-    Σ_{s on g} capacity(g)·utilization(s) + Σ graph_reserve(s,g)
-        + external_reserve + safety_margin  ≤  capacity(g)
-
-If it does not hold, fail fast (``StageAdmissionError``) rather than OOM at
-runtime. Because the budgets are proven to fit before anyone allocates, any
-profile/allocate interleaving is safe.
-
-The arithmetic (``evaluate``) is pure and unit-testable. Plan-walking
-(``check_admission``) takes injectable callables for device resolution and total
-memory so it can also be exercised without a GPU.
+Legacy parallel initialization uses utilization-based claims plus graph reserves.
+Static mode uses explicit total HBM envelopes (including their graph/slack
+reserves), with the same external reserve and device safety margin. The existing
+SH/EX initialization locks keep profiling phases quiescent; they do not enforce
+runtime allocation limits. The evaluator and injectable plan walker run before
+any local stage launches.
 """
 
 from __future__ import annotations
@@ -74,6 +64,7 @@ class StageDemand:
     utilization: float
     graph_reserve_bytes: int
     is_diffusion: bool = False
+    hbm_budget_bytes: int | None = None
 
 
 @dataclass
@@ -82,6 +73,7 @@ class DeviceLedger:
 
     device_id: int
     capacity_bytes: int
+    # Historical field name: now sums stage claims (not just KV storage).
     kv_budget_bytes: int = 0
     graph_reserve_bytes: int = 0
     external_reserve_bytes: int = 0
@@ -152,14 +144,18 @@ def evaluate(
     for d in demands:
         for dev in d.device_ids:
             ledger = _ledger(dev)
-            ledger.kv_budget_bytes += int(ledger.capacity_bytes * d.utilization)
+            ledger.kv_budget_bytes += (
+                d.hbm_budget_bytes
+                if d.hbm_budget_bytes is not None
+                else int(ledger.capacity_bytes * d.utilization)
+            )
             ledger.graph_reserve_bytes += d.graph_reserve_bytes
             ledger.contributors.append(f"stage{d.stage_id}/replica{d.replica_id}")
 
     over = [led for led in ledgers.values() if not led.fits]
     for led in ledgers.values():
         logger.info(
-            "[admission] device %d: capacity=%s required=%s (kv=%s graph=%s ext=%s margin=%s) "
+            "[admission] device %d: capacity=%s required=%s (stage_budget=%s graph=%s ext=%s margin=%s) "
             "headroom=%s contributors=%s%s",
             led.device_id,
             format_gib(led.capacity_bytes),
@@ -179,9 +175,9 @@ def evaluate(
             for led in over
         )
         raise StageAdmissionError(
-            "parallel_stage_init admission failed — per-device budget exceeds capacity. "
-            "Lower gpu_memory_utilization, reduce co-located stages, or disable "
-            f"parallel_stage_init. {detail}"
+            "Stage admission failed — per-device budget exceeds capacity. "
+            "Lower stage budgets or reduce co-located stages. "
+            f"{detail}"
         )
     return ledgers
 
@@ -211,6 +207,12 @@ def check_admission(
     unbounded demand, defeating admission (fail-closed).
     ``device_total_memory(id)`` returns a device's total bytes.
     """
+    from vllm_omni.config.static_budget import budget_bytes
+
+    static_mode = any(
+        replica_hbm_limit(replica) is not None
+        for plan in stage_plans for replica in getattr(plan, "replicas", [])
+    )
     demands: list[StageDemand] = []
     exempt: list[str] = []
     unaccounted: list[str] = []
@@ -219,6 +221,35 @@ def check_admission(
             metadata = replica.metadata
             label = f"stage{metadata.stage_id}/replica{replica.replica_id}"
             device_ids = resolve_physical_devices(replica)
+            if static_mode:
+                limit = replica_hbm_limit(replica)
+                if limit is None or isinstance(device_ids, AdmissionExempt):
+                    raise StageAdmissionError(
+                        f"Static HBM requires explicit budgets and local placement for every replica: {label}"
+                    )
+                if not device_ids:
+                    raise StageAdmissionError(f"Unresolved static HBM devices for {label}")
+                raw = getattr(getattr(replica, "stage_cfg", None), "engine_args", {}) or {}
+                cfg = getattr(getattr(replica, "stage_vllm_config", None), "model_config", None)
+                reserve = getattr(cfg, "hbm_reserved_gb", raw.get("hbm_reserved_gb", 2.0))
+                if getattr(cfg, "worker_type", raw.get("worker_type")) == "generation":
+                    raise StageAdmissionError(f"Static HBM is not supported for generation worker {label}")
+                if replica.stage_vllm_config is None:
+                    mode = raw.get("diffusion_kv_mode", "dense_legacy")
+                    if getattr(mode, "value", mode) != "paged_scheduler":
+                        raise StageAdmissionError(f"{label}: static HBM requires profiled paged_scheduler diffusion")
+                demands.append(
+                    StageDemand(
+                        stage_id=metadata.stage_id,
+                        replica_id=replica.replica_id,
+                        device_ids=list(device_ids),
+                        utilization=0.0,
+                        graph_reserve_bytes=0,
+                        is_diffusion=replica.stage_vllm_config is None,
+                        hbm_budget_bytes=budget_bytes(limit, reserve),
+                    )
+                )
+                continue
             if isinstance(device_ids, AdmissionExempt):
                 exempt.append(label)
                 continue
@@ -295,3 +326,13 @@ def _diffusion_utilization(replica: Any) -> float | None:
         if util is not None:
             return float(util)
     return None
+
+
+def replica_hbm_limit(replica: Any) -> float | None:
+    """Read the resolved AR model config or diffusion pre-launch arguments."""
+    config = getattr(getattr(replica, "stage_vllm_config", None), "model_config", None)
+    limit = getattr(config, "hbm_limit_gb", None)
+    if limit is not None:
+        return limit
+    raw = getattr(getattr(replica, "stage_cfg", None), "engine_args", None)
+    return raw.get("hbm_limit_gb") if isinstance(raw, dict) else None
