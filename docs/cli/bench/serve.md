@@ -23,7 +23,9 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   The API endpoint exposed externally, to which clients send their requests.
 
 - `--dataset-name`
-  The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio), while `omniinteract` replays official OmniInteract videos.
+  The name of the dataset used; `random-mm` generates random multimodal inputs (images, videos, audio),
+  `omniinteract` replays official OmniInteract videos, and `videomme` loads Video-MME MCQ videos
+  (`lmms-eval/Video-MME`, MiniCPM OmniEvalKit packing).
 
 - `--num-prompts`
   The total number of requests to send, an integer.
@@ -338,6 +340,37 @@ It requires every case to commit its input, complete any emitted response lifecy
 transcript, event, and result artifacts without errors. A valid LISTEN-only case may have no response audio or transcript
 chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
 signal, not a transport failure. This local performance test does not score answer accuracy.
+
+### Video-MME Benchmark
+
+Video-MME (`--dataset-name videomme`) scores multiple-choice video QA. Default packing is
+OmniEvalKit MiniCPM `minicpm-frames` (up to 96 sampled frames as `image_url`). Pass a local
+mirror with `--dataset-path` / `--videomme-parquet` + `--videomme-video-dir`, or a Hugging
+Face dataset id (`lmms-eval/Video-MME` by default; any `org/name` is accepted when
+`--dataset-name videomme` is explicit). Relative `--videomme-video-dir` values are resolved
+to absolute `file://` URLs. For those URLs, start the server with
+`--allowed-local-media-path` covering the video root; otherwise use `--videomme-inline-local-video`.
+
+```bash
+vllm bench serve --omni \
+  --backend openai-chat-omni \
+  --dataset-name videomme \
+  --dataset-path lmms-eval/Video-MME \
+  --videomme-pack-mode minicpm-frames \
+  --videomme-max-frames 96 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --endpoint /v1/chat/completions \
+  --num-prompts 8 \
+  --max-concurrency 1 \
+  --save-result
+```
+
+Accuracy keys (`videomme_accuracy`, per-duration / domain / task breakdowns) are written into
+the saved JSON. `videomme_accuracy` excludes HTTP failures; `videomme_accuracy_incl_http_fail`
+counts them as wrong. `videomme_submitted` / `videomme_unique_question_ids` show when
+oversampling or missing media made the request count differ from unique-question coverage.
+Use `--videomme-save-eval-items` (or `VIDEOMME_SAVE_EVAL_ITEMS=1`) for per-request
+`videomme_eval_items` rows.
 
 ### Multi-Modal Benchmark
 

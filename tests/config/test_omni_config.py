@@ -215,6 +215,15 @@ def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_s
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
+def test_from_pipeline_config_accepts_allowed_local_media_path_cli():
+    omni_config = _from_pipeline_key(
+        "minicpmo_4_5",
+        cli_overrides={"allowed_local_media_path": "/data"},
+    )
+
+    assert all(stage.model_config.allowed_local_media_path == "/data" for stage in omni_config.stage_configs)
+
+
 @pytest.mark.parametrize("disabled", [True, False])
 def test_frontend_log_stats_flag_is_not_an_unowned_stage_argument(disabled):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
@@ -737,6 +746,7 @@ def test_sub_config_fields_match_structured_scopes():
         "limit_mm_per_prompt",
         "interleave_mm_strings",
         "media_io_kwargs",
+        "allowed_local_media_path",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
