@@ -11,6 +11,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.platforms import Platform
+from vllm.platforms.cpu import CpuPlatform
 from vllm.platforms.interface import PlatformEnum
 
 logger = init_logger(__name__)
@@ -382,15 +383,38 @@ class OmniPlatform(Platform):
         )
 
 
-class UnspecifiedOmniPlatform(OmniPlatform):
+class UnspecifiedOmniPlatform(OmniPlatform, CpuPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
     _enum = PlatformEnum.UNSPECIFIED
-    device_type = "cpu"
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         return torch.device("cpu")
 
     @classmethod
+    def get_omni_ar_worker_cls(cls) -> str:
+        return "vllm_omni.worker.cpu_ar_worker.CPUARWorker"
+
+    @classmethod
+    def get_omni_generation_worker_cls(cls) -> str:
+        return "vllm_omni.worker.cpu_generation_worker.CPUGenerationWorker"
+
+    @classmethod
+    def get_default_stage_config_path(cls) -> str:
+        return "vllm_omni/deploy"
+
+    @classmethod
+    def synchronize(cls) -> None:
+        pass
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        pass
+
+    @classmethod
+    def supports_torch_inductor(cls) -> bool:
+        return True
+
+    @classmethod
     def get_device_count(cls) -> int:
-        return 0
+        return 1
