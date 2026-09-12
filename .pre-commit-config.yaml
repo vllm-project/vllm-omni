@@ -122,6 +122,13 @@ repos:
       # pre-commit hides output from passing hooks unless the hook is verbose.
       verbose: true
 
+    - id: check-examples-policy
+      name: Block new model-specific Python examples
+      entry: python tools/pre_commit/check_examples_policy.py
+      language: python
+      pass_filenames: false
+      files: ^(examples/.*\.py|tools/pre_commit/check_examples_policy\.py|tools/pre_commit/examples_policy_baseline\.txt)$
+
     - id: shellcheck
       name: Lint shell scripts
       # language: script breaks on Windows (shebang path loses slashes).
