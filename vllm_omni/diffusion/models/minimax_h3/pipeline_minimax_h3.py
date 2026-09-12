@@ -56,7 +56,9 @@ from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
+    offload_streams_blocks,
     resolve_offload,
+    resolve_offload_strategy,
     should_offload_component,
 )
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
@@ -1052,8 +1054,8 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and bool(
-            od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
+        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and (
+            offload_streams_blocks(od_config)
         )
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
@@ -1075,7 +1077,7 @@ class MiniMaxH3Pipeline(
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
         needs_component_cache = legacy_manual_components or offloads_text_encoder
-        if getattr(od_config, "enable_distributed_layerwise_offload", False) and needs_component_cache:
+        if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and needs_component_cache:
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
             if legacy_manual_components:
                 _register_dlo_component_cache(
@@ -1565,10 +1567,8 @@ class MiniMaxH3Pipeline(
         if od_config is None:
             return False
         if getattr(od_config, "diffusion_offload_config", None) is None:
-            return bool(
-                getattr(od_config, "enable_layerwise_offload", False)
-                or getattr(od_config, "enable_distributed_layerwise_offload", False)
-            )
+            # The compatibility topology stages every component it can.
+            return offload_streams_blocks(od_config)
         return component is getattr(self, "text_encoder", None) and should_offload_component(
             od_config, TEXT_ENCODER_COMPONENT
         )

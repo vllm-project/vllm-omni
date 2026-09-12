@@ -29,6 +29,10 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import Dis
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -620,11 +624,10 @@ def _load_ltx25_native_diffusion_decoder(
 
 def _place_aux_components(pipeline: Any) -> None:
     parallel_config = getattr(pipeline.od_config, "parallel_config", None)
-    use_managed_placement = bool(
-        getattr(pipeline.od_config, "enable_cpu_offload", False)
-        or getattr(pipeline.od_config, "enable_layerwise_offload", False)
-        or getattr(parallel_config, "use_hsdp", False)
-    )
+    use_managed_placement = resolve_offload_strategy(pipeline.od_config) in (
+        OffloadStrategy.MODEL_LEVEL,
+        OffloadStrategy.LAYER_WISE,
+    ) or bool(getattr(parallel_config, "use_hsdp", False))
     if use_managed_placement:
         return
 

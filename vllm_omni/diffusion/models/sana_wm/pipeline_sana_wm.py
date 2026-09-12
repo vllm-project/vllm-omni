@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Sana-WM pipeline integration.
 
 This module wires the registry-visible surface, release-layout validation, and
@@ -50,6 +50,10 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SanaWmTransformer3DModel,
 )
 from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteScheduler
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
@@ -389,11 +393,10 @@ class SanaWmPipeline(
         components to still be on CPU when they take over.
         """
         parallel_config = getattr(self.od_config, "parallel_config", None)
-        if (
-            getattr(self.od_config, "enable_cpu_offload", False)
-            or getattr(self.od_config, "enable_layerwise_offload", False)
-            or getattr(parallel_config, "use_hsdp", False)
-        ):
+        if resolve_offload_strategy(self.od_config) in (
+            OffloadStrategy.MODEL_LEVEL,
+            OffloadStrategy.LAYER_WISE,
+        ) or getattr(parallel_config, "use_hsdp", False):
             return
         modules = ModuleDiscovery.discover(self)
         for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):

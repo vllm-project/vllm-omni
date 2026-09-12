@@ -53,6 +53,10 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SIGMA_SHIFT,
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.capability import (
@@ -434,9 +438,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             self.vae = DistributedAutoencoderKLWan()
             self.vae.init_distributed()
-        if not (
-            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
-        ):
+        if resolve_offload_strategy(od_config) not in (OffloadStrategy.MODEL_LEVEL, OffloadStrategy.LAYER_WISE):
             self.vae = self.vae.to(device=get_local_device(), dtype=od_config.dtype)
         self.register_buffer(
             "vae_latents_mean",

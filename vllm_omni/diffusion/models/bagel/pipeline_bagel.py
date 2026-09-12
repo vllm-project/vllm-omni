@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 BagelPipeline implementation for vLLM-Omni.
 """
@@ -32,6 +32,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -442,7 +446,9 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         #    selectively materialized/moved by the offloader.
         # 3. HSDP: weights should be loaded on CPU first and sharded afterwards,
         #    rather than eagerly placing the full model on one GPU.
-        if quant_config is None and not (od_config.enable_layerwise_offload or od_config.parallel_config.use_hsdp):
+        if quant_config is None and not (
+            resolve_offload_strategy(od_config) is OffloadStrategy.LAYER_WISE or od_config.parallel_config.use_hsdp
+        ):
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler

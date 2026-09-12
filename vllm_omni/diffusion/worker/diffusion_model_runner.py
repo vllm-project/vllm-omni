@@ -52,7 +52,13 @@ from vllm_omni.diffusion.models.interface import (
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
-from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
+from vllm_omni.diffusion.offloader.config import (
+    TEXT_ENCODER_COMPONENT,
+    OffloadStrategy,
+    offload_enabled,
+    resolve_offload,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -309,13 +315,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             device=self.device,
         )
 
-        load_device = (
-            "cpu"
-            if self.od_config.enable_cpu_offload
-            or self.od_config.enable_layerwise_offload
-            or getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            else str(self.device)
-        )
+        load_device = "cpu" if offload_enabled(self.od_config) else str(self.device)
 
         def get_memory_context() -> AbstractContextManager[Any]:
             if memory_pool_context_fn is not None:
@@ -743,7 +743,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
         # counters, which inference tensors do not track.
         use_hsdp = od_config.parallel_config.use_hsdp
-        use_distributed_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+        use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
             for req in reqs:
