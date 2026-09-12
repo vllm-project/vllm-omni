@@ -216,6 +216,13 @@ class OmniEngineArgs(EngineArgs):
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float = 0.0
     fa_deterministic: bool = False
+    # Diffusion cache acceleration (cache_dit/tea_cache). Diffusion stages
+    # consume these through OmniDiffusionConfig; LLM_GENERATION stages that
+    # host a denoising pipeline (e.g. MammothModa2 DiT) surface them on
+    # model_config, where the pipeline owns its cache lifecycle.
+    cache_backend: str | None = None
+    cache_config: dict[str, Any] | None = None
+    enable_cache_dit_summary: bool | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -436,6 +443,9 @@ class OmniEngineArgs(EngineArgs):
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
             sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
+            cache_backend=self.cache_backend,
+            cache_config=self.cache_config,
+            enable_cache_dit_summary=self.enable_cache_dit_summary,
         )
         return omni_config
 
@@ -619,6 +629,14 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        # Diffusion cache acceleration: orch parses the top-level CLI flag;
+        # the per-stage engine surfaces it on model_config for generation-
+        # stage pipelines (e.g. MammothModa2 DiT) and into OmniDiffusionConfig
+        # for diffusion stages. Also StageDeployConfig fields, so they stay
+        # valid per-stage deploy/CLI overrides (deploy_runtime_override_keys).
+        "cache_backend",
+        "cache_config",
+        "enable_cache_dit_summary",
     }
 )
 

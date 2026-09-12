@@ -155,6 +155,13 @@ class OmniModelConfig(ModelConfig):
     # ``cfg_role`` for classifier-free-guidance request pairs).
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
+    # Diffusion cache acceleration (cache_dit/tea_cache) for pipelines that
+    # own their denoising loop on non-diffusion runners (e.g. MammothModa2
+    # DiT on the generation runner). Diffusion stages read the same knobs
+    # through OmniDiffusionConfig instead.
+    cache_backend: str | None = None
+    cache_config: dict[str, Any] | None = None
+    enable_cache_dit_summary: bool | None = None
 
     @property
     def registry(self):

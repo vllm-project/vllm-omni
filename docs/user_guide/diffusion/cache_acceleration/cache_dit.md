@@ -72,6 +72,39 @@ omni = Omni(
 
 ## Example Script
 
+### Multi-Stage Models (MammothModa2)
+
+MammothModa2's DiT runs on the generation runner rather than the diffusion
+runner, so Cache-DiT is configured on the **DiT stage entry** of the deploy
+YAML instead of the top-level `Omni(cache_backend=...)` kwargs:
+
+```yaml
+# deploy YAML (see vllm_omni/deploy/mammoth_moda2.yaml)
+stages:
+  - stage_id: 1
+    # ... other DiT stage settings ...
+    cache_backend: cache_dit
+    cache_config:
+      Fn_compute_blocks: 1
+      Bn_compute_blocks: 0
+      max_warmup_steps: 4
+      residual_diff_threshold: 0.24
+      max_continuous_cached_steps: 3
+    enable_cache_dit_summary: true   # log skip-ratio stats per request
+```
+
+Behavior notes:
+
+- Only the repeated main-layer stack is cached; the Q-Former refiners always run.
+- Sequential-CFG parity requires the unconditional pass on every denoise step,
+  so the `cfg_range` skip optimization is not used: outside the interval CFG is
+  neutralized with `scale=1.0` instead of skipping the uncond forward.
+- Requests with `text_guidance_scale = 1.0` run with cache hooks disabled.
+- `residual_diff_threshold` defaults to `0.24` (measured ~1.7-2.2x at 50 steps,
+  PSNR 27-34 dB vs uncached). For 20-step generation — especially with a
+  partial `cfg_range` — use `0.12` for noticeably closer parity at a modest
+  speed cost.
+
 ### Offline Inference
 
 Use the example script under `examples/offline_inference/text_to_image`:

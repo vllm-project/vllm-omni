@@ -20,6 +20,16 @@ stages:
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
+    # Optional Cache-DiT acceleration for the DiT stage (~2x faster denoise,
+    # training-free). Uncomment to enable; guidance=1.0 requests bypass it.
+    # cache_backend: cache_dit
+    # cache_config:
+    #   Fn_compute_blocks: 1
+    #   Bn_compute_blocks: 0
+    #   max_warmup_steps: 4
+    #   residual_diff_threshold: 0.24
+    #   max_continuous_cached_steps: 3
+    # enable_cache_dit_summary: true
     default_sampling_params:
       extra_args:
         text_guidance_scale: 9.0

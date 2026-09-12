@@ -156,7 +156,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-cache-dit-summary",
         action="store_true",
-        help="Enable cache-dit summary logging after diffusion forward passes.",
+        default=None,
+        help=(
+            "Enable cache-dit summary logging after diffusion forward passes. "
+            "Default: unset (defer to the deploy YAML's enable_cache_dit_summary)."
+        ),
     )
     parser.add_argument(
         "--ulysses-degree",
