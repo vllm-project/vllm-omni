@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MOSS-TTS-Nano single-stage model for vLLM-Omni.
 
 Runs in a single AR worker stage.  The 0.1B AR LM and the
@@ -160,6 +160,33 @@ def _pick(info: dict, key: str, default):
     return val if val is not None else default
 
 
+def _configure_attention_implementation(lm: nn.Module, device: torch.device) -> None:
+    if device.type == "cuda":
+        try:
+            import flash_attn  # noqa: F401
+
+            lm._set_attention_implementation("flash_attention_2")
+            logger.info("MOSS-TTS-Nano using flash_attention_2")
+        except ImportError:
+            lm._set_attention_implementation("sdpa")
+            logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
+    else:
+        # The checkpoint defaults to flash_attention_2, whose external
+        # flash_attn package is CUDA-only. PyTorch SDPA is dispatched to the
+        # native backend on non-CUDA accelerators such as Ascend NPU.
+        lm._set_attention_implementation("sdpa")
+        logger.info("MOSS-TTS-Nano using sdpa on %s", device.type)
+
+
+def _validate_max_num_seqs(max_num_seqs: int) -> None:
+    if max_num_seqs != 1:
+        raise ValueError(
+            "MOSS-TTS-Nano currently requires max_num_seqs=1 because its "
+            "remote model and audio tokenizer share RNG and streaming decode "
+            "state across requests. Higher values can corrupt generated audio."
+        )
+
+
 class MossTTSNanoForGeneration(nn.Module):
     """Single-stage MOSS-TTS-Nano model with streaming audio output.
 
@@ -179,6 +206,7 @@ class MossTTSNanoForGeneration(nn.Module):
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
         self.model_path: str = vllm_config.model_config.model
+        _validate_max_num_seqs(vllm_config.scheduler_config.max_num_seqs)
 
         # Eager construction (not in load_weights) -- see module docstring.
         _patch_torchaudio_load()
@@ -209,15 +237,7 @@ class MossTTSNanoForGeneration(nn.Module):
                 trust_remote_code=True,
                 torch_dtype=tts_dtype,
             )
-        if device.type == "cuda":
-            try:
-                import flash_attn  # noqa: F401
-
-                lm._set_attention_implementation("flash_attention_2")
-                logger.info("MOSS-TTS-Nano using flash_attention_2")
-            except ImportError:
-                lm._set_attention_implementation("sdpa")
-                logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
+        _configure_attention_implementation(lm, device)
         lm.to(device=device)
         lm.eval()
 
