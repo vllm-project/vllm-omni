@@ -9,9 +9,14 @@ stages:
     max_num_seqs: 100
     max_model_len: 8192
     gpu_memory_utilization: 0.5
-    enforce_eager: true
+    # AR backbone: torch.compile on. DiT compile / AR CUDA graph capture
+    # are tracked separately (#7154 / #7319).
+    enforce_eager: false
     trust_remote_code: true
     enable_prefix_caching: false
+    compilation_config:
+      mode: 3  # PIECEWISE
+      cudagraph_mode: NONE
 
   - stage_id: 1
     devices: "0"

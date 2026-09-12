@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
@@ -8,6 +11,7 @@ import torch
 from torch import nn
 from transformers import Qwen2Config, Qwen3VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -97,82 +101,48 @@ def moe_forward(
     gen_expert: Callable[[torch.Tensor], torch.Tensor] | None,
     gen_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Perform Mixture-of-Experts (MoE) routing and forward pass.
+    """Route tokens to `und_expert` / `gen_expert` by `gen_token_mask` and scatter back.
 
-    This function routes tokens to either the understanding expert (`und_expert`) or the
-    generation expert (`gen_expert`) based on the `gen_token_mask`.
+    - `gen_expert is None` or `gen_token_mask is None`: all tokens go to `und_expert`.
+    - Otherwise: mask-True tokens go to `gen_expert`, mask-False to `und_expert`,
+      results written back to original positions via `index_copy`.
 
-    Routing Logic:
-    - If `gen_expert` is None: All tokens go to `und_expert`.
-    - If `gen_token_mask` is None or all False: All tokens go to `und_expert`.
-    - If `gen_token_mask` is all True: All tokens go to `gen_expert`.
-    - Otherwise (mixed batch):
-        - Tokens where `gen_token_mask` is True go to `gen_expert`.
-        - Tokens where `gen_token_mask` is False go to `und_expert`.
-        - Results are concatenated and reordered to match the original input order.
-
-    Args:
-        hidden_states (torch.Tensor): Input hidden states. Shape: `(batch_size, seq_len, hidden_size)`
-            or `(num_tokens, hidden_size)`.
-        und_expert (Callable): The expert module for understanding/text tokens.
-            Takes `(N, D)` tensor, returns `(N, D_out)`.
-        gen_expert (Callable | None): The expert module for generation/image tokens, or None.
-            If provided, takes `(N, D)` tensor, returns `(N, D_out)`.
-        gen_token_mask (torch.Tensor | None): Boolean mask indicating generation tokens.
-            Shape matches `hidden_states` (excluding feature dim). True for generation tokens.
-
-    Returns:
-        torch.Tensor: The processed hidden states with the same shape as input (except potentially
-        different feature dimension if `D_out != D`).
+    `hidden_states`: `(..., D)`. `gen_token_mask` matches shape excluding feature dim.
     """
     if gen_expert is None:
         return und_expert(hidden_states)
-
-    if gen_token_mask is None or not gen_token_mask.any():
+    if gen_token_mask is None:
         return und_expert(hidden_states)
-    if gen_token_mask.all():
-        return gen_expert(hidden_states)
 
-    if hidden_states.ndim == 2:
-        flat_hid = hidden_states
-        d_model = hidden_states.shape[-1]
-        total_tokens = hidden_states.shape[0]
-    elif hidden_states.ndim == 3:
-        d_model = hidden_states.shape[-1]
-        flat_hid = hidden_states.reshape(-1, d_model)  # (B*L, D)
-        total_tokens = flat_hid.shape[0]
-    else:
-        raise ValueError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
-
-    # Validate before reshape to catch shape mismatches where numel() would
-    # coincidentally match after flattening dimensions of different sizes.
-    if gen_token_mask.numel() != total_tokens:  # type: ignore[union-attr]
-        raise ValueError(
+    orig_shape = hidden_states.shape
+    d_model = orig_shape[-1]
+    flat_hid = hidden_states.reshape(-1, d_model)
+    flat_mask = gen_token_mask.reshape(-1)
+    # Guard against silent corruption from an under-sized mask.
+    torch._check(
+        flat_mask.shape[0] == flat_hid.shape[0],
+        lambda: (
             "gen_token_mask shape mismatch: "
             f"mask={tuple(gen_token_mask.shape)}, hidden_states={tuple(hidden_states.shape)}"
-        )
-    # mask: [num_tokens] or [B, L] -> flatten to [total_tokens]
-    flat_mask = gen_token_mask.reshape(-1)  # type: ignore[union-attr]
-    gen_pos = torch.where(flat_mask)[0]
-    und_pos = torch.where(~flat_mask)[0]
-    permute_order = torch.cat([gen_pos, und_pos], dim=0)
-    inverse_order = torch.argsort(permute_order)
-    gen_token_num = int(flat_mask.sum().item())
-    gen_hid, und_hid = flat_hid[permute_order].split([gen_token_num, total_tokens - gen_token_num], dim=0)
+        ),
+    )
 
-    # 1.1 Generation tokens (True)
-    gen_out = gen_expert(gen_hid)  # (N_gen, D)
+    gen_idx = flat_mask.nonzero(as_tuple=True)[0]
+    und_idx = (~flat_mask).nonzero(as_tuple=True)[0]
 
-    # 1.2 Understanding tokens (False)
-    und_out = und_expert(und_hid)  # (N_und, D)
+    gen_out = gen_expert(flat_hid.index_select(0, gen_idx))
+    und_out = und_expert(flat_hid.index_select(0, und_idx))
     out_dim = und_out.shape[-1]
 
-    merged = torch.cat([gen_out, und_out], dim=0)
-    merged = merged[inverse_order]
+    out = torch.empty(
+        (flat_hid.shape[0], out_dim),
+        dtype=und_out.dtype,
+        device=und_out.device,
+    )
+    out = out.index_copy(0, gen_idx, gen_out)
+    out = out.index_copy(0, und_idx, und_out)
 
-    if hidden_states.ndim == 2:
-        return merged.view(total_tokens, out_dim).contiguous()
-    return merged.view(*hidden_states.shape[:-1], out_dim).contiguous()
+    return out.view(*orig_shape[:-1], out_dim)
 
 
 class Mammothmoda2Processor(Qwen2_5_VLProcessor):
@@ -271,6 +241,19 @@ class Mammoth2DecoderLayer(Qwen2DecoderLayer):
         return hidden_states, residual
 
 
+# Decorator patches `__bases__` in place, so `MammothModa2Qwen3ForCausalLM`
+# inherits the compiled dispatch via MRO. `dynamic_arg_dims` mirrors upstream
+# Qwen3-Omni's `Qwen3MoeLLMModel`; `positions` uses -1 to cover both text-only
+# `(seq_len,)` and MRoPE `(3, seq_len)`.
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "deepstack_input_embeds": 0,
+    }
+)
 class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", decoder_layer_type: type[nn.Module] = Mammoth2DecoderLayer
@@ -414,29 +397,18 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         if not self.extra_gen_vocab or self.gen_embed_tokens is None:
             return self.embed_tokens(input_ids)
 
-        gen_mask = input_ids >= int(self.gen_vocab_start_index)
-        if not gen_mask.any():
-            return self.embed_tokens(input_ids)
-        if gen_mask.all():
-            gen_ids = input_ids - int(self.gen_vocab_start_index)
-            return self.gen_embed_tokens(gen_ids)
+        # Run both embeddings on the full tensor and pick per-position via
+        # `torch.where`. Out-of-range IDs are clamped to 0 in each branch so
+        # the gather is always legal; those slots are then discarded by the
+        # mask.
+        gen_start = int(self.gen_vocab_start_index)
+        gen_mask = input_ids >= gen_start
+        base_ids = torch.where(gen_mask, torch.zeros_like(input_ids), input_ids)
+        gen_ids = torch.where(gen_mask, input_ids - gen_start, torch.zeros_like(input_ids))
 
-        flat_ids = input_ids.reshape(-1)
-        flat_mask = gen_mask.reshape(-1)
-        out = torch.empty(
-            (flat_ids.shape[0], self.config.hidden_size),
-            dtype=self.embed_tokens.weight.dtype,  # type: ignore[attr-defined]
-            device=flat_ids.device,
-        )
-
-        base_pos = torch.where(~flat_mask)[0]
-        gen_pos = torch.where(flat_mask)[0]
-        if base_pos.numel() > 0:
-            out[base_pos] = self.embed_tokens(flat_ids[base_pos])
-        if gen_pos.numel() > 0:
-            gen_ids = flat_ids[gen_pos] - int(self.gen_vocab_start_index)
-            out[gen_pos] = self.gen_embed_tokens(gen_ids)
-        return out.view(*input_ids.shape, -1).contiguous()
+        base_emb = self.embed_tokens(base_ids)
+        gen_emb = self.gen_embed_tokens(gen_ids)
+        return torch.where(gen_mask.unsqueeze(-1), gen_emb, base_emb)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)
