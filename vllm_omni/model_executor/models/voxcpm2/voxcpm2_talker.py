@@ -877,8 +877,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._tts.residual_lm = None
         torch.accelerator.empty_cache()
 
-        self._inference_timesteps = 10
-        self._cfg_value = 2.0
+        self._inference_timesteps = self._runtime_config.inference_timesteps
+        self._cfg_value = self._runtime_config.cfg_value
         self._cfg_cutoff_ratio = self._runtime_config.cfg_cutoff_ratio
         # Number of trailing latent frames to keep as VAE receptive-field context
         # for sliding-window streaming decode. 12 matches the nanovllm reference
