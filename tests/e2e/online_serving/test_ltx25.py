@@ -87,3 +87,64 @@ def test_ltx25_pipeline_entries(
                 )
 
             openai_client.send_video_diffusion_request(request_config)
+
+
+# Distributed VAE patch parallelism needs a multi-rank DiT group to fan out over, so this
+# case runs on two cards instead of the single-card smokes above.
+VAE_PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+
+
+def _vae_parallel_server() -> OmniServerParams:
+    return OmniServerParams(
+        model=MODEL,
+        server_args=[
+            *(["--revision", MODEL_REVISION] if MODEL_REVISION else []),
+            "--model-class-name",
+            "LTX2Pipeline",
+            "--enforce-eager",
+            "--diffusion-attention-backend",
+            "CUDNN_ATTN",
+            # HSDP shards the transformer to give a 2-rank DiT group; the VAE patch-parallel
+            # executor fans its tiles out over that same group.
+            "--use-hsdp",
+            "--hsdp-shard-size",
+            "2",
+            "--vae-patch-parallel-size",
+            "2",
+            "--vae-use-tiling",
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    [pytest.param(_vae_parallel_server(), id="i2v_vae_patch_parallel", marks=VAE_PARALLEL_MARKS)],
+    indirect=["omni_server"],
+)
+def test_ltx25_i2v_vae_patch_parallel(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+) -> None:
+    """I2V through the distributed VAE tiling parallel encode and decode path.
+
+    The full one-stage pipeline encodes the reference image at the full output resolution, so
+    576x576 (above the VAE's 512 tile threshold) splits into a 2x2 tile grid and drives
+    tiled_encode/tiled_decode across the DiT group. The single-card smokes above run at
+    256x256, which stays under the threshold and never reaches the tiled path.
+    """
+    request_config = {
+        "model": omni_server.model,
+        "form_data": {
+            "model": omni_server.model,
+            "prompt": PROMPT,
+            "height": 576,
+            "width": 576,
+            "num_frames": 9,
+            "fps": 24,
+            "num_inference_steps": 8,
+            "seed": 42,
+        },
+        "image_reference": f"data:image/jpeg;base64,{generate_synthetic_image(576, 576)['base64']}",
+    }
+
+    openai_client.send_video_diffusion_request(request_config)
