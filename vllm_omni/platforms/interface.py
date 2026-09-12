@@ -162,6 +162,11 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_gfx_arch(cls) -> str | None:
+        """Return the ROCm gfx architecture, if applicable."""
+        return None
+
+    @classmethod
     def supports_talker_mtp_graph_capture(cls) -> bool:
         """Whether a model may capture its dedicated talker MTP graph."""
         return True
