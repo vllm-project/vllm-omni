@@ -32,13 +32,13 @@ mode is selected per request:
   T2V/I2V `/v1/videos/sync` request to also generate synchronized audio, muxed into
   the mp4 as AAC 48 kHz stereo. See the official model card's "Video + Audio" examples.
 - **Action** — pass `extra_params={"action_mode": ...}` to drive Physical-AI tasks:
-  - `forward_dynamics` — given a first frame or video **and** an action trajectory,
+    - `forward_dynamics` — given a first frame or video **and** an action trajectory,
     roll out the resulting video. Synchronous: `POST /v1/videos/sync`.
-  - `policy` — given a first frame or video and a language instruction,
+    - `policy` — given a first frame or video and a language instruction,
     **predict** the action trajectory (and a rollout video). Use the async
     `POST /v1/videos` endpoint and read the predicted action from the top-level
     `action` field.
-  - `inverse_dynamics` — given a video, **recover** the action trajectory. Use
+    - `inverse_dynamics` — given a video, **recover** the action trajectory. Use
     the async `POST /v1/videos` endpoint and read the recovered action from
     the top-level `action` field
     (`{data, shape, dtype, raw_action_dim, domain_id}`).
@@ -105,6 +105,25 @@ vllm serve nvidia/Cosmos3-Nano \
   --host 0.0.0.0 --port 8000 \
   --init-timeout 1800
 ```
+
+For Cosmos3, SeaCache is the recommended default choice when opting into
+diffusion caching. Caching remains opt-in; add `--cache-backend sea_cache` to
+the command above. Its default threshold and maximum cached-step streak are
+tuned for Cosmos3, so no `--cache-config` is required.
+
+Override individual defaults with a JSON cache configuration; for example:
+
+```bash
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --cache-backend sea_cache \
+  --cache-config '{"sea_threshold":0.2,"sea_max_consecutive_cached":3}'
+```
+
+Lower `sea_threshold` values and smaller `sea_max_consecutive_cached` caps are
+more conservative. Higher values allow more cached steps and may improve
+speed, but can increase quality loss. Setting `sea_max_consecutive_cached` to
+`0` removes the streak cap.
 
 To run **without** guardrails (you are responsible for license compliance),
 add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
@@ -382,12 +401,12 @@ OpenPI route uses the normal API authentication middleware. RoboLab's
 
 #### Notes
 
-- **Measured latency (1x B300, bf16, guardrails off):**
-  - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
-  - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
-  - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
-  - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
-  - Guardrails-on overhead: ~8% on T2I, negligible on video.
+- **Measured latency (1x B300, bf16, guardrails off, diffusion cache off):**
+    - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
+    - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
+    - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
+    - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
+    - Guardrails-on overhead: ~8% on T2I, negligible on video.
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 GPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
   ~33 GB on disk.
@@ -443,12 +462,12 @@ OpenPI route uses the normal API authentication middleware. RoboLab's
   `conditioning_fps`, `action_chunk_size`, `raw_action_dim`, `deterministic_seed`,
   and `session_id`.
 - **Known limitations:**
-  - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
+    - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
     `nvidia/Cosmos-1.0-Guardrail` repo (accept license + `HF_TOKEN`); otherwise
     the server fails at pipeline build with a gated-repo / safety-checker error.
-  - A guardrail-blocked prompt currently returns HTTP 500
+    - A guardrail-blocked prompt currently returns HTTP 500
     (`"Guardrail blocked prompt"`).
-  - Action `forward_dynamics`, `policy`, and `inverse_dynamics` are supported
+    - Action `forward_dynamics`, `policy`, and `inverse_dynamics` are supported
     online. Use async `POST /v1/videos` when you need the predicted/recovered
     action payload under the top-level `action` field; sync `/v1/videos/sync`
     returns raw MP4 bytes and does not expose action metadata in the response body.
@@ -579,14 +598,14 @@ so an md5 comparison across two runs also works as a smoke check.
   a ~390 s build of the VAE decode path *for that shape*, so warming 1024² images
   does nothing for 189-frame video. At 720p / 189 frames / 35 steps this is
   **540 s cold vs 161 s warm, with byte-identical output**.
-- **Measured on 1x MI350X (bf16, guardrails off, warm):** T2I 1024² @ 50 steps
+- **Measured on 1x MI350X (bf16, guardrails off, diffusion cache off, warm):** T2I 1024² @ 50 steps
   **~2.7 s**; T2V 1280×720 / 189 frames @ 35 steps **~161 s**, of which ~92% is
   the DiT denoise loop and ~4% VAE decode, so optimization effort belongs in the
   denoise loop. The optional flags act on different terms of the memory bill and
   are therefore complementary rather than redundant:
 
   | Flag | Latency | Peak reserved | Peak allocated | Acts on |
-  |---|---|---|---|---|
+  | --- | --- | --- | --- | --- |
   | *(none)* | 161 s | 120 GiB | 95 GiB | — |
   | `--vae-use-tiling` | 183 s (+13.5%) | **38 GiB** (−68%) | **36 GiB** (−62%) | decode activations |
   | `--enable-layerwise-offload` | 162 s (+0.8%) | 84 GiB (−30%) | 69 GiB (−27%) | weights |
@@ -768,11 +787,11 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 
 #### Notes
 
-- **Measured latency (1x Ascend 910B / 910C, bf16, guardrails off):**
-  - T2I 1024² — 10 steps → ~8 s
-  - T2V 1280×720 @ 20 steps — 49 frames → ~55 s
-  - I2V 1280×720 @ 10 steps — 25 frames → ~25 s
-  - V2V 480×320 @ 10 steps — 17 frames → ~12 s
+- **Measured latency (1x Ascend 910B / 910C, bf16, guardrails off, diffusion cache off):**
+    - T2I 1024² — 10 steps → ~8 s
+    - T2V 1280×720 @ 20 steps — 49 frames → ~55 s
+    - I2V 1280×720 @ 10 steps — 25 frames → ~25 s
+    - V2V 480×320 @ 10 steps — 17 frames → ~12 s
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 NPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
   ~33 GB on disk.
@@ -785,9 +804,9 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   (for model loading), `--tensor-parallel-size 8` for multi-NPU, and
   `--model-class-name Cosmos3OmniDiffusersPipeline` to force the pipeline class.
 - **Known limitations:**
-  - Transfer V2V with `extra_params` (`edge`/`blur`/`depth`/`seg`/`wsm`) hits a
+    - Transfer V2V with `extra_params` (`edge`/`blur`/`depth`/`seg`/`wsm`) hits a
     resolution-parsing bug; basic V2V without transfer hints works.
-  - FP8 online quantization and layerwise offload are not supported on NPU.
+    - FP8 online quantization and layerwise offload are not supported on NPU.
 
 ### 1x Ascend 910B / 910C (Atlas A2 / A3) — Offline generation
 

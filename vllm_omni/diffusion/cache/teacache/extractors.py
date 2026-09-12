@@ -199,7 +199,7 @@ def extract_qwen_context(
     hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
     image_rotary_emb = (vid_freqs, txt_freqs)
 
-    timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    timestep = torch.as_tensor(timestep, device=hidden_states.device, dtype=hidden_states.dtype)
 
     # Call modulate_index_prepare instead of handling timestep directly.
     # For zero_cond_t=False: timestep unchanged, modulate_index=None.
@@ -618,6 +618,8 @@ def extract_flux2_klein_context(
     # ============================================================================
     dtype = hidden_states.dtype
 
+    if encoder_hidden_states is None:
+        raise ValueError("Flux2Klein requires encoder_hidden_states")
     num_txt_tokens = encoder_hidden_states.shape[1]
 
     timestep = timestep.to(dtype=dtype) * 1000
@@ -1466,6 +1468,77 @@ def extract_minimax_h3_context(
     )
 
 
+def extract_cosmos3_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    video_shape: tuple[int, int, int],
+    fps: float | None = None,
+    action_latents: torch.Tensor | None = None,
+    action_domain_ids: torch.Tensor | None = None,
+    action_noisy_mask: torch.Tensor | None = None,
+    action_start_frame_offset: int = 1,
+    action_fps: float | None = None,
+    sound_latents: torch.Tensor | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+    control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+    control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+    transfer_share_vision_temporal_positions: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """Build the shared cache execution context for Cosmos3's GEN pathway."""
+    if kwargs:
+        raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+
+    prep = module._gen_preprocess(
+        hidden_states,
+        timestep,
+        text_ids,
+        text_mask,
+        video_shape,
+        fps=fps,
+        action_latents=action_latents,
+        action_domain_ids=action_domain_ids,
+        action_noisy_mask=action_noisy_mask,
+        action_start_frame_offset=action_start_frame_offset,
+        action_fps=action_fps,
+        sound_latents=sound_latents,
+        noisy_frame_mask=noisy_frame_mask,
+        control_latents=control_latents,
+        control_weights=control_weights,
+        transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+    )
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        return (module._run_gen_stack(prep),)
+
+    def postprocess(hidden: torch.Tensor) -> Any:
+        return module._gen_postprocess(hidden, prep)
+
+    if control_latents is None:
+        controls: list[torch.Tensor] = []
+    elif isinstance(control_latents, torch.Tensor):
+        controls = [control_latents]
+    else:
+        controls = list(control_latents)
+
+    return CacheContext(
+        # SeaCache uses the separate inputs in extra_states for its decision.
+        modulated_input=prep.hidden_gen,
+        hidden_states=prep.hidden_gen,
+        encoder_hidden_states=None,
+        temb=prep.time_embed,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "sea_cache_latents": [*controls, hidden_states],
+            "sea_cache_noisy_frame_mask": noisy_frame_mask,
+        },
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1475,6 +1548,8 @@ def extract_minimax_h3_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,
+    "Cosmos3VFMTransformer": extract_cosmos3_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
@@ -1521,16 +1596,15 @@ def register_extractor(transformer_cls_name: str, extractor_fn: Callable) -> Non
     EXTRACTOR_REGISTRY[transformer_cls_name] = extractor_fn
 
 
-def get_extractor(transformer_cls_name: str) -> Callable:
+def get_extractor(transformer_type: str | type) -> Callable:
     """
     Get extractor function for given transformer class.
 
-    This function looks up the extractor based on the exact transformer_cls_name string,
-    which should match the transformer type in the pipeline (i.e., pipeline.transformer.__class__.__name__).
+    String lookups match an exact registered name. Type lookups also check base
+    classes so runtime wrappers such as FSDP retain the underlying model extractor.
 
     Args:
-        transformer_cls_name: Transformer class name (e.g., "QwenImageTransformer2DModel")
-                                Must exactly match a key in EXTRACTOR_REGISTRY.
+        transformer_type: Transformer class name or runtime type.
 
     Returns:
         Extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1543,14 +1617,18 @@ def get_extractor(transformer_cls_name: str) -> Callable:
         >>> extractor = get_extractor("QwenImageTransformer2DModel")
         >>> ctx = extractor(transformer, hidden_states, encoder_hidden_states, timestep, ...)
     """
-    # Direct lookup - no substring matching
-    if transformer_cls_name in EXTRACTOR_REGISTRY:
-        return EXTRACTOR_REGISTRY[transformer_cls_name]
+    candidate_names: tuple[str, ...]
+    if isinstance(transformer_type, str):
+        candidate_names = (transformer_type,)
+    else:
+        candidate_names = tuple(candidate.__name__ for candidate in transformer_type.__mro__)
+    for candidate_name in candidate_names:
+        if candidate_name in EXTRACTOR_REGISTRY:
+            return EXTRACTOR_REGISTRY[candidate_name]
 
-    # No match found
     available_types = list(EXTRACTOR_REGISTRY.keys())
     raise ValueError(
-        f"Unknown model type: '{transformer_cls_name}'. "
+        f"Unknown model type: '{transformer_type}'. "
         f"Available types: {available_types}\n"
         f"To add support for a new model, use register_extractor() or add to EXTRACTOR_REGISTRY."
     )
