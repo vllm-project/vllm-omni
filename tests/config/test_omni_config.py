@@ -811,6 +811,7 @@ def test_sub_config_fields_match_structured_scopes():
         "allgather_degree",
         "ulysses_mode",
         "ulysses_a2a_permute",
+        "enable_usp",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
         "vae_parallel_mode",
