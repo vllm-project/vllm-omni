@@ -77,6 +77,9 @@ dev = [
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
+    # HyperPyYAML's custom loader is incompatible with ruamel.yaml 0.19.
+    "hyperpyyaml==1.2.3",
+    "ruamel.yaml==0.17.40",
 ]
 
 demo = [
