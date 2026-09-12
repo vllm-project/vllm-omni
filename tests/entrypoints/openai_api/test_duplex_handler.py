@@ -5341,7 +5341,7 @@ async def test_playback_ack_recovers_missing_response_history_registration():
 
 
 @pytest.mark.asyncio
-async def test_playback_ack_rejects_response_after_followup_user_commit():
+async def test_playback_ack_after_followup_user_commit_is_noop():
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(FakeEngineClient()),
         config_timeout_s=0.1,
@@ -5373,8 +5373,10 @@ async def test_playback_ack_rejects_response_after_followup_user_commit():
         ws.send_json,
     )
 
-    assert ws.sent_types() == ["error"]
-    assert ws.sent[0]["code"] == "playback_ack_too_late"
+    # The ack lost the race against the follow-up user commit. It is a
+    # pipelining artifact, not a client bug, so the server must not fail the
+    # session: no error event, no history mutation.
+    assert ws.sent_types() == []
     assert session.history == (
         {"role": "user", "content": "user A"},
         {"role": "user", "content": "user B"},

@@ -1920,14 +1920,16 @@ class OmniDuplexSessionHandler(
                 )
                 return
             if session.playback_ack_is_too_late(response_id, item_id):
-                await send_json(
-                    {
-                        "type": "error",
-                        "session_id": session.session_id,
-                        "epoch": session.epoch,
-                        "code": "playback_ack_too_late",
-                        "error": "playback.ack arrived after a later user input was committed.",
-                    }
+                # A pipelining client computes this ack before it observes the
+                # user-input commit that supersedes the acked response, so the
+                # race is benign and unavoidable: the superseded response never
+                # entered history and the ack has nothing to update. Ignore it
+                # instead of failing the session with a protocol error.
+                logger.warning(
+                    "Ignoring superseded playback.ack for response %s in session %s "
+                    "(a later user input was committed first).",
+                    response_id,
+                    session.session_id,
                 )
                 return
             # Reserve the response's current history position before any later
