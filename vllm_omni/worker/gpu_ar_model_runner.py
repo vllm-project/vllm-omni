@@ -2088,6 +2088,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+        if self.use_async_scheduling:
+            pp = get_pp_group()
+            # Earlier PP ranks posted the matching async receive in the
+            # connector-only branch above (inherited from vLLM). Without this
+            # send their next `_prepare_input_ids` waits forever.
+            # For torchrun external_launcher PP mode with broadcast_pp_output=True,
+            # PP outputs have been broadcast to all ranks at logits computation,
+            # so the sampled token ids must not be sent again.
+            if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
+                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
