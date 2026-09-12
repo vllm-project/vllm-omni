@@ -14,6 +14,7 @@ import weakref
 from typing import Any
 
 import pytest
+import torch
 from PIL import Image
 
 from vllm_omni.entrypoints.openai import video_stream_base, video_stream_envs
@@ -455,6 +456,54 @@ async def test_async_chunk_mode_is_read_by_engine_path_at_runtime(monkeypatch):
     )
     assert {"type": "response.text.done", "text": "hello"} in ws_off.sent
     assert not any(m.get("type") == "response.text.delta" for m in ws_off.sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_chunk_mode", ["on", "off"])
+async def test_audio_events_use_output_audio_names(monkeypatch, async_chunk_mode):
+    class AudioEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                yield _audio_result([torch.zeros(1)])
+
+            return _gen()
+
+    class AudioHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt": "x"}
+
+    monkeypatch.setenv("VLLM_VIDEO_ASYNC_CHUNK", async_chunk_mode)
+    monkeypatch.setattr(
+        OmniStreamingVideoHandler,
+        "_encode_audio_wav_b64",
+        staticmethod(lambda _audio: "audio-b64"),
+    )
+
+    ws = MockWebSocket()
+    handler = AudioHandler(chat_service=object(), engine_client=AudioEngine())
+    config = StreamingVideoSessionConfig(model="test", modalities=["text", "audio"])
+
+    await handler._process_query_engine(
+        ws,
+        config,
+        [_b64(_make_jpeg())],
+        bytearray(),
+        [],
+        "describe",
+        "req-audio-events",
+        asyncio.Event(),
+        {},
+    )
+
+    audio_events = [message for message in ws.sent if "audio" in message.get("type", "")]
+    assert audio_events == [
+        {
+            "type": "response.output_audio.delta",
+            "data": "audio-b64",
+            "format": "wav",
+        },
+        {"type": "response.output_audio.done"},
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import importlib.util
 import math
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +33,10 @@ _STUBBED_MODULE_NAMES = (
     "vllm_omni.diffusion",
     "vllm_omni.diffusion.attention",
     "vllm_omni.diffusion.attention.layer",
+    "vllm_omni.diffusion.distributed",
+    "vllm_omni.diffusion.distributed.comm",
+    "vllm_omni.diffusion.distributed.parallel_state",
+    "vllm_omni.diffusion.distributed.sp_plan",
     "vllm_omni.diffusion.layers",
     "vllm_omni.diffusion.layers.norm",
     "vllm_omni.diffusion.layers.rope",
@@ -57,6 +61,47 @@ def _install_vllm_stubs() -> None:
     distributed.get_tensor_model_parallel_rank = lambda: 0
     distributed.get_tensor_model_parallel_world_size = lambda: 1
     distributed.tensor_model_parallel_all_reduce = lambda value: value
+
+    class _SeqAllToAll4D:
+        @staticmethod
+        def apply(group, value, scatter_idx, gather_idx, use_sync=False):
+            del group, scatter_idx, gather_idx, use_sync
+            return value
+
+    setattr(
+        sys.modules["vllm_omni.diffusion.distributed.comm"],
+        "SeqAllToAll4D",
+        _SeqAllToAll4D,
+    )
+
+    def get_sp_group():
+        return SimpleNamespace(
+            ulysses_world_size=1,
+            ulysses_rank=0,
+            ulysses_group=None,
+        )
+
+    setattr(
+        sys.modules["vllm_omni.diffusion.distributed.parallel_state"],
+        "get_sp_group",
+        get_sp_group,
+    )
+
+    class _SequenceParallelInput:
+        def __init__(self, split_dim, expected_dims=None, split_output=False, auto_pad=False):
+            self.split_dim = split_dim
+            self.expected_dims = expected_dims
+            self.split_output = split_output
+            self.auto_pad = auto_pad
+
+    class _SequenceParallelOutput:
+        def __init__(self, gather_dim, expected_dims=None):
+            self.gather_dim = gather_dim
+            self.expected_dims = expected_dims
+
+    sp_plan = sys.modules["vllm_omni.diffusion.distributed.sp_plan"]
+    setattr(sp_plan, "SequenceParallelInput", _SequenceParallelInput)
+    setattr(sp_plan, "SequenceParallelOutput", _SequenceParallelOutput)
 
     def set_weight_attrs(weight: torch.Tensor, attrs: dict) -> None:
         for name, value in attrs.items():
@@ -541,3 +586,38 @@ def test_tp_rmsnorm_weight_loader_selects_rank_shard(monkeypatch: pytest.MonkeyP
     norm.weight.weight_loader(norm.weight, torch.tensor([10.0, 20.0, 30.0, 40.0]))
 
     torch.testing.assert_close(norm.weight, torch.tensor([30.0, 40.0]))
+
+
+def test_single_token_text_kv_shard_owns_compact_storage(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "get_sp_group",
+        lambda: SimpleNamespace(
+            ulysses_world_size=2,
+            ulysses_rank=1,
+            ulysses_group=None,
+        ),
+    )
+    attention = module.LingBotCrossAttention(dim=8, num_heads=4)
+    full = torch.arange(8, dtype=torch.float32).reshape(1, 1, 4, 2)
+    shard = attention.shard_kv_heads(full)
+    torch.testing.assert_close(shard, full[:, :, 2:], rtol=0, atol=0)
+    assert shard.is_contiguous()
+    assert shard.untyped_storage().nbytes() == shard.numel() * shard.element_size()
+
+
+@pytest.mark.parametrize("attention_class", ["LingBotSelfAttention", "LingBotCrossAttention"])
+def test_ulysses_rejects_non_divisible_head_count(monkeypatch, attention_class):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "get_sp_group",
+        lambda: SimpleNamespace(
+            ulysses_world_size=3,
+            ulysses_rank=0,
+            ulysses_group=None,
+        ),
+    )
+    with pytest.raises(ValueError, match="heads must be divisible"):
+        getattr(module, attention_class)(dim=8, num_heads=4)
