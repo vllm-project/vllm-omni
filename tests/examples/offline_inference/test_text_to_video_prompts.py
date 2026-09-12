@@ -55,6 +55,8 @@ def test_text_to_video_builds_canonical_prompt(
         ("BestWishYsh/Helios-Distilled", None, "helios"),
         ("/models/cosmos-edge", "Cosmos3EdgeVFMTransformer", "cosmos3_edge"),
         ("/models/vace", "WanVACEPipeline", "vace"),
+        ("Skywork/SkyReels-V2-T2V-14B-540P-Diffusers", None, "skyreels_v2"),
+        ("/models/skyreels", "SkyReelsV2Pipeline", "skyreels_v2"),
     ],
 )
 def test_detect_preset_is_scoped_to_model_family(
@@ -78,6 +80,20 @@ def test_lingbot_preset_matches_lingbot_defaults() -> None:
         "fps": 24,
         "flow_shift": 3.0,
         "output": "lingbot_video_output.mp4",
+    }
+
+
+def test_skyreels_v2_preset_matches_skyreels_defaults() -> None:
+    mod = _load_text_to_video()
+    assert mod._MODEL_PRESETS["skyreels_v2"] == {
+        "height": 544,
+        "width": 960,
+        "num_frames": 97,
+        "num_inference_steps": 50,
+        "guidance_scale": 6.0,
+        "fps": 24,
+        "flow_shift": 8.0,
+        "output": "skyreels_v2_output.mp4",
     }
 
 

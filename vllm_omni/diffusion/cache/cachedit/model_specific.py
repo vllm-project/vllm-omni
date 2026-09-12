@@ -881,6 +881,8 @@ def register_custom_dit_enablers() -> None:
             "Wan22TI2VPipeline": enable_cache_for_wan22,
             "Wan22VACEPipeline": enable_cache_for_wan22,
             "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
+            # SkyReels V2 T2V reuses the Wan DiT stack.
+            "SkyReelsV2Pipeline": enable_cache_for_wan22,
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,

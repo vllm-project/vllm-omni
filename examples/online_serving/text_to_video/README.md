@@ -9,6 +9,8 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (1.3B) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| SkyReels V2 T2V (540P) | `Skywork/SkyReels-V2-T2V-14B-540P-Diffusers` |
+| SkyReels V2 T2V (720P) | `Skywork/SkyReels-V2-T2V-14B-720P-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
 | Helios (Base / Mid / Distilled) | `BestWishYsh/Helios-Base`, `Helios-Mid`, `Helios-Distilled` |
 | SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
@@ -42,6 +44,33 @@ The script allows overriding:
 - `FLOW_SHIFT` (default: `5.0`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
+
+## SkyReels V2 T2V
+
+Single-DiT Diffusers T2V (no MoE `transformer_2`). Recommended defaults: `flow_shift=8.0`, `guidance_scale=6.0`.
+
+```bash
+vllm serve Skywork/SkyReels-V2-T2V-14B-540P-Diffusers --omni --port 8091 \
+  --flow-shift 8.0 --boundary-ratio 0.0
+```
+
+Sync smoke (540P):
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A cat and a dog baking a cake together in a kitchen." \
+  -F "size=960x544" \
+  -F "num_frames=33" \
+  -F "fps=24" \
+  -F "num_inference_steps=20" \
+  -F "guidance_scale=6.0" \
+  -F "flow_shift=8.0" \
+  -F "boundary_ratio=0.0" \
+  -F "seed=42" \
+  -o skyreels_v2_sync.mp4
+```
+
+For 720P, serve `Skywork/SkyReels-V2-T2V-14B-720P-Diffusers` and use `size=1280x720`.
 
 ## Async Job Behavior
 
