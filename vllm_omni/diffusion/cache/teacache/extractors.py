@@ -89,6 +89,13 @@ class CacheContext:
         extra_states: Optional dict for additional model-specific state.
             Use this for models that need to pass additional context beyond
             the standard fields.
+
+            Reserved keys:
+            - "run_full_transformer_with_single": Callable with signature
+              (hidden_states, encoder_hidden_states) -> tuple[torch.Tensor, torch.Tensor | None]
+              used by dual+single-stream models whose cacheable unit must
+              include both the main transformer blocks and follow-on
+              single-stream blocks.
     """
 
     modulated_input: torch.Tensor
@@ -672,7 +679,7 @@ def extract_flux2_klein_context(
             )
         return (h, c)
 
-    def run_flux2_full_transformer_with_single(ori_h, ori_c):
+    def run_full_transformer_with_single(ori_h, ori_c):
         h = ori_h
         c = ori_c
         for block in module.transformer_blocks:
@@ -716,7 +723,106 @@ def extract_flux2_klein_context(
         run_transformer_blocks=run_flux2_transformer_blocks,
         postprocess=postprocess,
         extra_states={
-            "run_flux2_full_transformer_with_single": run_flux2_full_transformer_with_single,
+            "run_full_transformer_with_single": run_full_transformer_with_single,
+        },
+    )
+
+
+def extract_ovis_image_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor | None = None,
+    timestep: torch.LongTensor = None,
+    img_ids: torch.Tensor = None,
+    txt_ids: torch.Tensor = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for OvisImageTransformer2DModel.
+
+    Ovis-Image uses a dual-stream transformer trunk followed by
+    single_transformer_blocks, so TeaCache should cache the full transformer
+    output and skip both stages on cache hits.
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks")
+
+    # ============================================================================
+    # PREPROCESSING (Ovis-specific)
+    # ============================================================================
+    hidden_states = module.x_embedder(hidden_states)
+    timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
+
+    timesteps_proj = module.time_proj(timestep)
+    temb = module.timestep_embedder(timesteps_proj.to(device=hidden_states.device, dtype=hidden_states.dtype))
+
+    encoder_hidden_states = module.context_embedder_norm(encoder_hidden_states)
+    encoder_hidden_states = module.context_embedder(encoder_hidden_states)
+
+    if txt_ids.ndim == 3:
+        txt_ids = txt_ids[0]
+    if img_ids.ndim == 3:
+        img_ids = img_ids[0]
+
+    ids = torch.cat((txt_ids, img_ids), dim=0)
+    image_rotary_emb = module.pos_embed(ids)
+
+    # ============================================================================
+    # EXTRACT MODULATED INPUT (for cache decision)
+    # ============================================================================
+    block = module.transformer_blocks[0]
+    modulated_input = block.norm1(hidden_states, emb=temb)[0]
+
+    # ============================================================================
+    # DEFINE TRANSFORMER EXECUTION (Ovis-specific)
+    # ============================================================================
+    def run_dual_stream_transformer_blocks(h, e):
+        for block in module.transformer_blocks:
+            e, h = block(
+                hidden_states=h,
+                encoder_hidden_states=e,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
+        return (h, e)
+
+    def run_ovis_transformer_blocks():
+        return run_dual_stream_transformer_blocks(hidden_states, encoder_hidden_states)
+
+    def run_full_transformer_with_single(ori_h, ori_e):
+        h, e = run_dual_stream_transformer_blocks(ori_h, ori_e)
+        for block in module.single_transformer_blocks:
+            e, h = block(
+                hidden_states=h,
+                encoder_hidden_states=e,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
+        return h, e
+
+    # ============================================================================
+    # DEFINE POSTPROCESSING (Ovis-specific)
+    # ============================================================================
+    return_dict = kwargs.get("return_dict", True)
+
+    def postprocess(h):
+        h = module.norm_out(h, temb)
+        h = module.proj_out(h)
+        if not return_dict:
+            return (h,)
+        return Transformer2DModelOutput(sample=h)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        run_transformer_blocks=run_ovis_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "run_full_transformer_with_single": run_full_transformer_with_single,
         },
     )
 
@@ -1477,6 +1583,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "Bagel": extract_bagel_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
+    "OvisImageTransformer2DModel": extract_ovis_image_context,
     "StableAudioDiTModel": extract_stable_audio_context,
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
