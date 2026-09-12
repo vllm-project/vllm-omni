@@ -752,6 +752,11 @@ class MixRequestFuncOutput(RequestFuncOutput):
     final_output_type: str | None = None
     duplex_request_metrics: list[dict[str, object]] | None = None
     duplex_session_metrics: dict[str, object] | None = None
+    #: Whether this request is contractually required to produce output.
+    #: OmniInteract listen-only sessions (``require_response=False``) may
+    #: legitimately finish with no text/audio, so the empty-output integrity
+    #: check in the metrics aggregator must honor the contract.
+    output_required: bool | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -2289,6 +2294,7 @@ async def _async_request_omniinteract(
         output.duplex_request_metrics = case_result.duplex_request_metrics
         output.duplex_session_metrics = session_metrics
         output.success = case_result.success
+        output.output_required = options.require_response
         output.error = case_result.error
         setattr(output, "omniinteract_case", case)
         setattr(output, "omniinteract_case_result", case_result)

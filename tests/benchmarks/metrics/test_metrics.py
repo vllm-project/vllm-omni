@@ -84,6 +84,101 @@ def _calculate_test_metrics(outputs, goodput=None):
     )[0]
 
 
+def _make_degraded_output(prompt_len: int = 100) -> MixRequestFuncOutput:
+    """HTTP-successful request whose stream closed without any measurable output."""
+    output = _make_output(prompt_len, output_tokens=0)
+    output.generated_text = ""
+    output.itl = []
+    return output
+
+
+# ============================================================================
+# Empty-output integrity Tests
+# ============================================================================
+
+
+def test_http_success_with_no_output_counts_as_failed():
+    degraded = _make_degraded_output()
+    healthy = _make_output(100, output_tokens=10)
+
+    metrics = _calculate_test_metrics([degraded, healthy], {"tpot": 1.0})
+
+    assert metrics.completed == 1
+    assert metrics.failed == 1
+    assert metrics.num_itl_samples == len(healthy.itl)
+
+
+def test_audio_output_makes_empty_text_request_completed():
+    audio_only = _make_degraded_output()
+    audio_only.audio_frames = 24_000
+    audio_only.audio_duration = 1.0
+
+    metrics = _calculate_test_metrics([audio_only])
+
+    assert metrics.completed == 1
+    assert metrics.failed == 0
+
+
+def test_no_output_request_excluded_from_latency_aggregates():
+    degraded = _make_degraded_output()
+    degraded.latency = 999.0  # would poison e2el if counted as completed
+    healthy = _make_output(100)
+
+    metrics = _calculate_test_metrics([degraded, healthy])
+
+    assert metrics.completed == 1
+    assert metrics.mean_e2el_ms == pytest.approx(1000.0)
+
+
+def test_no_output_request_does_not_inflate_output_throughput():
+    degraded = _make_degraded_output()
+    healthy = _make_output(100, output_tokens=10)
+
+    metrics = _calculate_test_metrics([degraded, healthy])
+
+    assert metrics.total_output == 10
+    # The degraded response must not fabricate a first-token entry in the peak
+    # timeline: the combined peak must equal the healthy request's own peak.
+    # All 10 healthy tokens (ttft 0.1 + nine 0.1s ITLs, last at ~1.0s) fall in
+    # second bucket 0, so the healthy request alone peaks at 10 tokens/s.
+    healthy_only = _calculate_test_metrics([healthy])
+    assert metrics.max_output_tokens_per_s == pytest.approx(healthy_only.max_output_tokens_per_s)
+    assert metrics.max_output_tokens_per_s == pytest.approx(10.0)
+
+
+def test_single_no_output_request_reports_no_peak_rate():
+    degraded = _make_degraded_output()
+
+    metrics = _calculate_test_metrics([degraded])
+
+    assert metrics.completed == 0
+    assert metrics.failed == 1
+    assert metrics.total_output == 0
+    assert metrics.max_output_tokens_per_s == 0.0
+
+
+def test_listen_only_session_without_required_output_stays_completed():
+    listen_only = _make_degraded_output()
+    listen_only.output_required = False
+
+    metrics = _calculate_test_metrics([listen_only])
+
+    assert metrics.completed == 1
+    assert metrics.failed == 0
+    assert metrics.total_input == 100
+    assert metrics.mean_e2el_ms == pytest.approx(1000.0)
+
+
+def test_required_output_contract_still_fails_empty_responses():
+    required = _make_degraded_output()
+    required.output_required = True
+
+    metrics = _calculate_test_metrics([required])
+
+    assert metrics.completed == 0
+    assert metrics.failed == 1
+
+
 # ============================================================================
 # total_input Tests
 # ============================================================================
