@@ -778,12 +778,25 @@ def test_shifted_sigma_schedule_matches_reference_values():
         minimax_h3_time_shift_sigmas,
     )
 
-    sigmas = minimax_h3_time_shift_sigmas(num_steps=5, shift_scale=12.0)
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=4, shift_scale=12.0)
 
     assert sigmas == pytest.approx(
         [1.0, 0.9729729891, 0.9230769277, 0.8000000119, 0.0],
         abs=1e-7,
     )
+
+
+@pytest.mark.parametrize("num_steps", [1, 8, 50])
+@pytest.mark.parametrize("shift_scale", [3.0, 12.0])
+def test_uniform_sigma_schedule_has_one_interval_per_requested_step(num_steps, shift_scale):
+    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=shift_scale)
+
+    assert len(sigmas) == num_steps + 1
+    assert sigmas[0] == 1.0
+    assert sigmas[-1] == 0.0
+    assert all(current > following for current, following in zip(sigmas, sigmas[1:]))
 
 
 def test_base_schedule_overrides_the_uniform_sigma_positions():
