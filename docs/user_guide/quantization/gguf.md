@@ -39,6 +39,7 @@ guide.
 | Model | HF base model | GGUF input | Scope | Adapter |
 |-------|---------------|------------|-------|---------|
 | Qwen-Image family | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512`, edit and layered Qwen-Image pipelines | Local `.gguf`, `repo/file.gguf`, or `repo:quant_type` | Transformer only | `QwenImageGGUFAdapter` |
+| MiniMax-H3 | `MiniMaxAI/MiniMax-H3` | Explicit non-pruned task-partition `.gguf` | One DiT partition per process; text encoder and VAEs stay on base weights | `MiniMaxH3DiffusionGGUFAdapter` |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Transformer only | No validated adapter listed |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Local `.gguf`, `repo/file.gguf`, or `repo:quant_type` | Transformer only | `ZImageGGUFAdapter` |
 | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B` | Local `.gguf`, `repo/file.gguf`, or `repo:quant_type` | Transformer only | `Flux2KleinGGUFAdapter` |
@@ -85,6 +86,20 @@ vllm serve Qwen/Qwen-Image \
   --port 8000 \
   --diffusion-quantization-config '{"method":"gguf","gguf_model":"QuantStack/Qwen-Image-GGUF/Qwen_Image-Q4_K_M.gguf"}'
 ```
+
+### MiniMax-H3
+
+MiniMax-H3 exposes separate task-specific DiT weight sources. A single
+`gguf_model` replaces exactly one source, so select one task partition per
+process. `--task-type auto` and `combined` are not supported with this
+configuration because they create more than one DiT source.
+
+Use an explicit non-pruned GGUF filename when a repository contains multiple
+files. Pruned checkpoints containing `adaln_t_table` or omitting the complete
+`time_embedder` weights are not compatible with the current architecture.
+
+For the canonical server command and its validation scope, see the
+[MiniMax-H3 recipe](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3).
 
 ## Parameters
 
