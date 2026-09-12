@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ class OpenAIDelegationBridge:
             content.append({"type": "text", "text": f"<{time_range}>"})
             content.append({"type": "image_url", "image_url": {"url": data_url}})
         content.append({"type": "text", "text": question or note or "Answer the user's question."})
-        messages = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": content},
         ]
@@ -384,6 +384,13 @@ class RoutingDelegationBridge:
 
     async def aclose(self) -> None:
         self._route.clear()
+        first_error: Exception | None = None
         for bridge in (self._chat, self._image, self._edit):
             if bridge is not None:
-                await bridge.aclose()
+                try:
+                    await bridge.aclose()
+                except Exception as exc:  # noqa: BLE001 - close every owned bridge before propagating
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
