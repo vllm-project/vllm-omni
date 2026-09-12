@@ -9,6 +9,7 @@ import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,77 @@ def _scalar(value: Any, default: Any = None) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return _scalar(value[0], default) if value else default
     return default if value is None else value
+
+
+_REF_TARGET_SAMPLE_RATE = 24000
+# Overridable per deployment via ``ref_audio_max_seconds``.
+_REF_MAX_SECONDS = 6.0
+# Channel ceiling for the optional (channels, samples) downmix guard.
+_REF_MAX_CHANNELS = 8
+
+
+@lru_cache(maxsize=8)
+def _get_resampler(orig_freq: int, new_freq: int):
+    """Cached anti-aliased resampler matching token2wav's own loader.
+
+    ``torchaudio`` is imported lazily (it is not a hard runtime requirement of
+    this model on every platform) and the transform is built once per rate pair
+    instead of once per request, keeping it off the first-packet path.
+    """
+    import torchaudio
+
+    return torchaudio.transforms.Resample(orig_freq=orig_freq, new_freq=new_freq)
+
+
+def _normalize_reference(
+    ref_audio: Any,
+    sample_rate_hz: int,
+    *,
+    max_seconds: float = _REF_MAX_SECONDS,
+) -> tuple[torch.Tensor, int]:
+    """Normalize a per-request reference waveform onto a shared grid.
+
+    MiniCPM-o streaming uses the reference-audio length as the CFM attention
+    cache origin (L0). Unnormalized references give every request a distinct
+    L0, which explodes the CFM CUDA-graph cache key space (see #6628). Fold
+    every reference onto the same sample rate and a fixed length (truncate
+    long ones, zero-pad short ones) so L0 becomes one constant value.
+
+    References longer than ``max_seconds`` are truncated with a warning;
+    the window is configurable via ``ref_audio_max_seconds``.
+    """
+    tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
+    if tensor.dim() > 1:
+        # (channels, samples) -> mono; plain reshape(-1) would interleave.
+        # Upstream flattens request references to 1-D, so anything else is a
+        # non-standard caller: reject layouts we cannot downmix unambiguously
+        # instead of silently averaging the waveform away.
+        if tensor.shape[0] > _REF_MAX_CHANNELS:
+            raise ValueError(f"reference audio must be 1-D or (channels, samples); got shape {tuple(tensor.shape)}")
+        tensor = tensor.mean(dim=0)
+    waveform = tensor.reshape(-1).cpu().contiguous()
+    if waveform.numel() == 0:
+        # Keep the caller's "empty_ref_audio" error path intact: an empty
+        # waveform must not be zero-padded into a valid-length reference.
+        return waveform, _REF_TARGET_SAMPLE_RATE
+    if sample_rate_hz != _REF_TARGET_SAMPLE_RATE:
+        # Match token2wav's own loader (torchaudio, anti-aliased): it only
+        # resamples when the stored rate differs, so this output is what the
+        # model consumes.
+        waveform = _get_resampler(sample_rate_hz, _REF_TARGET_SAMPLE_RATE)(waveform.view(1, -1)).view(-1).contiguous()
+    max_samples = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
+    if waveform.numel() > max_samples:
+        logger.warning(
+            "Reference audio is %.2fs, truncating to the %.2fs window (set ``ref_audio_max_seconds`` to keep more).",
+            waveform.numel() / _REF_TARGET_SAMPLE_RATE,
+            max_seconds,
+        )
+        waveform = waveform[:max_samples].contiguous()
+    elif waveform.numel() < max_samples:
+        # Zero-pad short references so every request shares one L0; trailing
+        # silence has minimal style impact (verified via E3 WER/SIM).
+        waveform = torch.nn.functional.pad(waveform, (0, max_samples - waveform.numel()))
+    return waveform, _REF_TARGET_SAMPLE_RATE
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
@@ -181,7 +253,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+            "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
         }
+        self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
+        if self._ref_max_seconds <= 0:
+            raise ValueError("MiniCPM-o Code2Wav ref_audio_max_seconds must be > 0")
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -192,12 +268,48 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
+        self._default_prompt_normalized: tuple[str, str] | None = None
 
     @property
     def _default_prompt_wav(self) -> str:
         if self._prompt_wav_override is not None:
             return str(self._prompt_wav_override)
         return str(Path(self.model_path) / "assets" / "HT_ref_audio.wav")
+
+    def _normalized_default_prompt(self) -> tuple[str, str]:
+        """Fold the shipped default prompt onto the request-reference grid.
+
+        The shipped asset is 6.016 s and is loaded directly by token2wav, so a
+        request without a reference would otherwise keep a second L0 value a
+        couple of frames away from the normalized request references -- two
+        graph-key families instead of one. Returns ``(prompt_wav,
+        prompt_cache_id)``; if the asset cannot be read, the shipped path is
+        returned unchanged.
+        """
+        if self._default_prompt_normalized is not None:
+            return self._default_prompt_normalized
+        source = self._default_prompt_wav
+        fallback = (source, self._default_prompt_id)
+        try:
+            waveform, sample_rate_hz = sf.read(source, dtype="float32", always_2d=False)
+            normalized, target_sr = _normalize_reference(waveform, int(sample_rate_hz))
+        except Exception:
+            logger.warning("Could not normalize the default prompt %s; using it as-is", source)
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        if normalized.numel() == 0:
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        digest = sha256()
+        digest.update(normalized.numpy().tobytes())
+        digest.update(str(target_sr).encode())
+        cache_id = f"default-ref-{digest.hexdigest()[:24]}-{target_sr}"
+        path = Path(self._runtime_prompt_dir.name) / f"{cache_id}.wav"
+        if not path.is_file():
+            sf.write(path, normalized.numpy(), target_sr, format="WAV")
+        logger.info("Default prompt normalized onto the %.1fs grid: %s", _REF_MAX_SECONDS, path)
+        self._default_prompt_normalized = (str(path), cache_id)
+        return self._default_prompt_normalized
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
@@ -220,9 +332,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         sample_rate: Any,
     ) -> tuple[str, _RuntimePrompt]:
         sample_rate_hz = int(_scalar(sample_rate, 0))
-        waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
+        waveform, sample_rate_hz = _normalize_reference(
+            ref_audio,
+            sample_rate_hz,
+            max_seconds=self._ref_max_seconds,
+        )
         if waveform.numel() == 0:
             raise _batch_error("empty_ref_audio")
         if not bool(torch.isfinite(waveform).all().item()):
@@ -288,9 +404,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is not None:
             return entry.cache_id, entry.path, cache_key
 
+        default_wav, default_cache_id = self._normalized_default_prompt()
         return (
-            str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id)),
-            str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav)),
+            str(_scalar(meta.get("prompt_cache_id"), default_cache_id)),
+            str(_scalar(meta.get("prompt_wav"), default_wav)),
             None,
         )
 
