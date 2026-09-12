@@ -886,6 +886,31 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
+    def release_shm_resources(self, request_id: str) -> int:
+        """Unlink inter-stage segments this request left unconsumed.
+
+        Safe only once every stage has finished with the request: the producer
+        keeps writing until its own request ends, and a consumer that stopped
+        early never drains the remainder. The orchestrator is the only party
+        that knows all stages are done, so it drives this (see
+        ``Orchestrator._cleanup_request_ids``); calling it from either stage's
+        own teardown would race the other side.
+
+        Returns the number of reclaimed segments -- a non-zero count means the
+        consumer stopped before draining the producer, which is worth alerting
+        on independently of the reclaim.
+        """
+        connector = getattr(self, "connector", None)
+        cleanup = getattr(connector, "cleanup", None)
+        if cleanup is None:
+            return 0
+        external_req_id = self.request_ids_mapping.get(request_id, request_id)
+        try:
+            return int(cleanup(external_req_id) or 0)
+        except Exception as e:
+            logger.debug("release_shm_resources(%s) failed: %s", request_id, e)
+            return 0
+
     def cleanup(
         self,
         request_id: str,

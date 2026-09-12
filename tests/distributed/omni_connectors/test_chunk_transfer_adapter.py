@@ -2423,6 +2423,12 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     scheduler = mocker.MagicMock()
     scheduler.chunk_transfer_adapter = adapter_mock
+    # MagicMock is truthy; bind the real helper so save_async is not skipped.
+    scheduler._omits_kv_transfer_cache = {}
+    scheduler._request_omits_kv_transfer_to_next_stage = MethodType(
+        OmniARScheduler._request_omits_kv_transfer_to_next_stage,
+        scheduler,
+    )
     scheduler.connector = None
     scheduler.perf_metrics = None
     scheduler.log_stats = False

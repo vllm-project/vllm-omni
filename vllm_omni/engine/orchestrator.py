@@ -473,6 +473,9 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        # Strong refs for in-flight transfer-resource releases; the loop only
+        # holds weak refs to tasks, so dropping these risks mid-flight GC.
+        self._transfer_release_tasks: set[asyncio.Task] = set()
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -1019,6 +1022,31 @@ class Orchestrator:
         for index, output_msg in enumerate(abort_outputs):
             output_msg.finished = index == last_index_by_req[output_msg.request_id]
         return abort_outputs
+
+    def _release_stage_transfer_resources(self, request_ids: list[str]) -> None:
+        """Drop each stage's inter-stage transfer resources for finished requests.
+
+        This is the only point that knows every stage is done with the request,
+        so it is the only safe place to reclaim segments a consumer never
+        drained. Scheduled rather than awaited: reclaim is best-effort and must
+        not add RPC latency to request teardown.
+        """
+        if not request_ids:
+            return
+
+        async def _run() -> None:
+            for pool in self.stage_pools:
+                try:
+                    await pool.release_request_resources(request_ids)
+                except Exception as e:
+                    logger.debug("[Orchestrator] release transfer resources failed: %s", e)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_run())
+            self._transfer_release_tasks.add(task)
+            task.add_done_callback(self._transfer_release_tasks.discard)
+        except RuntimeError:
+            pass
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -1827,6 +1855,7 @@ class Orchestrator:
             if abort:
                 abort_outputs = await self._abort_request_ids(cleanup_ids)
             self._release_request_bindings(cleanup_ids)
+            self._release_stage_transfer_resources(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)

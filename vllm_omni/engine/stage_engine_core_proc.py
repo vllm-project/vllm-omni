@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -82,6 +85,41 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    def omni_release_request_resources(self, request_ids: list[str]) -> int:
+        """Release this stage's inter-stage transfer resources for *request_ids*.
+
+        Invoked over the UTILITY channel by the orchestrator once every stage
+        has finished with the request. Idempotent and safe for unknown ids.
+        """
+        adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
+        if adapter is None:
+            return 0
+        reclaimed = 0
+        for request_id in request_ids or ():
+            try:
+                reclaimed += adapter.release_shm_resources(request_id)
+            except Exception as e:
+                logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
+        if reclaimed:
+            # Non-zero means a consumer stopped before draining the producer.
+            # Common on audio requests, so warn only when the running total
+            # crosses another warn_internal_times boundary.
+            prev = getattr(self, "_omni_reclaimed_total", 0)
+            self._omni_reclaimed_total = prev + reclaimed
+            logger.debug(
+                "Reclaimed %d unconsumed inter-stage segment(s) for %d finished request(s)",
+                reclaimed,
+                len(request_ids or ()),
+            )
+            warn_internal_times = 1000
+            if prev // warn_internal_times != self._omni_reclaimed_total // warn_internal_times:
+                logger.warning(
+                    "Reclaimed %d unconsumed inter-stage segments so far; "
+                    "a downstream stage finished before draining its producer",
+                    self._omni_reclaimed_total,
+                )
+        return reclaimed
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

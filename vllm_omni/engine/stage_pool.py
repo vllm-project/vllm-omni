@@ -1271,6 +1271,26 @@ class StagePool:
 
         return abort_outputs
 
+    async def release_request_resources(self, request_ids: list[str]) -> None:
+        """Ask every live replica to drop transfer resources for *request_ids*.
+
+        Broadcast rather than binding-routed: the orchestrator releases route
+        bindings as part of the same teardown, so a binding lookup here would
+        race it. The engine-core handler is idempotent for unknown ids.
+        """
+        if not request_ids:
+            return
+        for client in self.clients:
+            if client is None:
+                continue
+            call = getattr(client, "call_utility_async", None)
+            if call is None:
+                continue
+            try:
+                await call("omni_release_request_resources", list(request_ids))
+            except Exception as e:
+                logger.debug("[StagePool-%s] release_request_resources failed: %s", self.stage_id, e)
+
     async def collective_rpc(
         self,
         replica_id: int,
