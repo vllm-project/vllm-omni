@@ -12,7 +12,7 @@ directory without modifying the downloaded weights:
 
 ```bash
 uv pip install 'step-audio2==1.0.0' 's3tokenizer==0.3.0' \
-  'hyperpyyaml==1.2.3' 'ruamel.yaml==0.17.40'
+  'hyperpyyaml==1.2.3'
 hf download Gander-Omni/Gander --revision 24fc4cc8543f95daf99be53b6199403a7732688f
 python -m vllm_omni.model_executor.models.minicpmo_4_5.gander \
   /path/to/downloaded/snapshot /path/to/new/gander-model

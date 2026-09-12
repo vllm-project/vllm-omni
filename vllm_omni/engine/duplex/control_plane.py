@@ -1073,7 +1073,7 @@ class DuplexControlPlane:
             )
             if control_error.code == "replica_lost" and session is not None:
                 try:
-                    await self._terminate_replica_lost_session(session)
+                    await self._terminate_failed_session(session, reason="native_kv_replica_lost")
                 except Exception as cleanup_exc:
                     logger.warning(
                         "native duplex replica-loss cleanup remains pending for session %s: %s",
@@ -1099,23 +1099,34 @@ class DuplexControlPlane:
                 max(_time.monotonic() - started_at, 0.0),
             )
 
-    async def _terminate_replica_lost_session(self, session: DuplexSessionRuntimeState) -> None:
-        submitted = tuple(session.resource_request_ids(submitted=True))
-        reserved = tuple(session.resource_request_ids(submitted=False))
-        self.sessions.begin_close_session(session.fence, reason="native_kv_replica_lost")
+    async def _terminate_failed_session(
+        self,
+        session: DuplexSessionRuntimeState,
+        *,
+        reason: str,
+        accepted_request_id: str | None = None,
+    ) -> None:
+        submitted = tuple(
+            dict.fromkeys(
+                [*session.resource_request_ids(submitted=True), *([accepted_request_id] if accepted_request_id else [])]
+            )
+        )
+        reserved = tuple(rid for rid in session.resource_request_ids(submitted=False) if rid not in submitted)
+        self.sessions.begin_close_session(session.fence, reason=reason)
         self._sync_session_metrics()
-        cleanup_key = self._cleanup_key("replica_lost", session.fence)
+        cleanup_key = self._cleanup_key("failure", session.fence)
         pending = self._pending_control_cleanups.get(cleanup_key)
         if pending is None:
             pending = _PendingControlCleanup(
-                kind="replica_lost",
+                kind="failure",
                 session_id=session.session_id,
                 fence=session.fence,
                 submitted_request_ids=submitted,
                 reserved_request_ids=reserved,
             )
             self._pending_control_cleanups[cleanup_key] = pending
-            self._metric("inc_duplex_replica_affinity_loss", 1)
+            if reason == "native_kv_replica_lost":
+                self._metric("inc_duplex_replica_affinity_loss", 1)
         await self._complete_control_cleanup(cleanup_key, pending)
 
     @staticmethod
@@ -1294,14 +1305,15 @@ class DuplexControlPlane:
                 if pending_output is not None:
                     self._record_context_output(session, pending_output)
         except BaseException:
-            self._pending_submission_cleanups[session.session_id] = _PendingSubmissionCleanup(
-                session_id=session.session_id,
-                request_ids=(request_id,),
-            )
+            # The engine already accepted this input. Bookkeeping failure can
+            # leave replay incomplete (including output arriving before its
+            # append receipt); aborting just the request would allow a later
+            # append to silently start with empty KV. Retire the whole session.
             try:
-                await self._complete_pending_submission_cleanup(
-                    session.session_id,
-                    deadline_monotonic=message.deadline_monotonic,
+                await self._terminate_failed_session(
+                    session,
+                    reason="duplex_append_commit_failed",
+                    accepted_request_id=request_id,
                 )
             except Exception as cleanup_exc:
                 logger.warning(
@@ -2151,14 +2163,14 @@ class DuplexControlPlane:
         if session is not None and self.sessions.get(pending.session_id) is session:
             if pending.kind == "cancel":
                 session.release_fence(pending.fence)
-            elif pending.kind in {"close", "open_rollback", "replica_lost"}:
-                if pending.kind == "replica_lost" and self._lifecycle_sink is not None:
+            elif pending.kind in {"close", "open_rollback", "failure"}:
+                if pending.kind == "failure" and self._lifecycle_sink is not None:
                     await self._lifecycle_sink.put(
                         DuplexSessionLifecycleMessage(
                             fence=session.fence,
                             session_id=session.session_id,
                             event="terminated",
-                            reason="native_kv_replica_lost",
+                            reason=session.lease.terminal_reason or "duplex_session_failed",
                             lease_generation=session.lease.generation,
                             submitted_request_ids=list(pending.submitted_request_ids),
                             reserved_request_ids=list(pending.reserved_request_ids),
