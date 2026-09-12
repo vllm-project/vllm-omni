@@ -73,6 +73,7 @@ steps:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
         commands:
+          - python -m vllm_omni.benchmarks.media_preflight
           # Pin the Seed-TTS scorer to the second card: _get_eval_device() otherwise
           # auto-picks npu:0, which the omni server under test already fills with its
           # KV cache, so Whisper OOMs on `.to(device)` and every clip reports

@@ -71,6 +71,7 @@ steps:
         source_file_dependencies: omni_minicpmo_4_5_accuracy
         timeout_in_minutes: 180
         commands:
+          - python -m vllm_omni.benchmarks.media_preflight
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - |
