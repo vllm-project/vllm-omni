@@ -130,6 +130,7 @@ and compare the output JSON or terminal metrics.
 - Key flags: `--step-execution` enables the step-wise runtime; `--max-num-seqs` controls how many compatible requests may stay active together.
 - Keep `--max-num-seqs 1` when you want the more conservative path, when traffic is mostly single-request, or when you are debugging correctness before measuring throughput.
 - Current batching is still shape-sensitive: different step progress can co-batch, but different resolutions do not yet co-batch.
+- Sequence parallel (`--usp N`) keeps text embeddings replicated by default. To shard the text stream as well, set the Qwen-Image-only extra `qwen_image_split_text_embed_in_sp: true`. This pads the text length to a multiple of the SP size and leaves those pad tokens unmasked, so quality can shift slightly. Enable with `--stage-overrides '{"0":{"extras":{"qwen_image_split_text_embed_in_sp":true}}}'`.
 
 ### 2x B200 ModelOpt mixed FP8/NVFP4
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -43,11 +43,16 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+# Model-scoped opt-in for sharding the text stream across SP ranks. See
+# QwenImageTransformer2DModel.forward for the padding caveats it carries.
+_SPLIT_TEXT_EMBED_EXTRA = "qwen_image_split_text_embed_in_sp"
 
 
 def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -59,6 +64,32 @@ def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.
     """
     paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+
+
+def _split_text_embed_in_sp_from_extras(od_config: OmniDiffusionConfig) -> bool:
+    extras = getattr(od_config, "extras", None) or {}
+    value = extras.get(_SPLIT_TEXT_EMBED_EXTRA, False)
+    if not isinstance(value, bool):
+        raise TypeError(f"{_SPLIT_TEXT_EMBED_EXTRA} must be a bool, got {type(value)!r}")
+    return value
+
+
+def _pad_text_inputs_for_sp(
+    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states_mask: torch.Tensor | None,
+    txt_seq_lens: list[int] | None,
+    sp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, list[int] | None]:
+    txt_pad_size = -encoder_hidden_states.shape[1] % sp_size
+    if txt_pad_size == 0:
+        return encoder_hidden_states, encoder_hidden_states_mask, txt_seq_lens
+
+    encoder_hidden_states = F.pad(encoder_hidden_states, (0, 0, 0, txt_pad_size))
+    if encoder_hidden_states_mask is not None:
+        encoder_hidden_states_mask = F.pad(encoder_hidden_states_mask, (0, txt_pad_size), value=True)
+    # txt_freqs is sliced to max(txt_seq_lens), which must cover the padding.
+    txt_seq_lens = [encoder_hidden_states.shape[1]]
+    return encoder_hidden_states, encoder_hidden_states_mask, txt_seq_lens
 
 
 def _normalize_qwen_image_weight_name(name: str) -> str:
@@ -116,8 +147,9 @@ class ImageRopePrepare(nn.Module):
             vid_freqs: Image RoPE frequencies [img_seq_len, rope_dim]
             txt_freqs: Text RoPE frequencies [txt_seq_len, rope_dim]
 
-        Note: _sp_plan will shard hidden_states and vid_freqs via split_output=True
-              txt_freqs is kept replicated for dual-stream attention
+        Note: _sp_plan shards hidden_states and vid_freqs via split_output=True.
+              txt_freqs remains replicated unless forward() applies the
+              split-text opt-in.
         """
         # Apply input projection
         hidden_states = self.img_in(hidden_states)
@@ -977,7 +1009,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
             0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
             # vid_freqs: auto_pad=True to match hidden_states padding
             1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
-            # txt_freqs (index 2) is NOT sharded - kept replicated for dual-stream attention
+            # txt_freqs (index 2) is replicated here; forward() shards it only when
+            # the split-text-embed opt-in is enabled
         },
         # Shard ModulateIndexPrepare output (modulate_index must be sharded to match hidden_states)
         # This is only active when zero_cond_t=True (image editing models)
@@ -1008,6 +1041,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
+        self.split_text_embed_in_sp = _split_text_embed_in_sp_from_extras(od_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
@@ -1136,16 +1170,30 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # else:
         #     lora_scale = 1.0
 
-        # Set split_text_embed_in_sp = False for dual-stream attention
-        # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
-        # Text embeddings must be replicated across SP ranks for correctness.
-        if self.parallel_config.sequence_parallel_size > 1:
-            get_forward_context().split_text_embed_in_sp = False
+        # Optionally shard the text stream across SP ranks together with the image
+        # stream. The text sequence is naively padded and the padding is not masked,
+        # which perturbs results slightly.
+        sp_size = self.parallel_config.sequence_parallel_size
+        split_text_embed = sp_size > 1 and self.split_text_embed_in_sp
+        if split_text_embed:
+            encoder_hidden_states, encoder_hidden_states_mask, txt_seq_lens = _pad_text_inputs_for_sp(
+                encoder_hidden_states,
+                encoder_hidden_states_mask,
+                txt_seq_lens,
+                sp_size,
+            )
+
+            get_forward_context().split_text_embed_in_sp = True
+            encoder_hidden_states = sp_shard(encoder_hidden_states, dim=1)
+            if encoder_hidden_states_mask is not None:
+                encoder_hidden_states_mask = sp_shard(encoder_hidden_states_mask, dim=1)
 
         # Prepare hidden_states and RoPE via ImageRopePrepare module
         # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
-        # txt_freqs is kept replicated for dual-stream attention
         hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+        if split_text_embed:
+            # Keep txt_freqs aligned with the sharded (padded) text embeddings.
+            txt_freqs = sp_shard(txt_freqs, dim=0)
         image_rotary_emb = (vid_freqs, txt_freqs)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
