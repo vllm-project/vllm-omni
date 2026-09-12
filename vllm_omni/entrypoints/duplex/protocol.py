@@ -178,6 +178,8 @@ class DuplexPlaybackCursor:
     sent_ms: int = 0
     played_ms: int = 0
     committed_ms: int = 0
+    generated_frames: int = 0
+    sample_rate_hz: int | None = None
 
     def acknowledge(self, played_ms: int, committed_ms: int | None = None) -> None:
         self.played_ms = max(self.played_ms, max(0, int(played_ms)))
@@ -1103,25 +1105,54 @@ class DuplexSession:
         if text:
             self._response.assistant_text_buffer.append(text)
 
+    def record_generated_audio(self, response_id: str, *, frame_count: int, sample_rate_hz: int) -> int | None:
+        """Accumulate source frames, rounding only the cumulative duration.
+
+        A late chunk cannot change a different response's playback cursor.
+        This records encoded audio, not transport delivery or client playback.
+        """
+        if response_id != self.active_response_id:
+            return None
+        if type(frame_count) is not int or frame_count < 0:
+            raise ValueError("Audio frame_count must be a non-negative integer")
+        if type(sample_rate_hz) is not int or sample_rate_hz <= 0:
+            raise ValueError("Audio sample_rate_hz must be a positive integer")
+        playback = self._playback.current
+        if playback.sample_rate_hz is not None and playback.sample_rate_hz != sample_rate_hz:
+            raise ValueError("Audio sample rate changed within a response")
+        playback.sample_rate_hz = sample_rate_hz
+        playback.generated_frames += frame_count
+        playback.generated_ms = playback.generated_frames * 1000 // sample_rate_hz
+        return playback.generated_ms
+
     def mark_audio_sent(
         self,
         duration_ms: int | None = None,
         *,
+        response_id: str | None = None,
         text_chars: int | None = None,
         audio_text_marks: list[dict[str, object]] | None = None,
     ) -> None:
-        playback = self._playback.current
+        """Record cumulative audio accepted by the output path.
+
+        ``sent_ms`` includes queued/journaled output; only client acknowledgements
+        establish ``played_ms``. It is not confirmation of socket delivery.
+        """
+        playback = self._playback.current if response_id is None else self._playback.by_response.get(response_id)
+        if playback is None:
+            return
+        is_current = response_id is None or response_id == self.active_response_id
         if duration_ms is not None:
             playback.generated_ms = max(playback.generated_ms, duration_ms)
             playback.sent_ms = max(playback.sent_ms, duration_ms)
-            if text_chars is not None and text_chars >= 0:
+            if is_current and text_chars is not None and text_chars >= 0:
                 self._response.assistant_audio_text_marks.append(
                     DuplexAssistantAudioTextMark(
                         text_chars=int(text_chars),
                         audio_end_ms=max(0, int(duration_ms)),
                     )
                 )
-        if audio_text_marks:
+        if is_current and audio_text_marks:
             for raw_mark in audio_text_marks:
                 if not isinstance(raw_mark, dict):
                     continue
@@ -1135,7 +1166,8 @@ class DuplexSession:
                         audio_end_ms=max(0, int(raw_audio_end_ms)),
                     )
                 )
-        self.turn_state = DuplexTurnState.ASSISTANT_PLAYING
+        if is_current:
+            self.turn_state = DuplexTurnState.ASSISTANT_PLAYING
 
     def _playback_cursor_for_response(self, response_id: str | None = None) -> DuplexPlaybackCursor:
         if response_id is None:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from functools import partial
 from typing import Any
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -115,6 +116,13 @@ class ChatFallbackProjectorMixin:
         ):
             model_extra.pop(protocol_key, None)
         kwargs.update(model_extra)
+        if "audio" in response_config.modalities:
+            audio_options = kwargs.get("audio")
+            audio_options = dict(audio_options) if isinstance(audio_options, dict) else {}
+            # Chat defaults to WAV. Request the session's internal output format
+            # explicitly rather than relabeling the returned bytes as PCM.
+            audio_options["format"] = response_config.response_format
+            kwargs["audio"] = audio_options
         if isinstance(tools, list):
             kwargs["tools"] = tools
         if isinstance(tool_choice, str | dict):
@@ -190,6 +198,8 @@ class ChatFallbackProjectorMixin:
         response_id: str,
         send_json,
     ) -> None:
+        if session.epoch != epoch or session.active_response_id != response_id:
+            return
         metrics = payload.get("metrics")
         stage_metrics = metrics.get("stage_metrics") if isinstance(metrics, dict) else None
         if isinstance(stage_metrics, dict):
@@ -233,19 +243,7 @@ class ChatFallbackProjectorMixin:
                 content = message.get("content")
 
             if isinstance(content, str) and content:
-                if modality == "audio":
-                    session.mark_audio_sent()
-                    await send_json(
-                        {
-                            "type": "response.output_audio.delta",
-                            "session_id": session.session_id,
-                            "response_id": response_id,
-                            "epoch": epoch,
-                            "audio": content,
-                            "format": session.response_config.response_format,
-                        }
-                    )
-                else:
+                if modality != "audio":
                     session.append_assistant_text(content)
                     await send_json(
                         {
@@ -256,6 +254,39 @@ class ChatFallbackProjectorMixin:
                             "delta": content,
                         }
                     )
+
+            audio_content = content if modality == "audio" else None
+            if isinstance(message, dict):
+                message_audio = message.get("audio")
+                if isinstance(message_audio, dict):
+                    audio_content = message_audio.get("data")
+            if isinstance(audio_content, str) and audio_content:
+                # The OpenAI package imports duplex serving during initialization.
+                # Defer this import until chat fallback has finished loading.
+                from vllm_omni.entrypoints.openai.protocol.audio import AudioChunkMetadata
+
+                audio_metadata = AudioChunkMetadata.model_validate(choice.get("audio_metadata"))
+                duration_ms = session.record_generated_audio(
+                    response_id,
+                    frame_count=audio_metadata.frame_count,
+                    sample_rate_hz=audio_metadata.sample_rate_hz,
+                )
+                if duration_ms is None:
+                    return
+                await send_json(
+                    {
+                        "type": "response.output_audio.delta",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": epoch,
+                        "audio": audio_content,
+                        "format": audio_metadata.format,
+                        "sample_rate_hz": audio_metadata.sample_rate_hz,
+                        "channels": audio_metadata.channels,
+                        "audio_duration_ms": duration_ms,
+                    },
+                    on_accepted=partial(session.mark_audio_sent, duration_ms, response_id=response_id),
+                )
 
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None and modality != "audio":

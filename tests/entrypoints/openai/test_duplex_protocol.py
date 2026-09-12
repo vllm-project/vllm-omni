@@ -462,6 +462,54 @@ def test_duplex_playback_ack_tracks_committed_cursor_separately():
     assert session.playback.committed_ms == 2_000
 
 
+@pytest.mark.parametrize("sample_rate_hz,frame_count", [(22_050, 23), (24_000, 24)])
+def test_duplex_generated_audio_rounds_only_cumulative_frames(sample_rate_hz: int, frame_count: int):
+    session = DuplexSessionRegistry().create()
+    response_id = session.begin_response()
+
+    durations = [
+        session.record_generated_audio(response_id, frame_count=1, sample_rate_hz=sample_rate_hz)
+        for _ in range(frame_count)
+    ]
+
+    assert durations[:-1] == [0] * (frame_count - 1)
+    assert durations[-1] == 1
+    assert session.playback.generated_ms == 1
+    assert session.playback.sent_ms == 0
+    assert session.playback.played_ms == 0
+
+
+def test_duplex_generated_audio_rejects_rate_change_without_advancing():
+    session = DuplexSessionRegistry().create()
+    response_id = session.begin_response()
+    session.record_generated_audio(response_id, frame_count=2205, sample_rate_hz=22_050)
+
+    with pytest.raises(ValueError, match="sample rate changed"):
+        session.record_generated_audio(response_id, frame_count=2400, sample_rate_hz=24_000)
+
+    assert session.playback.generated_ms == 100
+    assert session.playback.sent_ms == 0
+
+
+def test_duplex_late_audio_accounting_cannot_change_new_response():
+    session = DuplexSessionRegistry().create()
+    old_response = session.begin_response()
+    session.record_generated_audio(old_response, frame_count=2205, sample_rate_hz=22_050)
+    session.barge_in()
+    new_response = session.begin_response()
+    session.record_generated_audio(new_response, frame_count=2400, sample_rate_hz=48_000)
+    current_state = session.turn_state
+
+    assert session.record_generated_audio(old_response, frame_count=2205, sample_rate_hz=22_050) is None
+    session.mark_audio_sent(100, response_id=old_response, text_chars=99)
+
+    assert session.playback_for_response(old_response).sent_ms == 100
+    assert session.playback.generated_ms == 50
+    assert session.playback.sent_ms == 0
+    assert session.assistant_audio_text_marks == ()
+    assert session.turn_state == current_state
+
+
 def test_duplex_history_commit_uses_audio_text_alignment_marks():
     registry = DuplexSessionRegistry()
     session = registry.create()

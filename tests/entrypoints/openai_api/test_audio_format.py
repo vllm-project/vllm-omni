@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import base64
+import json
 from io import BytesIO
 
 import numpy as np
@@ -27,6 +29,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SUPPORTED_CHAT_AUDIO_FORMATS,
     CreateAudio,
 )
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -65,6 +69,13 @@ class TestCreateAudio:
         )
         response = mixin.create_audio(audio_obj)
         assert len(response.audio_data) > 0
+        assert response.audio_metadata is not None
+        assert response.audio_metadata.model_dump() == {
+            "format": fmt,
+            "sample_rate_hz": 24000,
+            "frame_count": 24000,
+            "channels": 1,
+        }
 
     def test_wav_magic_bytes(self, mixin, audio_tensor):
         audio_obj = CreateAudio(
@@ -113,10 +124,9 @@ class TestCreateAudio:
         response = mixin.create_audio(audio_obj)
         assert response.audio_data[:4] == b"RIFF"
         assert response.media_type == "audio/wav"
+        assert response.audio_metadata.format == "wav"
 
     def test_base64_encoding(self, mixin, audio_tensor):
-        import base64
-
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
             sample_rate=24000,
@@ -128,21 +138,33 @@ class TestCreateAudio:
         decoded = base64.b64decode(response.audio_data)
         assert decoded[:4] == b"RIFF"
 
-    def test_resamples_wav_to_requested_output_rate(self, mixin, audio_tensor):
+    @pytest.mark.parametrize(
+        "channels,speed,frame_count",
+        [(1, 1.0, 8000), (2, 2.0, 4000)],
+        ids=["mono-resampled", "stereo-resampled-faster"],
+    )
+    def test_metadata_matches_transformed_waveform(self, mixin, audio_tensor, channels, speed, frame_count):
         response = mixin.create_audio(
             CreateAudio(
-                audio_tensor=audio_tensor,
+                audio_tensor=audio_tensor if channels == 1 else np.stack((audio_tensor, audio_tensor)),
                 sample_rate=24000,
                 output_sample_rate=8000,
                 response_format="wav",
-                speed=1.0,
+                speed=speed,
                 base64_encode=False,
             )
         )
 
         with soundfile.SoundFile(BytesIO(response.audio_data)) as audio_file:
             assert audio_file.samplerate == 8000
-            assert audio_file.frames == 8000
+            assert audio_file.frames == frame_count
+            assert audio_file.channels == channels
+            assert response.audio_metadata.model_dump() == {
+                "format": "wav",
+                "sample_rate_hz": audio_file.samplerate,
+                "frame_count": audio_file.frames,
+                "channels": audio_file.channels,
+            }
 
 
 class TestStreamingAudioResampler:
@@ -262,3 +284,65 @@ class TestResolveAudioFormat:
             request = self._make_request({"format": fmt, "voice": "alloy"})
             result = serving_chat._resolve_audio_format(request)
             assert not isinstance(result, ErrorResponse), f"Format {fmt} should be accepted"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("fmt", ["pcm", "wav"])
+def test_chat_audio_metadata_survives_response_serialization(stream, fmt):
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
+
+    from vllm_omni.entrypoints.openai.protocol.chat_completion import (
+        OmniChatCompletionResponse,
+        OmniChatCompletionStreamResponse,
+    )
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    serving_chat = object.__new__(OmniOpenAIServingChat)
+    output = MultimodalCompletionOutput(
+        index=0,
+        text="",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+        multimodal_output=MultimodalPayload.from_dict(
+            {"audio": [torch.zeros(17), torch.zeros(23)], "sr": torch.tensor(22050)}
+        ),
+        finish_reason="stop",
+        stop_reason=None,
+    )
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hello"}],
+        audio={"format": fmt, "voice": "alloy"},
+    )
+    choices = serving_chat._create_audio_choice(
+        OmniRequestOutput(outputs=[output], final_output_type="audio"), "assistant", request, stream=stream
+    )
+    assert not isinstance(choices, ErrorResponse)
+    response_type = OmniChatCompletionStreamResponse if stream else OmniChatCompletionResponse
+    response = response_type(
+        id="chatcmpl-audio-metadata",
+        created=0,
+        model="test-model",
+        choices=choices,
+        usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+    )
+
+    serialized = json.loads(response.model_dump_json(exclude_unset=True))
+    choice = serialized["choices"][0]
+    frame_count = 23 if stream else 40
+    assert choice["audio_metadata"] == {
+        "format": fmt,
+        "sample_rate_hz": 22050,
+        "frame_count": frame_count,
+        "channels": 1,
+    }
+    audio = choice["delta"]["content"] if stream else choice["message"]["audio"]["data"]
+    raw = base64.b64decode(audio)
+    if fmt == "wav":
+        with soundfile.SoundFile(BytesIO(raw)) as audio_file:
+            assert audio_file.frames == frame_count
+            assert audio_file.samplerate == 22050
+    else:
+        assert len(raw) == frame_count * 2

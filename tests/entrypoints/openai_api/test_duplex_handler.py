@@ -9,6 +9,8 @@ import io
 import json
 import struct
 import wave
+from collections.abc import Callable
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -2182,7 +2184,8 @@ async def test_minicpmo_native_session_update_rejects_native_duplex_mode_flip():
     assert "session.updated" not in ws.sent_types()
 
 
-def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
+@pytest.mark.parametrize("sample_rate_hz", [22_050, 24_000])
+def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz(sample_rate_hz: int):
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
 
@@ -2192,7 +2195,8 @@ def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
             "response_id": "resp-a",
             "audio": "AAAA",
             "format": "pcm",
-            "sample_rate_hz": 24000,
+            "sample_rate_hz": sample_rate_hz,
+            "audio_duration_ms": 135,
         }
     )
 
@@ -2201,7 +2205,8 @@ def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
     ]
     assert {payload["type"] for payload in audio_events} == {"response.output_audio.delta"}
     assert {payload["format"] for payload in audio_events} == {"pcm16"}
-    assert {payload["sample_rate_hz"] for payload in audio_events} == {24000}
+    assert {payload["sample_rate_hz"] for payload in audio_events} == {sample_rate_hz}
+    assert audio_events[0]["metadata"]["audio_duration_ms"] == 135
 
 
 def test_native_realtime_protocol_ignores_removed_legacy_event_switches():
@@ -5023,8 +5028,10 @@ async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
     response_id = session.begin_response()
     sent: list[dict[str, Any]] = []
 
-    async def send_json(data: dict[str, Any]) -> None:
+    async def send_json(data: dict[str, Any], *, on_accepted: Callable[[], None] | None = None) -> None:
         sent.append(data)
+        if on_accepted is not None:
+            on_accepted()
 
     await handler._emit_chat_payload(
         session,
@@ -5034,7 +5041,13 @@ async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
                 {
                     "delta": {
                         "content": "AAAA",
-                    }
+                    },
+                    "audio_metadata": {
+                        "format": "wav",
+                        "sample_rate_hz": 22_050,
+                        "frame_count": 2205,
+                        "channels": 1,
+                    },
                 }
             ],
         },
@@ -5051,8 +5064,222 @@ async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
             "epoch": 0,
             "audio": "AAAA",
             "format": "wav",
+            "sample_rate_hz": 22_050,
+            "channels": 1,
+            "audio_duration_ms": 100,
         }
     ]
+    assert session.playback.generated_ms == 100
+    assert session.playback.sent_ms == 100
+    assert session.playback.played_ms == 0
+
+
+@pytest.mark.parametrize("response_format", ["pcm", "wav"])
+def test_duplex_chat_request_uses_response_audio_format(response_format: str):
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    extra_audio = {"format": "flac", "voice": "alloy"}
+    session = DuplexSession(
+        session_id="sid-chat-audio-format",
+        config=DuplexSessionConfig(response_format=response_format, extra_body={"audio": extra_audio}),
+    )
+    session.begin_response()
+
+    request = handler._build_chat_request(session, "format-request")
+
+    assert request.audio == {"format": response_format, "voice": "alloy"}
+    assert extra_audio == {"format": "flac", "voice": "alloy"}
+
+
+def _chat_audio_completion_payload(*, frame_count: int = 2205, sample_rate_hz: int = 22_050) -> dict[str, object]:
+    return {
+        "modality": "audio",
+        "choices": [
+            {
+                "delta": {"content": "AAAA"},
+                "audio_metadata": {
+                    "format": "pcm",
+                    "sample_rate_hz": sample_rate_hz,
+                    "frame_count": frame_count,
+                    "channels": 1,
+                },
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplex_chat_full_audio_message_preserves_actual_format_and_duration():
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-chat-full-audio", config=DuplexSessionConfig(response_format="wav"))
+    response_id = session.begin_response()
+    sent: list[dict[str, object]] = []
+
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
+        sent.append(data)
+        if on_accepted is not None:
+            on_accepted()
+
+    await handler._emit_chat_payload(
+        session,
+        {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "hello", "audio": {"data": "AAAA"}},
+                    "audio_metadata": {
+                        "format": "pcm",
+                        "sample_rate_hz": 22_050,
+                        "frame_count": 2205,
+                        "channels": 1,
+                    },
+                }
+            ],
+        },
+        session.epoch,
+        response_id,
+        send_json,
+    )
+
+    assert [event["type"] for event in sent] == ["response.text.delta", "response.output_audio.delta"]
+    assert sent[1]["audio"] == "AAAA"
+    assert sent[1]["format"] == "pcm"
+    assert sent[1]["sample_rate_hz"] == 22_050
+    assert sent[1]["audio_duration_ms"] == 100
+    assert session.assistant_text_buffer == ("hello",)
+    assert session.playback.sent_ms == 100
+
+
+@pytest.mark.asyncio
+async def test_duplex_chat_audio_does_not_round_each_fragment():
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-chat-sub-ms", config=DuplexSessionConfig())
+    response_id = session.begin_response()
+    sent: list[dict[str, object]] = []
+
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
+        sent.append(data)
+        if on_accepted is not None:
+            on_accepted()
+
+    for _ in range(23):
+        await handler._emit_chat_payload(
+            session,
+            _chat_audio_completion_payload(frame_count=1),
+            session.epoch,
+            response_id,
+            send_json,
+        )
+
+    assert [event["audio_duration_ms"] for event in sent] == [0] * 22 + [1]
+    assert session.playback.generated_ms == 1
+    assert session.playback.sent_ms == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_error", [None, RuntimeError("output unavailable")], ids=["rejected", "failed"])
+async def test_duplex_chat_unaccepted_audio_is_generated_but_not_sent(send_error: RuntimeError | None):
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-chat-unaccepted-audio", config=DuplexSessionConfig())
+    response_id = session.begin_response()
+
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
+        if send_error is not None:
+            raise send_error
+
+    with pytest.raises(RuntimeError, match="output unavailable") if send_error is not None else nullcontext():
+        await handler._emit_chat_payload(
+            session, _chat_audio_completion_payload(), session.epoch, response_id, send_json
+        )
+
+    assert session.playback.generated_ms == 100
+    assert session.playback.sent_ms == 0
+    assert session.playback.played_ms == 0
+
+
+@pytest.mark.asyncio
+async def test_duplex_chat_late_send_completion_only_updates_old_response():
+    handler = OmniDuplexSessionHandler(
+        chat_service=TurnBasedFakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-chat-late-audio", config=DuplexSessionConfig())
+    old_response = session.begin_response()
+    send_started = asyncio.Event()
+    finish_send = asyncio.Event()
+
+    async def delayed_send(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
+        send_started.set()
+        await finish_send.wait()
+        assert on_accepted is not None
+        on_accepted()
+
+    emit_task = asyncio.create_task(
+        handler._emit_chat_payload(session, _chat_audio_completion_payload(), session.epoch, old_response, delayed_send)
+    )
+    try:
+        await asyncio.wait_for(send_started.wait(), timeout=1)
+        session.barge_in()
+        new_response = session.begin_response()
+        current_state = session.turn_state
+        finish_send.set()
+        await asyncio.wait_for(emit_task, timeout=1)
+
+        assert session.active_response_id == new_response
+        assert session.playback_for_response(old_response).sent_ms == 100
+        assert session.playback.generated_ms == 0
+        assert session.playback.sent_ms == 0
+        assert session.turn_state == current_state
+    finally:
+        emit_task.cancel()
+        await asyncio.gather(emit_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_duplex_chat_missing_audio_metadata_reports_error():
+    class MissingMetadataChatService(TurnBasedFakeChatService):
+        async def create_chat_completion(self, request, raw_request=None):
+            async def generate():
+                payload = {"modality": "audio", "choices": [{"delta": {"content": "AAAA"}}]}
+                yield f"data: {json.dumps(payload)}\n\n"
+
+            return generate()
+
+    handler = OmniDuplexSessionHandler(
+        chat_service=MissingMetadataChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(session_id="sid-chat-missing-metadata", config=DuplexSessionConfig())
+    sent: list[dict[str, object]] = []
+
+    async def send_json(data: dict[str, object], *, on_accepted: Callable[[], None] | None = None) -> None:
+        sent.append(data)
+        if on_accepted is not None:
+            on_accepted()
+
+    await handler._run_response(session, send_json)
+
+    assert [event["type"] for event in sent] == ["response.created", "error"]
+    assert sent[-1]["code"] == "response_error"
+    assert "AudioChunkMetadata" in sent[-1]["error"]
+    assert session.playback.generated_ms == 0
+    assert session.playback.sent_ms == 0
 
 
 @pytest.mark.asyncio
@@ -5071,7 +5298,17 @@ async def test_duplex_chat_stage_metrics_use_latest_streaming_snapshot():
                 for index, snapshot in enumerate(snapshots):
                     payload = {
                         "modality": "audio",
-                        "choices": [{"delta": {"content": f"audio-{index}"}}],
+                        "choices": [
+                            {
+                                "delta": {"content": f"audio-{index}"},
+                                "audio_metadata": {
+                                    "format": "pcm",
+                                    "sample_rate_hz": 24_000,
+                                    "frame_count": 2400,
+                                    "channels": 1,
+                                },
+                            }
+                        ],
                         "metrics": {"stage_metrics": {"0": snapshot}},
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
@@ -5089,13 +5326,22 @@ async def test_duplex_chat_stage_metrics_use_latest_streaming_snapshot():
     )
     sent: list[dict[str, Any]] = []
 
-    async def send_json(data: dict[str, Any]) -> None:
+    async def send_json(data: dict[str, Any], *, on_accepted: Callable[[], None] | None = None) -> None:
         sent.append(data)
+        if on_accepted is not None:
+            on_accepted()
 
     await handler._run_response(session, send_json)
 
     audio_deltas = [event for event in sent if event.get("type") == "response.output_audio.delta"]
     done = next(event for event in sent if event.get("type") == "response.done")
+    assert [event["audio_duration_ms"] for event in audio_deltas] == [100, 200, 300]
+    assert done["playback"] == {
+        "generated_ms": 300,
+        "sent_ms": 300,
+        "played_ms": 0,
+        "committed_ms": 0,
+    }
     assert all("vllm_omni" not in event for event in audio_deltas)
     assert done["vllm_omni"]["stage_metrics"]["0"] == {
         "num_tokens_out": 3,
