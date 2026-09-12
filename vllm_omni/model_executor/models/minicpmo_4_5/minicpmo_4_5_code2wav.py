@@ -9,6 +9,7 @@ import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,6 @@ from typing import Any
 import soundfile as sf
 import torch
 import torch.nn as nn
-import torchaudio
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
@@ -61,6 +61,21 @@ def _scalar(value: Any, default: Any = None) -> Any:
 _REF_TARGET_SAMPLE_RATE = 24000
 # Overridable per deployment via ``ref_audio_max_seconds``.
 _REF_MAX_SECONDS = 6.0
+# Channel ceiling for the optional (channels, samples) downmix guard.
+_REF_MAX_CHANNELS = 8
+
+
+@lru_cache(maxsize=8)
+def _get_resampler(orig_freq: int, new_freq: int):
+    """Cached anti-aliased resampler matching token2wav's own loader.
+
+    ``torchaudio`` is imported lazily (it is not a hard runtime requirement of
+    this model on every platform) and the transform is built once per rate pair
+    instead of once per request, keeping it off the first-packet path.
+    """
+    import torchaudio
+
+    return torchaudio.transforms.Resample(orig_freq=orig_freq, new_freq=new_freq)
 
 
 def _normalize_reference(
@@ -83,25 +98,22 @@ def _normalize_reference(
     tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
     if tensor.dim() > 1:
         # (channels, samples) -> mono; plain reshape(-1) would interleave.
-        # Upstream already flattens to 1-D; this guards non-standard callers.
+        # Upstream flattens request references to 1-D, so anything else is a
+        # non-standard caller: reject layouts we cannot downmix unambiguously
+        # instead of silently averaging the waveform away.
+        if tensor.shape[0] > _REF_MAX_CHANNELS:
+            raise ValueError(f"reference audio must be 1-D or (channels, samples); got shape {tuple(tensor.shape)}")
         tensor = tensor.mean(dim=0)
     waveform = tensor.reshape(-1).cpu().contiguous()
     if waveform.numel() == 0:
         # Keep the caller's "empty_ref_audio" error path intact: an empty
         # waveform must not be zero-padded into a valid-length reference.
         return waveform, _REF_TARGET_SAMPLE_RATE
-    if sample_rate_hz != _REF_TARGET_SAMPLE_RATE and waveform.numel() > 0:
+    if sample_rate_hz != _REF_TARGET_SAMPLE_RATE:
         # Match token2wav's own loader (torchaudio, anti-aliased): it only
         # resamples when the stored rate differs, so this output is what the
         # model consumes.
-        waveform = (
-            torchaudio.transforms.Resample(
-                orig_freq=sample_rate_hz,
-                new_freq=_REF_TARGET_SAMPLE_RATE,
-            )(waveform.view(1, -1))
-            .view(-1)
-            .contiguous()
-        )
+        waveform = _get_resampler(sample_rate_hz, _REF_TARGET_SAMPLE_RATE)(waveform.view(1, -1)).view(-1).contiguous()
     max_samples = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
     if waveform.numel() > max_samples:
         logger.warning(

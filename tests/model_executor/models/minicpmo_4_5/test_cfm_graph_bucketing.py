@@ -20,11 +20,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_pads_partial_chunk_up_to_bucket():
     # 50 frames on a 16-frame grid -> 14 padding frames.
-    assert _cfm_pad_frames(mel_frames=50, offset=0, noise_capacity=1000, bucket_frames=16, ragged=False) == 14
+    assert _cfm_pad_frames(mel_frames=50, offset=0, noise_capacity=1000, bucket_frames=16, disabled=False) == 14
 
 
 def test_aligned_chunk_needs_no_padding():
-    assert _cfm_pad_frames(mel_frames=64, offset=0, noise_capacity=1000, bucket_frames=16, ragged=False) == 0
+    assert _cfm_pad_frames(mel_frames=64, offset=0, noise_capacity=1000, bucket_frames=16, disabled=False) == 0
 
 
 def test_ragged_valid_lengths_path_disables_bucketing():
@@ -37,7 +37,7 @@ def test_ragged_valid_lengths_path_disables_bucketing():
                     offset=0,
                     noise_capacity=1000,
                     bucket_frames=16,
-                    ragged=ragged,
+                    disabled=ragged,
                 )
                 == 0
             )
@@ -52,7 +52,7 @@ def test_disabled_bucketing_returns_zero():
                 offset=0,
                 noise_capacity=1000,
                 bucket_frames=bucket,
-                ragged=False,
+                disabled=False,
             )
             == 0
         )
@@ -65,62 +65,42 @@ def test_padding_never_overflows_noise_buffer():
     its width would crash. Bucketing is best-effort, never required.
     """
     # 96 frames + 16 pad = 112 > 100 capacity -> give up, pad 0.
-    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=16, ragged=False) == 0
+    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=16, disabled=False) == 0
     # Same mel length fits when un-padded: 96 <= 100.
-    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=1, ragged=False) == 0
+    assert _cfm_pad_frames(mel_frames=96, offset=0, noise_capacity=100, bucket_frames=1, disabled=False) == 0
     # Cache offset eats into the capacity: 64 + 0 pad would fit, 64 + 48 pad
     # would not, so the pad must be dropped.
-    assert _cfm_pad_frames(mel_frames=64, offset=50, noise_capacity=110, bucket_frames=16, ragged=False) == 0
+    assert _cfm_pad_frames(mel_frames=64, offset=50, noise_capacity=110, bucket_frames=16, disabled=False) == 0
 
 
 def test_padding_applies_with_cache_offset_when_it_fits():
     # offset 50 + mel 50 + pad 14 = 114 <= 200 -> pad stands.
-    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=200, bucket_frames=16, ragged=False) == 14
+    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=200, bucket_frames=16, disabled=False) == 14
 
 
-def test_cache_width_advances_on_bucket_grid():
-    """The cache width must keep advancing in bucket-sized steps.
+def test_steady_state_cache_width_saturates_on_bucket_grid():
+    """Pin the real recurrence: grow, then trim to ``prompt_len + 100``.
 
-    ``_decode_cfm`` reads the next call's cache offset back from the cached
-    width, and that width is part of the CUDA-graph key, so every steady-state
-    step has to land on the same grid for the capture shapes to collapse.
+    ``_decode_batch_once`` trims the estimator attention cache after every
+    decode, so the width saturates instead of growing without bound. What
+    matters for the graph cache is that the steady-state
+    ``(chunk_width, cache_width)`` pair settles on a single grid point.
     """
-    bucket, l0 = 16, 304
-    width = l0
+    bucket, prompt_len = 16, 304
+    cache_cap = prompt_len + 100
+    width = prompt_len
+    shapes = set()
     for _ in range(20):
         pad = _cfm_pad_frames(
             mel_frames=50,
             offset=width,
             noise_capacity=30000,
             bucket_frames=bucket,
-            ragged=False,
+            disabled=False,
         )
         assert pad == 14
-        width += 50 + pad
-    assert width == l0 + 20 * 64
-    assert (width - l0) % bucket == 0
-
-
-def test_minute_long_utterance_stays_within_noise_capacity():
-    """Cumulative cache growth must keep realistic utterances runnable.
-
-    Bucketing folds the padding frames into the cache width, so the cache
-    grows faster than the real frame count. Assert the shipped settings still
-    carry a minute-long utterance (60 padded chunks) without falling back or
-    overflowing the decoder's noise buffer.
-    """
-    bucket, noise_capacity, l0 = 16, 30000, 304
-    width, chunks = l0, 0
-    for _ in range(60):
-        pad = _cfm_pad_frames(
-            mel_frames=50,
-            offset=width,
-            noise_capacity=noise_capacity,
-            bucket_frames=bucket,
-            ragged=False,
-        )
-        assert pad > 0, "bucketing must stay active, not silently fall back"
-        width += 50 + pad
-        chunks += 1
-    assert chunks == 60
-    assert width <= noise_capacity
+        shapes.add((50 + pad, width))  # (chunk width, cache width) as used
+        width = min(width + 50 + pad, cache_cap)
+    assert width == cache_cap
+    # (64, 304) -> (64, 368) -> (64, 404), then stable.
+    assert shapes == {(64, 304), (64, 368), (64, 404)}

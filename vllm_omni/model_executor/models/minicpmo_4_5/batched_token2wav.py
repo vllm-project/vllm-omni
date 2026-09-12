@@ -52,25 +52,29 @@ def _cfm_pad_frames(
     offset: int,
     noise_capacity: int,
     bucket_frames: int,
-    ragged: bool,
+    disabled: bool,
 ) -> int:
     """Frame padding that aligns one CFM call onto the capture-shape grid.
 
-    Steady-state chunk lengths vary per request; without padding every length
-    becomes its own CUDA-graph capture shape. Padding the frame axis up to
-    ``bucket_frames`` collapses them onto one grid (the output is trimmed back
-    by the caller). Returns 0 when bucketing does not apply: the ragged
-    valid-lengths path, graph bucketing disabled, or padding that would
-    overflow the decoder's noise buffer.
+    Chunk lengths vary per request: the steady-state chunk is 50 mel frames,
+    but the first/last chunk and the ``plan_token2wav_encode_slices`` splits
+    land on arbitrary lengths, and every distinct length is its own CUDA-graph
+    capture shape. Padding the frame axis up to ``bucket_frames`` collapses
+    them onto one grid (the caller trims the output back). Measured on the
+    shipped config, 128 requests / concurrency 8: 61 captures and 1 cache
+    flush without bucketing versus 15 captures and 0 flushes with it, audio
+    RTF 1.317 -> 1.191 under otherwise identical conditions.
 
-    The padding frames are deliberately folded into the attention and CNN
-    cache widths: those cache shapes are part of the CUDA-graph key, so they
-    must advance on the same grid for the capture shapes to collapse. The
-    caches therefore grow in ``bucket_frames`` steps rather than by the real
-    frame count, bounded by the decoder's ``rand_noise`` capacity (30000
-    frames with the shipped bucket of 16, far above any streaming workload).
+    The attention and CNN caches also advance by the padded width so their
+    shapes stay on the same grid; in practice that is bounded by the trim in
+    ``_decode_batch_once`` (the cache width saturates at ``prompt_len +
+    100``) rather than by the decoder's ``rand_noise`` capacity.
+
+    Returns 0 when bucketing does not apply: the ragged valid-lengths path,
+    graphs unavailable or already disabled by ``CFMGraphWrapper._disable``,
+    or padding that would overflow the decoder's noise buffer.
     """
-    if ragged or bucket_frames <= 1:
+    if disabled or bucket_frames <= 1:
         return 0
     pad = (bucket_frames - mel_frames % bucket_frames) % bucket_frames
     if offset + mel_frames + pad > noise_capacity:
@@ -615,7 +619,13 @@ class BatchedToken2Wav(nn.Module):
             offset=offset,
             noise_capacity=int(decoder.rand_noise.shape[2]),
             bucket_frames=self._cfm_graph_bucket_frames,
-            ragged=valid_lengths is not None or self._cfm_graph_wrapper is None,
+            disabled=(
+                valid_lengths is not None
+                or self._cfm_graph_wrapper is None
+                # `_disable` keeps the wrapper object alive, so check the flag
+                # too: padding under a disabled wrapper is pure overhead.
+                or not self._cfm_graph_wrapper.enabled
+            ),
         )
         if pad_frames:
             # See _cfm_pad_frames: the caches also advance by the padded width.

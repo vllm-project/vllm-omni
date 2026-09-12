@@ -113,8 +113,21 @@ def test_window_length_is_configurable():
 
 
 def test_truncation_emits_warning(caplog):
-    """Silent truncation would hide a user-visible behavior change."""
+    """Silent truncation would hide a user-visible behavior change.
+
+    A bare ``caplog.at_level`` does not capture vLLM loggers (they do not
+    propagate to the root handlers the fixture taps), so attach the fixture
+    handler to the module logger directly -- same idiom as
+    ``tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py``.
+    """
     samples_7s = torch.arange(7 * TARGET, dtype=torch.float32)
-    with caplog.at_level(logging.WARNING):
+    target_logger = logging.getLogger("vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav")
+    target_logger.addHandler(caplog.handler)
+    prev_level = target_logger.level
+    target_logger.setLevel(logging.WARNING)
+    try:
         _normalize_reference(samples_7s, TARGET)
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(prev_level)
     assert any("truncating" in record.getMessage() for record in caplog.records)
