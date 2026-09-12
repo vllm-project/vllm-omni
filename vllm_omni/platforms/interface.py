@@ -274,6 +274,22 @@ class OmniPlatform(Platform):
     def synchronize(cls) -> None:
         raise NotImplementedError
 
+    # ── Distributed collectives ──
+
+    @classmethod
+    def all_gather_into_tensor(cls, input_: torch.Tensor, world_size: int, group) -> torch.Tensor:
+        """Run all-gather and return an output tensor the caller owns."""
+        output_size = list(input_.size())
+        output_size[0] *= world_size
+        output = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
+        torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group)
+        return output
+
+    @classmethod
+    def reset_all_gather_buffers(cls) -> None:
+        """Drop any buffers ``all_gather_into_tensor`` keeps. No-op by default."""
+        pass
+
     # ── Async diffusion output: cross-stream sync ──
 
     @classmethod

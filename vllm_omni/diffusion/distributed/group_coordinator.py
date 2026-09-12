@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -215,12 +217,10 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
-        # Allocate output tensor.
+        # Sizes for the `dim != 0` reshape below.
         input_size = list(input_.size())
         input_size[0] *= world_size
-        output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
-        # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor, input_.contiguous(), group=group)
+        output_tensor = current_omni_platform.all_gather_into_tensor(input_, world_size, group)
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
