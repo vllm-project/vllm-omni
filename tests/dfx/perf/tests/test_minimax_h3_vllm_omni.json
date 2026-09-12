@@ -287,5 +287,68 @@
         }
       }
     ]
+  },
+  {
+    "test_name": "test_minimax_h3_t2va_npu_a3_8card",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 8
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3 T2VA text-to-video+audio on 8 Ascend A3 NPUs (USP8, encoder TP8, tiled VAE PP8, distributed layerwise offload)",
+    "server_type": "vllm-omni",
+    "benchmark_endpoint": "/v1/videos",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "serve_args": {
+        "trust-remote-code": true,
+        "num-gpus": 8,
+        "usp": 8,
+        "ring": 1,
+        "text-encoder-tp-size": 8,
+        "enable-distributed-layerwise-offload": true,
+        "vae-parallel-mode": "tile",
+        "vae-use-tiling": true,
+        "vae-patch-parallel-size": 8,
+        "diffusion-attention-backend": "FLASH_ATTN",
+        "stage-init-timeout": 1800,
+        "init-timeout": 1800,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1344x768_frames209_steps8",
+        "dataset": "random",
+        "task": "t2v",
+        "num-prompts": 1,
+        "max-concurrency": 1,
+        "warmup-requests": 1,
+        "warmup-concurrency": 1,
+        "seed": 42,
+        "random-request-config": [
+          {
+            "width": 1344,
+            "height": 768,
+            "prompt": "Cinematic drone shot pushing through misty mountain ridges at sunrise, golden light catching the clouds, slow and smooth.",
+            "num_inference_steps": 8,
+            "num_frames": 209,
+            "fps": 24,
+            "weight": 1
+          }
+        ],
+        "extra-body": {
+          "flow_shift": 12.0,
+          "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        }
+      }
+    ]
   }
 ]
