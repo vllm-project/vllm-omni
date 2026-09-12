@@ -10,6 +10,10 @@ import torch
 from vllm_omni.model_executor.models.ming_tts.constants import LATENT_DIM, PATCH_SIZE
 from vllm_omni.model_executor.stage_input_processors.ming_tts import (
     MING_EMIT_PATCH_COUNT_KEY,
+    MING_FINAL_DECODE_STEP_KEY,
+    MING_STOP_REASON_KEY,
+    _extract_ming_output_snapshot,
+    llm2audio_vae,
     llm2audio_vae_async_chunk,
 )
 
@@ -54,6 +58,110 @@ def _append_patch(tm, req_id: str, idx: int, *, finished: bool = False):
         _make_request(req_id, finished=finished),
         is_finished=finished,
     )
+
+
+def test_ming_output_snapshot_selects_last_active_row():
+    patches = torch.arange(3 * PATCH_SIZE * LATENT_DIM, dtype=torch.float32).reshape(
+        3,
+        PATCH_SIZE,
+        LATENT_DIM,
+    )
+    pooling_output = {
+        "ming_has_patch": torch.tensor([1, 0, 1], dtype=torch.bool),
+        "ming_latent_patch": patches,
+        "ming_decode_step": torch.tensor([11, 22, 33]),
+        MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+    }
+
+    patch, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
+
+    torch.testing.assert_close(patch, patches[2])
+    assert decode_step == 33
+    assert stop_reason == "max_decode_steps"
+
+
+def test_ming_output_snapshot_selects_all_active_rows_for_full_payload():
+    patches = torch.arange(3 * PATCH_SIZE * LATENT_DIM, dtype=torch.float32).reshape(
+        3,
+        PATCH_SIZE,
+        LATENT_DIM,
+    )
+    pooling_output = {
+        "ming_has_patch": torch.tensor([1, 0, 1], dtype=torch.bool),
+        "ming_latent_patch": patches,
+        "ming_decode_step": torch.tensor([11, 22, 33]),
+        MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+    }
+
+    selected, decode_step, stop_reason = _extract_ming_output_snapshot(
+        pooling_output,
+        all_patches=True,
+    )
+
+    torch.testing.assert_close(selected, patches[[0, 2]])
+    assert decode_step == 33
+    assert stop_reason == "max_decode_steps"
+
+
+def test_ming_output_snapshot_returns_empty_when_no_row_is_active():
+    pooling_output = {
+        "ming_has_patch": torch.tensor([0, 0], dtype=torch.bool),
+        "ming_latent_patch": torch.ones(2, PATCH_SIZE, LATENT_DIM),
+        "ming_decode_step": torch.tensor([11, 22]),
+        MING_STOP_REASON_KEY: torch.tensor([0, 1]),
+    }
+
+    assert _extract_ming_output_snapshot(pooling_output) == (None, None, None)
+
+
+def test_ming_output_snapshot_preserves_list_metadata_fallback():
+    patches = torch.arange(2 * PATCH_SIZE * LATENT_DIM, dtype=torch.float32).reshape(
+        2,
+        PATCH_SIZE,
+        LATENT_DIM,
+    )
+    pooling_output = {
+        "ming_has_patch": torch.tensor([0, 1], dtype=torch.bool),
+        "ming_latent_patch": patches,
+        "ming_decode_step": [11, 22],
+        MING_STOP_REASON_KEY: [0, 1],
+    }
+
+    patch, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
+
+    torch.testing.assert_close(patch, patches[1])
+    assert decode_step == 22
+    assert stop_reason == "stop_head"
+
+
+def test_ming_full_payload_reuses_snapshot_for_patches_and_metadata():
+    patches = torch.arange(3 * PATCH_SIZE * LATENT_DIM, dtype=torch.float32).reshape(
+        3,
+        PATCH_SIZE,
+        LATENT_DIM,
+    )
+    multimodal_output = {
+        "ming_has_patch": torch.tensor([1, 0, 1], dtype=torch.bool),
+        "ming_latent_patch": patches,
+        "ming_decode_step": torch.tensor([11, 22, 33]),
+        MING_STOP_REASON_KEY: torch.tensor([0, 1, 2]),
+    }
+    stage_output = SimpleNamespace(
+        finished=True,
+        request_id="req",
+        outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+    )
+
+    outputs = llm2audio_vae([stage_output])
+
+    assert len(outputs) == 1
+    additional_information = outputs[0]["additional_information"]
+    torch.testing.assert_close(
+        additional_information["ming_latent_patches"],
+        patches[[0, 2]],
+    )
+    assert additional_information[MING_FINAL_DECODE_STEP_KEY] == 33
+    assert additional_information[MING_STOP_REASON_KEY] == "max_decode_steps"
 
 
 def test_ming_async_chunk_emits_small_initial_chunk_then_steady_chunks():
