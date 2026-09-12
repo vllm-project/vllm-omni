@@ -7,7 +7,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 
-See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
+See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
 !!! tip "Deployment recipes"
     TTS deployment recipes are published at
@@ -782,6 +782,12 @@ hidden-state dtype before the output projection. Consequently, a float32 stage c
 | Model | Description |
 | ------- | ------------- |
 | `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
+
+### Breeze-TTS-2
+
+| Model | Description |
+| ------- | ------------- |
+| `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
 
 ## Error Responses
 
