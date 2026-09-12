@@ -36,6 +36,7 @@ nav:
     - Online Serving:
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
+      - Cosmos Multiview-AV: user_guide/examples/online_serving/cosmos3_multiview.md
       - Speech-To-Video: user_guide/examples/online_serving/speech_to_video.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
       - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md

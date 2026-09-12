@@ -17,7 +17,7 @@ import random
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from typing import Annotated, Any, Literal
 
@@ -163,6 +163,7 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_SYNC_TIMEOUT_S,
+    VideoUploadResources,
     _cleanup_video_references,
     _parse_video_form,
     _run_video_generation_job,
@@ -2239,6 +2240,7 @@ async def create_video(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        VideoUploadResources,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2254,22 +2256,39 @@ async def create_video(
         reference_video,
         reference_audio,
         control_path,
+        upload_resources,
     ) = ctx
-    ref = video_response_from_request(effective_model_name, request)
-    await VIDEO_STORE.upsert(ref.id, ref)
-    task = asyncio.create_task(
-        _run_video_generation_job(
-            handler,
-            request,
-            ref.id,
-            reference_image,
-            reference_video,
-            reference_audio,
-            control_path,
-            app_state=raw_request.app.state,
+    task: asyncio.Task[None] | None = None
+    ref = None
+    try:
+        ref = video_response_from_request(effective_model_name, request)
+        await VIDEO_STORE.upsert(ref.id, ref)
+        task = asyncio.create_task(
+            _run_video_generation_job(
+                handler,
+                request,
+                ref.id,
+                reference_image,
+                reference_video,
+                reference_audio,
+                control_path,
+                app_state=raw_request.app.state,
+                upload_resources=upload_resources,
+            )
         )
-    )
-    await VIDEO_TASKS.upsert(ref.id, task)
+        # A task cancelled before its first step never enters its finally block.
+        task.add_done_callback(lambda _: upload_resources.cleanup())
+        await VIDEO_TASKS.upsert(ref.id, task)
+    except BaseException:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        upload_resources.cleanup()
+        _cleanup_video_references(reference_video, reference_audio, control_path)
+        if ref is not None:
+            await VIDEO_STORE.pop(ref.id)
+        raise
     return ref
 
 
@@ -2292,6 +2311,7 @@ async def create_video_sync(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        VideoUploadResources,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2311,6 +2331,7 @@ async def create_video_sync(
         reference_video,
         reference_audio,
         control_path,
+        upload_resources,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -2348,6 +2369,7 @@ async def create_video_sync(
         ) from exc
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path)
+        upload_resources.cleanup()
     inference_time_s = time.perf_counter() - started_at
 
     return Response(

@@ -205,13 +205,13 @@ class OmniOpenAIServingVideo:
         return capability is True or metadata_capability
 
     @property
-    def supported_control_upload_types(self) -> frozenset[str]:
-        """Return multipart control types accepted by the active pipeline.
+    def supports_multiview_reference_inputs(self) -> bool:
+        return any(
+            get_diffusion_model_metadata(arch).supports_multiview_reference_inputs
+            for arch in self._video_model_architectures()
+        )
 
-        Unknown pipelines deliberately return an empty set.  This keeps the
-        generic video API isolated from model-specific controls unless a model
-        explicitly opts into the ``control_path`` contract in metadata.
-        """
+    def _video_model_architectures(self) -> list[str | None]:
         od_config = self._resolve_diffusion_od_config()
         model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
         for stage_config in self.stage_configs or ():
@@ -228,8 +228,13 @@ class OmniOpenAIServingVideo:
                 )
             )
 
+        return model_archs
+
+    @property
+    def supported_control_upload_types(self) -> frozenset[str]:
+        """Return multipart control types explicitly accepted by the active pipeline."""
         supported: set[str] = set()
-        for model_arch in model_archs:
+        for model_arch in self._video_model_architectures():
             supported.update(get_diffusion_model_metadata(model_arch).supported_control_upload_types)
         return frozenset(supported)
 

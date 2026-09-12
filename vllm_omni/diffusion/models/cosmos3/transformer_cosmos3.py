@@ -51,6 +51,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
+
 
 class RMSNorm(_VllmRMSNorm):
     """Cosmos3-local RMSNorm that uses the FP32 native implementation."""
@@ -252,12 +254,19 @@ def compute_mrope_position_ids_vision(
     base_temporal_compression_factor: int | None = None,
     enable_fps_modulation: bool = True,
     start_frame_offset: int = 0,
+    temporal_position_period: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
     Creates a (t, h, w) position grid with spatial indices reset per segment
-    (Qwen3VL-style). Flattened in t-major order.
+    (Qwen3VL-style). Flattened in t-major order. When
+    ``temporal_position_period`` is set, camera-major frame indexes wrap at
+    that period before optional FPS scaling so corresponding views align.
     """
+    if temporal_position_period is not None and temporal_position_period <= 0:
+        raise ValueError(f"Cosmos3 temporal_position_period must be positive, got {temporal_position_period}.")
+    if fps is not None and (not math.isfinite(fps) or fps <= 0):
+        raise ValueError(f"Cosmos3 vision FPS must be finite and positive, got {fps!r}.")
     fps_modulation = enable_fps_modulation and fps is not None
 
     if fps_modulation:
@@ -269,6 +278,8 @@ def compute_mrope_position_ids_vision(
         )
         base_tps = base_fps / effective_base_tcf
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
             ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
@@ -276,10 +287,11 @@ def compute_mrope_position_ids_vision(
             .flatten()
         )
     else:
+        frame_indices = torch.arange(grid_t, dtype=torch.long)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
-            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
-            + int(temporal_offset)
-            + start_frame_offset
+            frame_indices.view(-1, 1).expand(-1, grid_h * grid_w).flatten() + int(temporal_offset) + start_frame_offset
         )
 
     h_index = torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -754,6 +766,18 @@ class Cosmos3CrossAttention(nn.Module):
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
 
+    def _forward_multiview(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        multiview_layout: Any,
+    ) -> torch.Tensor:
+        del q, k, v, k_und, v_und, multiview_layout
+        raise TypeError("The base Cosmos3 transformer does not support multiview attention layouts.")
+
     def _forward_multi_control(
         self,
         q: torch.Tensor,
@@ -820,6 +844,7 @@ class Cosmos3CrossAttention(nn.Module):
         freqs_sin: torch.Tensor,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -843,7 +868,11 @@ class Cosmos3CrossAttention(nn.Module):
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if control_token_sizes is not None or control_weights is not None:
+        if multiview_layout is not None:
+            if control_token_sizes is not None or control_weights is not None:
+                raise ValueError("Cosmos3 multiview attention cannot use the multi-control attention path.")
+            out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
+        elif control_token_sizes is not None or control_weights is not None:
             if control_token_sizes is None or control_weights is None:
                 raise ValueError("Cosmos3 multi-control attention requires both control token sizes and weights.")
             out = self._forward_multi_control(
@@ -935,12 +964,13 @@ class Cosmos3GenDecoderLayer(nn.Module):
         rms_norm_eps: float,
         quant_config: QuantizationConfig | None = None,
         mlp_cls: type[nn.Module] = Cosmos3GatedMLP,
+        cross_attention_cls: type[nn.Module] = Cosmos3CrossAttention,
         qk_norm: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.cross_attention = Cosmos3CrossAttention(
+        self.cross_attention = cross_attention_cls(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
@@ -971,6 +1001,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         if cached_kv is not None:
             if self.layer_idx is None:
@@ -992,6 +1023,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=freqs_sin,
             control_token_sizes=control_token_sizes,
             control_weights=control_weights,
+            multiview_layout=multiview_layout,
         )
         hidden_states = residual + hidden_states
 
@@ -1144,6 +1176,8 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _language_model_cls = Cosmos3LanguageModel
     _gen_mlp_cls = Cosmos3GatedMLP
+    _gen_layer_cls = Cosmos3GenDecoderLayer
+    _cross_attention_cls = Cosmos3CrossAttention
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -1322,7 +1356,7 @@ class Cosmos3VFMTransformer(nn.Module):
 
         self.gen_layers = nn.ModuleList(
             [
-                Cosmos3GenDecoderLayer(
+                self._gen_layer_cls(
                     layer_idx=i,
                     hidden_size=self.hidden_size,
                     intermediate_size=self.intermediate_size,
@@ -1332,6 +1366,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     rms_norm_eps=self.rms_norm_eps,
                     quant_config=quant_config,
                     mlp_cls=self._gen_mlp_cls,
+                    cross_attention_cls=self._cross_attention_cls,
                     qk_norm=self.qk_norm_for_diffusion,
                     prefix=f"gen_layers.{i}",
                 )
@@ -1556,6 +1591,7 @@ class Cosmos3VFMTransformer(nn.Module):
         t_sound: int | None = None,
         num_vision_items: int = 1,
         share_vision_temporal_positions: bool = False,
+        temporal_position_period: int | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND text and GEN media pathways."""
         if num_vision_items <= 0:
@@ -1584,6 +1620,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     base_fps=self.base_fps,
                     temporal_compression_factor=self.temporal_compression_factor,
                     enable_fps_modulation=self.enable_fps_modulation,
+                    temporal_position_period=temporal_position_period,
                 )
                 gen_positions.extend([v_pos] * num_vision_items)
             else:
@@ -1598,6 +1635,7 @@ class Cosmos3VFMTransformer(nn.Module):
                         base_fps=self.base_fps,
                         temporal_compression_factor=self.temporal_compression_factor,
                         enable_fps_modulation=self.enable_fps_modulation,
+                        temporal_position_period=temporal_position_period,
                     )
                     gen_positions.append(v_pos)
             if action_frames > 0:
@@ -1695,6 +1733,8 @@ class Cosmos3VFMTransformer(nn.Module):
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
+        multiview_layout: Any | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
@@ -1842,6 +1882,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 t_sound=s_sound,
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+                temporal_position_period=temporal_position_period,
             )
             self.cached_freqs_gen = freqs_gen
 
@@ -1946,6 +1987,7 @@ class Cosmos3VFMTransformer(nn.Module):
                         freqs_sin=freqs_sin,
                         control_token_sizes=multi_control_token_sizes,
                         control_weights=multi_control_weights,
+                        multiview_layout=multiview_layout,
                     )
                     # Cache-dit's block wrapper may return a tuple; unwrap it.
                     if isinstance(hidden_gen, tuple):
@@ -1959,6 +2001,7 @@ class Cosmos3VFMTransformer(nn.Module):
                         freqs_gen=freqs_gen,
                         control_token_sizes=multi_control_token_sizes,
                         control_weights=multi_control_weights,
+                        multiview_layout=multiview_layout,
                     )
                     if isinstance(hidden_gen, tuple):
                         hidden_gen = hidden_gen[0]

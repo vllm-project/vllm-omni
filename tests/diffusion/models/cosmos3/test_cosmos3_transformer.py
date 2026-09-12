@@ -104,6 +104,30 @@ def test_mrope_position_ids_cover_text_video_sound_and_action() -> None:
     torch.testing.assert_close(modulated_ids[0], torch.tensor([10.0, 12.0]))
     assert modulated_offset == 13
 
+    aligned_ids, aligned_offset = compute_mrope_position_ids_vision(
+        6,
+        1,
+        1,
+        temporal_offset=10,
+        fps=None,
+        temporal_position_period=3,
+    )
+    assert aligned_ids[0].tolist() == [10, 11, 12, 10, 11, 12]
+    assert aligned_offset == 13
+
+    aligned_modulated_ids, aligned_modulated_offset = compute_mrope_position_ids_vision(
+        6,
+        1,
+        1,
+        temporal_offset=10,
+        fps=12.0,
+        base_fps=24.0,
+        temporal_compression_factor=4,
+        temporal_position_period=3,
+    )
+    torch.testing.assert_close(aligned_modulated_ids[0], torch.tensor([10.0, 12.0, 14.0] * 2))
+    assert aligned_modulated_offset == 15
+
     sound_ids, sound_offset = compute_mrope_position_ids_sound(3, temporal_offset=10, sound_latent_fps=25.0)
     torch.testing.assert_close(sound_ids[0], torch.tensor([10.0, 10.96, 11.92]))
     assert sound_offset == 12
@@ -164,6 +188,37 @@ def test_edge_config_resolves_nemotron_defaults() -> None:
     assert model.latent_channel_size == 48
     assert model.latent_patch_size == 2
     assert model.temporal_compression_factor == 4
+
+
+def test_multiview_transformer_installs_sparse_cross_attention_and_clears_mask_cache() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+        Cosmos3MultiviewCrossAttention,
+        Cosmos3MultiviewVFMTransformer,
+    )
+
+    model = Cosmos3MultiviewVFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(
+                num_hidden_layers=1,
+                backbone_type=COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+            ),
+            dtype=torch.float32,
+        )
+    )
+
+    assert isinstance(model.gen_layers[0].cross_attention, Cosmos3MultiviewCrossAttention)
+    model._multiview_mask_cache[("fixture",)] = object()
+    model._multiview_buffer_cache[("fixture",)] = torch.empty(0)
+    model.cached_kv = []
+    model.cached_freqs_gen = (torch.empty(0), torch.empty(0))
+    model.reset_cache()
+    # Both request-local caches must go: the masks are keyed on request
+    # geometry, and the packing buffers hold gigabytes between requests.
+    assert model._multiview_mask_cache == {}
+    assert model._multiview_buffer_cache == {}
+    assert model.cached_kv is None
+    assert model.cached_freqs_gen is None
 
 
 def test_edge_config_requires_backbone_type() -> None:
@@ -948,6 +1003,23 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     )
     _, shared_gen_pos = rotary.position_ids
     assert shared_gen_pos[0, 0].tolist() == [102, 103, 102, 103, 102, 103]
+
+    rotary.position_ids.clear()
+    model._compute_rope_freqs(
+        text_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        t=6,
+        hp=1,
+        wp=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        num_vision_items=2,
+        share_vision_temporal_positions=True,
+        temporal_position_period=3,
+    )
+    _, aligned_shared_gen_pos = rotary.position_ids
+    expected_aligned_item = [102, 103, 104, 102, 103, 104]
+    assert aligned_shared_gen_pos[0, 0].tolist() == expected_aligned_item * 2
 
     rotary.position_ids.clear()
     model._compute_rope_freqs(
