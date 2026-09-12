@@ -9,6 +9,8 @@ from pydantic import ValidationError
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.diffusion.cache.seacache import SeaCacheBackend
+from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -138,6 +140,38 @@ def test_default_cache_config_used_when_missing():
 
     cache_config = _terminal_config(stage_cfg).cache_config
     assert cache_config.Fn_compute_blocks == 1
+
+
+@pytest.mark.parametrize(
+    ("cache_args", "expected_thresh", "expected_norm"),
+    [
+        pytest.param([], 0.3, "mean", id="defaults"),
+        pytest.param(["--cache-config", '{"sea_thresh": 0}'], 0.0, "mean", id="disabled-skipping"),
+        pytest.param(
+            ["--cache-config", '{"sea_thresh": 0.6, "sea_norm_mode": "none"}'],
+            0.6,
+            "none",
+            id="explicit-config",
+        ),
+        pytest.param(["--cache-config", "{invalid"], 0.3, "mean", id="invalid-json-defaults"),
+    ],
+)
+def test_serve_seacache_config_reaches_backend(cache_args, expected_thresh, expected_norm):
+    """Keep SeaCache CLI defaults and overrides through centralized resolution."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(
+        ["serve", "black-forest-labs/FLUX.1-dev", "--omni", "--cache-backend", "sea_cache", *cache_args]
+    )
+
+    stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    config = _terminal_config(stage_cfg)
+    backend = get_cache_backend(config.cache_backend, config.cache_config)
+
+    assert isinstance(backend, SeaCacheBackend)
+    assert backend.config.sea_thresh == expected_thresh
+    assert backend.config.sea_norm_mode == expected_norm
 
 
 def test_default_stage_devices_from_sequence_parallel():
