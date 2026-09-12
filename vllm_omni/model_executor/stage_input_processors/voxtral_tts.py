@@ -51,8 +51,10 @@ def generator2tokenizer_async_chunk(
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            # Keep the frame on its producing device: appending must not force a
+            # per-frame D2H sync. The whole window is copied to host once per
+            # flushed chunk below instead.
+            transfer_manager.code_prompt_token_ids[request_id].append(frame.detach())
     elif not finished:
         # Some steps may not produce multimodal_output. Only flush on finish.
         return None
@@ -95,7 +97,15 @@ def generator2tokenizer_async_chunk(
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack context + chunk into codebook-major flat codes for adapter.
-    code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
+    # Frames may still be on the GPU, so flatten on-device and issue a single
+    # D2H copy for the whole window (one per chunk instead of one per frame).
+    # torch.as_tensor passes tensors through zero-copy and still accepts the
+    # plain-int frames older seeds/tests may have stored; stragglers on another
+    # device (e.g. pre-seeded CPU lists against CUDA frames) are moved to the
+    # producing device of the newest frame first. .to() is a no-op when the
+    # window is homogeneous.
+    frames = [torch.as_tensor(f).reshape(-1) for f in window_frames]
+    code_predictor_codes = torch.cat([f.to(frames[-1].device) for f in frames]).cpu().tolist()
 
     return OmniPayloadStruct(
         codes=CodesStruct(
