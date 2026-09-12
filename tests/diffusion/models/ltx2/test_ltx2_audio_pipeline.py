@@ -65,6 +65,24 @@ def test_ltx_t2a_public_contract_is_audio_only():
     assert LTX2TextToAudioPipeline.dummy_run_num_frames == 9
 
 
+@pytest.mark.parametrize(
+    "parallel_config",
+    [
+        SimpleNamespace(tensor_parallel_size=2, sequence_parallel_size=1),
+        SimpleNamespace(tensor_parallel_size=1, sequence_parallel_size=2),
+    ],
+)
+def test_ltx_t2a_rejects_tensor_or_sequence_parallelism(parallel_config):
+    od_config = SimpleNamespace(parallel_config=parallel_config)
+
+    with pytest.raises(
+        ValueError,
+        match=r"currently supports only tensor_parallel_size=1 and sequence_parallel_size=1; "
+        r"TP/SP execution is not supported for audio-only T2A",
+    ):
+        LTX2TextToAudioPipeline(od_config=od_config)
+
+
 def test_ltx_t2a_runs_only_audio_connector_for_per_modality_projection():
     class AudioConnector:
         def __init__(self):

@@ -257,9 +257,9 @@ class LTXAudioRuntime(
         sequence_parallel_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
         if tensor_parallel_size != 1 or sequence_parallel_size != 1:
             raise ValueError(
-                f"{type(self).__name__} requires tensor_parallel_size=1 and "
-                "sequence_parallel_size=1. Distributed execution is provided "
-                "by the LTX2 audio TP/SP extension."
+                f"{type(self).__name__} currently supports only "
+                "tensor_parallel_size=1 and sequence_parallel_size=1; "
+                "TP/SP execution is not supported for audio-only T2A."
             )
 
         additional_config = getattr(od_config, "additional_config", None)
