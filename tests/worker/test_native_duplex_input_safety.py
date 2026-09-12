@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
-import runpy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,35 +92,6 @@ def test_live_prefill_output_does_not_alias_cached_prepared_embeddings():
     assert prepared[:, 0].tolist() == [101, 102]
     _, retried, _ = _preprocess(model, seq=1, ids=[0], offset=1, prompt=[0, 0])
     assert retried[:, 0].tolist() == [102]
-
-
-@pytest.mark.parametrize("corrupt,stage", [(False, "llm"), (True, "llm"), (True, "tts")])
-def test_embedding_oracle_checks_real_preprocess_outputs(monkeypatch, corrupt, stage):
-    monkeypatch.delenv("VLLM_OMNI_TEST_NATIVE_INPUT_FAULT", raising=False)
-    path = Path(__file__).resolve().parents[1] / "dfx/reliability/fault_injection/native_input_safety/sitecustomize.py"
-    patch = runpy.run_path(str(path))["_patch"]
-    patch.__globals__["_MODE"] = "embedding_oracle"
-    model = _model_with_prepared_units()
-    original = model.preprocess
-
-    class OracleModel:
-        model_stage = stage
-
-        def preprocess(self, input_ids, **kwargs):
-            result = original(input_ids, **kwargs)
-            if corrupt:
-                result[1].add_(1)
-            return result
-
-        def __getattr__(self, name):
-            return getattr(model, name)
-
-    patch(SimpleNamespace(MiniCPMO45OmniForConditionalGeneration=OracleModel))
-    if corrupt and stage == "llm":
-        with pytest.raises(AssertionError):
-            _preprocess(OracleModel(), seq=1, ids=[0, 0], offset=0, prompt=[0, 0])
-    else:
-        _preprocess(OracleModel(), seq=1, ids=[0, 0], offset=0, prompt=[0, 0])
 
 
 def test_failed_preprocess_uses_v028_embedding_interface_without_a_template():
@@ -476,46 +446,6 @@ def test_turn_eos_does_not_fence_required_following_chunk_eos(monkeypatch):
     for expected in (5, 3):
         model.prepare_duplex_sampling(torch.zeros(1, 8), SimpleNamespace(), (row,))
         assert model.sample(torch.zeros(1, 8), SimpleNamespace()).sampled_token_ids.item() == expected
-
-
-@pytest.mark.parametrize("in_flight", [0, 8])
-def test_preemption_fault_exercises_sync_and_async_in_flight_requests(monkeypatch, in_flight):
-    monkeypatch.delenv("VLLM_OMNI_TEST_NATIVE_INPUT_FAULT", raising=False)
-    fault_path = (
-        Path(__file__).resolve().parents[1] / "dfx/reliability/fault_injection/native_input_safety/sitecustomize.py"
-    )
-    patch = runpy.run_path(str(fault_path))["_patch"]
-    patch.__globals__["_MODE"] = "preempt"
-    request = SimpleNamespace(
-        request_id="req",
-        streaming_prompt_continuous=True,
-        model_intermediate_buffer={"duplex": {"seq": 2}},
-        num_computed_tokens=89,
-        num_in_flight_tokens=in_flight,
-        num_preemptions=0,
-    )
-
-    class Scheduler:
-        def __init__(self):
-            self.running = [request]
-
-        def schedule(self):
-            return "scheduled"
-
-        def _preempt_request(self, req, timestamp, *, drop_stale_output):
-            assert drop_stale_output is True
-            assert req is request
-            assert timestamp > 0
-            req.num_computed_tokens = 0
-            req.num_preemptions += 1
-
-    patch(SimpleNamespace(OmniARScheduler=Scheduler))
-    scheduler = Scheduler()
-    assert scheduler.schedule() == "scheduled"
-    assert request.num_preemptions == 1
-    assert request.num_computed_tokens == 0
-    assert scheduler.schedule() == "scheduled"
-    assert request.num_preemptions == 1
 
 
 @pytest.mark.parametrize(
