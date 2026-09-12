@@ -10,24 +10,23 @@ import base64
 import hashlib
 import json
 import math
+import time
 import uuid
 import wave
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 
 try:
     import websockets
-    from websockets.exceptions import ConnectionClosed
+    from websockets.exceptions import ConnectionClosed, WebSocketException
 except ImportError as exc:  # pragma: no cover - driver dependency.
     raise SystemExit("Install websockets first: pip install websockets") from exc
 
-from vllm_omni.clients.duplex import (
-    EventCollector,
-    write_pcm16_wav,
-)
+from vllm_omni.clients.duplex import EventCollector, write_pcm16_wav
 from vllm_omni.clients.duplex import (
     wait_for_condition as wait_for,
 )
@@ -35,6 +34,15 @@ from vllm_omni.clients.duplex import (
 SAMPLE_RATE_HZ = 24_000
 FRAME_SAMPLES = 1_920
 FRAME_PERIOD_S = FRAME_SAMPLES / SAMPLE_RATE_HZ
+AUDIO_DELTA_EVENT_TYPES = frozenset({"response.audio.delta", "response.output_audio.delta"})
+
+
+class _ProbeTransport(Protocol):
+    async def recv(self) -> str | bytes: ...
+
+    async def send(self, message: str) -> None: ...
+
+    async def close(self) -> None: ...
 
 
 class RawRealtimeProbe:
@@ -50,7 +58,7 @@ class RawRealtimeProbe:
         self.url = url
         self.max_size = max_size
         self.events = EventCollector()
-        self._ws = None
+        self._ws: _ProbeTransport | None = None
         self._reader_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> RawRealtimeProbe:
@@ -69,6 +77,7 @@ class RawRealtimeProbe:
                 pass
 
     async def _read_events(self) -> None:
+        assert self._ws is not None
         try:
             while True:
                 raw = await self._ws.recv()
@@ -81,6 +90,7 @@ class RawRealtimeProbe:
             return
 
     async def send(self, event: dict[str, object]) -> None:
+        assert self._ws is not None
         await self._ws.send(json.dumps(event))
 
 
@@ -142,6 +152,38 @@ def _events(client: RawRealtimeProbe, event_type: str) -> list[dict[str, object]
     return [event for event in client.events.events if event.get("type") == event_type]
 
 
+def _audio_events(client: RawRealtimeProbe) -> list[dict[str, object]]:
+    """Return audio deltas from both current and legacy Realtime event names."""
+    return [event for event in client.events.events if event.get("type") in AUDIO_DELTA_EVENT_TYPES]
+
+
+def _validated_audio_event(event: dict[str, object]) -> bytes:
+    """Decode one wire audio delta without depending on client event aliases."""
+    encoded = event.get("delta")
+    if not isinstance(encoded, str):
+        raise ValueError("missing_audio_delta")
+    try:
+        chunk = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        raise ValueError("invalid_audio_base64") from None
+    if chunk:
+        if len(chunk) % 2:
+            raise ValueError("unaligned_pcm16_packet")
+        if event.get("sample_rate_hz") != SAMPLE_RATE_HZ:
+            raise ValueError("invalid_audio_sample_rate")
+        if not isinstance(event.get("response_id"), str) or not event.get("response_id"):
+            raise ValueError("missing_audio_response_id")
+    return chunk
+
+
+def _validated_audio_chunks(client: RawRealtimeProbe) -> list[tuple[dict[str, object], bytes]]:
+    return [(event, _validated_audio_event(event)) for event in _audio_events(client)]
+
+
+def _audio_bytes(client: RawRealtimeProbe) -> bytes:
+    return b"".join(chunk for _, chunk in _validated_audio_chunks(client) if chunk)
+
+
 async def _open_session(
     args: argparse.Namespace,
     *,
@@ -151,22 +193,7 @@ async def _open_session(
 ) -> tuple[RawRealtimeProbe, dict[str, object]]:
     client = RawRealtimeProbe(_realtime_url(args.url, args.model, session_id))
     await client.__aenter__()
-    await client.send(
-        {
-            "type": "session.update",
-            "session": {
-                "session_id": session_id,
-                "model": args.model,
-                "modalities": ["audio", "text"],
-                "input_audio_format": "pcm_f32le",
-                "output_audio_format": "pcm16",
-                "voice": args.voice,
-                "instructions": persona,
-                "turn_detection": None,
-                "extra_body": {"auto_response": True},
-            },
-        }
-    )
+    await client.send(_session_update(args, session_id=session_id, persona=persona))
     event_type = "error" if expect_error else "session.created"
     await wait_for(
         lambda: client.events.count(event_type) > 0,
@@ -174,6 +201,23 @@ async def _open_session(
         label=event_type,
     )
     return client, _events(client, event_type)[-1]
+
+
+def _session_update(args: argparse.Namespace, *, session_id: str, persona: str) -> dict[str, object]:
+    return {
+        "type": "session.update",
+        "session": {
+            "session_id": session_id,
+            "model": args.model,
+            "modalities": ["audio", "text"],
+            "input_audio_format": "pcm_f32le",
+            "output_audio_format": "pcm16",
+            "voice": args.voice,
+            "instructions": persona,
+            "turn_detection": None,
+            "extra_body": {"auto_response": True},
+        },
+    }
 
 
 async def _close_session(client: RawRealtimeProbe, *, timeout_s: float) -> None:
@@ -200,21 +244,22 @@ async def _stream_frames(
             frame_count = min(frame_count, max_frames)
     for seq in range(frame_count):
         frame = pcm[seq * FRAME_SAMPLES : (seq + 1) * FRAME_SAMPLES]
-        frame = np.pad(frame, (0, FRAME_SAMPLES - frame.size))
-        frame = np.ascontiguousarray(frame, dtype="<f4")
-        await client.send(
-            {
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(frame).decode("ascii"),
-                "format": "pcm_f32le",
-                "sample_rate_hz": SAMPLE_RATE_HZ,
-                "duration_ms": 80,
-                "audio_end_ms": (seq + 1) * 80,
-                "is_speech": bool(np.sqrt(np.mean(np.square(frame))) >= 1e-4),
-            }
-        )
+        await client.send(_frame_event(frame, seq))
         await asyncio.sleep(FRAME_PERIOD_S)
     return frame_count
+
+
+def _frame_event(frame: np.ndarray, seq: int) -> dict[str, object]:
+    frame = np.ascontiguousarray(np.pad(frame, (0, FRAME_SAMPLES - frame.size)), dtype="<f4")
+    return {
+        "type": "input_audio_buffer.append",
+        "audio": base64.b64encode(frame).decode("ascii"),
+        "format": "pcm_f32le",
+        "sample_rate_hz": SAMPLE_RATE_HZ,
+        "duration_ms": 80,
+        "audio_end_ms": (seq + 1) * 80,
+        "is_speech": bool(np.sqrt(np.mean(np.square(frame))) >= 1e-4),
+    }
 
 
 def _audio_frame_stats(
@@ -242,11 +287,7 @@ def _audio_frame_stats(
 
 
 def _response_ids(client: RawRealtimeProbe) -> set[str]:
-    return {
-        str(event["response_id"])
-        for event in _events(client, "response.output_audio.delta")
-        if isinstance(event.get("response_id"), str)
-    }
+    return {str(event["response_id"]) for event in _audio_events(client) if isinstance(event.get("response_id"), str)}
 
 
 def _session_result(
@@ -256,8 +297,16 @@ def _session_result(
     args: argparse.Namespace,
     minimum_chunks: int,
 ) -> tuple[bytes, set[str], dict[str, object]]:
-    chunks = sum(len(items) for items in client.events.response_audio.values())
-    raw = client.events.audio_bytes()
+    if isinstance(client, RawRealtimeProbe):
+        audio_chunks = _validated_audio_chunks(client)
+        chunks = sum(bool(chunk) for _, chunk in audio_chunks)
+        raw = b"".join(chunk for _, chunk in audio_chunks if chunk)
+    else:
+        # Unit fixtures may provide an already-decoded EventCollector without
+        # retaining the base64 wire field. Real websocket probes always take
+        # the strict wire-validation path above.
+        chunks = sum(len(items) for items in client.events.response_audio.values())
+        raw = client.events.audio_bytes()
     if chunks < minimum_chunks or not raw or len(raw) % 2:
         raise AssertionError(f"invalid PCM16 output: chunks={chunks}, bytes={len(raw)}")
     pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
@@ -266,11 +315,7 @@ def _session_result(
     # Audible speech is checked per frame below with the higher 1e-3 default.
     if not np.isfinite(pcm).all() or rms <= 1e-5:
         raise AssertionError(f"output audio is non-finite or silent: samples={pcm.size}, rms={rms}")
-    rates = {
-        int(event["sample_rate_hz"])
-        for event in _events(client, "response.output_audio.delta")
-        if isinstance(event.get("sample_rate_hz"), int)
-    }
+    rates = {rate for event in _audio_events(client) if isinstance(rate := event.get("sample_rate_hz"), int)}
     if rates != {SAMPLE_RATE_HZ}:
         raise AssertionError(f"unexpected output sample rates: {sorted(rates)}")
     stats = _audio_frame_stats(
@@ -289,7 +334,7 @@ def _session_result(
         )
     runtime_metadata = [
         metadata["vllm_omni"]
-        for event in _events(client, "response.output_audio.delta")
+        for event in _audio_events(client)
         if isinstance((metadata := event.get("metadata")), dict) and isinstance(metadata.get("vllm_omni"), dict)
     ]
     if not any(
@@ -332,6 +377,8 @@ def _save(output_dir: Path, name: str, client: RawRealtimeProbe, raw: bytes) -> 
 
 
 async def run(args: argparse.Namespace) -> dict[str, object]:
+    if getattr(args, "sessions", None) is not None:
+        return await run_load(args)
     input_path = Path(args.input_wav)
     input_identity = _input_identity(
         input_path,
@@ -381,14 +428,12 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     )
     await asyncio.gather(
         wait_for(
-            lambda: len(primary.events.audio_bytes()) // (2 * FRAME_SAMPLES) >= primary_frames - args.max_frame_deficit,
+            lambda: len(_audio_bytes(primary)) // (2 * FRAME_SAMPLES) >= primary_frames - args.max_frame_deficit,
             timeout_s=args.timeout_s,
             label="primary frame coverage",
         ),
         wait_for(
-            lambda: (
-                len(secondary.events.audio_bytes()) // (2 * FRAME_SAMPLES) >= secondary_frames - args.max_frame_deficit
-            ),
+            lambda: (len(_audio_bytes(secondary)) // (2 * FRAME_SAMPLES) >= secondary_frames - args.max_frame_deficit),
             timeout_s=args.timeout_s,
             label="secondary frame coverage",
         ),
@@ -426,16 +471,14 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     await asyncio.gather(
         wait_for(
             lambda: (
-                len(secondary.events.audio_bytes()) // (2 * FRAME_SAMPLES)
-                >= secondary_total_frames - args.max_frame_deficit
+                len(_audio_bytes(secondary)) // (2 * FRAME_SAMPLES) >= secondary_total_frames - args.max_frame_deficit
             ),
             timeout_s=args.timeout_s,
             label="survivor frame coverage after slot recycle",
         ),
         wait_for(
             lambda: (
-                len(replacement.events.audio_bytes()) // (2 * FRAME_SAMPLES)
-                >= replacement_frames - args.max_frame_deficit
+                len(_audio_bytes(replacement)) // (2 * FRAME_SAMPLES) >= replacement_frames - args.max_frame_deficit
             ),
             timeout_s=args.timeout_s,
             label="replacement frame coverage",
@@ -493,6 +536,250 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     return result
 
 
+def _distribution(values: list[float]) -> dict[str, int | float | None]:
+    if not values:
+        return {"count": 0, "median": None, "p99": None, "max": None, "argmax_index": None}
+    return {
+        "count": len(values),
+        "median": float(np.median(values)),
+        "p99": float(np.quantile(values, 0.99)),
+        "max": max(values),
+        "argmax_index": int(np.argmax(values)),
+    }
+
+
+def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, float]]) -> dict[str, object]:
+    # Use the collector's local clock, never a timestamp supplied by the server.
+    packets: list[dict[str, object]] = []
+    response_ids: set[str] = set()
+    packet_times: list[float] = []
+    invalid_packets: list[dict[str, object]] = []
+    samples = 0
+    for index, (raw, received) in enumerate(zip(client.events.events, client.events.event_received_at_s, strict=True)):
+        if raw.get("type") not in AUDIO_DELTA_EVENT_TYPES:
+            continue
+        try:
+            chunk = _validated_audio_event(raw)
+        except ValueError as exc:
+            # Only fixed diagnostic codes from the validator are exported,
+            # never audio payloads or details from the remote endpoint.
+            invalid_packets.append({"event_index": index, "received_at_s": received, "code": str(exc)})
+            continue
+        if chunk:
+            samples += len(chunk) // 2
+            packet_times.append(received)
+            response_id = raw.get("response_id")
+            packets.append({"received_at_s": received, "samples": len(chunk) // 2, "response_id": response_id})
+            if isinstance(response_id, str) and response_id:
+                response_ids.add(response_id)
+    intervals = [(b - a) * 1000 for a, b in zip(packet_times, packet_times[1:])]
+    first_send = sends[0][1] if sends else None
+    audio_duration = samples / SAMPLE_RATE_HZ
+    first_audio_ms = (packet_times[0] - first_send) * 1000 if packet_times and first_send is not None else None
+    client_rtf = (packet_times[-1] - first_send) / audio_duration if audio_duration and first_send is not None else None
+    return {
+        "input_frames": len(sends),
+        "output_samples": samples,
+        "frame_deficit": len(sends) - samples / FRAME_SAMPLES,
+        "response_ids": sorted(response_ids),
+        "client_first_audio_after_stream_start_ms": first_audio_ms,
+        "client_stream_rtf": client_rtf,
+        "client_audio_packet_interval_ms": _distribution(intervals),
+        "client_send_lateness_ms": _distribution([max(0.0, sent - planned) * 1000 for planned, sent, _ in sends]),
+        "input_timeline": [
+            {"frame_index": i, "planned_at_s": planned, "send_started_at_s": sent, "send_completed_at_s": completed}
+            for i, (planned, sent, completed) in enumerate(sends)
+        ],
+        "audio_packet_timeline": packets,
+        "invalid_audio_packets": invalid_packets,
+    }
+
+
+def _check_load_connection(client: RawRealtimeProbe) -> None:
+    if client.events.errors():
+        raise RuntimeError("server emitted a Realtime error (see the session error count)")
+    if client._reader_task is not None and client._reader_task.done():
+        client._reader_task.result()  # Propagate malformed JSON/reader failures.
+        raise RuntimeError("connection closed before session completion")
+
+
+async def _wait_load_event(client: RawRealtimeProbe, event_type: str, timeout_s: float) -> None:
+    def received() -> bool:
+        if client.events.count(event_type):
+            return True
+        _check_load_connection(client)
+        return False
+
+    await wait_for(received, timeout_s=timeout_s, label=event_type)
+
+
+async def _paced_load_frames(
+    client: RawRealtimeProbe,
+    pcm: np.ndarray,
+    *,
+    epoch: float,
+    timeout_s: float,
+    sends: list[tuple[float, float, float]],
+) -> None:
+    next_send = epoch
+    for seq in range(math.ceil(pcm.size / FRAME_SAMPLES)):
+        await asyncio.sleep(max(0.0, next_send - time.monotonic()))
+        _check_load_connection(client)
+        event = _frame_event(pcm[seq * FRAME_SAMPLES : (seq + 1) * FRAME_SAMPLES], seq)
+        started = time.monotonic()
+        await asyncio.wait_for(client.send(event), timeout=timeout_s)
+        completed = time.monotonic()
+        sends.append((epoch + seq * FRAME_PERIOD_S, started, completed))
+        # Do not burst to catch up after a stalled send; report accumulated lag.
+        next_send = max(epoch + (seq + 1) * FRAME_PERIOD_S, completed + FRAME_PERIOD_S)
+
+
+async def _run_load_session(
+    args: argparse.Namespace,
+    pcm: np.ndarray,
+    index: int,
+    ready: asyncio.Future[None],
+    start: asyncio.Future[float],
+) -> dict[str, object]:
+    session_id = f"personaplex-load-{index}-{uuid.uuid4().hex}"
+    client = RawRealtimeProbe(_realtime_url(args.url, args.model, session_id))
+    sends: list[tuple[float, float, float]] = []
+    error: str | None = None
+    cleanup_error: str | None = None
+    metrics: dict[str, object] | None = None
+    phase = "admission"
+    try:
+        async with client:
+            try:
+                await asyncio.wait_for(
+                    client.send(_session_update(args, session_id=session_id, persona=args.persona)), args.timeout_s
+                )
+                await _wait_load_event(client, "session.created", args.timeout_s)
+                capabilities = _capabilities(_events(client, "session.created")[-1])
+                if (
+                    capabilities.get("chunk_period_ms") != 80
+                    or capabilities.get("supports_multi_session_same_replica") is not True
+                ):
+                    raise AssertionError("server did not advertise PersonaPlex multi-session capabilities")
+                ready.set_result(None)
+                phase = "stream"
+                epoch = await asyncio.shield(start)
+                await _paced_load_frames(client, pcm, epoch=epoch, timeout_s=args.timeout_s, sends=sends)
+                phase = "drain"
+                # Fixed, reported observation window. Closing must not extend
+                # it and let a slow session pass by flushing after the cutoff.
+                await asyncio.sleep(args.drain_s)
+                _check_load_connection(client)
+                _session_result(client, input_frames=len(sends), args=args, minimum_chunks=args.minimum_audio_chunks)
+            finally:
+                metrics = _load_metrics(client, sends)
+                if client.events.count("session.created") and not client.events.count("session.closed"):
+                    try:
+                        await asyncio.wait_for(client.send({"type": "session.close"}), args.timeout_s)
+                        await _wait_load_event(client, "session.closed", args.timeout_s)
+                    except (OSError, asyncio.TimeoutError, ValueError, RuntimeError, WebSocketException) as exc:
+                        cleanup_error = f"cleanup: {type(exc).__name__}"
+    except (OSError, asyncio.TimeoutError, ValueError, RuntimeError, AssertionError, WebSocketException) as exc:
+        # Exception messages may include handshake credentials or server data.
+        # Export the phase/type only; retain structured server codes below.
+        error = f"{phase}: {type(exc).__name__}"
+    finally:
+        # Admission failure must not leave the other sessions at the barrier.
+        if not ready.done():
+            ready.set_result(None)
+    if metrics is None:
+        metrics = _load_metrics(client, sends)
+    if cleanup_error:
+        error = f"{error}; {cleanup_error}" if error else cleanup_error
+    if client.events.errors():
+        error = error or "server emitted a Realtime error"
+    if metrics["invalid_audio_packets"]:
+        error = error or "invalid audio packets"
+    first_audio = metrics["client_first_audio_after_stream_start_ms"]
+    if isinstance(first_audio, float) and first_audio < 0:
+        error = error or "audio arrived before the first input frame"
+    rtf = metrics["client_stream_rtf"]
+    if args.max_client_rtf is not None and isinstance(rtf, float) and rtf > args.max_client_rtf:
+        error = error or f"client_stream_rtf exceeds {args.max_client_rtf}"
+    return {
+        "index": index,
+        "session_id": session_id,
+        "ok": error is None,
+        "error": error,
+        "server_error_count": len(client.events.errors()),
+        "server_error_codes": [
+            str(body.get("code", "unknown")) if isinstance(body := event.get("error"), dict) else "unknown"
+            for event in client.events.errors()
+        ],
+        **metrics,
+    }
+
+
+async def run_load(args: argparse.Namespace) -> dict[str, object]:
+    input_path = Path(args.input_wav)
+    identity = _input_identity(input_path, expected_sha256=args.expected_input_sha256)
+    pcm = _read_wav_as_float32(input_path)
+    if args.tail_s:
+        pcm = np.concatenate([pcm, np.zeros(round(args.tail_s * SAMPLE_RATE_HZ), dtype=np.float32)])
+    pcm = pcm[: args.load_frames * FRAME_SAMPLES]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Refuse to silently overwrite evidence from a previous sweep.
+    result_path = output_dir / "load-result.json"
+    if result_path.exists():
+        raise FileExistsError(result_path)
+    loop = asyncio.get_running_loop()
+    start: asyncio.Future[float] = loop.create_future()
+    ready: list[asyncio.Future[None]] = [loop.create_future() for _ in range(args.sessions)]
+    tasks = [asyncio.create_task(_run_load_session(args, pcm, i, r, start)) for i, r in enumerate(ready)]
+    try:
+        await asyncio.gather(*ready)
+        start.set_result(time.monotonic())
+        rows = await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    seen: set[str] = set()
+    shared: set[str] = set()
+    for row in rows:
+        assert isinstance(row["response_ids"], list)
+        response_ids = set(row["response_ids"])
+        shared.update(seen & response_ids)
+        seen.update(response_ids)
+    for row in rows:
+        assert isinstance(row["response_ids"], list)
+        if shared.intersection(row["response_ids"]):
+            row.update(ok=False, error="concurrent sessions shared a response id")
+    result = {
+        "schema_version": 1,
+        "mode": "paced_multi_session",
+        "model": args.model,
+        "requested_sessions": args.sessions,
+        "passed_sessions": sum(row["ok"] is True for row in rows),
+        "ok": all(row["ok"] is True for row in rows),
+        "input": {**identity, "tail_s": args.tail_s, "load_frames": args.load_frames},
+        "frame_period_s": FRAME_PERIOD_S,
+        "drain_s": args.drain_s,
+        "max_client_rtf": args.max_client_rtf,
+        "acceptance": {
+            "max_frame_deficit": args.max_frame_deficit,
+            "min_voiced_frames": args.min_voiced_frames,
+            "minimum_audio_chunks": args.minimum_audio_chunks,
+            "voiced_frame_rms_threshold": args.voiced_frame_rms_threshold,
+        },
+        "shared_response_ids": sorted(shared),
+        "sessions": rows,
+        "reported_server": {"revision": args.server_revision, "hardware": args.server_hardware},
+        "measurement_origin": "client monotonic clock; admission excluded; streaming and drain retained",
+        "interval_definition": "nonempty audio packet arrivals, not server ticks or per-frame inference latency",
+    }
+    with result_path.open("x", encoding="utf-8") as stream:
+        json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    return result
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://127.0.0.1:8099/v1/realtime?duplex=1")
@@ -536,11 +823,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Frames sent after slot reuse; 0 replays the full input so the replacement must produce audible output.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--sessions", type=int, help="Opt into paced load mode with N sessions; omit for the lifecycle test."
+    )
+    parser.add_argument(
+        "--load-frames", type=int, default=1000, help="Maximum input frames per load session (no repetition)."
+    )
+    parser.add_argument("--max-client-rtf", type=float, help="Optional client stream-window RTF acceptance ceiling.")
+    parser.add_argument("--server-revision", help="User-reported server commit/version; not verified by this client.")
+    parser.add_argument(
+        "--server-hardware", help="User-reported server hardware; not inferred from the client machine."
+    )
+    args = parser.parse_args(argv)
+    if args.sessions is not None:
+        if not 1 <= args.sessions <= 64 or not 1 <= args.load_frames <= 10000:
+            parser.error("load mode requires sessions in [1,64] and load-frames in [1,10000]")
+        for name in ("timeout_s", "drain_s", "tail_s"):
+            value = getattr(args, name)
+            if not math.isfinite(value) or value < 0 or (name == "timeout_s" and value == 0):
+                parser.error(f"{name} must be finite and non-negative (timeout must be positive)")
+        if args.max_client_rtf is not None and (not math.isfinite(args.max_client_rtf) or args.max_client_rtf <= 0):
+            parser.error("max-client-rtf must be finite and positive")
+        if args.max_frame_deficit < 0 or args.min_voiced_frames < 1 or args.minimum_audio_chunks < 1:
+            parser.error("frame-deficit must be non-negative; voiced frames and audio chunks must be positive")
+        if not math.isfinite(args.voiced_frame_rms_threshold) or args.voiced_frame_rms_threshold < 0:
+            parser.error("voiced-frame-rms-threshold must be finite and non-negative")
+    return args
 
 
 def main() -> None:
-    print(json.dumps(asyncio.run(run(parse_args())), ensure_ascii=False, indent=2))
+    result = asyncio.run(run(parse_args()))
+    print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+    if result.get("mode") == "paced_multi_session" and not result["ok"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

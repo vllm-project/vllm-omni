@@ -271,3 +271,92 @@ The required evidence is:
 
 Audio that is empty, all zero, non-finite, or only a protocol `listen` event is
 not a successful end-to-end result.
+
+### Paced multi-session load driver
+
+The existing driver keeps its two-session admission and slot-reuse validation
+when `--sessions` is omitted. Passing `--sessions N` selects a separate,
+bounded load mode; it does not replace the lifecycle test or change server
+admission capacity. Start an existing PersonaPlex server configured to admit
+the requested number of sessions, then run from a source checkout with the
+vLLM-Omni client dependencies installed:
+
+```bash
+python -m tests.e2e.online_serving.personaplex_realtime_duplex \
+  --model nvidia/personaplex-7b-v1 \
+  --input-wav /path/to/input.wav \
+  --sessions 2 --load-frames 1000 --drain-s 2 \
+  --server-revision SERVER_COMMIT --server-hardware A100-80GB \
+  --output-dir /tmp/personaplex-load-n2
+```
+
+Use a new output directory for every run. The driver refuses to overwrite an
+existing `load-result.json`. The server labels are supplied by the operator,
+not detected or verified by the client. Record the server command, package
+versions, checkpoint revision and hardware alongside a published measurement.
+
+All attempted sessions finish admission before admitted sessions share a
+common input start. A rejected session remains a failed row in the report;
+it is not removed from the denominator. Each session receives at most
+`--load-frames` input frames, without looping the WAV, and uses 80 ms pacing.
+A stalled send cannot cause a catch-up burst. The timeline records send
+schedule lateness so an overloaded client is visible rather than mistaken
+for a faster server. This mode measures steady concurrency, not join/leave
+interference; the original lifecycle mode still checks slot reuse.
+
+The fixed drain window is part of the measurement configuration. Audio
+arriving during cleanup is excluded, so closing cannot rescue a session that
+missed its observation deadline. Cleanup is attempted for admitted sessions
+even when audio validation fails. Protocol errors, missing/invalid audio,
+shared response IDs and cleanup failures make the report fail and the CLI
+exit nonzero. Cancellation closes transports and propagates to the caller.
+
+`load-result.json` retains per-session send and audio-packet timelines using
+the client's monotonic clock. It does not export handshake credentials or
+raw audio payloads. Metric definitions are explicit:
+
+Load mode validates each nonempty audio packet's strict base64 encoding, PCM16
+sample alignment, 24 kHz sample rate and response identity. Valid aggregate
+audio cannot hide a malformed packet. Rejected packets make the session fail
+and appear in `invalid_audio_packets` with their event index, receive time and
+fixed diagnostic code; they do not contribute samples or timing intervals.
+Empty audio deltas remain legal and contribute no samples. This check does
+not change the public client's decoding or the default lifecycle mode.
+
+The probe accepts both the current OpenAI Realtime audio event name
+`response.audio.delta` and the legacy `response.output_audio.delta`. Validation
+uses the wire payload directly rather than relying on a particular client
+library's alias table, so a server-side event-name migration cannot silently
+turn real audio into a zero-output measurement.
+
+| Field | Meaning |
+| --- | --- |
+| `client_audio_packet_interval_ms` | Consecutive nonempty packet arrivals: median, linear p99, max, and zero-based index of the first maximal interval. Interval index 0 ends at packet 1. One packet can contain multiple codec frames; this is not server tick latency. |
+| `client_first_audio_after_stream_start_ms` | First audio receipt minus first input send start; admission is excluded. |
+| `client_stream_rtf` | First input send start to last audio receipt, divided by received audio duration. This includes real-time input pacing and is not an inference-only RTF. |
+| `client_send_lateness_ms` | Send start minus its original shared schedule, clipped at zero. |
+| `frame_deficit` | Sent input frames minus received samples divided by 1920. |
+
+No output gives missing latency/RTF values, not zero. By default RTF is
+diagnostic; `--max-client-rtf` adds an explicit ceiling. The existing frame
+coverage, audible-frame and scheduler-data-plane checks still apply. A longer
+`--drain-s` can demonstrate eventual completion under backlog, but it must not
+be reported as real-time capacity when the fixed-window run failed or client
+RTF exceeded the stated target. Likewise, the first live session can pay
+one-time model/codec/JIT costs; either use the server's configured duplex
+warmup path or label that run as cold-start evidence before comparing steady
+capacity. Passing client-only metrics does not certify model quality or a
+real-time capacity target on another GPU. Begin with N=1 and N=2; higher N is a
+capacity experiment, not a promised property of an A100 or of this patch.
+
+Deterministic driver and localhost WebSocket checks need no model or GPU:
+
+```bash
+python -m pytest tests/e2e/online_serving/test_personaplex_load_driver.py \
+  -m 'core_model and cpu' --run-level core_model -q
+```
+
+These checks test the driver against controlled protocol responses. Run the
+load-driver command against real weights separately before reporting model-serving
+performance. Server tick timestamps and generic TTFT/TPOT aggregation remain
+the responsibility of the existing duplex metrics paths, not this driver.
