@@ -702,6 +702,7 @@ def _initialize_model_parallel(
     fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
+    enable_pipefusion: bool = False,
     backend: str | None = None,
 ) -> None:
     global _FS, _HSDP_REPLICATE
@@ -724,6 +725,8 @@ def _initialize_model_parallel(
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
         fully_shard_degree: number of GPUs used for the HSDP shard dimension.
+        use_hsdp: whether to initialize HSDP sharded data parallelism.
+        enable_pipefusion: whether to initialize PipeFusion runtime state for this topology.
         backend: distributed backend of pytorch collective comm.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
@@ -852,6 +855,10 @@ def _initialize_model_parallel(
         parallel_mode="pipeline",
     )
     vllm_parallel_state._PP = _PP
+    if enable_pipefusion:  # PipeFusion resides on top of PP
+        from vllm_omni.diffusion.distributed.pipefusion.pipefusion_runtime import initialize_pupefusion_runtime
+
+        initialize_pupefusion_runtime()
 
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
@@ -961,6 +968,7 @@ def initialize_model_parallel(
     fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
+    enable_pipefusion: bool = False,
     backend: str | None = None,
 ) -> None:
     """Atomically initialize diffusion parallel groups.
@@ -999,6 +1007,7 @@ def initialize_model_parallel(
             fully_shard_degree=fully_shard_degree,
             enable_expert_parallel=enable_expert_parallel,
             use_hsdp=use_hsdp,
+            enable_pipefusion=enable_pipefusion,
             backend=backend,
         )
     except BaseException:
