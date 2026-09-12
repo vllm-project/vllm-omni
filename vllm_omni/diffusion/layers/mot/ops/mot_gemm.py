@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: N803, E741
 import functools
 import json
@@ -226,6 +229,9 @@ def _get_mot_pointers(
 
     # 2. MoT Routing
     # Initialize VAE variables first and overwrite for Text
+    # ``is_text_program`` is returned so the caller can pick per-expert
+    # compile-time options (e.g. whether that expert owns a bias).
+    is_text_program = pid < num_pid_m_text * num_pid_n
 
     # VAE Path
     cur_pid = pid - (num_pid_m_text * num_pid_n)
@@ -240,7 +246,7 @@ def _get_mot_pointers(
     M_limit = M_vae
 
     # Text Path
-    if pid < num_pid_m_text * num_pid_n:
+    if is_text_program:
         cur_pid = pid
         # Select Text Pointers
         cur_b_ptr = b_text_ptr
@@ -288,6 +294,7 @@ def _get_mot_pointers(
         cur_scale_b_ptr,  # Selected Scale Pointer
         cur_stride_bk,
         cur_stride_bn,  # Selected Strides
+        is_text_program,  # Which expert this program serves
     )
 
 
@@ -533,7 +540,11 @@ def mot_unified_gemm_kernel(
     # Quant Control
     # 0=None, 1=W8A8, 2=W8A16, 3=W4A16
     QUANT_TYPE: tl.constexpr,
-    HAS_BIAS: tl.constexpr = False,
+    # Bias presence is per expert: the MoT linear layers expose ``bias`` and
+    # ``vae_bias`` as independent flags, so one expert can own a bias while the
+    # other does not.
+    HAS_BIAS_TEXT: tl.constexpr = False,
+    HAS_BIAS_VAE: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
 
@@ -553,6 +564,7 @@ def mot_unified_gemm_kernel(
         cur_scale_b_ptr,
         cur_stride_bk,
         cur_stride_bn,
+        is_text_program,
     ) = _get_mot_pointers(
         pid,
         a_ptr,
@@ -675,9 +687,18 @@ def mot_unified_gemm_kernel(
     # -----------------------------------------------------------
 
     # Bias Add
-    if HAS_BIAS:
+    # Each branch below is resolved at compile time. When only one expert owns a
+    # bias, the other expert's pointer aliases that same tensor (see
+    # ``_resolve_bias_pointers``) so the load stays in bounds and correctly
+    # typed, and the select drops the value for the expert without one.
+    if HAS_BIAS_TEXT or HAS_BIAS_VAE:
         bias = tl.load(cur_bias_ptr + offs_n, mask=n_mask, other=0.0)
-        c = c + bias[None, :]  # reshape to (1, BLOCK_SIZE_N)
+        if HAS_BIAS_TEXT and HAS_BIAS_VAE:
+            c = c + bias[None, :]  # reshape to (1, BLOCK_SIZE_N)
+        elif HAS_BIAS_TEXT:
+            c = c + tl.where(is_text_program, bias[None, :], 0.0)
+        else:
+            c = c + tl.where(is_text_program, 0.0, bias[None, :])
 
     # Cast C into the output dtype
     c = c.to(OUTPUT_DTYPE)
@@ -690,6 +711,39 @@ def mot_unified_gemm_kernel(
     # (out-of-bounds padding), but c_mask needs the real boundary
     store_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(c_ptrs, c, mask=store_mask)
+
+
+def _resolve_bias_pointers(
+    bias_text: torch.Tensor | None,
+    bias_vae: torch.Tensor | None,
+) -> tuple[torch.Tensor | int, torch.Tensor | int, bool, bool]:
+    """Resolve the two bias pointers and their per-expert presence flags.
+
+    The text and VAE experts own their bias independently -- ``MoTQKVParallelLinear``
+    and ``MoTRowParallelLinear`` expose ``bias`` and ``vae_bias`` as separate
+    constructor flags, and their defaults (``bias=True``, ``vae_bias=False``)
+    produce exactly the one-sided case.
+
+    A ``None`` pointer cannot simply be passed as ``0`` alongside a real tensor:
+    the kernel selects one of the two bias pointers at runtime, so mixing an
+    integer with a pointer is not typeable. Instead the bias-less expert aliases
+    the other expert's tensor -- keeping the load in bounds and correctly typed --
+    and the kernel's ``HAS_BIAS_TEXT`` / ``HAS_BIAS_VAE`` flags drop the loaded
+    value for whichever expert does not own a bias.
+
+    Returns ``(p_bias_text, p_bias_vae, has_bias_text, has_bias_vae)``.
+    """
+    if bias_text is not None and bias_vae is not None:
+        assert bias_text.dtype == bias_vae.dtype, (
+            f"text bias dtype {bias_text.dtype} must match vae bias dtype {bias_vae.dtype}"
+        )
+        return bias_text, bias_vae, True, True
+    # One-sided bias: alias the present tensor for the absent expert.
+    if bias_text is not None:
+        return bias_text, bias_text, True, False
+    if bias_vae is not None:
+        return bias_vae, bias_vae, False, True
+    return 0, 0, False, False
 
 
 # Define is_weak_contiguous
@@ -832,11 +886,8 @@ def invoke_mot_gemm(
     STRIDE_BK_IS_1 = (B_text.stride(0) == 1) and (B_vae.stride(0) == 1)
     STRIDE_BN_IS_1 = (B_text.stride(1) == 1) and (B_vae.stride(1) == 1)
 
-    # bias check
-    assert (bias_text is None) == (bias_vae is None), (
-        "Bias must be provided for both Text and VAE simultaneously, or neither."
-    )
-    has_bias = bias_text is not None
+    # bias check: text and vae bias are independent, so resolve them per expert
+    p_bias_text, p_bias_vae, has_bias_text, has_bias_vae = _resolve_bias_pointers(bias_text, bias_vae)
 
     # --- 3. Grid Calculation ---
     def grid(META):
@@ -853,7 +904,8 @@ def invoke_mot_gemm(
             "ACCUMULATOR_DTYPE": ACCUMULATOR_DTYPE,
             "COMPUTE_DTYPE": COMPUTE_DTYPE,
             "OUTPUT_DTYPE": OUTPUT_DTYPE,
-            "HAS_BIAS": has_bias,
+            "HAS_BIAS_TEXT": has_bias_text,
+            "HAS_BIAS_VAE": has_bias_vae,
             "EVEN_K": EVEN_K,
             "EVEN_N": EVEN_N,
             "STRIDE_AK_IS_1": STRIDE_AK_IS_1,
@@ -866,8 +918,6 @@ def invoke_mot_gemm(
     p_a_scale = A_scale if A_scale is not None else 0
     p_b_text_scale = B_text_scale if B_text_scale is not None else 0
     p_b_vae_scale = B_vae_scale if B_vae_scale is not None else 0
-    p_bias_text = bias_text if bias_text is not None else 0
-    p_bias_vae = bias_vae if bias_vae is not None else 0
 
     # Quantization granularity
     stride_scale_a = 1 if A_per_channel_quant else 0
