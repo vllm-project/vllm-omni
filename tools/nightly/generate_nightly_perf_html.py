@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
@@ -297,6 +298,23 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing diffusion_perf_*.json files; default falls back to --input-dir.",
     )
     return parser.parse_args()
+
+
+def _sanitize_nonfinite(value: Any) -> Any:
+    """Replace non-finite floats with ``None`` so the embedded report data stays strictly valid JSON.
+
+    Unmeasured metrics (e.g. TPOT with no multi-token samples) are stored as
+    ``NaN`` and vLLM's ``json.dump`` writes them as bare ``NaN`` literals,
+    which strict JSON parsers reject. The report JS already renders ``null``
+    as an empty cell and skips it in charts and sorting.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _sanitize_nonfinite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_nonfinite(item) for item in value]
+    return value
 
 
 def _build_html_document(
@@ -633,8 +651,16 @@ code {
 }
 """
 
-    omni_data_json = json.dumps(list(omni_records), ensure_ascii=False)
-    diffusion_data_json = json.dumps(list(diffusion_records), ensure_ascii=False)
+    omni_data_json = json.dumps(
+        [_sanitize_nonfinite(record) for record in omni_records],
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    diffusion_data_json = json.dumps(
+        [_sanitize_nonfinite(record) for record in diffusion_records],
+        ensure_ascii=False,
+        allow_nan=False,
+    )
     omni_cols_json = json.dumps(list(omni_columns), ensure_ascii=False)
     diffusion_cols_json = json.dumps(list(diffusion_columns), ensure_ascii=False)
 
