@@ -241,6 +241,7 @@ These `extra_params` control how the server turns decoded frames into MP4 bytes.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `preencode_mp4` | boolean | false | Encode the MP4 on the worker while the VAE is still decoding, instead of after the full video is materialized |
+| `preencode_batch_frames` | positive integer | 17 (H3, Wan T2V/I2V); 1 (Wan S2V) | Minimum accumulated frames per worker transfer/encoding batch; used only with `preencode_mp4=true` |
 | `video_codec_options` | object | null | Encoder options passed through to the H.264 encoder, such as `{"preset": "ultrafast", "threads": "0"}` |
 
 With `preencode_mp4` enabled, each committed VAE chunk leaves the accelerator and
@@ -251,16 +252,29 @@ unchanged: the same complete MP4, byte-for-byte equivalent frames.
 ```bash
 curl -X POST http://localhost:8091/v1/videos/sync \
   -F "prompt=A small robot walking through a neon city" \
-  -F 'extra_params={"preencode_mp4": true, "video_codec_options": {"preset": "ultrafast"}}' \
+  -F 'extra_params={"preencode_mp4": true, "preencode_batch_frames": 33, "video_codec_options": {"preset": "ultrafast"}}' \
   -o output.mp4
 ```
 
+Set `preencode_batch_frames` in `extra_params` (or `extra_args` for offline
+sampling) to tune batching. The worker accumulates complete VAE chunks until
+it has at least this many frames, then transfers and encodes them together.
+It always flushes the final partial batch. This is a threshold, not an exact
+chunk length: a value of 1 submits every native chunk immediately, and a value
+smaller than a native chunk does not split it. Larger values reduce transfers
+but retain more frames on the accelerator and delay encoding. The VAE decode
+window and output frame count stay unchanged. Wan S2V keeps its existing
+per-clip behavior by default. Zero, negative, fractional, boolean, string, and
+null values are rejected when pre-encoding is enabled.
+
 `preencode_mp4` applies to the complete-MP4 response paths only. The
 `/v1/realtime/video` WebSocket endpoint rejects it, because that path already
-overlaps encoding through its own incremental fragmented-MP4 encoder.
+overlaps encoding through its own incremental fragmented-MP4 encoder. Wan also
+rejects it together with `enable_frame_interpolation`, which needs the decoded
+frames the pre-encoded path no longer materializes.
 
-Support is per model: MiniMax-H3 implements it, and other models ignore the flag
-and take the full-decode path.
+Support is per model: MiniMax-H3 and Wan 2.2 (T2V, I2V, and S2V) implement it,
+and other models ignore the flag and take the full-decode path.
 
 ## Storage
 
