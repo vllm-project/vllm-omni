@@ -35,6 +35,23 @@ def _make_request_batch(prompt, **sampling_overrides):
     return DiffusionRequestBatch([request])
 
 
+def _make_cache_config(*, parallel_kwargs=None, **config_overrides):
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    config = {
+        "model": "unused",
+        "cache_backend": "cache_dit",
+        "enable_cpu_offload": False,
+        "enable_layerwise_offload": False,
+        "enable_distributed_layerwise_offload": False,
+    }
+    config.update(config_overrides)
+    return SimpleNamespace(
+        parallel_config=DiffusionParallelConfig(**(parallel_kwargs or {})),
+        **config,
+    )
+
+
 def test_lingbot_video_pipeline_import_and_registry():
     from vllm_omni.diffusion.models.lingbot_video import (
         LingBotVideoPipeline,
@@ -69,6 +86,123 @@ def test_component_discovery_declarations():
     assert LingBotVideoPipeline._vae_modules == ["vae"]
     assert LingBotVideoPipeline.supports_step_execution is False
     assert LingBotVideoPipeline.max_outputs_per_prompt == 1
+    assert LingBotVideoPipeline.default_num_inference_steps == 40
+
+
+@pytest.mark.cache
+@pytest.mark.parametrize(
+    ("parallel_kwargs", "config_overrides", "message"),
+    [
+        ({"pipeline_parallel_size": 2}, {}, "pipeline parallelism"),
+        ({"tensor_parallel_size": 2}, {}, "tensor parallelism"),
+        ({"enable_expert_parallel": True}, {}, "expert parallelism"),
+        ({"ulysses_degree": 2}, {}, "sequence parallelism"),
+        ({"cfg_parallel_size": 2}, {}, "CFG parallelism"),
+        ({"use_hsdp": True, "hsdp_shard_size": 2}, {}, "HSDP"),
+        ({}, {"enable_cpu_offload": True}, "CPU offload"),
+        ({}, {"enable_layerwise_offload": True}, "layerwise offload"),
+        (
+            {},
+            {"enable_distributed_layerwise_offload": True},
+            "distributed layerwise offload",
+        ),
+    ],
+)
+def test_cache_dit_rejects_unvalidated_configuration_before_loading(
+    monkeypatch,
+    parallel_kwargs,
+    config_overrides,
+    message,
+):
+    from vllm_omni.diffusion.models.lingbot_video import (
+        pipeline_lingbot_video as module,
+    )
+
+    load_calls = []
+    monkeypatch.setattr(
+        module.LingBotVideoTransformer3DModel,
+        "from_pretrained",
+        lambda *args, **kwargs: load_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        module.LingBotVideoPipeline(
+            od_config=_make_cache_config(
+                parallel_kwargs=parallel_kwargs,
+                **config_overrides,
+            )
+        )
+
+    assert load_calls == []
+
+
+@pytest.mark.cache
+@pytest.mark.parametrize(
+    ("sampling_overrides", "message"),
+    [
+        (
+            {
+                "guidance_scale": 1.0,
+                "guidance_scale_provided": True,
+            },
+            "guidance_scale",
+        ),
+        ({"extra_args": {"batch_cfg": True}}, "batch_cfg"),
+        ({"extra_args": {"t_thresh": 0.2}}, "t_thresh"),
+    ],
+)
+def test_cache_dit_rejects_unsupported_requests_via_forward(
+    sampling_overrides,
+    message,
+):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _make_pipeline()
+    pipeline.od_config.cache_backend = "cache_dit"
+    pipeline._generate = lambda **kwargs: pytest.fail(f"invalid request reached generation: {kwargs}")
+    sampling = {
+        "height": 192,
+        "width": 320,
+        "num_frames": 5,
+        "num_inference_steps": 6,
+        "guidance_scale": 3.0,
+        "guidance_scale_provided": True,
+    }
+    sampling.update(sampling_overrides)
+
+    with pytest.raises(OmniClientError, match=message):
+        pipeline.forward(_make_request_batch("a robotic arm", **sampling))
+
+
+@pytest.mark.cache
+def test_runner_refreshes_cache_dit_for_each_lingbot_request():
+    from vllm_omni.diffusion.worker.diffusion_model_runner import (
+        DiffusionModelRunner,
+    )
+
+    pipeline = _make_pipeline()
+    refresh_calls = []
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.cache_backend = SimpleNamespace(
+        is_enabled=lambda: True,
+        refresh=lambda active, steps, verbose=True: refresh_calls.append((active, steps, verbose)),
+    )
+
+    for steps in (None, 6):
+        request = _make_request_batch(
+            "a robotic arm",
+            num_inference_steps=steps,
+        ).requests[0]
+        runner._refresh_cache_for_requests(
+            [request],
+            od_config=SimpleNamespace(cache_backend="cache_dit"),
+        )
+
+    assert refresh_calls == [
+        (pipeline, 40, True),
+        (pipeline, 6, True),
+    ]
 
 
 def test_extra_body_params_include_video_flow_shift_alias():
