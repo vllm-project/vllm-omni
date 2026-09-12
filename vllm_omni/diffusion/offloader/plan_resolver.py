@@ -91,6 +91,11 @@ class ResolvedOffloadPlan:
     # still interpret topology themselves.
     modules: PipelineModules
     declaration: OffloadPlan | None = None
+    # Ordinary layerwise offload turns a legacy selection it cannot serve into
+    # a complete no-op, placement included. Distributed layerwise offload warns
+    # and keeps preparing its other components instead, so this stays scoped to
+    # the strategy that honors it.
+    skip_reason: str | None = None
 
     @property
     def components(self) -> tuple[ResolvedComponent, ...]:
@@ -304,6 +309,11 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
         residents=tuple(residents),
         modules=modules,
         declaration=declaration,
+        skip_reason=(
+            "No DiT/transformer modules found for selected DiT layerwise offload"
+            if config.strategy is OffloadStrategy.LAYER_WISE and dit_selected and not dits
+            else None
+        ),
     )
     _validate_unique_ownership(resolved)
     return resolved

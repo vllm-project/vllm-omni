@@ -14,11 +14,6 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, run_cleanup_steps
-from .block_discovery import (
-    get_blocks_attr_names,
-    get_blocks_from_dit,
-    set_blocks_attr_names,
-)
 from .component_utils import (
     clear_encoder_layerwise_state,
     iter_streamable_dits,
@@ -26,7 +21,6 @@ from .component_utils import (
     prepare_pipeline_components,
     set_encoder_layerwise_state,
 )
-from .config import DIT_COMPONENT
 from .plan_resolver import ResolvedComponent, resolve_offload_plan
 from .tensor_utils import (
     clear_block_storage,
@@ -433,9 +427,8 @@ class LayerWiseOffloadBackend(OffloadBackend):
             return
 
         resolved = resolve_offload_plan(pipeline, self.config)
-        if not resolved.dits and self.config.offloads(DIT_COMPONENT):
-            # An explicit selection already failed while resolving.
-            logger.warning("No DiT/transformer modules found for selected DiT layerwise offload")
+        if resolved.skip_reason is not None:
+            logger.warning("%s", resolved.skip_reason)
             return
 
         def enable_encoder_blocks(component: ResolvedComponent) -> bool:
@@ -458,15 +451,6 @@ class LayerWiseOffloadBackend(OffloadBackend):
             enable_encoder_blocks=enable_encoder_blocks,
         )
 
-        if not self.config.offloads(DIT_COMPONENT):
-            self.enabled = bool(self._encoder_modules or self._staged_components)
-            if not self.enabled:
-                raise ValueError(
-                    "None of the selected layerwise offload components have "
-                    "a model-declared streamable or on-demand plan"
-                )
-            return
-
         logger.info("Applying layer-wise offloading on %s", [component.path for component in resolved.dits])
 
         # Apply block-wise offloading hook for each of the blocks in DiT model(s)
@@ -475,22 +459,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
             dit_module = component.module
             blocks = list(stack.blocks)
 
-            # Move non-block modules to GPU (they stay resident)
-            for name, m in dit_module.named_children():
-                if name not in stack.attrs:
-                    m.to(self.device)
-                    logger.debug(f"Moved {name} to device {self.device}")
-                else:
-                    logger.debug(f"Skipped blocks module {name}")
-
-            # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
-            for param in dit_module._parameters.values():
-                if param is not None:
-                    param.data = param.data.to(self.device, non_blocking=True)
-
-            for buffer in dit_module._buffers.values():
-                if buffer is not None:
-                    buffer.data = buffer.data.to(self.device, non_blocking=True)
+            # Place the remainder by resolved block tensor identity, just as
+            # for encoders. Attribute aliases must not move streamed weights.
+            move_non_block_state_to_device(dit_module, (stack.blocks,), self.device)
 
             block_hooks = _install_layerwise_hook_group(
                 blocks,
@@ -550,8 +521,3 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         self._disable(restore_weights=True)
-
-    # Compatibility aliases for existing model integrations.
-    get_blocks_attr_names = staticmethod(get_blocks_attr_names)
-    set_blocks_attr_names = staticmethod(set_blocks_attr_names)
-    get_blocks_from_dit = staticmethod(get_blocks_from_dit)
