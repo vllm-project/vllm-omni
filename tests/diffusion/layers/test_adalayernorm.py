@@ -116,6 +116,47 @@ def test_adalayernorm_continuous_forward_shape():
     assert out.shape == (batch, seq_len, dim)
 
 
+def test_adalayernorm_scale_shift_matches_reference():
+    """AdaLayerNorm applies layernorm(x) * (1 + scale) + shift."""
+    from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+
+    dim = 64
+    torch.manual_seed(42)
+    norm = AdaLayerNorm(dim, elementwise_affine=False, eps=1e-6)
+    x = torch.randn(2, 4, dim)
+    scale = torch.randn(2, 1, dim)
+    shift = torch.randn(2, 1, dim)
+
+    out = norm.forward_native(x, scale, shift)
+    ref = torch.nn.functional.layer_norm(x.float(), (dim,), None, None, 1e-6) * (1 + scale) + shift
+
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_adalayernorm_triton_cuda_matches_native(monkeypatch):
+    """Triton fused CUDA path matches the native implementation."""
+    import vllm_omni.diffusion.layers.adalayernorm as adaln_module
+    from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+
+    if not adaln_module._HAS_TRITON:
+        pytest.skip("Triton is not available")
+
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_TRITON_ADALN", "1")
+
+    dim = 128
+    torch.manual_seed(42)
+    norm = AdaLayerNorm(dim, elementwise_affine=False, eps=1e-6).cuda()
+    x = torch.randn(2, 8, dim, device="cuda", dtype=torch.bfloat16)
+    emb = torch.randn(2, 6, dim, device="cuda", dtype=torch.bfloat16)
+    shift, scale = emb.chunk(6, dim=1)[:2]
+
+    out = norm.forward_cuda(x, scale, shift)
+    ref = norm.forward_native(x, scale, shift)
+
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+
+
 def test_adalayernorm_zero_accepts_quant_config():
     """Constructor accepts quant_config=None and prefix='test' without error."""
     from vllm_omni.diffusion.layers.adalayernorm import (
