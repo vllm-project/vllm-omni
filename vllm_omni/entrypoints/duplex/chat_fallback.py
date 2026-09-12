@@ -12,7 +12,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.duplex.protocol import DuplexSession
+from vllm_omni.entrypoints.duplex.protocol import DuplexRequestIdScope, DuplexSession
 
 logger = init_logger(__name__)
 
@@ -24,7 +24,10 @@ class ChatFallbackProjectorMixin:
         response_id = session.begin_response()
         epoch = session.epoch
         request_id = f"duplex-{session.session_id}-{epoch}-{session.input_commit_seq}"
-        session.bind_request(f"chatcmpl-{request_id}")
+        session.bind_request(
+            f"chatcmpl-{request_id}",
+            scope=DuplexRequestIdScope.EXTERNAL,
+        )
         await send_json(
             self._response_created_payload(
                 session,

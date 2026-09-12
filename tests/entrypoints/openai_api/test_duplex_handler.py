@@ -36,6 +36,7 @@ from vllm_omni.entrypoints.duplex.protocol import (
     DuplexCapabilities,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
+    DuplexRequestIdScope,
     DuplexSession,
     DuplexSessionConfig,
     ResponseCreateOptions,
@@ -4226,6 +4227,41 @@ async def test_minicpmo_auto_response_continuation_stops_at_large_safety_boundar
 
 
 @pytest.mark.asyncio
+async def test_native_listen_aborts_internal_request_after_clearing_binding():
+    # Exercise the adapter contract, not a claim about a model's emitted flags.
+    request_id = "duplex-sid-listen-abort-e0-stage0"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(session_id="sid-listen-abort", config=DuplexSessionConfig())
+    response_id = session.begin_response(turn_id=0)
+    session.bind_request(request_id)
+    native = handler._runtime_session_state(session)
+    native.continuation_owner_id = f"response:{response_id}"
+    native.continuation_units = handler._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
+    ws = TimedWebSocket()
+
+    close_reason, emitted = await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "is_listen": True,
+            "data_plane_request_id": request_id,
+            "abort_data_plane_request": True,
+        },
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert engine.internal_abort_batches == [[request_id]]
+    assert engine.abort_batches == []
+    assert session.active_request_id is None
+    assert session.active_response_id is None
+    assert ws.sent_types() == ["response.listen", "response.done"]
+    assert all(payload["response_id"] == response_id for payload in ws.sent)
+
+
+@pytest.mark.asyncio
 async def test_minicpmo_auto_response_boundary_listen_closes_response():
     request_id = "duplex-sid-boundary-listen-e0-stage0"
     engine = FakeEngineClient()
@@ -5183,7 +5219,8 @@ async def test_duplex_handler_aborts_current_chat_request_id_on_barge_in():
     assert "audio.cancelled" in ws.sent_types()
     assert chat_service.seen_request_ids == ["duplex-sid-a-0-1"]
     assert engine.aborted == ["chatcmpl-duplex-sid-a-0-1"]
-    assert engine.internal_abort_batches == [["chatcmpl-duplex-sid-a-0-1"]]
+    assert engine.abort_batches == [["chatcmpl-duplex-sid-a-0-1"]]
+    assert engine.internal_abort_batches == []
 
 
 @pytest.mark.asyncio
@@ -5847,7 +5884,10 @@ async def test_cancel_chat_fallback_response_aborts_request_and_task():
     handler = OmniDuplexSessionHandler(chat_service=TurnBasedFakeChatService(engine))
     session = DuplexSession("sid-chat-cancel", DuplexSessionConfig())
     response_id = session.begin_response()
-    session.bind_request("chatcmpl-cancel")
+    session.bind_request(
+        "chatcmpl-cancel",
+        scope=DuplexRequestIdScope.EXTERNAL,
+    )
     ws = TimedWebSocket()
     task = asyncio.create_task(asyncio.sleep(60))
     try:
@@ -5855,7 +5895,8 @@ async def test_cancel_chat_fallback_response_aborts_request_and_task():
 
         assert cancelled is True
         assert task.cancelled()
-        assert engine.internal_abort_batches == [["chatcmpl-cancel"]]
+        assert engine.abort_batches == [["chatcmpl-cancel"]]
+        assert engine.internal_abort_batches == []
         assert "error" not in ws.sent_types()
         (event,) = [event for event in ws.sent if event["type"] == "audio.cancelled"]
         assert event["response_id"] == response_id

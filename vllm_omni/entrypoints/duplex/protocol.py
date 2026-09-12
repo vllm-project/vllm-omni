@@ -31,6 +31,13 @@ class DuplexPlaybackCommitPolicy(str, Enum):
     ACK_ONLY = "ack_only"
 
 
+class DuplexRequestIdScope(str, Enum):
+    """Identify which AsyncOmni abort API accepts a bound request ID."""
+
+    EXTERNAL = "external"
+    INTERNAL = "internal"
+
+
 class DuplexSessionState(str, Enum):
     OPEN = "open"
     CLOSING = "closing"
@@ -389,6 +396,12 @@ class DuplexAssistantAudioTextMark:
     audio_end_ms: int
 
 
+@dataclass(frozen=True)
+class DuplexRequestBinding:
+    request_id: str
+    scope: DuplexRequestIdScope
+
+
 @dataclass
 class InputBufferState:
     commit_seq: int = 0
@@ -408,7 +421,7 @@ class InputBufferState:
 
 @dataclass
 class ResponseState:
-    active_request_id: str | None = None
+    active_request: DuplexRequestBinding | None = None
     active_response_id: str | None = None
     active_response_turn_id: int | None = None
     active_response_input_commit_seq: int | None = None
@@ -500,7 +513,12 @@ class DuplexSession:
 
     @property
     def active_request_id(self) -> str | None:
-        return self._response.active_request_id
+        binding = self._response.active_request
+        return binding.request_id if binding is not None else None
+
+    @property
+    def active_request_binding(self) -> DuplexRequestBinding | None:
+        return self._response.active_request
 
     @property
     def active_response_id(self) -> str | None:
@@ -642,13 +660,26 @@ class DuplexSession:
     def transition_session(self, state: DuplexSessionState) -> None:
         self.state = state
 
-    def bind_request(self, request_id: str | None) -> None:
-        self._response.active_request_id = request_id
+    def bind_request(
+        self,
+        request_id: str | None,
+        *,
+        scope: DuplexRequestIdScope = DuplexRequestIdScope.INTERNAL,
+    ) -> None:
+        """Bind the active response to the ID accepted by its abort API.
+
+        Native duplex paths expose engine-internal IDs. Chat fallback paths
+        expose the external ID passed to ``AsyncOmni.generate`` and must use
+        the public ``AsyncOmni.abort`` mapper.
+        """
+        self._response.active_request = (
+            DuplexRequestBinding(request_id=request_id, scope=scope) if request_id is not None else None
+        )
 
     def clear_request(self, expected_request_id: str | None = None) -> bool:
-        if expected_request_id is not None and self._response.active_request_id != expected_request_id:
+        if expected_request_id is not None and self.active_request_id != expected_request_id:
             return False
-        self._response.active_request_id = None
+        self._response.active_request = None
         return True
 
     def bind_response_turn(self, turn_id: int | None) -> None:
@@ -1237,7 +1268,7 @@ class DuplexSession:
             self._discard_history_item_placeholder(f"item_{response_id}")
         self._response.assistant_text_buffer.clear()
         if not preserve_request:
-            self._response.active_request_id = None
+            self._response.active_request = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None
@@ -1554,7 +1585,7 @@ class DuplexSession:
         self._input.pending_audio.clear()
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()
-        self._response.active_request_id = None
+        self._response.active_request = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None

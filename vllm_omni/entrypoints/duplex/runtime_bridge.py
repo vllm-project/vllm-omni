@@ -17,6 +17,8 @@ from vllm_omni.engine.duplex.control_client import DuplexControlRequestError
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.runtime import duplex_data_plane_request_info
 from vllm_omni.entrypoints.duplex.protocol import (
+    DuplexRequestBinding,
+    DuplexRequestIdScope,
     DuplexSession,
     DuplexSessionState,
 )
@@ -1010,7 +1012,7 @@ class NativeRuntimeBridgeMixin:
             if native_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
                 await self._abort_request_background(
                     session,
-                    data_plane_request_id,
+                    DuplexRequestBinding(data_plane_request_id, DuplexRequestIdScope.INTERNAL),
                     send_json,
                     notify=False,
                 )
