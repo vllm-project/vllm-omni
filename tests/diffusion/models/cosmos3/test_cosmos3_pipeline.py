@@ -9,6 +9,7 @@ import types
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -376,23 +377,31 @@ def _capture_tokenize_calls(pipeline: Any) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize(
-    ("provided", "value", "default", "is_distilled", "expected"),
+    ("provided", "value", "default", "is_distilled", "expected", "expected_warning"),
     [
-        (False, 1.0, 7.0, False, 7.0),
-        (True, 1.0, 7.0, False, 1.0),
-        (True, 4.5, 7.0, False, 4.5),
-        (False, 1.0, 7.0, True, 1.0),
-        (True, 4.5, 7.0, True, 1.0),
+        (False, 1.0, 7.0, False, 7.0, False),
+        (True, 1.0, 7.0, False, 1.0, False),
+        (True, 4.5, 7.0, False, 4.5, False),
+        (False, 1.0, 7.0, True, 1.0, False),
+        (True, 1.0, 7.0, True, 1.0, False),
+        (True, 4.5, 7.0, True, 1.0, True),
+        (True, 0.0, 7.0, True, 1.0, True),
     ],
 )
 def test_resolve_guidance_scale(
     make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
     provided: bool,
     value: float,
     default: float,
     is_distilled: bool,
     expected: float,
+    expected_warning: bool,
 ) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    warning_once = Mock()
+    monkeypatch.setattr(pipeline_cosmos3.logger, "warning_once", warning_once)
     pipeline = make_cosmos3_pipeline()
     pipeline.is_distilled_model = is_distilled
     sp = make_sampling_params(
@@ -401,6 +410,12 @@ def test_resolve_guidance_scale(
     )
 
     assert pipeline._resolve_guidance_scale(sp, default) == expected
+    if expected_warning:
+        warning_once.assert_called_once()
+        assert "overridden to 1.0" in warning_once.call_args.args[0]
+        assert "negative_prompt does not affect generation" in warning_once.call_args.args[0]
+    else:
+        warning_once.assert_not_called()
 
 
 def test_distilled_generation_accepts_t2i_and_i2v(make_cosmos3_pipeline) -> None:
@@ -735,6 +750,7 @@ def _make_od_config(
         custom_pipeline_args={},
         model_config=model_config or {},
         tf_model_config=tf_model_config,
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1),
     )
 
 
@@ -770,6 +786,7 @@ def test_pipeline_init_uses_flow_unipc_with_cosmos3_defaults(stub_real_pipeline_
     assert pipeline._engine_init_flow_shift == 2.5
 
 
+@pytest.mark.parametrize("cfg_parallel_size,ulysses_degree", [(1, 1), (1, 2), (2, 1), (2, 2)])
 @pytest.mark.parametrize(
     ("scheduler_class_name", "expected_distilled"),
     [
@@ -783,6 +800,8 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     monkeypatch: pytest.MonkeyPatch,
     scheduler_class_name: str,
     expected_distilled: bool,
+    cfg_parallel_size: int,
+    ulysses_degree: int,
 ) -> None:
     import json
 
@@ -831,6 +850,20 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
 
     od_config = _make_od_config(sound_gen=False)
     od_config.model = str(tmp_path)
+    od_config.parallel_config.cfg_parallel_size = cfg_parallel_size
+    od_config.parallel_config.ulysses_degree = ulysses_degree
+    if expected_distilled and cfg_parallel_size > 1:
+        monkeypatch.setattr(
+            pipeline_cosmos3.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: pytest.fail("component loading must not start for distilled CFG parallelism"),
+        )
+        with pytest.raises(ValueError, match="Set --cfg-parallel-size 1 and use --ulysses-degree"):
+            Cosmos3OmniDiffusersPipeline(od_config=od_config)
+        assert StubFlowMatchScheduler.from_config_calls == []
+        assert StubFlowUniPCScheduler.from_config_calls == []
+        return
+
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
     assert pipeline.is_distilled_model is expected_distilled
