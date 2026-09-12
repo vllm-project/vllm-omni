@@ -586,6 +586,77 @@ class OmniServerStageCli(OmniServer):
         cleanup_test_environment()
 
 
+def _validate_qwen3_tts_offline_request(
+    prompt_text: object,
+    tts_kw: dict[str, Any],
+) -> tuple[str, bool]:
+    """Validate and normalize a Qwen3-TTS offline request.
+
+    Returns (text_str, x_vector_only_mode).
+    Raises ValueError for invalid input.
+    """
+    # 1. Input text must be non-empty
+    text_str = str(prompt_text).strip()
+    if not text_str:
+        raise ValueError("Input text cannot be empty")
+
+    task_type = tts_kw.get("task_type", "CustomVoice")
+    ref_audio = tts_kw.get("ref_audio")
+    ref_text = tts_kw.get("ref_text")
+    speaker_embedding = tts_kw.get("speaker_embedding")
+    x_vector_only_mode = bool(tts_kw.get("x_vector_only_mode", False))
+
+    # 2. speaker_embedding is only valid for Base task
+    if speaker_embedding is not None:
+        if task_type != "Base":
+            raise ValueError("'speaker_embedding' is only valid for Base task")
+        if not speaker_embedding:
+            raise ValueError("'speaker_embedding' must be a non-empty list of floats")
+        x_vector_only_mode = True
+
+    # 3. Base task requires a voice source
+    if task_type == "Base":
+        if ref_audio is None and speaker_embedding is None:
+            raise ValueError("Base task requires 'ref_audio' or 'speaker_embedding' for voice cloning")
+        # 4. Base task with ref_audio requires non-empty ref_text
+        if ref_audio is not None and not x_vector_only_mode:
+            if not ref_text or not str(ref_text).strip():
+                raise ValueError(
+                    "Base task requires non-empty 'ref_text' (transcript of "
+                    "the reference audio) unless 'x_vector_only_mode' is enabled"
+                )
+
+    return text_str, x_vector_only_mode
+
+
+def _build_qwen3_tts_additional_information(
+    text_str: str,
+    tts_kw: dict[str, Any],
+    x_vector_only_mode: bool = False,
+) -> dict[str, Any]:
+    """Build ``additional_information`` dict for a Qwen3-TTS offline request."""
+    additional_information: dict[str, Any] = {
+        "task_type": [tts_kw.get("task_type", "CustomVoice")],
+        "text": [text_str],
+        "language": [tts_kw.get("language", "Auto")],
+        "speaker": [tts_kw.get("speaker", "Vivian")],
+        "max_new_tokens": [int(tts_kw.get("max_new_tokens", 2048))],
+    }
+    ref_audio = tts_kw.get("ref_audio")
+    ref_text = tts_kw.get("ref_text")
+    speaker_embedding = tts_kw.get("speaker_embedding")
+
+    if ref_audio is not None:
+        additional_information["ref_audio"] = [ref_audio]
+    if ref_text is not None:
+        additional_information["ref_text"] = [ref_text]
+    if speaker_embedding is not None:
+        additional_information["voice_clone_prompt"] = [{"ref_spk_embedding": speaker_embedding}]
+    if x_vector_only_mode:
+        additional_information["x_vector_only_mode"] = [True]
+    return additional_information
+
+
 class OmniRunner:
     def __init__(
         self,
@@ -722,27 +793,11 @@ class OmniRunner:
         is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()
         if is_tts_model and modalities == ["audio"]:
             tts_kw = mm_processor_kwargs or {}
-            task_type = tts_kw.get("task_type", "CustomVoice")
-            speaker = tts_kw.get("speaker", "Vivian")
-            language = tts_kw.get("language", "Auto")
-            max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
-            ref_audio = tts_kw.get("ref_audio", None)
-            ref_text = tts_kw.get("ref_text", None)
 
             omni_inputs: list[TextPrompt] = []
             for prompt_text in prompts:
-                text_str = str(prompt_text).strip() or " "
-                additional_information: dict[str, Any] = {
-                    "task_type": [task_type],
-                    "text": [text_str],
-                    "language": [language],
-                    "speaker": [speaker],
-                    "max_new_tokens": [max_new_tokens],
-                }
-                if ref_audio is not None:
-                    additional_information["ref_audio"] = [ref_audio]
-                if ref_text is not None:
-                    additional_information["ref_text"] = [ref_text]
+                text_str, x_vector_only_mode = _validate_qwen3_tts_offline_request(prompt_text, tts_kw)
+                additional_information = _build_qwen3_tts_additional_information(text_str, tts_kw, x_vector_only_mode)
                 plen = self._estimate_prompt_len(additional_information, self.model_name)
                 input_dict: TextPrompt = {
                     "prompt_token_ids": [0] * plen,
