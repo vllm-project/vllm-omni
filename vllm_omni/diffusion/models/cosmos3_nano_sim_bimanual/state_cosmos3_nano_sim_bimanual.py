@@ -34,19 +34,19 @@ def append_dense_kv_history(
     tail_tokens = window_frames * tokens_per_frame
     max_tokens = sink_tokens + tail_tokens
     if not current_kv:
-        raise ValueError("Cosmos-Dreams dense K/V update must contain at least one layer.")
+        raise ValueError("Cosmos3-Nano-Sim-Bimanual dense K/V update must contain at least one layer.")
 
     def validate_pair(key: torch.Tensor, value: torch.Tensor, *, label: str) -> None:
         if key.ndim < 2 or key.shape != value.shape:
             raise ValueError(
-                f"Cosmos-Dreams {label} K/V must have matching rank-2+ shapes, "
+                f"Cosmos3-Nano-Sim-Bimanual {label} K/V must have matching rank-2+ shapes, "
                 f"got {tuple(key.shape)} and {tuple(value.shape)}."
             )
         if key.device != value.device or key.dtype != value.dtype:
-            raise ValueError(f"Cosmos-Dreams {label} K/V must have matching dtypes and devices.")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual {label} K/V must have matching dtypes and devices.")
         if key.shape[1] <= 0 or key.shape[1] % tokens_per_frame:
             raise ValueError(
-                f"Cosmos-Dreams {label} K/V token length must be a positive multiple "
+                f"Cosmos3-Nano-Sim-Bimanual {label} K/V token length must be a positive multiple "
                 f"of tokens_per_frame={tokens_per_frame}, got {key.shape[1]}."
             )
 
@@ -58,11 +58,13 @@ def append_dense_kv_history(
         # block. Retain its detached storage directly instead of copying it
         # through a concatenation with zero-length views.
         if any(key.shape[1] > max_tokens for key, _ in current_kv):
-            raise ValueError("The initial Cosmos-Dreams dense K/V block exceeds the configured history window.")
+            raise ValueError(
+                "The initial Cosmos3-Nano-Sim-Bimanual dense K/V block exceeds the configured history window."
+            )
         return [(key.detach(), value.detach()) for key, value in current_kv]
     if len(history) != len(current_kv):
         raise ValueError(
-            "Cosmos-Dreams dense K/V layer count changed within a session: "
+            "Cosmos3-Nano-Sim-Bimanual dense K/V layer count changed within a session: "
             f"history={len(history)}, current={len(current_kv)}."
         )
 
@@ -77,7 +79,8 @@ def append_dense_kv_history(
             or old_k.shape[:1] + old_k.shape[2:] != new_k.shape[:1] + new_k.shape[2:]
         ):
             raise ValueError(
-                f"Cosmos-Dreams dense K/V layer {layer_idx} geometry, dtype, or device changed within a session."
+                "Cosmos3-Nano-Sim-Bimanual dense K/V layer "
+                f"{layer_idx} geometry, dtype, or device changed within a session."
             )
 
     def combined_prefix(old: torch.Tensor, new: torch.Tensor, count: int) -> list[torch.Tensor]:
@@ -114,7 +117,7 @@ def append_dense_kv_history(
 
 
 @dataclass(frozen=True)
-class CosmosDreamsSessionFingerprint:
+class Cosmos3NanoSimBimanualSessionFingerprint:
     prompt_hash: str
     real_text_kv_lengths: tuple[tuple[str, int], ...]
     height: int
@@ -129,33 +132,36 @@ class CosmosDreamsSessionFingerprint:
 
     def __post_init__(self) -> None:
         if not self.prompt_hash:
-            raise ValueError("Cosmos-Dreams session fingerprint requires prompt_hash")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires prompt_hash")
         if self.height <= 0 or self.width <= 0 or self.fps <= 0:
             raise ValueError(
-                f"Cosmos-Dreams fingerprint resolution/FPS must be positive, got {self.height}x{self.width}@{self.fps}"
+                "Cosmos3-Nano-Sim-Bimanual fingerprint resolution/FPS must be "
+                f"positive, got {self.height}x{self.width}@{self.fps}"
             )
         if self.domain_id < 0:
-            raise ValueError(f"Cosmos-Dreams domain_id must be non-negative, got {self.domain_id}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual domain_id must be non-negative, got {self.domain_id}")
         if not self.embodiment:
-            raise ValueError("Cosmos-Dreams session fingerprint requires an embodiment")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires an embodiment")
         if not self.action_contract_sha256:
-            raise ValueError("Cosmos-Dreams session fingerprint requires action_contract_sha256")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires action_contract_sha256")
         if not self.real_text_kv_lengths:
-            raise ValueError("Cosmos-Dreams fingerprint requires at least one text KV branch")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual fingerprint requires at least one text KV branch")
         if any(length <= 0 for _, length in self.real_text_kv_lengths):
-            raise ValueError(f"Cosmos-Dreams real text KV lengths must be positive, got {self.real_text_kv_lengths}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual real text KV lengths must be positive, got {self.real_text_kv_lengths}"
+            )
 
     def text_length(self, branch: str) -> int:
         try:
             return dict(self.real_text_kv_lengths)[branch]
         except KeyError as exc:
-            raise KeyError(f"Cosmos-Dreams fingerprint has no text length for branch {branch!r}") from exc
+            raise KeyError(f"Cosmos3-Nano-Sim-Bimanual fingerprint has no text length for branch {branch!r}") from exc
 
 
 @dataclass
-class CosmosDreamsSessionState:
+class Cosmos3NanoSimBimanualSessionState:
     session_id: str
-    fingerprint: CosmosDreamsSessionFingerprint | None = None
+    fingerprint: Cosmos3NanoSimBimanualSessionFingerprint | None = None
     next_frame_idx: int = 0
     terminal: bool = False
     tick_output_type: str | None = None
@@ -169,30 +175,33 @@ class CosmosDreamsSessionState:
 
     def initialize(
         self,
-        fingerprint: CosmosDreamsSessionFingerprint,
+        fingerprint: Cosmos3NanoSimBimanualSessionFingerprint,
         *,
         next_frame_idx: int = 0,
     ) -> None:
         if self.fingerprint is not None:
             raise RuntimeError(
-                f"Cosmos-Dreams session {self.session_id!r} is already initialized; session reset required"
+                f"Cosmos3-Nano-Sim-Bimanual session {self.session_id!r} is already initialized; session reset required"
             )
         if next_frame_idx < 0:
-            raise ValueError(f"Cosmos-Dreams next_frame_idx must be non-negative, got {next_frame_idx}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual next_frame_idx must be non-negative, got {next_frame_idx}")
         self.fingerprint = fingerprint
         self.next_frame_idx = int(next_frame_idx)
 
     def validate_request(
         self,
-        fingerprint: CosmosDreamsSessionFingerprint,
+        fingerprint: Cosmos3NanoSimBimanualSessionFingerprint,
         *,
         frame_idx: int,
     ) -> None:
         if self.fingerprint is None:
-            raise RuntimeError(f"Cosmos-Dreams session {self.session_id!r} is not initialized; session reset required")
+            raise RuntimeError(
+                f"Cosmos3-Nano-Sim-Bimanual session {self.session_id!r} is not initialized; session reset required"
+            )
         if self.terminal:
             raise ValueError(
-                f"Cosmos-Dreams session {self.session_id!r} already completed a full rollout; session reset required"
+                "Cosmos3-Nano-Sim-Bimanual session "
+                f"{self.session_id!r} already completed a full rollout; session reset required"
             )
         if fingerprint != self.fingerprint:
             changed = [
@@ -201,11 +210,11 @@ class CosmosDreamsSessionState:
                 if getattr(self.fingerprint, field_name) != getattr(fingerprint, field_name)
             ]
             raise ValueError(
-                f"Cosmos-Dreams session conditioning changed ({', '.join(changed)}); session reset required"
+                f"Cosmos3-Nano-Sim-Bimanual session conditioning changed ({', '.join(changed)}); session reset required"
             )
         if frame_idx != self.next_frame_idx:
             raise ValueError(
-                "Cosmos-Dreams request is out of order: "
+                "Cosmos3-Nano-Sim-Bimanual request is out of order: "
                 f"expected latent frame {self.next_frame_idx}, got {frame_idx}; session reset required"
             )
 
@@ -217,10 +226,12 @@ class CosmosDreamsSessionState:
         retain_latent: bool = True,
     ) -> None:
         if chunk.ndim != 5 or chunk.shape[0] != 1:
-            raise ValueError(f"Cosmos-Dreams session chunks must have shape [1,C,T,H,W], got {tuple(chunk.shape)}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual session chunks must have shape [1,C,T,H,W], got {tuple(chunk.shape)}"
+            )
         if frame_start != self.next_frame_idx:
             raise ValueError(
-                "Cosmos-Dreams cannot append an out-of-order chunk: "
+                "Cosmos3-Nano-Sim-Bimanual cannot append an out-of-order chunk: "
                 f"expected {self.next_frame_idx}, got {frame_start}; session reset required"
             )
         if retain_latent:
@@ -234,7 +245,7 @@ class CosmosDreamsSessionState:
         feature_cache: list[Any],
     ) -> None:
         if input_frames <= 0:
-            raise ValueError(f"Cosmos-Dreams decode input_frames must be positive, got {input_frames}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual decode input_frames must be positive, got {input_frames}")
         self.vae_decoder_feat_cache = feature_cache
         self.vae_decoder_initialized = True
         self.last_vae_decode_input_frames = int(input_frames)

@@ -1,19 +1,21 @@
-# Cosmos-Dreams (Cosmos3-Interactive)
+# Cosmos3-Nano-Sim-Bimanual
 
-Cosmos-Dreams is the causal action-conditioned Cosmos3 world model. This port
+Cosmos3-Nano-Sim-Bimanual is the causal action-conditioned Cosmos3 world model. This port
 targets the distilled `interact_8b_tfdcm_chunk4_agibot` checkpoint pinned to
 `iter_000001600`: four SDE denoise steps, `[1, 4, 4, ...]` latent chunks, and
 per-frame interleaved action/video tokens.
 
 ## Artifact contract
 
-Use the two-stage imaginaire4 exporter with a completed
-`cosmos_dreams_manifest.example.json`. The manifest must include the DCP content
-hash and the real action-normalizer statistics/provenance. Stage 1 validates the
-selected EMA/student tensor inventory; Stage 2 writes
-`CosmosDreamsPipeline` into `model_index.json`, embeds the causal fields in
-`transformer/config.json`, and emits `cosmos_dreams_artifact.json` with tensor
-headers and per-shard SHA-256 hashes.
+Use the two-stage imaginaire4 exporter with `--cosmos3-nano-sim-bimanual`.
+Stage 1 derives checkpoint identity, sampler settings, and the action contract
+from the resolved experiment and materialized checkpoint. It validates the
+selected EMA/student tensor inventory and publishes
+`cosmos3_nano_sim_bimanual_manifest.json`. Stage 2 discovers that manifest
+automatically, writes `Cosmos3NanoSimBimanualPipeline` into `model_index.json`,
+and embeds the full runtime contract under `cosmos3_nano_sim_bimanual` in
+`transformer/config.json`. It emits `cosmos3_nano_sim_bimanual_artifact.json`
+with tensor headers and per-shard SHA-256 hashes.
 
 Raw DCP is intentionally not accepted by Stage 2.
 
@@ -24,38 +26,37 @@ normalizer sources before serving them. The unified `yam_dataset` classes have
 different coordinate semantics and are not interchangeable with these legacy
 contracts.
 
-From the `imaginaire4` checkout, materialize the checkpoint locally and copy
-`packages/cosmos3/cosmos3/scripts/cosmos_dreams_manifest.example.json` to a
-working manifest. Compute the hash over the same local `model/` directory that
-Stage 1 will load, then replace every template value, including the complete
-numeric normalizer arrays:
+From the `imaginaire4/packages/cosmos3` checkout, materialize the complete
+checkpoint locally, then run both stages. No hand-written manifest is needed:
 
 ```bash
-python -c 'from pathlib import Path; from cosmos3.scripts.cosmos_dreams_export import sha256_checkpoint; print(sha256_checkpoint(Path("/checkpoints/iter_000001600/model")))'
-
 python -m cosmos3.scripts.export_model \
   --checkpoint-path /checkpoints/iter_000001600/model \
   --config-file /runs/interact_8b_tfdcm_chunk4_agibot/config.yaml \
-  --cosmos-dreams-manifest /manifests/cosmos_dreams.json \
+  --experiment interact_8b_tfdcm_chunk4_agibot \
+  --cosmos3-nano-sim-bimanual \
   --student-only-checkpoint-metadata \
-  -o /exports/cosmos-dreams-hf
+  -o /exports/cosmos3-nano-sim-bimanual-hf
 
 python -m cosmos3.scripts.convert_model_to_diffusers \
-  --checkpoint-path /exports/cosmos-dreams-hf \
-  --cosmos-dreams-manifest /manifests/cosmos_dreams.json \
-  -o /exports/cosmos-dreams-diffusers
+  --checkpoint-path /exports/cosmos3-nano-sim-bimanual-hf \
+  -o /exports/cosmos3-nano-sim-bimanual-diffusers
 ```
+
+The renamed runtime requires newly exported metadata. Regenerate existing
+exports through both stages; legacy imports, deployment names, and export
+flags are no longer supported. Schema versions and model weights are unchanged.
 
 Stage 1 rejects remote DCP paths for causal exports: download the complete tree
 first so `checkpoint_hash` can be verified. It compares the selected
 `net_ema.*` namespace against the export target before DCP loading, preventing
 missing tensors from surviving as random initialization. Stage 2 then compares
 the serialized tensor names, shapes, and dtypes against its strict remap
-inventory. Keep `cosmos_dreams_artifact.json` with the model directory.
+inventory. Keep `cosmos3_nano_sim_bimanual_artifact.json` with the model directory.
 
 ## Deployment
 
-Start from [`cosmos_dreams.yaml`](../../vllm_omni/deploy/cosmos_dreams.yaml).
+Start from [`cosmos3_nano_sim_bimanual.yaml`](../../vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml).
 The default is eager, batch size one, 720×1280, one resident session, and a
 96-latent-frame window. Each request resolves an aligned canvas and selects a
 matching paged KV pool; the maximum permitted geometry is validated at load.
@@ -70,13 +71,13 @@ retain floating-point transport. See the
 [transport guide](../../docs/user_guide/diffusion/device_side_video_postprocess.md)
 for precision and memory fallback behavior.
 
-For compatible serialized ModelOpt FP8/NVFP4 Dreams artifacts, the inherited
+For compatible serialized ModelOpt FP8/NVFP4 Bimanual artifacts, the inherited
 `cosmos3_mixed_precision` policy is evaluated separately for each four-step
 denoising chunk. Clean-frame KV commits (including the initial conditioning
 frame) use the final step's precision. Generation precision resets after every
 chunk or commit, including failures; the reasoner follows its independent policy.
 BF16 artifacts do not enable this schedule. The upstream default of three first
-and three last A16 steps covers all four Dreams steps. For example, setting
+and three last A16 steps covers all four Bimanual steps. For example, setting
 `first_steps=1` and `last_steps=1` selects A16/native/native/A16 per chunk.
 See the [ModelOpt schedule documentation](../../docs/user_guide/quantization/modelopt.md#cosmos3-mixed-precision-schedule)
 for checkpoint requirements and runtime configuration.
@@ -120,5 +121,5 @@ the real text K/V in the auxiliary scratch slots; the dense path concatenates th
 same three spans. Compile/CUDA graphs, RF/CFG checkpoints, and multi-session
 serving remain follow-up work.
 
-See the [offline parity runner](../../examples/offline_inference/cosmos_dreams/README.md)
+See the [offline parity runner](../../examples/offline_inference/cosmos3_nano_sim_bimanual/README.md)
 for jsonl/pickle input and latent-output examples.

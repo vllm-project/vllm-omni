@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Target-specific Cosmos-Dreams action normalization."""
+"""Target-specific Cosmos3-Nano-Sim-Bimanual action normalization."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import (
     RANGE_FLOOR,
     ActionNormalizerContract,
     QuantileRotNormalizerContract,
@@ -34,7 +34,7 @@ class ActionAffineNormalizer:
             suspicious = [index for index, value in enumerate(contract.transform.scale) if value <= 100.0 * RANGE_FLOOR]
             if suspicious:
                 logger.warning(
-                    "Cosmos-Dreams normalizer %s has scales close to range_floor at channels %s.",
+                    "Cosmos3-Nano-Sim-Bimanual normalizer %s has scales close to range_floor at channels %s.",
                     contract.transform_sha256,
                     suspicious,
                 )
@@ -49,15 +49,15 @@ class ActionAffineNormalizer:
 
         if action.shape[-1] != len(self.offset):
             raise ValueError(
-                "Cosmos-Dreams raw action dimension does not match the action contract: "
+                "Cosmos3-Nano-Sim-Bimanual raw action dimension does not match the action contract: "
                 f"{action.shape[-1]} != {len(self.offset)}."
             )
         action_f32 = action.to(dtype=torch.float32)
         if not torch.isfinite(action_f32).all():
-            raise ValueError("Cosmos-Dreams raw actions must contain only finite values.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual raw actions must contain only finite values.")
         offset = action_f32.new_tensor(self.offset)
         scale = action_f32.new_tensor(self.scale)
         normalized = (action_f32 - offset) / scale
         if not torch.isfinite(normalized).all():
-            raise ValueError("Cosmos-Dreams normalized actions must contain only finite values.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual normalized actions must contain only finite values.")
         return normalized

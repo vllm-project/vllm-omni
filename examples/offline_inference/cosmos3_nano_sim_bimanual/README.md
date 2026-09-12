@@ -1,4 +1,4 @@
-# Cosmos-Dreams offline parity runner
+# Cosmos3-Nano-Sim-Bimanual offline parity runner
 
 This runner accepts the reference interactive JSONL plus an optional NPZ
 payload. A record may contain `prompt`/`ai_caption`, `input_video`/`video`/`image`,
@@ -16,13 +16,13 @@ For checkpoints containing multiple legacy YAM datasets, select `abc_yam`,
 retaining distinct normalizers.
 
 ```bash
-python examples/offline_inference/cosmos_dreams/cosmos_dreams.py \
-  --model /checkpoints/cosmos-dreams-diffusers \
+python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+  --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl /data/reference_samples.jsonl \
   --sample-index 0 \
   --num-frames 601 \
   --seed 42 \
-  --output cosmos_dreams_sample_0.mp4
+  --output cosmos3_nano_sim_bimanual_sample_0.mp4
 ```
 
 Use `--output-type latent --output sample_0.pt` for the pre-VAE parity gate.

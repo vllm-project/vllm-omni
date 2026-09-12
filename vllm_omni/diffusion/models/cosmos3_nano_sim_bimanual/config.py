@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Strict schema-v1 artifact and deployment configuration for Cosmos-Dreams."""
+"""Strict schema-v1 artifact and deployment configuration for Cosmos3-Nano-Sim-Bimanual."""
 
 from __future__ import annotations
 
@@ -9,16 +9,16 @@ import math
 from dataclasses import dataclass, fields
 from typing import Any
 
-from vllm_omni.diffusion.models.cosmos_dreams.action_contract import CosmosDreamsActionSchema
-from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
-    CosmosDreamsActionConditioning,
-    CosmosDreamsConditioning,
-    CosmosDreamsControlVideoConditioning,
-    parse_cosmos_dreams_conditioning,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import Cosmos3NanoSimBimanualActionSchema
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
+    Cosmos3NanoSimBimanualActionConditioning,
+    Cosmos3NanoSimBimanualConditioning,
+    Cosmos3NanoSimBimanualControlVideoConditioning,
+    parse_cosmos3_nano_sim_bimanual_conditioning,
 )
 
-COSMOS_DREAMS_SCHEMA_VERSION = 1
-COSMOS_DREAMS_ARTIFACT_FIELDS = frozenset(
+COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION = 1
+COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS = frozenset(
     {
         "schema_version",
         "checkpoint_id",
@@ -43,7 +43,7 @@ COSMOS_DREAMS_ARTIFACT_FIELDS = frozenset(
 )
 _DEPLOY_ARTIFACT_ENVELOPES = frozenset(
     {
-        "cosmos_dreams",
+        "cosmos3_nano_sim_bimanual",
         "causal_manifest",
         "interactive_config",
         "diffusion_expert_config",
@@ -87,7 +87,12 @@ def _exported_artifact_source(config: Any) -> dict[str, Any]:
     """Return the sole supported artifact source in transformer configuration."""
 
     transformer_config = _mapping(getattr(config, "tf_model_config", None))
-    return _mapping(transformer_config.get("cosmos_dreams"))
+    if "cosmos_dreams" in transformer_config:
+        raise ValueError(
+            "Legacy Cosmos-Dreams metadata is no longer supported. Re-export the checkpoint through both "
+            "imaginaire4 stages with --cosmos3-nano-sim-bimanual."
+        )
+    return _mapping(transformer_config.get("cosmos3_nano_sim_bimanual"))
 
 
 def _validate_deploy_layout(config: Any) -> None:
@@ -97,43 +102,44 @@ def _validate_deploy_layout(config: Any) -> None:
         envelopes = sorted(_DEPLOY_ARTIFACT_ENVELOPES & set(root))
         if envelopes:
             raise ValueError(
-                f"Cosmos-Dreams artifact envelopes are not supported in {attr}: {envelopes}. "
-                "The artifact must come from tf_model_config['cosmos_dreams']."
+                f"Cosmos3-Nano-Sim-Bimanual artifact envelopes are not supported in {attr}: {envelopes}. "
+                "The artifact must come from tf_model_config['cosmos3_nano_sim_bimanual']."
             )
-        artifact_fields = sorted(COSMOS_DREAMS_ARTIFACT_FIELDS & set(root))
+        artifact_fields = sorted(COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS & set(root))
         if artifact_fields:
             raise ValueError(
-                f"Cosmos-Dreams artifact fields must not be placed at deploy root {attr}: {artifact_fields}."
+                "Cosmos3-Nano-Sim-Bimanual artifact fields must not be placed at "
+                f"deploy root {attr}: {artifact_fields}."
             )
 
 
 def _strict_int(value: Any, name: str, *, positive: bool = True) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"Cosmos-Dreams artifact {name} must be an integer, got {value!r}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual artifact {name} must be an integer, got {value!r}")
     if positive and value <= 0:
-        raise ValueError(f"Cosmos-Dreams artifact {name} must be positive, got {value}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual artifact {name} must be positive, got {value}")
     return value
 
 
 def _strict_bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
-        raise ValueError(f"Cosmos-Dreams artifact {name} must be a boolean, got {value!r}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual artifact {name} must be a boolean, got {value!r}")
     return value
 
 
 def _strict_float(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"Cosmos-Dreams artifact {name} must be numeric, got {value!r}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual artifact {name} must be numeric, got {value!r}")
     return float(value)
 
 
 def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     fixed_step = artifact["fixed_step_sampler_config"]
     if not isinstance(fixed_step, dict):
-        raise ValueError("Cosmos-Dreams artifact fixed_step_sampler_config must be an object")
+        raise ValueError("Cosmos3-Nano-Sim-Bimanual artifact fixed_step_sampler_config must be an object")
     raw_t_list = fixed_step.get("t_list")
     if not isinstance(raw_t_list, list):
-        raise ValueError("Cosmos-Dreams artifact fixed_step_sampler_config.t_list must be a list")
+        raise ValueError("Cosmos3-Nano-Sim-Bimanual artifact fixed_step_sampler_config.t_list must be a list")
     t_list = tuple(_strict_float(value, "fixed_step_sampler_config.t_list entry") for value in raw_t_list)
     base_fps = _strict_float(artifact["base_fps"], "base_fps")
     return {
@@ -163,15 +169,15 @@ def _parse_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_id": artifact["checkpoint_id"],
         "checkpoint_iteration": _strict_int(artifact["checkpoint_iteration"], "checkpoint_iteration"),
         "checkpoint_hash": artifact["checkpoint_hash"],
-        "conditioning": parse_cosmos_dreams_conditioning(artifact["conditioning"]),
+        "conditioning": parse_cosmos3_nano_sim_bimanual_conditioning(artifact["conditioning"]),
     }
 
 
 @dataclass(frozen=True)
-class CosmosDreamsManifest:
-    """Immutable schema-v1 artifact fields required by Cosmos-Dreams runtime."""
+class Cosmos3NanoSimBimanualManifest:
+    """Immutable schema-v1 artifact fields required by Cosmos3-Nano-Sim-Bimanual runtime."""
 
-    schema_version: int = COSMOS_DREAMS_SCHEMA_VERSION
+    schema_version: int = COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION
     chunk_size: int = 4
     window_frames: int = 96
     sink_frames: int = 0
@@ -191,13 +197,13 @@ class CosmosDreamsManifest:
     checkpoint_id: str = "unknown"
     checkpoint_iteration: int = 0
     checkpoint_hash: str = "unknown"
-    conditioning: CosmosDreamsConditioning | None = None
+    conditioning: Cosmos3NanoSimBimanualConditioning | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != COSMOS_DREAMS_SCHEMA_VERSION:
+        if self.schema_version != COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION:
             raise ValueError(
-                f"Unsupported Cosmos-Dreams artifact schema_version={self.schema_version}; "
-                f"expected {COSMOS_DREAMS_SCHEMA_VERSION}"
+                f"Unsupported Cosmos3-Nano-Sim-Bimanual artifact schema_version={self.schema_version}; "
+                f"expected {COSMOS3_NANO_SIM_BIMANUAL_SCHEMA_VERSION}"
             )
         positive = {
             "chunk_size": self.chunk_size,
@@ -211,65 +217,70 @@ class CosmosDreamsManifest:
         }
         for name, value in positive.items():
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"Cosmos-Dreams manifest {name} must be a positive integer, got {value!r}")
+                raise ValueError(f"Cosmos3-Nano-Sim-Bimanual manifest {name} must be a positive integer, got {value!r}")
         if isinstance(self.sink_frames, bool) or not isinstance(self.sink_frames, int) or self.sink_frames < 0:
-            raise ValueError(f"Cosmos-Dreams manifest sink_frames must be non-negative, got {self.sink_frames!r}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual manifest sink_frames must be non-negative, got {self.sink_frames!r}"
+            )
         if self.checkpoint_iteration < 0:
             raise ValueError(
-                f"Cosmos-Dreams checkpoint_iteration must be non-negative, got {self.checkpoint_iteration}"
+                f"Cosmos3-Nano-Sim-Bimanual checkpoint_iteration must be non-negative, got {self.checkpoint_iteration}"
             )
         if self.attention_mode != "three_way":
-            raise ValueError(f"Cosmos-Dreams requires attention_mode='three_way', got {self.attention_mode!r}")
+            raise ValueError(
+                f"Cosmos3-Nano-Sim-Bimanual requires attention_mode='three_way', got {self.attention_mode!r}"
+            )
         if self.video_temporal_causal is not True:
-            raise ValueError("Cosmos-Dreams requires video_temporal_causal=True")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual requires video_temporal_causal=True")
         if self.unified_3d_mrope_reset_spatial_ids is not True:
-            raise ValueError("Cosmos-Dreams requires unified_3d_mrope_reset_spatial_ids=True")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual requires unified_3d_mrope_reset_spatial_ids=True")
         if self.enable_fps_modulation is not True:
-            raise ValueError("Cosmos-Dreams AR inference requires FPS modulation")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual AR inference requires FPS modulation")
         if not math.isfinite(self.base_fps) or self.base_fps <= 0:
-            raise ValueError(f"Cosmos-Dreams base_fps must be positive, got {self.base_fps}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual base_fps must be positive, got {self.base_fps}")
         if self.sample_type != "sde":
-            raise ValueError(f"Cosmos-Dreams sample_type must be 'sde', got {self.sample_type!r}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual sample_type must be 'sde', got {self.sample_type!r}")
         if not self.t_list:
-            raise ValueError("Cosmos-Dreams t_list must not be empty")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual t_list must not be empty")
         if abs(self.t_list[0] - 1.0) > 1e-6:
-            raise ValueError(f"Cosmos-Dreams t_list must start at 1.0, got {self.t_list[0]}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual t_list must start at 1.0, got {self.t_list[0]}")
         if any(not math.isfinite(sigma) or sigma <= 0.0 or sigma > 1.0 for sigma in self.t_list):
-            raise ValueError(f"Cosmos-Dreams t_list entries must be in (0, 1], got {self.t_list}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual t_list entries must be in (0, 1], got {self.t_list}")
         if any(left <= right for left, right in zip(self.t_list, self.t_list[1:])):
-            raise ValueError(f"Cosmos-Dreams t_list must be strictly descending, got {self.t_list}")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual t_list must be strictly descending, got {self.t_list}")
         if not isinstance(self.checkpoint_id, str) or not self.checkpoint_id:
-            raise ValueError("Cosmos-Dreams checkpoint_id must be a non-empty string")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoint_id must be a non-empty string")
         if not isinstance(self.checkpoint_hash, str):
-            raise ValueError("Cosmos-Dreams checkpoint_hash must be a string")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoint_hash must be a string")
         if self.checkpoint_hash != "unknown" and (
             len(self.checkpoint_hash) != 64
             or any(character not in "0123456789abcdefABCDEF" for character in self.checkpoint_hash)
         ):
             raise ValueError(
-                f"Cosmos-Dreams checkpoint_hash must be a 64-character SHA-256 digest, got {self.checkpoint_hash!r}"
+                "Cosmos3-Nano-Sim-Bimanual checkpoint_hash must be a 64-character "
+                f"SHA-256 digest, got {self.checkpoint_hash!r}"
             )
         if self.checkpoint_hash != "unknown" and set(self.checkpoint_hash) == {"0"}:
-            raise ValueError("Cosmos-Dreams checkpoint_hash cannot be the all-zero template value")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual checkpoint_hash cannot be the all-zero template value")
         if self.conditioning is not None and not isinstance(
-            self.conditioning, CosmosDreamsActionConditioning | CosmosDreamsControlVideoConditioning
+            self.conditioning, Cosmos3NanoSimBimanualActionConditioning | Cosmos3NanoSimBimanualControlVideoConditioning
         ):
-            raise ValueError("Cosmos-Dreams schema v1 requires a recognized conditioning payload")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual schema v1 requires a recognized conditioning payload")
 
     @property
-    def action_schema(self) -> CosmosDreamsActionSchema | None:
-        return self.conditioning if isinstance(self.conditioning, CosmosDreamsActionConditioning) else None
+    def action_schema(self) -> Cosmos3NanoSimBimanualActionSchema | None:
+        return self.conditioning if isinstance(self.conditioning, Cosmos3NanoSimBimanualActionConditioning) else None
 
-    def require_action_schema(self) -> CosmosDreamsActionSchema:
+    def require_action_schema(self) -> Cosmos3NanoSimBimanualActionSchema:
         schema = self.action_schema
         if schema is None:
-            raise ValueError("Cosmos-Dreams action conditioning is unavailable.")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual action conditioning is unavailable.")
         return schema
 
-    def require_control_video_conditioning(self) -> CosmosDreamsControlVideoConditioning:
+    def require_control_video_conditioning(self) -> Cosmos3NanoSimBimanualControlVideoConditioning:
         conditioning = self.conditioning
-        if not isinstance(conditioning, CosmosDreamsControlVideoConditioning):
-            raise ValueError("Cosmos-Dreams control_video conditioning is unavailable.")
+        if not isinstance(conditioning, Cosmos3NanoSimBimanualControlVideoConditioning):
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual control_video conditioning is unavailable.")
         return conditioning
 
     @property
@@ -301,7 +312,7 @@ class CosmosDreamsManifest:
 
     @property
     def conditioning_tokens_per_frame(self) -> int:
-        if isinstance(self.conditioning, CosmosDreamsControlVideoConditioning):
+        if isinstance(self.conditioning, Cosmos3NanoSimBimanualControlVideoConditioning):
             return 0
         return self.action_tokens_per_frame
 
@@ -311,25 +322,27 @@ class CosmosDreamsManifest:
             return None
         digest = self.conditioning.digest
         if not isinstance(digest, str) or not digest:
-            raise ValueError("Cosmos-Dreams conditioning payload must expose a non-empty digest")
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual conditioning payload must expose a non-empty digest")
         return digest
 
     @classmethod
-    def from_od_config(cls, od_config: Any) -> CosmosDreamsManifest:
+    def from_od_config(cls, od_config: Any) -> Cosmos3NanoSimBimanualManifest:
         """Load the sole schema-v1 artifact source; deployments never synthesize it."""
 
         _validate_deploy_layout(od_config)
         artifact = _exported_artifact_source(od_config)
         if not artifact:
             raise ValueError(
-                "Cosmos-Dreams requires a schema-v1 artifact in tf_model_config['cosmos_dreams']; "
+                "Cosmos3-Nano-Sim-Bimanual requires a schema-v1 artifact in "
+                "tf_model_config['cosmos3_nano_sim_bimanual']; "
                 "deployment defaults are not an artifact."
             )
-        missing = sorted(COSMOS_DREAMS_ARTIFACT_FIELDS - set(artifact))
-        unknown = sorted(set(artifact) - COSMOS_DREAMS_ARTIFACT_FIELDS)
+        missing = sorted(COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS - set(artifact))
+        unknown = sorted(set(artifact) - COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS)
         if missing or unknown:
             raise ValueError(
-                f"Cosmos-Dreams schema-v1 artifact fields are invalid: missing={missing}, unknown={unknown}."
+                "Cosmos3-Nano-Sim-Bimanual schema-v1 artifact fields are invalid: "
+                f"missing={missing}, unknown={unknown}."
             )
         return cls(**_parse_artifact(artifact))
 
@@ -343,7 +356,7 @@ class CosmosDreamsManifest:
             missing.append("checkpoint_hash")
         if missing:
             raise ValueError(
-                "Cosmos-Dreams requires a validated exported artifact; missing "
+                "Cosmos3-Nano-Sim-Bimanual requires a validated exported artifact; missing "
                 f"{', '.join(missing)} from its causal manifest."
             )
 
@@ -353,7 +366,7 @@ class CosmosDreamsManifest:
             return dict(self.embodiment_to_domain)[normalized]
         except KeyError as exc:
             raise ValueError(
-                f"Unknown Cosmos-Dreams domain_name={name!r}; expected one of "
+                f"Unknown Cosmos3-Nano-Sim-Bimanual domain_name={name!r}; expected one of "
                 f"{sorted(dict(self.embodiment_to_domain))}."
             ) from exc
 

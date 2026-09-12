@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cosmos-Dreams single-stage autoregressive diffusion topology."""
+"""Cosmos3-Nano-Sim-Bimanual single-stage autoregressive diffusion topology."""
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -7,11 +7,11 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-COSMOS_DREAMS_PIPELINE = PipelineConfig(
-    model_type="cosmos_dreams",
-    default_deploy_config_name="cosmos_dreams.yaml",
-    model_arch="CosmosDreamsPipeline",
-    diffusers_class_name="CosmosDreamsPipeline",
+COSMOS3_NANO_SIM_BIMANUAL_PIPELINE = PipelineConfig(
+    model_type="cosmos3_nano_sim_bimanual",
+    default_deploy_config_name="cosmos3_nano_sim_bimanual.yaml",
+    model_arch="Cosmos3NanoSimBimanualPipeline",
+    diffusers_class_name="Cosmos3NanoSimBimanualPipeline",
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -20,7 +20,7 @@ COSMOS_DREAMS_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="video",
-            model_arch="CosmosDreamsPipeline",
+            model_arch="Cosmos3NanoSimBimanualPipeline",
         ),
     ),
 )

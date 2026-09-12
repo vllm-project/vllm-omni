@@ -18,9 +18,9 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
 def iter_ar_chunk_ranges(start_frame: int, num_frames: int, chunk_size: int) -> Iterator[tuple[int, int]]:
     """Yield the training-aligned partition ``[1, C, C, ...]``."""
     if start_frame < 0 or num_frames < 0 or start_frame > num_frames:
-        raise ValueError(f"Invalid Cosmos-Dreams frame range [{start_frame}, {num_frames})")
+        raise ValueError(f"Invalid Cosmos3-Nano-Sim-Bimanual frame range [{start_frame}, {num_frames})")
     if chunk_size <= 0:
-        raise ValueError(f"Cosmos-Dreams chunk_size must be positive, got {chunk_size}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual chunk_size must be positive, got {chunk_size}")
     frame = start_frame
     while frame < num_frames:
         if frame == 0:
@@ -47,7 +47,8 @@ def iter_clean_commit_frames(
     """
     if chunk_start < 0 or chunk_end <= chunk_start or target_frame < chunk_end:
         raise ValueError(
-            f"Invalid Cosmos-Dreams clean-commit range: chunk=[{chunk_start}, {chunk_end}), target={target_frame}"
+            "Invalid Cosmos3-Nano-Sim-Bimanual clean-commit range: "
+            f"chunk=[{chunk_start}, {chunk_end}), target={target_frame}"
         )
     for local_idx, frame_idx in enumerate(range(chunk_start, chunk_end)):
         if terminal_request and frame_idx == target_frame - 1:
@@ -67,12 +68,12 @@ def interleave_action_vision_tokens(
     """
     if action_tokens.ndim != 4 or vision_tokens.ndim != 4:
         raise ValueError(
-            "Cosmos-Dreams interleaving expects action [B,T,A,D] and vision [B,T,P,D], "
+            "Cosmos3-Nano-Sim-Bimanual interleaving expects action [B,T,A,D] and vision [B,T,P,D], "
             f"got {tuple(action_tokens.shape)} and {tuple(vision_tokens.shape)}"
         )
     if action_tokens.shape[:2] != vision_tokens.shape[:2] or action_tokens.shape[-1] != vision_tokens.shape[-1]:
         raise ValueError(
-            "Cosmos-Dreams action/vision batch, frame, and hidden dimensions must match; "
+            "Cosmos3-Nano-Sim-Bimanual action/vision batch, frame, and hidden dimensions must match; "
             f"got {tuple(action_tokens.shape)} and {tuple(vision_tokens.shape)}"
         )
     return torch.cat([action_tokens, vision_tokens], dim=2).flatten(1, 2)
@@ -87,11 +88,11 @@ def split_interleaved_action_vision_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse of :func:`interleave_action_vision_tokens`."""
     if tokens.ndim != 3:
-        raise ValueError(f"Cosmos-Dreams packed tokens must have shape [B,S,D], got {tuple(tokens.shape)}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual packed tokens must have shape [B,S,D], got {tuple(tokens.shape)}")
     tokens_per_frame = action_tokens_per_frame + vision_tokens_per_frame
     expected = num_frames * tokens_per_frame
     if tokens.shape[1] != expected:
-        raise ValueError(f"Cosmos-Dreams packed length must be {expected}, got {tokens.shape[1]}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual packed length must be {expected}, got {tokens.shape[1]}")
     framed = tokens.view(tokens.shape[0], num_frames, tokens_per_frame, tokens.shape[-1])
     return framed[:, :, :action_tokens_per_frame], framed[:, :, action_tokens_per_frame:]
 
@@ -120,13 +121,15 @@ def build_interleaved_mrope_position_ids(
     """
     if frame_start < 0 or num_frames <= 0 or grid_h <= 0 or grid_w <= 0:
         raise ValueError(
-            "Cosmos-Dreams mRoPE dimensions must be positive and frame_start non-negative; "
+            "Cosmos3-Nano-Sim-Bimanual mRoPE dimensions must be positive and frame_start non-negative; "
             f"got start={frame_start}, frames={num_frames}, grid={grid_h}x{grid_w}"
         )
     if fps <= 0 or base_fps <= 0:
-        raise ValueError(f"Cosmos-Dreams FPS values must be positive, got fps={fps}, base_fps={base_fps}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual FPS values must be positive, got fps={fps}, base_fps={base_fps}")
     if action_tokens_per_frame <= 0:
-        raise ValueError(f"Cosmos-Dreams action_tokens_per_frame must be positive, got {action_tokens_per_frame}")
+        raise ValueError(
+            f"Cosmos3-Nano-Sim-Bimanual action_tokens_per_frame must be positive, got {action_tokens_per_frame}"
+        )
 
     null_frames = {int(frame) for frame in null_action_frames}
     patch_count = grid_h * grid_w
@@ -145,7 +148,7 @@ def build_interleaved_mrope_position_ids(
     )
     # Each action token represents one pixel-rate step ending at its latent
     # frame. Flattening the frame/action axes gives the base helper the exact
-    # sequence it expects; Dreams only owns the final per-frame interleaving.
+    # sequence it expects; Bimanual only owns the final per-frame interleaving.
     action_start_offset = frame_start * action_tokens_per_frame - action_tokens_per_frame + 1
     action_ids, _ = compute_mrope_position_ids_action(
         grid_t=num_frames * action_tokens_per_frame,
@@ -176,10 +179,10 @@ def zero_null_action_values(
 ) -> torch.Tensor:
     """Zero V (not K) for null action slots before persistent storage."""
     if value.ndim != 4:
-        raise ValueError(f"Cosmos-Dreams K/V must have shape [B,S,H,D], got {tuple(value.shape)}")
+        raise ValueError(f"Cosmos3-Nano-Sim-Bimanual K/V must have shape [B,S,H,D], got {tuple(value.shape)}")
     if value.shape[1] != num_frames * tokens_per_frame:
         raise ValueError(
-            "Cosmos-Dreams K/V length does not match frame geometry: "
+            "Cosmos3-Nano-Sim-Bimanual K/V length does not match frame geometry: "
             f"length={value.shape[1]}, frames={num_frames}, tokens_per_frame={tokens_per_frame}"
         )
     if not null_frame_indexes:
@@ -188,7 +191,7 @@ def zero_null_action_values(
     positions: list[int] = []
     for frame in null_frame_indexes:
         if frame < 0 or frame >= num_frames:
-            raise ValueError(f"Cosmos-Dreams null action frame {frame} is outside [0, {num_frames})")
+            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual null action frame {frame} is outside [0, {num_frames})")
         start = frame * tokens_per_frame
         positions.extend(range(start, start + action_tokens_per_frame))
     result[:, positions] = 0

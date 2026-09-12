@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Strict conditioning contract for Cosmos-Dreams-Transfer artifacts."""
+"""Strict conditioning contract for Cosmos3-Nano-Sim-Transfer artifacts."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
-    CosmosDreamsActionSchema,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import (
+    Cosmos3NanoSimBimanualActionSchema,
     canonical_sha256,
 )
 
@@ -19,13 +19,13 @@ TRANSFER_CONTROL_ATTENTION_MODE = "causal_control_with_rgb_history"
 TransferHint = Literal["edge", "blur", "depth", "seg"]
 
 
-class CosmosDreamsActionConditioning(CosmosDreamsActionSchema):
+class Cosmos3NanoSimBimanualActionConditioning(Cosmos3NanoSimBimanualActionSchema):
     """Schema-v1 action-conditioning branch."""
 
     mode: Literal["action"]
 
 
-class CosmosDreamsControlVideoConditioning(BaseModel):
+class Cosmos3NanoSimBimanualControlVideoConditioning(BaseModel):
     """Immutable schema-v1 payload pinned to the target Transfer checkpoint."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -47,14 +47,14 @@ class CosmosDreamsControlVideoConditioning(BaseModel):
     @classmethod
     def validate_literal_true(cls, value: object) -> object:
         if value is not True:
-            raise ValueError("Cosmos-Dreams-Transfer contract flags must be JSON boolean true.")
+            raise ValueError("Cosmos3-Nano-Sim-Transfer contract flags must be JSON boolean true.")
         return value
 
     @model_validator(mode="after")
-    def validate_target_contract(self) -> CosmosDreamsControlVideoConditioning:
+    def validate_target_contract(self) -> Cosmos3NanoSimBimanualControlVideoConditioning:
         if self.hints != TRANSFER_HINTS:
             raise ValueError(
-                f"Cosmos-Dreams-Transfer hints must exactly match {list(TRANSFER_HINTS)}, got {list(self.hints)}."
+                f"Cosmos3-Nano-Sim-Transfer hints must exactly match {list(TRANSFER_HINTS)}, got {list(self.hints)}."
             )
         return self
 
@@ -63,26 +63,26 @@ class CosmosDreamsControlVideoConditioning(BaseModel):
         return canonical_sha256(self.model_dump(mode="json"))
 
 
-CosmosDreamsConditioning = Annotated[
-    CosmosDreamsActionConditioning | CosmosDreamsControlVideoConditioning,
+Cosmos3NanoSimBimanualConditioning = Annotated[
+    Cosmos3NanoSimBimanualActionConditioning | Cosmos3NanoSimBimanualControlVideoConditioning,
     Field(discriminator="mode"),
 ]
-_CONDITIONING_ADAPTER = TypeAdapter(CosmosDreamsConditioning)
+_CONDITIONING_ADAPTER = TypeAdapter(Cosmos3NanoSimBimanualConditioning)
 
 
-def parse_cosmos_dreams_conditioning(value: object) -> CosmosDreamsConditioning:
+def parse_cosmos3_nano_sim_bimanual_conditioning(value: object) -> Cosmos3NanoSimBimanualConditioning:
     """Parse schema-v1 conditioning by its required ``mode`` discriminator."""
 
     return _CONDITIONING_ADAPTER.validate_python(value)
 
 
 __all__ = [
-    "CosmosDreamsActionConditioning",
-    "CosmosDreamsControlVideoConditioning",
-    "CosmosDreamsConditioning",
+    "Cosmos3NanoSimBimanualActionConditioning",
+    "Cosmos3NanoSimBimanualControlVideoConditioning",
+    "Cosmos3NanoSimBimanualConditioning",
     "TRANSFER_CONTROL_ATTENTION_MODE",
     "TRANSFER_HINTS",
     "TRANSFER_SYSTEM_PROMPT_ID",
     "TransferHint",
-    "parse_cosmos_dreams_conditioning",
+    "parse_cosmos3_nano_sim_bimanual_conditioning",
 ]

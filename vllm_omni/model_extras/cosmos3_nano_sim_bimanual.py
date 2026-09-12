@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serving parameters exposed by the Cosmos-Dreams pipeline."""
+"""Serving parameters exposed by the Cosmos3-Nano-Sim-Bimanual pipeline."""
 
-COSMOS_DREAMS_EXTRA_BODY_PARAMS = frozenset(
+COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS = frozenset(
     {
         "action",
         "ar_diffusion_tick",
@@ -18,4 +18,4 @@ COSMOS_DREAMS_EXTRA_BODY_PARAMS = frozenset(
     }
 )
 
-COSMOS_DREAMS_EXTRA_OUTPUT_PARAMS = frozenset()
+COSMOS3_NANO_SIM_BIMANUAL_EXTRA_OUTPUT_PARAMS = frozenset()
