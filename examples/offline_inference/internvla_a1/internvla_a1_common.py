@@ -12,7 +12,6 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
-import torchvision
 
 from vllm_omni.diffusion.models.internvla_a1.config import (  # noqa: E402
     OBS_IMAGES,
@@ -79,29 +78,38 @@ def unnormalize_vector(values: torch.Tensor, stats: dict[str, torch.Tensor]) -> 
 
 
 class TorchvisionVideoReaderCache:
+    # torchvision>=0.23 removed the video reading API (VideoReader/read_video was
+    # moved to torchcodec), so decode frames with PyAV directly. Same interface.
     def __init__(self, backend: str = "pyav") -> None:
         self.backend = backend
         self._readers: dict[str, Any] = {}
-        torchvision.set_video_backend(backend)
 
     def get(self, path: str) -> Any:
         reader = self._readers.get(path)
         if reader is None:
-            reader = torchvision.io.VideoReader(path, "video")
+            import av
+
+            reader = av.open(path)
             self._readers[path] = reader
         return reader
 
     def decode_frames(self, path: str, timestamps: list[float], tolerance_s: float = 1e-4) -> torch.Tensor:
-        reader = self.get(path)
+        container = self.get(path)
+        stream = container.streams.video[0]
+        time_base = float(stream.time_base)
         first_ts = min(timestamps)
         last_ts = max(timestamps)
-        reader.seek(first_ts, keyframes_only=self.backend == "pyav")
+
+        # Seek to the keyframe at or before the earliest requested timestamp,
+        # then decode forward and collect frames up to the latest timestamp.
+        container.seek(int(max(first_ts, 0.0) / time_base), stream=stream, backward=True, any_frame=False)
 
         loaded_frames: list[torch.Tensor] = []
         loaded_ts: list[float] = []
-        for frame in reader:
-            current_ts = float(frame["pts"])
-            loaded_frames.append(frame["data"])
+        for frame in container.decode(stream):
+            current_ts = float(frame.pts * time_base)
+            arr = frame.to_ndarray(format="rgb24")  # HxWxC uint8
+            loaded_frames.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
             loaded_ts.append(current_ts)
             if current_ts >= last_ts:
                 break
