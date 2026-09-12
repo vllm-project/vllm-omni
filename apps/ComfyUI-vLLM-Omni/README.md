@@ -13,7 +13,6 @@ It can send model inference requests to either a locally running vLLM-Omni servi
 > [!TIP]
 > If you run both ComfyUI and vLLM-Omni on the same device, you can create separate virtual environments and use different Python versions for them.
 
-
 ## Installation
 
 Copy this folder to the `custom_nodes` subfolder of your ComfyUI installation. Your directory should look like `ComfyUI/custom_nodes/ComfyUI-vLLM-Omni`.
@@ -21,9 +20,10 @@ Copy this folder to the `custom_nodes` subfolder of your ComfyUI installation. Y
 If you are running ComfyUI during copying, you should restart ComfyUI to load this extension.
 
 > [!TIP]
-> You can use utility websites such as https://download-directory.github.io/ to download a subdirectory of a repo. Also checkout community discussions (e.g., https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository) for more info.
+> You can use utility websites such as <https://download-directory.github.io/> to download a subdirectory of a repo. Also checkout community discussions (e.g., <https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository>) for more info.
 
 On the device and virtual environment you run ComfyUI, launch ComfyUI with
+
 ```bash
 cd ComfyUI
 
@@ -35,6 +35,7 @@ python main.py --cpu
 ```
 
 On the device and virtual environment you run vLLM-Omni, start a model service with
+
 ```bash
 vllm serve The_Model_ID_to_Serve --omni --port 8000
 ```
@@ -48,6 +49,7 @@ This extension offers the following nodes based on the output modalities (at **C
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
+- **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
 
@@ -123,6 +125,40 @@ You can configure per-stage sampling parameters for multi-stage models.
 >
 > Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
 
+#### FastH3 text-to-video
+
+FastH3 is fused into MiniMax-H3 when the vLLM-Omni server starts; it is not a request-switchable LoRA. Download one adapter variant and start a non-offloaded FL2VA server. For the Dense / Data-Free profile:
+
+```bash
+export FASTH3_DIR=/path/to/fasth3
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
+
+vllm serve /path/to/MiniMax-H3 \
+  --omni \
+  --task-type fl2va \
+  --lora-path "${FASTH3_DIR}/dense-datafree/adapter_model.safetensors" \
+  --port 8000
+```
+
+For the VSA / Data-Free profile, download `vsa-datafree/adapter_model.safetensors`, use that file as `--lora-path`, and add:
+
+```bash
+--diffusion-attention-backend FASTVIDEO_VSA \
+--fastvideo-vsa-topk 64
+```
+
+The VSA profile also requires a compatible `fastvideo-kernel` installation. See the [MiniMax-H3 FastH3 recipe](../../recipes/MiniMaxAI/MiniMax-H3.md#fasth3-adapter) for the full serving contract, supported parallel layouts, and kernel requirements.
+
+Open the **vLLM-Omni FastH3 Text to Video** template, then:
+
+- Set the server URL, served model name, and matching `dense-datafree` or `vsa-datafree` label on **FastH3 Deployment**.
+- Connect its output to **Generate Video → fast_h3**. When connected, the deployment node's URL and model take precedence over the corresponding Generate Video widgets.
+- Keep `frame`, `references`, **LoRA**, and **MiniMax-H3 Video Params** disconnected. FastH3 Preview v1 supports T2VA only, is already fused, and owns both flow shifts.
+- A connected **Diffusion Sampling Params** node may set seed and other ordinary sampling options. The integration always enforces four denoising steps and 24 FPS for FastH3.
+
+The profile field records which pre-deployed service the workflow targets; it does not switch adapters or attention backends on a running server.
+
 ### TTS (e.g., Qwen TTS series)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni TTS**)
@@ -178,11 +214,11 @@ Whenever you find an issue or problem, please
 
 Features
 
-- https://github.com/dougbtv/comfyui-vllm-omni/ The official reference implementation for ComfyUI integration with vLLM-Omni's DALL-E compatible image generation API.
-- https://github.com/Comfy-Org/ComfyUI/tree/master/comfy_extras ComfyUI's built-in node implementations.
+- <https://github.com/dougbtv/comfyui-vllm-omni/> The official reference implementation for ComfyUI integration with vLLM-Omni's DALL-E compatible image generation API.
+- <https://github.com/Comfy-Org/ComfyUI/tree/master/comfy_extras> ComfyUI's built-in node implementations.
 
 UI/UX design references
 
-- https://github.com/sgl-project/sglang/pull/15271 SGLang Diffusion's official ComfyUI integration for image and video generation.
-- https://github.com/SXQBW/ComfyUI-Qwen-Omni A third party ComfyUI integration for Qwen Omni series.
-- https://github.com/flybirdxx/ComfyUI-Qwen-TTS https://github.com/DarioFT/ComfyUI-Qwen3-TTS Third  party ComfyUI integrations for Qwen TTS series.
+- <https://github.com/sgl-project/sglang/pull/15271> SGLang Diffusion's official ComfyUI integration for image and video generation.
+- <https://github.com/SXQBW/ComfyUI-Qwen-Omni> A third party ComfyUI integration for Qwen Omni series.
+- <https://github.com/flybirdxx/ComfyUI-Qwen-TTS> <https://github.com/DarioFT/ComfyUI-Qwen3-TTS> Third  party ComfyUI integrations for Qwen TTS series.

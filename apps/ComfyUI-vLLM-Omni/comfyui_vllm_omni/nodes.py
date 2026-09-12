@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Literal
 
 import torch
@@ -10,6 +13,7 @@ from .utils.types import (
     AudioFormat,
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
+    FastH3Deployment,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
     VideoReferences,
@@ -21,6 +25,24 @@ from .utils.validators import (
 )
 
 logger = get_logger(__name__)
+
+FASTH3_PROFILES = ("dense-datafree", "vsa-datafree")
+FASTH3_INFERENCE_STEPS = 4
+FASTH3_FPS = 24
+
+
+def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str, str]:
+    if not isinstance(deployment, dict):
+        raise ValueError("FastH3 deployment must be provided by a FastH3 Deployment node.")
+
+    url = str(deployment.get("url") or "").strip().rstrip("/")
+    model = str(deployment.get("model") or "").strip()
+    profile = str(deployment.get("profile") or "").strip()
+    if not url or not model:
+        raise ValueError("FastH3 deployment requires both URL and model.")
+    if profile not in FASTH3_PROFILES:
+        raise ValueError(f"Unsupported FastH3 profile {profile!r}; expected one of {FASTH3_PROFILES}.")
+    return url, model, profile
 
 
 class _VLLMOmniGenerateBase:
@@ -162,7 +184,20 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "width": ("INT", {"default": 832, "min": 1}),
                 "height": ("INT", {"default": 480, "min": 1}),
                 "fps": ("INT", {"default": 16, "min": 1}),
-                "num_frames": ("INT", {"default": 41, "min": 1}),
+                "duration": (
+                    "FLOAT",
+                    {
+                        "default": 4.0,
+                        "min": 0.1,
+                        "step": 0.1,
+                        "round": 0.001,
+                        "tooltip": (
+                            "Clip length in seconds, converted to frames with the fps above. "
+                            "Models that only accept certain frame counts (e.g. MiniMax-H3) round to "
+                            "their own lattice, so the served clip can be slightly longer than requested."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "frame": ("IMAGE",),
@@ -170,6 +205,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
                 "model_params": ("VIDEO_PARAMS",),
+                "fast_h3": ("FASTH3_DEPLOYMENT",),
             },
         }
 
@@ -194,19 +230,56 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         width: int,
         height: int,
         fps: int,
-        num_frames: int,
+        duration: float,
         negative_prompt: str | None = None,
         frame: torch.Tensor | None = None,
         references: dict | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
+        fast_h3: dict | None = None,
         **kwargs,
     ):
         if kwargs:
             logger.info("Uncaught kwargs: %s", kwargs)
         logger.debug("Got sampling params: %s", sampling_params)
         logger.debug("Got model params: %s", model_params)
+
+        if fast_h3 is not None:
+            if frame is not None or references is not None:
+                raise ValueError("FastH3 Preview supports T2VA only; disconnect frame and references inputs.")
+            if lora is not None:
+                raise ValueError(
+                    "FastH3 is already fused into the selected server; disconnect the request-level LoRA input."
+                )
+
+            url, model, profile = _resolve_fast_h3_deployment(fast_h3)
+            logger.info("Using FastH3 deployment profile %s at %s", profile, url)
+            fps = FASTH3_FPS
+
+            if sampling_params is None:
+                sampling_params = DiffusionSamplingParams()
+            elif isinstance(sampling_params, list):
+                if len(sampling_params) != 1:
+                    raise ValueError("FastH3 expects a single diffusion sampling params group.")
+                sampling_params = sampling_params[0].__class__(sampling_params[0])
+            else:
+                sampling_params = sampling_params.__class__(sampling_params)
+            sampling_params["num_inference_steps"] = FASTH3_INFERENCE_STEPS
+
+            # FastH3 owns both modality shifts. Sending the ordinary H3 values
+            # from a connected H3 Params node would turn a deployment choice
+            # into a request-level override, which the server intentionally
+            # rejects when it differs from the fused adapter contract.
+            if model_params is not None:
+                model_params = model_params.__class__(model_params)
+                model_params.pop("flow_shift", None)
+                model_params.pop("audio_flow_shift", None)
+
+        # Frames stay the wire unit. Convert after the FastH3 branch above, so the
+        # duration is measured against the fps the server will actually apply.
+        num_frames = max(1, round(duration * fps))
+
         validate_model_and_sampling_params_types(model, sampling_params)
 
         # Currently, all video generation models are single-stage diffusion models
@@ -693,6 +766,59 @@ class VLLMOmniRemoteLoRA:
             "int_id": int(int_id) if int_id > 0 else None,
         }
         return (lora,)
+
+
+class VLLMOmniFastH3Deployment:
+    """Select a vLLM-Omni service that fused FastH3 at startup."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": (
+                    "STRING",
+                    {
+                        "default": "http://localhost:8000/v1",
+                        "tooltip": "URL of a vLLM-Omni server started with a FastH3 --lora-path.",
+                    },
+                ),
+                "model": (
+                    "STRING",
+                    {
+                        "default": "MiniMaxAI/MiniMax-H3",
+                        "tooltip": "Model name exposed by the FastH3 deployment.",
+                    },
+                ),
+                "profile": (
+                    list(FASTH3_PROFILES),
+                    {
+                        "default": FASTH3_PROFILES[0],
+                        "tooltip": "Must match the FastH3 adapter and attention backend used by the server.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("FASTH3_DEPLOYMENT",)
+    RETURN_NAMES = ("deployment",)
+    FUNCTION = "get_deployment"
+    CATEGORY = "vLLM-Omni"
+    DESCRIPTION = (
+        "Selects a server with FastH3 fused at startup. The connected Generate Video node uses T2VA, "
+        "four inference steps, and 24 FPS without sending a request-level LoRA."
+    )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, url, model, profile) -> str | Literal[True]:
+        try:
+            _resolve_fast_h3_deployment({"url": url, "model": model, "profile": profile})
+        except ValueError as exc:
+            return str(exc)
+        return True
+
+    def get_deployment(self, url: str, model: str, profile: str):
+        url, model, profile = _resolve_fast_h3_deployment({"url": url, "model": model, "profile": profile})
+        return (FastH3Deployment({"url": url, "model": model, "profile": profile}),)
 
 
 class VLLMOmniQwenTTSParams:

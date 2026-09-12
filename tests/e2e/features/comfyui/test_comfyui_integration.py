@@ -24,6 +24,7 @@ import requests
 import torch
 from comfy_api.input import AudioInput, VideoInput
 from comfyui_vllm_omni.nodes import (
+    VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
     VLLMOmniGenerateVideo,
     VLLMOmniTTS,
@@ -78,6 +79,7 @@ class SamplingKind(str, Enum):
     TTS_DIFFUSION_SINGLE = "tts_diffusion_single"
     VIDEO_NONE = "video_none"
     VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
+    VIDEO_FASTH3 = "video_fasth3"
     VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
     VIDEO_REF2VA_MULTI_VIDEO = "video_ref2va_multi_video"
 
@@ -89,6 +91,9 @@ VIDEO_WIDTH = 32
 VIDEO_HEIGHT = 32
 VIDEO_FPS = 8
 VIDEO_NUM_FRAMES = 5
+VIDEO_DURATION = VIDEO_NUM_FRAMES / VIDEO_FPS  # 0.625 s at the generic 8 fps
+# FastH3 pins 24 fps, so the same duration is a different frame count there.
+VIDEO_FASTH3_NUM_FRAMES = round(VIDEO_DURATION * 24)
 DIFFUSION_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
     {
         "n": 2,
@@ -394,6 +399,24 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 LORA_PARAMS,
             )
             _assert_model_param_values(received_sampling_params_list[0], VIDEO_MODEL_PARAMS)
+        elif sampling_case.kind is SamplingKind.VIDEO_FASTH3:
+            assert len(received_sampling_params_list) == 1
+            received = received_sampling_params_list[0]
+            _assert_sampling_param_values(
+                received,
+                {
+                    "width": VIDEO_WIDTH,
+                    "height": VIDEO_HEIGHT,
+                    "num_frames": VIDEO_FASTH3_NUM_FRAMES,
+                    "fps": 24,
+                    "num_inference_steps": 4,
+                },
+            )
+            assert received.lora_request is None
+            # t2va is refused without an explicit ratio; 32x32 derives "1:1".
+            _assert_model_param_values(received, {"task": "t2va", "aspect_ratio": "1:1"})
+            assert "flow_shift" not in received.extra_args
+            assert "audio_flow_shift" not in received.extra_args
         elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO:
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
@@ -861,7 +884,7 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
         "width": VIDEO_WIDTH,
         "height": VIDEO_HEIGHT,
         "fps": VIDEO_FPS,
-        "num_frames": VIDEO_NUM_FRAMES,
+        "duration": VIDEO_DURATION,
         "model_params": VIDEO_MODEL_PARAMS,
     }
     if image_input:
@@ -872,6 +895,51 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
         kwargs["lora"] = sampling_case.lora
 
     result = await node.generate(**kwargs)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], VideoInput)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        ServerCase(
+            served_model="MiniMaxAI/MiniMax-H3",
+            stage_list=["diffusion"],
+            stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+            outputs=[_build_diffusion_video_output()],
+        )
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [SamplingCase(kind=SamplingKind.VIDEO_FASTH3, sampling_params=DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS)],
+    indirect=True,
+)
+async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingCase):
+    deployment_node = VLLMOmniFastH3Deployment()
+    (deployment,) = deployment_node.get_deployment(
+        url=api_server,
+        model="MiniMaxAI/MiniMax-H3",
+        profile="dense-datafree",
+    )
+
+    result = await VLLMOmniGenerateVideo().generate(
+        url="http://ignored.invalid/v1",
+        model="ignored-model",
+        prompt="A singer performs on a neon-lit stage.",
+        negative_prompt="",
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=VIDEO_FPS,
+        duration=VIDEO_DURATION,
+        sampling_params=sampling_case.sampling_params,
+        model_params=H3_MODEL_PARAMS,
+        fast_h3=deployment,
+    )
 
     assert isinstance(result, tuple)
     assert len(result) == 1
@@ -944,7 +1012,7 @@ async def test_video_generation_node_minimax_h3_ref2va(
         width=VIDEO_WIDTH,
         height=VIDEO_HEIGHT,
         fps=VIDEO_FPS,
-        num_frames=VIDEO_NUM_FRAMES,
+        duration=VIDEO_DURATION,
         references=references,
         model_params=H3_MODEL_PARAMS,
     )

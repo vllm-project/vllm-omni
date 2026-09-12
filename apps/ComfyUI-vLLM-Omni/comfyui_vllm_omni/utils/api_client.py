@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 An high-level API client adapter that forwards ComfyUI inputs to vLLM-Omni's REST API,
 and transforms the API responses back to ComfyUI formats.
@@ -364,6 +367,8 @@ class VLLMOmniClient:
             form_fields = params_builder(
                 model_params or {},
                 extra_params={**extra_params, "task": video_task},
+                width=width,
+                height=height,
             )
             for k, v in form_fields.items():
                 form.add_field(k, v if isinstance(v, str) else str(v))
