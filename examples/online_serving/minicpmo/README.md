@@ -279,6 +279,39 @@ generation records `clock=media`; artifacts generated with
 `--pace as-fast-as-possible` record `clock=invalid` and evaluation rejects
 them unless `--allow-invalid-clock` is explicit.
 
+### Judge context overflow with sampled frames
+
+`--judge-frame-overflow error` is the default: a rejected judge request fails
+without changing its input. To opt into reduced-frame recovery, add
+`--judge-frame-overflow reduce` to `evaluate`, normally together with
+`--judge-video-mode frame-sample`.
+
+The policy applies to both temporal image-frame calls and frame-sample content
+calls. It retries only explicit context-length errors returned as HTTP 400 or
+500. Each retry uses approximately half as many frames, sampled uniformly from
+the original timeline. Multiple retained frames preserve the endpoints; a
+single retained frame uses the original middle frame. Ordinary HTTP failures,
+rate limits, transport timeouts, and an overflow with only one frame remaining
+still propagate. The `video_url` content request is unchanged; temporal judging
+always uses image frames and can still use the opt-in policy.
+
+This is failure recovery, **not proactive token budgeting**. It does not resize
+images, estimate the judge's tokenizer, guarantee that one image fits, or recover
+an oversized request that only times out instead of returning a recognized
+context-length error.
+
+Each score records `judge_frame_overflow`. Content and temporal frame results
+record `frame_count_initial`, `frame_count`, and `frame_budget_retries` (the number
+of recovery retries, not a measured token budget). The RTD summary reports
+`judge_frame_overflow_policies` and `frame_reduction_samples`.
+
+Reduced frames can omit short events or useful OCR evidence and therefore change
+the evaluation workload. Use a separate `--score-root` for each policy/model
+configuration, or explicitly use `--overwrite`; otherwise existing score files
+are reused. Do not compare mixed-policy summaries as though they used identical
+inputs. No claim is made that reduced-frame scores equal the original protocol's
+scores.
+
 ## Related examples
 
 - [Offline MiniCPM-o inference](../../offline_inference/minicpmo/)

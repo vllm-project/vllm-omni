@@ -21,6 +21,33 @@ from vllm_omni.entrypoints.cli.benchmark.omni_duplex_eval import OmniDuplexEvalS
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
+@pytest.mark.parametrize("policy", [None, "error", "reduce"])
+def test_cli_forwards_explicit_frame_overflow_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy):
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    argv = [
+        "evaluate",
+        "--response-root",
+        str(tmp_path / "responses"),
+        "--score-root",
+        str(tmp_path / "scores"),
+        "--judge-model",
+        "fixture-judge",
+    ]
+    if policy is not None:
+        argv.extend(["--judge-frame-overflow", policy])
+    sample = DuplexSample("sample", "RTD_OCR", "rtd", None, tmp_path / "video.mp4")
+    monkeypatch.setattr(cli, "load_samples", lambda *args, **kwargs: [sample])
+    observed = []
+
+    def evaluate(*args, **kwargs):
+        observed.append(kwargs["judge_frame_overflow"])
+
+    monkeypatch.setattr(cli, "evaluate_sample", evaluate)
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args(argv))
+    assert observed == [policy or "error"]
+
+
 def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys):
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
