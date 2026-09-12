@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
 from typing import Any
 
@@ -123,6 +126,8 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     async_chunk: bool = False
     session_mode: str = "turn"
+    # Resolved per-stage runner-owned vocoder CUDA Graph configuration.
+    vocoder_cudagraph_config: dict[str, Any] | None = None
     retains_state_across_chunks: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
