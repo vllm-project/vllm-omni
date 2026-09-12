@@ -252,6 +252,14 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
 
+        # The AR bridge carries the target size for both T2I and IT2I.
+        # Resolve it before layout preparation and the pipeline's size fallback,
+        # while preserving explicitly configured sampling dimensions.
+        if request.sampling_params.height is None and prompt.get("height") is not None:
+            request.sampling_params.height = int(prompt["height"])
+        if request.sampling_params.width is None and prompt.get("width") is not None:
+            request.sampling_params.width = int(prompt["width"])
+
         multi_modal_data = prompt.get("multi_modal_data") or {}
         raw_images = multi_modal_data.get("image")
         if raw_images is None:
@@ -262,13 +270,11 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
             cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
             prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
 
-            bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
-            bridge_w = prompt.get("width") if isinstance(prompt, dict) else None
             first_image_w, first_image_h = _to_pil_image(image_list[0]).size
             if request.sampling_params.width is None:
-                request.sampling_params.width = int(bridge_w or first_image_w)
+                request.sampling_params.width = int(first_image_w)
             if request.sampling_params.height is None:
-                request.sampling_params.height = int(bridge_h or first_image_h)
+                request.sampling_params.height = int(first_image_h)
 
         request.prompt = prompt
         if prepare_diffusion_kv_layout:

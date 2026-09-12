@@ -52,7 +52,10 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
-from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+from vllm_omni.engine.stage_init_utils import (
+    build_engine_args_dict_from_omni_stage_config,
+    build_legacy_engine_args_dict,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -121,6 +124,39 @@ def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [1, 1]
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["turn", "turn"]
+
+
+def test_hunyuan_image3_pd_structured_config_projects_vllm_kv_transfer() -> None:
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_pd")
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
+
+    prefill = omni_config.stage_by_id(0)
+    decode = omni_config.stage_by_id(1)
+    assert prefill.scheduler_config.enable_chunked_prefill is True
+    assert decode.scheduler_config.enable_chunked_prefill is True
+    assert prefill.cache_config.enable_prefix_caching is False
+    assert decode.cache_config.enable_prefix_caching is False
+    assert prefill.connector_config.kv_transfer_config == {
+        "kv_connector": "MooncakeConnector",
+        "kv_role": "kv_producer",
+        "kv_rank": 0,
+        "kv_parallel_size": 2,
+        "kv_ip": "127.0.0.1",
+        "kv_connector_extra_config": {"mooncake_bootstrap_port": 25201},
+    }
+    assert decode.connector_config.kv_transfer_config == {
+        "kv_connector": "MooncakeConnector",
+        "kv_role": "kv_consumer",
+        "kv_rank": 1,
+        "kv_parallel_size": 2,
+        "kv_ip": "127.0.0.1",
+        "kv_connector_extra_config": {"mooncake_bootstrap_port": 25202},
+    }
+
+    prefill_args = build_engine_args_dict_from_omni_stage_config(prefill, "dummy-model")
+    decode_args = build_engine_args_dict_from_omni_stage_config(decode, "dummy-model")
+    assert prefill_args["kv_transfer_config"]["kv_role"] == "kv_producer"
+    assert decode_args["kv_transfer_config"]["kv_role"] == "kv_consumer"
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
@@ -747,6 +783,7 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageConnectorConfig)} == {
         "async_chunk",
         "omni_kv_config",
+        "kv_transfer_config",
         "stage_connector",
         "output_connectors",
         "input_connectors",

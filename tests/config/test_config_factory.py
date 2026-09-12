@@ -21,6 +21,7 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     DeployConfig,
+    PDRole,
     PipelineConfig,
     StageConfig,
     StageDeployConfig,
@@ -38,6 +39,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -150,6 +152,15 @@ class TestStageConfig:
         omega_config = config.to_omegaconf()
 
         assert omega_config.session_mode == "duplex"
+
+    def test_to_omegaconf_preserves_pd_role(self):
+        config = StageConfig(
+            stage_id=0,
+            model_stage="AR",
+            pd_role=PDRole.PREFILL,
+        )
+
+        assert config.to_omegaconf().pd_role == "prefill"
 
     def test_to_omegaconf_with_runtime_overrides(self):
         """Test that runtime overrides are applied to OmegaConf output."""
@@ -570,6 +581,48 @@ class TestPipelineDiscovery:
         assert "qwen3_omni_moe" in OMNI_PIPELINES
         assert "qwen3_omni_moe_thinker_only" in OMNI_PIPELINES
         assert "qwen3_tts" in OMNI_PIPELINES
+        assert "hunyuan_image3_pd" in OMNI_PIPELINES
+
+    def test_hunyuan_image3_pd_deploy_wiring(self):
+        pipeline = resolve_pipeline_config("hunyuan_image3_pd")
+        assert isinstance(pipeline, PipelineConfig)
+
+        deploy = load_deploy_config(Path(get_deploy_config_path("hunyuan_image_3_moe_pd.yaml")))
+        assert deploy.connectors is not None
+        assert set(deploy.connectors) == {"rdma_connector", "shared_memory_connector"}
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        omega_stages = [stage.to_omegaconf() for stage in stages]
+
+        assert [stage.input_sources for stage in stages] == [[], [0], [1]]
+        assert [stage.pd_role for stage in stages] == [PDRole.PREFILL, PDRole.DECODE, None]
+        assert [stage.is_comprehension for stage in stages] == [True, False, False]
+        assert [stage.final_output for stage in stages] == [False, True, True]
+        assert [stage.final_output_type for stage in stages] == [None, "text", "image"]
+        assert PDDisaggregationMixin.detect_pd_separation_from_stage_configs(omega_stages) == (0, 1)
+        assert PDDisaggregationMixin.detect_pd_separation_from_stage_configs(list(pipeline.stages)) == (0, 1)
+        assert PDDisaggregationMixin.get_mooncake_bootstrap_addr(omega_stages[0]) == "http://127.0.0.1:25201"
+
+        prefill_kv = stages[0].yaml_engine_args["kv_transfer_config"]
+        decode_kv = stages[1].yaml_engine_args["kv_transfer_config"]
+        assert prefill_kv["kv_connector"] == decode_kv["kv_connector"] == "MooncakeConnector"
+        assert prefill_kv["kv_role"] == "kv_producer"
+        assert decode_kv["kv_role"] == "kv_consumer"
+        assert (prefill_kv["kv_rank"], decode_kv["kv_rank"]) == (0, 1)
+        assert prefill_kv["kv_parallel_size"] == decode_kv["kv_parallel_size"] == 2
+        assert prefill_kv["kv_ip"] == decode_kv["kv_ip"] == "127.0.0.1"
+        assert prefill_kv["kv_connector_extra_config"]["mooncake_bootstrap_port"] == 25201
+        assert decode_kv["kv_connector_extra_config"]["mooncake_bootstrap_port"] == 25202
+        assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
+        assert stages[1].yaml_engine_args["tensor_parallel_size"] == 2
+        assert stages[0].yaml_runtime["env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "25201"
+        assert stages[1].yaml_runtime["env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "25202"
+
+        assert "omni_kv_config" not in stages[0].yaml_engine_args
+        assert "output_connectors" not in stages[0].yaml_extras
+        assert stages[1].yaml_engine_args["omni_kv_config"]["need_send_cache"] is True
+        assert stages[1].yaml_extras["output_connectors"] == {"to_stage_2": "shared_memory_connector"}
+        assert stages[2].yaml_engine_args["omni_kv_config"]["need_recv_cache"] is True
+        assert stages[2].yaml_extras["input_connectors"] == {"from_stage_1": "shared_memory_connector"}
 
     def test_registry_resolver_qwen3_omni_all_stages(self):
         """Test that providing the HF config for qwen3 omni with audio enabled uses all stages."""

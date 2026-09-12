@@ -12,6 +12,8 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+from vllm_omni.engine.pd_continuation import PDContinuation
+
 
 class PromptEmbedsPayload(msgspec.Struct):
     """Serialized prompt embeddings payload for direct transfer.
@@ -75,6 +77,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
     # Optional additional information dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
+    pd_continuation: PDContinuation | None = None
     # Runner-owned runtime payload. This is materialized directly into
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
@@ -121,6 +124,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             abort_immediately=request.abort_immediately,
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
+            pd_continuation=getattr(request, "pd_continuation", None),
         )
 
 
