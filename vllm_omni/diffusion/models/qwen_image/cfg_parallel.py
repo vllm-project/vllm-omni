@@ -42,6 +42,8 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         image_latents: torch.Tensor | None = None,
         cfg_normalize: bool = True,
         additional_transformer_kwargs: dict[str, Any] | None = None,
+        resume_from_step: int = 0,
+        resume_latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Diffusion loop with optional classifier-free guidance.
@@ -70,16 +72,28 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
+        # Inter-request cache: seed latents from cache when resuming.
+        if resume_from_step > 0 and resume_latents is not None:
+            latents = resume_latents.to(device=latents.device, dtype=latents.dtype)
+            self.scheduler._step_index = resume_from_step
+            self.scheduler.set_begin_index(resume_from_step)
+        # Tell the step-recorder hook (if any) to skip the cached steps.
+        _recorder = getattr(self, "_step_latents_recorder", None)
+        if _recorder is not None:
+            _recorder.resume_from_step = resume_from_step
+
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
+                # Step hooks: callbacks may skip this step (e.g. resume).
+                if not self.on_diffuse_step_begin(i, t):
+                    pbar.update()
+                    continue
                 if self.interrupt:
                     continue
                 self._current_timestep = t
 
-                # Broadcast timestep to match batch size
                 timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
-                # Concatenate image latents with noise latents if available (for editing pipelines)
                 latent_model_input = latents
                 if image_latents is not None:
                     latent_model_input = torch.cat([latents, image_latents], dim=1)
@@ -108,10 +122,8 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 else:
                     negative_kwargs = None
 
-                # For editing pipelines, we need to slice the output to remove condition latents
                 output_slice = latents.size(1) if image_latents is not None else None
 
-                # Predict noise with automatic CFG parallel handling
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg,
                     true_cfg_scale,
@@ -121,8 +133,9 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     output_slice,
                 )
 
-                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                self.on_diffuse_step_end(i, t, latents)
 
                 pbar.update()
 

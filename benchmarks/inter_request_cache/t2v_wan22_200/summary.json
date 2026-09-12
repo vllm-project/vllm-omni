@@ -1,0 +1,47 @@
+{
+  "model": "Wan2.2-T2V-A14B",
+  "task": "t2v",
+  "video_config": "832x480, 81 frames, 24 fps",
+  "num_inference_steps": 40,
+  "seed": 42,
+  "num_prompts": 200,
+  "hardware": "16x Ascend 910B (CANN 9.0.0), 8-way TP",
+  "prompt_set": "T2V-CompBench CLIP-similarity cluster (200 prompts, ~78% pairwise-reachable at 0.75)",
+  "stages": {
+    "baseline": {
+      "backend": "cache_dit",
+      "duration_s": 24946.0,
+      "throughput_qps": 0.008,
+      "latency_mean_s": 124.73,
+      "latency_p50_s": 121.9,
+      "latency_p95_s": 133.0,
+      "latency_p99_s": 133.4,
+      "viclip_score_mean": 0.2437,
+      "viclip_score_std": 0.0334
+    },
+    "warmup": {
+      "backend": "inter_request+cache_dit",
+      "duration_s": 24277.27,
+      "throughput_qps": 0.0082,
+      "latency_mean_s": 120.7074,
+      "latency_p50_s": 123.7583,
+      "latency_p95_s": 135.6375,
+      "latency_p99_s": 136.9362,
+      "viclip_score_mean": 0.2328,
+      "viclip_score_std": 0.0426
+    },
+    "cache_hit": {
+      "backend": "inter_request+cache_dit",
+      "duration_s": 335.13,
+      "throughput_qps": 0.5968,
+      "latency_mean_s": 0.9878,
+      "latency_p50_s": 0.8583,
+      "latency_p95_s": 1.5681,
+      "latency_p99_s": 1.6226,
+      "viclip_score_mean": 0.2328,
+      "viclip_score_std": 0.0426
+    }
+  },
+  "hit_rate": 1.0,
+  "throughput_speedup": 126.27
+}

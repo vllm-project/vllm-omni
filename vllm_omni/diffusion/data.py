@@ -615,6 +615,30 @@ class DiffusionCacheConfig:
     # Policy for force refresh: "once" refreshes only at the hint step,
     # "repeat" refreshes every force_refresh_step_hint steps.
     force_refresh_step_policy: str = "once"
+    # Inter-request cache parameters [inter_request only]
+    inter_request_max_entries: int = 100
+    # DiTCacheStore CPU hot-cache budget; 0 = shell-only mode (latents in LMCache)
+    inter_request_max_memory_gb: float = 0.0
+    inter_request_record_step_latents: bool = False
+    inter_request_step_latents_dir: str = "./step_latents"
+    inter_request_persistent_cache_dir: str | None = None
+    # LMCache-backed CPU→Disk tiering: when disk_dir is set, latent tensors
+    # are stored via LMCache ECCacheEngine (with built-in CPU→Disk layering +
+    # LRU eviction). None = disable tiering (original behaviour).
+    inter_request_lmcache_disk_dir: str | None = None
+    inter_request_lmcache_max_cpu_gb: float = 5.0  # LMCache CPU pool size (GB)
+    inter_request_lmcache_max_disk_gb: float = 100.0  # LMCache disk quota (GB)
+    # CLIP-based semantic matching parameters [inter_request only]
+    inter_request_clip_model_path: str | None = None
+    inter_request_clip_threshold: float = 0.75
+    inter_request_clip_min_skip: int = 5
+    inter_request_clip_max_skip_ratio: float = 0.5
+    # Max number of step latents to store per cache entry. Only the first N
+    # denoising steps are cached; semantic-hit resume beyond N is clamped to N.
+    # This drastically reduces per-entry size (e.g. 10 steps instead of 40).
+    # 0 = store all steps (original behaviour).
+    inter_request_max_stored_steps: int = 0
+    inter_request_use_t2i_penalty: bool = True
 
     # step_cache parameters [step_cache only] — DreamZero velocity schedule
     step_cache_dit_enabled: bool = True

@@ -1,0 +1,46 @@
+{
+  "model": "Qwen-Image",
+  "task": "t2i",
+  "image_size": "1024x1024",
+  "num_inference_steps": 44,
+  "seed": 42,
+  "num_prompts": 7975,
+  "hardware": "16x Ascend 910B (CANN 9.0.0)",
+  "stages": {
+    "baseline": {
+      "backend": "cache_dit",
+      "duration_s": 69600.24,
+      "throughput_qps": 0.1146,
+      "latency_mean_s": 8.7273,
+      "latency_p50_s": 8.3546,
+      "latency_p95_s": 9.9049,
+      "latency_p99_s": 9.9934,
+      "clip_score_mean": 27.9033,
+      "clip_score_std": 3.7299
+    },
+    "warmup": {
+      "backend": "inter_request+cache_dit",
+      "duration_s": 66525.06,
+      "throughput_qps": 0.1199,
+      "latency_mean_s": 8.3417,
+      "latency_p50_s": 8.4020,
+      "latency_p95_s": 9.6480,
+      "latency_p99_s": 10.0334,
+      "clip_score_mean": 26.3513,
+      "clip_score_std": 5.3133
+    },
+    "cache_hit": {
+      "backend": "inter_request+cache_dit",
+      "duration_s": 26347.26,
+      "throughput_qps": 0.3027,
+      "latency_mean_s": 3.3037,
+      "latency_p50_s": 0.7668,
+      "latency_p95_s": 8.3906,
+      "latency_p99_s": 8.7071,
+      "clip_score_mean": 26.2243,
+      "clip_score_std": 5.4022
+    }
+  },
+  "hit_rate": 0.447,
+  "throughput_speedup": 2.64
+}
