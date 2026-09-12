@@ -60,6 +60,14 @@ _MAX_EVENT_BYTES = 15 * 1024 * 1024
 class DuplexSessionRunnerMixin:
     """Run one ordered WebSocket mailbox for a duplex session."""
 
+    @staticmethod
+    def _native_input_sample_rate_hz(session: DuplexSession) -> int:
+        """Return the fixed input rate declared by a native append runtime."""
+        sample_rate_hz = session.capabilities.input_sample_rate_hz
+        if sample_rate_hz is None:
+            raise ValueError("The selected native duplex runtime has no input sample rate")
+        return validate_input_sample_rate_hz(sample_rate_hz)
+
     async def handle_session(
         self,
         websocket: WebSocket,
@@ -1562,10 +1570,14 @@ class DuplexSessionRunnerMixin:
                     turn_based_server_vad = server_vad_config is not None and not native_input
                     if not turn_based_server_vad:
                         try:
+                            target_sample_rate_hz = (
+                                self._native_input_sample_rate_hz(session) if native_input else 16_000
+                            )
                             audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
                                 audio,
                                 fmt,
                                 sample_rate_hz=sample_rate_hz,
+                                target_sample_rate_hz=target_sample_rate_hz,
                             )
                         except ValueError as exc:
                             await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
@@ -1615,8 +1627,9 @@ class DuplexSessionRunnerMixin:
                         previous_scratch_bytes = pipeline.scratch_bytes
                         try:
                             if native_input:
-                                if fmt != "pcm_f32le" or sample_rate_hz != pipeline.sample_rate_hz:
-                                    raise ValueError("native server_vad input must be mono PCM float32 at 16000 Hz")
+                                if fmt != "pcm_f32le":
+                                    raise ValueError("native server_vad input must be mono PCM float32")
+                                source_sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
                                 raw_audio = base64.b64decode(audio, validate=True)
                                 if len(raw_audio) % np.dtype("<f4").itemsize:
                                     raise ValueError("native server_vad input contains an incomplete float32 sample")
@@ -1680,7 +1693,10 @@ class DuplexSessionRunnerMixin:
                                 continue
                         try:
                             vad_batch = (
-                                await pipeline.push(normalized_audio)
+                                await pipeline.push_float32(
+                                    normalized_audio,
+                                    source_sample_rate_hz=source_sample_rate_hz,
+                                )
                                 if native_input
                                 else await pipeline.push_pcm16(
                                     raw_audio,

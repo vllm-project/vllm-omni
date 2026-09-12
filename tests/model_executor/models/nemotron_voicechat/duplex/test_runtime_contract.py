@@ -55,6 +55,12 @@ def _plan(extension, *, input_seq: int):
     )
 
 
+def test_serving_capabilities_declare_the_model_input_rate() -> None:
+    capabilities = NemotronVoiceChatServingRuntimeAdapter.capabilities(max_sessions=1)
+
+    assert capabilities.input_sample_rate_hz == 16_000
+
+
 def test_first_append_prefills_prompt_then_each_append_consumes_one_frame() -> None:
     extension = NemotronVoiceChatDuplexRuntimeExtension()
 

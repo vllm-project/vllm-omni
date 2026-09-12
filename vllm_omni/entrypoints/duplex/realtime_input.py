@@ -374,6 +374,10 @@ class RealtimeInputTranslator(RealtimeStateOwner):
                         audio,
                         fmt,
                         sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
+                        # Preserve the client rate: an implicit session may
+                        # not have a resolved model. The session runner
+                        # resamples after resolving input_sample_rate_hz.
+                        target_sample_rate_hz=None,
                     )
                 except ValueError as exc:
                     await self._send_realtime_payload(
@@ -1402,6 +1406,10 @@ class RealtimeInputTranslator(RealtimeStateOwner):
                         audio,
                         fmt,
                         sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
+                        # Preserve the client rate: an implicit session may
+                        # not have a resolved model. The session runner
+                        # resamples after resolving input_sample_rate_hz.
+                        target_sample_rate_hz=None,
                     )
                 except ValueError as exc:
                     await self._send_realtime_payload(

@@ -28,6 +28,24 @@ def test_pcm16_input_conversion_is_pure_and_reports_target_rate():
     assert np.allclose(samples, [-1.0, 0.0, 32767 / 32768])
 
 
+def test_pcm_f32_input_conversion_resamples_without_changing_format():
+    source = np.linspace(-0.5, 0.5, 160, dtype="<f4")
+    encoded = base64.b64encode(source.tobytes()).decode("ascii")
+
+    converted, fmt, sample_rate = convert_input_audio_with_rate(
+        encoded,
+        "pcm_f32le",
+        sample_rate_hz=16_000,
+        target_sample_rate_hz=24_000,
+    )
+
+    assert fmt == "pcm_f32le"
+    assert sample_rate == 24_000
+    samples = np.frombuffer(base64.b64decode(converted), dtype="<f4")
+    assert samples.size == 240
+    assert np.isfinite(samples).all()
+
+
 @pytest.mark.parametrize("sample_rate_hz", [8_000, 192_000])
 def test_pcm16_input_conversion_accepts_supported_sample_rate_boundaries(sample_rate_hz: int):
     encoded = base64.b64encode(np.zeros(8, dtype="<i2").tobytes()).decode("ascii")

@@ -499,6 +499,7 @@ def test_duplex_capabilities_do_not_claim_core_kv_or_input_append():
     assert caps["implementation_level"] == "serving_session_adapter"
     assert caps["supports_kv_lease"] is False
     assert caps["supports_input_append"] is False
+    assert caps["input_sample_rate_hz"] is None
     assert caps["supports_reencode_context"] is True
     assert caps["adapter_patterns"] == ["chunk_group_append"]
     assert "turn_commit_only" in caps["input_modes"]
@@ -510,6 +511,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
 
     assert caps["implementation_level"] == "model_native_duplex"
     assert caps["supports_input_append"] is True
+    assert caps["input_sample_rate_hz"] == 16_000
     assert caps["input_modes"] == ["append_audio_chunk"]
     assert caps["adapter_patterns"] == ["scheduler_data_plane"]
     assert caps["supports_model_internal_state"] is True

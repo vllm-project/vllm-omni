@@ -1404,12 +1404,35 @@ async def test_realtime_server_vad_input_path_uses_runtime_capability(native: bo
     assert append is not None
     if native:
         assert append["format"] == "pcm_f32le"
-        assert append["sample_rate_hz"] == 16_000
-        assert len(base64.b64decode(append["audio"])) == 160 * 4
+        assert append["sample_rate_hz"] == 24_000
+        assert len(base64.b64decode(append["audio"])) == 240 * 4
     else:
         assert append["format"] == "pcm16"
         assert append["sample_rate_hz"] == 24_000
         np.testing.assert_array_equal(np.frombuffer(base64.b64decode(append["audio"]), dtype="<i2"), source)
+
+
+@pytest.mark.asyncio
+async def test_native_realtime_input_preserves_the_client_rate_until_runtime_selection():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+    protocol.bind_native_input_append(True)
+
+    source = np.zeros(160, dtype="<i2")
+    append = await protocol._to_duplex_event(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(source.tobytes()).decode(),
+            "format": "pcm16",
+            "sample_rate_hz": 16_000,
+        }
+    )
+
+    assert append is not None
+    assert append["format"] == "pcm_f32le"
+    assert append["sample_rate_hz"] == 16_000
+    assert len(base64.b64decode(append["audio"])) == 160 * 4
 
 
 @pytest.mark.parametrize(("initial_rate_hz", "updated_rate_hz"), [(16_000, 24_000), (24_000, 16_000)])
