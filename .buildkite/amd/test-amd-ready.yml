@@ -160,6 +160,41 @@ steps:
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
 
+- label: "ROCm · Engine & Model Executor GPU Coverage (R2-01)"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  timeout_in_minutes: 20
+  artifact_paths:
+    - "artifacts/rocm-r2-01/**/*"
+  commands:
+    # Native AMD tests run from /app/vllm-omni, while Buildkite uploads
+    # artifacts relative to its checkout directory.
+    - export R2_01_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-r2-01"
+    - mkdir -p "$$R2_01_ARTIFACT_DIR"
+    # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
+    # Keep the initial ROCm burn-in scoped to the requested directories.
+    - >-
+      pytest --collect-only -q
+      tests/engine/ tests/model_executor/
+      -m 'core_model and cuda and not
+      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+      --run-level "core_model"
+      2>&1 | tee "$$R2_01_ARTIFACT_DIR/collected-nodeids.txt"
+    - >-
+      pytest -sv -ra
+      tests/engine/ tests/model_executor/
+      -m 'core_model and cuda and not
+      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$R2_01_ARTIFACT_DIR/pytest.xml"
+      2>&1 | tee "$$R2_01_ARTIFACT_DIR/pytest.log"
+    - >-
+      tail -n 100 "$$R2_01_ARTIFACT_DIR/pytest.log" >
+      "$$R2_01_ARTIFACT_DIR/pytest-summary.txt"
+
 - label: "Engine Test"
   agent_pool: mi300_1
   depends_on: amd-build
