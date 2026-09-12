@@ -153,6 +153,18 @@ class DuplexSessionRunnerMixin:
             if session is not None:
                 session.mark_closing()
 
+        def discard_native_input(
+            *,
+            session: DuplexSession,
+            native: ServingRuntimeSessionState,
+        ) -> None:
+            """Discard native input audio and accounting state."""
+            native.audio_buffer.clear()
+            session.release_all_input_bytes()
+            native.input_since_commit = False
+            native.speech_since_commit = False
+            native.clear_committed_audio()
+
         event_emit_lock = asyncio.Lock()
 
         async def send_outbound(payload: dict[str, object]) -> None:
@@ -902,11 +914,7 @@ class DuplexSessionRunnerMixin:
 
                 if event_type == "__timeout__":
                     begin_close("timeout")
-                    native.audio_buffer.clear()
-                    session.release_all_input_bytes()
-                    native.input_since_commit = False
-                    native.speech_since_commit = False
-                    native.clear_committed_audio()
+                    discard_native_input(session=session, native=native)
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -1022,11 +1030,7 @@ class DuplexSessionRunnerMixin:
                     if session.state == DuplexSessionState.CLOSED:
                         runtime_closed = True
                         return
-                    native.audio_buffer.clear()
-                    session.release_all_input_bytes()
-                    native.input_since_commit = False
-                    native.speech_since_commit = False
-                    native.clear_committed_audio()
+                    discard_native_input(session=session, native=native)
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -1048,14 +1052,10 @@ class DuplexSessionRunnerMixin:
                     return
 
                 if event_type == "input_audio_buffer.clear":
-                    native.audio_buffer.clear()
-                    session.release_all_input_bytes()
+                    discard_native_input(session=session, native=native)
                     server_vad_pipeline = self._server_vad_pipelines.get(session.session_id)
                     if server_vad_pipeline is not None:
                         server_vad_pipeline.reset()
-                    native.input_since_commit = False
-                    native.speech_since_commit = False
-                    native.clear_committed_audio()
                     cancelled = session.cancel_pending_input()
                     await emit_event(
                         {
@@ -1121,11 +1121,7 @@ class DuplexSessionRunnerMixin:
                     )
                     playback_was_active = self._assistant_playback_active(session)
                     if event_type in {"input.cancel", "barge_in"}:
-                        native.audio_buffer.clear()
-                        session.release_all_input_bytes()
-                        native.input_since_commit = False
-                        native.speech_since_commit = False
-                        native.clear_committed_audio()
+                        discard_native_input(session=session, native=native)
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
@@ -1999,11 +1995,7 @@ class DuplexSessionRunnerMixin:
                     ):
                         continue
                     if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
-                        native.input_since_commit = False
-                        native.speech_since_commit = False
-                        native.audio_buffer.clear()
-                        session.release_all_input_bytes()
-                        native.clear_committed_audio()
+                        discard_native_input(session=session, native=native)
                         await emit_event(
                             {
                                 "type": "input.committed",
@@ -2091,11 +2083,7 @@ class DuplexSessionRunnerMixin:
                         )
                         if commit_action is CommitAction.DEFER_ACTIVE_RESPONSE:
                             if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
-                                native.audio_buffer.clear()
-                                session.release_all_input_bytes()
-                                native.input_since_commit = False
-                                native.speech_since_commit = False
-                                native.clear_committed_audio()
+                                discard_native_input(session=session, native=native)
                                 if realtime_protocol is not None:
                                     await realtime_protocol.discard_pending_input_audio(
                                         audio_end_ms=session.overlap_speech_ms
