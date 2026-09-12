@@ -104,6 +104,33 @@ def extract_speaker_from_prompt(
 
 
 # =============================================================================
+# Prompt construction mode helpers
+# =============================================================================
+
+
+def extract_non_streaming_mode_from_request(request: Any) -> bool | None:
+    """Extract ``non_streaming_mode`` from a request's additional_information.
+
+    Returns:
+        True/False when explicitly set, otherwise None.
+    """
+    additional_information = getattr(request, "additional_information", None)
+    if additional_information is None:
+        return None
+    entries = getattr(additional_information, "entries", None)
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get("non_streaming_mode")
+    if entry is None:
+        return None
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, list) and list_data:
+        raw = list_data[0]
+        return raw if isinstance(raw, bool) else None
+    return None
+
+
+# =============================================================================
 # Language helpers
 # =============================================================================
 
