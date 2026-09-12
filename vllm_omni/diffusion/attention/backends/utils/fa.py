@@ -60,6 +60,9 @@ def is_flash_attn_4_available() -> bool:
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
 
+# True when flash_attn_func is provided by aiter (ROCm only).
+HAS_AITER_FLASH_ATTN = False
+
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
     try:
@@ -71,6 +74,8 @@ if current_omni_platform.is_rocm():
 
             flash_attn_func = _fa_func
             flash_attn_varlen_func = _fa_varlen
+
+            HAS_AITER_FLASH_ATTN = True
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_xpu():
