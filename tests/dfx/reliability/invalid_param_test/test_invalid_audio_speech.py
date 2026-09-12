@@ -37,9 +37,6 @@ _SPEECH_INVALID_EMBEDDING_ONLY_BODY = "__speech_invalid_embedding_only_body__"
 # as "unset". Strip clone fields from the batch envelope before asserting CustomVoice preset errors.
 _SPEECH_BATCH_NO_CLONE_FIELDS = "__speech_batch_no_clone_fields__"
 
-_SKIP_ISSUE_3649 = pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3649")
-
-
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 _L4_SPEECH_HW = hardware_marks(res={"cuda": "L4"})
@@ -141,7 +138,7 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
     [
         pytest.param({"input": ""}, ("input", "empty"), id="input_empty"),
         pytest.param({"input": "   "}, ("input", "empty"), id="input_whitespace_only"),
-        pytest.param({"voice": ""}, "Invalid voice", id="voice_empty", marks=_SKIP_ISSUE_3649),
+        pytest.param({"voice": ""}, "Invalid voice", id="voice_empty"),
         pytest.param(
             {"instructions": 123}, ("instructions", "string_type", "valid string"), id="instructions_wrong_type"
         ),
@@ -412,16 +409,15 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
 @pytest.mark.parametrize(
     "loc, overrides, err_message",
     [
-        pytest.param("item", {"input": ""}, ("input", "empty"), id="item_input_empty", marks=_SKIP_ISSUE_3649),
+        pytest.param("item", {"input": ""}, ("input", "empty"), id="item_input_empty"),
         pytest.param(
             "item",
             {"input": "   "},
             ("input", "empty"),
             id="item_input_whitespace_only",
-            marks=_SKIP_ISSUE_3649,
         ),
-        pytest.param("batch", {"voice": ""}, "Invalid voice", id="batch_voice_empty", marks=_SKIP_ISSUE_3649),
-        pytest.param("item", {"voice": ""}, "Invalid voice", id="item_voice_empty", marks=_SKIP_ISSUE_3649),
+        pytest.param("batch", {"voice": ""}, "Invalid voice", id="batch_voice_empty"),
+        pytest.param("item", {"voice": ""}, "Invalid voice", id="item_voice_empty"),
         pytest.param(
             "batch",
             {
@@ -432,7 +428,6 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
             },
             "Invalid voice",
             id="batch_voice_unknown_preset",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
@@ -443,7 +438,6 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
             },
             "Invalid voice",
             id="item_voice_unknown_preset",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "batch",
@@ -462,14 +456,12 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
             {"instructions": "x" * (_SPEECH_API_MAX_INSTRUCTIONS_CHARS + 1)},
             ("instructions", "too long"),
             id="batch_instructions_exceed_api_limit",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"instructions": "x" * (_SPEECH_API_MAX_INSTRUCTIONS_CHARS + 1)},
             ("instructions", "too long"),
             id="item_instructions_exceed_api_limit",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "batch",
@@ -502,42 +494,36 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
             {"language": ""},
             ("language", "invalid language", "chinese"),
             id="batch_language_empty",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"language": ""},
             ("language", "invalid language", "chinese"),
             id="item_language_empty",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "batch",
             {"ref_audio": "ftp://example.com/a.wav"},
             ("ref_audio", "URL"),
             id="batch_ref_audio_bad_scheme",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"ref_audio": "ftp://example.com/a.wav"},
             ("ref_audio", "URL"),
             id="item_ref_audio_bad_scheme",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "batch",
             {"ref_audio": "not_a_valid_uri"},
             ("ref_audio", "url"),
             id="batch_ref_audio_invalid_uri",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"ref_audio": "not_a_valid_uri"},
             ("ref_audio", "url"),
             id="item_ref_audio_invalid_uri",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "batch",
@@ -568,28 +554,24 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
             {"max_new_tokens": 0},
             ("max_new_tokens", "greater_than_equal"),
             id="batch_max_new_tokens_below_min",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"max_new_tokens": 0},
             ("max_new_tokens", "greater_than_equal"),
             id="item_max_new_tokens_below_min",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "batch",
             {"max_new_tokens": _SPEECH_API_MAX_NEW_TOKENS + 1},
             ("max_new_tokens", "exceed 4096"),
             id="batch_max_new_tokens_above_max",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"max_new_tokens": _SPEECH_API_MAX_NEW_TOKENS + 1},
             ("max_new_tokens", "exceed 4096"),
             id="item_max_new_tokens_above_max",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "batch",
@@ -613,7 +595,6 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
             },
             ("ref_text", "base task", "non-empty"),
             id="batch_ref_text_whitespace_only_base_clone",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
@@ -624,7 +605,6 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
             },
             ("ref_text", "base task", "non-empty"),
             id="item_ref_text_whitespace_only_base_clone",
-            marks=_SKIP_ISSUE_3649,
         ),
     ],
 )
@@ -787,21 +767,18 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "   ", "name": "v_ws_consent_{uuid}"},
             "consent",
             id="whitespace_consent",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
             {"consent": "bad/consent", "name": "v_bad_cons_{uuid}"},
             "consent",
             id="consent_path_sep",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
             {"consent": _VF_LONG_CONSENT, "name": "v_long_cons_{uuid}"},
             ("consent", "too long", "Failed to save"),
             id="consent_too_long",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -820,7 +797,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "consent_ok", "name": "v_long_ref_{uuid}", "ref_text": _VF_LONG_REF_TEXT},
             "ref_text",
             id="ref_text_too_long",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -831,7 +807,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             "speaker_description",
             id="speaker_description_too_long",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_pdf_type",
