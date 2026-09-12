@@ -13,7 +13,6 @@ It can send model inference requests to either a locally running vLLM-Omni servi
 !!! tip
     If you run both ComfyUI and vLLM-Omni on the same device, you can create separate virtual environments and use different Python versions for them.
 
-
 ## Installation
 
 Copy the `apps/ComfyUI-vLLM-Omni` folder to the `custom_nodes` subfolder of your ComfyUI installation. Your directory should look like `ComfyUI/custom_nodes/ComfyUI-vLLM-Omni`.
@@ -21,9 +20,10 @@ Copy the `apps/ComfyUI-vLLM-Omni` folder to the `custom_nodes` subfolder of your
 If you are running ComfyUI during copying, you should restart ComfyUI to load this extension.
 
 !!! tip
-    You can use utility websites such as https://download-directory.github.io/ to download a subdirectory of a repo. Also checkout community discussions (e.g., https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository) for more info.
+    You can use utility websites such as <https://download-directory.github.io/> to download a subdirectory of a repo. Also checkout community discussions (e.g., <https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository>) for more info.
 
 On the device and virtual environment you run ComfyUI, launch ComfyUI with
+
 ```bash
 cd ComfyUI
 
@@ -35,6 +35,7 @@ python main.py --cpu
 ```
 
 On the device and virtual environment you run vLLM-Omni, start a model service with
+
 ```bash
 vllm serve The_Model_ID_to_Serve --omni --port 8000
 ```
@@ -65,6 +66,18 @@ To build a simple workflow yourself,
     - For multi-stage models, you can connect multiple **AR Sampling Params** and **Diffusion Sampling Params** nodes to a **Multi-Stage Sampling Params List** node, and connect this node to the generation node.
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
+
+## MiniMax H3 text-to-video workflow
+
+The **MiniMax H3 Text to Video** template uses the existing remote Generate Video,
+H3 Params, sampling, and Remote LoRA nodes. It includes Base settings and an
+optional Turbo preset, with native resolution, 24 FPS, and `17k+5` frame counts.
+ComfyUI receives the generated video and audio from the server; it does not load
+H3 weights locally.
+
+See the [H3 workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/minimax-h3-t2v.md)
+for server setup, template import, Turbo configuration, recorded validation,
+and the shared audio-preservation prerequisite.
 
 ## Examples & Screenshots
 

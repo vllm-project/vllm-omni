@@ -13,7 +13,6 @@ It can send model inference requests to either a locally running vLLM-Omni servi
 > [!TIP]
 > If you run both ComfyUI and vLLM-Omni on the same device, you can create separate virtual environments and use different Python versions for them.
 
-
 ## Installation
 
 Copy this folder to the `custom_nodes` subfolder of your ComfyUI installation. Your directory should look like `ComfyUI/custom_nodes/ComfyUI-vLLM-Omni`.
@@ -21,9 +20,10 @@ Copy this folder to the `custom_nodes` subfolder of your ComfyUI installation. Y
 If you are running ComfyUI during copying, you should restart ComfyUI to load this extension.
 
 > [!TIP]
-> You can use utility websites such as https://download-directory.github.io/ to download a subdirectory of a repo. Also checkout community discussions (e.g., https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository) for more info.
+> You can use utility websites such as <https://download-directory.github.io/> to download a subdirectory of a repo. Also checkout community discussions (e.g., <https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository>) for more info.
 
 On the device and virtual environment you run ComfyUI, launch ComfyUI with
+
 ```bash
 cd ComfyUI
 
@@ -35,6 +35,7 @@ python main.py --cpu
 ```
 
 On the device and virtual environment you run vLLM-Omni, start a model service with
+
 ```bash
 vllm serve The_Model_ID_to_Serve --omni --port 8000
 ```
@@ -123,6 +124,14 @@ You can configure per-stage sampling parameters for multi-stage models.
 >
 > Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
 
+### MiniMax H3 Text to Video
+
+Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Video.json)
+for remote video generation with audio. It includes connected base presets and
+optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
+[workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
+settings, and saved-video validation, including the shared audio prerequisite.
+
 ### TTS (e.g., Qwen TTS series)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni TTS**)
@@ -178,11 +187,11 @@ Whenever you find an issue or problem, please
 
 Features
 
-- https://github.com/dougbtv/comfyui-vllm-omni/ The official reference implementation for ComfyUI integration with vLLM-Omni's DALL-E compatible image generation API.
-- https://github.com/Comfy-Org/ComfyUI/tree/master/comfy_extras ComfyUI's built-in node implementations.
+- <https://github.com/dougbtv/comfyui-vllm-omni/> The official reference implementation for ComfyUI integration with vLLM-Omni's DALL-E compatible image generation API.
+- <https://github.com/Comfy-Org/ComfyUI/tree/master/comfy_extras> ComfyUI's built-in node implementations.
 
 UI/UX design references
 
-- https://github.com/sgl-project/sglang/pull/15271 SGLang Diffusion's official ComfyUI integration for image and video generation.
-- https://github.com/SXQBW/ComfyUI-Qwen-Omni A third party ComfyUI integration for Qwen Omni series.
-- https://github.com/flybirdxx/ComfyUI-Qwen-TTS https://github.com/DarioFT/ComfyUI-Qwen3-TTS Third  party ComfyUI integrations for Qwen TTS series.
+- <https://github.com/sgl-project/sglang/pull/15271> SGLang Diffusion's official ComfyUI integration for image and video generation.
+- <https://github.com/SXQBW/ComfyUI-Qwen-Omni> A third party ComfyUI integration for Qwen Omni series.
+- <https://github.com/flybirdxx/ComfyUI-Qwen-TTS> <https://github.com/DarioFT/ComfyUI-Qwen3-TTS> Third  party ComfyUI integrations for Qwen TTS series.

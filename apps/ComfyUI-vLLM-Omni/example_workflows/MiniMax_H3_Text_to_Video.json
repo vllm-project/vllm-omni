@@ -1,0 +1,351 @@
+{
+  "last_node_id": 8,
+  "last_link_id": 3,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [
+        20,
+        20
+      ],
+      "size": [
+        310,
+        280
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "diffusion sampling params",
+          "type": "SAMPLING_PARAMS",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniDiffusionSampling"
+      },
+      "widgets_values": [
+        1,
+        50,
+        1.0,
+        1.0,
+        false,
+        false,
+        1101,
+        "fixed"
+      ],
+      "title": "Base sampling"
+    },
+    {
+      "id": 2,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        20,
+        340
+      ],
+      "size": [
+        310,
+        140
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MiniMax-H3 video params",
+          "type": "VIDEO_PARAMS",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3.0,
+        12.0,
+        "16:9"
+      ],
+      "title": "Base H3 params"
+    },
+    {
+      "id": 3,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        430,
+        20
+      ],
+      "size": [
+        430,
+        440
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "frame",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "link": null
+        },
+        {
+          "name": "sampling_params",
+          "type": "SAMPLING_PARAMS",
+          "link": 1
+        },
+        {
+          "name": "lora",
+          "type": "REMOTE_LORA",
+          "link": null
+        },
+        {
+          "name": "model_params",
+          "type": "VIDEO_PARAMS",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "A small stream flows through a sunlit forest. The camera slowly moves toward the water. Birds chirp in the trees and water gurgles over smooth stones. Natural continuous sound, no music.",
+        "",
+        1344,
+        768,
+        24,
+        124
+      ]
+    },
+    {
+      "id": 4,
+      "type": "SaveVideo",
+      "pos": [
+        940,
+        20
+      ],
+      "size": [
+        440,
+        440
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": null,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/MiniMax_H3_WF01",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "VLLMOmniRemoteLoRA",
+      "pos": [
+        430,
+        540
+      ],
+      "size": [
+        430,
+        160
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "lora",
+          "type": "REMOTE_LORA",
+          "links": null,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniRemoteLoRA"
+      },
+      "widgets_values": [
+        "",
+        "h3-turbo-v1.0-768p",
+        1.0,
+        1
+      ],
+      "title": "Optional Turbo: server LoRA path"
+    },
+    {
+      "id": 6,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [
+        20,
+        540
+      ],
+      "size": [
+        310,
+        280
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "diffusion sampling params",
+          "type": "SAMPLING_PARAMS",
+          "links": null,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniDiffusionSampling"
+      },
+      "widgets_values": [
+        1,
+        5,
+        1.0,
+        1.0,
+        false,
+        false,
+        1101,
+        "fixed"
+      ],
+      "title": "Turbo sampling (4 forwards)"
+    },
+    {
+      "id": 7,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        430,
+        740
+      ],
+      "size": [
+        310,
+        140
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MiniMax-H3 video params",
+          "type": "VIDEO_PARAMS",
+          "links": null,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3.0,
+        6.0,
+        "16:9"
+      ],
+      "title": "Turbo H3 params"
+    },
+    {
+      "id": 8,
+      "type": "Note",
+      "pos": [
+        940,
+        520
+      ],
+      "size": [
+        440,
+        440
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "Note"
+      },
+      "widgets_values": [
+        "MiniMax H3 Text to Video (WF-01)\n\nBASE: connected presets, 50 steps / video flow 12 / audio flow 3.\n\nTURBO: set LoRA local_path to the SERVER path of minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors from lightx2v/Minimax-h3-Turbo. Connect Turbo sampling, Turbo H3 params, and LoRA to Generate Video, replacing the two Base links. The 4-forward artifact needs 5 steps, video flow 6, audio flow 3. Do not use the ComfyUI-layout artifact.\n\nKeep frame and references disconnected for T2VA. Native landscape canvas: 1344x768, aspect_ratio 16:9, 24fps, 124 frames (17*7+5). Save Video keeps video and audio together.\n\nSet URL and served model name for your server. See docs/minimax-h3-t2v.md for setup and audio prerequisite. Source topology: Comfy-Org/workflow_templates/templates/video_minimax_h3_t2v.json."
+      ],
+      "title": "Setup / Base and Turbo"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      2,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      4,
+      "VIDEO_PARAMS"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.8,
+      "offset": [
+        50,
+        50
+      ]
+    }
+  },
+  "version": 0.4
+}

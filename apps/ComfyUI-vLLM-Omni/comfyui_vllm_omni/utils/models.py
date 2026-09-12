@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import re
 from typing import Any
@@ -45,8 +48,9 @@ def _minimaxh3_params_builder(
     form_fields: dict[str, Any] = {}
     merged_extra_params: dict[str, Any] = dict(extra_params or {})
 
-    if "flow_shift" in params:
-        form_fields["flow_shift"] = params.pop("flow_shift")
+    for key in ("flow_shift", "aspect_ratio"):
+        if key in params:
+            form_fields[key] = params.pop(key)
     for key in ("audio_flow_shift",):
         if key in params:
             merged_extra_params[key] = params.pop(key)
