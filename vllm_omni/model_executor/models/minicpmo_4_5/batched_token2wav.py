@@ -445,6 +445,7 @@ class BatchedToken2Wav(nn.Module):
         att_cache: torch.Tensor | None,
         attn_mask: torch.Tensor | None = None,
         valid_lengths: list[int] | None = None,
+        valid_frames: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._trt_stepper is not None and valid_lengths is None:
             out, new_cnn, new_att = self._trt_stepper.step(
@@ -460,6 +461,13 @@ class BatchedToken2Wav(nn.Module):
         time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
+        if valid_frames is not None and valid_frames < width:
+            # Every frame gets the speaker vector, so the padded columns would
+            # stay non-zero even with x/mu/cond zeroed -- and the estimator
+            # would then emit non-zero features there, leaving the
+            # chunk-boundary attention/CNN caches padding-derived. Zero them.
+            speaker_features = speaker_features.clone()
+            speaker_features[:, :, valid_frames:] = 0.0
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
@@ -693,6 +701,7 @@ class BatchedToken2Wav(nn.Module):
                     att_cache=old_att,
                     attn_mask=attn_mask,
                     valid_lengths=valid_lengths,
+                    valid_frames=mel_frames if pad_frames else None,
                 )
                 conditional, unconditional = estimate.split(batch_size, dim=0)
                 velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional

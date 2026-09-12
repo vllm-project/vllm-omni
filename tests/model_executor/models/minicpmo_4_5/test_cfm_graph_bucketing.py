@@ -104,3 +104,26 @@ def test_steady_state_cache_width_saturates_on_bucket_grid():
     assert width == cache_cap
     # (64, 304) -> (64, 368) -> (64, 404), then stable.
     assert shapes == {(64, 304), (64, 368), (64, 404)}
+
+
+def test_varied_chunk_lengths_collapse_onto_few_widths():
+    """Bucketing exists for the varied-length calls, not the steady 50-frame one.
+
+    The first/last chunk and the ``plan_token2wav_encode_slices`` splits land on
+    arbitrary lengths; those are the calls that would each become their own
+    capture shape. Pin that a realistic mix collapses onto a few padded widths.
+    """
+    varied = (7, 12, 17, 25, 33, 50, 51, 64)
+    padded = {
+        mel
+        + _cfm_pad_frames(
+            mel_frames=mel,
+            offset=300,
+            noise_capacity=30000,
+            bucket_frames=16,
+            disabled=False,
+        )
+        for mel in varied
+    }
+    assert len(padded) == 4, sorted(padded)  # 16 / 32 / 48 / 64
+    assert len(padded) < len(varied)
