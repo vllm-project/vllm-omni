@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import pytest
@@ -155,3 +158,64 @@ def test_build_and_log_summary_multiple_requests() -> None:
     r2_stage_entry = next(e for e in summary["stage_table"] if e["request_id"] == "r2")
     assert len(r1_stage_entry["stages"]) == 2
     assert len(r2_stage_entry["stages"]) == 1
+
+
+def test_merge_stage_metric_event_token_weights_tpot() -> None:
+    first = StageRequestStats(
+        batch_id=1,
+        batch_size=1,
+        num_tokens_in=10,
+        num_tokens_out=4,
+        stage_gen_time_ms=15.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+        stage_id=0,
+        vllm_tpot_ms=10.0,
+    )
+    second = StageRequestStats(
+        batch_id=1,
+        batch_size=1,
+        num_tokens_in=8,
+        num_tokens_out=6,
+        stage_gen_time_ms=20.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+        stage_id=0,
+        vllm_tpot_ms=20.0,
+    )
+    merged = OrchestratorAggregator._merge_stage_metric_event(None, first)
+    merged = OrchestratorAggregator._merge_stage_metric_event(merged, second)
+    assert merged["vllm_tpot_ms"] == pytest.approx((10.0 * 3 + 20.0 * 5) / 8.0)
+
+
+def test_omni_timing_keeps_total_engine_without_identity(mocker) -> None:
+    logged = mocker.patch("vllm_omni.metrics.stats.logger.info")
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    agg.on_stage_metrics(
+        0,
+        "r1",
+        StageRequestStats(
+            batch_id=1,
+            batch_size=1,
+            num_tokens_in=3,
+            num_tokens_out=3,
+            stage_gen_time_ms=30.0,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(),
+        ),
+    )
+    agg.on_finalize_request(0, "r1", req_start_ts=0.0)
+    agg.build_and_log_summary()
+    timing = [call.args[1] for call in logged.call_args_list if call.args and call.args[0] == "[OmniTiming] %s"]
+    assert timing
+    assert "total=" in timing[0]
+    assert "engine=" in timing[0]
+    assert "StageRequestStats [request_id=r1]" in "\n".join(
+        call.args[1] for call in logged.call_args_list if call.args and call.args[0] == "\n%s"
+    )

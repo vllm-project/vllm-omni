@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+from typing import Protocol
 from uuid import uuid4
 
 import numpy as np
+from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.duplex.audio import (
     encode_float32_mono_wav_base64,
@@ -19,6 +21,8 @@ from vllm_omni.entrypoints.duplex.server_vad import (
     ServerVADConfig,
     parse_session_turn_detection,
 )
+
+logger = init_logger(__name__)
 
 
 class DuplexOverlapPolicy(str, Enum):
@@ -448,6 +452,17 @@ class ConversationHistory:
     )
 
 
+class DuplexResponseEndHook(Protocol):
+    def __call__(
+        self,
+        session: DuplexSession,
+        *,
+        request_id: str | None,
+        response_id: str,
+        reason: str,
+    ) -> None: ...
+
+
 @dataclass
 class DuplexSession:
     session_id: str
@@ -463,6 +478,8 @@ class DuplexSession:
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _runtime_config: dict[str, object] = field(default_factory=dict, repr=False)
+    on_response_begin: Callable[[DuplexSession], None] | None = field(default=None, repr=False, compare=False)
+    on_response_end: DuplexResponseEndHook | None = field(default=None, repr=False, compare=False)
 
     @property
     def response_config(self) -> DuplexSessionConfig:
@@ -985,6 +1002,12 @@ class DuplexSession:
         self._playback.current = DuplexPlaybackCursor()
         self._playback.by_response[response_id] = self._playback.current
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
+        hook = self.on_response_begin
+        if hook is not None:
+            try:
+                hook(self)
+            except Exception:
+                logger.exception("duplex on_response_begin failed session=%s", self.session_id)
         return response_id
 
     def _clear_response_metrics(self) -> None:
@@ -1188,6 +1211,7 @@ class DuplexSession:
         commit_text: bool = True,
         playback_commit_policy: str | None = None,
         preserve_request: bool = False,
+        finished_reason: str = "stop",
     ) -> dict[str, object] | None:
         response_id = self._response.active_response_id
         response_input_commit_seq = self._response.active_response_input_commit_seq
@@ -1203,6 +1227,8 @@ class DuplexSession:
         )
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
         message = None
+        request_id = self._response.active_request_id
+        response_id = self._response.active_response_id
         if assistant_text:
             self._conversation.last_assistant_full_message = {"role": "assistant", "content": assistant_text}
             self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
@@ -1245,6 +1271,12 @@ class DuplexSession:
         self._clear_response_metrics()
         self.turn_state = DuplexTurnState.IDLE
         self._restore_response_config()
+        hook = self.on_response_end
+        if hook is not None and response_id is not None:
+            try:
+                hook(self, request_id=request_id, response_id=response_id, reason=finished_reason)
+            except Exception:
+                logger.exception("duplex on_response_end failed session=%s", self.session_id)
         return message
 
     def register_history_item(self, item_id: str | None, message: dict[str, object] | None) -> None:
