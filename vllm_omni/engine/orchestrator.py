@@ -723,7 +723,11 @@ class Orchestrator:
                     self._shutdown_event.wait(),
                     timeout=self._duplex_reaper_interval_s,
                 )
-            except TimeoutError:
+            # The timeout is this loop's normal tick. Python 3.10 raises
+            # asyncio.TimeoutError, which is not the builtin TimeoutError
+            # before 3.11, so catching only the builtin lets the tick escape
+            # into run()'s gather and tear every stage down.
+            except (TimeoutError, asyncio.TimeoutError):
                 plane = self.duplex_control_plane
                 if plane is not None:
                     try:

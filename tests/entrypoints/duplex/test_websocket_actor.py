@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from vllm_omni.entrypoints.duplex.websocket import (
+    DuplexSessionTasks,
     DuplexWebSocketActor,
     normalize_duplex_input_event,
 )
@@ -143,3 +144,32 @@ async def test_writer_does_not_revoke_accepted_terminal_after_close_starts():
 
     assert websocket.sent == [{"type": "response.done", "epoch": 1, "response_id": "resp-1"}]
     assert actor.stale_output_dropped == 0
+
+
+async def test_cancel_append_tasks_swallows_a_cancel_that_outlives_the_wait():
+    # The wait_for timeout is the designed path for an append task that does
+    # not stop on the first cancel, so cancel_append_tasks must absorb it and
+    # still report that it cancelled. On Python 3.10 that timeout arrives as
+    # asyncio.TimeoutError, which is a different class from the builtin.
+    tasks = DuplexSessionTasks()
+    cancels = 0
+
+    async def stubborn() -> bool:
+        nonlocal cancels
+        while True:
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancels += 1
+                if cancels >= 2:
+                    raise
+
+    task = asyncio.create_task(stubborn())
+    await asyncio.sleep(0)
+    tasks.track_append_task(task, epoch=0, mode="append", final=False, response_bound=False)
+
+    assert await tasks.cancel_append_tasks(timeout_s=0.05) is True
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
