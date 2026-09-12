@@ -51,6 +51,7 @@ from tests.dfx.conftest import (
     resolve_pytest_marks,
     resource_label_for_filename,
 )
+from tests.helpers.gpu_telemetry import GpuTelemetrySampler, format_summary_line
 from tests.helpers.runtime import get_open_port
 
 
@@ -204,14 +205,14 @@ def load_diffusion_benchmark_configs(
 ) -> list[dict[str, Any]]:
     """Load one diffusion benchmark JSON, or merge all ``*.json`` under *config_dir*."""
     if config_path is not None:
-        configs = load_configs(config_path)
+        configs: list[dict[str, Any]] = load_configs(config_path)
         source = str(Path(config_path).resolve())
         for cfg in configs:
             cfg.setdefault(_DIFFUSION_SOURCE_CONFIG_KEY, source)
         return configs
     if config_dir is None:
         raise ValueError("load_diffusion_benchmark_configs requires config_path or config_dir")
-    configs: list[dict[str, Any]] = []
+    configs = []
     for path in sorted(config_dir.glob("*.json")):
         source = str(path.resolve())
         for cfg in load_configs(str(path)):
@@ -768,13 +769,18 @@ def run_benchmark(
         log_fh.write(f"cmd: {' '.join(cmd)}\n\n")
         log_fh.flush()
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=log_fh,
-            stderr=log_fh,
-            cwd=str(Path(__file__).parent.parent.parent.parent),
-        )
-        process.wait()
+        # Sample GPU clocks / utilization / throttle reasons for the duration of
+        # the case so a perf-gate failure can be classified as node vs code.
+        with GpuTelemetrySampler() as telemetry:
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_fh,
+                stderr=log_fh,
+                cwd=str(Path(__file__).parent.parent.parent.parent),
+            )
+            process.wait()
+    gpu_telemetry = telemetry.summary()
+    print(f"  {format_summary_line(gpu_telemetry)}")
 
     with open(log_file, encoding="utf-8") as log_fh:
         print(log_fh.read(), end="")
@@ -851,6 +857,7 @@ def run_benchmark(
         "stage_durations_mean": metrics.get("stage_durations_mean"),
         "stage_durations_p50": metrics.get("stage_durations_p50"),
         "stage_durations_p99": metrics.get("stage_durations_p99"),
+        "gpu_telemetry": gpu_telemetry,
         "commit_sha": _get_branchpoint_commit_sha(),
         "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
         "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
