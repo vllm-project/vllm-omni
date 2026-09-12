@@ -900,13 +900,11 @@ def llm2tts(
                             special_token_ids.get("chunk_tts_eos_token_id"),
                         }
                         break
-                # Map output indices onto hidden rows by END alignment: the
-                # leading decision tokens of the delta may ALSO be folded into
-                # the resumable prompt (they belong to earlier non-forwarded
-                # segments), so prompt_len + delta over-counts them and
-                # front-aligned indexing truncates the slice. The hidden
-                # tensor's last len(out_ids) rows are the delta's rows.
-                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
+                # Accumulated rows precede the sampled output IDs by one:
+                # the next forward consumes that sampled token and yields the
+                # post-token hidden required by the official duplex Talker.
+                # The handoff requires that forward to have run.
+                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids) + 1
                 if hidden_base >= 0 and out_end > out_start:
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
                     tts_hidden_slice = (
@@ -934,7 +932,7 @@ def llm2tts(
                             special_token_ids.get("chunk_tts_eos_token_id"),
                         }
                         break
-                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
+                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids) + 1
                 if hidden_base >= 0 and out_end > out_start:
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
                     tts_hidden_slice = (
@@ -942,6 +940,34 @@ def llm2tts(
                         .to(torch.float32)
                         .contiguous()
                     )
+        # Resolve the speech span against actual forwarded token positions,
+        # including when newer non-speaking units have extended the payload.
+        if is_native_duplex_handoff and tts_token_ids_slice is not None and tts_token_ids_slice.numel():
+            row_ids = mm_output.get("latent_input_ids")
+            row_positions = mm_output.get("latent_positions")
+            if not isinstance(row_ids, torch.Tensor) or not isinstance(row_positions, torch.Tensor):
+                raise ValueError("MiniCPM-o native duplex: missing latent row identities")
+            row_ids = row_ids.reshape(-1).tolist()
+            row_positions = row_positions.reshape(-1).tolist()
+            if len(row_ids) != thinker_hidden_states.shape[0] or len(row_positions) != len(row_ids):
+                raise ValueError(
+                    "MiniCPM-o native duplex: row ledger shape mismatch "
+                    f"{len(row_ids)} / {thinker_hidden_states.shape[0]}"
+                )
+            target = tts_token_ids_slice.reshape(-1).tolist()
+            width = len(target)
+            candidates = [
+                i
+                for i in range(len(row_ids) - width + 1)
+                if row_ids[i : i + width] == target
+                and row_positions[i : i + width] == list(range(row_positions[i], row_positions[i] + width))
+            ]
+            if not candidates:
+                raise ValueError(
+                    f"MiniCPM-o native duplex: no forwarded span for {target}; ledger tail={row_ids[-30:]}"
+                )
+            chosen = max(candidates, key=lambda i: (row_positions[i], i))
+            tts_hidden_slice = thinker_hidden_states[chosen : chosen + width].to(torch.float32).contiguous()
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(

@@ -829,8 +829,8 @@ def test_pcm16_wav_round_trip(tmp_path):
 
 
 def test_duplex_unit_boundary_and_residual_math():
-    assert duplex_unit_boundary_ms(0) == 1030
-    assert duplex_unit_boundary_ms(2) == 3030
+    assert duplex_unit_boundary_ms(0) == 1000
+    assert duplex_unit_boundary_ms(2) == 3000
     assert has_residual_model_unit(b"\x00" * 32_000, chunk_period_ms=1000) is False
     assert has_residual_model_unit(b"\x00" * 32_002, chunk_period_ms=1000) is True
     created = {"type": "session.created", "session": {"capabilities": {"chunk_period_ms": 500}}}
@@ -854,9 +854,13 @@ async def test_stream_pcm_sends_each_units_composite_beside_its_base_frame():
         # A composite belongs to the unit it was captured in, so it rides the
         # same append as that unit's base frame; a unit without one sends the
         # base alone. Frame k rides the append that closes model unit k.
-        assert [event["video_frames"] for event in appends if "video_frames" in event] == [["f0", "s0"], ["f1"]]
-        assert [event["audio_end_ms"] for event in appends if "video_frames" in event] == [1200, 2200]
-        assert frames_sent == 2
+        assert [event["video_frames"] for event in appends if "video_frames" in event] == [
+            ["f0", "s0"],
+            ["f1"],
+            ["f1"],
+        ]
+        assert [event["audio_end_ms"] for event in appends if "video_frames" in event] == [1000, 2000, 3000]
+        assert frames_sent == 3
         sock.feed(SESSION_CLOSED)
 
 

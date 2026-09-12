@@ -90,13 +90,10 @@ __all__ = [
 PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
 
-# Server-side model unit boundaries, in cumulative appended audio.
-# Stage0 configures the streaming mel processor with first_chunk_ms=1035 and
-# chunk_ms=1000; the processor aligns the first chunk down to a hop_length (160
-# samples) multiple, so unit 0 closes at 16480 samples and every later unit
-# closes 16000 samples after it. Camera frames must ride the append that closes
-# a unit, otherwise Stage0 cannot bind them to that unit's audio.
-DUPLEX_FIRST_UNIT_MS = 1030
+# The native PCM reservation closes every 1000 ms, including the first unit.
+# Stage0 adds the first mel window's padding internally; the camera frame must
+# arrive with the reservation, before that internal padding is applied.
+DUPLEX_FIRST_UNIT_MS = 1000
 DUPLEX_UNIT_MS = 1000
 
 
@@ -772,10 +769,9 @@ class DuplexClient:
         model unit ``k`` (see :func:`duplex_unit_boundary_ms`), which
         reproduces the official ``streaming_prefill(audio_waveform=<1 s>,
         frame_list=[frame])`` pairing: a second of audio and the picture
-        captured during it enter the same unit. Sending on whole-second
-        boundaries instead would strand frame 0 on an append that cannot
-        close a unit yet, and shift every later frame one unit ahead of its
-        audio.
+        captured during it enter the same unit. Sending a frame before its
+        whole-second unit boundary would strand it on an append that cannot
+        close the unit yet.
 
         ``stacked_video_frames`` is the optional parallel track of composites
         (see ``vllm_omni.experimental.fullduplex.video_stacking``): entry ``k``

@@ -1343,10 +1343,10 @@ class TestDeployConfigLoading:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.async_chunk is True
-        assert stages[0].yaml_engine_args["async_scheduling"] is True
-        assert stages[1].yaml_engine_args["async_scheduling"] is True
-        assert "Async" in (stages[0].scheduler_cls or "")
-        assert "Async" in (stages[1].scheduler_cls or "")
+        assert stages[0].yaml_engine_args["async_scheduling"] is False
+        assert stages[1].yaml_engine_args["async_scheduling"] is False
+        assert "Async" not in (stages[0].scheduler_cls or "")
+        assert "Async" not in (stages[1].scheduler_cls or "")
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
         assert deploy.stages[1].enforce_eager is False
         assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
