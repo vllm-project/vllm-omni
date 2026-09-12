@@ -936,7 +936,25 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         if self.gating is None:
             assert self.linear1 is not None
             assert self.linear2 is not None
-            update = self.linear2(self.activation(self.linear1(x)))
+            from .codec_gemm import CONFIG, FUSE, selected_linear
+
+            if (
+                CONFIG
+                and execution_context is not None
+                and self.activation is F.gelu
+                and self.linear1.bias is None
+                and self.linear2.bias is None
+                and isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale)
+            ):
+                scale = self.layer_scale_2.scale
+                hidden = selected_linear(x, self.linear1.weight, scale, x_orig, 1 if FUSE else 0)
+                if not FUSE:
+                    hidden = self.activation(hidden)
+                update = selected_linear(hidden, self.linear2.weight, scale, x_orig, 2 if FUSE else 0)
+                if FUSE:
+                    return update
+            else:
+                update = self.linear2(self.activation(self.linear1(x)))
         else:
             if self.weights_per_step:
                 assert isinstance(self.gating, nn.ModuleList)
