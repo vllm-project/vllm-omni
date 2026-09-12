@@ -32,6 +32,13 @@ def _positive_finite_float(value: str) -> float:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return parsed
+
+
 def _existing_file(value: str) -> str:
     path = Path(value).expanduser()
     if not path.is_file():
@@ -42,12 +49,32 @@ def _existing_file(value: str) -> str:
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
         DEFAULT_MAX_VIDEO_DURATION_S,
+        OMNIINTERACT_SCENARIO_TAGS,
         OMNIINTERACT_SUBSETS,
     )
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
     group.add_argument(
         "--omniinteract-subsets", nargs="+", choices=OMNIINTERACT_SUBSETS, default=list(OMNIINTERACT_SUBSETS)
+    )
+    group.add_argument(
+        "--omniinteract-scenario-tags",
+        nargs="+",
+        choices=OMNIINTERACT_SCENARIO_TAGS,
+        default=None,
+        help=(
+            "Scenario tags used when sampling cases: realtime, proactive, nested, interrupted, 1qna. "
+            "Default behavior covers each requested tag with at least one case (when available), "
+            "then fills remaining --num-prompts from the rest of the selected subsets."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-scenario-focus",
+        action="store_true",
+        help=(
+            "Only run cases matching --omniinteract-scenario-tags. "
+            "Without this flag, tags are used for coverage-first sampling."
+        ),
     )
     group.add_argument(
         "--omniinteract-timeout-s", type=_positive_finite_float, default=900.0, help="Complete session timeout."
@@ -75,6 +102,50 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path("omniinteract-output"),
         help="Directory for case and evaluator artifacts.",
+    )
+    group.add_argument(
+        "--omniinteract-evaluate",
+        action="store_true",
+        help="Run the text-only OmniInteract judge after generation and print an accuracy report.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-base-url",
+        default="http://127.0.0.1:8000",
+        help="Base URL of an already-running OpenAI-compatible judge server.",
+    )
+    group.add_argument("--omniinteract-judge-model", help="Model name exposed by the judge server.")
+    group.add_argument(
+        "--omniinteract-judge-api-key",
+        default="EMPTY",
+        help="Bearer token for the judge server.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-timeout-s",
+        type=_positive_finite_float,
+        default=60.0,
+        help="Timeout for each judge request.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-max-tokens",
+        type=_positive_int,
+        default=512,
+        help="Maximum completion tokens for each judge request.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-workers",
+        type=_positive_int,
+        default=8,
+        help="Maximum number of concurrent judge requests.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-output-dir",
+        type=Path,
+        help="Accuracy artifact directory; defaults to OUTPUT_DIR/evaluation.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-skip-existing",
+        action="store_true",
+        help="Reuse successful per-case evaluation artifacts.",
     )
 
 
@@ -345,6 +416,12 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             raise ValueError("OmniInteract requires --endpoint /v1/realtime")
         if not getattr(args, "omniinteract_ref_audio", None):
             raise ValueError("OmniInteract requires --omniinteract-ref-audio")
+        if getattr(args, "omniinteract_evaluate", False) and not getattr(args, "omniinteract_judge_model", None):
+            raise ValueError("OmniInteract evaluation requires --omniinteract-judge-model")
+        if getattr(args, "omniinteract_scenario_focus", False) and not getattr(
+            args, "omniinteract_scenario_tags", None
+        ):
+            raise ValueError("--omniinteract-scenario-focus requires --omniinteract-scenario-tags")
         if getattr(args, "ignore_eos", False):
             raise ValueError("OmniInteract does not support --ignore-eos")
         if getattr(args, "profile", False):
