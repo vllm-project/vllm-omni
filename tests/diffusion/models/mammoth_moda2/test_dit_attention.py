@@ -33,6 +33,14 @@ SEQ, BATCH = 37, 2
 _SDPA_CONFIG = OmniDiffusionConfig(diffusion_attention_config={"default": {"backend": "TORCH_SDPA"}})
 
 
+@pytest.fixture(autouse=True)
+def _mock_tp1(monkeypatch):
+    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1)
+
+
 def _block(kv_heads: int, modulation: bool = True) -> TransformerBlock:
     torch.manual_seed(0)
     with set_current_diffusion_config(_SDPA_CONFIG):
@@ -45,6 +53,15 @@ def _block(kv_heads: int, modulation: bool = True) -> TransformerBlock:
             norm_eps=1e-5,
             modulation=modulation,
         )
+    # vLLM parallel linear parameters are allocated with torch.empty and are
+    # normally populated by the checkpoint loader. Populate this standalone
+    # unit-test block explicitly so its arithmetic is deterministic and finite.
+    with torch.no_grad():
+        for parameter in block.parameters():
+            if parameter.ndim > 1:
+                torch.nn.init.normal_(parameter, mean=0.0, std=0.02)
+            else:
+                parameter.fill_(1.0)
     return block.eval()
 
 
@@ -63,7 +80,9 @@ def _inputs(head_dim: int):
 def _reference_attention(attn, hidden, mask, rotary):
     """The pre-change processor, kept verbatim as the oracle."""
     batch, seq, _ = hidden.shape
-    query, key, value = attn.to_q(hidden), attn.to_k(hidden), attn.to_v(hidden)
+    query = attn.to_q(hidden)
+    key = attn.to_k(hidden)
+    value = attn.to_v(hidden)
     head_dim = query.shape[-1] // attn.heads
     kv_heads = key.shape[-1] // head_dim
     query = attn.norm_q(query.view(batch, seq, attn.heads, head_dim))
@@ -77,7 +96,8 @@ def _reference_attention(attn, hidden, mask, rotary):
         value = value.repeat_interleave(attn.heads // kv_heads, dim=1)
     out = F.scaled_dot_product_attention(query, key, value, attn_mask=mask.view(batch, 1, 1, seq), scale=attn.scale)
     out = (out * mask[:, None, :, None]).transpose(1, 2).reshape(batch, seq, attn.heads * head_dim)
-    return attn.to_out[1](attn.to_out[0](out))
+    out = attn.to_out[0](out)
+    return attn.to_out[1](out)
 
 
 @pytest.mark.parametrize("kv_heads", [2, HEADS], ids=["gqa_3to1", "mha"])

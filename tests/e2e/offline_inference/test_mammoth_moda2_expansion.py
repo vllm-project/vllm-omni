@@ -46,7 +46,8 @@ _AR_PATCH_SIZE = 16
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
+_BF16_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
+_FP8_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG, {"quantization": "fp8"})
 
 # Optional golden pixel reference file. Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
@@ -129,17 +130,22 @@ def test_diffusion_output_exposes_images_at_top_level():
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
+@pytest.mark.parametrize(
+    ("omni_runner", "precision"),
+    [(_BF16_RUNNER_PARAM, "bf16"), (_FP8_RUNNER_PARAM, "fp8")],
+    indirect=["omni_runner"],
+    ids=["bf16", "online_fp8"],
+)
 @hardware_test(res={"cuda": "H100"})
-def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
+def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner, precision: str):
     """
     End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
 
     Verifies:
       - Omni pipeline initialises with the two-stage YAML config.
       - DiT stage outputs one RGB PIL image at the requested size.
-      - When the optional fixture exists, fixed pixel samples match its golden
-        reference (regenerate with ``UPDATE_GOLDEN=1``).
+      - BF16 matches the optional golden reference; online FP8 produces finite pixels.
+        Regenerate the BF16 fixture with ``UPDATE_GOLDEN=1``.
     """
     gen_cfg = _load_t2i_gen_config(MODEL_PATH)
     eol_token_id = int(gen_cfg["eol_token_id"])
@@ -206,13 +212,15 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     assert image.mode == "RGB"
     assert image.size == (width, height)
 
-    sampled = _sample_pixels(_pil_to_tensor(image))
+    image_tensor = _pil_to_tensor(image)
+    assert torch.isfinite(image_tensor).all()
+    sampled = _sample_pixels(image_tensor)
 
-    if os.environ.get("UPDATE_GOLDEN"):
+    if os.environ.get("UPDATE_GOLDEN") and precision == "bf16":
         _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
         _GOLDEN_T2I_PATH.write_text(json.dumps({"pixels": sampled}, indent=2))
         print(f"\nGolden file written to {_GOLDEN_T2I_PATH}")
-    elif _GOLDEN_T2I_PATH.exists():
+    elif precision == "bf16" and _GOLDEN_T2I_PATH.exists():
         golden = json.loads(_GOLDEN_T2I_PATH.read_text())["pixels"]
         for i, (got, exp) in enumerate(zip(sampled, golden)):
             assert abs(got - exp) < 1e-4, f"Pixel {i} mismatch: got {got}, expected {exp}"
