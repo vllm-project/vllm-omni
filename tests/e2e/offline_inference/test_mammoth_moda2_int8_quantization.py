@@ -100,7 +100,7 @@ def _stage_config(quantization: str | None) -> str:
     stage_updates = dict(_AR_STAGE_OVERRIDES)
     if quantization is None:
         return modify_stage_config(
-          base, updates={"stages": {0: stage_updates}}, deletes={"stages": {0: ["quantization"]}}
+            base, updates={"stages": {0: stage_updates}}, deletes={"stages": {0: ["quantization"]}}
         )
     stage_updates["quantization"] = quantization
     return modify_stage_config(base, updates={"stages": {0: stage_updates}})
