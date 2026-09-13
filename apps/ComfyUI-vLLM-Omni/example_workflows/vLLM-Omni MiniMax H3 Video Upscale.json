@@ -1,0 +1,631 @@
+{
+  "version": 0.4,
+  "last_node_id": 11,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        440,
+        130
+      ],
+      "size": [
+        370,
+        500
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "frame",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "sampling_params",
+          "type": "SAMPLING_PARAMS",
+          "shape": 7,
+          "link": 11
+        },
+        {
+          "name": "lora",
+          "type": "REMOTE_LORA",
+          "shape": 7,
+          "link": 12
+        },
+        {
+          "name": "model_params",
+          "type": "VIDEO_PARAMS",
+          "shape": 7,
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            1,
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://127.0.0.1:8091/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "A small brass bell hanging from a wooden beam in a quiet garden. A gentle breeze swings the bell and it rings clearly. Static camera, natural daylight, continuous motion, synchronized ringing and soft birdsong.",
+        "",
+        1344,
+        768,
+        24,
+        124
+      ]
+    },
+    {
+      "id": 2,
+      "type": "GetVideoComponents",
+      "pos": [
+        900,
+        160
+      ],
+      "size": [
+        270,
+        125
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            6
+          ]
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": [
+            5
+          ]
+        },
+        {
+          "name": "bit_depth",
+          "type": "INT",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "GetVideoComponents"
+      }
+    },
+    {
+      "id": 3,
+      "type": "UpscaleModelLoader",
+      "pos": [
+        900,
+        440
+      ],
+      "size": [
+        320,
+        85
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "model_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "UPSCALE_MODEL",
+          "type": "UPSCALE_MODEL",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UpscaleModelLoader"
+      },
+      "widgets_values": [
+        "RealESRGAN_x2plus.pth"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "ImageUpscaleWithModel",
+      "pos": [
+        1280,
+        160
+      ],
+      "size": [
+        280,
+        90
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "upscale_model",
+          "type": "UPSCALE_MODEL",
+          "link": 3
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageUpscaleWithModel"
+      }
+    },
+    {
+      "id": 5,
+      "type": "CreateVideo",
+      "pos": [
+        1640,
+        160
+      ],
+      "size": [
+        290,
+        165
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 4
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": 5
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "shape": 7,
+          "link": 6
+        },
+        {
+          "name": "bit_depth",
+          "type": "INT",
+          "widget": {
+            "name": "bit_depth"
+          },
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        24,
+        8
+      ]
+    },
+    {
+      "id": 6,
+      "type": "SaveVideo",
+      "pos": [
+        2010,
+        160
+      ],
+      "size": [
+        390,
+        410
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 8
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "name": "codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "WF07/upscaled",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        30,
+        40
+      ],
+      "size": [
+        330,
+        140
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MiniMax-H3 video params",
+          "type": "VIDEO_PARAMS",
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3.0,
+        6.0,
+        "16:9"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [
+        30,
+        225
+      ],
+      "size": [
+        330,
+        280
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "diffusion sampling params",
+          "type": "SAMPLING_PARAMS",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniDiffusionSampling"
+      },
+      "widgets_values": [
+        1,
+        5,
+        1.0,
+        1.0,
+        false,
+        true,
+        42,
+        "fixed"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "VLLMOmniRemoteLoRA",
+      "pos": [
+        30,
+        560
+      ],
+      "size": [
+        370,
+        180
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "lora",
+          "type": "REMOTE_LORA",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniRemoteLoRA"
+      },
+      "widgets_values": [
+        "models/minimax-h3-turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+        "h3-turbo-v1.0",
+        1.0,
+        0
+      ]
+    },
+    {
+      "id": 10,
+      "type": "SaveVideo",
+      "pos": [
+        960,
+        650
+      ],
+      "size": [
+        390,
+        410
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 9
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "name": "codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "WF07/generated",
+        "mp4",
+        "auto"
+      ],
+      "title": "Save generated video before upscale"
+    },
+    {
+      "id": 11,
+      "type": "Note",
+      "pos": [
+        1430,
+        650
+      ],
+      "size": [
+        520,
+        260
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "Note"
+      },
+      "widgets_values": [
+        "WF-07: remote H3 generation -> frame upscale -> original FPS + audio -> MP4.\nConfigure the remote URL and a server-side Turbo path. The relative LoRA path is resolved on the vLLM-Omni server.\nThis preset: FL2VA server, LightX2V v1.0 768p Turbo, 5 sigma points, video shift 6, audio shift 3; 124 frames at 24 FPS.\nBase H3: disconnect LoRA, set steps to 50 and video shift to 12.\nRequires the audio-preserving MP4 decoder (PR #6782 or equivalent), the H3 aspect_ratio field, and RealESRGAN_x2plus.pth in ComfyUI models/upscale_models."
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      0,
+      4,
+      1,
+      "IMAGE"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "UPSCALE_MODEL"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      2,
+      2,
+      5,
+      1,
+      "FLOAT"
+    ],
+    [
+      6,
+      2,
+      1,
+      5,
+      2,
+      "AUDIO"
+    ],
+    [
+      7,
+      2,
+      3,
+      5,
+      3,
+      "INT"
+    ],
+    [
+      8,
+      5,
+      0,
+      6,
+      0,
+      "VIDEO"
+    ],
+    [
+      9,
+      1,
+      0,
+      10,
+      0,
+      "VIDEO"
+    ],
+    [
+      10,
+      7,
+      0,
+      1,
+      4,
+      "VIDEO_PARAMS"
+    ],
+    [
+      11,
+      8,
+      0,
+      1,
+      2,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      12,
+      9,
+      0,
+      1,
+      3,
+      "REMOTE_LORA"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        20,
+        40
+      ]
+    }
+  }
+}

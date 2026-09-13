@@ -1,0 +1,129 @@
+{
+  "1": {
+    "class_type": "VLLMOmniGenerateVideo",
+    "inputs": {
+      "url": "http://127.0.0.1:8091/v1",
+      "model": "MiniMaxAI/MiniMax-H3",
+      "prompt": "A small brass bell hanging from a wooden beam in a quiet garden. A gentle breeze swings the bell and it rings clearly. Static camera, natural daylight, continuous motion, synchronized ringing and soft birdsong.",
+      "negative_prompt": "",
+      "width": 1344,
+      "height": 768,
+      "fps": 24,
+      "num_frames": 124,
+      "model_params": [
+        "7",
+        0
+      ],
+      "sampling_params": [
+        "8",
+        0
+      ],
+      "lora": [
+        "9",
+        0
+      ]
+    }
+  },
+  "2": {
+    "class_type": "GetVideoComponents",
+    "inputs": {
+      "video": [
+        "1",
+        0
+      ]
+    }
+  },
+  "3": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "RealESRGAN_x2plus.pth"
+    }
+  },
+  "4": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "upscale_model": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "4",
+        0
+      ],
+      "fps": [
+        "2",
+        2
+      ],
+      "audio": [
+        "2",
+        1
+      ],
+      "bit_depth": [
+        "2",
+        3
+      ]
+    }
+  },
+  "6": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "5",
+        0
+      ],
+      "filename_prefix": "WF07/upscaled",
+      "format": "mp4",
+      "codec": "auto"
+    }
+  },
+  "7": {
+    "class_type": "VLLMOmniMiniMaxH3Params",
+    "inputs": {
+      "audio_flow_shift": 3.0,
+      "flow_shift": 6.0,
+      "aspect_ratio": "16:9"
+    }
+  },
+  "8": {
+    "class_type": "VLLMOmniDiffusionSampling",
+    "inputs": {
+      "n": 1,
+      "num_inference_steps": 5,
+      "guidance_scale": 1.0,
+      "true_cfg_scale": 1.0,
+      "vae_use_slicing": false,
+      "vae_use_tiling": true,
+      "seed": 42
+    }
+  },
+  "9": {
+    "class_type": "VLLMOmniRemoteLoRA",
+    "inputs": {
+      "local_path": "models/minimax-h3-turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+      "name": "h3-turbo-v1.0",
+      "scale": 1.0,
+      "int_id": 0
+    }
+  },
+  "10": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "1",
+        0
+      ],
+      "filename_prefix": "WF07/generated",
+      "format": "mp4",
+      "codec": "auto"
+    }
+  }
+}
