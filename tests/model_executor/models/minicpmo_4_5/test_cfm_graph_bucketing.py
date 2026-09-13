@@ -10,9 +10,11 @@ back. These tests pin the decision math on CPU, no CUDA required.
 """
 
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _cfm_pad_frames,
+    _zero_padded_frames,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -71,6 +73,11 @@ def test_padding_never_overflows_noise_buffer():
     # Cache offset eats into the capacity: 64 + 0 pad would fit, 64 + 48 pad
     # would not, so the pad must be dropped.
     assert _cfm_pad_frames(mel_frames=64, offset=50, noise_capacity=110, bucket_frames=16, disabled=False) == 0
+    # The original chunk fits while the padded one does not: 50 + 50 = 100
+    # <= 110, but 100 + 14 = 114 > 110, so the pad must be dropped.
+    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=110, bucket_frames=16, disabled=False) == 0
+    # Same numbers with room for the padding: 114 <= 120, so it stands.
+    assert _cfm_pad_frames(mel_frames=50, offset=50, noise_capacity=120, bucket_frames=16, disabled=False) == 14
 
 
 def test_padding_applies_with_cache_offset_when_it_fits():
@@ -127,3 +134,29 @@ def test_varied_chunk_lengths_collapse_onto_few_widths():
     }
     assert len(padded) == 4, sorted(padded)  # 16 / 32 / 48 / 64
     assert len(padded) < len(varied)
+
+
+def test_zero_padded_frames_survives_an_integration_step():
+    """The padded region must stay zero after ``x = x + dt * velocity``.
+
+    Zeroing once before the CFM loop is not enough: the update touches every
+    column, so the padded region becomes non-zero again (0 -> 0.010 -> 0.020
+    over the first steps). Pin the helper that re-zeroes it each step.
+    """
+    mel, pad = 50, 14
+    x = torch.zeros(2, 4, mel + pad)
+    x[..., :mel] = 0.05
+    _zero_padded_frames(x, mel)
+    assert torch.all(x[..., mel:] == 0.0)
+    for _ in range(3):
+        x = x + 0.02 * torch.ones_like(x)  # the integration step
+        _zero_padded_frames(x, mel)
+        assert torch.all(x[..., mel:] == 0.0)
+        assert torch.all(x[..., :mel] > 0.0)
+
+
+def test_zero_padded_frames_is_a_noop_without_padding():
+    x = torch.ones(1, 2, 32)
+    _zero_padded_frames(x, None)
+    _zero_padded_frames(x, 32)
+    assert torch.all(x == 1.0)

@@ -282,7 +282,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         The shipped asset is 6.016 s and is loaded directly by token2wav, so a
         request without a reference would otherwise keep a second L0 value a
         couple of frames away from the normalized request references -- two
-        graph-key families instead of one. Returns ``(prompt_wav,
+        graph-key families instead of one (both use ``ref_audio_max_seconds``).
+        Returns ``(prompt_wav,
         prompt_cache_id)``; if the asset cannot be read, the shipped path is
         returned unchanged.
         """
@@ -292,7 +293,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         fallback = (source, self._default_prompt_id)
         try:
             waveform, sample_rate_hz = sf.read(source, dtype="float32", always_2d=False)
-            normalized, target_sr = _normalize_reference(waveform, int(sample_rate_hz))
+            normalized, target_sr = _normalize_reference(
+                waveform,
+                int(sample_rate_hz),
+                max_seconds=self._ref_max_seconds,
+            )
         except Exception:
             logger.warning("Could not normalize the default prompt %s; using it as-is", source)
             self._default_prompt_normalized = fallback
@@ -307,7 +312,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         path = Path(self._runtime_prompt_dir.name) / f"{cache_id}.wav"
         if not path.is_file():
             sf.write(path, normalized.numpy(), target_sr, format="WAV")
-        logger.info("Default prompt normalized onto the %.1fs grid: %s", _REF_MAX_SECONDS, path)
+        logger.info("Default prompt normalized onto the %.2fs window: %s", self._ref_max_seconds, path)
         self._default_prompt_normalized = (str(path), cache_id)
         return self._default_prompt_normalized
 

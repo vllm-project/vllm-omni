@@ -82,6 +82,20 @@ def _cfm_pad_frames(
     return pad
 
 
+def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
+    """Keep the padded columns of ``tensor`` at zero, in place.
+
+    Bucketing pads the frame axis so the capture shape stays fixed. The padded
+    columns must not carry content: the CFM attention runs with
+    ``attn_mask=None`` (fully connected), so real frames would attend to them,
+    and the integration step ``x = x + dt * velocity`` would otherwise make the
+    padded region non-zero again after the initial zeroing.
+    """
+    if valid_frames is None or valid_frames >= int(tensor.shape[-1]):
+        return
+    tensor[..., valid_frames:] = 0.0
+
+
 def plan_token2wav_encode_slices(
     num_frames: int,
     *,
@@ -467,7 +481,7 @@ class BatchedToken2Wav(nn.Module):
             # would then emit non-zero features there, leaving the
             # chunk-boundary attention/CNN caches padding-derived. Zero them.
             speaker_features = speaker_features.clone()
-            speaker_features[:, :, valid_frames:] = 0.0
+            _zero_padded_frames(speaker_features, valid_frames)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
@@ -706,6 +720,7 @@ class BatchedToken2Wav(nn.Module):
                 conditional, unconditional = estimate.split(batch_size, dim=0)
                 velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
                 x = x + dt * velocity
+                _zero_padded_frames(x, mel_frames if pad_frames else None)
                 time = time + dt
                 if step + 1 < self.n_timesteps:
                     dt = timeline[step + 2] - time[0]
