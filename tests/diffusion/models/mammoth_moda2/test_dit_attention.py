@@ -17,6 +17,7 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
+    Transformer2DModel,
     TransformerBlock,
     apply_real_rotary_emb,
 )
@@ -154,6 +155,31 @@ def test_block_forward_hands_native_kv_heads_to_shared_layer(monkeypatch, modula
     assert k_shape == v_shape == (BATCH, SEQ, 2, block.head_dim)
     assert metadata is not None and metadata.attn_mask.dtype == torch.bool
     assert torch.equal(metadata.attn_mask, mask)
+
+
+def test_empty_text_stream_skips_the_entire_context_refiner():
+    class FailOnCall(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("context refiner called with an empty text stream")
+
+    class Increment(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states + 1
+
+    model = object.__new__(Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.context_refiner = torch.nn.ModuleList([FailOnCall()])
+    model.noise_refiner = torch.nn.ModuleList([Increment()])
+    text = torch.empty(BATCH, 0, DIM)
+    text_mask = torch.empty(BATCH, 0, dtype=torch.bool)
+    image = torch.zeros(BATCH, SEQ, DIM)
+
+    refined_text, refined_image = model._apply_refiners(
+        text, text_mask, torch.empty(1, 0, DIM), image, None, None, None
+    )
+
+    assert refined_text.shape == text.shape
+    torch.testing.assert_close(refined_image, torch.ones_like(image))
 
 
 def test_backend_selection_reaches_the_dit_layer():
