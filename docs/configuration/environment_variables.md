@@ -112,6 +112,7 @@ settings.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
+| `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS` | Non-negative integer; unset or empty means each consumer's own default (Boogu-Image: `2048`) | Token gate of the shared `fused_qk_norm_rope` op: a rotary table is packed for the fused kernel only when it spans at least this many positions (`B*S`); read at forward time | Environment-only. `0` = always fuse; a very large value disables the fused path. Any other value raises `ValueError` on the first forward. The crossover is host-dependent; re-benchmark before overriding. | Experimental performance control |
 | `VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | ModelOpt NVFP4 compatibility patch; read when `vllm_omni.patch` imports | Environment-only escape hatch. Any other value means false. Set only to diagnose the upstream NaN-scale issue. | Diagnostic and temporary |
 | `VLLM_OMNI_USE_QUACK_FP8` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; unset means hardware auto-detection | FP8 scaled matrix multiplication; evaluated when quack capability is selected | A set value overrides auto-detection. Any non-truthy value forces quack off. If quack cannot load, vLLM-Omni warns and falls back to FlashInfer. | Experimental performance control |
 
