@@ -563,6 +563,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
+    "MammothModa2DiTPipeline": "get_mammoth_moda2_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
     "BooguImageTurboPipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",

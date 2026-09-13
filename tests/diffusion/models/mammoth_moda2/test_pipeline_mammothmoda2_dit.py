@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
     MammothModa2DiTPipeline,
     _build_mammoth_config,
@@ -78,6 +79,22 @@ def test_pipeline_declares_native_components_and_single_request_mode_only() -> N
     assert MammothModa2DiTPipeline._vae_modules == ["gen_vae"]
     assert MammothModa2DiTPipeline.supports_request_batch is False
     assert MammothModa2DiTPipeline.supports_step_execution is False
+
+
+def test_mammoth_postprocess_denormalizes_nonnegative_raw_vae_output() -> None:
+    factory = getattr(pipeline_mammothmoda2_dit, "get_mammoth_moda2_post_process_func", None)
+    assert factory is not None
+
+    images = factory(SimpleNamespace())(torch.zeros(1, 3, 2, 2))
+
+    assert len(images) == 1
+    assert images[0].getpixel((0, 0)) == (128, 128, 128)
+
+
+def test_mammoth_postprocess_is_registered() -> None:
+    from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+    assert _DIFFUSION_POST_PROCESS_FUNCS["MammothModa2DiTPipeline"] == "get_mammoth_moda2_post_process_func"
 
 
 def test_root_weight_source_rejects_missing_model_path() -> None:
