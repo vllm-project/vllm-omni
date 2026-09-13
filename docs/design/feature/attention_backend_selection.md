@@ -4,6 +4,9 @@ This document defines the selection and extension contract for diffusion
 attention backends. User-facing backend choices, installation, and tuning are
 in the [attention backend guides](../../user_guide/diffusion/attention_backends.md).
 
+The [execution contract PoC](attention_execution_contract_poc.md) describes the
+experimental post-selection capability and lifecycle contract from RFC #7226.
+
 ## Scope
 
 The contract applies to DiT and other diffusion attention layers. It is
