@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Online serving smoke coverage for the dense LingBot-Video checkpoint."""
 
@@ -41,7 +41,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.slow
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
@@ -63,7 +63,7 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
     )
 
 
-@pytest.mark.slow
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_video_generation_modes_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:

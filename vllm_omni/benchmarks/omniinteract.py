@@ -233,7 +233,7 @@ class _Playback:
                 if response_id:
                     self.completed.add(response_id)
                 continue
-            if event.get("type") != "response.audio.delta":
+            if event.get("type") != "response.output_audio.delta":
                 continue
             encoded = event.get("delta") or event.get("audio")
             if not response_id:
@@ -241,13 +241,13 @@ class _Playback:
             if not isinstance(encoded, str):
                 raise ValueError("response audio payload is missing")
             if event.get("format") is None:
-                self._warn_once("response.audio.delta omitted format; assumed pcm16")
+                self._warn_once("response.output_audio.delta omitted format; assumed pcm16")
             elif event.get("format") != "pcm16":
                 raise ValueError("OmniInteract output must be pcm16")
             rate = event.get("sample_rate_hz")
             if rate is None:
                 rate = events.output_sample_rate_hz or OUTPUT_SAMPLE_RATE
-                self._warn_once(f"response.audio.delta omitted sample_rate_hz; assumed {rate}")
+                self._warn_once(f"response.output_audio.delta omitted sample_rate_hz; assumed {rate}")
             if rate != OUTPUT_SAMPLE_RATE:
                 raise ValueError(f"OmniInteract output must use {OUTPUT_SAMPLE_RATE} Hz audio")
             try:
@@ -683,7 +683,7 @@ def _collect_output(
         timing = response_times.setdefault(response_id, [start_s, end_s])
         timing[0], timing[1] = min(timing[0], start_s), max(timing[1], end_s)
 
-    text_event_types = {"response.audio_transcript.delta", "response.output_text.delta", "response.text.delta"}
+    text_event_types = {"response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta"}
     text_ids = {collector.response_id(event) for event in collector.events if event.get("type") in text_event_types}
     if None in text_ids or not text_ids <= created:
         raise ValueError("response transcript has no matching response.created")
@@ -726,7 +726,7 @@ def _collect_output(
                 **{key: value for key, value in event.items() if key not in {"delta", "audio"}},
                 "audio_bytes": audio_sizes[index],
             }
-            if event.get("type") == "response.audio.delta"
+            if event.get("type") == "response.output_audio.delta"
             else dict(event)
             for index, event in enumerate(collector.events)
         ]

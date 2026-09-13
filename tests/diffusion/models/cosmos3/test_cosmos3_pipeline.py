@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -19,6 +21,20 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical_name"),
+    [
+        ("galbot", "embodiment_b"),
+        ("agibot_gear_gripper", "embodiment_c_gripper"),
+        ("agibot_gear_gripper_ext", "embodiment_c_gripper_ext"),
+    ],
+)
+def test_action_domain_table_preserves_legacy_aliases(alias: str, canonical_name: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.action import resolve_domain_id
+
+    assert resolve_domain_id(domain_name=alias) == resolve_domain_id(domain_name=canonical_name)
 
 
 def test_pipeline_declares_layerwise_offload_components() -> None:
@@ -361,23 +377,31 @@ def _capture_tokenize_calls(pipeline: Any) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize(
-    ("provided", "value", "default", "is_distilled", "expected"),
+    ("provided", "value", "default", "is_distilled", "expected", "expected_warning"),
     [
-        (False, 1.0, 7.0, False, 7.0),
-        (True, 1.0, 7.0, False, 1.0),
-        (True, 4.5, 7.0, False, 4.5),
-        (False, 1.0, 7.0, True, 1.0),
-        (True, 4.5, 7.0, True, 1.0),
+        (False, 1.0, 7.0, False, 7.0, False),
+        (True, 1.0, 7.0, False, 1.0, False),
+        (True, 4.5, 7.0, False, 4.5, False),
+        (False, 1.0, 7.0, True, 1.0, False),
+        (True, 1.0, 7.0, True, 1.0, False),
+        (True, 4.5, 7.0, True, 1.0, True),
+        (True, 0.0, 7.0, True, 1.0, True),
     ],
 )
 def test_resolve_guidance_scale(
     make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
     provided: bool,
     value: float,
     default: float,
     is_distilled: bool,
     expected: float,
+    expected_warning: bool,
 ) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    warning_once = Mock()
+    monkeypatch.setattr(pipeline_cosmos3.logger, "warning_once", warning_once)
     pipeline = make_cosmos3_pipeline()
     pipeline.is_distilled_model = is_distilled
     sp = make_sampling_params(
@@ -386,6 +410,12 @@ def test_resolve_guidance_scale(
     )
 
     assert pipeline._resolve_guidance_scale(sp, default) == expected
+    if expected_warning:
+        warning_once.assert_called_once()
+        assert "overridden to 1.0" in warning_once.call_args.args[0]
+        assert "negative_prompt does not affect generation" in warning_once.call_args.args[0]
+    else:
+        warning_once.assert_not_called()
 
 
 def test_distilled_generation_accepts_t2i_and_i2v(make_cosmos3_pipeline) -> None:
@@ -477,6 +507,69 @@ def test_forward_threads_request_id_to_robolab(make_cosmos3_pipeline) -> None:
 
     assert pipeline.forward(request) is expected
     assert captured["session_id"] == "robolab-request-7"
+
+
+@pytest.mark.parametrize("format_prompt_as_json", [False, True])
+def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
+    make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    format_prompt_as_json: bool,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.transformer = StubCosmos3Transformer(action_gen=True, action_dim=64)
+    captured: dict[str, Any] = {}
+
+    def fake_transform(sample, resolution):
+        captured["sample_mode"] = sample["mode"]
+        captured["resolution"] = resolution
+        sample["sequence_plan"] = SimpleNamespace(
+            condition_frame_indexes_action=[0],
+            action_start_frame_offset=1,
+        )
+        sample["raw_action_dim"] = torch.tensor(8)
+        sample["image_size"] = torch.tensor([16, 16, 16, 16])
+        if format_prompt_as_json:
+            sample["ai_caption"] = {"actions": {"instruction": sample["ai_caption"]}}
+        return sample
+
+    def fake_get_transform(*, format_prompt_as_json: bool):
+        captured["format_prompt_as_json"] = format_prompt_as_json
+        return fake_transform
+
+    pipeline._get_robolab_transform = fake_get_transform
+    monkeypatch.setattr(pipeline_cosmos3, "get_robolab_domain_id", lambda name: 8)
+    obs = {
+        "prompt": "Pick up the cube.",
+        "observation/image": np.zeros((16, 16, 3), dtype=np.uint8),
+        "observation/joint_position": np.zeros(7, dtype=np.float32),
+        "observation/gripper_position": np.zeros(1, dtype=np.float32),
+    }
+    sampling_params = make_sampling_params(
+        extra_args={
+            "robot_obs": obs,
+            "action_chunk_size": 2,
+            "image_height": 16,
+            "image_width": 16,
+            "format_prompt_as_json": format_prompt_as_json,
+        }
+    )
+
+    inputs = pipeline._build_robolab_policy_inputs(sampling_params, request_id="request-1")
+
+    assert inputs is not None
+    assert captured == {
+        "sample_mode": "wam",
+        "resolution": "480",
+        "format_prompt_as_json": format_prompt_as_json,
+    }
+    assert inputs.domain_id == 8
+    assert inputs.raw_action_dim == 8
+    if format_prompt_as_json:
+        assert json.loads(inputs.prompt) == {"actions": {"instruction": "Pick up the cube."}}
+    else:
+        assert inputs.prompt == "Pick up the cube."
 
 
 @pytest.mark.parametrize(
@@ -657,6 +750,7 @@ def _make_od_config(
         custom_pipeline_args={},
         model_config=model_config or {},
         tf_model_config=tf_model_config,
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1),
     )
 
 
@@ -692,6 +786,7 @@ def test_pipeline_init_uses_flow_unipc_with_cosmos3_defaults(stub_real_pipeline_
     assert pipeline._engine_init_flow_shift == 2.5
 
 
+@pytest.mark.parametrize("cfg_parallel_size,ulysses_degree", [(1, 1), (1, 2), (2, 1), (2, 2)])
 @pytest.mark.parametrize(
     ("scheduler_class_name", "expected_distilled"),
     [
@@ -705,6 +800,8 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     monkeypatch: pytest.MonkeyPatch,
     scheduler_class_name: str,
     expected_distilled: bool,
+    cfg_parallel_size: int,
+    ulysses_degree: int,
 ) -> None:
     import json
 
@@ -753,6 +850,20 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
 
     od_config = _make_od_config(sound_gen=False)
     od_config.model = str(tmp_path)
+    od_config.parallel_config.cfg_parallel_size = cfg_parallel_size
+    od_config.parallel_config.ulysses_degree = ulysses_degree
+    if expected_distilled and cfg_parallel_size > 1:
+        monkeypatch.setattr(
+            pipeline_cosmos3.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: pytest.fail("component loading must not start for distilled CFG parallelism"),
+        )
+        with pytest.raises(ValueError, match="Set --cfg-parallel-size 1 and use --ulysses-degree"):
+            Cosmos3OmniDiffusersPipeline(od_config=od_config)
+        assert StubFlowMatchScheduler.from_config_calls == []
+        assert StubFlowUniPCScheduler.from_config_calls == []
+        return
+
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
     assert pipeline.is_distilled_model is expected_distilled

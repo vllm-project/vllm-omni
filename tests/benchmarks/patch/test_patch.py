@@ -168,7 +168,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             )
             self.events.add(
                 {
-                    "type": "response.audio_transcript.delta",
+                    "type": "response.output_audio_transcript.delta",
                     "response_id": response_id,
                     "delta": f"turn {self.response_count}",
                 },
@@ -176,7 +176,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             )
             self.events.add(
                 {
-                    "type": "response.audio.delta",
+                    "type": "response.output_audio.delta",
                     "response_id": response_id,
                     "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
                     "sample_rate_hz": 24_000,

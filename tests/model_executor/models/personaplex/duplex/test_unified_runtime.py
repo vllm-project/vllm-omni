@@ -61,7 +61,7 @@ def _audio_client(
     frames[:voiced_frames] = 1000
     raw = frames.tobytes()
     event = {
-        "type": "response.audio.delta",
+        "type": "response.output_audio.delta",
         "response_id": "response-1",
         "sample_rate_hz": e2e_driver.SAMPLE_RATE_HZ,
         "metadata": {

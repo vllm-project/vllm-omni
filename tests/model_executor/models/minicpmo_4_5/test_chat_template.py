@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from jinja2 import TemplateError
-from transformers.utils.chat_template_utils import _compile_jinja_template
+from transformers.utils.chat_template_utils import render_jinja_template
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -26,12 +26,15 @@ TEMPLATE = Path(__file__).resolve().parents[4] / "vllm_omni/transformers_utils/c
     ],
 )
 def test_native_content_concatenation(parts, expected):
-    rendered = _compile_jinja_template(TEMPLATE.read_text()).render(
-        messages=[{"role": "user", "content": parts}],
+    # render_jinja_template takes a batch of conversations and returns
+    # (rendered_conversations, continuation_chunks), so [0][0] is the string.
+    rendered = render_jinja_template(
+        [[{"role": "user", "content": parts}]],
+        chat_template=TEMPLATE.read_text(),
         add_generation_prompt=True,
         enable_thinking=False,
         use_tts_template=True,
-    )
+    )[0][0]
     assert rendered == (
         f"<|im_start|>user\n{expected}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>"
     )
@@ -39,7 +42,8 @@ def test_native_content_concatenation(parts, expected):
 
 def test_unsupported_part_is_not_silently_discarded():
     with pytest.raises(TemplateError, match="Unsupported MiniCPM-o content part"):
-        _compile_jinja_template(TEMPLATE.read_text()).render(
-            messages=[{"role": "user", "content": [{"type": "unknown"}]}],
+        render_jinja_template(
+            [[{"role": "user", "content": [{"type": "unknown"}]}]],
+            chat_template=TEMPLATE.read_text(),
             add_generation_prompt=True,
         )
