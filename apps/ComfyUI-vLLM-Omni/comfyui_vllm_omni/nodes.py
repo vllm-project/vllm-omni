@@ -163,6 +163,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "height": ("INT", {"default": 480, "min": 1}),
                 "fps": ("INT", {"default": 16, "min": 1}),
                 "num_frames": ("INT", {"default": 41, "min": 1}),
+                "generate_sound": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "frame": ("IMAGE",),
@@ -195,6 +196,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         height: int,
         fps: int,
         num_frames: int,
+        generate_sound: bool,
         negative_prompt: str | None = None,
         frame: torch.Tensor | None = None,
         references: dict | None = None,
@@ -234,6 +236,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             height=height,
             num_frames=num_frames,
             fps=fps,
+            generate_sound=generate_sound,
             negative_prompt=negative_prompt,
             sampling_params=sampling_params,
             lora=lora,
