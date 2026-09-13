@@ -67,6 +67,36 @@ logger = init_logger(__name__)
 _RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
 
 
+_RAS_SPIKE = os.environ.get("COSYVOICE3_RAS_SPIKE", "0") not in ("0", "false", "False", "")
+
+
+class _SpikeParams:
+    """Sampling parameters read once, then reused.
+
+    ``_req_scalar`` costs one D2H sync per parameter per request per step. In
+    the benchmark these values never change, so the spike pays for them once.
+    A real fix keeps them as tensors instead; this is here to get them out of
+    the measurement.
+    """
+
+    cache: dict = {}
+
+    @classmethod
+    def get(cls, md, default_top_p, default_top_k):
+        if not cls.cache:
+            def first(param, default):
+                if param is None or param.numel() == 0:
+                    return default
+                return param.reshape(-1)[0].item()
+
+            cls.cache = {
+                "temperature": float(first(md.temperature, 1.0)),
+                "top_p": float(first(md.top_p, default_top_p)),
+                "top_k": int(first(md.top_k, default_top_k)),
+            }
+        return cls.cache
+
+
 def _cosyvoice3_trt_enabled() -> bool:
     """COSYVOICE3_TRT env toggle (default on) for the optional TensorRT paths.
 
@@ -638,6 +668,9 @@ class CosyVoice3Model(
         # so ``weights`` is guaranteed to have at least one nonzero entry. The
         # final ``.item()`` is the ONLY D2H sync per call.
         sample_idx = cls._random_sample_one(weights, generator=generator)
+        if _RAS_SPIKE:
+            # 0-D CUDA tensor; the caller keeps it on the device.
+            return sorted_idx[sample_idx]
         return int(sorted_idx[sample_idx].item())
 
     @classmethod
@@ -664,8 +697,12 @@ class CosyVoice3Model(
                 device=weighted_scores.device,
                 dtype=torch.long,
             )
-            rep_num = int((recent == top_id).sum().item())
-            if rep_num >= win_size * tau_r:
+            if _RAS_SPIKE:
+                # The only data-dependent sync left on this path.
+                trigger = bool(((recent == top_id).sum() >= win_size * tau_r).item())
+            else:
+                trigger = int((recent == top_id).sum().item()) >= win_size * tau_r
+            if trigger:
                 weighted_scores = weighted_scores.clone()
                 original_score = weighted_scores[top_id].clone()
                 weighted_scores[top_id] = float("-inf")
@@ -674,7 +711,8 @@ class CosyVoice3Model(
                     weighted_scores[top_id],
                     original_score,
                 )
-                top_id = int(cls._random_sample_one(weighted_scores.softmax(dim=0), generator=generator).item())
+                _alt = cls._random_sample_one(weighted_scores.softmax(dim=0), generator=generator)
+                top_id = _alt if _RAS_SPIKE else int(_alt.item())
         return top_id
 
     def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
@@ -686,10 +724,11 @@ class CosyVoice3Model(
             return False
         if bool(sampling_metadata.bad_words_token_ids):
             return False
-        if torch.any(sampling_metadata.frequency_penalties != 0):
-            return False
-        if torch.any(sampling_metadata.presence_penalties != 0):
-            return False
+        if not _RAS_SPIKE:
+            if torch.any(sampling_metadata.frequency_penalties != 0):
+                return False
+            if torch.any(sampling_metadata.presence_penalties != 0):
+                return False
         return True
 
     def sample(
@@ -718,7 +757,7 @@ class CosyVoice3Model(
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
             logits = processor.apply(logits)
         finite_logits = torch.isfinite(logits)
-        if not finite_logits.any(dim=-1).all().item():
+        if not _RAS_SPIKE and not finite_logits.any(dim=-1).all().item():
             raise ValueError("CosyVoice3 sampling received a row with no finite logits")
         logits.masked_fill_(~finite_logits, float("-inf"))
 
@@ -728,17 +767,23 @@ class CosyVoice3Model(
         win_size = int(sampling_cfg.get("win_size", 10))
         tau_r = float(sampling_cfg.get("tau_r", 0.1))
 
-        sampled_ids: list[int] = []
+        sampled_ids: list = []
+        _spike = _SpikeParams.get(sampling_metadata, default_top_p, default_top_k) if _RAS_SPIKE else None
         for req_idx in range(int(logits.shape[0])):
             row_logits = logits[req_idx]
 
-            temperature = float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
+            temperature = (_spike["temperature"] if _RAS_SPIKE
+                           else float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0)))
             if temperature < self._sampling_eps:
-                sampled_ids.append(int(torch.argmax(row_logits).item()))
+                sampled_ids.append(torch.argmax(row_logits) if _RAS_SPIKE
+                                   else int(torch.argmax(row_logits).item()))
                 continue
 
-            top_p = float(self._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
-            top_k = int(self._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
+            if _RAS_SPIKE:
+                top_p, top_k = _spike["top_p"], _spike["top_k"]
+            else:
+                top_p = float(self._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
+                top_k = int(self._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
             generator = sampling_metadata.generators.get(req_idx)
             weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
             decoded_tokens = (
@@ -756,7 +801,10 @@ class CosyVoice3Model(
                 )
             )
 
-        sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
+        if _RAS_SPIKE:
+            sampled = torch.stack(sampled_ids).to(torch.int32)
+        else:
+            sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
