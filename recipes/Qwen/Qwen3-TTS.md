@@ -182,6 +182,128 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 
 ## GPU
 
+### 1x RTX 4070 Ti SUPER 16GB (0.6B CustomVoice)
+
+The 0.6B CustomVoice checkpoint is the smallest Qwen3-TTS deployment and runs on
+a 16 GB consumer card with the bundled deploy config unmodified.
+
+#### Environment
+
+- OS: Ubuntu 24.04.4 LTS (WSL2), kernel 6.6.114.1-microsoft-standard-WSL2
+- Python: 3.12.3
+- PyTorch: 2.13.0+cu132
+- Driver / runtime: NVIDIA 610.60 / CUDA 13.2
+- GPU: NVIDIA GeForce RTX 4070 Ti SUPER, 16376 MiB
+- vLLM version: 0.29.0
+- vLLM-Omni version or commit: `01a2f93256975c7ff9565c5414b0fe0225bc4765`
+
+#### Command
+
+```bash
+source /path/to/your/venv/bin/activate
+
+vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --omni --port 8091
+```
+
+The default deploy config (`qwen3_tts.yaml`) works without modification on this
+16 GB card. Both stages (talker + code2wav) share GPU 0 with
+`gpu_memory_utilization: 0.3` each, so no override is required and the
+`0.15` profile documented in the 4090 section below is not needed here.
+
+#### Verification
+
+**English synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Qwen3-TTS running on RTX 4070 Ti SUPER.",
+        "voice": "vivian",
+        "language": "English"
+    }' --output test_english.wav
+```
+
+**Chinese synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "你好，这是在RTX 4070 Ti SUPER上运行的语音合成测试。",
+        "voice": "vivian",
+        "language": "Chinese"
+    }' --output test_chinese.wav
+```
+
+**With emotion instruction:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "I am so excited about this!",
+        "voice": "vivian",
+        "language": "English",
+        "instructions": "Speak with great enthusiasm"
+    }' --output test_emotion.wav
+```
+
+All three return 24 kHz mono 16-bit PCM WAV, typically about 7 s, 6 s and 2.7 s
+of audio delivered in roughly 2 s, 1 s and 0.5 s of wall clock; the first
+request after startup also absorbs warmup. Clip length varies between runs
+because stage 0 samples with `temperature: 0.9` and `top_k: 50` — across eight
+runs the English prompt produced between 6.3 s and 11.7 s of audio. Whisper
+transcription reproduces the sentence frame every time and the Chinese and
+emotion clips match their input text; the model name and the digits in `4070`
+transcribe inconsistently between runs, and phrase repetition appeared in 2 of
+the 7 transcribed runs. These are reported as observations: no root cause was
+established, and audio quality was not assessed by listening.
+
+The third request exercises the `instructions` field end to end. It confirms the
+request is accepted and returns audio; whether the delivered prosody follows the
+instruction was not evaluated.
+
+#### Notes
+
+- Memory usage: **9753 MiB / 16376 MiB** at idle and **9768 MiB / 16376 MiB**
+  peak (`nvidia-smi`) under a burst of 8 concurrent requests, with the default
+  deploy config (`gpu_memory_utilization: 0.3` per stage). These are
+  whole-device totals: the desktop compositor and background applications on
+  this WSL2 host hold about 1.0 GiB of it, measured at 1045 MiB immediately
+  before startup and 1015 MiB immediately after shutdown. The server itself
+  therefore accounts for roughly 8.5 GiB, leaving about 6.4 GiB free on a 16 GB
+  card.
+- KV cache is reserved at startup, and the sampled peak stayed close to idle: a
+  burst of 8 concurrent requests, all served in 2.3 s wall clock, moved
+  `nvidia-smi` by only ~10 MiB. That figure covers short prompts at a
+  concurrency of 8 across roughly 5 s of sampling; other text lengths and
+  concurrency levels need their own measurement.
+- Engine-reported breakdown on this card: Stage 0 (talker) weights 1.91 GiB,
+  KV cache 2.01 GiB (18,816 tokens, 4.59x maximum concurrency at 4,096 tokens
+  per request), CUDA graphs 0.17 GiB, peak activation 0.81 GiB; Stage 1
+  (code2wav) weights 0.48 GiB, CUDA graphs 0.18 GiB.
+- Activate the virtual environment before `vllm serve` instead of invoking the
+  launcher by path (`/path/to/venv/bin/vllm`). FlashInfer JIT-compiles its
+  sampling kernel on the first request path, and shells out to `ninja` by name.
+  `ninja` is installed as a venv-scoped console script, so if the venv `bin`
+  directory is not on `PATH` stage 0 aborts during startup with:
+
+  ```text
+  FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+  ```
+
+  This is reached because stage 0 sets `top_k: 50` in its
+  `default_sampling_params`. Activating the venv, or otherwise putting its `bin`
+  directory on `PATH`, resolves it.
+- First startup takes roughly 2.5 minutes because FlashInfer JIT-compiles its
+  sampling kernel. Once that cache is warm the server reaches
+  `Application startup complete` in about 80 s.
+- `torch._inductor` logs `Not enough SMs to use max_autotune_gemm mode` during
+  capture. This is expected on a 66-SM consumer part and is harmless.
+
 ### 1x RTX 4090 24GB (0.6B CustomVoice)
 
 #### Environment
