@@ -59,6 +59,7 @@ def is_flash_attn_4_available() -> bool:
 # Bind via aliases so mypy does not treat each candidate import as a redefinition.
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
+IS_FLASH_ATTN_4 = False
 
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
@@ -102,6 +103,7 @@ else:
 
                 flash_attn_func = _fa_func
                 flash_attn_varlen_func = _fa_varlen
+                IS_FLASH_ATTN_4 = True
                 logger.info("Using CuTe FlashAttention-4 on Blackwell")
             except Exception as exc:
                 # Optional FA4 dependencies may be present but ABI-incompatible
