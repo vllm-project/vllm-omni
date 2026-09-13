@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 import os
 from collections.abc import Collection, Iterable, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
@@ -36,6 +37,9 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     pool_write_chunk,
     resident_block_ids,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import _PagedMetaCache
 
 _log = init_logger(__name__)
 
@@ -77,6 +81,14 @@ class ARDiffusionRequestAdapter:
         # advances num_computed_tokens on on_chunk_committed(), so there are
         # never optimistically-counted in-flight tokens to subtract.
         self.num_in_flight_tokens = 0
+        # Device-side paged-attention metadata for non-committing forwards,
+        # reused across the denoise steps of one chunk. Owned by the adapter so
+        # it dies with the request; see ARDiffusionPagedForwardContext.prepare.
+        self.paged_meta_cache: _PagedMetaCache | None = None
+
+    def invalidate_paged_meta(self) -> None:
+        """Drop cached paged-attention metadata (block table changed)."""
+        self.paged_meta_cache = None
 
     @property
     def num_computed_tokens(self) -> int:
@@ -100,6 +112,7 @@ class ARDiffusionRequestAdapter:
     def on_chunk_committed(self) -> None:
         """Advance by one chunk. Call once per chunk, not per denoise step."""
         self._completed_chunks += 1
+        self.invalidate_paged_meta()
 
 
 def compute_num_blocks(
@@ -542,6 +555,7 @@ class ARDiffusionKVCache:
 
         Returns the request's full block table (incl. null_block placeholders).
         """
+        adapter.invalidate_paged_meta()
         blocks = self.manager.allocate_slots(adapter, num_new_tokens=self.spec.chunk_size)
         if blocks is None:
             raise RuntimeError("AR-Diffusion KV pool exhausted while allocating a chunk")
@@ -561,6 +575,7 @@ class ARDiffusionKVCache:
         """Allocate managed blocks for an in-flight video span without committing it."""
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        adapter.invalidate_paged_meta()
         blocks = self.manager.allocate_slots(adapter, num_new_tokens=num_tokens)
         if blocks is None:
             raise RuntimeError("AR-Diffusion KV pool exhausted while allocating paged attention slots")

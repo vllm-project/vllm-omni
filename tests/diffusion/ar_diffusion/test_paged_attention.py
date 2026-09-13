@@ -419,3 +419,82 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
         # Leave a clean dynamo state for later suites in the same pytest process
         # (e.g. model_executor transformers models).
         torch._dynamo.reset()
+
+
+# ── Per-chunk metadata cache for non-committing forwards ────────────────────
+
+
+def _probe(st, branch=POS, *, action_len=0, seq_len=BLOCK, commit=False, device=torch.device("cpu")):
+    """One branch forward's worth of prepare(); returns the forward context."""
+    fctx = st.get_kv_caches(branch, seq_len=seq_len, commit_current=commit)[0].forward_ctx
+    fctx.prepare(device=device, action_len=action_len, query_len=seq_len + action_len)
+    return fctx
+
+
+def test_non_commit_prepare_reuses_metadata_across_denoise_steps():
+    """The T-1 probes of one chunk must not rebuild (and re-upload) metadata."""
+    _, st = make_state(window_chunks=2)
+    a = _probe(st, action_len=BLOCK)
+    b = _probe(st, action_len=BLOCK)
+    for name in ("block_table", "seq_lens", "query_start_loc", "current_video_slot_mapping", "action_slot_mapping"):
+        assert getattr(a, name) is getattr(b, name), name
+    assert (a.query_len, a.kv_len, a.max_seq_len) == (b.query_len, b.kv_len, b.max_seq_len)
+    assert b.current_video_block_ids == a.current_video_block_ids
+    assert b.action_scratch_block_ids == a.action_scratch_block_ids
+    # Both contexts are independently prepared and usable.
+    assert b.layer_inputs(0).block_table is a.layer_inputs(0).block_table
+
+
+def test_non_commit_metadata_matches_uncached_build():
+    """A cache hit must be value-identical to a fresh build."""
+    _, st = make_state(window_chunks=2)
+    a = _probe(st, action_len=BLOCK)
+    st.adapter(POS).invalidate_paged_meta()
+    b = _probe(st, action_len=BLOCK)
+    assert a.block_table is not b.block_table
+    for name in ("block_table", "seq_lens", "query_start_loc", "current_video_slot_mapping", "action_slot_mapping"):
+        assert torch.equal(getattr(a, name), getattr(b, name)), name
+
+
+def test_commit_prepare_is_never_cached():
+    _, st = make_state(window_chunks=2)
+    a = _probe(st, commit=True)
+    assert st.adapter(POS).paged_meta_cache is None
+    st.commit_paged_context(POS)
+    b = _probe(st, commit=True)
+    assert a.block_table is not b.block_table
+    st.commit_paged_context(POS)
+
+
+def test_commit_invalidates_cached_metadata():
+    """After a chunk commits the history grows, so the next probe rebuilds."""
+    _, st = make_state(window_chunks=2)
+    a = _probe(st)
+    st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx.prepare(
+        device=torch.device("cpu"), action_len=0, query_len=BLOCK
+    )
+    st.commit_paged_context(POS)
+    b = _probe(st)
+    assert a.block_table is not b.block_table
+    assert int(a.seq_lens[0]) == BLOCK
+    assert int(b.seq_lens[0]) == 2 * BLOCK
+
+
+def test_reset_and_branches_do_not_share_cached_metadata():
+    _, st = make_state(window_chunks=2)
+    pos1 = _probe(st, POS)
+    neg1 = _probe(st, NEG)
+    assert pos1.block_table is not neg1.block_table
+    st.reset()
+    pos2 = _probe(st, POS)
+    assert pos2.block_table is not pos1.block_table
+    assert torch.equal(pos2.block_table, pos1.block_table)
+
+
+def test_cache_miss_on_changed_action_or_query_len():
+    _, st = make_state(window_chunks=2)
+    a = _probe(st, action_len=0)
+    b = _probe(st, action_len=BLOCK)
+    assert a.block_table is not b.block_table
+    c = _probe(st, action_len=BLOCK)
+    assert c.block_table is b.block_table
