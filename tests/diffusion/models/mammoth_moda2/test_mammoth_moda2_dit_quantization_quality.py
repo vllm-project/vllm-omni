@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""BF16 versus online-FP8 quality and memory test for MammothModa2."""
+"""BF16 versus DiT-only online-FP8 quality and memory test for MammothModa2."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import yaml
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
@@ -30,12 +31,13 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-HEIGHT = 256
-WIDTH = 256
-NUM_INFERENCE_STEPS = 2
+HEIGHT = 1024
+WIDTH = 1024
+NUM_INFERENCE_STEPS = 50
 SEED = 42
 MAX_LPIPS = 0.15
-_AR_PATCH_SIZE = 16
+AR_HEIGHT = 32
+AR_WIDTH = 32
 _IMAGE_TOKEN_ID = 151655
 _VIDEO_TOKEN_ID = 151656
 _VISION_START_TOKEN_ID = 151652
@@ -92,16 +94,15 @@ def _to_pil(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
-def _generate(quantization: str | None) -> tuple[Image.Image, float]:
+def _generate(deploy_config: str) -> tuple[Image.Image, float]:
     generation_config = _load_generation_config()
-    ar_height = HEIGHT // _AR_PATCH_SIZE
-    ar_width = WIDTH // _AR_PATCH_SIZE
-    expected_grid_tokens = ar_height * (ar_width + 1)
-    prompt = _format_prompt("A cat sitting on a laptop keyboard", ar_width, ar_height)
+    expected_grid_tokens = AR_HEIGHT * (AR_WIDTH + 1)
+    prompt = _format_prompt("A cat sitting on a laptop keyboard", AR_WIDTH, AR_HEIGHT)
 
     ar_sampling = SamplingParams(
-        temperature=0.0,
-        top_k=1,
+        temperature=float(generation_config["temperature"]),
+        top_p=float(generation_config["top_p"]),
+        top_k=int(generation_config["top_k"]),
         max_tokens=expected_grid_tokens + 1,
         detokenize=False,
         seed=SEED,
@@ -111,15 +112,15 @@ def _generate(quantization: str | None) -> tuple[Image.Image, float]:
         "prompt": prompt,
         "additional_information": {
             "omni_task": ["t2i"],
-            "ar_width": [ar_width],
-            "ar_height": [ar_height],
+            "ar_width": [AR_WIDTH],
+            "ar_height": [AR_HEIGHT],
             "eol_token_id": [int(generation_config["eol_token_id"])],
             "visual_token_start_id": [int(generation_config["visual_token_start_id"])],
             "visual_token_end_id": [int(generation_config["visual_token_end_id"])],
             "image_height": [HEIGHT],
             "image_width": [WIDTH],
             "num_inference_steps": [NUM_INFERENCE_STEPS],
-            "text_guidance_scale": [1.0],
+            "text_guidance_scale": [9.0],
             "cfg_range": [0.0, 1.0],
             "visual_ids": [
                 _IMAGE_TOKEN_ID,
@@ -136,13 +137,12 @@ def _generate(quantization: str | None) -> tuple[Image.Image, float]:
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
     try:
-        runner_kwargs = {
-            "deploy_config": DEPLOY_CONFIG,
-            "enforce_eager": True,
-        }
-        if quantization is not None:
-            runner_kwargs["quantization"] = quantization
-        with OmniRunner(MODEL_PATH, seed=SEED, **runner_kwargs) as runner:
+        with OmniRunner(
+            MODEL_PATH,
+            seed=SEED,
+            deploy_config=deploy_config,
+            enforce_eager=True,
+        ) as runner:
             outputs = list(runner.omni.generate([request], [ar_sampling, dit_sampling]))
             image = _extract_image(outputs)
         device_peak_memory_mb = monitor.peak_used_mb
@@ -155,20 +155,34 @@ def _generate(quantization: str | None) -> tuple[Image.Image, float]:
     return _to_pil(image), device_peak_memory_mb
 
 
+@pytest.fixture(scope="module")
+def dit_fp8_deploy_config(tmp_path_factory: pytest.TempPathFactory) -> str:
+    config = yaml.safe_load(Path(DEPLOY_CONFIG).read_text(encoding="utf-8"))
+    stages = config["stages"]
+    assert all("quantization" not in stage for stage in stages)
+
+    dit_stage = next(stage for stage in stages if stage["stage_id"] == 1)
+    dit_stage["quantization"] = "fp8"
+
+    config_path = tmp_path_factory.mktemp("mammoth_moda2") / "mammoth_moda2_dit_fp8.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    return str(config_path)
+
+
 @pytest.mark.full_model
 @pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_mammoth_moda2_online_fp8_quality_and_memory():
-    baseline, bf16_device_mem = _generate(quantization=None)
-    quantized, fp8_device_mem = _generate(quantization="fp8")
+def test_mammoth_moda2_dit_online_fp8_quality_and_memory(dit_fp8_deploy_config: str):
+    baseline, bf16_device_mem = _generate(DEPLOY_CONFIG)
+    quantized, fp8_device_mem = _generate(dit_fp8_deploy_config)
 
     lpips_score = _compute_lpips(baseline, quantized, "t2i")
     psnr_score, mae_score = _compute_psnr_and_mae(baseline, quantized, "t2i")
-    assert lpips_score <= MAX_LPIPS, f"MammothModa2 online-FP8 LPIPS {lpips_score:.4f} exceeds {MAX_LPIPS}"
+    assert lpips_score <= MAX_LPIPS, f"MammothModa2 DiT online-FP8 LPIPS {lpips_score:.4f} exceeds {MAX_LPIPS}"
 
     device_reduction = (bf16_device_mem - fp8_device_mem) / bf16_device_mem * 100 if bf16_device_mem > 0 else 0.0
-    print("\nMammothModa2 BF16 versus online FP8")
+    print("\nMammothModa2 BF16 versus DiT-only online FP8")
     print(f"  LPIPS:           {lpips_score:.4f} (threshold: {MAX_LPIPS})")
     print(f"  PSNR:            {psnr_score:.4f} dB")
     print(f"  MAE:             {mae_score:.6f}")
