@@ -372,12 +372,12 @@ class OmniBase(PDDisaggregationMixin):
 
     @staticmethod
     def _apply_sampling_constraints(params: Any, constraints: Mapping[str, Any]) -> Any:
-        """Rebuild params with pipeline-required settings without mutating caller input."""
+        """Apply pipeline requirements, merging required stops with caller stops."""
         if not constraints:
             return params
         if isinstance(params, Mapping):
-            return {**params, **constraints}
-        if is_dataclass(params):
+            values = dict(params)
+        elif is_dataclass(params):
             values = {field.name: getattr(params, field.name) for field in fields(params) if field.init}
         elif struct_fields := getattr(params, "__struct_fields__", None):
             values = {
@@ -387,7 +387,17 @@ class OmniBase(PDDisaggregationMixin):
             }
         else:
             raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
-        return type(params)(**{**values, **constraints})
+
+        resolved_constraints = dict(constraints)
+        if "stop_token_ids" in resolved_constraints:
+            caller_stop_ids = values.get("stop_token_ids") or []
+            required_stop_ids = resolved_constraints["stop_token_ids"] or []
+            resolved_constraints["stop_token_ids"] = list(dict.fromkeys([*caller_stop_ids, *required_stop_ids]))
+
+        resolved = {**values, **resolved_constraints}
+        if isinstance(params, Mapping):
+            return resolved
+        return type(params)(**resolved)
 
     def _record_request_failure_once(self, request_id: str, reason: str) -> None:
         req_state = self.request_states.get(request_id)

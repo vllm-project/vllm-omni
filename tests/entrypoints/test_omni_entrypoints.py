@@ -200,20 +200,23 @@ def _make_base():
     return obj
 
 
-def test_resolve_sampling_params_list_preserves_stage_constraints():
+def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base = _make_base()
     base.engine.num_stages = 1
-    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    required_stop_ids = [151704, 151645]
+    base.default_sampling_params_list = [
+        SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=required_stop_ids)
+    ]
     base.engine.stage_configs = [
         StageConfig(
             stage_id=0,
             model_stage="dummy-model",
-            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+            sampling_constraints={"detokenize": False, "stop_token_ids": required_stop_ids},
         ).to_omegaconf()
     ]
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
-    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
-    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": required_stop_ids}]
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[100, 151704])
 
     resolved = base.resolve_sampling_params_list(caller_params)
 
@@ -221,10 +224,10 @@ def test_resolve_sampling_params_list_preserves_stage_constraints():
     assert resolved[0].seed == 1234
     assert resolved[0].max_tokens == 7
     assert resolved[0].detokenize is False
-    assert resolved[0].stop_token_ids == [42]
-    assert 42 in resolved[0]._all_stop_token_ids
+    assert resolved[0].stop_token_ids == [100, 151704, 151645]
+    assert {100, 151704, 151645}.issubset(resolved[0]._all_stop_token_ids)
     assert caller_params.detokenize is True
-    assert caller_params.stop_token_ids == [7]
+    assert caller_params.stop_token_ids == [100, 151704]
 
 
 @pytest.mark.parametrize("use_defaults", [False, True])
