@@ -205,7 +205,7 @@ def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base.engine.num_stages = 1
     required_stop_ids = [151704, 151645]
     base.default_sampling_params_list = [
-        SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=required_stop_ids)
+        SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[99, *required_stop_ids])
     ]
     base.engine.stage_configs = [
         StageConfig(
@@ -216,6 +216,11 @@ def test_resolve_sampling_params_list_merges_required_stop_tokens():
     ]
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
     assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": required_stop_ids}]
+
+    resolved_defaults = base.resolve_sampling_params_list(None)
+
+    assert resolved_defaults[0].stop_token_ids == [99, 151704, 151645]
+
     caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[100, 151704])
 
     resolved = base.resolve_sampling_params_list(caller_params)

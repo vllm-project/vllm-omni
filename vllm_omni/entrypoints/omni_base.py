@@ -18,6 +18,7 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -388,13 +389,7 @@ class OmniBase(PDDisaggregationMixin):
         else:
             raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
 
-        resolved_constraints = dict(constraints)
-        if "stop_token_ids" in resolved_constraints:
-            caller_stop_ids = values.get("stop_token_ids") or []
-            required_stop_ids = resolved_constraints["stop_token_ids"] or []
-            resolved_constraints["stop_token_ids"] = list(dict.fromkeys([*caller_stop_ids, *required_stop_ids]))
-
-        resolved = {**values, **resolved_constraints}
+        resolved = merge_sampling_constraints(values, constraints)
         if isinstance(params, Mapping):
             return resolved
         return type(params)(**resolved)
