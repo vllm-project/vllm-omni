@@ -174,11 +174,8 @@ def build_engine_core_request_from_tokens(
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
-    wire_payload: dict[str, Any] | None = None
-    if isinstance(raw_additional_information, dict):
-        wire_payload = dict(raw_additional_information)
     additional_info_payload = serialize_additional_information(
-        wire_payload,
+        raw_additional_information,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
@@ -189,14 +186,40 @@ def build_engine_core_request_from_tokens(
         sampling_params=sampling_params,
         pooling_params=pooling_params,
         arrival_time=arrival_time,
-        lora_request=getattr(params, "lora_request", None),
+        lora_request=prompt.get("lora_request", getattr(params, "lora_request", None)),
         cache_salt=prompt.get("cache_salt"),
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
+        prompt_is_token_ids=prompt.get("prompt_is_token_ids"),
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
     )
+
+
+def _pd_decode_input_from_prefill_prompt(prefill_prompt: Any) -> tuple[dict[str, Any], list | None]:
+    """Extract the processed stage-0 request fields needed by a PD decode."""
+    if isinstance(prefill_prompt, dict):
+        get_field = prefill_prompt.get
+    else:
+
+        def get_field(key: str, default: Any = None) -> Any:
+            return getattr(prefill_prompt, key, default)
+
+    prompt_token_ids = get_field("prompt_token_ids")
+    if prompt_token_ids is None:
+        raise RuntimeError("[Orchestrator][PD] Prefill request has no prompt_token_ids")
+
+    decode_input = {
+        "prompt_token_ids": list(prompt_token_ids),
+        "prompt_embeds": get_field("prompt_embeds"),
+        "prompt_is_token_ids": get_field("prompt_is_token_ids"),
+        "additional_information": get_field("additional_information"),
+        "model_intermediate_buffer": get_field("model_intermediate_buffer"),
+        "cache_salt": get_field("cache_salt"),
+        "lora_request": get_field("lora_request"),
+    }
+    return decode_input, get_field("mm_features")
 
 
 @dataclass
@@ -217,6 +240,10 @@ class OrchestratorRequestState:
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
+    # The processed stage-0 request is retained only for the P->D handoff.
+    # ``prompt`` deliberately remains the original user input for downstream
+    # bridges such as HunyuanImage3 AR->DiT.
+    pd_prefill_prompt: Any | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
@@ -770,6 +797,7 @@ class Orchestrator:
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
+            pd_prefill_prompt=(prompt if self._pd_pair is not None and self._pd_pair[0] == stage_id else None),
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
         self.request_states[request_id] = req_state
@@ -2381,12 +2409,10 @@ class Orchestrator:
         if sp.extra_args is None:
             sp.extra_args = {}
 
-        # Get KV params captured from the prefill output (must include remote_request_id).
-        kv_prefill_params = self._pd_kv_params.pop(req_id, None)
-        if not kv_prefill_params or "remote_request_id" not in kv_prefill_params:
-            raise RuntimeError(
-                f"[Orchestrator][PD] Missing prefill kv_transfer_params.remote_request_id for req={req_id}"
-            )
+        # Mooncake keys the transfer by transfer_id and returns no request
+        # metadata from request_finished(). Treat connector output as an
+        # optional compatibility overlay for versions that do return it.
+        kv_prefill_params = self._pd_kv_params.pop(req_id, None) or {}
 
         decode_kv_params: dict[str, Any] = {
             "transfer_id": f"xfer-{req_id}",
@@ -2398,14 +2424,25 @@ class Orchestrator:
         if self._pd_prefill_engine_id:
             decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
 
-        # Overlay params from prefill side (includes remote_request_id set by monkey patch).
+        # Preserve all metadata returned by the prefill-side connector.
         decode_kv_params.update(kv_prefill_params)
+        from vllm_omni.engine.pd_continuation import PD_RNG_STATE_KEY
+
+        decode_kv_params.pop(PD_RNG_STATE_KEY, None)
 
         # Ensure these flags are set correctly after any overlay.
         decode_kv_params["do_remote_prefill"] = True
         decode_kv_params["do_remote_decode"] = False
         if not decode_kv_params.get("transfer_id"):
             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
+
+        missing = [
+            key for key in ("remote_engine_id", "remote_bootstrap_addr", "transfer_id") if not decode_kv_params.get(key)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"[Orchestrator][PD] Missing decode kv_transfer_params fields for req={req_id}: {', '.join(missing)}"
+            )
 
         sp.extra_args["kv_transfer_params"] = decode_kv_params
 
@@ -2665,47 +2702,37 @@ class Orchestrator:
             )
             return
 
-        # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
+        # PD disaggregation: rebuild decode from the processed prefill request.
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
             params = self._build_pd_decode_params(req_id, params)
 
-            # Use the original user prompt for the decode stage (not processed embeddings)
-            original_prompt = req_state.prompt
-            raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+            if req_state.pd_prefill_prompt is None:
+                raise RuntimeError(f"[Orchestrator][PD] Missing processed prefill prompt for req={req_id}")
+            pd_decode_prompt, pd_decode_mm_features = _pd_decode_input_from_prefill_prompt(req_state.pd_prefill_prompt)
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=pd_decode_prompt,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=pd_decode_mm_features,
+                resumable=next_stage_resumable,
+            )
+            request.external_req_id = request.request_id
+            from vllm_omni.engine.pd_continuation import PD_RESUME_KEY, PDContinuation, validate_pd_sampling
 
-            decode_inputs: list[dict[str, Any]] = []
-            for decode_input in raw_decode_inputs:
-                if isinstance(decode_input, dict):
-                    decode_inputs.append(decode_input)
-                    continue
-                prompt_token_ids = getattr(decode_input, "prompt_token_ids", None)
-                if prompt_token_ids is None:
-                    raise TypeError(
-                        "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
-                        f"got {type(decode_input).__name__} for req={req_id}"
-                    )
-                decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
-
-            for decode_input in decode_inputs:
-                request = build_engine_core_request_from_tokens(
-                    request_id=req_id,
-                    prompt=decode_input,
-                    params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
-                    mm_features=req_state.mm_features,
-                    resumable=next_stage_resumable,
-                )
-                request.external_req_id = request.request_id
-                if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
-                else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                self._record_duplex_stage_submission(
-                    next_logical,
-                    req_id,
-                    replica_id,
-                    req_state,
-                )
+            if (params.extra_args or {}).get(PD_RESUME_KEY):
+                validate_pd_sampling(params)
+                request.pd_continuation = PDContinuation.from_output(output, request.prompt_token_ids)
+            if already_submitted:
+                replica_id = await next_pool.submit_update(req_id, req_state, request)
+            else:
+                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+            self._record_duplex_stage_submission(
+                next_logical,
+                req_id,
+                replica_id,
+                req_state,
+            )
 
             req_state.stage_submit_ts[next_logical] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0

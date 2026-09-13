@@ -62,6 +62,7 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._paused = False
     omni.engine = SimpleNamespace(
         num_stages=1,
+        stage_configs=[SimpleNamespace(stage_id=0)],
         add_request_async=fake_add_request,
         abort_async=fake_abort_request,
     )
@@ -127,6 +128,51 @@ def test_generate_forwards_lora_request_to_engine():
         assert len(submitted_ids) == 1
         assert len(submitted_loras) == 1
         assert submitted_loras[0] is lora
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_generate_propagates_bare_sampling_params_to_pd_decode():
+    """A bare logical AR param applies to both halves of a stage-0 PD split."""
+
+    async def run():
+        submitted_params = []
+
+        async def fake_add_request(*, sampling_params_list, **kwargs):
+            del kwargs
+            submitted_params.append(sampling_params_list)
+
+        omni = get_async_omni_instance(fake_add_request=fake_add_request)
+        omni.engine.num_stages = 3
+        omni.engine.stage_configs = [SimpleNamespace(stage_id=i) for i in range(3)]
+        omni._pd_separation_pair = (0, 1)
+        decode_default = SamplingParams(max_tokens=8192, temperature=0.9)
+        diffusion_default = SimpleNamespace(num_inference_steps=50)
+        omni.default_sampling_params_list = [
+            SamplingParams(max_tokens=8192),
+            decode_default,
+            diffusion_default,
+        ]
+        user_params = SamplingParams(max_tokens=64, temperature=0.2)
+
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="pd-request",
+            sampling_params=user_params,
+            output_modalities=["text"],
+        ):
+            pass
+
+        assert len(submitted_params) == 1
+        prefill_params, decode_params, diffusion_params = submitted_params[0]
+        assert prefill_params is not user_params
+        assert prefill_params.max_tokens == 1
+        assert decode_params is user_params
+        assert decode_params.max_tokens == 64
+        assert decode_params.temperature == 0.2
+        assert diffusion_params is diffusion_default
+        assert decode_default.max_tokens == 8192
 
     asyncio.run(run())
 

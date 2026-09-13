@@ -622,6 +622,19 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
         )
+        continuation = getattr(request, "pd_continuation", None)
+        if continuation is not None and request.sampling_params.stop:
+            from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+
+            # Admission precedes sending the request to EngineCore. Check a
+            # terminal first token now so D can finish after KV receive without
+            # another model forward. The real detokenizer later consumes the
+            # scheduler's complete token stream, including y1, exactly once.
+            detector = IncrementalDetokenizer.from_new_request(self.tokenizer, request)
+            first_token = continuation.token_ids[0]
+            sp = request.sampling_params
+            token_stop = first_token == sp.eos_token_id or first_token in (sp.stop_token_ids or [])
+            continuation.stop_string = detector.update(continuation.token_ids, stop_terminated=token_stop)
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req

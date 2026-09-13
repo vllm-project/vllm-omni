@@ -310,6 +310,29 @@ def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests(
     assert payload_req_ids == ["r2"]
 
 
+@pytest.mark.parametrize(
+    ("current_stage_id", "final_stage_id", "expected"),
+    [
+        (0, 0, False),
+        (0, 1, True),
+        (1, 1, False),
+        (1, 2, True),
+    ],
+)
+def test_downstream_payload_is_relative_to_current_stage(
+    current_stage_id: int,
+    final_stage_id: int,
+    expected: bool,
+):
+    runner = object.__new__(GPUARModelRunner)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=current_stage_id))
+    runner.model_intermediate_buffer = {"req": {"omni_final_stage_id": final_stage_id}}
+    runner.requests = {}
+    runner._downstream_payload_cache = {}
+
+    assert runner._request_needs_downstream_stage_payload("req") is expected
+
+
 def test_sparse_mm_req_ids_requires_sparse_audio_marker():
     assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"req_id": ["r1"]}}) is None
     assert sparse_audio.resolve_sparse_mm_req_ids({"meta.req_id": ["r1"]}) is None

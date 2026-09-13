@@ -559,6 +559,12 @@ class AsyncOmni(EngineClient, OmniBase):
                 else:
                     default = list(self.default_sampling_params_list)
                     default[0] = sampling_params
+                    pd_pair = self._get_pd_separation_pair()
+                    if pd_pair is not None and pd_pair[0] == 0:
+                        # A bare SamplingParams describes logical stage 0. Mirror it
+                        # to Decode when that AR stage is split, which also prepares
+                        # the public generate/completions path for pure AR PD pipelines.
+                        default[pd_pair[1]] = sampling_params
                     sampling_params_list = default
 
             # Expand sampling params for PD disaggregation (user may provide N-1 params)

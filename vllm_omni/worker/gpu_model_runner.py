@@ -504,6 +504,33 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 mrope_pos_ptr += completion_part_len
 
+    def _create_request_generator(self, new_req_data):
+        """Initialize a new worker request; existing requests retain their RNG."""
+        sampling_params = new_req_data.sampling_params
+        if sampling_params is None or sampling_params.sampling_type != SamplingType.RANDOM_SEED:
+            return None
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(sampling_params.seed)
+        if getattr(new_req_data, "initial_output_token_ids", None):
+            from vllm.distributed.parallel_state import get_tp_group
+
+            from vllm_omni.engine.pd_continuation import needs_pd_rng_state
+            from vllm_omni.worker.pd_rng import restore_pd_rng_state
+
+            if needs_pd_rng_state(sampling_params):
+                if len(new_req_data.initial_output_token_ids) != 1:
+                    raise ValueError("Cannot recreate a PD generator from its initial state after further decode")
+                tp = get_tp_group()
+                restore_pd_rng_state(
+                    generator,
+                    getattr(new_req_data, "pd_rng_state", None),
+                    seed=sampling_params.seed,
+                    tp_rank=tp.rank_in_group,
+                    tp_size=tp.world_size,
+                    req_id=new_req_data.req_id,
+                )
+        return generator
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -609,11 +636,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
-            if sampling_params and sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
+            generator = self._create_request_generator(new_req_data)
 
             if self.is_pooling_model:
                 assert pooling_params is not None
@@ -634,7 +657,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 generator=generator,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
+                output_token_ids=list(getattr(new_req_data, "initial_output_token_ids", [])),
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state

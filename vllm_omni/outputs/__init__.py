@@ -60,6 +60,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    # Serialized request generators after P accepts the first token.
+    pd_rng_states: dict[str, bytes] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

@@ -94,6 +94,37 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[2].lora_request is None
 
 
+def test_build_multistage_generation_inputs_propagates_seed_to_pd_decode(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="llm", is_comprehension=False),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(max_tokens=1, seed=11),
+            SamplingParams(max_tokens=8192, seed=22),
+            OmniDiffusionSamplingParams(seed=33),
+        ],
+        _pd_separation_pair=(0, 1),
+    )
+
+    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a robot",
+        extra_body={},
+        reference_images=[],
+        gen_params=OmniDiffusionSamplingParams(seed=1234),
+    )
+
+    assert [params.seed for params in sampling_params_list] == [1234, 1234, 1234]
+    assert sampling_params_list[0].max_tokens == 1
+    assert sampling_params_list[1].max_tokens == 8192
+
+
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
