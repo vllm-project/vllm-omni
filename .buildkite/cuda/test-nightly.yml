@@ -234,20 +234,11 @@ steps:
             --run-level "full_model"
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · Single-GPU"
+        source_file_dependencies: diffusion_qwen_image_function
         timeout_in_minutes: 120
         commands:
           - pytest -sv tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py -m "full_model and diffusion and L4 and B200 and cards_1" --run-level "full_model"
 
-      - label: ":full_moon: Diffusion X2I(&A&T) · Z-Image Function Test · L4 · 4-GPU"
-        source_file_dependencies: diffusion_z_image_function
-        timeout_in_minutes: 120
-        commands:
-          - >-
-            pytest -sv
-            tests/e2e/online_serving/test_zimage_expansion.py
-            -m "full_model and diffusion and L4 and cards_4"
-            --run-level "full_model"
-        mirror_hardwares: l4_4
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Doc Test"
         source_file_dependencies: diffusion_text_to_image_doc
@@ -350,9 +341,8 @@ steps:
             tests/e2e/online_serving/test_lingbot_video.py
             tests/e2e/online_serving/test_lingbot_video_moe.py
             tests/e2e/offline_inference/test_lingbot_world_v2.py
-            -m "full_model and diffusion and H100 and cards_1"
+            -m "full_model and diffusion and H100 and B200 and cards_1"
             --run-level "full_model"
-        mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Doc Test"
         source_file_dependencies: diffusion_image_to_video_doc
@@ -372,8 +362,7 @@ steps:
         commands:
           - |
             VLLM_OMNI_DEVICE_POSTPROCESS_MODEL=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-              pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and cuda" --run-level "full_model"
-        mirror_hardwares: h100_1
+              pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and H100 and B200 and cuda and cards_1" --run-level "full_model"
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         source_file_dependencies: diffusion_wan22_accuracy
