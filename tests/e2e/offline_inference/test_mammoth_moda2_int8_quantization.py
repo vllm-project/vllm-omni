@@ -99,7 +99,9 @@ def _stage_config(quantization: str | None) -> str:
     base = get_deploy_config_path("mammoth_moda2_ar.yaml")
     stage_updates = dict(_AR_STAGE_OVERRIDES)
     if quantization is None:
-        return modify_stage_config(base, updates={"stages": {0: stage_updates}}, deletes={"stages": {0: ["quantization"]}})
+        return modify_stage_config(
+          base, updates={"stages": {0: stage_updates}}, deletes={"stages": {0: ["quantization"]}}
+        )
     stage_updates["quantization"] = quantization
     return modify_stage_config(base, updates={"stages": {0: stage_updates}})
 
@@ -203,8 +205,7 @@ def test_bf16_vs_int8_generation_consistency():
 
     if logprob_cos == logprob_cos:  # not NaN
         assert logprob_cos >= MIN_LOGPROB_COSINE, (
-            f"BF16/INT8 logprob sequences diverge too much: cosine={logprob_cos:.4f} < "
-            f"{MIN_LOGPROB_COSINE}"
+            f"BF16/INT8 logprob sequences diverge too much: cosine={logprob_cos:.4f} < {MIN_LOGPROB_COSINE}"
         )
 
 
@@ -421,6 +422,7 @@ def test_bf16_vs_int8_t2i_image_consistency():
 # ---------------------------------------------------------------------------
 # Checkpoint loading + quantization scales (no GPU required)
 # ---------------------------------------------------------------------------
+
 
 def _local_checkpoint_dir(model: str):
     """Return the local checkpoint directory for *model*, or ``None``."""
