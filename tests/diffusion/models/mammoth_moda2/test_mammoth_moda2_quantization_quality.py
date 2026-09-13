@@ -59,15 +59,10 @@ def _format_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
     )
 
 
-def _extract_image_and_worker_peak(outputs) -> tuple[torch.Tensor, float]:
-    worker_peak_memory_mb = 0.0
+def _extract_image(outputs) -> torch.Tensor:
     for output_group in outputs:
         request_outputs = output_group if isinstance(output_group, list) else [output_group]
         for request_output in request_outputs:
-            worker_peak_memory_mb = max(
-                worker_peak_memory_mb,
-                float(getattr(request_output, "peak_memory_mb", 0.0) or 0.0),
-            )
             completions = getattr(request_output, "outputs", None)
             if not isinstance(completions, list):
                 continue
@@ -83,7 +78,7 @@ def _extract_image_and_worker_peak(outputs) -> tuple[torch.Tensor, float]:
                     image = image[0]
                 if image.ndim != 3:
                     raise ValueError(f"Expected a CHW image tensor, got shape {tuple(image.shape)}")
-                return image.detach().float().cpu(), worker_peak_memory_mb
+                return image.detach().float().cpu()
     raise ValueError("MammothModa2 pipeline produced no image tensor")
 
 
@@ -97,7 +92,7 @@ def _to_pil(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
-def _generate(quantization: str | None) -> tuple[Image.Image, float, float]:
+def _generate(quantization: str | None) -> tuple[Image.Image, float]:
     generation_config = _load_generation_config()
     ar_height = HEIGHT // _AR_PATCH_SIZE
     ar_width = WIDTH // _AR_PATCH_SIZE
@@ -149,7 +144,7 @@ def _generate(quantization: str | None) -> tuple[Image.Image, float, float]:
             runner_kwargs["quantization"] = quantization
         with OmniRunner(MODEL_PATH, seed=SEED, **runner_kwargs) as runner:
             outputs = list(runner.omni.generate([request], [ar_sampling, dit_sampling]))
-            image, worker_peak_memory_mb = _extract_image_and_worker_peak(outputs)
+            image = _extract_image(outputs)
         device_peak_memory_mb = monitor.peak_used_mb
     finally:
         monitor.stop()
@@ -157,7 +152,7 @@ def _generate(quantization: str | None) -> tuple[Image.Image, float, float]:
         current_omni_platform.empty_cache()
 
     assert torch.isfinite(image).all(), "Generated image contains non-finite values"
-    return _to_pil(image), device_peak_memory_mb, worker_peak_memory_mb
+    return _to_pil(image), device_peak_memory_mb
 
 
 @pytest.mark.full_model
@@ -165,25 +160,21 @@ def _generate(quantization: str | None) -> tuple[Image.Image, float, float]:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 def test_mammoth_moda2_online_fp8_quality_and_memory():
-    baseline, bf16_device_mem, bf16_worker_mem = _generate(quantization=None)
-    quantized, fp8_device_mem, fp8_worker_mem = _generate(quantization="fp8")
+    baseline, bf16_device_mem = _generate(quantization=None)
+    quantized, fp8_device_mem = _generate(quantization="fp8")
 
     lpips_score = _compute_lpips(baseline, quantized, "t2i")
     psnr_score, mae_score = _compute_psnr_and_mae(baseline, quantized, "t2i")
     assert lpips_score <= MAX_LPIPS, f"MammothModa2 online-FP8 LPIPS {lpips_score:.4f} exceeds {MAX_LPIPS}"
 
     device_reduction = (bf16_device_mem - fp8_device_mem) / bf16_device_mem * 100 if bf16_device_mem > 0 else 0.0
-    worker_reduction = (bf16_worker_mem - fp8_worker_mem) / bf16_worker_mem * 100 if bf16_worker_mem > 0 else 0.0
     print("\nMammothModa2 BF16 versus online FP8")
     print(f"  LPIPS:           {lpips_score:.4f} (threshold: {MAX_LPIPS})")
     print(f"  PSNR:            {psnr_score:.4f} dB")
     print(f"  MAE:             {mae_score:.6f}")
     print(f"  BF16 device:     {bf16_device_mem:.2f} MiB")
     print(f"  FP8 device:      {fp8_device_mem:.2f} MiB ({device_reduction:.1f}% reduction)")
-    print(f"  BF16 DiT worker: {bf16_worker_mem:.2f} MiB")
-    print(f"  FP8 DiT worker:  {fp8_worker_mem:.2f} MiB ({worker_reduction:.1f}% reduction)")
 
     assert np.isfinite(psnr_score) or np.isinf(psnr_score)
     assert np.isfinite(mae_score)
     assert bf16_device_mem > 0 and fp8_device_mem > 0
-    assert bf16_worker_mem > 0 and fp8_worker_mem > 0

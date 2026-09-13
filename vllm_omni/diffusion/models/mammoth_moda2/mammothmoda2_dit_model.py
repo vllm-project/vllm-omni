@@ -501,8 +501,6 @@ class TransformerBlock(nn.Module):
 class Transformer2DModel(ModelMixin, ConfigMixin):
     """MammothModa2 DiT transformer"""
 
-    ignore_for_config = ["quant_config", "prefix"]
-
     @register_to_config
     def __init__(
         self,
