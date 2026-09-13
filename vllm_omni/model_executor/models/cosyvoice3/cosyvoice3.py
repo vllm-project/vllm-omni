@@ -591,91 +591,111 @@ class CosyVoice3Model(
         return req_ids[valid_mask]
 
     @staticmethod
-    def _req_scalar(param: torch.Tensor | None, req_idx: int, default: float | int) -> float | int:
+    def _per_request(
+        param: torch.Tensor | None,
+        num_reqs: int,
+        default: float | int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """A per-request sampling parameter as a ``[num_reqs]`` device tensor.
+
+        vLLM passes ``None`` when no request in the batch sets the parameter, and
+        the model's configured default applies then, as before. Reading the values
+        into Python instead cost one blocking sync per parameter per request.
+        """
         if param is None or param.numel() == 0:
-            return default
-        index = min(req_idx, int(param.numel()) - 1)
-        value = param.reshape(-1)[index].item()
-        if isinstance(default, int):
-            return int(value)
-        return float(value)
+            return torch.full((num_reqs,), default, dtype=dtype, device=device)
+        return param.reshape(-1)[:num_reqs].to(device=device, dtype=dtype)
 
     @staticmethod
     def _random_sample_one(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         return random_sample(probs.unsqueeze(0), {} if generator is None else {0: generator}).reshape(())
 
-    @classmethod
-    def _nucleus_sample_one(
-        cls,
-        weighted_scores: torch.Tensor,
+    def _sample_primary(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
         *,
-        top_p: float,
-        top_k: int,
-        generator: torch.Generator | None,
-    ) -> int:
-        """Vectorized nucleus + top-k sampling.
+        default_top_p: float,
+        default_top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Temperature, top-p and top-k draw for the whole batch, without leaving the device.
 
-        Distribution-equivalent to the reference iterative implementation: the
-        keep-set is identical (token i is kept iff
-        ``cumsum(sorted_probs)[i] - sorted_probs[i] < top_p`` AND ``i < top_k``)
-        and the renormalized sampling distribution matches, but the exact token
-        drawn for a given seed is NOT guaranteed to match. The reference draws
-        via ``multinomial`` over the stacked kept subset while this draws over
-        the full sorted vector (zeroed outside the keep-set), so the generator
-        advances over different-sized inputs and may yield a different sample.
-        The win: no per-token ``.item()`` D2H syncs from the Python loop —
-        those dominated the sampler CPU time in profiling.
+        Returns ``(token_ids, weighted_scores, greedy)``: ``[N]`` token ids, the
+        ``[N, V]`` temperature-scaled log-probabilities RAS resamples from, and the
+        ``[N]`` mask of greedy rows, which take the argmax of ``logits``.
+
+        For a seeded request the draw matches the per-request loop this replaces.
+        ``random_sample`` fills each seeded row's noise from that row's own
+        generator over the same full-vocabulary width, so every generator still
+        advances by one row of exponentials per step. Unseeded rows now share one
+        call on the global stream, so their tokens differ from before, as they
+        already did from run to run.
         """
-        probs = weighted_scores.softmax(dim=0)
-        sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
-        cum_before = sorted_prob.cumsum(dim=0) - sorted_prob
-        mask = cum_before < top_p
-        if top_k > 0:
-            n = sorted_prob.shape[0]
-            mask = mask & (torch.arange(n, device=mask.device) < min(int(top_k), n))
-        weights = sorted_prob * mask.to(sorted_prob.dtype)
-        # First token always passes (cum_before[0] = 0 < top_p for any top_p > 0),
-        # so ``weights`` is guaranteed to have at least one nonzero entry. The
-        # final ``.item()`` is the ONLY D2H sync per call.
-        sample_idx = cls._random_sample_one(weights, generator=generator)
-        return int(sorted_idx[sample_idx].item())
+        num_reqs, vocab = logits.shape
+        device = logits.device
+        temperature = self._per_request(sampling_metadata.temperature, num_reqs, 1.0, torch.float32, device)
+        top_p = self._per_request(sampling_metadata.top_p, num_reqs, default_top_p, torch.float32, device)
+        top_k = self._per_request(sampling_metadata.top_k, num_reqs, default_top_k, torch.long, device)
 
-    @classmethod
-    def _ras_sample_one(
-        cls,
+        greedy = temperature < self._sampling_eps
+        weighted_scores = torch.log_softmax(logits / temperature.clamp_min(self._sampling_eps).unsqueeze(1), dim=-1)
+
+        probs = weighted_scores.softmax(dim=-1)
+        sorted_prob, sorted_idx = probs.sort(dim=-1, descending=True, stable=True)
+        keep = (sorted_prob.cumsum(dim=-1) - sorted_prob) < top_p.unsqueeze(1)
+        # A non-positive top_k disables the limit, as before.
+        limit = torch.where(top_k > 0, top_k.clamp(max=vocab), vocab)
+        keep &= torch.arange(vocab, device=device) < limit.unsqueeze(1)
+        weights = sorted_prob * keep.to(sorted_prob.dtype)
+        # random_sample divides ``weights`` in place; nothing reads it afterwards.
+        picked = random_sample(weights, sampling_metadata.generators)
+        token_ids = sorted_idx.gather(1, picked.unsqueeze(1)).squeeze(1)
+        token_ids = torch.where(greedy, logits.argmax(dim=-1), token_ids)
+        return token_ids, weighted_scores, greedy
+
+    def _apply_ras_legacy(
+        self,
+        token_ids: torch.Tensor,
         weighted_scores: torch.Tensor,
-        decoded_tokens: Sequence[int],
+        greedy: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
         *,
-        top_p: float,
-        top_k: int,
         win_size: int,
         tau_r: float,
-        generator: torch.Generator | None,
-    ) -> int:
-        top_id = cls._nucleus_sample_one(
-            weighted_scores,
-            top_p=top_p,
-            top_k=top_k,
-            generator=generator,
-        )
-        if win_size > 0 and decoded_tokens:
-            recent = torch.as_tensor(
-                list(decoded_tokens[-win_size:]),
-                device=weighted_scores.device,
-                dtype=torch.long,
-            )
+    ) -> torch.Tensor:
+        """Repetition-aware resampling, still decided request by request on the host.
+
+        This is the boundary a device-resident RAS policy replaces, and it keeps the
+        previous control flow on purpose: one blocking read per sampled request per
+        step for the repetition predicate, and the fallback draw taken from the
+        request's generator only when that predicate fires. Each generator therefore
+        sees the same sequence of draws as before.
+        """
+        if win_size <= 0:
+            return token_ids
+        # vLLM knows on the host whether any row is greedy, so the per-row read is
+        # only paid for mixed batches.
+        greedy_rows = None if sampling_metadata.all_random else greedy.tolist()
+        output_token_ids = sampling_metadata.output_token_ids
+        for req_idx in range(int(token_ids.shape[0])):
+            if greedy_rows is not None and greedy_rows[req_idx]:
+                continue
+            decoded_tokens = output_token_ids[req_idx] if req_idx < len(output_token_ids) else []
+            if not decoded_tokens:
+                continue
+            top_id = token_ids[req_idx]
+            recent = torch.as_tensor(list(decoded_tokens[-win_size:]), device=token_ids.device, dtype=torch.long)
             rep_num = int((recent == top_id).sum().item())
             if rep_num >= win_size * tau_r:
-                weighted_scores = weighted_scores.clone()
-                original_score = weighted_scores[top_id].clone()
-                weighted_scores[top_id] = float("-inf")
-                weighted_scores[top_id] = torch.where(
-                    torch.isfinite(weighted_scores).any(),
-                    weighted_scores[top_id],
-                    original_score,
-                )
-                top_id = int(cls._random_sample_one(weighted_scores.softmax(dim=0), generator=generator).item())
-        return top_id
+                scores = weighted_scores[req_idx].clone()
+                original_score = scores[top_id].clone()
+                scores[top_id] = float("-inf")
+                scores[top_id] = torch.where(torch.isfinite(scores).any(), scores[top_id], original_score)
+                generator = sampling_metadata.generators.get(req_idx)
+                token_ids[req_idx] = self._random_sample_one(scores.softmax(dim=0), generator=generator)
+        return token_ids
 
     def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
         if self.model_stage != "cosyvoice3_talker":
@@ -728,36 +748,21 @@ class CosyVoice3Model(
         win_size = int(sampling_cfg.get("win_size", 10))
         tau_r = float(sampling_cfg.get("tau_r", 0.1))
 
-        sampled_ids: list[int] = []
-        for req_idx in range(int(logits.shape[0])):
-            row_logits = logits[req_idx]
-
-            temperature = float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
-            if temperature < self._sampling_eps:
-                sampled_ids.append(int(torch.argmax(row_logits).item()))
-                continue
-
-            top_p = float(self._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
-            top_k = int(self._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
-            generator = sampling_metadata.generators.get(req_idx)
-            weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
-            decoded_tokens = (
-                sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
-            )
-            sampled_ids.append(
-                self._ras_sample_one(
-                    weighted_scores,
-                    decoded_tokens,
-                    top_p=top_p,
-                    top_k=top_k,
-                    win_size=win_size,
-                    tau_r=tau_r,
-                    generator=generator,
-                )
-            )
-
-        sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
-        return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
+        token_ids, weighted_scores, greedy = self._sample_primary(
+            logits,
+            sampling_metadata,
+            default_top_p=default_top_p,
+            default_top_k=default_top_k,
+        )
+        token_ids = self._apply_ras_legacy(
+            token_ids,
+            weighted_scores,
+            greedy,
+            sampling_metadata,
+            win_size=win_size,
+            tau_r=tau_r,
+        )
+        return SamplerOutput(sampled_token_ids=token_ids.to(torch.int32).unsqueeze(-1), logprobs_tensors=None)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
