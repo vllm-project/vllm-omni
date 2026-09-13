@@ -38,6 +38,8 @@ def minimax_h3_batched_forward_kwargs(
     t_audio: Sequence[float],
     imgvid_cond_timesteps: Sequence[float],
     audio_ref_cond_timesteps: Sequence[float],
+    video_target_timesteps: Sequence[torch.Tensor | None] | None = None,
+    audio_target_timesteps: Sequence[torch.Tensor | None] | None = None,
 ) -> dict[str, Any]:
     """Build one DiT forward kwargs dict covering every request in the batch.
 
@@ -46,6 +48,27 @@ def minimax_h3_batched_forward_kwargs(
     happen to agree -- which also keeps ``video_token_layout`` (the sparse-
     attention hint) on the single-request step path.
     """
+    request_count = len(branches)
+    scalar_inputs = {
+        "video_rows": video_rows,
+        "audio_rows": audio_rows,
+        "t_video": t_video,
+        "t_audio": t_audio,
+        "imgvid_cond_timesteps": imgvid_cond_timesteps,
+        "audio_ref_cond_timesteps": audio_ref_cond_timesteps,
+    }
+    for name, values in scalar_inputs.items():
+        if len(values) != request_count:
+            raise ValueError(f"{name} has {len(values)} requests, expected {request_count}")
+    if video_target_timesteps is None:
+        video_target_timesteps = [None] * request_count
+    elif len(video_target_timesteps) != request_count:
+        raise ValueError(f"video_target_timesteps has {len(video_target_timesteps)} requests, expected {request_count}")
+    if audio_target_timesteps is None:
+        audio_target_timesteps = [None] * request_count
+    elif len(audio_target_timesteps) != request_count:
+        raise ValueError(f"audio_target_timesteps has {len(audio_target_timesteps)} requests, expected {request_count}")
+
     if len(branches) == 1:
         return branches[0].forward_kwargs(
             video_rows=video_rows[0],
@@ -54,6 +77,8 @@ def minimax_h3_batched_forward_kwargs(
             t_audio=t_audio[0],
             imgvid_cond_timestep=imgvid_cond_timesteps[0],
             audio_ref_cond_timestep=audio_ref_cond_timesteps[0],
+            video_target_timesteps=video_target_timesteps[0],
+            audio_target_timesteps=audio_target_timesteps[0],
         )
 
     device = branches[0].device
@@ -89,9 +114,31 @@ def minimax_h3_batched_forward_kwargs(
         text_embed_parts.append(branch.text_embeddings_dev)
 
         timesteps[seq_offset : seq_offset + branch.seq_len] = float(t_video[index])
-        timesteps[img_pos[branch.update_mask_dev]] = float(t_video[index])
+        video_target_pos = img_pos[branch.update_mask_dev]
+        request_video_timesteps = video_target_timesteps[index]
+        if request_video_timesteps is None:
+            timesteps[video_target_pos] = float(t_video[index])
+        else:
+            request_video_timesteps = request_video_timesteps.to(device=device, dtype=torch.float32).reshape(-1)
+            if int(request_video_timesteps.numel()) != int(video_target_pos.numel()):
+                raise ValueError(
+                    f"video_target_timesteps[{index}] rows {int(request_video_timesteps.numel())} "
+                    f"!= target video rows {int(video_target_pos.numel())}"
+                )
+            timesteps[video_target_pos] = request_video_timesteps
         timesteps[img_pos[~branch.update_mask_dev]] = float(imgvid_cond_timesteps[index])
-        timesteps[audio_pos[branch.audio_update_mask_dev]] = float(t_audio[index])
+        audio_target_pos = audio_pos[branch.audio_update_mask_dev]
+        request_audio_timesteps = audio_target_timesteps[index]
+        if request_audio_timesteps is None:
+            timesteps[audio_target_pos] = float(t_audio[index])
+        else:
+            request_audio_timesteps = request_audio_timesteps.to(device=device, dtype=torch.float32).reshape(-1)
+            if int(request_audio_timesteps.numel()) != int(audio_target_pos.numel()):
+                raise ValueError(
+                    f"audio_target_timesteps[{index}] rows {int(request_audio_timesteps.numel())} "
+                    f"!= target audio rows {int(audio_target_pos.numel())}"
+                )
+            timesteps[audio_target_pos] = request_audio_timesteps
         timesteps[audio_pos[~branch.audio_update_mask_dev]] = float(audio_ref_cond_timesteps[index])
 
         # Empty documents are omitted because not every varlen kernel accepts

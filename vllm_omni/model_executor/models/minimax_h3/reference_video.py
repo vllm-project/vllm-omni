@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """MiniMax H3 Ref2VA reference-video preparation."""
 
 from __future__ import annotations
@@ -324,10 +326,21 @@ def _transcode_reference_video(
     workdir: str,
     start_time_seconds: float = 0.0,
     duration_seconds: float | None = None,
+    pad_last_frame: bool = False,
 ) -> str:
     output = str(Path(workdir) / "prepared.mp4")
     duration_args = ["-t", f"{float(duration_seconds):.6f}"] if duration_seconds is not None else []
     frame_count_args = ["-frames:v", str(int(target_frame_count))] if target_frame_count > 0 else []
+    filters = [
+        f"fps={MINIMAX_H3_FPS:g}",
+        f"scale={target_width}:{target_height}:flags=lanczos",
+        "setsar=1",
+    ]
+    if pad_last_frame:
+        # Keep cloning the final converted frame until -frames:v reaches the
+        # requested target. Applying this unconditionally also makes longer
+        # inputs use the same deterministic trim path.
+        filters.append("tpad=stop_mode=clone:stop=-1")
     subprocess.run(
         [
             "ffmpeg",
@@ -342,7 +355,7 @@ def _transcode_reference_video(
             "0:v:0",
             "-an",
             "-vf",
-            (f"fps={MINIMAX_H3_FPS:g},scale={target_width}:{target_height}:flags=lanczos,setsar=1"),
+            ",".join(filters),
             *duration_args,
             *frame_count_args,
             "-metadata:s:v:0",
@@ -364,6 +377,94 @@ def _transcode_reference_video(
         check=True,
     )
     return output
+
+
+def prepare_edit_video(
+    value: Any,
+    target_width: int,
+    target_height: int,
+    target_frame_count: int,
+    workdir: str,
+) -> dict[str, Any]:
+    """Prepare one source video for H3 latent-mask editing.
+
+    Unlike Ref2VA references, an edit source may be shorter than the generated
+    clip and may use any container/codec that ffmpeg can read. The prepared
+    stream always contains exactly ``target_frame_count`` lossless RGB frames:
+    excess frames are trimmed and missing frames clone the final source frame.
+    """
+    if not isinstance(value, str | os.PathLike):
+        raise OmniClientError("MiniMax H3 edit video input must be a single file path")
+    source = str(value)
+    if not source:
+        raise OmniClientError("MiniMax H3 edit video input must be a non-empty file path")
+
+    dimensions = {
+        "target_width": target_width,
+        "target_height": target_height,
+        "target_frame_count": target_frame_count,
+    }
+    for name, raw_value in dimensions.items():
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int | np.integer) or int(raw_value) <= 0:
+            raise OmniClientError(f"{name} must be a positive integer")
+    width = int(target_width)
+    height = int(target_height)
+    frame_count = int(target_frame_count)
+
+    try:
+        source_meta = _probe_video(source)
+    except OmniClientError:
+        raise
+    except Exception as exc:
+        raise OmniClientError(f"cannot inspect MiniMax H3 edit video: {source}") from exc
+    if int(source_meta.get("frame_count", 0)) <= 0:
+        raise OmniClientError(f"video has no frames: {source}")
+
+    try:
+        Path(workdir).mkdir(parents=True, exist_ok=True)
+        prepared_path = _transcode_reference_video(
+            source,
+            target_width=width,
+            target_height=height,
+            target_frame_count=frame_count,
+            workdir=workdir,
+            pad_last_frame=True,
+        )
+    except OmniClientError:
+        raise
+    except Exception as exc:
+        raise OmniClientError(f"cannot prepare MiniMax H3 edit video: {source}") from exc
+
+    try:
+        prepared_meta = _probe_video(prepared_path)
+    except OmniClientError as exc:
+        raise OmniClientError(f"cannot verify prepared MiniMax H3 edit video: {prepared_path}") from exc
+    except Exception as exc:
+        raise OmniClientError(f"cannot verify prepared MiniMax H3 edit video: {prepared_path}") from exc
+    actual = (
+        int(prepared_meta.get("width", 0)),
+        int(prepared_meta.get("height", 0)),
+        int(prepared_meta.get("frame_count", 0)),
+    )
+    expected = (width, height, frame_count)
+    if actual != expected or not math.isclose(
+        float(prepared_meta.get("fps", 0.0)),
+        MINIMAX_H3_FPS,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise OmniClientError(
+            f"prepared MiniMax H3 edit video does not match the requested 24 FPS {width}x{height}x{frame_count} shape"
+        )
+
+    return {
+        "original_path": source,
+        "prepared_path": prepared_path,
+        "input_has_audio": bool(source_meta.get("audio_codecs")),
+        "width": width,
+        "height": height,
+        "frame_count": frame_count,
+    }
 
 
 def prepare_reference_videos(
@@ -583,15 +684,66 @@ def _soundfile_to_waveform(path: str) -> tuple[torch.Tensor, int]:
     return waveform, int(sample_rate)
 
 
-def load_audio_file(path: str) -> tuple[torch.Tensor, int]:
+def load_audio_file(
+    path: str,
+    *,
+    duration_seconds: float | None = None,
+) -> tuple[torch.Tensor, int]:
     """Load an audio file as ``(waveform[C, T] float32, sample_rate)``.
 
     torchaudio 2.6+ routes ``load`` through TorchCodec, whose wheels do not load
     on aarch64 with a CPU-only torch (they link CUDA libraries that are absent).
     Fall back to soundfile; if the container is not libsndfile-readable (e.g.
     mp3/m4a/mp4), demux to wav with ffmpeg first so any ffmpeg-supported input
-    works at its native sample rate.
+    works at its native sample rate. When ``duration_seconds`` is supplied,
+    always use ffmpeg to stop decoding at that boundary and normalize the
+    output to the H3 Audio-VAE contract. This keeps a large or highly compressed
+    edit source from being fully materialized before the caller can trim it.
     """
+    if duration_seconds is not None:
+        if isinstance(duration_seconds, bool):
+            raise OmniClientError("MiniMax H3 audio decode duration must be positive")
+        try:
+            duration = float(duration_seconds)
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError("MiniMax H3 audio decode duration must be positive") from exc
+        if not math.isfinite(duration) or duration <= 0:
+            raise OmniClientError("MiniMax H3 audio decode duration must be positive")
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="minimax_h3_audio_prefix_") as tmpdir:
+            wav = str(Path(tmpdir) / "audio.wav")
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    path,
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-sn",
+                    "-dn",
+                    "-t",
+                    f"{duration:.6f}",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "32000",
+                    "-c:a",
+                    "pcm_f32le",
+                    "-f",
+                    "wav",
+                    wav,
+                ],
+                check=True,
+            )
+            return _soundfile_to_waveform(wav)
+
     try:
         import torchaudio
 
@@ -661,6 +813,7 @@ __all__ = [
     "load_audio_file",
     "load_video_audio",
     "load_video_frames",
+    "prepare_edit_video",
     "prepare_reference_videos",
     "sample_reference_video_frames",
     "validate_reference_audio_files",

@@ -80,6 +80,17 @@ class ReferenceAudio:
 
 
 @dataclass
+class LatentEditInput:
+    """Request-scoped source media and masks for latent-mask editing."""
+
+    source_video: str | None = None
+    source_audio: str | None = None
+    video_noise_mask: Any | None = None
+    audio_noise_mask: Any | None = None
+    cleanup_paths: tuple[str, ...] = ()
+
+
+@dataclass
 class VideoGenerationArtifacts:
     """Normalized outputs and profiler metadata extracted from one request."""
 
@@ -212,6 +223,30 @@ class OmniOpenAIServingVideo:
         return capability is True or metadata_capability
 
     @property
+    def supports_latent_mask_editing(self) -> bool:
+        """Return whether the configured diffusion model accepts latent edits."""
+        od_config = self._resolve_diffusion_od_config()
+        capability = None if od_config is None else getattr(od_config, "supports_latent_mask_editing", None)
+        model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
+        for stage_config in self.stage_configs or ():
+            stage_get = (
+                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
+            )
+            engine_args = stage_get("engine_args") or {}
+            model_archs.extend(
+                (
+                    stage_get("model_arch"),
+                    engine_args.get("model_class_name")
+                    if isinstance(engine_args, Mapping)
+                    else getattr(engine_args, "model_class_name", None),
+                )
+            )
+        metadata_capability = any(
+            get_diffusion_model_metadata(model_arch).supports_latent_mask_editing for model_arch in model_archs
+        )
+        return capability is True or metadata_capability
+
+    @property
     def supported_control_upload_types(self) -> frozenset[str]:
         """Return multipart control types accepted by the active pipeline.
 
@@ -264,6 +299,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
@@ -344,6 +380,19 @@ class OmniOpenAIServingVideo:
             multi_modal_data["video"] = input_video
         if reference_audio is not None:
             multi_modal_data["audio"] = reference_audio.path
+        if latent_edit_input is not None:
+            multi_modal_data.update(
+                {
+                    key: value
+                    for key, value in {
+                        "source_video": latent_edit_input.source_video,
+                        "source_audio": latent_edit_input.source_audio,
+                        "video_noise_mask": latent_edit_input.video_noise_mask,
+                        "audio_noise_mask": latent_edit_input.audio_noise_mask,
+                    }.items()
+                    if value is not None
+                }
+            )
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:
@@ -477,6 +526,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationResponse:
         artifacts = await self._run_and_extract(
             request,
@@ -484,6 +534,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            latent_edit_input=latent_edit_input,
         )
 
         video_codec_options = {"preset": "ultrafast", "threads": "0"}
@@ -528,6 +579,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        latent_edit_input: LatentEditInput | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
@@ -536,6 +588,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            latent_edit_input=latent_edit_input,
         )
         if len(artifacts.videos) > 1:
             logger.warning(

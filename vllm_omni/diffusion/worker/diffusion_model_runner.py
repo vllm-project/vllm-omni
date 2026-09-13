@@ -40,7 +40,10 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+    get_world_group,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -75,6 +78,7 @@ from vllm_omni.diffusion.worker.utils import (
     merge_stage_durations,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -96,12 +100,8 @@ def _dit_any_rank_failed(local_failed: bool) -> bool:
     if not torch.distributed.is_initialized():
         return local_failed
     try:
-        from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-
-        group = get_dit_group()
-    except (AssertionError, ImportError):
-        group = None
-    if group is None:
+        group = get_world_group().device_group
+    except AssertionError:
         return local_failed
     signal = torch.tensor(1 if local_failed else 0, dtype=torch.int32)
     if current_omni_platform.is_available():
@@ -877,6 +877,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             output = runner_output.runner_outputs[0].result
             assert output is not None
             return output
+        except OmniClientError as exc:
+            # Request-mode worker RPC errors otherwise cross the async IPC
+            # boundary as strings and lose their 4xx metadata. Return the
+            # typed failure as a normal result, matching the stepwise path.
+            return DiffusionOutput.from_exception(exc)
         finally:
             if installed_request:
                 self.remove_diffusion_kv_requests([req.request_id])

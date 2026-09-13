@@ -37,6 +37,13 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     serialize_prepared_reference_videos,
 )
 
+_MINIMAX_H3_LATENT_EDIT_MM_KEYS = (
+    "source_video",
+    "source_audio",
+    "video_noise_mask",
+    "audio_noise_mask",
+)
+
 
 def _items(value: Any) -> list[Any]:
     if value is None:
@@ -262,6 +269,8 @@ def prepare_text_encoder_prompt(
         transformed[REQUEST_ARTIFACT_DIRS_KEY] = [artifact_dir]
     qwen_mm_data = dict(multi_modal_data)
     qwen_mm_data.pop("audio", None)
+    for key in _MINIMAX_H3_LATENT_EDIT_MM_KEYS:
+        qwen_mm_data.pop(key, None)
     if images:
         qwen_mm_data["image"] = images
     if qwen_video_inputs:
