@@ -267,6 +267,8 @@ class VLLMOmniClient:
         fps: int,
         negative_prompt: str | None = None,
         frame: torch.Tensor | None = None,
+        first_frame: torch.Tensor | None = None,
+        last_frame: torch.Tensor | None = None,
         references: dict | None = None,
         sampling_params: dict | None = None,
         model_params: dict | None = None,
@@ -275,6 +277,10 @@ class VLLMOmniClient:
     ) -> VideoInput:
         if frame is not None and references is not None:
             raise ValueError("Provide only one of frame or references, not both.")
+        if frame is not None and (first_frame is not None or last_frame is not None):
+            raise ValueError("Provide either frame or first_frame/last_frame, not both.")
+        if references is not None and (first_frame is not None or last_frame is not None):
+            raise ValueError("Provide either first_frame/last_frame or references, not both.")
 
         # === regular payload fields ===
         form = aiohttp.FormData()
@@ -294,12 +300,25 @@ class VLLMOmniClient:
 
         # === multimodal inputs (first-last-frames, references, etc.) ===
         input_reference_image: torch.Tensor | None = None
+        keyframe_images: list[tuple[str, torch.Tensor]] = []
         audio_reference: AudioInput | None = None
         reference_videos: list[VideoInput] = []
         video_task: str | None = None
 
         if frame is not None:
             input_reference_image = frame
+            video_task = "fl2va"
+        elif first_frame is not None or last_frame is not None:
+            frame_indices: list[int] = []
+            if first_frame is not None:
+                keyframe_images.append(("first_frame.png", first_frame))
+                frame_indices.append(0)
+            if last_frame is not None:
+                keyframe_images.append(("last_frame.png", last_frame))
+                frame_indices.append(-1)
+            if len(keyframe_images) == 1:
+                input_reference_image = keyframe_images[0][1]
+            extra_params["frame_indices"] = frame_indices
             video_task = "fl2va"
         elif references is not None:
             images = [references[k] for k in ("image_1", "image_2") if k in references and references[k] is not None]
@@ -330,13 +349,22 @@ class VLLMOmniClient:
             video_task = "t2va"
 
         if input_reference_image is not None:
-            image_filename = "image.png"  # Required for multipart form
+            image_filename = keyframe_images[0][0] if keyframe_images else "image.png"
             form.add_field(
                 "input_reference",
                 image_tensor_to_png_bytes(input_reference_image, image_filename),
                 filename=image_filename,
                 content_type="image/png",
             )
+
+        if len(keyframe_images) == 2:
+            for image_filename, image in keyframe_images:
+                form.add_field(
+                    "input_references",
+                    image_tensor_to_png_bytes(image, image_filename),
+                    filename=image_filename,
+                    content_type="image/png",
+                )
 
         if audio_reference is not None:
             form.add_field(

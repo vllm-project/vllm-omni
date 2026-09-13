@@ -166,6 +166,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             },
             "optional": {
                 "frame": ("IMAGE",),
+                "first_frame": ("IMAGE",),
+                "last_frame": ("IMAGE",),
                 "references": ("VIDEO_REFERENCES",),
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
@@ -178,12 +180,25 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
     FUNCTION = "generate"
 
     @classmethod
-    def VALIDATE_INPUTS(cls, url, model, frame=None, references=None, **_kwargs) -> str | Literal[True]:
+    def VALIDATE_INPUTS(
+        cls,
+        url,
+        model,
+        frame=None,
+        first_frame=None,
+        last_frame=None,
+        references=None,
+        **_kwargs,
+    ) -> str | Literal[True]:
         base = super().VALIDATE_INPUTS(url, model)
         if base is not True:
             return base
         if frame is not None and references is not None:
             return "Provide only one of frame or references, not both."
+        if frame is not None and (first_frame is not None or last_frame is not None):
+            return "Provide either frame or first_frame/last_frame, not both."
+        if references is not None and (first_frame is not None or last_frame is not None):
+            return "Provide either first_frame/last_frame or references, not both."
         return True
 
     async def generate(
@@ -197,6 +212,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         num_frames: int,
         negative_prompt: str | None = None,
         frame: torch.Tensor | None = None,
+        first_frame: torch.Tensor | None = None,
+        last_frame: torch.Tensor | None = None,
         references: dict | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
@@ -229,6 +246,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             model=model,
             prompt=prompt,
             frame=frame,  # frame present => fl2va / Wan I2V
+            first_frame=first_frame,
+            last_frame=last_frame,
             references=references,
             width=width,
             height=height,
