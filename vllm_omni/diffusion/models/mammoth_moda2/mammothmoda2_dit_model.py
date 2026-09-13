@@ -759,8 +759,12 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         noise_rotary_emb: torch.Tensor,
         temb: torch.Tensor,
     ):
-        for layer in self.context_refiner:
-            text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
+        # Online-FP8 GEMM kernels do not accept M=0. The default CFG
+        # unconditional branch has zero text tokens when no negative prompt
+        # embeddings are available, so skip the entire context refiner.
+        if text_hidden_states.shape[1] > 0:
+            for layer in self.context_refiner:
+                text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
 
         for layer in self.noise_refiner:
             img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
