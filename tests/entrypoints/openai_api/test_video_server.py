@@ -34,7 +34,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video import LatentEditInput, OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
@@ -81,6 +81,7 @@ class FakeAsyncOmni:
         self.model_class_name = "WanPipeline"
         self.captured_prompt = None
         self.captured_reference_video_bytes = None
+        self.captured_latent_edit_source_bytes = {}
         self.captured_control_reference_bytes = {}
         self.captured_sampling_params_list = None
 
@@ -101,6 +102,10 @@ class FakeAsyncOmni:
             and all(isinstance(item, str) for item in reference_videos)
         ):
             self.captured_reference_video_bytes = [Path(item).read_bytes() for item in reference_videos]
+        for field_name in ("source_video", "source_audio"):
+            source_path = prompt.get("multi_modal_data", {}).get(field_name)
+            if isinstance(source_path, str):
+                self.captured_latent_edit_source_bytes[field_name] = Path(source_path).read_bytes()
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
@@ -216,17 +221,28 @@ class BlockingVideoHandler:
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.stage_configs = None
+        self.supports_latent_mask_editing = True
         self.started = threading.Event()
         self.cancelled = threading.Event()
+        self.latent_edit_path = None
 
     def set_stage_configs_if_missing(self, stage_configs):
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
     async def generate_video_bytes(
-        self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        latent_edit_input=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio
+        if latent_edit_input is not None:
+            self.latent_edit_path = latent_edit_input.source_video or latent_edit_input.source_audio
         self.started.set()
         try:
             await asyncio.Future()
@@ -986,6 +1002,364 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
     handler._stage_configs = handler._engine_client.stage_configs
 
     assert handler.supports_mixed_reference_inputs
+
+
+@pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
+def test_latent_mask_editing_capability_is_declared_by_h3(test_client, model_class_name):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = model_class_name
+
+    assert handler.supports_latent_mask_editing
+
+    handler._engine_client.model_class_name = "WanPipeline"
+    assert not handler.supports_latent_mask_editing
+
+
+def test_latent_mask_editing_capability_uses_diffusion_stage_metadata(test_client):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = None
+    handler._stage_configs = [
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3TextEncoder"}),
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3Pipeline"}),
+    ]
+
+    assert handler.supports_latent_mask_editing
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    video_mask = [[[0.0, 1.0], [0.5, 1.0]]]
+    audio_mask = [0.0, 0.25, 1.0]
+
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "Replace only the masked regions.",
+            "video_noise_mask": json.dumps(video_mask),
+            "audio_noise_mask": json.dumps(audio_mask),
+        },
+        files=[
+            ("source_video", ("source.mov", b"source-video", "video/quicktime")),
+            ("source_audio", ("source.mp3", b"source-audio", "audio/mpeg")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+
+    multi_modal_data = engine.captured_prompt["multi_modal_data"]
+    assert engine.captured_latent_edit_source_bytes == {
+        "source_video": b"source-video",
+        "source_audio": b"source-audio",
+    }
+    assert multi_modal_data["video_noise_mask"] == video_mask
+    assert multi_modal_data["audio_noise_mask"] == audio_mask
+    _wait_until(
+        lambda: (
+            not Path(multi_modal_data["source_video"]).exists() and not Path(multi_modal_data["source_audio"]).exists()
+        )
+    )
+    assert not Path(multi_modal_data["source_video"]).exists()
+    assert not Path(multi_modal_data["source_audio"]).exists()
+
+
+def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit", "video_noise_mask": "1"},
+        files={"source_video": ("source.mp4", b"video", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert "not supported" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("data", "files", "message"),
+    [
+        (
+            {"prompt": "edit"},
+            {"source_video": ("source.mp4", b"video", "video/mp4")},
+            "at least one",
+        ),
+        (
+            {"prompt": "edit", "video_noise_mask": "0"},
+            {"source_audio": ("source.wav", b"audio", "audio/wav")},
+            "requires a source_video",
+        ),
+        (
+            {"prompt": "edit", "audio_noise_mask": "0"},
+            None,
+            "requires a source_audio or source_video",
+        ),
+    ],
+)
+def test_h3_latent_edit_cross_field_validation(test_client, data, files, message):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post("/v1/videos/sync", data=data, files=files)
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "filename", "content_type", "message"),
+    [
+        ("source_video", "source.webm", "video/webm", "MP4 or MOV"),
+        ("source_audio", "source.flac", "audio/flac", "WAV or MP3"),
+    ],
+)
+def test_h3_latent_edit_rejects_unsupported_source_formats(
+    test_client,
+    field_name,
+    filename,
+    content_type,
+    message,
+):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    mask_name = "video_noise_mask" if field_name == "source_video" else "audio_noise_mask"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit", mask_name: "0"},
+        files={field_name: (filename, b"source", content_type)},
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_h3_latent_edit_rejects_empty_source(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit", "video_noise_mask": "0"},
+        files={"source_video": ("source.mp4", b"", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert "must not be empty" in response.json()["detail"]
+
+
+def test_h3_latent_edit_rejects_malformed_mask_json(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit", "video_noise_mask": "[not-json"},
+        files={"source_video": ("source.mp4", b"video", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert "Invalid JSON" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("failure", [ValueError("integer too long"), RecursionError("too deeply nested")])
+def test_h3_latent_edit_maps_json_resource_errors_to_bad_request(monkeypatch, failure):
+    def fail_parse(_value):
+        raise failure
+
+    monkeypatch.setattr(video_generation_helpers, "_parse_form_json", fail_parse)
+
+    with pytest.raises(HTTPException) as exc_info:
+        video_generation_helpers._parse_latent_edit_mask_json("0", field_name="video_noise_mask")
+
+    assert exc_info.value.status_code == 400
+    assert "Invalid JSON for video_noise_mask" in exc_info.value.detail
+
+
+@pytest.mark.parametrize(
+    ("mask", "message"),
+    [
+        ("NaN", "finite"),
+        ("1.1", "[0, 1]"),
+        ("true", "numeric scalar"),
+        ("[]", "must not be empty"),
+        ("[[0], [0, 1]]", "rectangular"),
+    ],
+)
+def test_h3_latent_edit_rejects_invalid_mask_values_before_queueing(test_client, mask, message):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "edit", "video_noise_mask": mask},
+        files={"source_video": ("source.mp4", b"video", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_h3_all_generate_masks_are_a_noop_without_sources(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "ordinary generation",
+            "video_noise_mask": "1",
+            "audio_noise_mask": "[1, 1]",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "multi_modal_data" not in engine.captured_prompt
+
+
+def test_h3_latent_edit_rejects_oversized_mask_json(test_client, monkeypatch):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    monkeypatch.setattr(video_generation_helpers, "LATENT_EDIT_MASK_MAX_JSON_CHARS", 4)
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit", "video_noise_mask": "[0.0]"},
+        files={"source_video": ("source.mp4", b"video", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert "JSON exceeds" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("mask", ["0", "1"])
+def test_h3_latent_edit_enforces_streaming_source_limit(test_client, monkeypatch, mask):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persist = video_generation_helpers._persist_latent_edit_source
+
+    async def persist_with_tiny_limit(upload, *, field_name):
+        return await persist(upload, field_name=field_name, max_bytes=4)
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_latent_edit_source", persist_with_tiny_limit)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit", "video_noise_mask": mask},
+        files={"source_video": ("source.mp4", b"12345", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert "source_video exceeds" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_h3_latent_edit_close_cancellation_cleans_persisted_upload(tmp_path, monkeypatch):
+    persisted_path = tmp_path / "source.mp4"
+
+    def create_persisted_file(*_args, **_kwargs):
+        fd = os.open(persisted_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return fd, str(persisted_path)
+
+    class CancelOnCloseUpload:
+        filename = "source.mp4"
+        size = None
+
+        def __init__(self):
+            self._content = b"source-video"
+
+        async def read(self, _size):
+            content, self._content = self._content, b""
+            return content
+
+        async def close(self):
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(video_generation_helpers.tempfile, "mkstemp", create_persisted_file)
+
+    with pytest.raises(asyncio.CancelledError):
+        await video_generation_helpers._persist_latent_edit_source(
+            CancelOnCloseUpload(),
+            field_name="source_video",
+        )
+
+    assert not persisted_path.exists()
+
+
+def test_h3_large_mask_can_be_uploaded_as_bounded_json_file(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    # File parts remain supported as a convenient alternative for large masks.
+    large_mask = b"0" + b" " * (1024 * 1024 + 1)
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit"},
+        files=[
+            ("source_video", ("source.mp4", b"video", "video/mp4")),
+            ("video_noise_mask", ("mask.json", large_mask, "application/json")),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert engine.captured_prompt["multi_modal_data"]["video_noise_mask"] == 0
+
+
+def test_h3_second_source_failure_cleans_first_persisted_upload(test_client, monkeypatch):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persist = video_generation_helpers._persist_latent_edit_source
+    persisted_paths: list[str] = []
+
+    async def capture_persist(upload, *, field_name):
+        path = await persist(upload, field_name=field_name)
+        persisted_paths.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_latent_edit_source", capture_persist)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "edit",
+            "video_noise_mask": "0",
+            "audio_noise_mask": "0",
+        },
+        files=[
+            ("source_video", ("source.mp4", b"video", "video/mp4")),
+            ("source_audio", ("source.flac", b"audio", "audio/flac")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert len(persisted_paths) == 1
+    assert not Path(persisted_paths[0]).exists()
+
+
+def test_video_reference_cleanup_continues_after_unlink_failure(tmp_path, monkeypatch):
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    real_unlink = os.unlink
+
+    def flaky_unlink(path):
+        if str(path) == str(first):
+            raise PermissionError("simulated cleanup failure")
+        real_unlink(path)
+
+    monkeypatch.setattr(video_generation_helpers.os, "unlink", flaky_unlink)
+    video_generation_helpers._cleanup_video_references(
+        None,
+        None,
+        latent_edit_input=LatentEditInput(cleanup_paths=(str(first), str(second))),
+    )
+
+    assert first.exists()
+    assert not second.exists()
 
 
 @pytest.mark.parametrize("model_class_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
@@ -1827,6 +2201,128 @@ def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_ba
     delete_spy.assert_called_once_with(video_id)
 
 
+def test_failed_async_latent_edit_cleans_source_upload(test_client, mocker: MockerFixture):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    captured_path: list[str] = []
+
+    async def fail_generation(*_args, latent_edit_input=None, **_kwargs):
+        assert latent_edit_input is not None
+        captured_path.append(latent_edit_input.source_video)
+        assert Path(latent_edit_input.source_video).read_bytes() == b"source-video"
+        raise RuntimeError("edit failed")
+
+    mocker.patch.object(handler, "generate_video_bytes", side_effect=fail_generation)
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "will fail", "video_noise_mask": "0"},
+        files={"source_video": ("source.mp4", b"source-video", "video/mp4")},
+    )
+    assert response.status_code == 200
+
+    _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.FAILED.value)
+    assert len(captured_path) == 1
+    _wait_until(lambda: not Path(captured_path[0]).exists())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("store unavailable"), asyncio.CancelledError()])
+async def test_async_route_cleans_latent_source_when_job_store_handoff_fails(
+    tmp_path,
+    monkeypatch,
+    failure,
+):
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source-video")
+    latent_edit_input = LatentEditInput(
+        source_video=str(source_path),
+        cleanup_paths=(str(source_path),),
+    )
+
+    async def fail_upsert(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(api_server.VIDEO_STORE, "upsert", fail_upsert)
+    request = VideoGenerationRequest(prompt="edit")
+    ctx = (
+        request,
+        SimpleNamespace(),
+        "MiniMaxAI/MiniMax-H3",
+        None,
+        None,
+        None,
+        None,
+        latent_edit_input,
+    )
+
+    with pytest.raises(type(failure), match="store unavailable" if isinstance(failure, RuntimeError) else None):
+        await api_server.create_video(SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace())), ctx)
+
+    assert not source_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_async_route_cleans_latent_source_when_task_registration_fails(
+    tmp_path,
+    monkeypatch,
+):
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source-video")
+    latent_edit_input = LatentEditInput(
+        source_video=str(source_path),
+        cleanup_paths=(str(source_path),),
+    )
+
+    async def fail_task_registration(*_args, **_kwargs):
+        raise RuntimeError("task registry unavailable")
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", fail_task_registration)
+    request = VideoGenerationRequest(prompt="edit")
+    ctx = (
+        request,
+        BlockingVideoHandler(),
+        "MiniMaxAI/MiniMax-H3",
+        None,
+        None,
+        None,
+        None,
+        latent_edit_input,
+    )
+
+    with pytest.raises(RuntimeError, match="task registry unavailable"):
+        await api_server.create_video(SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace())), ctx)
+
+    assert not source_path.exists()
+    assert await api_server.VIDEO_STORE.list_values() == []
+
+
+@pytest.mark.asyncio
+async def test_generation_job_cleans_latent_source_when_cancelled_before_store_lookup(
+    tmp_path,
+    monkeypatch,
+):
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source-video")
+    latent_edit_input = LatentEditInput(
+        source_video=str(source_path),
+        cleanup_paths=(str(source_path),),
+    )
+
+    async def cancel_lookup(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(video_generation_helpers.VIDEO_STORE, "get", cancel_lookup)
+    with pytest.raises(asyncio.CancelledError):
+        await video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(),
+            VideoGenerationRequest(prompt="edit"),
+            "video-cancelled-before-get",
+            latent_edit_input=latent_edit_input,
+        )
+
+    assert not source_path.exists()
+
+
 def test_async_guardrail_error_returns_400_on_retrieve(test_client, mocker: MockerFixture):
     mocker.patch.object(
         OmniOpenAIServingVideo,
@@ -2050,11 +2546,17 @@ def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
     handler = BlockingVideoHandler()
     test_client.app.state.openai_serving_video = handler
 
-    create_resp = test_client.post("/v1/videos", data={"prompt": "Cancel this video"})
+    create_resp = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Cancel this video", "video_noise_mask": "0"},
+        files={"source_video": ("source.mp4", b"source-video", "video/mp4")},
+    )
     assert create_resp.status_code == 200
     video_id = create_resp.json()["id"]
 
     assert handler.started.wait(timeout=2.0)
+    assert handler.latent_edit_path is not None
+    assert Path(handler.latent_edit_path).exists()
 
     delete_resp = test_client.delete(f"/v1/videos/{video_id}")
     assert delete_resp.status_code == 200
@@ -2063,6 +2565,7 @@ def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
     assert delete_resp.json()["object"] == "video.deleted"
 
     assert handler.cancelled.wait(timeout=2.0)
+    _wait_until(lambda: not Path(handler.latent_edit_path).exists())
     _wait_until(lambda: asyncio.run(api_server.VIDEO_TASKS.get(video_id)) is None)
     assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 

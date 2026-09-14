@@ -993,6 +993,7 @@ class OmniDiffusionConfig:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_latent_mask_editing: bool = False
 
     log_level: str = "info"
 
@@ -1414,6 +1415,7 @@ class OmniDiffusionConfig:
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
         self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
+        self.supports_latent_mask_editing = metadata.supports_latent_mask_editing
 
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:

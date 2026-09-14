@@ -673,7 +673,7 @@ curl -sS -X POST "${API_URL}" \
   -F 'num_inference_steps=50' \
   -F 'flow_shift=12' \
   -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":8.7,"audio_flow_shift":3.0}' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"aspect_ratio":"16:9","audio_flow_shift":3.0}' \
   -o t2va.mp4
 ```
 
@@ -810,6 +810,59 @@ video in `extra_params.start_time_seconds`.
 Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standalone
 audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
 at most 15 seconds combined.
+
+### 5. Latent-mask editing
+
+Latent editing is separate from task selection; the example below uses H3's
+`t2va` path, and edit inputs may accompany another otherwise valid H3 task.
+Upload an MP4/MOV source video and a JSON noise mask. An optional WAV/MP3
+`source_audio` overrides the video's soundtrack for audio editing; otherwise
+an audio mask uses the uploaded video's embedded audio stream.
+
+```bash
+export SOURCE_VIDEO=/path/to/source.mp4
+export SOURCE_AUDIO=/path/to/source.wav
+
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=Partially restyle the complete clip and soundtrack.' \
+  -F 'width=1344' \
+  -F 'height=768' \
+  -F 'fps=24' \
+  -F 'num_inference_steps=50' \
+  -F 'flow_shift=12' \
+  -F 'seed=4101' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"audio_flow_shift":3.0}' \
+  -F "source_video=@${SOURCE_VIDEO};type=video/mp4" \
+  -F "source_audio=@${SOURCE_AUDIO};type=audio/wav" \
+  -F 'video_noise_mask=0.5' \
+  -F 'audio_noise_mask=0.5' \
+  -o latent_edit.mp4
+
+ffprobe -v error \
+  -show_entries stream=codec_type,codec_name,sample_rate,channels \
+  -of json latent_edit.mp4
+```
+
+Mask semantics match ComfyUI: `0` preserves the source, `1` regenerates it,
+and values in between blend those behaviors. The model-facing token mask is
+rounded upward to 1/256 levels, while the final x0 restore uses the original
+unquantized values. A scalar applies to all tokens. For an aligned output of
+`F` frames at `W x H`, video array masks may be flat target rows,
+`[Tv, H/32, W/32]`, or `[Tv, H/16, W/16]`, where
+`Tv = 2 + 5 * ((F - 5) / 17)`. Full latent masks are max-pooled over each 2x2
+spatial token for model conditioning, but retain cell-level values for final
+restoration. Audio masks may be `[Ta]`, `[2, Ta]`, or flat `2 * Ta`, where
+`Ta = round(F * 40 / 24)`. The stereo row order is channel-major. Multipart
+text fields are limited to 1 MiB; upload larger masks as UTF-8 JSON file parts,
+for example `-F "video_noise_mask=@video-mask.json;type=application/json"` (or
+the corresponding audio field). Mask JSON is bounded to 8 MiB in either form.
+
+Source video is resized to the requested canvas and normalized to 24 FPS.
+Long sources are trimmed; short video sources clone their final frame. Short
+source audio zero-pads its latent tail and forces that tail's mask to `1`, so
+the model generates missing audio instead of preserving silence. Pixel-space
+masks are not accepted; pool or resize them to one of the latent/token shapes
+before sending the request.
 
 ## Official input matrix and limits
 

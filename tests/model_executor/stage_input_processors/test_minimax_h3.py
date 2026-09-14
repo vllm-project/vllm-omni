@@ -142,6 +142,28 @@ def test_prepare_ref2va_keeps_original_text_and_exact_condition_order():
     ]
 
 
+def test_latent_edit_inputs_bypass_qwen_but_reach_diffusion_stage():
+    latent_edit_data = {
+        "source_video": "/tmp/source.mp4",
+        "source_audio": "/tmp/source.wav",
+        "video_noise_mask": [[[0.0, 1.0]]],
+        "audio_noise_mask": [0.0, 1.0],
+    }
+    prompt = {
+        "prompt": "edit selected tokens",
+        "multi_modal_data": dict(latent_edit_data),
+    }
+    sampling = OmniDiffusionSamplingParams(height=256, width=448, extra_args={"task": "t2va"})
+
+    transformed = prepare_text_encoder_prompt(prompt, [sampling])
+
+    assert transformed["multi_modal_data"] is None
+    assert prompt["multi_modal_data"] == latent_edit_data
+
+    diffusion_prompt = text_encoder2diffusion([_source_output(_valid_text_conditioning_payload())], prompt)
+    assert diffusion_prompt["multi_modal_data"] == latent_edit_data
+
+
 def test_text_encoder_prompt_rejects_injected_prepared_video_descriptor():
     prompt = {
         "prompt": "hello",

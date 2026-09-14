@@ -254,11 +254,48 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         cols, _, _ = self.model.split_tiles(int(latent.shape[-1]) * ratio, True)
         return len(rows) * len(cols)
 
+    def _encoder_tile_count(self, frames: Any) -> int:
+        """Smallest encoder tile grid produced for ``frames``.
+
+        Mirrors ``encode_videos`` from the checkpoint: NumPy inputs use
+        ``[T, H, W, C]``, tensor inputs use ``[C, T, H, W]``, and both are
+        cropped to the processor's total patch size before ``tiled_encode``
+        computes its encoder grid.  The public adapter encodes one video, but
+        taking the smallest grid also keeps this guard safe if a list is ever
+        passed through directly.
+        """
+
+        videos = frames if isinstance(frames, list) else [frames]
+        tile_counts: list[int] = []
+        for video in videos:
+            shape = tuple(int(dim) for dim in video.shape)
+            if torch.is_tensor(video):
+                if len(shape) not in (4, 5):
+                    raise ValueError(f"unexpected reference video tensor shape {shape}")
+                # Tensor inputs are [C, T, H, W], optionally already batched.
+                height, width = shape[-2], shape[-1]
+            elif len(shape) == 4:
+                # The checkpoint's NumPy contract is [T, H, W, C].
+                height, width = shape[-3], shape[-2]
+            else:
+                raise ValueError(f"unexpected reference video shape {shape}")
+            height, width = self.model.processor._align_to_total_patch_size(
+                height,
+                width,
+            )
+            rows, _, _ = self.model.split_tiles(int(height), False)
+            cols, _, _ = self.model.split_tiles(int(width), False)
+            tile_counts.append(len(rows) * len(cols))
+
+        if not tile_counts:
+            raise ValueError("reference video list must not be empty")
+        return min(tile_counts)
+
     @contextmanager
     def _rank_local_tiling(self) -> Iterator[None]:
-        """Run one decode with tiling kept on this rank, then restore the group.
+        """Run one VAE call with tiling local to this rank, then restore the group.
 
-        Used only when there are fewer tiles than ranks. Every rank then decodes
+        Used only when there are fewer tiles than ranks. Every rank then handles
         every tile, which is slower than sharing the work but is correct and
         involves no collective.
         """
@@ -348,10 +385,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                latent = self.model.encode_videos(
-                    frames,
-                    use_fp16_latent=True,
-                )[0]
+                with self._encode_tiling_context(frames):
+                    latent = self.model.encode_videos(
+                        frames,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             if previous_dtype != torch.float32:
                 self.to(previous_dtype)
@@ -378,6 +416,24 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             patch_size=(1, 2, 2),
         ).float()
         return rows, shape
+
+    def _encode_tiling_context(self, frames: Any) -> AbstractContextManager:
+        """Pick the tiling mode an encode of ``frames`` can safely use."""
+
+        parallel_size = int(getattr(self, "parallel_size", 1))
+        if parallel_size <= 1:
+            return nullcontext()
+        num_tiles = self._encoder_tile_count(frames)
+        if num_tiles < parallel_size:
+            logger.warning_once(
+                "MiniMax-H3 VAE encode splits into %d tile(s) but the tile group has "
+                "%d ranks; encoding rank-locally for this shape instead, which is "
+                "slower but avoids ranks without tiles hanging the collective.",
+                num_tiles,
+                parallel_size,
+            )
+            return self._rank_local_tiling()
+        return nullcontext()
 
     def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
         """Pick the tiling mode a decode of ``latent`` can safely use.

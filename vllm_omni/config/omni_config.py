@@ -797,6 +797,7 @@ class _DiffusionConfigProjection:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_latent_mask_editing: bool = False
     model_paths: dict[str, str] = field(default_factory=dict)
     model_loaded: dict[str, bool] = field(
         default_factory=lambda: {

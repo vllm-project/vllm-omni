@@ -25,6 +25,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -221,6 +222,34 @@ def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
     runner.release_captured_graphs()
 
     assert not hasattr(runner, "graph_runners")
+
+
+def test_dit_any_rank_failed_reduces_on_world_device_group(monkeypatch):
+    device_group = object()
+    monkeypatch.setattr(model_runner_module.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_world_group",
+        lambda: SimpleNamespace(device_group=device_group),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_omni_platform",
+        SimpleNamespace(is_available=lambda: False),
+    )
+    reduced: dict[str, object] = {}
+
+    def fake_all_reduce(signal, *, op, group):
+        reduced.update(op=op, group=group)
+        signal.fill_(1)
+
+    monkeypatch.setattr(model_runner_module.torch.distributed, "all_reduce", fake_all_reduce)
+
+    assert model_runner_module._dit_any_rank_failed(False) is True
+    assert reduced == {
+        "op": torch.distributed.ReduceOp.MAX,
+        "group": device_group,
+    }
 
 
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
@@ -749,6 +778,32 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
     assert output.output == "a prompt"
     assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
     assert runner.pipeline.last_req.num_reqs == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_preserves_client_error_metadata_across_worker_rpc(monkeypatch):
+    class RejectingPipeline:
+        supports_request_batch = False
+
+        @staticmethod
+        def forward(_request):
+            raise OmniClientError(
+                "invalid edit source",
+                status_code=422,
+                error_type="UnprocessableEntityError",
+            )
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = RejectingPipeline()
+    req = _make_request()
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.error == "invalid edit source"
+    assert output.error_status_code == 422
+    assert output.error_type == "UnprocessableEntityError"
 
 
 @pytest.mark.core_model

@@ -161,6 +161,7 @@ from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
+    LatentEditInput,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
@@ -199,6 +200,8 @@ from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
+
+
 router = APIRouter()
 
 profiler_router = APIRouter()
@@ -2328,6 +2331,7 @@ async def create_video(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2343,22 +2347,51 @@ async def create_video(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     ref = video_response_from_request(effective_model_name, request)
-    await VIDEO_STORE.upsert(ref.id, ref)
-    task = asyncio.create_task(
-        _run_video_generation_job(
-            handler,
-            request,
-            ref.id,
-            reference_image,
-            reference_video,
-            reference_audio,
-            control_path,
-            app_state=raw_request.app.state,
+    task: asyncio.Task[None] | None = None
+    try:
+        await VIDEO_STORE.upsert(ref.id, ref)
+        task = asyncio.create_task(
+            _run_video_generation_job(
+                handler,
+                request,
+                ref.id,
+                reference_image,
+                reference_video,
+                reference_audio,
+                control_path,
+                app_state=raw_request.app.state,
+                latent_edit_input=latent_edit_input,
+            )
         )
-    )
-    await VIDEO_TASKS.upsert(ref.id, task)
+        await VIDEO_TASKS.upsert(ref.id, task)
+    except BaseException:
+        # The form dependency has already persisted uploaded media. Until a
+        # background task is registered successfully, this route owns those
+        # files. A task cancelled before its first coroutine step never enters
+        # its ``finally``, so clean up here even after awaiting cancellation.
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        try:
+            await STORAGE_MANAGER.delete(ref.id)
+        except (Exception, asyncio.CancelledError):
+            logger.warning("Failed to remove unqueued video output %s", ref.id, exc_info=True)
+        try:
+            await VIDEO_TASKS.pop(ref.id)
+        except (Exception, asyncio.CancelledError):
+            logger.warning("Failed to remove unregistered video task %s", ref.id, exc_info=True)
+        try:
+            await VIDEO_STORE.pop(ref.id)
+        except (Exception, asyncio.CancelledError):
+            logger.warning("Failed to remove unqueued video job %s", ref.id, exc_info=True)
+        raise
     return ref
 
 
@@ -2381,6 +2414,7 @@ async def create_video_sync(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2400,19 +2434,27 @@ async def create_video_sync(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        generation_kwargs: dict[str, Any] = {
+            "reference_image": reference_image,
+            "reference_video": reference_video,
+            "reference_audio": reference_audio,
+        }
+        if latent_edit_input is not None:
+            # Avoid changing the call contract for ordinary requests handled
+            # by compatible duck-typed video serving implementations.
+            generation_kwargs["latent_edit_input"] = latent_edit_input
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
                 handler.generate_video_bytes(
                     request,
                     request_id,
-                    reference_image=reference_image,
-                    reference_video=reference_video,
-                    reference_audio=reference_audio,
+                    **generation_kwargs,
                 ),
                 timeout=VIDEO_SYNC_TIMEOUT_S,
             ),
@@ -2436,7 +2478,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path)
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(

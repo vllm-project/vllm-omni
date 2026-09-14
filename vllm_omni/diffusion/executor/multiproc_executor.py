@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
@@ -47,6 +47,14 @@ _WORKER_SHUTDOWN_GRACE_S = 15.0
 _WORKER_TERMINATE_GRACE_S = 5.0
 _WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
+_LATENT_EDIT_MM_KEYS = frozenset(
+    {
+        "source_video",
+        "source_audio",
+        "video_noise_mask",
+        "audio_noise_mask",
+    }
+)
 
 
 def _is_empty_dp_prompt(prompt: object) -> bool:
@@ -70,6 +78,16 @@ def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
     if not isinstance(prompt, dict):
         return False, False
     return prompt.get("prompt_embeds") is not None, prompt.get("negative_prompt_embeds") is not None
+
+
+def _has_latent_edit_input(prompt: object) -> bool:
+    """Return whether a prompt carries model-specific latent edit inputs."""
+    if not isinstance(prompt, Mapping):
+        return False
+    multi_modal_data = prompt.get("multi_modal_data")
+    if not isinstance(multi_modal_data, Mapping):
+        return False
+    return any(multi_modal_data.get(key) is not None for key in _LATENT_EDIT_MM_KEYS)
 
 
 def _uses_text_encoder_allgather(config: object) -> bool:
@@ -525,7 +543,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # request and Diffusion KV metadata inseparable.
         # All ranks reply (unique_reply_rank=None) so we collect dp_size
         # responses and match by dp_rank.
-        if len(new_reqs) > 1 and any_selected_component_uses_allgather(self.od_config):
+        # Latent-edit source preparation still uses request-dependent WORLD
+        # collectives. Keep the whole wave on the serial path so every rank
+        # executes those collectives for the same request in the same order.
+        has_latent_edit_input = any(_has_latent_edit_input(new_req.req.prompt) for new_req in new_reqs)
+        if len(new_reqs) > 1 and any_selected_component_uses_allgather(self.od_config) and not has_latent_edit_input:
             # Reuse the request scheduler's complete compatibility key. DLO
             # AllGather requires every DP rank to execute the same collective
             # schedule, including shape, CFG, denoise steps, output count,

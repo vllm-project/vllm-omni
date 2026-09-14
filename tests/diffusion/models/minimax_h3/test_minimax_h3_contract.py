@@ -373,6 +373,7 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
     assert config.supports_multimodal_inputs
     assert config.max_multimodal_image_inputs == 9
     assert config.supports_mixed_reference_inputs
+    assert config.supports_latent_mask_editing
 
 
 @pytest.mark.parametrize(
@@ -1257,6 +1258,7 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
+    assert get_diffusion_model_metadata("MiniMaxH3Pipeline").supports_latent_mask_editing
 
 
 def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
@@ -1967,6 +1969,11 @@ def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
         pipeline_module.dist,
         "broadcast_object_list",
         fake_broadcast_object_list,
+    )
+    monkeypatch.setattr(
+        pipeline_module.dist,
+        "all_gather_object",
+        lambda gathered, value, *, group: gathered.__setitem__(slice(None), [value] * 4),
     )
     monkeypatch.setattr(
         pipeline_module,

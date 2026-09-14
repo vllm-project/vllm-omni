@@ -310,6 +310,7 @@ class AsyncOmniEngine:
                 supports_multimodal_inputs=metadata.supports_multimodal_inputs,
                 max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
                 supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+                supports_latent_mask_editing=metadata.supports_latent_mask_editing,
             )
         return self._diffusion_od_config_view
 

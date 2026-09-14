@@ -10,6 +10,7 @@ checkpoint weights.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -154,6 +155,62 @@ def test_step_execution_matches_request_mode_denoise_loop():
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
 
 
+def test_step_execution_matches_request_mode_with_latent_edits():
+    """Masked model rows, row timesteps, and scheduler math match both paths."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.latent_mask import MiniMaxH3LatentEdit
+
+    model = _SegmentMeanModel()
+    branch, video_rows, audio_rows = _make_branch(
+        text_len=9,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+        seed=51,
+    )
+    sigmas_video = _sigmas(5, 12.0)
+    sigmas_audio = _sigmas(5, 3.0)
+    video_clean = torch.linspace(-1.0, 1.0, video_rows.numel()).reshape_as(video_rows)
+    audio_clean = torch.linspace(1.0, -1.0, audio_rows.numel()).reshape_as(audio_rows)
+    video_edit = MiniMaxH3LatentEdit.from_rows(
+        video_clean,
+        0.999 * video_clean + 0.001 * video_rows,
+        torch.linspace(0.0, 1.0, video_rows.shape[0]),
+    )
+    audio_edit = MiniMaxH3LatentEdit.from_rows(
+        audio_clean,
+        audio_clean,
+        torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),
+    )
+    assert video_edit is not None and audio_edit is not None
+
+    reference_video, reference_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=video_rows,
+        initial_audio_rows=audio_rows,
+        keyframe_cond_rows=None,
+        video_edit=video_edit,
+        audio_edit=audio_edit,
+        sigmas_video=sigmas_video,
+        sigmas_audio=sigmas_audio,
+        device=torch.device("cpu"),
+    )
+
+    state = _make_state("req-edit", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
+    state.extra[mod._STEP_VIDEO_EDIT] = video_edit
+    state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
+    pipeline = _step_pipeline(model)
+    while not state.denoise_completed:
+        velocity = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
+        pipeline.step_scheduler(state, velocity)
+
+    torch.testing.assert_close(state.latents, reference_video)
+    torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
+
+
 def test_batched_step_execution_matches_independent_requests():
     """Two co-batched requests must land where they would have landed alone."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -197,6 +254,182 @@ def test_batched_step_execution_matches_independent_requests():
         active = [state for state in active if not state.denoise_completed]
 
     for state, (expected_video, expected_audio) in zip(states, alone):
+        torch.testing.assert_close(state.latents, expected_video)
+        torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], expected_audio)
+
+
+def test_batched_ref2va_step_keeps_edit_timesteps_and_offsets_request_local():
+    """Ref2VA anchors and edited targets keep their request-local row semantics."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
+    from vllm_omni.diffusion.models.minimax_h3.latent_mask import MiniMaxH3LatentEdit
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    class _RecordingSegmentMeanModel(_SegmentMeanModel):
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            return super().__call__(**kwargs)
+
+    def make_branch(*, latent_t: int, audio_t: int, ref_blocks, base: float):
+        packed = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=2,
+            latent_t=latent_t,
+            latent_h=2,
+            latent_w=2,
+            audio_t=audio_t,
+            ref_blocks=ref_blocks,
+        )
+        branch = MiniMaxH3DenoiseBranch(
+            packed=packed,
+            text_embeddings=torch.zeros(2, _HIDDEN),
+            token_tags=packed["token_tags"],
+            device=torch.device("cpu"),
+        )
+        video_rows = (
+            torch.arange(branch.img_pos.numel(), dtype=torch.float32).unsqueeze(1).expand(-1, 96).clone() + base
+        )
+        audio_rows = (
+            torch.arange(branch.audio_pos.numel(), dtype=torch.float32).unsqueeze(1).expand(-1, 32).clone()
+            + base
+            + 50.0
+        )
+        return branch, video_rows, audio_rows
+
+    requests = [
+        make_branch(
+            latent_t=2,
+            audio_t=2,
+            ref_blocks=[
+                {"kind": "image", "latent_h": 2, "latent_w": 2},
+                {"kind": "audio", "ref_audio_t": 1},
+            ],
+            base=100.0,
+        ),
+        make_branch(
+            latent_t=3,
+            audio_t=1,
+            ref_blocks=[
+                {
+                    "kind": "video_audio",
+                    "ref_audio_t": 2,
+                    "latent_t": 2,
+                    "latent_h": 2,
+                    "latent_w": 2,
+                }
+            ],
+            base=200.0,
+        ),
+    ]
+    branches = [request[0] for request in requests]
+    assert branches[0].img_pos.tolist() == [2, 9, 10]
+    assert branches[0].audio_pos.tolist() == [3, 4, 5, 6, 7, 8]
+    assert branches[1].img_pos.tolist() == [6, 7, 10, 11, 12]
+    assert branches[1].audio_pos.tolist() == [2, 3, 4, 5, 8, 9]
+
+    schedules = [([0.8, 0.4], [0.7, 0.3]), ([0.6, 0.2], [0.5, 0.1])]
+    video_masks = [torch.tensor([0.0, 0.5]), torch.tensor([0.25, 0.5, 1.0])]
+    audio_masks = [torch.tensor([0.0, 0.25, 0.75, 1.0]), torch.tensor([0.5, 1.0])]
+    model = _RecordingSegmentMeanModel()
+    pipeline = _step_pipeline(model)
+
+    def make_states(prefix: str):
+        states = []
+        edits = []
+        for index, ((branch, video_rows, audio_rows), (sigmas_video, sigmas_audio)) in enumerate(
+            zip(requests, schedules, strict=True)
+        ):
+            state = _make_state(
+                f"{prefix}-{index}",
+                model,
+                branch,
+                video_rows,
+                audio_rows,
+                sigmas_video,
+                sigmas_audio,
+            )
+            video_target = state.latents[branch.update_mask_dev]
+            audio_target = state.extra[mod._STEP_AUDIO_ROWS][branch.audio_update_mask_dev]
+            video_edit = MiniMaxH3LatentEdit.from_rows(
+                torch.full_like(video_target, 180.0 + 100.0 * index),
+                torch.full_like(video_target, 140.0 + 100.0 * index),
+                video_masks[index],
+            )
+            audio_edit = MiniMaxH3LatentEdit.from_rows(
+                torch.full_like(audio_target, 190.0 + 100.0 * index),
+                torch.full_like(audio_target, 160.0 + 100.0 * index),
+                audio_masks[index],
+            )
+            assert video_edit is not None and audio_edit is not None
+            state.extra[mod._STEP_VIDEO_EDIT] = video_edit
+            state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
+            state.extra[mod._STEP_COND_ANCHOR] = state.latents[~branch.update_mask_dev].clone()
+            state.extra[mod._STEP_AUDIO_ANCHOR] = state.extra[mod._STEP_AUDIO_ROWS][
+                ~branch.audio_update_mask_dev
+            ].clone()
+            states.append(state)
+            edits.append((video_edit, audio_edit))
+        return states, edits
+
+    # A request-at-a-time step is the differential oracle for the packed step.
+    alone_states, _ = make_states("alone")
+    alone = []
+    for state in alone_states:
+        velocity = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
+        pipeline.step_scheduler(state, velocity)
+        alone.append((state.latents.clone(), state.extra[mod._STEP_AUDIO_ROWS].clone()))
+
+    model.calls.clear()
+    states, edits = make_states("batch")
+    velocity = pipeline.denoise_step(SimpleNamespace(states=tuple(states)), states=states)
+    assert len(model.calls) == 1
+    call = model.calls[0]
+
+    assert call["packed_seq_params"]["cu_seqlens_q"].tolist() == [0, 11, 64, 77, 128]
+    expected_img_pos = torch.tensor([2, 9, 10, 70, 71, 74, 75, 76])
+    expected_audio_pos = torch.tensor([3, 4, 5, 6, 7, 8, 66, 67, 68, 69, 72, 73])
+    torch.testing.assert_close(call["img_pos_info"]["position_ids"], expected_img_pos)
+    torch.testing.assert_close(call["audio_pos_info"]["position_ids"], expected_audio_pos)
+
+    # Text/padding inherit each request's video timestep. Ref rows retain their
+    # condition pins, while only target rows receive mask-derived timesteps.
+    row_timesteps = call["unique_timesteps"][call["inverse_indices"]]
+    expected_timesteps = torch.full((128,), 0.2)
+    expected_timesteps[64:] = 0.4
+    expected_timesteps[torch.tensor([2, 70, 71])] = 0.999
+    expected_timesteps[torch.tensor([3, 4, 66, 67, 68, 69])] = 1.0
+    expected_timesteps[torch.tensor([9, 10])] = torch.tensor([0.999, 0.6])
+    expected_timesteps[torch.tensor([74, 75, 76])] = torch.tensor([0.85, 0.7, 0.4])
+    expected_timesteps[torch.tensor([5, 6, 7, 8])] = torch.tensor([1.0, 0.825, 0.475, 0.3])
+    expected_timesteps[torch.tensor([72, 73])] = torch.tensor([0.75, 0.5])
+    torch.testing.assert_close(row_timesteps, expected_timesteps)
+
+    seq_offset = 0
+    for state, branch, (video_edit, audio_edit) in zip(states, branches, edits, strict=True):
+        img_pos = branch.img_pos_dev + seq_offset
+        audio_pos = branch.audio_pos_dev + seq_offset
+        expected_video_rows = state.latents.clone()
+        expected_video_rows[branch.update_mask_dev] = video_edit.model_rows(state.latents[branch.update_mask_dev])
+        state_audio = state.extra[mod._STEP_AUDIO_ROWS]
+        expected_audio_rows = state_audio.clone()
+        expected_audio_rows[branch.audio_update_mask_dev] = audio_edit.model_rows(
+            state_audio[branch.audio_update_mask_dev]
+        )
+        torch.testing.assert_close(call["x"][0, img_pos], expected_video_rows)
+        torch.testing.assert_close(call["audio_x"][0, audio_pos], expected_audio_rows)
+        seq_offset += branch.seq_len
+
+    video_offset = 0
+    for state in states:
+        rows = int(state.latents.shape[0])
+        pipeline.step_scheduler(state, velocity[video_offset : video_offset + rows])
+        video_offset += rows
+    assert video_offset == int(velocity.shape[0])
+    for state, (expected_video, expected_audio) in zip(states, alone, strict=True):
         torch.testing.assert_close(state.latents, expected_video)
         torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], expected_audio)
 
@@ -289,6 +522,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=8)
+    video_edit = object()
+    audio_edit = object()
     sigmas_video = _sigmas(6, 12.0)
     sigmas_audio = _sigmas(6, 3.0)
     context = {
@@ -315,6 +550,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
             "audio_rows": audio_rows,
             "cond_anchor": None,
             "audio_anchor": None,
+            "video_edit": video_edit,
+            "audio_edit": audio_edit,
             "sigmas_video": sigmas_video,
             "sigmas_audio": sigmas_audio,
         },
@@ -336,6 +573,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     assert state.do_true_cfg is False
     torch.testing.assert_close(state.current_timestep, torch.tensor(1.0 - sigmas_video[0]))
     assert state.extra[mod._STEP_BRANCH] is branch
+    assert state.extra[mod._STEP_VIDEO_EDIT] is video_edit
+    assert state.extra[mod._STEP_AUDIO_EDIT] is audio_edit
     assert state.extra[mod._STEP_SHAPE]["height"] == 96
 
     pipeline.od_config = SimpleNamespace()
@@ -486,3 +725,151 @@ def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
     assert rank2_info.value.status_code == 422
     assert rank2_info.value.error_type == "UnprocessableEntityError"
     assert "invalid reference-video file" in str(rank2_info.value)
+
+
+def test_synchronize_rank_exception_propagates_error_from_any_rank(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    monkeypatch.setattr(mod, "_dit_rank_world", lambda: (object(), 3, 4))
+    rank1_error = {
+        "rank": 1,
+        "type": "RuntimeError",
+        "message": "video VAE encode failed",
+        "status_code": None,
+        "error_type": None,
+    }
+
+    def fake_all_gather(gathered, value, *, group):
+        assert value is None
+        gathered[:] = [None, rank1_error, None, None]
+
+    monkeypatch.setattr(mod.dist, "all_gather_object", fake_all_gather)
+    with pytest.raises(RuntimeError, match=r"\[rank 1\].*video VAE encode failed"):
+        mod._synchronize_rank_exception(None)
+
+
+def test_broadcast_tensor_synchronizes_rank0_validation_before_shape(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    monkeypatch.setattr(mod, "_dit_rank_world", lambda: (object(), 0, 2))
+    broadcast_calls = []
+    monkeypatch.setattr(mod.dist, "broadcast", lambda *args, **kwargs: broadcast_calls.append((args, kwargs)))
+
+    synchronized = []
+
+    def fake_broadcast_rank0_exception(exc):
+        synchronized.append(exc)
+        if exc is not None:
+            raise exc
+
+    monkeypatch.setattr(mod, "_broadcast_rank0_exception", fake_broadcast_rank0_exception)
+
+    with pytest.raises(ValueError, match="rank 0 must provide a tensor"):
+        mod._broadcast_tensor(None, dtype=torch.float32, device=torch.device("cpu"))
+
+    assert len(synchronized) == 1
+    assert isinstance(synchronized[0], ValueError)
+    assert broadcast_calls == []
+
+
+def test_broadcast_tensor_synchronizes_allocation_failure_before_payload(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    monkeypatch.setattr(mod, "_dit_rank_world", lambda: (object(), 1, 2))
+    monkeypatch.setattr(mod, "_broadcast_rank0_exception", lambda exc: None)
+    broadcast_calls = []
+
+    def fake_broadcast(value, *, src, group):
+        del src, group
+        broadcast_calls.append(value)
+        if len(broadcast_calls) == 1:
+            value.copy_(torch.tensor([2, 3, 4, 0, 0]))
+        else:
+            pytest.fail("payload broadcast was reached after a peer allocation failure")
+
+    def fail_empty(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("peer allocation failed")
+
+    monkeypatch.setattr(mod.dist, "broadcast", fake_broadcast)
+    monkeypatch.setattr(mod.torch, "empty", fail_empty)
+    synchronized = []
+
+    def fake_synchronize(exc):
+        synchronized.append(exc)
+        if exc is not None:
+            raise exc
+
+    monkeypatch.setattr(mod, "_synchronize_rank_exception", fake_synchronize)
+
+    with pytest.raises(RuntimeError, match="peer allocation failed"):
+        mod._broadcast_tensor(None, dtype=torch.float32, device=torch.device("cpu"))
+
+    assert len(broadcast_calls) == 1
+    assert synchronized[0] is None
+    assert isinstance(synchronized[-1], RuntimeError)
+
+
+def test_collective_safe_component_releases_after_peer_enter_failure(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    events: list[Any] = []
+
+    class Manager:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            events.append("exit")
+            return False
+
+    pipeline = SimpleNamespace(_component_on_device=lambda component: Manager())
+    sync_calls = 0
+
+    def fake_synchronize(exc):
+        nonlocal sync_calls
+        sync_calls += 1
+        events.append(("sync", exc))
+        if sync_calls == 1:
+            raise RuntimeError("peer component load failed")
+
+    monkeypatch.setattr(mod, "_synchronize_rank_exception", fake_synchronize)
+
+    with pytest.raises(RuntimeError, match="peer component load failed"):
+        with mod.MiniMaxH3Pipeline._collective_safe_component_on_device(pipeline, object()):
+            pytest.fail("body must not run after a peer fails to load the component")
+
+    assert events == ["enter", ("sync", None), "exit", ("sync", None)]
+
+
+def test_collective_safe_component_synchronizes_exit_failure(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    events: list[Any] = []
+
+    class Manager:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            events.append("exit")
+            raise RuntimeError("local component offload failed")
+
+    pipeline = SimpleNamespace(_component_on_device=lambda component: Manager())
+
+    def fake_synchronize(exc):
+        events.append(("sync", exc))
+        if exc is not None:
+            raise exc
+
+    monkeypatch.setattr(mod, "_synchronize_rank_exception", fake_synchronize)
+
+    with pytest.raises(RuntimeError, match="local component offload failed"):
+        with mod.MiniMaxH3Pipeline._collective_safe_component_on_device(pipeline, object()):
+            events.append("body")
+
+    assert events[:4] == ["enter", ("sync", None), "body", "exit"]
+    assert events[4][0] == "sync"
+    assert isinstance(events[4][1], RuntimeError)

@@ -486,6 +486,38 @@ class TestRequestModeDispatch:
         assert forwarded_envelopes is scheduler_output.scheduled_new_reqs
         assert [envelope.diffusion_kv_metadata.request_id for envelope in forwarded_envelopes] == ["A", "B"]
 
+    def test_dlo_dp_serializes_wave_when_any_request_uses_latent_editing(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.collective_rpc = Mock(side_effect=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        scheduler_output.scheduled_new_reqs[1].req.prompt = {
+            "prompt": "edit B",
+            "multi_modal_data": {
+                "source_video": "source.mp4",
+                "video_noise_mask": 0.0,
+            },
+        }
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+        assert executor.collective_rpc.call_count == 2
+        for call, new_req in zip(
+            executor.collective_rpc.call_args_list,
+            scheduler_output.scheduled_new_reqs,
+            strict=True,
+        ):
+            assert call.args == ("execute_model",)
+            assert call.kwargs["args"][0] is new_req.req
+            assert call.kwargs["unique_reply_rank"] == 0
+            assert call.kwargs["exec_all_ranks"] is True
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [
