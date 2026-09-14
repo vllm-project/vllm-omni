@@ -24,6 +24,7 @@ from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
@@ -80,6 +81,8 @@ class Attention(nn.Module):
         # varlen attention with learned sink logits). The shared Attention
         # layer still owns parallel dispatch and compile boundaries.
         custom_attention: nn.Module | None = None,
+        # Preserve dense FP32 inference for models opting into CUDA auto fallback.
+        allow_fp32_fallback: bool = False,
     ):
         super().__init__()
 
@@ -192,8 +195,8 @@ class Attention(nn.Module):
                 role=role,
                 backend_explicit=self.backend_explicit,
             )
-            # Some model-specific paths call this helper directly. The main backend
-            # dispatch below never switches to it implicitly.
+            # Compatibility kernels run inside shared dispatch, between the
+            # parallel strategy's input preparation and output restoration.
             self.sdpa_fallback = SDPABackend.get_impl_cls()(
                 num_heads=num_heads,
                 head_size=head_size,
@@ -220,6 +223,7 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.causal = causal
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.allow_fp32_fallback = allow_fp32_fallback
 
         self.use_ring = False
         self.ring_pg = None
@@ -261,15 +265,19 @@ class Attention(nn.Module):
             return None
         dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
         # Keep backend layout discovery under the same config context used by
-        # upstream vLLM's attention-spec collector.
+        # upstream vLLM's attention-spec collector.  vLLM 0.29 moved the
+        # block-stride decision off the spec and onto the single physical
+        # ``CacheConfig.kv_cache_layout`` resolved before the cache is built,
+        # so the backend's preference is enforced there (see
+        # ``vllm_omni.diffusion.diffusion_kv.initialization``) rather than
+        # carried per layer.
         with set_current_vllm_config(vllm_config):
-            indexes_kv_by_block_stride = self.attn_backend.indexes_kv_by_block_stride()
+            assert_backend_layout_supported(vllm_config, self.attn_backend)
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
             dtype=dtype,
-            indexes_kv_by_block_stride=indexes_kv_by_block_stride,
             non_causal=not self.causal,
         )
 
@@ -492,13 +500,33 @@ class Attention(nn.Module):
 
         self._assert_metadata_compatible(attn_metadata)
 
+        if (
+            self.allow_fp32_fallback
+            and query.is_cuda
+            and query.dtype == torch.float32
+            and query.ndim == 4
+            and not self.backend_explicit
+            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and (
+                attn_metadata is None
+                or (
+                    attn_metadata.full_attn_spans is None
+                    and attn_metadata.query_ranges is None
+                    and attn_metadata.video_layout is None
+                    and attn_metadata.packed_padding is None
+                    and not attn_metadata.extra
+                )
+            )
+        ):
+            logger.warning_once("Using SDPA for this layer's FP32 input with automatic CUDA FlashAttention selection.")
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
         # The startup KV-capacity profile needs tensor shapes, not a paged
         # attention result. If dense FLASH_ATTN deps are absent (NPU MindIE-SD
         # or CUDA CuTe FA4), SDPA provides that profile forward. Formal paged
         # requests never use this branch because their Worker adapter is active.
-        # Do not silently remap float32 (or other dtypes) to SDPA: a
-        # user-explicit backend must run or raise.
+        # A user-explicit backend must run or raise.
         if (
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None

@@ -24,7 +24,9 @@ implementation contract; it is not, by itself, a general support claim.
 - [Async Chunk](feature/async_chunk.md)
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
+- [Runner-to-model Prefill/Decode Phase Contract](feature/preprocess_phase_contract.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
+- [Model-local KV Caches](feature/model_local_kv_caches.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 
 ### Communication
@@ -34,6 +36,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Mooncake Store Connector](feature/omni_connectors/mooncake_store_connector.md)
 - [Mooncake Transfer Engine Connector](feature/omni_connectors/mooncake_transfer_engine_connector.md)
 - [Mori Transfer Engine Connector](feature/omni_connectors/mori_transfer_engine_connector.md)
+- [NIXL Connector](feature/omni_connectors/nixl_connector.md)
 - [Shared Memory Connector](feature/omni_connectors/shared_memory_connector.md)
 - [Yuanrong Store Connector](feature/omni_connectors/yuanrong_connector.md)
 - [Yuanrong Transfer Engine Connector](feature/omni_connectors/yuanrong_transfer_engine_connector.md)

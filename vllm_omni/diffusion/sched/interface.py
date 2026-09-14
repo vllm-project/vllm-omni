@@ -119,6 +119,7 @@ class RequestBatchSamplingParamsKey:
     guidance_scale: float = 0.0
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
+    guidance_scale_2_provided: bool = False
     guidance_rescale: float = 0.0
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False

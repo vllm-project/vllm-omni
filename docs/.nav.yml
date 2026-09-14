@@ -71,6 +71,7 @@ nav:
       - Overview and Compatibility:
         - Overview: user_guide/diffusion_features.md
         - Feature Compatibility: user_guide/feature_compatibility.md
+      - Device-side Video Postprocessing: user_guide/diffusion/device_side_video_postprocess.md
       - CPU Offloading:
         - Overview: user_guide/diffusion/cpu_offload.md
         - Model-Level: user_guide/diffusion/offloader/module_offload.md
@@ -127,6 +128,7 @@ nav:
         - Async Chunk: design/feature/async_chunk.md
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
+        - Prefill/Decode Phase Contract: design/feature/preprocess_phase_contract.md
         - Automatic Prefix Caching: design/feature/prefix_caching.md
         - Realtime AR-Diffusion: design/feature/realtime_ar_diffusion.md
       - Communication:
@@ -134,6 +136,7 @@ nav:
           - Mooncake Store Connector: design/feature/omni_connectors/mooncake_store_connector.md
           - Mooncake Transfer Engine Connector: design/feature/omni_connectors/mooncake_transfer_engine_connector.md
           - Mori Transfer Engine Connector: design/feature/omni_connectors/mori_transfer_engine_connector.md
+          - NIXL Connector: design/feature/omni_connectors/nixl_connector.md
           - Shared Memory Connector: design/feature/omni_connectors/shared_memory_connector.md
           - Yuanrong Store Connector: design/feature/omni_connectors/yuanrong_connector.md
           - Yuanrong Transfer Engine Connector: design/feature/omni_connectors/yuanrong_transfer_engine_connector.md

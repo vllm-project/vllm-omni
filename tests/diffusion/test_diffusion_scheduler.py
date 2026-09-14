@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -10,8 +10,9 @@ import pytest
 import torch
 import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from pytest_mock import MockerFixture
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
+from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -104,7 +105,7 @@ def _initialize_paged_scheduler(
     )
     config = KVCacheConfig(
         num_blocks=num_blocks,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layer0"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, num_blocks, ["layer0"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)],
     )
     scheduler.initialize(
@@ -276,12 +277,16 @@ class TestGetRequestBatchSamplingParamsKey:
         generator: torch.Generator | None = None,
         extra_args: dict | None = None,
         condition_key: tuple | None = None,
+        guidance_scale: float | None = None,
+        guidance_scale_2: float | None = None,
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
             seed=seed,
             generator=generator,
             extra_args=extra_args or {},
+            guidance_scale=guidance_scale,
+            guidance_scale_2=guidance_scale_2,
         )
         return OmniDiffusionRequest(
             prompt="prompt",
@@ -355,6 +360,21 @@ class TestGetRequestBatchSamplingParamsKey:
         assert scheduler._build_sampling_params_key(
             self._make(condition_key=("wan22_s2v_condition", True))
         ) != scheduler._build_sampling_params_key(self._make(condition_key=("wan22_s2v_condition", False)))
+
+    def test_distinguishes_explicit_guidance_scale_2(self) -> None:
+        # An omitted guidance_scale_2 is auto-filled from guidance_scale, so a
+        # request that omits it and one that passes the same value explicitly end
+        # up with an identical numeric guidance_scale_2 but different
+        # guidance_scale_2_provided. Pipelines read guidance_scale_2_provided from
+        # the batch's first request to gate image guidance, so the two must not
+        # share a request batch.
+        scheduler = RequestScheduler()
+        omitted = self._make(guidance_scale=2.0)
+        explicit = self._make(guidance_scale=2.0, guidance_scale_2=2.0)
+
+        assert omitted.sampling_params.guidance_scale_2 == explicit.sampling_params.guidance_scale_2
+        assert omitted.sampling_params.guidance_scale_2_provided != explicit.sampling_params.guidance_scale_2_provided
+        assert scheduler._build_sampling_params_key(omitted) != scheduler._build_sampling_params_key(explicit)
 
 
 class TestRequestScheduler:

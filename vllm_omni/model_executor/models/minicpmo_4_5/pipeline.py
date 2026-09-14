@@ -53,7 +53,13 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
-            sampling_constraints={"detokenize": True},
+            sampling_constraints={
+                "detokenize": True,
+                # The llm2tts bridge discards this boundary and every row
+                # after it, so stop Stage 0 as soon as either valid
+                # MiniCPM-o 4.5 turn terminator is sampled.
+                "stop_token_ids": [151704, 151645],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,

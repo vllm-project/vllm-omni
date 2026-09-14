@@ -11,7 +11,7 @@ def should_enable_duplex_endpoint(
     *,
     config_path: str | None = None,
 ) -> bool:
-    """Enable duplex routes only for deployments that explicitly opt in."""
+    """Enable the realtime session handler for explicitly configured deployments."""
     if stage_configs:
         for stage in stage_configs:
             session_mode = (
@@ -21,14 +21,13 @@ def should_enable_duplex_endpoint(
                 return True
     if config_path:
         try:
-            from omegaconf import OmegaConf
+            from vllm_omni.config.stage_config import resolve_deploy_yaml
 
-            raw_config = OmegaConf.load(config_path)
-            session_mode = raw_config.get("session_mode") if hasattr(raw_config, "get") else None
-            if session_mode == "duplex":
+            raw_config = resolve_deploy_yaml(config_path)
+            if raw_config.get("session_mode") == "duplex" or isinstance(raw_config.get("duplex_session"), dict):
                 return True
         except Exception as exc:
-            logger.warning("Failed to inspect duplex session_mode from %s: %s", config_path, exc)
+            logger.warning("Failed to inspect realtime session configuration from %s: %s", config_path, exc)
     return False
 
 

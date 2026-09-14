@@ -121,6 +121,13 @@ class AttentionBackend(ABC):
         when it unifies cache layouts across layers. Dense diffusion backends
         conservatively keep the default ``False``; a paged backend should
         override this only when its kernel actually follows that layout.
+
+        Since vLLM 0.29 this no longer rides on ``AttentionSpec``.  It selects
+        the block-outermost physical layout pinned on
+        ``CacheConfig.kv_cache_layout`` -- see
+        ``vllm_omni.diffusion.diffusion_kv.layout`` -- whose
+        ``is_block_outermost`` is what upstream reads when it sizes
+        ``KVCacheTensor`` regions.
         """
 
         return False
@@ -208,8 +215,9 @@ class AttentionMetadata:
     #     variable-length query/key sequences for FlashAttention.
     #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
     #     the packed cu_seqlens tensors.
-    #   "valid_kv_length": int — contiguous valid K/V prefix length for a
-    #     backend that advertises supports_prefix_kv_slicing.
+    #   "valid_kv_length": int — contiguous valid K/V prefix length. Local
+    #     backends may slice it directly; ring backends trim each circulated
+    #     K/V block from the same global prefix.
     #   "npu_attn_varlen": bool — model opt-in for the NPU packed varlen path
     #     (TND npu_fusion_attention driven by cu_seqlens, mask never read).
     #     Requires the [real, pad] two-document packing contract; see

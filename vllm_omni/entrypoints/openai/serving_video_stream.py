@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen-Omni streaming video WebSocket handler.
 
 Accepts video frames incrementally via WebSocket, buffers them, and
@@ -18,20 +18,22 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _BAD_FRAME,
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
+    PrewarmedFrame,
     StreamingVideoSessionConfig,
     VideoStreamTurnTrigger,
 )
@@ -59,7 +61,7 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         n_buf = len(frame_buffer)
         if n_buf <= config.num_frames:

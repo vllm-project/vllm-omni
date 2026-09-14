@@ -42,16 +42,18 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
-    SupportsPromptUpdate,
+    SupportsInteractionApply,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
-    supports_prompt_update,
+    supports_interaction_apply,
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
+from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -176,6 +178,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
+        self._interaction_coordinator: InteractionCoordinator | None = None
         self.model_memory_usage = 0
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
             vllm_config=vllm_config,
@@ -427,6 +430,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 model_tag=self.od_config.model_class_name,
             )
 
+        self._interaction_coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
+        if hasattr(self.pipeline, "_interaction_coordinator"):
+            self.pipeline._interaction_coordinator = self._interaction_coordinator
+
         logger.info("Model runner: Initialization complete.")
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -674,6 +681,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 od_config.cache_backend,
             )
 
+    def _prepare_output_for_transport(
+        self,
+        output: DiffusionOutput,
+        sampling_params: OmniDiffusionSamplingParams,
+    ) -> DiffusionOutput:
+        if output.media is not None:
+            if output.output is not None:
+                raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+            output.media = prepare_diffusion_media_for_transport(
+                output.media,
+                od_config=self.od_config,
+                sampling_params=sampling_params,
+            )
+        return output
+
     def _runner_output_from_outputs(
         self,
         reqs: list[OmniDiffusionRequest],
@@ -768,6 +790,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         allow_single_output=allow_single_output,
                         pipeline_name=type(self.pipeline).__name__,
                     )
+                with record_function("prepare_output_for_transport"):
+                    outputs = [
+                        self._prepare_output_for_transport(output, req.sampling_params)
+                        for req, output in zip(reqs, outputs, strict=True)
+                    ]
 
             if is_primary and outputs and record_output_peak_memory:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
@@ -789,7 +816,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return self._runner_output_from_outputs(reqs, outputs)
 
-    def _attach_stepwise_metrics(
+    def _attach_stepwise_metadata(
         self,
         state: StepRequestState,
         output: DiffusionOutput,
@@ -799,6 +826,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             consume_pipeline_stage_durations(self.pipeline),
         )
         attach_stage_durations(state, output)
+
+        # In streaming output mode with interaction, acknowledge which events are handled in this chunk.
+        meta = state.interaction_chunk_metadata
+        state.interaction_chunk_metadata = None
+        if meta is not None:
+            output.started_event_ids = list(meta.started_event_ids)
+            output.active_event_ids = list(meta.active_event_ids)
+            output.completed_event_ids = list(meta.completed_event_ids)
 
     def execute_model(
         self,
@@ -1275,10 +1310,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 clear_pipeline_stage_durations(self.pipeline)
                                 result = self.pipeline.post_decode(req)
                                 if result is not None:
-                                    self._attach_stepwise_metrics(
+                                    result = self._prepare_output_for_transport(result, req.sampling)
+                                    self._attach_stepwise_metadata(
                                         req,
                                         result,
                                     )
+                                    # After consuming this chunk's interaction metadata, apply pending interactions and
+                                    # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
+                                    if supports_interaction_apply(self.pipeline) and not req.request_denoise_completed:
+                                        pipe = cast(SupportsInteractionApply, self.pipeline)
+                                        pipe.apply_interaction_at_chunk_boundary(req)
+                                        pipe.prepare_next_chunk(req)
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index
@@ -1354,42 +1396,48 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         request_id: str,
         interaction: OmniInteractionPrompt,
     ) -> None:
-        """Route a midway interaction to the matching active stepwise request feature."""
+        """Route a midway interaction through the pipeline interaction coordinator."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not self.od_config.streaming_output:
             raise ValueError("submit_interaction requires streaming_output=True")
         if not self._supports_step_mode():
             raise ValueError("submit_interaction requires step execution support")
 
+        coordinator = self._interaction_coordinator
+        if coordinator is None:
+            coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
+            self._interaction_coordinator = coordinator
+            if hasattr(self.pipeline, "_interaction_coordinator"):
+                self.pipeline._interaction_coordinator = coordinator
+
         event = interaction.get("event")
-        if isinstance(event, dict) and "prompt" in event and "multi_modal_data" not in event:
-            # Is a prompt update interaction.
-            self._submit_prompt_update_interaction(request_id, interaction)
-            return
+        has_mm = isinstance(event, dict) and "multi_modal_data" in event
+        has_prompt = isinstance(event, dict) and "prompt" in event and event.get("prompt") is not None
 
-        raise NotImplementedError(
-            "Only text-only prompt update interactions with 'event.prompt' and optional "
-            "'transition_chunks' are supported in this release"
-        )
-
-    def _submit_prompt_update_interaction(
-        self,
-        request_id: str,
-        interaction: OmniInteractionPrompt,
-    ) -> None:
-        """Queue a prompt-update interaction for an active stepwise request."""
-        if not supports_prompt_update(self.pipeline):
+        # Prompt-only interactions in this release; multi_modal_data lands with camera support.
+        if not isinstance(event, dict) or has_mm or not has_prompt:
+            raise NotImplementedError(
+                "Only text-only prompt update interactions with 'event.prompt' and optional "
+                "'transition_chunks' are supported in this release"
+            )
+        if not coordinator.has_modality("prompt"):
             raise ValueError(f"prompt_update is not supported by pipeline {self.od_config.model_class_name!r}")
 
         state = self.state_cache.get(request_id)
         if state is None:
-            raise ValueError(f"No active request state for prompt_update: {request_id!r}")
+            raise ValueError(f"No active request state for interaction: {request_id!r}")
 
-        event = cast(dict[str, Any], interaction.get("event"))
-        prompt = event["prompt"]
-        transition_chunks = interaction.get("transition_chunks")
         event_id = interaction.get("event_id")
         if not isinstance(event_id, str) or not event_id:
             raise ValueError("event_id must be non-empty")
-        pipeline = cast(SupportsPromptUpdate, self.pipeline)
-        pipeline.prepare_prompt_update(state, prompt, event_id, transition_chunks)
+        prompt = event["prompt"]
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("prompt must be non-empty")
+        coordinator.enqueue(
+            state,
+            modality="prompt",
+            event_id=event_id,
+            received_at=time.monotonic(),
+            payload={"prompt": prompt},
+            transition_chunks=interaction.get("transition_chunks"),
+        )

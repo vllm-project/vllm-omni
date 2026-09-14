@@ -7,7 +7,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 
-See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
+See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
 !!! tip "Deployment recipes"
     TTS deployment recipes are published at
@@ -279,10 +279,15 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 
 ## Streaming Text Input (WebSocket)
 
-The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and generates audio per sentence as boundaries are detected.
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
+By default (`split_granularity=none`) it buffers until `input.done` and
+synthesizes that flush as **one** TTS request, which keeps long-form timbre
+stable. Set `split_granularity` to `sentence` or `clause` to emit a request
+at each detected boundary (lower time-to-first-audio for STT/LLM pipelines).
 
-> Note: text input is always streamed incrementally. Audio output remains sentence-scoped:
-> use `stream_audio=false` for one binary frame per sentence, or `stream_audio=true` for one or more PCM chunks per sentence.
+> Note: `stream_audio` only changes how **audio bytes** are framed (one WAV/PCM
+> payload vs chunked PCM). Text segmentation is controlled separately by
+> `split_granularity`.
 
 ### WebSocket Protocol
 
@@ -314,14 +319,16 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 - The session config is sticky. Send `input.text` again straight after
   `session.done` to reuse it, or send another `session.config` first to change
-  voice, format, or reference audio. A `session.config` sent while text is
-  still buffered is rejected so no pending input is silently dropped.
-- An utterance is the flush unit, not a linguistic one: it is whatever text was
-  buffered when `input.done` arrived, of any length, synthesized as one request.
-  `utterance_index` counts those flushes across the connection, so it tells you
-  which `input.done` a frame belongs to. `sentence_index` counts within one
-  flush and so pairs with `total_sentences`, which means every utterance reports
-  `sentence_index: 0` of `total_sentences: 1` (or `0` for an empty buffer).
+  voice, format, or reference audio. A `session.config` sent in the middle of
+  an utterance is rejected so no pending input is silently dropped and so a
+  split utterance cannot end up half in one voice and half in another.
+- An utterance is the flush unit, not a linguistic one: it is one `input.done`
+  cycle. `utterance_index` counts those flushes across the connection, so it
+  tells you which `input.done` a frame belongs to. `sentence_index` counts the
+  TTS requests inside one flush and so pairs with `total_sentences`: with the
+  default `split_granularity=none` that is always `sentence_index: 0` of
+  `total_sentences: 1` (or `0` for an empty buffer), while `sentence` or
+  `clause` counts the linguistic units actually synthesized.
 - End the connection with `session.close`, or by closing the socket. An idle
   connection is still closed after the server's idle timeout, which now also
   applies to the gap between utterances.
@@ -332,7 +339,15 @@ All REST API parameters are supported, plus:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
-| `stream_audio` | bool | false | Stream one or more PCM chunks for the buffered input over WebSocket |
+| `stream_audio` | bool | false | Stream one or more PCM chunks for each TTS request over WebSocket |
+| `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
+| `seed` | integer | null | Forwarded to the speech engine for this session |
+
+ASCII punctuation only ends a unit when whitespace or `input.done` follows it,
+and decimals (`3.14`), thousands separators (`1,000`), abbreviations (`Dr.`,
+`e.g.`) and initials (`J. R.`) are not treated as boundaries. A punctuation run
+and any closing quote or bracket stay with the unit they close, so `Wait...`
+and `He said "Hello."` are one request each.
 
 ```bash
 DELETE /v1/audio/voices/{name}
@@ -752,17 +767,61 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | ------- | ------------- |
 | `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
 
+OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
+key, and value tensors are evaluated in BF16 even when the stage is configured with `dtype: float32`; the attention output is converted back to the model's
+hidden-state dtype before the output projection. Consequently, a float32 stage configuration does not imply FP32 attention arithmetic.
+
 ### VoxCPM2
 
 | Model | Description |
 | ------- | ------------- |
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
 
+#### Startup LoRA adapter
+
+To serve a fine-tuned VoxCPM2 voice, set
+`voxcpm2_runtime_config.startup_lora_path` in the stage's `hf_overrides`.
+Copy `vllm_omni/deploy/voxcpm2.yaml` to a local deploy config and add this key
+alongside its existing runtime settings:
+
+```yaml
+# Under stages[0].engine_extras.hf_overrides.voxcpm2_runtime_config:
+startup_lora_path: /absolute/path/to/adapter
+```
+
+Then launch with the modified config:
+
+```bash
+vllm serve openbmb/VoxCPM2 --omni --deploy-config /absolute/path/to/voxcpm2-lora.yaml
+```
+
+The directory must be accessible to the worker and contain the native VoxCPM2
+training export: `lora_config.json` (with a `lora_config` object containing
+`r`, `alpha`, enabled groups, and target module names) and
+`lora_weights.safetensors`. PEFT checkpoints and pickle checkpoints are not
+accepted. Missing, unexpected, non-finite, or incorrectly shaped adapter
+tensors fail model loading rather than silently loading a partial adapter.
+
+The adapter is merged into the base LM, residual LM, LocDiT, and optional
+projection layers selected by its configuration, after base weight loading
+and before compilation or CUDA graph capture. All requests use that adapter;
+`voice` still selects a reference voice, not a LoRA adapter. Changing adapters
+requires restarting the server. Runtime loading/unloading, per-request
+multi-LoRA selection, and `load_format=dummy` are not supported by this path.
+Weight fusion rounds to the base model's dtype, so numerical and speech-quality
+parity should be checked against the upstream adapter on your deployment.
+
 ### MOSS-TTS-Nano
 
 | Model | Description |
 | ------- | ------------- |
 | `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
+
+### Breeze-TTS-2
+
+| Model | Description |
+| ------- | ------------- |
+| `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
 
 ## Error Responses
 

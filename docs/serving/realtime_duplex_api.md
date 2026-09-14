@@ -1,17 +1,17 @@
 # Realtime Duplex API
 
 vLLM-Omni serves full-duplex speech models over a WebSocket endpoint,
-`/v1/realtime?duplex=1`, that speaks the OpenAI Realtime vocabulary plus a
+`/v1/realtime`, that speaks the OpenAI Realtime vocabulary plus a
 set of duplex extensions: the model decides when to listen and when to speak,
 the user can talk over the assistant, playback progress is reported back so
 history stays honest, and a dropped connection can resume the same session.
 This page covers how to run a duplex deployment, how to drive it from Python
 with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 
-The endpoint is served for models that ship a duplex plugin — currently
-MiniCPM-o 4.5, PersonaPlex, and Nemotron VoiceChat — and only for deploy
-configurations that declare `session_mode: duplex`. The runtime architecture
-is described in [Full-Duplex Runtime (MiniCPM-o 4.5)](../design/fullduplex.md).
+The handler is enabled by either a model-native `session_mode: duplex`
+deployment or an explicit `duplex_session` configuration for turn-based
+Server VAD. The runtime architecture is described in
+[Full-Duplex Runtime (MiniCPM-o 4.5)](../design/fullduplex.md).
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 
 `vllm_omni/deploy/minicpmo_4_5.yaml` declares `session_mode: duplex` and
 `duplex_session.max_sessions: 4`, which mounts the WebSocket routes
-`ws://<host>:8099/v1/realtime?duplex=1` (this page) and `ws://<host>:8099/v1/duplex`
+`ws://<host>:8099/v1/realtime` (this page) and `ws://<host>:8099/v1/duplex`
 (the native dialect for raw-protocol clients) next to the usual HTTP API.
 PersonaPlex and Nemotron VoiceChat use `vllm_omni/deploy/personaplex.yaml` and
 `vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml` in the same way.
@@ -240,7 +240,7 @@ on the same helpers.
 
 ## API Reference
 
-This section is the complete wire contract of `/v1/realtime?duplex=1`: how
+This section is the complete wire contract of `/v1/realtime`: how
 the dialect relates to the OpenAI Realtime protocol, which surfaces each
 model's capability flags gate, a catalogue of every client-to-server and
 server-to-client event, and a JSON example for each. `DuplexClient` speaks
@@ -253,10 +253,11 @@ its protocol tests.
 
 ### Endpoint and transport
 
-The endpoint is `ws(s)://<host>/v1/realtime?duplex=1`; the `duplex` query
-parameter (`1`, `true`, or `on`) selects the duplex session handler, and the
-route is mounted only for deployments whose deploy configuration declares
-`session_mode: duplex`. Optional query parameters are `model`, `session_id`,
+The endpoint is `ws(s)://<host>/v1/realtime`. Bare connections select the
+session handler when the deployment declares either `session_mode: duplex`
+or `duplex_session`. `?duplex=1` remains a compatibility alias, while
+`?duplex=0` selects the legacy Realtime handler. Optional query parameters
+are `model`, `session_id`,
 `autostart` (`0` means resume-only), `resume`, and `native_duplex`
 (`minicpmo45_native_duplex` is accepted as a deprecated alias and folded
 into the canonical name). Every message is one JSON object per WebSocket
@@ -310,13 +311,19 @@ work unmodified. The overlap falls into the three tiers used by the event catalo
 | Direction | Messages |
 | --- | --- |
 | Client → server | `session.update`, `input_audio_buffer.append` / `.commit` / `.clear`, `conversation.item.create` / `.retrieve` / `.truncate` / `.delete`, `response.create`, `response.cancel`, `output_audio_buffer.clear` (OpenAI: WebRTC-only; here also a WebSocket event) |
-| Server → client | `error` (same `{type, code, message, event_id, param}` envelope and the same classes `invalid_request_error` / `server_error` / `rate_limit_error`), `session.created`, `session.updated`, `input_audio_buffer.committed` / `.cleared` / `.speech_started` / `.speech_stopped`, `conversation.item.created` / `.added` / `.done` / `.deleted` / `.retrieved` / `.truncated`, `conversation.item.input_audio_transcription.completed`, `response.created`, `response.done`, `response.output_item.added` / `.done`, `response.content_part.added` / `.done`, `response.audio.delta` / `.done`, `response.audio_transcript.delta` / `.done`, `response.output_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, `rate_limits.updated`, `output_audio_buffer.cleared` |
+| Server → client | `error` (same `{type, code, message, event_id, param}` envelope and the same classes `invalid_request_error` / `server_error` / `rate_limit_error`), `session.created`, `session.updated`, `input_audio_buffer.committed` / `.cleared` / `.speech_started` / `.speech_stopped`, `conversation.item.created` / `.added` / `.done` / `.deleted` / `.retrieved` / `.truncated`, `conversation.item.input_audio_transcription.completed`, `response.created`, `response.done`, `response.output_item.added` / `.done`, `response.content_part.added` / `.done`, `response.output_audio.delta` / `.done`, `response.output_audio_transcript.delta` / `.done`, `response.output_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, `rate_limits.updated`, `output_audio_buffer.cleared` |
 | Session fields | `model`, `modalities` / `output_modalities`, `instructions`, `voice`, `input_audio_format` / `output_audio_format` (beta spelling) **and** `audio.input.format` / `audio.output.format` objects (GA spelling), `turn_detection.server_vad {threshold, prefix_padding_ms, silence_duration_ms}`, `input_audio_transcription`, `input_audio_noise_reduction`, `tools`, `tool_choice`, `temperature`, `max_response_output_tokens`, `speed`, `tracing` |
 | Object shapes | `realtime.session`, `realtime.item`, `realtime.response`; item content parts `input_text` / `input_audio` / `output_text` / `output_audio`; `function_call` and `function_call_output` items; `previous_item_id` chaining; `output_index` / `content_index` addressing |
 | Sequencing | `response.created → output_item.added → content_part.added → deltas → *.done → content_part.done → output_item.done → response.done → rate_limits.updated`; `speech_started → speech_stopped → committed` |
 
-The server deliberately emits and accepts **both** the beta and the GA
-spellings at once (`response.audio.delta` alongside `output_modalities`,
+Audio/transcript output uses only the current (non-beta) OpenAI event names
+(`response.output_audio.delta`, not the deprecated `response.audio.delta`),
+matching `openai.types.realtime` in the official `openai` Python SDK and what
+clients built against it (e.g. `livekit-plugins-openai`'s non-Azure code path)
+expect; a client still on the old beta SDK types would not recognize these
+events. Session fields and `conversation.item.*` events, in contrast, are
+deliberately dual: the server emits and accepts **both** the beta and the GA
+spellings at once (`output_modalities` alongside `modalities`,
 `conversation.item.added` alongside `conversation.item.created`) so either
 generation of OpenAI client parses the stream.
 
@@ -328,7 +335,7 @@ A stock client ignores the extra keys; the extensions are additive.
 | --- | --- |
 | `session.created` / `session.updated` | top-level `incarnation`, `attachment_generation`, `resume_token`; inside `session`: `state`, `turn_state`, `epoch`, `turn_id`, `active_request_id`, `active_response_id`, `active_response_turn_id`, `overlap_policy`, `overlap_*_ms/rms`, `playback_commit_policy`, `playback`, `capabilities`, `ref_audio`, `extra_body`, `idle_timeout_s`, `response_format` |
 | `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
-| `response.audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback}` |
+| `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback}` |
 | `response.speak` (inserted before the first delta) | not an OpenAI event, but rides the OpenAI response envelope (`response_id`, `item_id`, `output_index`, `content_index`) |
 | `input_audio_buffer.append` | `is_speech`, `video_frames` (+ `max_slice_nums`), `duration_ms`, `audio_end_ms`, per-event `format` / `sample_rate_hz` |
 | `input_audio_buffer.commit` | `final`, `response_create`, `is_speech:false` (silence declaration) |
@@ -342,9 +349,14 @@ Semantic divergences hidden behind shared names:
   before any commit; a commit may end in `response.listen` and no
   response, and the model may open a response with no commit at all.
   OpenAI: commit ⇒ item, `response.create` ⇒ exactly one response.
-- `turn_detection.interrupt_response=false` is rejected;
-  `create_response` is ignored; `semantic_vad` is unsupported; the VAD
-  runs per session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+- With `turn_detection={"type":"server_vad"}`, omitted `interrupt_response`
+  defaults to `false` on turn-based models such as Qwen3-Omni, enabling
+  endpointing and automatic responses without interruption. Explicit `true`
+  is rejected there. Model-native duplex keeps the `true` default and rejects
+  `false`; its VAD implies `overlap_policy=barge_in_on_speech`.
+  This capability-dependent default differs from OpenAI's `true` default;
+  the effective configuration is returned in `session.created` / `session.updated`.
+  `semantic_vad` is unsupported.
 - `rate_limits.updated` is always an empty list (compatibility only).
 - Cancellation never reuses a `response_id`; truncation is driven by
   `playback.ack` as well as `conversation.item.truncate`.
@@ -374,6 +386,49 @@ Semantic divergences hidden behind shared names:
 - A **duplex-aware client** (`vllm_omni.clients.duplex.DuplexClient`) uses
   the Tier 3 surface on top of the same Tier 1 events, so both kinds of
   client can share one deployment and one event log.
+
+### Turn-based Chat audio metadata
+
+For turn-based models served through Chat fallback, non-empty audio choices
+produced by the Omni Chat audio encoder include `audio_metadata`, in both
+streaming and complete Chat responses. Text-only choices do not require it.
+
+| Field | Meaning |
+| --- | --- |
+| `format` | Encoding of the returned audio, such as `pcm` or `wav`; `pcm16` requests normalize to `pcm`. |
+| `sample_rate_hz` | Sample rate used by the encoder, in samples per second. |
+| `frame_count` | Samples per channel in this chunk, or in the complete waveform for a non-streaming choice. Not a byte count. |
+| `channels` | Number of audio channels. |
+
+These values describe the waveform after audio transformations. Compressed
+formats may add codec padding that is not included in `frame_count`.
+The encoder uses a model-reported sample rate when available; Qwen3-Omni
+currently omits it and uses the existing 24 kHz default. This metadata does
+not independently determine a model's sample rate.
+
+Chat fallback requests the session's output format explicitly. Its internal
+`response.output_audio.delta` carries `format`, `sample_rate_hz`, `channels`,
+and `audio_duration_ms`. The Realtime endpoint exposes output `format` and
+`sample_rate_hz` on `response.audio.delta`, with duration in
+`metadata.audio_duration_ms`; it does not currently forward `channels`.
+The duration is cumulative for the response:
+integer frames are summed before converting to milliseconds and rounding down.
+Non-empty audio without valid metadata, or a sample-rate change within one
+response, fails that fallback response with `response_error`.
+
+In this Chat fallback path, `response.done.response.metadata.playback` reports:
+
+- `generated_ms`: cumulative source-waveform duration.
+- `sent_ms`: cumulative audio accepted into the server output path, including
+  queued or journaled audio. A journaled event remains accepted if the
+  subsequent send fails; this is not proof of socket delivery.
+- `played_ms`: cumulative playback reported by the client.
+- `committed_ms`: playback position used for history reconciliation.
+
+The native model path still records audio before sending; it does not yet
+share Chat fallback's output-acceptance timing. Only client playback reports
+establish what was played. The existing duration-proportional text truncation
+remains an approximation, not word-level audio alignment.
 
 ### Event catalogue
 
@@ -437,12 +492,12 @@ table lives in the normative contract section of [Full-Duplex Runtime (MiniCPM-o
 | `response.output_item.added` | 1 | Assistant item (or `function_call` item) attached to the response. |
 | `response.content_part.added` | 1 | Audio/text content part opened on the assistant item. |
 | `response.speak` | 3 | Model chose to speak (native lane); at most once per response, before the first audio delta. |
-| `response.audio.delta` | 2 | One ordered audio chunk. OpenAI name; adds `format`, `sample_rate_hz`, `metadata{epoch, model_speak, end_of_turn, audio_text_marks, playback}`. |
-| `response.audio_transcript.delta` | 1 | Transcript text paired one-to-one with each audio delta. |
+| `response.output_audio.delta` | 2 | One ordered audio chunk. OpenAI name; adds `format`, `sample_rate_hz`, `metadata{epoch, model_speak, end_of_turn, audio_text_marks, playback}`. |
+| `response.output_audio_transcript.delta` | 1 | Transcript text paired one-to-one with each audio delta. |
 | `response.output_text.delta` | 1 | Text delta for text-modality responses. |
 | `response.output_text.done` | 1 | Final text of a text-modality response. |
-| `response.audio.done` | 1 | Audio stream closed for the response. |
-| `response.audio_transcript.done` | 1 | Full transcript (concatenation of the deltas). |
+| `response.output_audio.done` | 1 | Audio stream closed for the response. |
+| `response.output_audio_transcript.done` | 1 | Full transcript (concatenation of the deltas). |
 | `response.content_part.done` | 1 | Content part finalized with its transcript/text. |
 | `response.output_item.done` | 1 | Assistant item finalized. |
 | `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `cancelled` \| `failed`. OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
@@ -896,11 +951,11 @@ deferred commit during an active response (`event.response_create_deferred`)
 }
 ```
 
-`S→C response.audio.delta` (one ~1 s unit, 24 kHz PCM16)
+`S→C response.output_audio.delta` (one ~1 s unit, 24 kHz PCM16)
 
 ```json
 {
-  "type": "response.audio.delta",
+  "type": "response.output_audio.delta",
   "response_id": "resp_01",
   "item_id": "item_resp_01",
   "output_index": 0,
@@ -920,10 +975,10 @@ deferred commit during an active response (`event.response_create_deferred`)
 }
 ```
 
-`S→C response.audio_transcript.delta` (exactly one per audio delta)
+`S→C response.output_audio_transcript.delta` (exactly one per audio delta)
 
 ```json
-{"type": "response.audio_transcript.delta", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "delta": "It is sunny"}
+{"type": "response.output_audio_transcript.delta", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "delta": "It is sunny"}
 ```
 
 `S→C response.output_text.delta` / `response.output_text.done` (text modality)
@@ -936,14 +991,14 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "response.output_text.done", "response_id": "resp_02", "item_id": "item_resp_02", "output_index": 0, "content_index": 0, "text": "Tomorrow looks cloudy."}
 ```
 
-`S→C response.audio.done` / `response.audio_transcript.done`
+`S→C response.output_audio.done` / `response.output_audio_transcript.done`
 
 ```json
-{"type": "response.audio.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0}
+{"type": "response.output_audio.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0}
 ```
 
 ```json
-{"type": "response.audio_transcript.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "transcript": "It is sunny, 24 degrees."}
+{"type": "response.output_audio_transcript.done", "response_id": "resp_01", "item_id": "item_resp_01", "output_index": 0, "content_index": 0, "transcript": "It is sunny, 24 degrees."}
 ```
 
 `S→C response.content_part.done`
@@ -1185,8 +1240,8 @@ Realtime projector renames and fans out these events before they reach a
 | `session.create` (`open_session`, `session.config`) | first `session.update` |
 | `input.committed` | `conversation.item.added` / `conversation.item.created`, `input_audio_buffer.committed`, `conversation.item.input_audio_transcription.completed`, `conversation.item.done` |
 | `input.cancelled` | `input_audio_buffer.cleared` |
-| `response.output_audio.delta` (with `audio_transcript`) | optional `response.speak`, then `response.audio.delta` and `response.audio_transcript.delta` |
-| `response.output_audio.done` / `response.output_text.done` | `response.audio.done` / `response.output_text.done` |
+| `response.output_audio.delta` (with `audio_transcript`) | optional `response.speak`, then `response.output_audio.delta` and `response.output_audio_transcript.delta` |
+| `response.output_audio.done` / `response.output_text.done` | `response.output_audio.done` / `response.output_text.done` |
 | `response.text.delta` | `response.output_text.delta` |
 | `response.message` (chat-fallback raw chunk) | passed through |
 | `audio.cancelled` | optional `output_audio_buffer.cleared`, then the cancelled terminal events and `response.done` with `status: "cancelled"` |
@@ -1201,9 +1256,10 @@ Realtime projector renames and fans out these events before they reach a
   barge-in, or audio truncation; Nemotron VoiceChat does not support barge-in
   or audio truncation; camera frames are consumed only by MiniCPM-o 4.5; tool
   calls are produced only by Nemotron VoiceChat.
-- `turn_detection` supports only `server_vad` with `interrupt_response=true`;
-  `semantic_vad`, `interrupt_response=false`, and `create_response` are not
-  supported. Server VAD requires a model-native session.
+- `turn_detection` supports `server_vad` or `null`, not `semantic_vad`.
+  Turn-based models support endpointing without interruption, including
+  `create_response=false` for explicit response creation. Model-native duplex
+  requires `interrupt_response=true` and `create_response=true`.
 - `input_audio_transcription` and `input_audio_noise_reduction` are accepted
   and echoed but no separate transcription or noise-reduction stage runs;
   transcripts come from the model.
