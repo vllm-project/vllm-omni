@@ -134,6 +134,60 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     handler.shutdown()
 
 
+@pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
+def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(
+        prompt="test", extra_params={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+    )
+    try:
+        with pytest.raises(HTTPException, match="preencode_batch_frames") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "invalid-batch"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
+    from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
+
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    # Resolved frame count differs from anything the request asked for, so the
+    # metadata has to come from the encoded stream rather than request defaults.
+    preencoded = _make_test_video_bytes((32, 24), num_frames=7)
+    artifacts = VideoGenerationArtifacts(
+        videos=[preencoded],
+        audios=[None],
+        actions=[None],
+        audio_sample_rate=24000,
+        output_fps=24.0,
+        stage_durations={"decode": 0.5},
+        peak_memory_mb=123.0,
+        metrics={"generation_time": 1.25},
+    )
+    mocker.patch.object(handler, "_run_and_extract", return_value=artifacts)
+    encoder = mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes")
+    try:
+        result = asyncio.run(handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "preencoded"))
+        assert result == (
+            preencoded,
+            {"decode": 0.5},
+            123.0,
+            None,
+            {
+                "fps": 24.0,
+                "num_frames": 7,
+                "duration_s": 7 / 24.0,
+                "metrics": {"generation_time": 1.25},
+            },
+        )
+        encoder.assert_not_called()
+    finally:
+        handler.shutdown()
+
+
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
     od_config = SimpleNamespace(model_class_name="WanPipeline")
     handler = OmniOpenAIServingVideo.for_diffusion(

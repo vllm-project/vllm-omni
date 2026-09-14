@@ -271,6 +271,44 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
 
+_MODEL_CLI_FLAGS = {
+    "served_model_name": "omni",
+    "allowed_local_media_path": "/data",
+    "allowed_media_domains": ["example.com"],
+    "max_logprobs": 7,
+    "logprobs_mode": "processed_logprobs",
+    "mm_processor_kwargs": {"max_slice_nums": 1},
+    "mm_processor_cache_type": "shm",
+    "hf_token": "hf_test",
+    "hf_config_path": "/models/config",
+    "generation_config": "vllm",
+    "override_generation_config": {"temperature": 0.5},
+    "enable_prompt_embeds": True,
+}
+
+
+@pytest.mark.parametrize("model_type", ["minicpmo_4_5", "qwen3_tts"])
+@pytest.mark.parametrize(("field", "value"), list(_MODEL_CLI_FLAGS.items()), ids=list(_MODEL_CLI_FLAGS))
+def test_from_pipeline_config_owns_model_cli_fields(model_type, field, value):
+    config = _from_pipeline_key(model_type, cli_overrides={field: value})
+
+    for stage in config.stage_configs:
+        assert getattr(stage.model_config, field) == value
+
+
+def test_model_cli_fields_reach_typed_engine_args(monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    # Worker discovery requires hardware support; this test covers config transport.
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    config = _from_pipeline_key("minicpmo_4_5", cli_overrides=dict(_MODEL_CLI_FLAGS))
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
+
+    assert {field: engine_args.get(field) for field in _MODEL_CLI_FLAGS} == _MODEL_CLI_FLAGS
+
+
 @pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
 def test_llm_additional_config_roundtrip_and_isolation(stage_id, monkeypatch):
     from vllm_omni.engine import stage_init_utils
@@ -714,6 +752,7 @@ def test_sub_config_fields_match_structured_scopes():
         "max_cudagraph_capture_size",
         "enable_flashinfer_autotune",
         "enable_multithread_weight_load",
+        "enable_broadcast_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
         # Per-stage checkpoint resolution for repos whose stages live in
@@ -722,6 +761,18 @@ def test_sub_config_fields_match_structured_scopes():
         "model_subdir",
         "tokenizer_subdir",
         "requires_full_payload_input",
+        "served_model_name",
+        "allowed_local_media_path",
+        "allowed_media_domains",
+        "max_logprobs",
+        "logprobs_mode",
+        "mm_processor_kwargs",
+        "mm_processor_cache_type",
+        "hf_token",
+        "hf_config_path",
+        "generation_config",
+        "override_generation_config",
+        "enable_prompt_embeds",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)

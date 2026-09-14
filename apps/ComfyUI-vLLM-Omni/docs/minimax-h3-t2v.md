@@ -3,7 +3,9 @@
 Import [MiniMax_H3_Text_to_Video.json](../example_workflows/MiniMax_H3_Text_to_Video.json)
 by dragging it into ComfyUI, or select it under **Templates → ComfyUI-vLLM-Omni**.
 Restart ComfyUI after updating the extension. ComfyUI discovers the plugin's
-`example_workflows` directory automatically.
+`example_workflows` directory automatically. The extension's shared frontend
+adds the vLLM-Omni title-bar mark and node colours; refresh the browser after
+updating the extension to load them.
 
 The workflow sends a joint video/audio prompt through Generate Video to a remote
 H3 FL2VA service, then passes the returned VIDEO directly to Save Video. No H3
@@ -51,10 +53,17 @@ ssh -L 8188:127.0.0.1:8188 YOUR_SERVER
 
 Write camera action and accompanying dialogue, sound effects, or music in the
 same **prompt**. Leave **frame** and **references** disconnected to select T2VA.
-The template uses 1344×768, 24 FPS, 124 frames (17×7+5, about 5.17 seconds), and
-seed 1101. H3 Params supplies the explicit `16:9` aspect ratio required by H3;
-it is not inferred from rounded pixel dimensions. For portrait output, change
-both the dimensions to 768×1344 and the active H3 Params ratio to `9:16`.
+The template uses 1344×768, 24 FPS, a **duration** of **5.167 seconds**, and seed
+1101. The node converts this to 124 frames (17×7+5) for the API. The client
+selects the supported `16:9` preset from the dimensions; it does not send the
+rounded pixel ratio as the API identifier. For portrait output, change the
+dimensions to 768×1344 to select `9:16`. Keep **fast_h3** disconnected: this
+template uses the Base/Turbo settings below, while the separate FastH3 template
+targets an adapter fused into the server at startup.
+
+If upgrading an older copy of this template, reimport the updated JSON or set
+Generate Video's **duration** to **5.167**. Older exports that lack widget names
+cannot be migrated automatically from frame counts.
 
 | Setting | Base | Turbo v1.0 768p, four forwards |
 | --- | --- | --- |
@@ -114,16 +123,14 @@ count and dimensions, and audio/video durations agreeing within one video
 frame plus audio codec padding. Listen to the saved file to confirm audio is
 present and follows the visible action. HTTP success alone is insufficient.
 
-**Shared audio prerequisite:** the existing client can consume the container
-while decoding video before reading audio. Follow
-[the shared audio work in #7380](https://github.com/vllm-project/vllm-omni/issues/7380)
-and [#6782](https://github.com/vllm-project/vllm-omni/pull/6782). This workflow does
-not include that fix. Record any prerequisite commit used in real-model
-validation; a silent saved file does not pass WF-01 acceptance.
+**Audio handling:** the current extension includes the shared video/audio
+decoding fix from upstream. The historical run below used the then-separate
+[#6782 prerequisite](https://github.com/vllm-project/vllm-omni/pull/6782).
+A silent saved file still does not pass WF-01 acceptance.
 
 ## Recorded validation
 
-Validated on two H20-3e GPUs with vLLM-Omni base commit `bad50980`, vLLM 0.29.0,
+The original workflow was validated on two H20-3e GPUs with vLLM-Omni base commit `bad50980`, vLLM 0.29.0,
 PyTorch 2.13.0+cu129, and ComfyUI commit
 `1d48d9cf7bcecb6022a87b3cb13e0fb435bf9b8a` (CPU mode). The audio prerequisite
 was PR #6782 at `f1ab717a9692d485ab33e1c0ffa45b87334befb2`.
@@ -146,7 +153,9 @@ contained 124 H264 frames at 1344×768 and 24 FPS, plus 32 kHz stereo AAC audio.
 Video/audio durations were 5.166667/5.167000 seconds. Full ffmpeg decode passed,
 and the audio samples were nonzero. Subjective audio alignment is not established
 by those checks. Base parameters passed automated tests and a reduced-step smoke;
-50-step Base quality was not evaluated.
+50-step Base quality was not evaluated. These measurements predate the frontend
+update to duration inputs and node branding; they are not a new inference run
+on the updated branch.
 
 ## Source and scope
 

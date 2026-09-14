@@ -49,10 +49,16 @@ def test_workflow_links_and_native_defaults():
         assert output["type"] == input_["type"] == kind
     generate = widget_inputs(graph[3])
     assert (generate["width"], generate["height"], generate["fps"]) == (1344, 768, 24)
-    assert (generate["num_frames"] - 5) % 17 == 0
-    assert 4 <= generate["num_frames"] / generate["fps"] <= 15
+    assert generate["duration"] == 5.167
+    num_frames = round(generate["duration"] * generate["fps"])
+    assert num_frames == 124
+    assert (num_frames - 5) % 17 == 0
+    assert 4 <= generate["duration"] <= 15
+    assert all(input_["name"] != "num_frames" for input_ in graph[3]["inputs"])
     assert all(
-        input_["link"] is None for input_ in graph[3]["inputs"] if input_["name"] in ("frame", "references", "lora")
+        input_["link"] is None
+        for input_ in graph[3]["inputs"]
+        if input_["name"] in ("frame", "references", "lora", "fast_h3")
     )
     assert graph[4]["type"] == "SaveVideo"
     assert graph[4]["widgets_values"][1] == "mp4"
@@ -100,13 +106,13 @@ async def test_workflow_serializes_t2va_request(monkeypatch, turbo):
     monkeypatch.setattr(api_client, "bytes_to_video", lambda data: decoded)
     assert await nodes.VLLMOmniGenerateVideo().generate(**kwargs) == (decoded,)
     assert captured["model"] == "MiniMaxAI/MiniMax-H3"
-    assert captured["aspect_ratio"] == "16:9"
+    assert "aspect_ratio" not in captured
     assert captured["num_frames"] == "124"
     assert captured["fps"] == "24"
     assert captured["num_inference_steps"] == ("5" if turbo else "50")
     assert captured["flow_shift"] == ("6.0" if turbo else "12.0")
     assert captured["seed"] == "1101"
-    assert json.loads(captured["extra_params"]) == {"task": "t2va", "audio_flow_shift": 3.0}
+    assert json.loads(captured["extra_params"]) == {"task": "t2va", "audio_flow_shift": 3.0, "aspect_ratio": "16:9"}
     assert "input_reference" not in captured
     if turbo:
         assert json.loads(captured["lora"]) == kwargs["lora"]
@@ -115,18 +121,27 @@ async def test_workflow_serializes_t2va_request(monkeypatch, turbo):
 
 
 @pytest.mark.parametrize("aspect_ratio", ["16:9", "21:9", "4:3", "1:1", "3:4", "9:16"])
-def test_h3_aspect_ratio_is_a_form_field(aspect_ratio):
+def test_legacy_explicit_h3_aspect_ratio_overrides_dimension_inference(aspect_ratio):
     from comfyui_vllm_omni.utils.models import _minimaxh3_params_builder
 
     params = nodes.VLLMOmniMiniMaxH3Params().get_params(
         flow_shift=12.0, audio_flow_shift=3.0, aspect_ratio=aspect_ratio
     )[0]
-    fields = _minimaxh3_params_builder(params, extra_params={"task": "t2va"})
-    assert fields["aspect_ratio"] == aspect_ratio
-    assert "aspect_ratio" not in json.loads(fields["extra_params"])
+    fields = _minimaxh3_params_builder(params, extra_params={"task": "t2va"}, width=1344, height=768)
+    assert "aspect_ratio" not in fields
+    assert json.loads(fields["extra_params"])["aspect_ratio"] == aspect_ratio
     assert params["aspect_ratio"] == aspect_ratio
 
 
-def test_existing_h3_params_node_defaults_to_landscape():
+@pytest.mark.parametrize(
+    ("width", "height", "aspect_ratio"),
+    [(1344, 768, "16:9"), (21, 9, "21:9"), (4, 3, "4:3"), (1, 1, "1:1"), (3, 4, "3:4"), (768, 1344, "9:16")],
+)
+def test_h3_params_infer_supported_aspect_ratio_from_dimensions(width, height, aspect_ratio):
+    from comfyui_vllm_omni.utils.models import _minimaxh3_params_builder
+
     params = nodes.VLLMOmniMiniMaxH3Params().get_params(flow_shift=12.0, audio_flow_shift=3.0)[0]
-    assert params["aspect_ratio"] == "16:9"
+    assert "aspect_ratio" not in params
+    fields = _minimaxh3_params_builder(params, extra_params={"task": "t2va"}, width=width, height=height)
+    assert "aspect_ratio" not in fields
+    assert json.loads(fields["extra_params"])["aspect_ratio"] == aspect_ratio

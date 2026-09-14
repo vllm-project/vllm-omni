@@ -148,6 +148,50 @@ class OmniServeCommand(CLISubcommand):
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
+        # Require an explicit model under --omni. ``args.model`` always carries
+        # vLLM's ModelConfig default (``Qwen/Qwen3-0.6B``), so an omit is silent:
+        # the default text LLM is routed into the diffusion stage and startup
+        # crashes deep in the diffusion worker with a confusing registry error.
+        # Fail fast instead.
+        #
+        # The model must come from the CLI -- positionally
+        # (``vllm serve <model> --omni``) or via ``--model``. A deploy YAML
+        # (``--deploy-config``) is NOT a model source: it carries per-stage
+        # engine args only, and the checkpoint is always threaded in from
+        # ``args.model`` (see
+        # ``load_and_resolve_stage_configs``, which takes ``model`` as its first
+        # argument). Treating its mere presence as "model provided" let
+        # ``vllm serve --omni --deploy-config <cfg>`` slip through with the
+        # default model and reproduce the very crash this guard prevents. See
+        # https://github.com/vllm-project/vllm-omni/issues/4158.
+        if getattr(args, "omni", False):
+            explicit_keys = getattr(args, "explicit_keys", None) or frozenset()
+            # Resolve the model the user actually supplied on the CLI. A
+            # positional ``model_tag`` takes precedence (``cmd`` later copies it
+            # onto ``args.model``); otherwise ``--model`` counts only when it was
+            # explicitly passed. An empty/whitespace value (e.g. ``--model
+            # "$MODEL"`` with ``MODEL`` unset) is treated as "not provided" so it
+            # fails here with a clear message instead of the same confusing
+            # downstream crash.
+            model_tag = getattr(args, "model_tag", None)
+            if model_tag is not None:
+                explicit_model = model_tag
+            elif "model" in explicit_keys:
+                explicit_model = getattr(args, "model", None)
+            else:
+                explicit_model = None
+            model_provided = explicit_model is not None and str(explicit_model).strip() != ""
+            if not model_provided:
+                raise ValueError(
+                    "`vllm serve --omni` requires an explicit model. Pass it "
+                    "positionally (`vllm serve <model> --omni`) or via `--model`. "
+                    "`--deploy-config` carries per-stage engine args only and "
+                    "does not supply a model; without an "
+                    "explicit model, vLLM's default (Qwen/Qwen3-0.6B) is selected "
+                    "and routed into the diffusion stage, which fails with a "
+                    "confusing diffusion-registry error."
+                )
+
         # --omni-replica-address is only consulted in run_headless(); reject it
         # on the head so a misconfigured launch fails loudly instead of being
         # silently ignored.
@@ -725,6 +769,13 @@ class OmniServeCommand(CLISubcommand):
             dest="enable_multithread_weight_load",
             default=True,
             help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
+        )
+        omni_config_group.add_argument(
+            "--enable-broadcast-weight-load",
+            action="store_true",
+            dest="enable_broadcast_weight_load",
+            default=False,
+            help="Enable Rank-0 shared weight broadcast across workers for HSDP (default: disabled).",
         )
         omni_config_group.add_argument(
             "--num-weight-load-threads",

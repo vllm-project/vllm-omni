@@ -80,6 +80,11 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("POST", "/v1/realtime/sessions"),
+    ("POST", "/v1/realtime/sessions/{session_id}/step"),
+    ("POST", "/v1/realtime/sessions/{session_id}/reset"),
+    ("POST", "/v1/realtime/sessions/{session_id}/close"),
+    ("GET", "/v1/realtime/sessions/{session_id}/status"),
     ("GET", "/health"),
     ("GET", "/v1/models"),
     ("POST", "/v1/images/generations"),
@@ -120,6 +125,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_serving_realtime_robot",
+    "rl_rollout_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -151,12 +157,14 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_serving_realtime",
     "openai_serving_video",
     "openai_serving_realtime_robot",
+    "rl_rollout_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
 _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
+    "rl_rollout_serving",
 }
 _MULTISTAGE_MUST_BE_WIRED = _MULTISTAGE_APP_STATE_KEYS - _MULTISTAGE_MUST_BE_NONE
 

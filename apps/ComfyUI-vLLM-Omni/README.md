@@ -49,6 +49,7 @@ This extension offers the following nodes based on the output modalities (at **C
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
+- **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
 
@@ -56,6 +57,20 @@ This extension also offers example workflows (at **ComfyUI sidebar -> Templates 
 
 > [!NOTE]
 > The node UI and feature designs are intended to match vLLM-Omni online serving interfaces. It cannot offer more than what the interfaces support.
+
+Every node carries the vLLM-Omni mark in its title bar and is tinted by what it outputs, so a graph is readable at a glance:
+
+| Colour | Nodes | What they produce |
+| --- | --- | --- |
+| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
+| Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
+| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Teal | Video References | Reference media |
+
+Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
+
+**Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
 
 To build a simple workflow yourself,
 
@@ -130,7 +145,41 @@ Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Vide
 for remote video generation with audio. It includes connected base presets and
 optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
 [workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
-settings, and saved-video validation, including the shared audio prerequisite.
+settings, and saved-video/audio validation.
+
+#### FastH3 text-to-video
+
+FastH3 is fused into MiniMax-H3 when the vLLM-Omni server starts; it is not a request-switchable LoRA. Download one adapter variant and start a non-offloaded FL2VA server. For the Dense / Data-Free profile:
+
+```bash
+export FASTH3_DIR=/path/to/fasth3
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
+
+vllm serve /path/to/MiniMax-H3 \
+  --omni \
+  --task-type fl2va \
+  --lora-path "${FASTH3_DIR}/dense-datafree/adapter_model.safetensors" \
+  --port 8000
+```
+
+For the VSA / Data-Free profile, download `vsa-datafree/adapter_model.safetensors`, use that file as `--lora-path`, and add:
+
+```bash
+--diffusion-attention-backend FASTVIDEO_VSA \
+--fastvideo-vsa-topk 64
+```
+
+The VSA profile also requires a compatible `fastvideo-kernel` installation. See the [MiniMax-H3 FastH3 recipe](../../recipes/MiniMaxAI/MiniMax-H3.md#fasth3-adapter) for the full serving contract, supported parallel layouts, and kernel requirements.
+
+Open the **vLLM-Omni FastH3 Text to Video** template, then:
+
+- Set the server URL and served model name on **FastH3 Deployment**.
+- Connect its output to **Generate Video → fast_h3**. When connected, the deployment node's URL and model take precedence over the corresponding Generate Video widgets.
+- Keep `frame`, `references`, **LoRA**, and **MiniMax-H3 Video Params** disconnected. FastH3 Preview v1 supports T2VA only, is already fused, and owns both flow shifts.
+- A connected **Diffusion Sampling Params** node may set seed and other ordinary sampling options. The integration always enforces four denoising steps and 24 FPS for FastH3.
+
+The node records which server the workflow targets; it does not start one, nor switch adapters or attention backends on a running server.
 
 ### TTS (e.g., Qwen TTS series)
 
@@ -160,6 +209,8 @@ settings, and saved-video validation, including the shared audio prerequisite.
 ## Develop
 
 Follow the [development convention and rules of vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/).
+
+Node tints and the title-bar mark are applied in `web/main.js`, keyed off each node's declared output types rather than a list of node names. A new node that returns an existing type is themed with no front-end change; a new output type needs one entry in `FAMILY_BY_OUTPUT` there.
 
 ## Limitation and Non-Goals
 

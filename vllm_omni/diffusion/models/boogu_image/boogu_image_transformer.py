@@ -31,10 +31,17 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+)
 from vllm_omni.diffusion.models.utils import make_attention_mask
 from vllm_omni.platforms import current_omni_platform
 
@@ -43,7 +50,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-RotaryEmbedding = tuple[torch.Tensor, torch.Tensor]
+# (cos, sin) — optionally (cos, sin, packed_table) where packed_table is the
+# fp32 [tokens, head_dim] = [cos(theta) | sin(theta)] layout the fused
+# qk-norm+RoPE op consumes; the eager path ignores the third element.
+RotaryEmbedding = tuple[torch.Tensor, ...]
 RotaryFrequencyTables = list[RotaryEmbedding]
 
 
@@ -56,9 +66,12 @@ def apply_rotary_emb(x: torch.Tensor, rotary_emb: RotaryEmbedding) -> torch.Tens
 
     Args:
         x: Query or key tensor of shape [B, S, H, D].
-        rotary_emb: Cosine and sine tensors, each shaped [B, S, D].
+        rotary_emb: Cosine and sine tensors, each shaped [B, S, D]. The tuple
+            may carry a third element (the packed table for the fused
+            qk-norm+RoPE path); it is ignored here, hence the indexed access
+            instead of tuple unpacking.
     """
-    freqs_cos, freqs_sin = rotary_emb
+    freqs_cos, freqs_sin = rotary_emb[0], rotary_emb[1]
     freqs_cos = freqs_cos.unsqueeze(2)
     freqs_sin = freqs_sin.unsqueeze(2)
 
@@ -71,6 +84,87 @@ def apply_rotary_emb(x: torch.Tensor, rotary_emb: RotaryEmbedding) -> torch.Tens
     sin = freqs_sin[..., ::2]
     x_out = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(3)
     return x_out.type_as(x)
+
+
+# The fused qk-norm+RoPE path is always on where the fast path exists; on
+# other platforms the eager chain below is the behaviour-identical fallback.
+_FUSED_QK_NORM_ROPE = HAS_TRITON and current_platform.is_cuda()
+
+# Boogu's default for the fused-path token gate: fuse only when a rotary table
+# spans at least this many positions (counted as B*S). Below the crossover a
+# request is host-bound and the fused path's per-call Python launch (custom-op
+# impl + Triton launcher) can cost more end-to-end than the kernel saves.
+# Measured on one H200: on the pre-#6871 main, 512^2 (1.1k tokens) paid
+# +191 ms/request and the crossover sat at ~2,350 tokens; on the current main
+# the 512^2 family measures as noise (+/-25 ms, sign-inconsistent) while
+# >=768^2 (2.3k tokens) gains. The crossover is host-dependent — re-benchmark
+# on your hardware and override with VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS
+# (0 = always fuse); see fused_qk_norm_rope_min_tokens().
+_FUSED_MIN_TOKENS = 2048
+
+
+def _with_packed_rope_table(rotary_emb: RotaryEmbedding) -> RotaryEmbedding:
+    """Append the packed fp32 table the fused qk-norm+RoPE op consumes.
+
+    ``freqs_cos``/``freqs_sin`` are theta-repeat-interleaved ``[B, S, D]``
+    (``cos[2i] == cos[2i+1] == cos(theta_i)``), so taking every even column
+    yields the theta-width halves and the packed table is
+    ``[B*S, D] = [cos(theta) | sin(theta)]``. Tables spanning fewer positions
+    (counted as ``B*S``) than the token gate — Boogu's ``_FUSED_MIN_TOKENS``
+    default, overridable through ``VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS``
+    (``0`` = always fuse) — are returned unchanged: without the third element
+    every consumer stays on the eager chain (this also keeps short tables like
+    the context refiner's off the fused path).
+    """
+    freqs_cos, freqs_sin = rotary_emb[0], rotary_emb[1]
+    if freqs_cos.shape[0] * freqs_cos.shape[1] < fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS):
+        return rotary_emb
+    packed = torch.cat((freqs_cos[..., ::2], freqs_sin[..., ::2]), dim=-1)
+    return freqs_cos, freqs_sin, packed.reshape(-1, freqs_cos.shape[-1]).float()
+
+
+def _qk_norm_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    norm_q,
+    norm_k,
+    rotary_emb: RotaryEmbedding | None,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-head Q/K RMSNorm + RoPE + cast, fused into one kernel launch when
+    a packed rope table is present; otherwise the original eager chain."""
+    # Gate on the op's own fast-path predicate: when the fused CUDA kernel
+    # cannot run (dtype, device, or geometry outside even
+    # rotary_dim <= head_dim <= 256), the original chain below must be used
+    # bit-exactly rather than the op's internal eager fallback, whose rounding
+    # differs from vLLM's RMSNorm by one ulp on a fraction of elements.
+    if (
+        rotary_emb is not None
+        and len(rotary_emb) > 2
+        and rotary_emb[2] is not None
+        and _fused_cuda_supported(query, key, query.shape[-1], query.shape[-1], interleaved=True)
+    ):
+        batch, seq_len, num_heads, head_dim = query.shape
+        num_kv_heads = key.shape[2]
+        fused_q, fused_k = fused_qk_norm_rope(
+            query.view(batch * seq_len, num_heads, head_dim),
+            key.view(batch * seq_len, num_kv_heads, head_dim),
+            norm_q.weight,
+            norm_k.weight,
+            rotary_emb[2],
+            norm_q.variance_epsilon,
+            interleaved=True,
+        )
+        return (
+            fused_q.view(batch, seq_len, num_heads, head_dim),
+            fused_k.view(batch, seq_len, num_kv_heads, head_dim),
+        )
+    query = norm_q(query)
+    key = norm_k(key)
+    if rotary_emb is not None:
+        query = apply_rotary_emb(query, rotary_emb)
+        key = apply_rotary_emb(key, rotary_emb)
+    return query.to(dtype), key.to(dtype)
 
 
 def swiglu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -559,13 +653,7 @@ class BooguImageSelfAttention(nn.Module):
         key = key.unflatten(-1, (self.num_local_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_local_kv_heads, self.head_dim))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        if rotary_emb is not None:
-            query = apply_rotary_emb(query, rotary_emb)
-            key = apply_rotary_emb(key, rotary_emb)
-        query, key = query.to(dtype), key.to(dtype)
+        query, key = _qk_norm_rope(query, key, self.norm_q, self.norm_k, rotary_emb, dtype)
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         attn_output = self.attn(query, key, value, attn_metadata)
@@ -711,13 +799,7 @@ class BooguImageJointAttention(nn.Module):
         key = key.view(batch_size, -1, self.num_local_kv_heads, self.head_dim)
         value = value.view(batch_size, -1, self.num_local_kv_heads, self.head_dim)
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        if rotary_emb is not None:
-            query = apply_rotary_emb(query, rotary_emb)
-            key = apply_rotary_emb(key, rotary_emb)
-        query, key = query.to(dtype), key.to(dtype)
+        query, key = _qk_norm_rope(query, key, self.norm_q, self.norm_k, rotary_emb, dtype)
 
         attn_metadata = AttentionMetadata(attn_mask=joint_attention_mask) if joint_attention_mask is not None else None
         attn_output = self.attn(query, key, value, attn_metadata)
@@ -1449,6 +1531,11 @@ class BooguImageTransformer2DModel(nn.Module):
                     shift += ref_img_len
                     idx += 1
 
+            if _FUSED_QK_NORM_ROPE:
+                # The rebuilt per-reference-image tuple needs its own packed
+                # table; the forward-level tuples do not flow into this batch.
+                batch_ref_img_rotary_emb = _with_packed_rope_table(batch_ref_img_rotary_emb)
+
             for layer in self.ref_image_refiner:
                 batch_ref_image_hidden_states = layer(
                     batch_ref_image_hidden_states, batch_ref_img_mask, batch_ref_img_rotary_emb, batch_temb
@@ -1533,6 +1620,17 @@ class BooguImageTransformer2DModel(nn.Module):
             img_sizes,
             device,
         )
+
+        if _FUSED_QK_NORM_ROPE:
+            # One packed [cos|sin] table per rotary embedding that reaches an
+            # attention, built once per forward; the tuples grow a third
+            # element that the fused path consumes and the eager path ignores.
+            # (ref_img_rotary_emb is packed inside img_patch_embed_and_refine,
+            # on the rebuilt per-reference-image batch tuple.)
+            context_rotary_emb = _with_packed_rope_table(context_rotary_emb)
+            noise_rotary_emb = _with_packed_rope_table(noise_rotary_emb)
+            rotary_emb = _with_packed_rope_table(rotary_emb)
+            combined_img_rotary_emb = _with_packed_rope_table(combined_img_rotary_emb)
 
         # Context refinement.
         for layer in self.context_refiner:
