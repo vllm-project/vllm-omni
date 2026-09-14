@@ -4,6 +4,7 @@
 import pytest
 
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.endpoint_policy import OmniServingCapability
 from vllm_omni.config.stage_config import StageExecutionType, load_deploy_config
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
@@ -40,6 +41,16 @@ def test_mammothmoda2_deploy_does_not_shadow_request_sampling_fields() -> None:
     deploy = load_deploy_config(get_deploy_config_path("mammoth_moda2.yaml"))
 
     assert deploy.stages[1].default_sampling_params is None
+
+
+def test_mammothmoda2_rejects_unsupported_image_edits() -> None:
+    restrictions = {
+        restriction.capability: restriction.reason for restriction in MAMMOTH_MODA2_PIPELINE.endpoint_restrictions
+    }
+
+    assert set(restrictions) == {OmniServingCapability.IMAGE_EDITS}
+    assert "img2img" in restrictions[OmniServingCapability.IMAGE_EDITS]
+    assert MAMMOTH_MODA2_AR_PIPELINE.endpoint_restrictions == ()
 
 
 def test_mammothmoda2_ar_only_topology_is_unchanged() -> None:

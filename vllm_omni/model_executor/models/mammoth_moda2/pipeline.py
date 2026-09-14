@@ -8,6 +8,7 @@ Stage 1: DiT — latent → image
 For text/image understanding tasks (text output only), use MAMMOTH_MODA2_AR_PIPELINE.
 """
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -21,6 +22,13 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
     default_deploy_config_name="mammoth_moda2.yaml",
     model_arch="MammothModa2ForConditionalGeneration",
     hf_architectures=("Mammothmoda2Model", "MammothModa2ForConditionalGeneration"),
+    endpoint_restrictions=(
+        EndpointRestriction(
+            OmniServingCapability.IMAGE_EDITS,
+            "MammothModa2 image editing (img2img) is not supported. "
+            "Use /v1/images/generations for text-to-image requests.",
+        ),
+    ),
     stages=(
         StagePipelineConfig(
             stage_id=0,
