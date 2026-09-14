@@ -1003,16 +1003,31 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     ) -> None:
         """Hand one delivered async output to its waiter. Caller holds ``_futures_lock``.
 
+        * id already recorded as dropped -> discard the tensors: a
+          ``wait_output_ready`` observed a cancelled waiter and evicted it
+          into the dropped-id LRU before this delivery, so caching would
+          break the "every late wait on a dropped id fails the same way"
+          contract;
         * no waiter registered -> cache for a later ``wait_output_ready()``;
         * :class:`_DropPlaceholder` (request aborted) -> discard the tensors:
           terminate the placeholder with an error so a caller that already
           reused it via ``wait_output_ready()`` wakes up, and remember the id
           (bounded) so a later wait fails fast instead of hanging;
         * genuine pending waiter -> resolve it directly, never cache;
-        * waiter already cancelled/done -> discard, do not re-cache.
+        * waiter already cancelled/done -> discard the tensors and record the
+          id as dropped so a later wait fails fast instead of hanging.
         """
         pending = self._output_futures.pop(async_output_id, None)
         if pending is None:
+            if async_output_id in self._dropped_output_ids:
+                # Timeline-B: wait_output_ready has already observed a
+                # cancelled/done stale entry and moved this id into the
+                # dropped-id LRU. Late OUTPUT_READY must not repopulate
+                # _completed_outputs — a subsequent wait_output_ready would
+                # otherwise pop a successful Future and violate the dropped
+                # contract.
+                self._dropped_output_ids.move_to_end(async_output_id)
+                return
             fut: concurrent.futures.Future = concurrent.futures.Future()
             if exc is not None:
                 fut.set_exception(exc)

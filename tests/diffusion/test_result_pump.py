@@ -788,6 +788,59 @@ class TestDropOutput:
             assert "aid-stale" not in executor._output_futures
             assert "aid-stale" in executor._dropped_output_ids
 
+    def test_pump_after_cancelled_waiter_then_wait_stays_dropped(self):
+        """Timeline-B: the cancelled-waiter has already been observed by a
+        second wait_output_ready and evicted into the dropped-id LRU, THEN the
+        pump delivers OUTPUT_READY.
+
+        Without a dropped-id guard in _finish_output, the pump's ``pending``
+        is ``None`` (the second wait already popped the stale entry), so the
+        no-waiter branch caches the tensors in ``_completed_outputs``. A
+        subsequent wait_output_ready then pops that cache and returns a
+        successful Future — violating the "every late wait on a dropped id
+        fails the same way" contract from wait_output_ready.
+        """
+        executor = _make_executor()
+
+        # (1) step_streaming registers a real waiter.
+        real = executor.wait_output_ready("aid-tb")
+        assert not real.done()
+
+        # (2) asyncio cancels it.
+        assert real.cancel()
+
+        # (3) Second wait_output_ready observes the stale entry, evicts it into
+        # the dropped-id LRU and returns an already-failed Future.
+        first_late = executor.wait_output_ready("aid-tb")
+        assert first_late.done()
+        with pytest.raises(RuntimeError, match="was dropped"):
+            first_late.result(timeout=0)
+        with executor._futures_lock:
+            assert "aid-tb" not in executor._output_futures
+            assert "aid-tb" in executor._dropped_output_ids
+
+        # (4) Pump delivers OUTPUT_READY for the dropped id AFTER the LRU
+        # record is already in place.
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="aid-tb",
+            output=DiffusionOutput(output="late-after-evict"),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        # (5) The tensors must NOT be cached, and the id must remain in the LRU.
+        with executor._futures_lock:
+            assert "aid-tb" not in executor._completed_outputs
+            assert "aid-tb" not in executor._output_futures
+            assert "aid-tb" in executor._dropped_output_ids
+
+        # (6) A subsequent wait_output_ready must still fail fast, NOT pop a
+        # successful cached Future.
+        second_late = executor.wait_output_ready("aid-tb")
+        assert second_late.done()
+        with pytest.raises(RuntimeError, match="was dropped"):
+            second_late.result(timeout=0)
+
     def test_batch_split_drop_placeholder_discards_member(self):
         """_deliver_batch_split applies the same contract: a dropped member is
         discarded (never cached), a live member is resolved directly."""
