@@ -191,7 +191,7 @@ def main():
     report["checks"].update(
         requested_width=generated_video["width"] == requested["width"],
         requested_height=generated_video["height"] == requested["height"],
-        requested_frame_count=int(generated_video["nb_frames"]) == requested["num_frames"],
+        requested_frame_count=int(generated_video["nb_frames"]) == round(requested["duration"] * requested["fps"]),
     )
     cached_nodes = {
         str(node_id)

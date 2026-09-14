@@ -47,6 +47,12 @@
           "type": "VIDEO_PARAMS",
           "shape": 7,
           "link": 10
+        },
+        {
+          "name": "fast_h3",
+          "type": "FASTH3_DEPLOYMENT",
+          "shape": 7,
+          "link": null
         }
       ],
       "outputs": [
@@ -70,7 +76,7 @@
         1344,
         768,
         24,
-        124
+        5.167
       ]
     },
     {
@@ -357,8 +363,7 @@
       },
       "widgets_values": [
         3.0,
-        6.0,
-        "16:9"
+        6.0
       ]
     },
     {
@@ -515,7 +520,7 @@
         "Node name for S&R": "Note"
       },
       "widgets_values": [
-        "WF-07: remote H3 generation -> frame upscale -> original FPS + audio -> MP4.\nConfigure the remote URL and a server-side Turbo path. The relative LoRA path is resolved on the vLLM-Omni server.\nThis preset: FL2VA server, LightX2V v1.0 768p Turbo, 5 sigma points, video shift 6, audio shift 3; 124 frames at 24 FPS.\nBase H3: disconnect LoRA, set steps to 50 and video shift to 12.\nRequires the audio-preserving MP4 decoder (PR #6782 or equivalent), the H3 aspect_ratio field, and RealESRGAN_x2plus.pth in ComfyUI models/upscale_models."
+        "WF-07: remote H3 generation -> frame upscale -> original FPS + audio -> MP4.\nConfigure the remote URL and a server-side Turbo path. The relative LoRA path is resolved on the vLLM-Omni server.\nThis preset: FL2VA server, LightX2V v1.0 768p Turbo, 5 sigma points, video shift 6, audio shift 3; 5.167 seconds -> 124 frames at 24 FPS.\nBase H3: disconnect LoRA, set steps to 50 and video shift to 12.\nRequires ComfyUI-vLLM-Omni with PR #7456 (duration input, automatic H3 aspect ratio, audio decode fix), and RealESRGAN_x2plus.pth in ComfyUI models/upscale_models."
       ]
     }
   ],
