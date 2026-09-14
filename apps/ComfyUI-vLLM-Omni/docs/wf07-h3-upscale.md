@@ -19,15 +19,24 @@ The preset requests 1344×768, 124 frames, 24 FPS. The graph connects the genera
 
 GPU placement and offload belong to the server command, not to local H3 loader nodes. Use the official recipe for a profile suitable for your hardware. The worktree test's exact environment, startup arguments and real-model results are recorded separately with its evidence.
 
-## Exact validation commands
+## End-to-end validation
 
-From the vLLM-Omni checkout, with its test dependencies installed:
+The pytest case runs the supplied workflow against live ComfyUI and H3 services, waits for generation and upscale, downloads both MP4s, and checks the saved media. It does not mock generation, ComfyUI nodes, or media conversion. NumPy, SciPy, ffmpeg and ffprobe must be available to the test environment.
+
+From the vLLM-Omni checkout, with both services configured as above:
 
 ```bash
-python -m pytest tests/e2e/features/comfyui/test_minimax_h3_upscale.py -q
+COMFYUI_URL=http://127.0.0.1:8188 \
+VLLM_OMNI_URL=http://127.0.0.1:8091/v1 \
+WF07_LORA_PATH=models/minimax-h3-turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
+WF07_OUTPUT_DIR=wf07-evidence \
+python -m pytest tests/e2e/features/comfyui/test_minimax_h3_upscale.py \
+  -m 'core_model and diffusion and gpu' --run-level core_model -v -s
 ```
 
-With ComfyUI and the real H3 service running, and NumPy, SciPy, ffmpeg and ffprobe available:
+The test selects a new seed for each run and records it with the submitted graph. Set `WF07_SEED` to reproduce a particular request. An identical request may hit ComfyUI's cache; the test fails if the remote generation node was cached. If either service URL is unset, pytest skips the case rather than treating it as a completed E2E run. This case requires separately provisioned ComfyUI and H3 services; the default Buildkite jobs do not provision them.
+
+The same runner can be invoked directly:
 
 ```bash
 python apps/ComfyUI-vLLM-Omni/scripts/validate_h3_upscale.py \
@@ -35,10 +44,10 @@ python apps/ComfyUI-vLLM-Omni/scripts/validate_h3_upscale.py \
   --server-url http://127.0.0.1:8091/v1 \
   --model MiniMaxAI/MiniMax-H3 \
   --lora-path models/minimax-h3-turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
-  --output-dir wf07-evidence
+  --seed 20260914 --output-dir wf07-evidence
 ```
 
-The script records the submitted graph, ComfyUI history, generated and upscaled MP4s, their hashes, and `validation.json`. It checks dimensions, frame count, 24 FPS, duration, audio presence, sample rate/channels, and audio alignment before and after upscale. These checks measure preservation of the generated timing and soundtrack; they do not score the model's visual quality or its semantic audio-to-action synchronization.
+The runner records the submitted graph, ComfyUI history, generated and upscaled MP4s, their hashes, and `validation.json`. It checks dimensions, frame count, 24 FPS, duration, audio presence, sample rate/channels, and audio alignment before and after upscale. These checks measure preservation of the generated timing and soundtrack; they do not score visual quality or semantic audio-to-action synchronization. The request also stores the UI graph in ComfyUI history so the recorded run can be opened with its settings and outputs.
 
 ## Recorded runtime configuration
 

@@ -134,6 +134,7 @@ def main():
     parser.add_argument("--server-url", default="http://127.0.0.1:8091/v1")
     parser.add_argument("--model", default="MiniMaxAI/MiniMax-H3")
     parser.add_argument("--lora-path", help="Path as seen by the remote vLLM-Omni server")
+    parser.add_argument("--seed", type=int, help="Override the sampling seed to avoid cached generation")
     parser.add_argument("--output-dir", type=Path, default=Path("wf07-evidence"))
     parser.add_argument("--timeout", type=int, default=7200)
     args = parser.parse_args()
@@ -143,9 +144,21 @@ def main():
     graph["1"]["inputs"].update(url=args.server_url, model=args.model)
     if args.lora_path:
         graph["9"]["inputs"]["local_path"] = args.lora_path
+    if args.seed is not None:
+        graph["8"]["inputs"]["seed"] = args.seed
+    # Keep the UI graph with the API request so ComfyUI history can load this exact run.
+    workflow = json.loads(template.with_name("vLLM-Omni MiniMax H3 Video Upscale.json").read_text())
+    ui_nodes = {str(node["id"]): node for node in workflow["nodes"]}
+    ui_nodes["1"]["widgets_values"][:2] = [args.server_url, args.model]
+    ui_nodes["8"]["widgets_values"][6] = graph["8"]["inputs"]["seed"]
+    ui_nodes["9"]["widgets_values"][0] = graph["9"]["inputs"]["local_path"]
     # These IDs are the two SaveVideo outputs in the shipped WF-07 template.
     output_nodes = {"generated": "10", "upscaled": "6"}
-    payload = {"prompt": graph, "client_id": str(uuid.uuid4())}
+    payload = {
+        "prompt": graph,
+        "client_id": str(uuid.uuid4()),
+        "extra_data": {"extra_pnginfo": {"workflow": workflow}},
+    }
     (args.output_dir / "submitted_prompt.json").write_text(json.dumps(payload, indent=2))
     started = time.monotonic()
     submitted = request(args.comfy_url.rstrip("/") + "/prompt", payload)
@@ -180,6 +193,14 @@ def main():
         requested_height=generated_video["height"] == requested["height"],
         requested_frame_count=int(generated_video["nb_frames"]) == requested["num_frames"],
     )
+    cached_nodes = {
+        str(node_id)
+        for event, details in history["status"]["messages"]
+        if event == "execution_cached"
+        for node_id in details["nodes"]
+    }
+    # Loading an upscale model from cache is fine; reusing generated video is not an E2E run.
+    report["checks"]["remote_generation_executed"] = "1" not in cached_nodes
     report["passed"] = all(report["checks"].values())
     report.update(
         prompt_id=prompt_id,
