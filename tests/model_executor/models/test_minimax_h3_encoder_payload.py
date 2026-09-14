@@ -22,8 +22,11 @@ def test_pipeline_owns_three_encoders_then_dit_and_decoders() -> None:
 
     encoder, diffusion = MINIMAX_H3_PIPELINE.stages
     assert encoder.model_arch == "MiniMaxH3Encoder"
-    assert encoder.custom_process_next_stage_input_func is None
+    assert encoder.custom_process_next_stage_input_func == (
+        "vllm_omni.model_executor.stage_input_processors.minimax_h3.encoder2diffusion_full_payload"
+    )
     assert diffusion.model_arch == "MiniMaxH3Pipeline"
+    assert diffusion.stage_input_payload_keys == ("encoder_output",)
     assert diffusion.requires_multimodal_data is False
     assert diffusion.requires_full_payload_input is False
 

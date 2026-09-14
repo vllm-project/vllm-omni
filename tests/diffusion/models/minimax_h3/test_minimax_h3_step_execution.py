@@ -111,6 +111,8 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     pipeline.load_text_encoder = False
+    # Step fixtures consume the complete encoder handoff, not local VAE inputs.
+    pipeline.load_vae_encoder = False
     pipeline.transformer = model
     pipeline.device = torch.device("cpu")
     pipeline._transformer_for_task = lambda task: model
@@ -314,7 +316,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_prepare_encoder_conditioning_inputs",
-        lambda self, value, sampling: context,
+        lambda self, value, sampling: context if value is conditioning else pytest.fail("wrong encoder handoff"),
     )
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
