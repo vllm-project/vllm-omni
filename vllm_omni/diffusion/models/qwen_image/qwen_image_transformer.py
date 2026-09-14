@@ -653,23 +653,15 @@ class QwenImageCrossAttention(nn.Module):
         txt_query = self.norm_added_q(txt_query)
         txt_key = self.norm_added_k(txt_key)
 
-        if img_query.device.type == "cuda":
-            img_query = _apply_qwen_image_rotary_emb(img_query, vid_freqs)
-            img_key = _apply_qwen_image_rotary_emb(img_key, vid_freqs)
-            txt_query = _apply_qwen_image_rotary_emb(txt_query, txt_freqs)
-            txt_key = _apply_qwen_image_rotary_emb(txt_key, txt_freqs)
-        else:
-            # Retain the platform-specific kernels on other accelerators,
-            # which may not support complex tensors.
-            img_cos = torch.real(vid_freqs).to(img_query.dtype)
-            img_sin = torch.imag(vid_freqs).to(img_query.dtype)
-            txt_cos = torch.real(txt_freqs).to(txt_query.dtype)
-            txt_sin = torch.imag(txt_freqs).to(txt_query.dtype)
+        img_cos = torch.real(vid_freqs).to(img_query.dtype)
+        img_sin = torch.imag(vid_freqs).to(img_query.dtype)
+        txt_cos = torch.real(txt_freqs).to(txt_query.dtype)
+        txt_sin = torch.imag(txt_freqs).to(txt_query.dtype)
 
-            img_query = self.rope(img_query, img_cos, img_sin)
-            img_key = self.rope(img_key, img_cos, img_sin)
-            txt_query = self.rope(txt_query, txt_cos, txt_sin)
-            txt_key = self.rope(txt_key, txt_cos, txt_sin)
+        img_query = self.rope(img_query, img_cos, img_sin)
+        img_key = self.rope(img_key, img_cos, img_sin)
+        txt_query = self.rope(txt_query, txt_cos, txt_sin)
+        txt_key = self.rope(txt_key, txt_cos, txt_sin)
 
         seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)
