@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cache
+from operator import attrgetter
 from typing import TYPE_CHECKING
 
 from torch import nn
@@ -27,7 +28,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from .block_discovery import get_blocks_from_dit
 from .component_utils import get_encoder_block_groups, validate_on_demand_component
 from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, OffloadStrategy
-from .module_collector import ModuleDiscovery, PipelineModules
+from .module_collector import ModuleDiscovery
 from .offload_plan import OffloadPlan, get_offload_plan
 
 if TYPE_CHECKING:
@@ -76,6 +77,9 @@ class ResolvedComponent:
     selected: bool
     stacks: tuple[BlockStack, ...] = ()
     on_demand: bool = False
+    # Submodules of a DiT that are large enough to own their residency instead
+    # of staying resident with the rest of its non-block state.
+    children: tuple[ResolvedComponent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,15 +90,26 @@ class ResolvedOffloadPlan:
     encoders: tuple[ResolvedComponent, ...]
     vaes: tuple[ResolvedComponent, ...]
     residents: tuple[ResolvedComponent, ...]
-    # Raw discovery output and the model declaration remain reachable for the
-    # loader-owned mmap path and for DLO's nested-submodule staging, which
-    # still interpret topology themselves.
-    modules: PipelineModules
-    declaration: OffloadPlan | None = None
 
     @property
     def components(self) -> tuple[ResolvedComponent, ...]:
         return self.dits + self.encoders + self.vaes + self.residents
+
+
+# A DiT submodule this large owns its residency even when no plan declares it.
+_NESTED_OFFLOAD_THRESHOLD_MB = 1024
+_NESTED_BLOCK_ATTRS = ("layers", "blocks", "h", "model.layers")
+
+
+@cache
+def _warn_nested_block_scan(module_class: str, attr: str) -> None:
+    """Warn once per class that a nested block list was found by guessing."""
+    logger.warning(
+        "%s block list was discovered as %r by scanning well-known attribute names. "
+        "Declare it in OffloadPlan.offload_submodules; the attribute scan is deprecated.",
+        module_class,
+        attr,
+    )
 
 
 @cache
@@ -110,6 +125,77 @@ def _warn_legacy_discovery(pipeline_class: str) -> None:
         "_encoder_modules, and _vae_modules; the attribute scan is deprecated.",
         pipeline_class,
     )
+
+
+def _nested_block_stack(module: nn.Module, declared_attr: str | None) -> BlockStack | None:
+    """Resolve one DiT submodule's own block ring, if it has one."""
+    candidates = (declared_attr,) if declared_attr is not None else _NESTED_BLOCK_ATTRS
+    for attr in candidates:
+        try:
+            blocks = attrgetter(attr)(module)
+        except AttributeError:
+            continue
+        if isinstance(blocks, nn.ModuleList) and len(blocks) > 1:
+            if declared_attr is None:
+                _warn_nested_block_scan(type(module).__name__, attr)
+            return BlockStack(attrs=(attr,), blocks=tuple(blocks))
+    if declared_attr is not None:
+        logger.warning(
+            "OffloadPlan declared block attr %r for submodule %s but it is not a streamable block list",
+            declared_attr,
+            type(module).__name__,
+        )
+    return None
+
+
+def _resolve_dit_children(
+    dit_module: nn.Module,
+    dit_path: str,
+    stack: BlockStack,
+    declaration: OffloadPlan | None,
+    dit_module_ids: set[int],
+) -> tuple[ResolvedComponent, ...]:
+    """Resolve the DiT submodules that own their residency.
+
+    A submodule qualifies when the model declares it or when it is large enough
+    that keeping it resident would defeat streaming. Submodules that are
+    themselves discovered DiTs are left to their own component.
+    """
+    children: list[ResolvedComponent] = []
+    for name, module in dit_module.named_children():
+        if name in stack.attrs:
+            continue
+        declared_attr = None if declaration is None else declaration.offload_submodules.get(name)
+        if declared_attr is None and _module_size_mb(module) <= _NESTED_OFFLOAD_THRESHOLD_MB:
+            continue
+        path = f"{dit_path}.{name}"
+        if id(module) in dit_module_ids:
+            # Its own component owns this submodule; the parent must not place it.
+            children.append(ResolvedComponent(path=path, module=module, selected=False))
+            continue
+        nested_stack = _nested_block_stack(module, declared_attr)
+        if nested_stack is None:
+            # Without its own ring the submodule needs the pipeline lifecycle.
+            validate_on_demand_component(module, path)
+        children.append(
+            ResolvedComponent(
+                path=path,
+                module=module,
+                selected=True,
+                stacks=() if nested_stack is None else (nested_stack,),
+                on_demand=nested_stack is None,
+            )
+        )
+    return tuple(children)
+
+
+def _module_size_mb(module: nn.Module) -> float:
+    """Expected parameter bytes in MiB, including not-yet-loaded meta tensors.
+
+    Resolution precedes mmap materialization, so residency must depend on the
+    tensor metadata rather than whether the loader has allocated storage yet.
+    """
+    return sum(parameter.nelement() * parameter.element_size() for parameter in module.parameters()) / 1048576
 
 
 def _resolve_dit_stacks(
@@ -248,11 +334,25 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
     vaes: list[ResolvedComponent] = []
     residents: list[ResolvedComponent] = []
 
+    dit_module_ids = {id(module) for module in modules.dits}
     for path, module in zip(modules.dit_names, modules.dits):
         stacks: tuple[BlockStack, ...] = ()
+        children: tuple[ResolvedComponent, ...] = ()
         if dit_selected and layerwise:
             stacks = _resolve_dit_stacks(module, path, declaration, config, explicit=explicit)
-        dits.append(ResolvedComponent(path=path, module=module, selected=dit_selected, stacks=stacks))
+            # Only distributed layerwise offload streams or stages submodules;
+            # the ordinary backend keeps all non-block state resident.
+            if stacks and config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+                children = _resolve_dit_children(module, path, stacks[0], declaration, dit_module_ids)
+        dits.append(
+            ResolvedComponent(
+                path=path,
+                module=module,
+                selected=dit_selected,
+                stacks=stacks,
+                children=children,
+            )
+        )
 
     for path, module in zip(modules.encoder_names, modules.encoders):
         selected = config.should_offload_encoder(path, declaration)
@@ -302,8 +402,6 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
         encoders=tuple(encoders),
         vaes=tuple(vaes),
         residents=tuple(residents),
-        modules=modules,
-        declaration=declaration,
     )
     _validate_unique_ownership(resolved)
     return resolved
@@ -312,7 +410,10 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
 def _validate_unique_ownership(resolved: ResolvedOffloadPlan) -> None:
     """Reject topologies where two components would hook the same blocks."""
     owner_by_block: dict[int, str] = {}
-    for component in resolved.components:
+    pending = list(reversed(resolved.components))
+    while pending:
+        component = pending.pop()
+        pending.extend(reversed(component.children))
         for block in (block for stack in component.stacks for block in stack.blocks):
             owner = owner_by_block.setdefault(id(block), component.path)
             if owner != component.path:

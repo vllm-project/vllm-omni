@@ -73,10 +73,22 @@ Block topology comes from the pipeline `OffloadPlan` first: `block_attrs` maps
 each DiT path to its ordered block containers, `encoder_block_attrs` declares
 streamable encoder stacks, `on_demand_component_paths` marks pipeline-managed
 residency, `resident_dit_paths` marks the DiTs that may hold resident layers,
-and `encoder_dlo_weight_replication` marks the encoders whose loader-produced
-weights are safe for AllGather. DiTs absent from the plan fall back to
-`_layerwise_offload_blocks_attrs` (including the deprecated singular-name
-compatibility path).
+`encoder_dlo_weight_replication` marks the encoders whose loader-produced
+weights are safe for AllGather, and `offload_submodules` maps a DiT submodule
+that owns its residency to its own block container. DiTs absent from the plan
+fall back to `_layerwise_offload_blocks_attrs` (including the deprecated
+singular-name compatibility path).
+
+An undeclared DiT submodule joins the plan only when it is large enough that
+keeping it resident would defeat streaming; its block container is then found
+by scanning well-known attribute names, which warns once per submodule class.
+Size is computed from parameter shapes and dtypes, including meta parameters,
+so resolving before mmap loading preserves the same residency decision.
+Block ownership validation includes nested components: a block shared with a
+parent, sibling, or encoder is rejected before any hooks or storage are changed.
+A submodule with no block container must implement the `load_to_device` /
+`offload_to_cpu` lifecycle, and the resolver rejects it before any component of
+the pipeline is placed or hooked.
 
 The resolver is pure: it moves no tensor, installs no hook, writes no module
 attribute, and reads no process group — multi-rank facts come from
