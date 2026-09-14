@@ -20,7 +20,7 @@ PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 SMOKE_DEFAULT_SAMPLING_PARAMS = '{"0":{"num_frames":81,"num_inference_steps":2,"guidance_scale":3.0}}'
 
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": ["H100", "B200", "A100"]})
 
 
 def _get_server_cases(model: str):
