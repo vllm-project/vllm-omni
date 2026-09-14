@@ -30,6 +30,12 @@ from .schedulers import FlowMatchEulerDiscreteScheduler
 logger = init_logger(__name__)
 
 
+def _first_request_value(value: object) -> object:
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
 def get_mammoth_moda2_post_process_func(
     _od_config: OmniDiffusionConfig,
 ):
@@ -227,10 +233,15 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"Image size must be multiples of 16, got {height}x{width} for request {request_id}")
 
+        request_info = info if isinstance(info, dict) else {}
         extra_args = sampling.extra_args or {}
         guidance = extra_args.get("text_guidance_scale")
         if guidance is None:
-            guidance = sampling.guidance_scale if sampling.guidance_scale_provided else 9.0
+            guidance = sampling.guidance_scale if sampling.guidance_scale_provided else None
+        if guidance is None:
+            guidance = _first_request_value(request_info.get("text_guidance_scale"))
+        if guidance is None:
+            guidance = 9.0
         try:
             text_guidance_scale = float(guidance)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -238,6 +249,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         raw_num_inference_steps = extra_args.get("num_inference_steps")
         if raw_num_inference_steps is None:
             raw_num_inference_steps = sampling.num_inference_steps
+        if raw_num_inference_steps is None:
+            raw_num_inference_steps = _first_request_value(request_info.get("num_inference_steps"))
         if raw_num_inference_steps is None:
             raw_num_inference_steps = 50
         try:
@@ -247,6 +260,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         if num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive for request {request_id}")
         cfg_range = extra_args.get("cfg_range")
+        if cfg_range is None:
+            cfg_range = request_info.get("cfg_range")
         if cfg_range is None:
             cfg_range = [0.0, 1.0]
         if not isinstance(cfg_range, (list, tuple)) or len(cfg_range) != 2:

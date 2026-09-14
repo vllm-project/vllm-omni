@@ -51,6 +51,24 @@ def test_ar2diffusion_uses_prompt_dimension_fallbacks() -> None:
     assert (result["height"], result["width"]) == (256, 384)
 
 
+def test_ar2diffusion_preserves_request_level_sampling_fallbacks() -> None:
+    result = ar2diffusion(
+        [_source_output()],
+        {
+            "additional_information": {
+                "text_guidance_scale": [1.5],
+                "num_inference_steps": [3],
+                "cfg_range": [0.25, 0.75],
+            }
+        },
+    )
+
+    info = result["additional_information"]
+    assert info["text_guidance_scale"] == [1.5]
+    assert info["num_inference_steps"] == [3]
+    assert info["cfg_range"] == [0.25, 0.75]
+
+
 def test_ar2diffusion_unwraps_the_orchestrator_prompt_list() -> None:
     result = ar2diffusion(
         [_source_output()],

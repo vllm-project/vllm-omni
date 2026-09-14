@@ -79,5 +79,10 @@ def ar2diffusion(
             "full_hidden_states": full_hidden_states.float().contiguous(),
             "full_token_ids": full_token_ids,
             "answer_start_index": len(prompt_token_ids),
+            **{
+                key: additional[key]
+                for key in ("text_guidance_scale", "num_inference_steps", "cfg_range")
+                if key in additional
+            },
         },
     }

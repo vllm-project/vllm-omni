@@ -4,7 +4,7 @@
 """
 End-to-end test for MammothModa2 text-to-image generation.
 
-Verifies that the AR->DiT pipeline produces a valid image tensor. When an
+Verifies that the AR->DiT pipeline produces a valid PIL image. When an
 optional golden fixture is present, the test also compares fixed pixel samples;
 the portable golden/stability oracle remains tracked in #7090.
 
@@ -21,8 +21,10 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
@@ -101,7 +103,7 @@ def _sample_pixels(img_tensor: torch.Tensor) -> list[float]:
     return values
 
 
-def _iter_image_tensors(outputs: list[object]):
+def _iter_images(outputs: list[object]):
     """Yield images from shared diffusion ``OmniRequestOutput`` objects."""
     for out in outputs:
         ro_list = out if isinstance(out, list) else [out]
@@ -111,13 +113,18 @@ def _iter_image_tensors(outputs: list[object]):
                 yield from images
 
 
+def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1)
+
+
 @pytest.mark.cpu
 def test_diffusion_output_exposes_images_at_top_level():
-    image = torch.zeros((3, 16, 16))
+    image = Image.new("RGB", (16, 16), "black")
     output = OmniRequestOutput.from_diffusion(request_id="diffusion-test", images=[image])
 
     assert output.outputs == []
-    assert list(_iter_image_tensors([output])) == [image]
+    assert list(_iter_images([output])) == [image]
 
 
 @pytest.mark.slow
@@ -130,7 +137,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
 
     Verifies:
       - Omni pipeline initialises with the two-stage YAML config.
-      - DiT stage outputs an image tensor with the correct shape.
+      - DiT stage outputs one RGB PIL image at the requested size.
       - When the optional fixture exists, fixed pixel samples match its golden
         reference (regenerate with ``UPDATE_GOLDEN=1``).
     """
@@ -192,11 +199,12 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     assert len(outputs) > 0, "Pipeline produced no outputs"
 
     found_image = False
-    for img_tensor in _iter_image_tensors(outputs):
-        assert isinstance(img_tensor, torch.Tensor), f"Expected image tensor, got {type(img_tensor)}"
-        assert img_tensor.ndim in (3, 4), f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
+    for image in _iter_images(outputs):
+        assert isinstance(image, Image.Image), f"Expected PIL image, got {type(image)}"
+        assert image.mode == "RGB"
+        assert image.size == (width, height)
 
-        sampled = _sample_pixels(img_tensor)
+        sampled = _sample_pixels(_pil_to_tensor(image))
 
         if os.environ.get("UPDATE_GOLDEN"):
             _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -209,4 +217,4 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
 
         found_image = True
 
-    assert found_image, "No image tensor found in pipeline output"
+    assert found_image, "No PIL image found in pipeline output"

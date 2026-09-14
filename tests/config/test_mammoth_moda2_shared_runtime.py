@@ -3,7 +3,8 @@
 
 import pytest
 
-from vllm_omni.config.stage_config import StageExecutionType
+from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.stage_config import StageExecutionType, load_deploy_config
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
@@ -33,6 +34,12 @@ def test_mammothmoda2_dit_is_registered_only_with_diffusion_runtime() -> None:
         "MammothModa2DiTPipeline",
     )
     assert "MammothModa2DiTPipeline" not in _OMNI_MODELS
+
+
+def test_mammothmoda2_deploy_does_not_shadow_request_sampling_fields() -> None:
+    deploy = load_deploy_config(get_deploy_config_path("mammoth_moda2.yaml"))
+
+    assert deploy.stages[1].default_sampling_params is None
 
 
 def test_mammothmoda2_ar_only_topology_is_unchanged() -> None:

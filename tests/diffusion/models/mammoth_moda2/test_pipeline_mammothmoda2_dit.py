@@ -171,6 +171,35 @@ def test_parse_request_prefers_legacy_sampling_overrides() -> None:
     assert parsed.cfg_range == (0.0, 0.5)
 
 
+def test_parse_request_falls_back_to_request_level_sampling_values() -> None:
+    prompt = _batch().prompts[0]
+    prompt["additional_information"].update(
+        text_guidance_scale=[1.5],
+        num_inference_steps=[3],
+        cfg_range=[0.25, 0.75],
+    )
+
+    parsed = _pipeline_shell()._parse_request(_batch(prompt=prompt, sampling=OmniDiffusionSamplingParams()))
+
+    assert parsed.text_guidance_scale == 1.5
+    assert parsed.num_inference_steps == 3
+    assert parsed.cfg_range == (0.25, 0.75)
+
+
+def test_parse_request_standard_fields_precede_request_level_fallbacks() -> None:
+    prompt = _batch().prompts[0]
+    prompt["additional_information"].update(
+        text_guidance_scale=[1.5],
+        num_inference_steps=[3],
+    )
+    sampling = OmniDiffusionSamplingParams(guidance_scale=4.0, num_inference_steps=7)
+
+    parsed = _pipeline_shell()._parse_request(_batch(prompt=prompt, sampling=sampling))
+
+    assert parsed.text_guidance_scale == 4.0
+    assert parsed.num_inference_steps == 7
+
+
 def test_parse_request_rejects_multiple_requests_and_outputs() -> None:
     pipeline = _pipeline_shell()
     batch = _batch()
