@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import queue
@@ -97,9 +100,11 @@ class FakeAsyncOmniEngine:
     ) -> None:
         self.model = model
         self.config_path = None
-        self.stage_configs: list[Any] = []
         self.stage_metadata = stage_metadata or [THREE_STAGE_META[-1]]
         self.num_stages = len(self.stage_metadata)
+        self.stage_configs = [
+            StageConfig(stage_id=i, model_stage="dummy-model").to_omegaconf() for i in range(self.num_stages)
+        ]
         self.default_sampling_params_list = default_sampling_params_list or [
             SamplingParams(max_tokens=8) for _ in range(self.num_stages)
         ]
@@ -220,6 +225,25 @@ def test_resolve_sampling_params_list_preserves_stage_constraints():
     assert 42 in resolved[0]._all_stop_token_ids
     assert caller_params.detokenize is True
     assert caller_params.stop_token_ids == [7]
+
+
+@pytest.mark.parametrize("use_defaults", [False, True])
+def test_moss_local_output_policy_preserves_codec_streaming(use_defaults):
+    from vllm_omni.model_executor.models.moss_tts.pipeline import MOSS_TTS_LOCAL_PIPELINE
+
+    base = _make_base()
+    base.engine.num_stages = 2
+    base.sampling_constraints_list = [stage.sampling_constraints for stage in MOSS_TTS_LOCAL_PIPELINE.stages]
+    base.default_sampling_params_list = [
+        base._apply_sampling_constraints(SamplingParams(), constraints)
+        for constraints in base.sampling_constraints_list
+    ]
+    caller = [SamplingParams(output_kind=RequestOutputKind.DELTA) for _ in range(2)]
+    result = base.resolve_sampling_params_list(None if use_defaults else caller, allow_delta_coercion=True)
+
+    assert [params.output_kind for params in result] == [RequestOutputKind.FINAL_ONLY, RequestOutputKind.DELTA]
+    assert all(params.output_kind == RequestOutputKind.DELTA for params in caller)
+    assert base.default_sampling_params_list[0].output_kind == RequestOutputKind.FINAL_ONLY
 
 
 def _stage_spec(

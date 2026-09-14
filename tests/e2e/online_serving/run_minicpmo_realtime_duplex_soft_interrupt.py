@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Validate MiniCPM-o Realtime duplex soft-interrupt delta streaming.
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
@@ -21,9 +24,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
-AUDIO_DELTA_EVENTS = {"response.audio.delta", "response.output_audio.delta"}
+AUDIO_DELTA_EVENTS = {"response.output_audio.delta"}
 TRANSCRIPT_DELTA_EVENTS = {
-    "response.audio_transcript.delta",
+    "response.output_audio_transcript.delta",
     "response.output_text.delta",
 }
 

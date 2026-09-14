@@ -39,12 +39,15 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTA_PIPELINE,
     AUDEX_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
+from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
     BAGEL_SINGLE_STAGE_PIPELINE,
     BAGEL_THINK_PIPELINE,
 )
+from vllm_omni.model_executor.models.cosmos3.pipeline import COSMOS3_POLICY_PIPELINE
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dots_tts.pipeline import DOTS_TTS_PIPELINE
@@ -148,6 +151,11 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
+    # Cosmos3 policy checkpoints share HF metadata with the T2I/video Cosmos3
+    # checkpoints (which stay on the single-stage diffusion fallback), so this
+    # entry is only reachable through a deploy yaml's ``pipeline:`` key
+    # (see deploy/cosmos3_policy_droid.yaml).
+    "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
@@ -157,6 +165,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "dots_tts": DOTS_TTS_PIPELINE,
+    "auk": AUK_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
     "audex_tts": AUDEX_TTS_PIPELINE,
     "audex_tta": AUDEX_TTA_PIPELINE,
@@ -172,6 +181,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
+    "arktts": AUDIO8_TTS_PIPELINE,
     "ming_flash_omni": MING_FLASH_OMNI_PIPELINE,
     "ming_flash_omni_tts": MING_FLASH_OMNI_TTS_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,

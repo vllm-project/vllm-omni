@@ -1829,6 +1829,7 @@ class TestPreferModelSamplerNoneFallback:
             if _declares_prefer_model_sampler(p.read_text(encoding="utf-8", errors="ignore"))
         }
         expected = {
+            "audio8_tts",
             "cosyvoice3",
             "glm_tts",
             "higgs_audio_v2",

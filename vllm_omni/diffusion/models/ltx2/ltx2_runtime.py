@@ -65,27 +65,39 @@ from .ltx2_request import (
 logger = init_logger(__name__)
 
 
+@contextmanager
+def _deterministic_ltx_vocoder():
+    previous = torch.backends.cudnn.deterministic
+    try:
+        torch.backends.cudnn.deterministic = True
+        yield
+    finally:
+        torch.backends.cudnn.deterministic = previous
+
+
 def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
     """Run the BWE vocoder in FP32, matching the official LTX pipeline."""
-    if not hasattr(vocoder, "bwe_generator"):
-        return vocoder(generated_mel)
-
-    input_dtype = generated_mel.dtype
     device_type = generated_mel.device.type
-    module_dtype = next(vocoder.parameters()).dtype
-    if device_type == "mps":
-        if module_dtype != torch.float32:
-            vocoder.float()
-        try:
-            return vocoder(generated_mel.float()).to(input_dtype)
-        finally:
-            if module_dtype != torch.float32:
-                vocoder.to(module_dtype)
+    cudnn_context = _deterministic_ltx_vocoder() if device_type == "cuda" else nullcontext()
+    with cudnn_context:
+        if not hasattr(vocoder, "bwe_generator"):
+            return vocoder(generated_mel)
 
-    # BF16 errors compound through the BWE model's long convolution stack.
-    # FP32 autocast upcasts each op without materializing a second FP32 model.
-    with torch.autocast(device_type=device_type, dtype=torch.float32):
-        return vocoder(generated_mel.float()).to(input_dtype)
+        input_dtype = generated_mel.dtype
+        module_dtype = next(vocoder.parameters()).dtype
+        if device_type == "mps":
+            if module_dtype != torch.float32:
+                vocoder.float()
+            try:
+                return vocoder(generated_mel.float()).to(input_dtype)
+            finally:
+                if module_dtype != torch.float32:
+                    vocoder.to(module_dtype)
+
+        # BF16 errors compound through the BWE model's long convolution stack.
+        # FP32 autocast upcasts each op without materializing a second FP32 model.
+        with torch.autocast(device_type=device_type, dtype=torch.float32):
+            return vocoder(generated_mel.float()).to(input_dtype)
 
 
 def _prepare_ltx2_video_output(

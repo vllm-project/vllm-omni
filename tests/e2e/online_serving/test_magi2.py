@@ -8,7 +8,7 @@ It exercises the recommended resident SP4 topology through ``/v1/videos``.
 
 From ``tests/``::
 
-    pytest -s -v e2e/online_serving/test_magi2.py -m "advanced_model and diffusion" --run-level=advanced_model
+    pytest -s -v e2e/online_serving/test_magi2.py -m "slow and diffusion" --run-level=full_model
 """
 
 import json
@@ -27,8 +27,7 @@ PROMPT = "A red fox walks through fresh snow while wind moves the pine branches.
 FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=4)
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",

@@ -156,10 +156,14 @@ def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> Non
 
 
 @pytest.mark.full_model
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 def test_ltx_ulysses_transformer_matches_sp1(unused_tcp_port) -> None:
     """Exercise real plan hooks, RoPE/timestep sharding, and attention routing."""
     world_size = 2
+    device_count = current_omni_platform.device_count()
+    assert device_count >= world_size, (
+        f"LTX Ulysses parity requires {world_size} accelerator devices; only {device_count} are visible"
+    )
     torch.multiprocessing.spawn(
         _run_transformer_parity,
         args=(world_size, unused_tcp_port),

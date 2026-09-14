@@ -152,7 +152,7 @@ The following configuration was validated:
 - vLLM-Omni version or commit: Use a commit that contains TorchAO FP8
   checkpoint loading for diffusion models
 - TorchAO version: 0.17.0
-- `kernels` / `kernels-data`: 0.15.2 / 0.16.1
+- `kernels` / `kernels-data`: 0.16.1 / matching kernels-data
 
 #### Command
 
@@ -451,6 +451,39 @@ curl -s http://localhost:8091/v1/chat/completions \
   the regular Edit checkpoint applies.
 - **Known limitations:** the same single-GPU limitations as Base and Edit apply;
   CPU offload, Cache-DiT, and multi-GPU parallelism are not yet validated.
+
+## Output format and compression
+
+Image requests accept `output_format` (`png`, `jpeg`, or `webp`) and
+`output_compression` (0-100). The default is `png` with the fastest,
+least-compressed PNG encode, which is lossless but produces multi-megabyte
+payloads. For latency-sensitive clients, `output_format: "jpeg"` removes
+almost the entire response-encoding overhead: on a 1024x1024 Turbo request
+the client-observed e2e latency drops from ~900 ms to ~766 ms and the
+payload shrinks from ~3.1 MB to ~0.8 MB. Use `output_compression` to trade
+encode time against payload size when PNG must stay lossless: lower values
+(e.g. 1) compress harder and produce smaller payloads at proportionally
+longer encode times.
+
+## Attention backend
+
+The diffusion attention backend defaults to `FLASH_ATTN` (FlashAttention-2).
+On Hopper-class GPUs (SM90) pass `--diffusion-attention-backend CUDNN_ATTN`
+for a measured ~12% engine-time reduction on Boogu-Image workloads:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Turbo \
+  --omni \
+  --diffusion-attention-backend CUDNN_ATTN \
+  --port 8091
+```
+
+Measured on a 143 GB SM90 card (1024x1024, 4 steps, 5-run mean): stage time
+673 ms with `CUDNN_ATTN` vs 763 ms with the default. Outputs are numerically
+different from FLASH_ATTN (different attention kernel) but visually
+equivalent, deterministic per seed, and decode identically. On datacenter
+Blackwell (SM100 / SM103) use `--diffusion-attention-backend TRTLLM_ATTN`
+instead; it is rejected on SM90.
 
 ## Performance validation
 
