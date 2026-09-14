@@ -386,19 +386,23 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.Fi
     from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
     from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
 
-    model = Transformer2DModel(
-        patch_size=2,
-        in_channels=4,
-        hidden_size=96,
-        num_layers=4,
-        num_refiner_layers=1,
-        num_attention_heads=2,
-        num_kv_heads=2,
-        multiple_of=8,
-        axes_dim_rope=(16, 16, 16),
-        axes_lens=(300, 512, 512),
-        text_feat_dim=16,
-    )
+    # MammothModa2 attention resolves through the shared Omni attention layer,
+    # which picks the platform-default backend at construction time. Pin
+    # TORCH_SDPA so a CUDA-visible host does not select FA3 for CPU tensors.
+    with _force_torch_sdpa():
+        model = Transformer2DModel(
+            patch_size=2,
+            in_channels=4,
+            hidden_size=96,
+            num_layers=4,
+            num_refiner_layers=1,
+            num_attention_heads=2,
+            num_kv_heads=2,
+            multiple_of=8,
+            axes_dim_rope=(16, 16, 16),
+            axes_lens=(300, 512, 512),
+            text_feat_dim=16,
+        )
     model.eval()
 
     MammothModa2Pipeline = type("MammothModa2DiTPipeline", (), {})

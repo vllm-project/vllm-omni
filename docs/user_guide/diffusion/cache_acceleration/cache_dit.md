@@ -74,9 +74,9 @@ omni = Omni(
 
 ### Multi-Stage Models (MammothModa2)
 
-MammothModa2's DiT runs on the generation runner rather than the diffusion
-runner, so Cache-DiT is configured on the **DiT stage entry** of the deploy
-YAML instead of the top-level `Omni(cache_backend=...)` kwargs:
+MammothModa2 is a multi-stage AR→DiT pipeline; the diffusion runner owns the
+Cache-DiT lifecycle of its DiT stage. Configure it on the **DiT stage entry**
+of the deploy YAML so the acceleration only applies to the denoising stage:
 
 ```yaml
 # deploy YAML (see vllm_omni/deploy/mammoth_moda2.yaml)

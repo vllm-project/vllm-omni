@@ -20,7 +20,6 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     CacheDiTRequestSpec,
     RequestScopedCacheDiTRuntime,
-    cache_summary,
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -179,28 +178,21 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         self._llm_hidden_size = llm_hidden_size
 
-        # Cache-DiT lifecycle: this stage runs on the generation runner,
-        # which has no cache-backend wiring, so the pipeline owns its
-        # Cache-DiT lifecycle. Stage-level engine args (``cache_backend`` /
-        # ``cache_config`` on the deploy YAML stage entry) surface here via
-        # model_config; hooks install once at startup and forward()
-        # reconciles per-request state (step count, CFG parity).
+        # Cache-DiT lifecycle: the diffusion runner enables the configured
+        # backend (``cache_backend`` on the deploy YAML stage entry) at startup
+        # and transfers ownership here via the request-scoped protocol;
+        # forward() then reconciles per-request state (step count, CFG parity).
+        # The runner also emits the cache summary when
+        # ``enable_cache_dit_summary`` is set.
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
-        self._cache_dit_summary_enabled = bool(getattr(vllm_config.model_config, "enable_cache_dit_summary", False))
-        cache_backend = getattr(vllm_config.model_config, "cache_backend", None)
-        cache_config = getattr(vllm_config.model_config, "cache_config", None)
         self._cache_dit_config: DiffusionCacheConfig | None = None
-        if str(cache_backend or "").lower() == "cache_dit":
+        if str(getattr(od_config, "cache_backend", "") or "").lower() == "cache_dit":
+            cache_config = od_config.cache_config
             self._cache_dit_config = (
                 cache_config
                 if isinstance(cache_config, DiffusionCacheConfig)
                 else DiffusionCacheConfig.from_dict(cache_config or {})
             )
-            backend = CacheDiTBackend(self._cache_dit_config)
-            backend.enable(self)
-            self._cache_dit_runtime.adopt(backend, installation_key=_MAMMOTHMODA2_CACHE_DIT_KEY)
-        elif cache_backend not in (None, "", "none", "None"):
-            logger.warning("Cache backend '%s' is not supported for MammothModa2 yet; ignoring.", cache_backend)
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt a runner-installed Cache-DiT backend (request-scoped protocol)."""
@@ -518,9 +510,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 freqs_cis=self.gen_freqs_cis,
             )
             guidance_scale = (
-                request.text_guidance_scale
-                if request.cfg_range[0] <= i / total_steps <= request.cfg_range[1]
-                else 1.0
+                request.text_guidance_scale if request.cfg_range[0] <= i / total_steps <= request.cfg_range[1] else 1.0
             )
             run_uncond = guidance_scale > 1.0 and negative_prompt_embeds is not None
             if requires_paired_cfg and negative_prompt_embeds is not None:
@@ -537,9 +527,6 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=prompt_embeds.dtype)
-
-        if self._cache_dit_summary_enabled and self._cache_dit_runtime.is_enabled:
-            cache_summary(self)
 
         # VAE decode
         if self.gen_vae.config.scaling_factor is not None:

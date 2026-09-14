@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.cache.cachedit import RequestScopedCacheDiTRuntime
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
@@ -115,6 +116,10 @@ def _pipeline_shell() -> MammothModa2DiTPipeline:
         vision_end_token_id=903,
     )
     pipeline._llm_hidden_size = 8
+    # Cache-DiT runtime state that __init__ normally creates (disabled here,
+    # matching a pipeline built without a cache_backend).
+    pipeline._cache_dit_runtime = RequestScopedCacheDiTRuntime(pipeline)
+    pipeline._cache_dit_config = None
     return pipeline
 
 

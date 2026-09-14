@@ -180,14 +180,13 @@ cache_dit.enable_cache(
 
 > **Note:** For single transformer with multiple block lists, `refresh_context` works the same as standard models.
 
-### Example 3: Generation-Stage Pipeline with Sequential CFG (MammothModa2)
+### Example 3: Sequential-CFG Diffusion Pipeline (MammothModa2)
 
-MammothModa2's DiT stage is an `LLM_GENERATION` stage, not a diffusion stage, so
-the pipeline owns its Cache-DiT lifecycle instead of the diffusion model runner:
-the constructor reads `cache_backend`/`cache_config` from the stage's
-`model_config` (deploy YAML stage entry), installs hooks once via a custom
-enabler, and `forward()` reconciles per-request state through
-`RequestScopedCacheDiTRuntime`.
+MammothModa2's DiT stage runs on the diffusion runner, which enables the
+configured backend at startup and transfers ownership to the pipeline through
+the request-scoped protocol (`adopt_cache_dit_backend` / `is_cache_dit_enabled`);
+`forward()` then reconciles per-request state through
+`RequestScopedCacheDiTRuntime` (MiniMax H3 precedent).
 
 **Key difference:** The enabler caches only the repeated main-layer stack and
 marks the pipeline as requiring paired CFG forwards, because cache-dit's
