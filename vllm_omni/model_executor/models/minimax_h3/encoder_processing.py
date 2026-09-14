@@ -297,6 +297,8 @@ def _effective_audio_inputs(
     max_standalone_seconds: float,
 ) -> list[tuple[torch.Tensor, int]]:
     """Return the waveforms exactly as the audio WVAE will consume them."""
+    if not math.isfinite(max_standalone_seconds) or max_standalone_seconds <= 0:
+        raise ValueError("max_standalone_seconds must be positive and finite")
     audio_inputs = [item for item in video_audios if item is not None]
     audio_inputs.extend(
         (waveform[..., : int(round(max_standalone_seconds * sample_rate))], sample_rate)
@@ -489,6 +491,15 @@ def encode_media(
     Every visual participant must call this function with the same references.
     Component scopes allow the diffusion runner to stage one codec at a time.
     """
+    # Validate before the non-leader return so all participants reject bad input.
+    audio_inputs = _effective_audio_inputs(
+        media.video_audios,
+        media.audios,
+        max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
+    )
+    embedded_audio_count = sum(item is not None for item in media.video_audios)
+    validate_reference_audio_waveforms([item for item in media.video_audios if item is not None])
+    validate_reference_audio_waveforms(media.audios)
     visual_rows: list[torch.Tensor] = []
     visual_shapes: list[tuple[int, int, int]] = []
     if media.images or media.videos:
@@ -510,12 +521,6 @@ def encode_media(
 
     audio_rows: list[torch.Tensor] = []
     audio_lengths: list[int] = []
-    embedded_audio_count = sum(item is not None for item in media.video_audios)
-    audio_inputs = _effective_audio_inputs(
-        media.video_audios,
-        media.audios,
-        max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
-    )
     if audio_inputs:
         if audio_vae is None:
             raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")

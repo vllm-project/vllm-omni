@@ -154,6 +154,31 @@ def test_payload_sender_endpoint_matches_resolver_with_unequal_replicas(outgoing
     assert sender_info["zmq_port"] != consumer.extra["sender_zmq_port"]
 
 
+@pytest.mark.parametrize("initialized", [False, True])
+def test_intermediate_payload_sender_ignores_incoming_kv_endpoint(initialized):
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 1
+    client.replica_id = 3
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {
+                    "role": "receiver",
+                    "host": "10.0.0.1",
+                    "zmq_port": 47000,
+                    "from_stage": 0,
+                    "outgoing": {"host": "10.0.0.2", "zmq_port": 48000, "from_stage": 1},
+                },
+            }
+        )
+    )
+    client._omni_kv_config = {"connector_config": {"type": "NixlConnector", "role": "receiver", "zmq_port": 47100}}
+    client._kv_sender_info = {"host": "10.0.0.1", "zmq_port": 47100} if initialized else None
+
+    assert client._build_payload_sender_info() == {"host": "10.0.0.2", "zmq_port": 51073}
+
+
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 0
@@ -235,6 +260,90 @@ def test_stage_engine_core_client_preserves_explicit_loopback_sender_host():
     }
 
 
+def test_stage_engine_core_client_payload_sender_uses_unresolved_base_port():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {"role": "sender", "from_stage": 0, "zmq_port": 50171},
+            },
+            omni_kv_config={"connector_config": {"type": "NixlConnector", "role": "sender", "zmq_port": 50171}},
+        )
+    )
+    client._omni_kv_config = client.vllm_config.model_config.omni_kv_config
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
+def test_stage_engine_core_client_payload_sender_preserves_stage_port_without_kv_config():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {"role": "sender", "from_stage": 0, "zmq_port": 50071},
+            },
+            omni_kv_config=None,
+        )
+    )
+    client._omni_kv_config = None
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
+def test_stage_engine_core_client_payload_sender_falls_back_to_kv_connector_config():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config=None,
+            omni_kv_config={
+                "connector_config": {
+                    "type": "NixlConnector",
+                    "role": "sender",
+                    "zmq_port": 50171,
+                }
+            },
+        )
+    )
+    client._omni_kv_config = client.vllm_config.model_config.omni_kv_config
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
+def test_stage_engine_core_client_payload_sender_falls_back_to_initialized_kv_sender():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_connector_config=None))
+    client._omni_kv_config = None
+    client._kv_sender_info = {"host": "10.20.30.40", "zmq_port": 50171}
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
 def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
@@ -293,7 +402,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
 def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
-    diffusion_stage.custom_process_input_func = lambda *_args, **_kwargs: []
+    setattr(diffusion_stage, "custom_process_input_func", lambda *_args, **_kwargs: [])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
     diffusion_pool = StagePool(1, diffusion_stage)
 
