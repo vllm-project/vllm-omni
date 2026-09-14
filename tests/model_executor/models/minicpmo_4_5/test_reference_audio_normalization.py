@@ -10,6 +10,7 @@ pure math so future edits cannot silently widen L0 again.
 """
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -162,3 +163,42 @@ def test_soundfile_2d_output_is_transposed_before_the_normalizer(tmp_path):
     assert target_sr == TARGET
     assert normalized.shape[-1] == TARGET
     assert torch.allclose(normalized, torch.zeros_like(normalized), atol=1e-6)
+
+
+def test_default_prompt_uses_the_configured_window(tmp_path):
+    """The default prompt has to honour ``ref_audio_max_seconds``.
+
+    With a non-default window, a default prompt normalized at the fixed 6 s
+    constant would keep a different L0 from the request references, which is
+    the mismatch this normalization exists to remove.
+    """
+    import tempfile
+
+    import soundfile as sf
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+        MiniCPMO45Code2Wav,
+        _read_reference_wav,
+    )
+
+    frames = 2 * TARGET  # shorter than the window, so it gets zero-padded
+    samples = torch.full((frames, 2), 0.25)
+    source = tmp_path / "default.wav"
+    sf.write(str(source), samples.numpy(), TARGET, format="WAV")
+
+    window_seconds = 8.0
+    with tempfile.TemporaryDirectory() as runtime_dir:
+        stub = SimpleNamespace(
+            _default_prompt_wav=str(source),
+            _default_prompt_id="HT_ref_audio",
+            _default_prompt_normalized=None,
+            _ref_max_seconds=window_seconds,
+            _runtime_prompt_dir=SimpleNamespace(name=runtime_dir),
+        )
+        prompt_wav, _ = MiniCPMO45Code2Wav._normalized_default_prompt(stub)
+        # Read inside the block: the temporary directory is removed on exit.
+        normalized, sample_rate_hz = _read_reference_wav(prompt_wav)
+
+    assert sample_rate_hz == TARGET
+    # The configured window, not the fixed 6 s default.
+    assert normalized.shape[-1] == int(window_seconds * TARGET)
