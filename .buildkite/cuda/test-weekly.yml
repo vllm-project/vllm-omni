@@ -369,6 +369,7 @@ steps:
           - >-
             pytest -sv
             tests/e2e/offline_inference/test_mammoth_moda2_expansion.py
+            tests/diffusion/models/mammoth_moda2/test_mammoth_moda2_dit_quantization_quality.py
             -m "slow and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1
