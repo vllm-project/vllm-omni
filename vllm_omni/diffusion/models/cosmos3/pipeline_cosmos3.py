@@ -110,7 +110,7 @@ from .transfer import (
     transfer_max_frames_from_extra_args,
     uint8_cthw_to_normalized_5d,
 )
-from .transformer_cosmos3 import Cosmos3VFMTransformer, _od_config_get, _tf_config_get, resolve_sound_gen
+from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_sound_gen
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
     COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
@@ -204,20 +204,6 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
-
-
-def _resolve_cosmos3_sampling_dtype(od_config: OmniDiffusionConfig) -> torch.dtype:
-    sampling_dtype = os.environ.get("COSMOS3_SAMPLING_DTYPE")
-    if sampling_dtype is None:
-        sampling_dtype = _od_config_get(od_config, "sampling_dtype", "model")
-    if not isinstance(sampling_dtype, str):
-        raise TypeError(f"Cosmos3 sampling_dtype must be a string, got {type(sampling_dtype)!r}.")
-    sampling_dtype = sampling_dtype.lower()
-    if sampling_dtype == "float32":
-        return torch.float32
-    if sampling_dtype == "model":
-        return od_config.dtype
-    raise ValueError(f"Cosmos3 sampling_dtype must be 'float32' or 'model', got {sampling_dtype!r}.")
 
 
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
@@ -907,6 +893,7 @@ class Cosmos3OmniDiffusersPipeline(
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
     _resident_modules: ClassVar[list[str]] = []
+    sampling_dtype: ClassVar[torch.dtype] = torch.float32
 
     @classmethod
     def reference_video_decode_spec(
@@ -959,7 +946,6 @@ class Cosmos3OmniDiffusersPipeline(
             )
         self.device = get_local_device()
         self.dtype = od_config.dtype
-        self.sampling_dtype = _resolve_cosmos3_sampling_dtype(od_config)
 
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)

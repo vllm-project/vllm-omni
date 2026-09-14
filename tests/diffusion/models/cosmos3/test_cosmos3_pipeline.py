@@ -77,20 +77,10 @@ def test_component_selective_model_offload_fails_before_component_loading(monkey
         pipeline_module.Cosmos3OmniDiffusersPipeline(od_config=config)
 
 
-def test_sampling_dtype_is_cosmos3_model_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _resolve_cosmos3_sampling_dtype
+def test_sampling_dtype_is_float32() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 
-    default_config = SimpleNamespace(dtype=torch.bfloat16, model_config={}, tf_model_config={})
-    fp32_config = SimpleNamespace(
-        dtype=torch.bfloat16,
-        model_config={"sampling_dtype": "float32"},
-        tf_model_config={},
-    )
-
-    assert _resolve_cosmos3_sampling_dtype(default_config) == torch.bfloat16
-    assert _resolve_cosmos3_sampling_dtype(fp32_config) == torch.float32
-    monkeypatch.setenv("COSMOS3_SAMPLING_DTYPE", "float32")
-    assert _resolve_cosmos3_sampling_dtype(default_config) == torch.float32
+    assert Cosmos3OmniDiffusersPipeline.sampling_dtype == torch.float32
 
 
 class StubScheduler:
@@ -291,7 +281,6 @@ def make_cosmos3_pipeline():
         pipeline.od_config = SimpleNamespace()
         pipeline.device = torch.device("cpu")
         pipeline.dtype = torch.float32
-        pipeline.sampling_dtype = torch.float32
         pipeline.transformer = StubCosmos3Transformer(latent_channel_size=2)
         pipeline.vae = StubCosmos3VAE(z_dim=2)
         pipeline.vae_scale_factor_temporal = 4
@@ -2010,12 +1999,12 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(action, clean)
 
 
-def test_fp32_sampling_state_casts_only_transformer_execution(make_cosmos3_pipeline) -> None:
+def test_sampling_state_casts_transformer_execution_to_model_dtype(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     pipeline.dtype = torch.bfloat16
-    pipeline.sampling_dtype = torch.float32
 
     latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
+    assert pipeline.sampling_dtype == torch.float32
     assert latents.dtype == torch.float32
 
     prediction = pipeline.predict_noise(
@@ -2027,24 +2016,6 @@ def test_fp32_sampling_state_casts_only_transformer_execution(make_cosmos3_pipel
 
     assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
     assert prediction.dtype == torch.float32
-
-
-def test_model_sampling_dtype_preserves_legacy_state_precision(make_cosmos3_pipeline) -> None:
-    pipeline = make_cosmos3_pipeline()
-    pipeline.dtype = torch.bfloat16
-    pipeline.sampling_dtype = pipeline.dtype
-
-    latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
-    prediction = pipeline.predict_noise(
-        hidden_states=latents,
-        timestep=torch.tensor([1]),
-        text_ids=_ids(2),
-        text_mask=_mask(),
-    )
-
-    assert latents.dtype == torch.bfloat16
-    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
-    assert prediction.dtype == torch.bfloat16
 
 
 def test_prepare_latents_i2v_encodes_only_conditioning_frame(make_cosmos3_pipeline) -> None:
