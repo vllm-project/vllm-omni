@@ -50,17 +50,6 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 logger = init_logger(__name__)
 
 
-def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Rotate interleaved pairs before rounding back to the activation dtype.
-
-    Qwen-Image's reference uses complex FP32 multiplication. Rounding the
-    frequencies to BF16 before rotation loses positional precision; those
-    errors accumulate across the denoising steps.
-    """
-    paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
-
-
 def _normalize_qwen_image_weight_name(name: str) -> str:
     name = name.removeprefix("transformer.")
     if ".to_out.0." in name:
