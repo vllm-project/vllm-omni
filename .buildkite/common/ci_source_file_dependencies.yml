@@ -418,6 +418,11 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_z_image.py
     - tests/e2e/online_serving/test_zimage_expansion.py
 
+  diffusion_sana_video_function:
+    - *sana_video
+    - tests/e2e/online_serving/test_sana_video_expansion.py
+    - tests/e2e/accuracy/sana_video/
+
   diffusion_stable_audio_function:
     - *stable_audio
     - tests/e2e/offline_inference/test_stable_audio_expansion.py
