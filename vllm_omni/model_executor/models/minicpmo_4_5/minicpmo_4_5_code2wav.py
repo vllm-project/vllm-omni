@@ -78,6 +78,21 @@ def _get_resampler(orig_freq: int, new_freq: int):
     return torchaudio.transforms.Resample(orig_freq=orig_freq, new_freq=new_freq)
 
 
+def _read_reference_wav(path: str) -> tuple[Any, int]:
+    """Read a WAV file for :func:`_normalize_reference`.
+
+    ``soundfile`` returns ``(samples, channels)`` for multi-channel files
+    while the normalizer expects ``(channels, samples)``. Without the
+    transpose a stereo prompt looks like a huge channel count, the downmix
+    guard rejects it, and the caller silently falls back to the raw file --
+    a second L0 value for the same content.
+    """
+    waveform, sample_rate_hz = sf.read(path, dtype="float32", always_2d=False)
+    if getattr(waveform, "ndim", 1) > 1:
+        waveform = waveform.T
+    return waveform, int(sample_rate_hz)
+
+
 def _normalize_reference(
     ref_audio: Any,
     sample_rate_hz: int,
@@ -292,10 +307,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         source = self._default_prompt_wav
         fallback = (source, self._default_prompt_id)
         try:
-            waveform, sample_rate_hz = sf.read(source, dtype="float32", always_2d=False)
+            waveform, sample_rate_hz = _read_reference_wav(source)
             normalized, target_sr = _normalize_reference(
                 waveform,
-                int(sample_rate_hz),
+                sample_rate_hz,
                 max_seconds=self._ref_max_seconds,
             )
         except Exception:

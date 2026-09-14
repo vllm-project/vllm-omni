@@ -131,3 +131,34 @@ def test_truncation_emits_warning(caplog):
         target_logger.removeHandler(caplog.handler)
         target_logger.setLevel(prev_level)
     assert any("truncating" in record.getMessage() for record in caplog.records)
+
+
+def test_soundfile_2d_output_is_transposed_before_the_normalizer(tmp_path):
+    """``sf.read`` gives (samples, channels); the normalizer wants the transpose.
+
+    Without it a stereo default prompt looks like a huge channel count, the
+    downmix guard rejects it, and the caller falls back to the raw file -- so
+    that prompt keeps a second L0 value next to the normalized request
+    references.
+    """
+    import soundfile as sf
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+        _read_reference_wav,
+    )
+
+    frames = TARGET
+    # Opposite-signed channels: the downmix is a true mean only when the two
+    # channels were aligned as rows, so a wrong layout cannot look correct.
+    stereo = torch.stack((torch.full((frames,), 0.5), torch.full((frames,), -0.5)), dim=1)
+    path = tmp_path / "stereo.wav"
+    sf.write(str(path), stereo.numpy(), TARGET, format="WAV")
+
+    waveform, sample_rate_hz = _read_reference_wav(str(path))
+
+    assert sample_rate_hz == TARGET
+    assert waveform.shape == (2, frames)
+    normalized, target_sr = _normalize_reference(waveform, sample_rate_hz, max_seconds=1.0)
+    assert target_sr == TARGET
+    assert normalized.shape[-1] == TARGET
+    assert torch.allclose(normalized, torch.zeros_like(normalized), atol=1e-6)

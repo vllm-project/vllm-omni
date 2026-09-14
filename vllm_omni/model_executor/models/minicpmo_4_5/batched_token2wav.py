@@ -86,14 +86,38 @@ def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
     """Keep the padded columns of ``tensor`` at zero, in place.
 
     Bucketing pads the frame axis so the capture shape stays fixed. The padded
-    columns must not carry content: the CFM attention runs with
-    ``attn_mask=None`` (fully connected), so real frames would attend to them,
-    and the integration step ``x = x + dt * velocity`` would otherwise make the
-    padded region non-zero again after the initial zeroing.
+    columns carry no valid content: they are excluded from the attention by the
+    ``attn_mask`` built in ``_decode_batch_once``, and zeroing keeps them from
+    leaking back in. The integration step ``x = x + dt * velocity`` would
+    otherwise make the padded region non-zero again after the initial zeroing,
+    and the cross-chunk caches would read those values back.
     """
     if valid_frames is None or valid_frames >= int(tensor.shape[-1]):
         return
     tensor[..., valid_frames:] = 0.0
+
+
+def _zero_padded_cnn_cache(
+    cnn_cache: torch.Tensor,
+    estimator: nn.Module,
+    pad_frames: int,
+) -> None:
+    """Clear the cache positions that come from padded frames, in place.
+
+    Each block's CNN cache holds the tail of its convolution output
+    (``new_cnn_cache = x[..., -causal_padding[0]:]``, inside ``stepaudio2``),
+    so when the padding sits at the chunk tail those positions are
+    padding-derived and would otherwise become the next chunk's left context.
+    Padding is at most ``pad_frames`` wide, so only the trailing positions that
+    can come from it are cleared; the valid part of the window is kept.
+    """
+    for index, block in enumerate(estimator.blocks):
+        width = int(block.conv.block[1].causal_padding[0])
+        if width <= 0:
+            continue
+        zero_from = max(0, width - pad_frames)
+        if zero_from < width:
+            cnn_cache[index][..., zero_from:] = 0.0
 
 
 def plan_token2wav_encode_slices(
@@ -502,6 +526,7 @@ class BatchedToken2Wav(nn.Module):
                 graph_att,
                 cnn_out,
                 att_out,
+                attn_mask,
             )
         if valid_lengths is not None:
             if not hasattr(estimator, "in_proj"):
@@ -650,9 +675,11 @@ class BatchedToken2Wav(nn.Module):
             ),
         )
         if pad_frames:
-            # See _cfm_pad_frames: the caches also advance by the padded width.
-            mu = torch.nn.functional.pad(mu, (0, pad_frames))
-            cond = torch.nn.functional.pad(cond, (0, pad_frames))
+            # Replicate rather than zero: a repeated last frame is a closer
+            # continuation of the chunk than silence, so the padded positions
+            # carry less of a step change into the attention and CNN caches.
+            mu = torch.nn.functional.pad(mu, (0, pad_frames), mode="replicate")
+            cond = torch.nn.functional.pad(cond, (0, pad_frames), mode="replicate")
         end = offset + int(mu.shape[2])
         if end > int(decoder.rand_noise.shape[2]):
             raise RuntimeError(
@@ -662,10 +689,11 @@ class BatchedToken2Wav(nn.Module):
             )
         x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
         if pad_frames:
-            # The padded columns would otherwise carry real noise values, and the
-            # attention here is fully connected (`attn_mask=None`), so the real
-            # frames would attend to them. Zero them so padding only aligns the
-            # capture shape and contributes no content.
+            # The padded columns would otherwise carry real noise values. They
+            # are excluded from this chunk's attention by ``attn_mask`` below
+            # and held at zero here, so the padded region stays inert. Masking
+            # is what removes them; zeroing alone would not, since a zero row
+            # still occupies part of the softmax denominator.
             x[:, :, mel_frames:] = 0.0
         timeline = torch.linspace(
             0,
@@ -696,6 +724,20 @@ class BatchedToken2Wav(nn.Module):
                 device=mu.device,
             )
             attn_mask = valid_queries.unsqueeze(2) & torch.cat((current_keys, old_keys), dim=2)
+        elif pad_frames:
+            # Mask the padded keys instead of only zeroing their content: a
+            # zero-valued key/value pair still takes probability mass out of the
+            # softmax denominator, so the real frames keep attending to the
+            # padding unless it is explicitly excluded.
+            kv_len = int(mu.shape[2]) + offset
+            attn_mask = torch.ones(
+                2 * batch_size,
+                int(mu.shape[2]),
+                kv_len,
+                dtype=torch.bool,
+                device=mu.device,
+            )
+            attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None
@@ -717,6 +759,8 @@ class BatchedToken2Wav(nn.Module):
                     valid_lengths=valid_lengths,
                     valid_frames=mel_frames if pad_frames else None,
                 )
+                if pad_frames:
+                    _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
                 conditional, unconditional = estimate.split(batch_size, dim=0)
                 velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
                 x = x + dt * velocity
@@ -761,6 +805,12 @@ class BatchedToken2Wav(nn.Module):
                         dtype=self._estimator_att_cache_dtype,
                     )
                 next_att_cache[step].copy_(step_att)
+                if pad_frames:
+                    # The padded steps ran but hold no valid content, and each
+                    # cache entry becomes the next chunk's keys. Clear the
+                    # padded columns so the boundary the next chunk reads is
+                    # the valid one, in step with the mask built above.
+                    next_att_cache[step][..., mel_frames : mel_frames + pad_frames, :] = 0.0
                 del step_att
         if pad_frames:
             x = x[:, :, :mel_frames]
