@@ -1,4 +1,7 @@
 # Wan2.x Encode/Denoise/Decode disaggregated diffusion pipeline (3 stages).
+# E: UMT5 + optional TI2V VAE encoder; G: DiT only; D: decoder-only VAE.
+# E -> G transfers embeddings, image conditioning and versioned metadata.
+# G -> D transfers denoised latents only, not stale encoder payloads.
 
 pipeline: wan2_2_egd
 async_chunk: false

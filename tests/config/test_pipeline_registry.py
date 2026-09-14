@@ -101,6 +101,10 @@ def test_wan_eg_preserves_fused_denoise_decode_role():
     assert stage_component_groups("denoise") == frozenset({"dit"})
     assert stage_component_groups("denoise_decode") == frozenset({"dit", "vae"})
 
+    keys = ("prompt_embeds", "negative_prompt_embeds", "wan_image_condition", "wan_conditioning_metadata")
+    assert pipeline.stages[0].stage_output_payload_keys == keys
+    assert pipeline.stages[1].stage_input_payload_keys == keys
+
 
 def test_wan_egd_topology_and_deploy_wiring():
     pipeline = OMNI_PIPELINES["wan2_2_egd"]
@@ -113,11 +117,11 @@ def test_wan_egd_topology_and_deploy_wiring():
     ]
     assert [stage.stage_input_payload_keys for stage in pipeline.stages] == [
         (),
-        ("prompt_embeds", "negative_prompt_embeds"),
+        ("prompt_embeds", "negative_prompt_embeds", "wan_image_condition", "wan_conditioning_metadata"),
         ("latents",),
     ]
     assert [stage.stage_output_payload_keys for stage in pipeline.stages] == [
-        ("prompt_embeds", "negative_prompt_embeds"),
+        ("prompt_embeds", "negative_prompt_embeds", "wan_image_condition", "wan_conditioning_metadata"),
         ("latents",),
         (),
     ]
