@@ -26,9 +26,14 @@ redundant computation and providing significant end-to-end speedup.
 
 | Tier | Match Condition | Speedup | Quality |
 |------|----------------|---------|---------|
-| **Exact hit** | Identical prompt + seed + params | ~50× (skip all DiT steps) | Identical |
+| **Exact hit** | Identical prompt + seed + params | Skip all DiT steps (measured 11–142× latency on committed benchmarks; see `benchmarks/inter_request_cache/`) | Identical |
 | **Semantic hit** | CLIP text similarity > threshold | Partial (skip first N steps) | Near-identical |
 | **Miss** | No match | No speedup (compute & cache) | Normal |
+
+Only **text-prompt** requests with an **explicit seed** (or a resolvable
+generator seed) are cached. Image-conditioned requests (edit / i2v), embedding
+or token prompts, and seedless requests bypass the cache — see *Cache Safety*
+below.
 
 ---
 
@@ -139,13 +144,17 @@ All parameters use the `inter_request_` prefix in the `cache_config` dictionary:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `inter_request_max_entries` | int | 100 | *(example scripts default to 8000)* | Maximum number of cached entries (LRU eviction) |
-| `inter_request_max_memory_gb` | float | 4.0 | *(example scripts default to 800.0)* | Maximum total memory for cached latents (GB) |
-| `inter_request_persistent_cache_dir` | str \| None | None | Directory for disk persistence; if set, cache survives restarts |
+| `inter_request_max_memory_gb` | float | 4.0 | *(example scripts default to 800.0)* | Maximum total memory for cached latents (GB). Without LMCache, entries beyond the budget are LRU-evicted entirely; `0` is only meaningful in LMCache mode (embedding shells only, heavy tensors tiered to disk) |
+| `inter_request_persistent_cache_dir` | str \| None | None | Directory for disk persistence; if set, cache survives restarts. Keys embed a model-checkpoint + TP-topology digest, so a dir written by a different model/topology will not match |
 | `inter_request_clip_model_path` | str \| None | None | Path to CLIP model for semantic matching; if None, only exact matching is used |
 | `inter_request_clip_threshold` | float | 0.75 | CLIP text similarity threshold (τ) for semantic hit |
 | `inter_request_clip_min_skip` | int | 5 | Minimum denoising steps to skip on a semantic hit |
 | `inter_request_clip_max_skip_ratio` | float | 0.5 | Maximum skip ratio of total steps (when similarity ≈ 1.0) |
 | `inter_request_use_t2i_penalty` | bool | True | Enable t2i sigmoid penalty in hybrid similarity scoring |
+| `inter_request_lmcache_disk_dir` | str \| None | None | Root dir for LMCache CPU→disk tiering (see below); None disables tiering |
+| `inter_request_lmcache_max_cpu_gb` | float | 5.0 | LMCache CPU pool size (GB) |
+| `inter_request_lmcache_max_disk_gb` | float | 100.0 | LMCache disk quota (GB) |
+| `inter_request_max_stored_steps` | int | 0 | Max per-entry step latents stored (0 = all steps); semantic-hit resume is clamped to this |
 
 ### CLI Flags (example scripts)
 
@@ -189,8 +198,34 @@ When `inter_request_persistent_cache_dir` is set, the cache is automatically:
    are restored and become immediately searchable.
 2. **Saved** periodically and on shutdown — new entries are persisted to disk.
 
-This enables cache reuse across server restarts, model reloads, or even different machines
-sharing a cache directory.
+Cache keys embed a digest of the model checkpoint and TP world size, so a
+persistent dir written by a different model or topology is never served.
+
+## LMCache CPU→Disk Tiering (optional)
+
+For caches larger than host memory, set `inter_request_lmcache_disk_dir` to
+enable tiered storage via LMCache (`pip install 'vllm-omni[inter_request]'`):
+
+- Final latents are persisted with `torch.save` into
+  `<dir>/final_direct/` (async, off the request path).
+- Step latents go through LMCache's `ECCacheEngine` into `<dir>/steps/`,
+  which manages the CPU pool (`inter_request_lmcache_max_cpu_gb`) and spills
+  to disk (`inter_request_lmcache_max_disk_gb`) with LRU eviction.
+- Under sustained pool pressure, LMCache allocation waits at most 30s and
+  then degrades to a no-store (the request is unaffected; the entry simply
+  is not cached).
+
+## Cache Safety
+
+The inter-request cache deliberately **refuses** to serve or store:
+
+- **Image-conditioned requests** (`multi_modal_data` in the prompt, e.g.
+  Qwen-Image-Edit / Wan2.2-i2v) — the conditioning image is not part of the
+  key, so reuse could return an edit of the wrong source image.
+- **Non-text prompts** (token / embedding / custom prompt objects) — no
+  stable text identity.
+- **Seedless requests** — a random sample must stay random; caching would
+  silently make identical prompts deterministic.
 
 ---
 

@@ -569,15 +569,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return None
         return self.prompt_embed_cache.stats()
 
-    # DEBUG
     def _update_cache_image_embedding(self, cache_key_hash: str, image_tensor: torch.Tensor) -> None:
         # Skip image embedding update for video (5D tensor [B,C,T,H,W])
         if not hasattr(image_tensor, "dim") or image_tensor.dim() == 5:
             return
-        # Synchronous update (async daemon threads hang on NPU)
-        image_tensor_cpu = image_tensor.detach().clone().cpu()
         try:
-            self.cache_backend.update_image_embedding(cache_key_hash, image_tensor_cpu)
+            self.cache_backend.update_image_embedding(cache_key_hash, image_tensor)
         except Exception as e:
             logger.debug("Failed to update image embedding: %s", e)
 
@@ -685,19 +682,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
         if num_inference_steps is not None:
-            # Composite backends (inter_request+cache_dit) may reduce the
-            # effective step count when resuming from a cached step; they
-            # read resume_from_step via the optional kwarg.
-            resume = getattr(first_req.sampling_params, "resume_from_step", 0) or 0
-            try:
-                self.cache_backend.refresh(
-                    self.pipeline,
-                    num_inference_steps,
-                    resume_from_step=resume,
-                )
-            except TypeError:
-                # Backends whose refresh() does not accept resume_from_step.
-                self.cache_backend.refresh(self.pipeline, num_inference_steps)
+            # inter_request resumes by skipping steps at the pipeline loop
+            # level, so backends always see the full step count here.
+            self.cache_backend.refresh(self.pipeline, num_inference_steps)
         else:
             logger.warning(
                 "Failed to refresh the diffusion transformer cache; backend %s "
@@ -803,7 +790,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary and record_output_peak_memory:
                 current_omni_platform.reset_peak_memory_stats()
 
-            is_dummy = any("dummy" in r.request_id for r in reqs)
+            is_dummy = any(r.is_dummy_run() for r in reqs)
             self.cache_backend.before_diffuse(is_dummy=is_dummy)
 
             paged_kv_runtime = None

@@ -4,8 +4,7 @@
 Composite cache backend combining inter_request and cache_dit.
 
 This allows both cross-request latent reuse (inter_request) and intra-request
-block-level caching (cache_dit) to work together. When inter_request resumes
-from step N, cache_dit operates on the remaining (total - N) steps.
+block-level caching (cache_dit) to work together.
 
 Usage:
     omni = Omni(
@@ -27,6 +26,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from vllm_omni.diffusion.cache.cachedit.backend import CacheDiTBackend
 from vllm_omni.diffusion.cache.inter_request.backend import InterRequestCacheBackend
 
 logger = logging.getLogger(__name__)
@@ -36,22 +36,24 @@ class CompositeCacheBackend(InterRequestCacheBackend):
     """
     Composite backend that combines inter_request with cache_dit.
 
-    Inherits from InterRequestCacheBackend so all isinstance() checks in the
-    runner work transparently. Internally creates and manages a CacheDiTBackend
-    for block-level caching within each denoising step.
+    Inherits from InterRequestCacheBackend so all polymorphic cache hooks
+    (short_circuit_requests / post_forward_store / ...) work transparently.
+    Internally creates and manages a CacheDiTBackend for block-level caching
+    within each denoising step.
 
     Coordination logic:
     - enable(): enables cache_dit on transformer first, then inter_request recorder
-    - refresh(): when resume_from_step > 0, tells cache_dit to use (total - resume) steps
-    - All other methods (lookup, store, before_diffuse, after_diffuse) inherit from
-      InterRequestCacheBackend unchanged - cache_dit operates automatically via
-      transformer hooks.
+    - refresh(): forwards the FULL num_inference_steps to cache_dit. inter_request
+      resumes by skipping the first N steps at the pipeline loop level (step
+      hook); cache_dit operates inside the transformer and counts its own
+      executed steps from zero, so it must keep the original step count.
+    - All other methods (lookup, store, before_diffuse, after_diffuse) inherit
+      from InterRequestCacheBackend unchanged — cache_dit operates
+      automatically via transformer hooks.
     """
 
     def __init__(self, config: Any):
         super().__init__(config)
-        from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
-
         self._cache_dit_backend = CacheDiTBackend(config)
         logger.info(
             "CompositeCacheBackend initialized: inter_request + cache_dit (Fn=%d, Bn=%d, warmup=%d)",
@@ -73,21 +75,17 @@ class CompositeCacheBackend(InterRequestCacheBackend):
         pipeline: Any,
         num_inference_steps: int,
         verbose: bool = True,
-        resume_from_step: int = 0,
     ) -> None:
-        """Refresh cache_dit context.
+        """Refresh cache_dit context with the full step count.
 
-        When inter_request resumes from step N, the pipeline's denoise loop
-        still iterates over ``num_inference_steps`` steps — inter_request
-        simply skips the first N via the step hook. cache_dit operates inside
-        the transformer and sees the original step indices, so it must be
-        configured with the full ``num_inference_steps`` (not reduced).
-        Reducing the step count here would cause cache_dit to re-run its
-        warmup, losing the block-level acceleration for steps N..N+warmup.
+        inter_request resumes by skipping the first N steps at the pipeline
+        loop level; cache_dit sees the original step indices inside the
+        transformer, so the step count is intentionally NOT reduced by
+        resume_from_step.
         """
         self._cache_dit_backend.refresh(pipeline, num_inference_steps, verbose)
 
     @property
-    def cache_dit_backend(self):
+    def cache_dit_backend(self) -> CacheDiTBackend:
         """Access the internal cache_dit backend for summary/debugging."""
         return self._cache_dit_backend

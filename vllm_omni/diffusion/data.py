@@ -617,8 +617,11 @@ class DiffusionCacheConfig:
     force_refresh_step_policy: str = "once"
     # Inter-request cache parameters [inter_request only]
     inter_request_max_entries: int = 100
-    # DiTCacheStore CPU hot-cache budget; 0 = shell-only mode (latents in LMCache)
-    inter_request_max_memory_gb: float = 0.0
+    # DiTCacheStore CPU hot-cache budget (GB). Without LMCache, entries beyond
+    # this budget are LRU-evicted entirely; with LMCache, only the heavy
+    # tensors are dropped (embedding shells stay searchable). 0 keeps shells
+    # only — meaningful solely in LMCache mode.
+    inter_request_max_memory_gb: float = 4.0
     inter_request_record_step_latents: bool = False
     inter_request_step_latents_dir: str = "./step_latents"
     inter_request_persistent_cache_dir: str | None = None

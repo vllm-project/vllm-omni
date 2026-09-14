@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -19,7 +20,6 @@ logger = logging.getLogger(__name__)
 # ---- Module constants ----
 _MB = 1024**2
 _GB = 1024**3
-_SIM_STATS_PATH = "/tmp/cache_sim_stats.json"
 _SIM_STATS_FLUSH_INTERVAL = 50  # flush similarity stats to file every N searches
 
 
@@ -37,6 +37,9 @@ class CacheKey:
     max_sequence_length: int | None
     num_images_per_prompt: int
     num_frames: int = 1
+    # Fingerprint of model checkpoint + TP world size; namespaces persisted
+    # caches so a dir written by a different model/topology never matches.
+    model_digest: str = ""
 
     def to_hash(self) -> str:
         data = {
@@ -52,6 +55,7 @@ class CacheKey:
             "max_sequence_length": self.max_sequence_length,
             "num_images_per_prompt": self.num_images_per_prompt,
             "num_frames": self.num_frames,
+            "model_digest": self.model_digest,
         }
         serialized = json.dumps(data, sort_keys=True)
         return hashlib.sha256(serialized.encode()).hexdigest()
@@ -81,7 +85,6 @@ class DiTCacheStore:
         max_entries: int = 100,
         max_memory_gb: float = 4.0,
         lmcache_engine: Any | None = None,
-        lmcache_steps_engine: Any | None = None,
         max_stored_steps: int = 0,
         final_disk_dir: str | None = None,
     ):
@@ -98,12 +101,11 @@ class DiTCacheStore:
         self._use_t2i_penalty: bool = True  # enable t2i sigmoid penalty in hybrid matching
 
         # ---- LMCache-backed tiered storage ----
-        # When lmcache_engine is set, put() also writes latents to LMCache (which
-        # manages CPU→Disk tiering + LRU internally). On CPU eviction the entry's
-        # latents are set to None (lightweight shell kept for semantic_search);
-        # a subsequent get() recovers them from LMCache via engine.get().
-        self._lmcache = lmcache_engine  # for step latents (8MB each)
-        self._lmcache_steps = lmcache_steps_engine  # same as _lmcache (backward compat)
+        # When lmcache_engine is set, put() also writes step latents to LMCache
+        # (which manages CPU→Disk tiering + LRU internally). On CPU eviction the
+        # entry's latents are set to None (lightweight shell kept for
+        # semantic_search); a subsequent get() recovers them via engine.get().
+        self._lmcache = lmcache_engine
 
         # Final latent (185MB) uses direct torch.save to disk (async thread)
         # instead of LMCache. This avoids LMCache CPU pool pressure and
@@ -113,13 +115,9 @@ class DiTCacheStore:
             self._final_disk_dir.mkdir(parents=True, exist_ok=True)
         self._final_write_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="final-disk")
 
-        # Monkey-patch ECCacheEngine.put to use busy_loop=True.
-        # LMCache's put() hardcodes busy_loop=False, which means allocate()
-        # gives up immediately on pool pressure instead of waiting for LRU
-        # eviction to free space. With busy_loop=True, allocate() retries
-        # every 0.1s until eviction succeeds — preventing data loss.
+        # Bound LMCache's allocator wait: put() must degrade to a no-store
+        # under sustained pool pressure instead of blocking the request path.
         self._patch_lmcache_busy_loop(self._lmcache)
-        self._patch_lmcache_busy_loop(self._lmcache_steps)
 
         # Max number of step latents to store (0 = all steps).
         # Limits per-entry size; semantic-hit resume beyond this is clamped.
@@ -343,28 +341,18 @@ class DiTCacheStore:
             if self._final_disk_dir is not None:
                 # Async write final latent to disk
                 self._final_write_executor.submit(self._save_final_to_disk, key_hash, cached_latents)
-            if self._lmcache is not None or self._lmcache_steps is not None:
+            if self._lmcache is not None:
                 import torch.distributed as dist
 
                 if dist.is_initialized():
                     time.sleep(dist.get_rank() * 0.5)
-                # Step latents go to LMCache (small 8MB tensors)
-                steps_engine = self._lmcache_steps if self._lmcache_steps is not None else self._lmcache
                 meta_pairs = None
                 if cached_step_latents:
                     meta_pairs = torch.tensor(
                         [[s.step_index, s.timestep] for s in cached_step_latents],
                         dtype=torch.float32,
                     )
-                if steps_engine is not None:
-                    self._lmcache_put_entry_with_lock(
-                        key_hash,
-                        cached_latents,
-                        cached_step_latents,
-                        meta_pairs,
-                        final_engine=None,
-                        steps_engine=steps_engine,
-                    )
+                self._put_steps_to_lmcache(key_hash, cached_step_latents, meta_pairs)
 
             self._evict_if_needed(tensor_bytes)
 
@@ -396,28 +384,23 @@ class DiTCacheStore:
                 len(self._store),
             )
 
-    def _lmcache_put_entry_with_lock(
+    def _put_steps_to_lmcache(
         self,
         key_hash: str,
-        final_latent: torch.Tensor,
         step_latents: list[StepLatentData] | None,
         meta_pairs: torch.Tensor | None,
-        final_engine: Any | None = None,
-        steps_engine: Any | None = None,
     ) -> None:
-        """Write a complete cache entry to LMCache with retry on failure.
+        """Write step latents + meta to LMCache with bounded retry on failure.
 
-        Uses two separate engines to avoid fragmentation:
-        - final_engine: stores the 185MB final latent (uniform large blocks)
-        - steps_engine: stores 8MB step latents + meta (uniform small blocks)
-        If only one engine is provided, all data goes to it (backward compat).
+        The final latent is NOT stored via LMCache (it goes to torch.save);
+        only steps_meta and the per-step latents are written here.
         """
         max_retries = 5
 
-        def _put_with_retry(engine, key: str, tensor: torch.Tensor) -> bool:
+        def _put_with_retry(key: str, tensor: torch.Tensor) -> bool:
             backoff = 1.0
             for attempt in range(max_retries):
-                if engine.put(key, tensor):
+                if self._lmcache.put(key, tensor):
                     return True
                 logger.info(
                     "LMCache put retry %d/%d for %s (waiting %.1fs)",
@@ -431,26 +414,19 @@ class DiTCacheStore:
             logger.warning("LMCache put failed after %d retries for %s", max_retries, key[:24])
             return False
 
-        # Write final latent to final_engine (only if explicitly provided).
-        # If final_engine is None, final was already saved via torch.save.
-        if final_engine is not None:
-            _put_with_retry(final_engine, f"{key_hash}:final", final_latent)
-
-        # Write step latents to steps_engine (or final_engine if only one).
-        se = steps_engine if steps_engine is not None else final_engine
-        if se is not None:
-            if meta_pairs is not None:
-                _put_with_retry(se, f"{key_hash}:steps_meta", meta_pairs)
-            if step_latents:
-                for s in step_latents:
-                    _put_with_retry(se, f"{key_hash}:step_{s.step_index:04d}", s.latent)
+        if meta_pairs is not None:
+            _put_with_retry(f"{key_hash}:steps_meta", meta_pairs)
+        if step_latents:
+            for s in step_latents:
+                _put_with_retry(f"{key_hash}:step_{s.step_index:04d}", s.latent)
 
     def _recover_latents_from_lmcache(self, entry: CacheEntry, key_hash: str) -> bool:
         """Recover entry.latents if it was evicted to None.
         Called inside self._lock. Returns True if latents are now available."""
         if entry.latents is not None:
             return True
-        # Try disk first (final latent saved via torch.save)
+        # Final latents are only persisted via torch.save (never written to
+        # the LMCache steps engine), so recovery is disk-only.
         if self._final_disk_dir is not None:
             path = self._final_disk_dir / f"{key_hash}.pt"
             if path.exists():
@@ -459,17 +435,7 @@ class DiTCacheStore:
                 self._current_memory_bytes += self._estimate_tensor_bytes(recovered)
                 logger.debug("Recovered %s final latent from disk", key_hash[:8])
                 return True
-        # Fallback to LMCache
-        engine = self._lmcache if self._lmcache is not None else self._lmcache_steps
-        if engine is None:
-            return False
-        recovered = engine.get(f"{key_hash}:final", device="cpu")
-        if recovered is None:
-            return False
-        entry.latents = recovered
-        self._current_memory_bytes += self._estimate_tensor_bytes(recovered)
-        logger.debug("Recovered %s final latent from LMCache", key_hash[:8])
-        return True
+        return False
 
     def get(self, key: CacheKey, target_device: torch.device | str | None = None) -> torch.Tensor | None:
         key_hash = key.to_hash()
@@ -729,20 +695,19 @@ class DiTCacheStore:
 
             # LMCache recovery: if step_latents were evicted from CPU, recover.
             if entry.step_latents is None:
-                steps_engine = self._lmcache_steps if self._lmcache_steps is not None else self._lmcache
-                if steps_engine is None:
+                if self._lmcache is None:
                     return None
                 # Recover final latent first (to ensure entry is warm).
                 self._recover_latents_from_lmcache(entry, key_hash)
-                # Recover step latents from steps_engine using the meta tensor.
-                meta = steps_engine.get(f"{key_hash}:steps_meta", device="cpu")
+                # Recover step latents from LMCache using the meta tensor.
+                meta = self._lmcache.get(f"{key_hash}:steps_meta", device="cpu")
                 if meta is None:
                     return None
                 recovered_steps = []
                 for row in meta:
                     si = int(row[0].item())
                     ts = float(row[1].item())
-                    latent = steps_engine.get(f"{key_hash}:step_{si:04d}", device="cpu")
+                    latent = self._lmcache.get(f"{key_hash}:step_{si:04d}", device="cpu")
                     if latent is None:
                         break
                     recovered_steps.append(StepLatentData(step_index=si, timestep=ts, latent=latent))
@@ -782,28 +747,22 @@ class DiTCacheStore:
         return self._hits / total
 
     def get_similarity_stats(self) -> dict:
-        """Return distribution stats of all similarity values collected.
-        Reads from a shared file so it can be called from any process."""
-        try:
-            with open(_SIM_STATS_PATH) as f:
-                return json.load(f)
-        except Exception:
-            return {"final_sim": {"total_comparisons": 0}, "t2t_sim": {"total_comparisons": 0}}
+        """Return distribution stats of the similarity values seen so far.
+
+        In-process stats are returned directly; the optional shared JSON dump
+        (env ``INTER_REQUEST_SIM_STATS_PATH``) is written periodically by
+        ``_flush_sim_stats_to_file`` if configured.
+        """
+        with self._lock:
+            return self._compute_similarity_stats()
 
     def reset_similarity_stats(self) -> None:
-        """Clear collected similarity values and reset the shared file."""
+        """Clear collected similarity values."""
         with self._lock:
             self._all_sims.clear()
             self._all_t2t_sims.clear()
-        try:
-            with open(_SIM_STATS_PATH, "w") as f:
-                json.dump({"final_sim": {"total_comparisons": 0}, "t2t_sim": {"total_comparisons": 0}}, f)
-        except Exception:
-            pass
 
-    def _flush_sim_stats_to_file(self) -> None:
-        """Write current sim stats to a shared file (called from within lock)."""
-
+    def _compute_similarity_stats(self) -> dict:
         def _compute_stats(values):
             if not values:
                 return {"total_comparisons": 0}
@@ -822,13 +781,24 @@ class DiTCacheStore:
                 "gte_0.5": int(np.sum(arr >= 0.5)),
             }
 
-        result = {
+        return {
             "final_sim": _compute_stats(self._all_sims),
             "t2t_sim": _compute_stats(self._all_t2t_sims),
         }
+
+    def _flush_sim_stats_to_file(self) -> None:
+        """Optionally dump sim stats to a file (called from within lock).
+
+        Disabled by default: a fixed path would be clobbered by every rank /
+        worker process. Set ``INTER_REQUEST_SIM_STATS_PATH`` to enable, and
+        give each rank its own path (e.g. suffix by rank) to avoid conflicts.
+        """
+        path = os.environ.get("INTER_REQUEST_SIM_STATS_PATH")
+        if not path:
+            return
         try:
-            with open(_SIM_STATS_PATH, "w") as f:
-                json.dump(result, f)
+            with open(path, "w") as f:
+                json.dump(self._compute_similarity_stats(), f)
         except Exception:
             pass
 
@@ -1091,39 +1061,82 @@ class DiTCacheStore:
         except Exception as e:
             logger.warning("Failed to save final latent %s: %s", key_hash[:8], e)
 
-    @staticmethod
-    def _patch_lmcache_busy_loop(engine):
-        """Patch LMCache allocator to use busy_loop=True everywhere.
+    # Bounded wait for LMCache allocation under pool pressure. A put() that
+    # cannot get memory within this budget degrades to a no-store instead of
+    # blocking the request path indefinitely.
+    _LMCACHE_ALLOC_TIMEOUT_S = 30.0
 
-        LMCache hardcodes busy_loop=False in two places:
-        1. ECCacheEngine.put() → allocate()
-        2. StorageManager.batched_put() → allocate_and_copy_objects() → allocate()
-        Both give up immediately on pool pressure. We patch the allocator
-        backend's allocate() method itself to always use busy_loop=True,
-        covering both call sites.
+    @classmethod
+    def _patch_lmcache_busy_loop(cls, engine):
+        """Bound LMCache's allocator wait on pool pressure.
+
+        LMCache's put() calls allocate() with busy_loop=False, which gives up
+        immediately when the CPU pool is full (before LRU eviction can free
+        space). We wrap allocate() with our own bounded retry loop: retry the
+        non-blocking allocation every 0.1s while eviction drains the pool, and
+        give up (return None) after ``_LMCACHE_ALLOC_TIMEOUT_S`` so put()
+        degrades to a no-store rather than hanging the request path.
+
+        NOTE: reaches into engine._storage_manager.allocator_backend (private
+        LMCache internals); verified against lmcache 0.5.1, which the
+        ``inter_request`` extra pins.
         """
         if engine is None:
             return
-        alloc_backend = engine._storage_manager.allocator_backend
+        try:
+            alloc_backend = engine._storage_manager.allocator_backend
+        except AttributeError:
+            # Engine without the expected private layout (test doubles, or a
+            # future LMCache reshaping its internals): skip the bound, put()
+            # keeps LMCache's own give-up-immediately allocation semantics.
+            logger.debug(
+                "LMCache allocator layout not found on %s; skipping bounded-wait patch",
+                type(engine).__name__,
+            )
+            return
         original_allocate = alloc_backend.allocate
 
         def patched_allocate(shapes, dtypes, fmt=None, eviction=True, busy_loop=True):
-            return original_allocate(shapes, dtypes, fmt, eviction=eviction, busy_loop=True)
+            deadline = time.monotonic() + cls._LMCACHE_ALLOC_TIMEOUT_S
+            while True:
+                mem_obj = original_allocate(shapes, dtypes, fmt, eviction=eviction, busy_loop=False)
+                if mem_obj is not None:
+                    return mem_obj
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "LMCache allocation timed out after %.0fs (sustained pool pressure); skipping store",
+                        cls._LMCACHE_ALLOC_TIMEOUT_S,
+                    )
+                    return None
+                time.sleep(0.1)
 
         alloc_backend.allocate = patched_allocate
-
-    @staticmethod
-    def _is_rank0() -> bool:
-        """Check if this process is rank 0 (or single-process)."""
-        import torch.distributed as dist
-
-        return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def build_cache_key_from_request(
     req: Any,
     pipeline: Any,
+    model_digest: str = "",
 ) -> CacheKey | None:
+    """Build a cache key from a diffusion request.
+
+    Returns None (cache disabled for this request) when the request cannot be
+    identified deterministically or safely reused:
+
+    - non text prompts (tokens/embedding/custom prompt objects) have no stable
+      text identity and would cross-collide;
+    - image-conditioned requests (``multi_modal_data`` in the prompt dict,
+      e.g. Qwen-Image-Edit / Wan2.2-i2v) are not keyed on the conditioning
+      image, so reuse could return an edit of the wrong source image;
+    - requests without an explicit seed (and without a generator whose seed
+      can be resolved) are random by definition — caching would silently make
+      them deterministic.
+
+    Args:
+        model_digest: fingerprint of model checkpoint + TP world size,
+            namespacing persisted caches so a dir written by a different
+            model or topology never serves foreign latents.
+    """
     try:
         prompt_item = getattr(req, "prompt", None)
         if prompt_item is None:
@@ -1134,8 +1147,23 @@ def build_cache_key_from_request(
         if isinstance(prompt_item, str):
             prompt_text = prompt_item
         elif isinstance(prompt_item, dict):
-            prompt_text = prompt_item.get("prompt", "")
+            if prompt_item.get("multi_modal_data"):
+                # Image-conditioned generation: the conditioning image is not
+                # part of the key, so reuse would conflate different sources.
+                return None
+            if prompt_item.get("prompt_embeds") is not None:
+                # Embedding prompts have no stable text identity.
+                return None
+            prompt_text = prompt_item.get("prompt")
+            if not isinstance(prompt_text, str) or not prompt_text:
+                # Token dicts / structured payloads without a text prompt
+                # have no stable text identity either.
+                return None
             negative_prompt_text = prompt_item.get("negative_prompt", "") or ""
+        else:
+            # OmniTokensPrompt / OmniCustomPrompt / other structured forms:
+            # no stable text identity.
+            return None
 
         sampling = req.sampling_params
 
@@ -1151,13 +1179,17 @@ def build_cache_key_from_request(
         num_inference_steps = sampling.num_inference_steps or 50
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
         true_cfg_scale = sampling.true_cfg_scale or 1.0
-        seed = sampling.seed if sampling.seed is not None else -1
-        if seed == -1 and sampling.generator is not None:
+        seed = sampling.seed
+        if seed is None and sampling.generator is not None:
             try:
                 if isinstance(sampling.generator, torch.Generator):
                     seed = sampling.generator.initial_seed()
             except Exception:
-                pass
+                seed = None
+        if seed is None:
+            # Unseeded requests are random samples; caching them would make
+            # every identical prompt return the first request's output.
+            return None
 
         sigmas = tuple(sampling.sigmas) if sampling.sigmas is not None else None
         max_sequence_length = sampling.max_sequence_length
@@ -1177,6 +1209,7 @@ def build_cache_key_from_request(
             max_sequence_length=max_sequence_length,
             num_images_per_prompt=num_images_per_prompt,
             num_frames=num_frames,
+            model_digest=model_digest,
         )
     except Exception as e:
         logger.warning("Failed to build cache key: %s", e)

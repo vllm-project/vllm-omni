@@ -98,7 +98,6 @@ class InterRequestCacheBackend(CacheBackend):
                 metadata=lc_metadata,
                 encoder_dtype=_torch.float32,
             )
-            self._lmcache_steps_engine = self._lmcache_engine
             logger.info(
                 "LMCache ECCacheEngine initialized for step latents: steps_dir=%s, cpu_gb=%.1f",
                 steps_dir,
@@ -106,7 +105,6 @@ class InterRequestCacheBackend(CacheBackend):
             )
         else:
             self._lmcache_engine = None
-            self._lmcache_steps_engine = None
 
         # Final latent directory (torch.save direct to disk, bypasses LMCache)
         final_disk_dir = None
@@ -118,10 +116,12 @@ class InterRequestCacheBackend(CacheBackend):
             max_entries=max_entries,
             max_memory_gb=max_memory_gb,
             lmcache_engine=self._lmcache_engine,
-            lmcache_steps_engine=self._lmcache_steps_engine,
             max_stored_steps=getattr(config, "inter_request_max_stored_steps", 0),
             final_disk_dir=final_disk_dir,
         )
+        # Fingerprint of model checkpoint + TP world size; included in every
+        # cache key so persisted caches are namespaced per model/topology.
+        self._model_digest = ""
         self._pipeline = None
 
         self._persistent_cache_dir = getattr(config, "inter_request_persistent_cache_dir", None)
@@ -161,6 +161,7 @@ class InterRequestCacheBackend(CacheBackend):
     def enable(self, pipeline: Any) -> None:
         self._pipeline = pipeline
         self.enabled = True
+        self._model_digest = self._compute_model_digest(pipeline)
         self._recorder = StepLatentsRecorder()
         # Register as a general-purpose denoising-step hook (see
         # ProgressBarMixin). Kept also as an attribute for backwards compat.
@@ -185,9 +186,35 @@ class InterRequestCacheBackend(CacheBackend):
                 )
 
         logger.info(
-            "InterRequestCacheBackend enabled on pipeline %s",
+            "InterRequestCacheBackend enabled on pipeline %s (model_digest=%s)",
             pipeline.__class__.__name__,
+            self._model_digest[:8] or "n/a",
         )
+
+    @staticmethod
+    def _compute_model_digest(pipeline: Any) -> str:
+        """Fingerprint the model checkpoint + TP topology for cache namespacing.
+
+        Persisted caches written by a different model or world size must never
+        be served: identical prompts across checkpoints would collide on hash
+        keys otherwise.
+        """
+        import hashlib
+
+        parts = [type(pipeline).__name__]
+        for attr in ("name_or_path", "model_name", "_name_or_path"):
+            val = getattr(pipeline, attr, None)
+            if isinstance(val, str) and val:
+                parts.append(val)
+                break
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                parts.append(f"tp{dist.get_world_size()}")
+        except Exception:
+            pass
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
     def _init_clip_encoder(self) -> None:
         try:
@@ -296,17 +323,71 @@ class InterRequestCacheBackend(CacheBackend):
             logger.debug("encode_image_cpu failed: %s", e)
             return None
 
-    def update_image_embedding(self, cache_key_hash: str | None, image_tensor: torch.Tensor) -> None:
+    def _decode_latent_to_image(self, latent: torch.Tensor, height: int, width: int) -> torch.Tensor | None:
+        """Best-effort decode of a final latent to a pixel image [B, 3, H, W].
+
+        The t2i image-similarity penalty needs the *generated image*, but the
+        runner only hands us the pre-VAE latent. Decode via the pipeline's VAE
+        on its native device; on any failure return None (the entry then stays
+        in the text-only matching group — no penalty, but matching still works).
+        """
+        if self._pipeline is None:
+            return None
+        try:
+            decoded = None
+            decode = getattr(self._pipeline, "_decode_latents", None)
+            if decode is not None:
+                decoded = decode(latent.to(next(self._pipeline.vae.parameters()).device), height, width, "pt")
+            vae = getattr(self._pipeline, "vae", None)
+            if (decoded is None) and (vae is not None):
+                scale = getattr(getattr(vae, "config", None), "scaling_factor", None)
+                scaled = latent / scale if scale else latent
+                decoded = vae.decode(scaled.to(next(vae.parameters()).device)).sample
+            if decoded is None:
+                return None
+            if decoded.dim() == 4 and decoded.shape[1] != 3:
+                return None
+            return decoded.detach()
+        except Exception as e:
+            logger.debug("latent decode for image embedding failed: %s", e)
+            return None
+
+    def update_image_embedding(self, cache_key_hash: str | None, image_or_latent: torch.Tensor) -> None:
+        """Store the image embedding for a cache entry (t2i hybrid penalty).
+
+        Accepts either a pixel image [B, 3, H, W] or a final latent; latents
+        are decoded through the pipeline VAE first. Runs on the background
+        final-latent executor to keep decode off the request path.
+        """
         if cache_key_hash is None:
             return
         if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
             return
-        # Force CPU for image embedding to avoid NPU async issues in daemon threads
-        image_emb = self._encode_image_cpu(image_tensor)
-        logger.info("UPDATE_IMG: encode_image result is None=%s", image_emb is None)
-        if image_emb is not None:
-            self._cache_store.update_image_embedding(cache_key_hash, image_emb)
-            logger.info("UPDATE_IMG: stored image embedding for %s", cache_key_hash[:8])
+        t = image_or_latent
+        is_pixel_image = t.dim() == 4 and t.shape[1] == 3
+        if is_pixel_image:
+            image = t
+        else:
+            # Latent: decode in the background so VAE cost stays off the
+            # request path; dimensions come from the stored cache key.
+            entry_key = self._cache_store._store.get(cache_key_hash)
+            h = entry_key.cache_key.height if entry_key is not None and entry_key.cache_key else None
+            w = entry_key.cache_key.width if entry_key is not None and entry_key.cache_key else None
+            if h is None or w is None:
+                return
+            image = self._decode_latent_to_image(t.detach().cpu(), h, w)
+            if image is None:
+                logger.debug("no image embedding for %s: latent decode unavailable", cache_key_hash[:8])
+                return
+
+        def _encode_and_store():
+            # Force CPU for image embedding to avoid NPU async issues in executor threads
+            image_emb = self._encode_image_cpu(image)
+            if image_emb is not None:
+                self._cache_store.update_image_embedding(cache_key_hash, image_emb)
+                logger.debug("stored image embedding for %s", cache_key_hash[:8])
+
+        self._cache_store._final_write_executor.submit(_encode_and_store)
 
     def semantic_lookup(
         self, req: Any, target_device: torch.device | str | None = None
@@ -314,7 +395,7 @@ class InterRequestCacheBackend(CacheBackend):
         if not self.enabled or self._clip_model is None:
             return None, None, 0.0, None, None
 
-        cache_key = build_cache_key_from_request(req, self._pipeline)
+        cache_key = build_cache_key_from_request(req, self._pipeline, model_digest=self._model_digest)
         if cache_key is None:
             return None, None, 0.0, None, None
 
@@ -408,7 +489,7 @@ class InterRequestCacheBackend(CacheBackend):
         if not self.enabled or self._pipeline is None:
             return None
 
-        cache_key = build_cache_key_from_request(req, self._pipeline)
+        cache_key = build_cache_key_from_request(req, self._pipeline, model_digest=self._model_digest)
         if cache_key is None:
             return None
 
@@ -420,7 +501,7 @@ class InterRequestCacheBackend(CacheBackend):
         if not self.enabled or self._pipeline is None:
             return None
 
-        cache_key = build_cache_key_from_request(req, self._pipeline)
+        cache_key = build_cache_key_from_request(req, self._pipeline, model_digest=self._model_digest)
         if cache_key is None:
             return None
 
@@ -436,7 +517,7 @@ class InterRequestCacheBackend(CacheBackend):
         if not self.enabled or self._pipeline is None:
             return None
 
-        cache_key = build_cache_key_from_request(req, self._pipeline)
+        cache_key = build_cache_key_from_request(req, self._pipeline, model_digest=self._model_digest)
         if cache_key is None:
             return None
 
@@ -512,6 +593,12 @@ class InterRequestCacheBackend(CacheBackend):
             if self.clip_enabled:
                 clip_result = self.semantic_lookup(req, target_device=target_device)
                 clip_latents, clip_step_latents, clip_sim, _, _ = clip_result
+                if clip_latents is not None and clip_step_latents is None:
+                    # The matched entry was evicted to a shell (heavy tensors
+                    # dropped, embeddings kept). semantic_lookup cannot return
+                    # step latents for shells — recover them from LMCache the
+                    # same way the exact-hit path does.
+                    clip_step_latents = self.lookup_step_latents(req, target_device=target_device)
                 if clip_latents is not None and clip_step_latents is not None:
                     total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
                     clip_resume_step = self.compute_skip_steps(clip_sim, total_steps)
@@ -563,24 +650,17 @@ class InterRequestCacheBackend(CacheBackend):
                     for r in self._recorder.records
                 ]
             cache_key_hash = self.store(req, output.output, step_latents=step_latents_data)
-            logger.info(
-                "STORE_DEBUG: hash=%s output_shape=%s resumed=%s",
-                cache_key_hash,
-                output.output.shape if hasattr(output.output, "shape") else "N/A",
-                recorder_resumed,
-            )
-            if cache_key_hash is not None:
-                output.custom_output["cache_key_hash"] = cache_key_hash
-                if runner is not None and hasattr(runner, "_update_cache_image_embedding"):
-                    runner._update_cache_image_embedding(cache_key_hash, output.output)
             if recorder_resumed:
                 steps_desc = "skipped(resumed)"
             else:
                 steps_desc = f"{len(step_latents_data) if step_latents_data else 0} steps"
-            logger.info(
-                "Inter-request cache: stored DiT output for future reuse (step_latents=%s)",
+            logger.debug(
+                "Inter-request cache: stored %s (step_latents=%s)",
+                cache_key_hash[:8] if cache_key_hash else "n/a",
                 steps_desc,
             )
+            if cache_key_hash is not None and runner is not None and hasattr(runner, "_update_cache_image_embedding"):
+                runner._update_cache_image_embedding(cache_key_hash, output.output)
         return outputs
 
     def merge_hit_outputs(self, outputs: list, hit_outputs: list) -> list:
