@@ -129,6 +129,7 @@ class Cosmos3NanoSimBimanualSessionFingerprint:
     checkpoint_id: str
     manifest_id: str
     sampler_id: str
+    action_space: str = "raw"
 
     def __post_init__(self) -> None:
         if not self.prompt_hash:

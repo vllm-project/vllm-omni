@@ -1,21 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run a Cosmos3-Nano-Sim-Bimanual sample from the reference JSONL/NPZ format."""
+"""Run Cosmos3-Nano-Sim-Bimanual from reference JSONL/NPZ or action-sidecar and camera JSONL inputs."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
-
-from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.platforms import current_omni_platform
 
 
 def _load_record(jsonl_path: Path, sample_index: int) -> dict[str, Any]:
@@ -79,6 +77,8 @@ def _first_image(record: dict[str, Any], *, base_dir: Path) -> Image.Image | Non
 
 
 def _unwrap_video(output: Any) -> Any:
+    from vllm_omni.outputs import OmniRequestOutput
+
     if isinstance(output, list):
         output = output[0]
     if isinstance(output, OmniRequestOutput):
@@ -98,7 +98,7 @@ def _video_frames(video: Any) -> list[np.ndarray]:
         if video.ndim == 4 and video.shape[0] in (3, 4):
             video = video.permute(1, 2, 3, 0)
         if video.is_floating_point():
-            video = video.clamp(-1, 1) * 0.5 + 0.5
+            video = video.float().clamp(-1, 1) * 0.5 + 0.5
         video = video.numpy()
     array = np.asarray(video)
     if array.ndim == 5:
@@ -111,79 +111,234 @@ def _video_frames(video: Any) -> list[np.ndarray]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Converted Cosmos3-Nano-Sim-Bimanual Diffusers directory.")
-    parser.add_argument("--jsonl", type=Path, required=True, help="Reference inference jsonl file.")
-    parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--jsonl", type=Path, required=True, help="Input JSONL records.")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--sample-index", type=int, default=0)
+    selection.add_argument("--all-samples", action="store_true")
+    parser.add_argument("--input-format", choices=("reference", "cookbook"), default="reference")
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml")
     parser.add_argument("--output", type=Path, default=Path("cosmos3_nano_sim_bimanual.mp4"))
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--output-type", choices=("video", "latent"), default="video")
-    return parser.parse_args()
+    parser.add_argument("--resolution", type=int, default=None)
+    parser.add_argument("--camera-trajectory")
+    parser.add_argument("--camera-translation-scale", type=float)
+    parser.add_argument("--camera-action-normalization", choices=("global_asinh", "scale"))
+    parser.add_argument("--camera-pose-convention", choices=("backward_chunk_anchored_16f", "backward_framewise"))
+    parser.add_argument("--camera-num-frames", type=int)
+    args = parser.parse_args()
+    if args.all_samples and args.output_dir is None:
+        parser.error("--all-samples requires --output-dir")
+    if args.input_format == "reference" and any(
+        getattr(args, key) is not None
+        for key in (
+            "resolution",
+            "camera_trajectory",
+            "camera_translation_scale",
+            "camera_action_normalization",
+            "camera_pose_convention",
+            "camera_num_frames",
+        )
+    ):
+        parser.error("Resolution/camera recipe flags require --input-format cookbook")
+    return args
 
 
-def main() -> None:
-    args = parse_args()
-    record = _load_record(args.jsonl, args.sample_index)
+def _reference_request(
+    record: dict[str, Any], args: argparse.Namespace
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     prompt = str(record.get("prompt", record.get("ai_caption", record.get("text", ""))))
     image = _first_image(record, base_dir=args.jsonl.parent)
     action_value = record.get("action", record.get("actions"))
     action = None if action_value is None else torch.as_tensor(action_value, dtype=torch.float32)
     fps = float(
         args.fps
-        or record.get(
-            "fps",
-            record.get("conditioning_fps", record.get("frame_rate", 15.0)),
-        )
+        if args.fps is not None
+        else record.get("fps", record.get("conditioning_fps", record.get("frame_rate", 15.0)))
     )
-    num_frames = args.num_frames
-    if num_frames is None:
-        num_frames = int(record.get("num_frames", action.shape[0] + 1 if action is not None else 17))
-
+    num_frames = (
+        args.num_frames
+        if args.num_frames is not None
+        else int(record.get("num_frames", action.shape[0] + 1 if action is not None else 17))
+    )
     prompt_data: dict[str, Any] = {"prompt": prompt}
     if image is not None:
         prompt_data["multi_modal_data"] = {"image": image}
-    extra_args: dict[str, Any] = {
-        "session_id": f"offline-{args.sample_index}",
-        "reset": True,
-        "close_session": True,
-        "domain_id": int(record.get("domain_id", 15)),
-    }
+    extra: dict[str, Any] = {}
     domain_name = record.get("domain_name", record.get("embodiment"))
     if domain_name is not None:
-        extra_args["domain_name"] = str(domain_name)
+        extra["domain_name"] = str(domain_name)
+    if record.get("domain_id") is not None:
+        extra["domain_id"] = int(record["domain_id"])
     if action is not None:
-        extra_args["action"] = action
+        extra["action"] = action
+    if "action_space" in record:
+        extra["action_space"] = record["action_space"]
+    params = {
+        "height": args.height,
+        "width": args.width,
+        "num_frames": num_frames,
+        "frame_rate": fps,
+        "seed": args.seed if args.seed is not None else 42,
+    }
+    return prompt_data, {**params, "extra_args": extra}, {**params, "synthetic": True}
 
-    omni = Omni(
-        model=args.model,
-        model_class_name="Cosmos3NanoSimBimanualPipeline",
-        deploy_config=args.deploy_config,
-        enforce_eager=True,
-    )
-    sampling_params = OmniDiffusionSamplingParams(
-        height=args.height,
-        width=args.width,
-        num_frames=num_frames,
-        num_inference_steps=4,
-        guidance_scale=1.0,
-        frame_rate=fps,
-        seed=args.seed,
-        output_type="latent" if args.output_type == "latent" else None,
-        generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed),
-        extra_args=extra_args,
-    )
-    result = _unwrap_video(omni.generate(prompt_data, sampling_params))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    if args.output_type == "latent":
-        torch.save(result, args.output)
-    else:
-        from diffusers.utils import export_to_video
 
-        export_to_video(_video_frames(result), str(args.output), fps=fps)
-    print(f"Saved Cosmos3-Nano-Sim-Bimanual {args.output_type} output to {args.output}")
+def _video_metadata(path: Path) -> dict[str, Any]:
+    import imageio.v2 as imageio
+
+    count = 0
+    with imageio.get_reader(str(path)) as reader:
+        fps = float(reader.get_meta_data()["fps"])
+        height = width = 0
+        for frame in reader:
+            height, width = frame.shape[:2]
+            count += 1
+    return {"actual_num_frames": count, "actual_fps": fps, "actual_height": height, "actual_width": width}
+
+
+def main() -> None:
+    args = parse_args()
+    from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.platforms import current_omni_platform
+
+    manifest = None
+    if args.input_format == "cookbook":
+        from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
+
+        config_path = Path(args.model) / "transformer" / "config.json"
+        manifest = Cosmos3NanoSimBimanualManifest.from_od_config(
+            SimpleNamespace(tf_model_config=json.loads(config_path.read_text(encoding="utf-8")))
+        )
+        manifest.require_exported_artifact()
+    count = sum(bool(line.strip()) for line in args.jsonl.read_text().splitlines())
+    indexes = range(count) if args.all_samples else [args.sample_index]
+    if count == 0:
+        raise ValueError("The input JSONL is empty.")
+    output_dir = args.output_dir or args.output.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    statuses: list[dict[str, Any]] = []
+    omni = None
+    try:
+        for index in indexes:
+            status: dict[str, Any] = {"sample_index": index, "status": "failed"}
+            started = time.perf_counter()
+            try:
+                record = _load_record(args.jsonl, index)
+                status["name"] = str(record.get("name", f"sample_{index}"))
+                if args.output_dir:
+                    name = re.sub(r"[^A-Za-z0-9_.-]", "_", status["name"]).strip(".") or "sample"
+                    output = output_dir / f"{index:04d}_{name}{'.pt' if args.output_type == 'latent' else '.mp4'}"
+                else:
+                    output = args.output
+                status["output"] = str(output)
+                if manifest is not None:
+                    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.cookbook import prepare_cookbook_input
+
+                    keys = (
+                        "seed",
+                        "fps",
+                        "num_frames",
+                        "height",
+                        "width",
+                        "resolution",
+                        "camera_trajectory",
+                        "camera_translation_scale",
+                        "camera_action_normalization",
+                        "camera_pose_convention",
+                        "camera_num_frames",
+                    )
+                    prepared = prepare_cookbook_input(
+                        record,
+                        manifest=manifest,
+                        base_dir=args.jsonl.parent,
+                        cache_dir=output_dir / ".inputs",
+                        overrides={key: getattr(args, key) for key in keys},
+                    )
+                    prompt_data = {"prompt": prepared.prompt}
+                    if prepared.image is not None:
+                        prompt_data["multi_modal_data"] = {"image": prepared.image}
+                    params = {
+                        "height": prepared.height,
+                        "width": prepared.width,
+                        "num_frames": prepared.num_frames,
+                        "frame_rate": prepared.fps,
+                        "seed": prepared.seed,
+                        "extra_args": prepared.extra_args,
+                    }
+                    status.update(prepared.metadata)
+                    if prepared.poses is not None:
+                        pose_path = output.with_suffix(".camera_trajectory.json")
+                        pose_path.write_text(json.dumps(prepared.poses.tolist()) + "\n", encoding="utf-8")
+                        status["camera_trajectory_path"] = str(pose_path)
+                else:
+                    prompt_data, params, metadata = _reference_request(record, args)
+                    status.update(metadata)
+                params["extra_args"].update(session_id=f"offline-{index}", reset=True, close_session=True)
+                print(
+                    json.dumps(
+                        {
+                            "sample_index": index,
+                            "seed": params["seed"],
+                            "num_frames": params["num_frames"],
+                            "fps": params["frame_rate"],
+                            "num_steps": 4,
+                            "guidance_scale": 1.0,
+                        }
+                    )
+                )
+                if omni is None:
+                    omni = Omni(
+                        model=args.model,
+                        model_class_name="Cosmos3NanoSimBimanualPipeline",
+                        deploy_config=args.deploy_config,
+                        enforce_eager=True,
+                    )
+                sampling_params = OmniDiffusionSamplingParams(
+                    **params,
+                    num_inference_steps=4,
+                    guidance_scale=1.0,
+                    output_type="latent" if args.output_type == "latent" else None,
+                    generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(params["seed"]),
+                )
+                result = _unwrap_video(omni.generate(prompt_data, sampling_params))
+                if args.output_type == "latent":
+                    torch.save(result, output)
+                    status["latent_shape"] = list(result.shape)
+                else:
+                    from diffusers.utils import export_to_video
+
+                    export_to_video(_video_frames(result), str(output), fps=params["frame_rate"])
+                    status.update(_video_metadata(output))
+                    if status["actual_num_frames"] != params["num_frames"]:
+                        raise ValueError("Output frame count does not match the effective request.")
+                    if abs(status["actual_fps"] - params["frame_rate"]) > 0.01:
+                        raise ValueError("Output FPS does not match the request.")
+                    if params["height"] is not None and (status["actual_height"], status["actual_width"]) != (
+                        params["height"],
+                        params["width"],
+                    ):
+                        raise ValueError("Output dimensions do not match the request.")
+                status["status"] = "success"
+                print(f"Saved Cosmos3-Nano-Sim-Bimanual {args.output_type} output to {output}")
+            except Exception as exc:
+                status["error"] = f"{type(exc).__name__}: {exc}"
+                print(f"Sample {index} failed: {status['error']}")
+            finally:
+                status["elapsed_seconds"] = time.perf_counter() - started
+                statuses.append(status)
+                (output_dir / "sample_outputs.json").write_text(json.dumps(statuses, indent=2) + "\n", encoding="utf-8")
+    finally:
+        if omni is not None:
+            omni.close()
+    if any(status["status"] != "success" for status in statuses):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

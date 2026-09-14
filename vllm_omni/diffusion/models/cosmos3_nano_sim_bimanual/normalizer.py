@@ -11,6 +11,7 @@ import torch
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import (
     RANGE_FLOOR,
     ActionNormalizerContract,
+    GlobalAsinhNormalizerContract,
     QuantileRotNormalizerContract,
 )
 
@@ -19,11 +20,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ActionAffineNormalizer:
-    """Unclamped affine transform from a validated action contract."""
+    """Unclamped affine transform, optionally followed by exported asinh compression."""
 
     offset: tuple[float, ...]
     scale: tuple[float, ...]
     transform_sha256: str
+    asinh_unit: float | None = None
 
     @classmethod
     def from_contract(
@@ -42,6 +44,7 @@ class ActionAffineNormalizer:
             offset=contract.transform.offset,
             scale=contract.transform.scale,
             transform_sha256=contract.transform_sha256,
+            asinh_unit=contract.transform.unit if isinstance(contract, GlobalAsinhNormalizerContract) else None,
         )
 
     def normalize(self, action: torch.Tensor) -> torch.Tensor:
@@ -58,6 +61,8 @@ class ActionAffineNormalizer:
         offset = action_f32.new_tensor(self.offset)
         scale = action_f32.new_tensor(self.scale)
         normalized = (action_f32 - offset) / scale
+        if self.asinh_unit is not None:
+            normalized = torch.asinh(normalized) / normalized.new_tensor(self.asinh_unit)
         if not torch.isfinite(normalized).all():
             raise ValueError("Cosmos3-Nano-Sim-Bimanual normalized actions must contain only finite values.")
         return normalized

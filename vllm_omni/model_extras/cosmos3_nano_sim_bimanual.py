@@ -4,6 +4,8 @@
 COSMOS3_NANO_SIM_BIMANUAL_EXTRA_BODY_PARAMS = frozenset(
     {
         "action",
+        "action_space",
+        "action_mode",
         "ar_diffusion_tick",
         "chunk_only",
         "close_session",

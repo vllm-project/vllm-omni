@@ -22,13 +22,13 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
-from vllm_omni.diffusion.models.cosmos3.action import load_action_tensor, pad_action_to_dim
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     Cosmos3OmniDiffusersPipeline,
     get_cosmos3_ir_op_priority_func,
     get_cosmos3_post_process_func,
     get_cosmos3_pre_process_func,
 )
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_action_values
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest, deploy_option
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
@@ -111,6 +111,7 @@ class _RequestControls:
     frame_idx: Any
     num_latent_frames: Any
     action: Any
+    action_space: str = "raw"
 
 
 def _resolution_policy(
@@ -503,6 +504,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     def _request_controls(self, sp, extra: Mapping, typed_tick) -> _RequestControls:
         """Read one request's controls from whichever transport supplied them."""
 
+        action_space = self._get_sp_param(sp, "action_space", "raw")
+        if action_space not in ("raw", "model") or (typed_tick is not None and action_space != "raw"):
+            raise ARDiffusionRequestRejectedError(
+                "action_space must be 'raw' or 'model'; typed ticks require raw actions."
+            )
         if typed_tick is not None:
             typed = parse_cosmos3_nano_sim_bimanual_tick(typed_tick)
             return _RequestControls(
@@ -517,6 +523,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 num_latent_frames=typed.num_latent_frames,
                 action=typed.action,
             )
+        action = self._get_sp_param(sp, "action", None)
+        if self._get_sp_param(sp, "action_mode", None) == "forward_dynamics" and action is None:
+            raise ARDiffusionRequestRejectedError("forward_dynamics requires action conditioning.")
         tick = bool(extra.get("chunk_only", False))
         return _RequestControls(
             session_id=str(extra.get("session_id") or self._bound_session_id or "default"),
@@ -528,7 +537,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             domain_name=self._get_sp_param(sp, "domain_name", None),
             frame_idx=extra.get("frame_idx"),
             num_latent_frames=extra.get("num_latent_frames"),
-            action=self._get_sp_param(sp, "action", None),
+            action=action,
+            action_space=action_space,
         )
 
     # -- Session and conditioning -----------------------------------------
@@ -587,6 +597,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         fps: float,
         domain_id: int,
         embodiment: str,
+        action_space: str = "raw",
     ) -> Cosmos3NanoSimBimanualSessionFingerprint:
         return Cosmos3NanoSimBimanualSessionFingerprint(
             prompt_hash=prompt_token_hash(text_ids),
@@ -600,6 +611,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             checkpoint_id=self.checkpoint_id,
             manifest_id=self.manifest.digest,
             sampler_id=self.manifest.sampler_id,
+            action_space=action_space,
         )
 
     # -- Dense/paged transformer bridge -----------------------------------
@@ -679,18 +691,18 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         embodiment: str,
         action_value: Any,
+        action_space: str = "raw",
     ) -> torch.Tensor | None:
         if action_value is None:
             return None
-        action = load_action_tensor(action_value)
         expected_raw_action_dim = self.manifest.raw_action_dim_for(embodiment)
-        if action.shape[-1] != expected_raw_action_dim:
-            raise ValueError(
-                f"Cosmos3-Nano-Sim-Bimanual embodiment {embodiment!r} requires raw action dimension "
-                f"{expected_raw_action_dim}, got {action.shape[-1]}."
-            )
-        action = self.action_normalizers[embodiment].normalize(action)
-        action = pad_action_to_dim(action, self.manifest.max_action_dim)
+        action = prepare_action_values(
+            action_value,
+            width=expected_raw_action_dim,
+            model_width=self.manifest.max_action_dim,
+            action_space=action_space,
+            normalizer=self.action_normalizers[embodiment],
+        )
         return action.to(device=self.device, dtype=self.dtype)
 
     def _resolve_action_layout(
@@ -867,7 +879,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         state: Cosmos3NanoSimBimanualSessionState,
         latents: torch.Tensor,
     ) -> torch.Tensor:
-        """Decode only the new tick block with session-owned Wan features."""
+        """Decode a new causal block with session-owned Wan features."""
 
         result = decode_wan_causal_chunk(
             self.vae,
@@ -1107,6 +1119,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             fps=fps,
             domain_id=domain_id,
             embodiment=embodiment,
+            action_space=controls.action_space,
         )
         start_frame = 0 if state_was_new else existing_state.next_frame_idx
         requested_frame_idx = _admission_int(_first_not_none(controls.frame_idx, start_frame), "frame_idx")
@@ -1126,7 +1139,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 )
 
         try:
-            raw_action = self._prepare_raw_action(embodiment=embodiment, action_value=controls.action)
+            raw_action = self._prepare_raw_action(
+                embodiment=embodiment, action_value=controls.action, action_space=controls.action_space
+            )
         except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         try:
@@ -1164,6 +1179,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(
                     f"Cosmos3-Nano-Sim-Bimanual num_frames must be positive, got {requested_pixel_frames}."
                 )
+            if (requested_pixel_frames - 1) % self.manifest.temporal_compression_factor:
+                raise ARDiffusionRequestRejectedError(
+                    "num_frames must satisfy (num_frames - 1) % temporal_compression_factor == 0; "
+                    f"got {requested_pixel_frames} with factor {self.manifest.temporal_compression_factor}."
+                )
             target_frame = (requested_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
             if target_frame < start_frame:
                 raise ARDiffusionRequestRejectedError(
@@ -1193,6 +1213,16 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)
         request_latent_chunks: list[torch.Tensor] = []
+        # Decode fresh full videos chunk by chunk, releasing GPU latents as we go.
+        # The shared output builder still owns media and guardrail routing.
+        stream_video = not tick and state_was_new and sp.output_type != "latent"
+        decoded_chunks: list[torch.Tensor] = []
+
+        def retain_output(chunk: torch.Tensor) -> None:
+            if stream_video:
+                decoded_chunks.append(self._decode_live_latents(state, chunk).clamp(-1, 1).cpu())
+            else:
+                request_latent_chunks.append(chunk)
 
         if initial_latent is not None and state.next_frame_idx == 0:
             initial_action, initial_null = self._actions_for_frames(
@@ -1220,8 +1250,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                         domain_ids=domain_ids,
                         null_action=bool(initial_null),
                     )
-            state.append_chunk(initial_latent, frame_start=0, retain_latent=not tick)
-            request_latent_chunks.append(initial_latent)
+            state.append_chunk(initial_latent, frame_start=0, retain_latent=not tick and not stream_video)
+            retain_output(initial_latent)
+            del initial_latent
 
         generation_start = state.next_frame_idx
         for chunk_start, chunk_end in iter_ar_chunk_ranges(
@@ -1306,16 +1337,23 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                         domain_ids=domain_ids,
                         null_action=local_idx in null_action_indexes,
                     )
-            state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick)
-            request_latent_chunks.append(clean_chunk)
+            state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick and not stream_video)
+            retain_output(clean_chunk)
+            del clean_chunk
 
-        if not request_latent_chunks:
+        if not request_latent_chunks and not decoded_chunks:
             raise RuntimeError("Cosmos3-Nano-Sim-Bimanual request produced no new latent frames.")
-        request_latents = torch.cat(request_latent_chunks, dim=2)
-        accumulated = state.accumulated_latents
-        if not tick and accumulated is None:
+        request_latents = torch.cat(request_latent_chunks, dim=2) if request_latent_chunks else None
+        accumulated = state.accumulated_latents if not stream_video else None
+        if not tick and not stream_video and accumulated is None:
             raise RuntimeError("Cosmos3-Nano-Sim-Bimanual full rollout produced no accumulated latent frames.")
-        if sp.output_type == "latent":
+        if stream_video:
+            output_value = torch.cat(decoded_chunks, dim=2)
+            if output_value.shape[2] != requested_pixel_frames:
+                raise RuntimeError(
+                    f"Causal decoder returned {output_value.shape[2]} frames; expected {requested_pixel_frames}."
+                )
+        elif sp.output_type == "latent":
             output_value = request_latents if tick else accumulated
         else:
             with self._timed_tick_stage(
