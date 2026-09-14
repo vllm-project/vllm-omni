@@ -16,6 +16,12 @@ def pytest_addoption(parser):
         choices=["core_model", "advanced_model", "full_model"],
         help="Test level to run: L2, L3, L4",
     )
+    parser.addoption(
+        "--run-slow",
+        action="store_true",
+        default=False,
+        help="Run tests marked slow. Nightly stability jobs pass this flag; some trees skip @pytest.mark.slow without it.",
+    )
 
 
 @pytest.fixture(scope="session")

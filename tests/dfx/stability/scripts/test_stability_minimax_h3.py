@@ -25,12 +25,17 @@ from tests.dfx.conftest import (
 )
 from tests.dfx.stability.helpers import _run_one_diffusion_batch, run_stability_benchmark_loop
 from tests.e2e.online_serving.minimax_h3._common import FASTH3_LORA
+from tests.helpers.mark import hardware_marks
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"
 CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test_minimax_h3.json")
 DEFAULT_NUM_PROMPTS_PER_BATCH = 20
 STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "1800", "--init-timeout", "1800"]
+
+# Runtime marks also come from JSON via create_unique_server_pytest_params;
+# keep a helper call here so pre-commit check-mark sees a hardware mark.
+_H800_FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H800"}, num_cards=4)  # noqa: F841
 
 
 def _inject_fasth3_lora_path(configs: list[dict]) -> list[dict]:
