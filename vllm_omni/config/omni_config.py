@@ -153,6 +153,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
+    allowed_local_media_path: str
     active_stream_window: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
@@ -434,6 +435,8 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
+    # Lets ``--allowed-local-media-path`` reach LLM stages (file:// / MediaConnector).
+    allowed_local_media_path: str | None = None
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
