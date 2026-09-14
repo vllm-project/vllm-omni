@@ -13,15 +13,7 @@ from torch import nn
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import LuminaFeedForward
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
-
-
-@pytest.fixture(autouse=True)
-def _mock_tp1(monkeypatch):
-    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1)
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.usefixtures("mock_tp1")]
 
 
 def test_merged_ffn_matches_original_swiglu():

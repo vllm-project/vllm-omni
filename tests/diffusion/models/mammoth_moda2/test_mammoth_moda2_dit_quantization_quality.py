@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
@@ -61,7 +62,8 @@ def _format_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
     )
 
 
-def _extract_image(outputs) -> torch.Tensor:
+def _extract_image(outputs, *, height: int = HEIGHT, width: int = WIDTH) -> torch.Tensor:
+    images = []
     for output_group in outputs:
         request_outputs = output_group if isinstance(output_group, list) else [output_group]
         for request_output in request_outputs:
@@ -72,26 +74,40 @@ def _extract_image(outputs) -> torch.Tensor:
                 multimodal = getattr(completion, "multimodal_output", None)
                 if not isinstance(multimodal, Mapping) or "image" not in multimodal:
                     continue
-                images = multimodal["image"]
-                image = images[0] if isinstance(images, list) else images
-                if not isinstance(image, torch.Tensor):
-                    raise TypeError(f"Expected an image tensor, got {type(image)!r}")
-                if image.ndim == 4:
-                    image = image[0]
-                if image.ndim != 3:
-                    raise ValueError(f"Expected a CHW image tensor, got shape {tuple(image.shape)}")
-                return image.detach().float().cpu()
-    raise ValueError("MammothModa2 pipeline produced no image tensor")
+                payload = multimodal["image"]
+                tensors = payload if isinstance(payload, list) else [payload]
+                for tensor in tensors:
+                    if not isinstance(tensor, torch.Tensor):
+                        raise TypeError(f"Expected an image tensor, got {type(tensor)!r}")
+                    if tensor.ndim == 4:
+                        images.extend(tensor.unbind(0))
+                    elif tensor.ndim == 3:
+                        images.append(tensor)
+                    else:
+                        raise ValueError(f"Expected a CHW or BCHW image tensor, got shape {tuple(tensor.shape)}")
+
+    # Count across every completion, image list, and tensor batch. Never
+    # silently discard extra outputs before the quality comparison.
+    if len(images) != 1:
+        raise ValueError(f"Expected exactly one image, got {len(images)}")
+    image = images[0]
+    expected_shape = (3, height, width)
+    if tuple(image.shape) != expected_shape:
+        raise ValueError(f"Expected RGB image with CHW shape {expected_shape}, got {tuple(image.shape)}")
+    image = image.detach().float().cpu()
+    if not torch.isfinite(image).all():
+        raise ValueError("Generated image contains non-finite values")
+    return image
 
 
 def _to_pil(image: torch.Tensor) -> Image.Image:
-    image = image.float()
-    # Mammoth's VAE currently returns an unprocessed tensor. Support both its
-    # conventional [-1, 1] output and an already-normalized [0, 1] output.
-    if float(image.min()) < 0.0:
-        image = image * 0.5 + 0.5
-    array = image.clamp(0.0, 1.0).mul(255).round().to(torch.uint8).permute(1, 2, 0).numpy()
-    return Image.fromarray(array, mode="RGB")
+    # The pipeline returns raw VAE output with a known [-1, 1] range, even
+    # when all pixels in an individual image happen to be nonnegative.
+    return VaeImageProcessor().postprocess(
+        image.detach().float().cpu().unsqueeze(0),
+        output_type="pil",
+        do_denormalize=[True],
+    )[0]
 
 
 def _generate(deploy_config: str) -> tuple[Image.Image, float]:
@@ -144,15 +160,17 @@ def _generate(deploy_config: str) -> tuple[Image.Image, float]:
             enforce_eager=True,
         ) as runner:
             outputs = list(runner.omni.generate([request], [ar_sampling, dit_sampling]))
-            image = _extract_image(outputs)
+            image = _extract_image(outputs, height=HEIGHT, width=WIDTH)
         device_peak_memory_mb = monitor.peak_used_mb
     finally:
         monitor.stop()
         gc.collect()
         current_omni_platform.empty_cache()
 
-    assert torch.isfinite(image).all(), "Generated image contains non-finite values"
-    return _to_pil(image), device_peak_memory_mb
+    pil_image = _to_pil(image)
+    assert pil_image.mode == "RGB"
+    assert pil_image.size == (WIDTH, HEIGHT)
+    return pil_image, device_peak_memory_mb
 
 
 @pytest.fixture(scope="module")
