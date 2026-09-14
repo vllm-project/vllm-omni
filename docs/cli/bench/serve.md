@@ -300,6 +300,16 @@ vllm bench serve --omni \
 selects all and oversize values use all available cases. Reference audio is required, and OmniInteract uses the
 `/v1/realtime` endpoint.
 
+Use `--omniinteract-scenario-tags` to steer small runs toward paper-table scenarios (`realtime`, `proactive`,
+`nested`, `interrupted`, `1qna`). By default the sampler covers each requested tag with at least one matching case
+(when available under `--omniinteract-subsets`), then fills the remaining `--num-prompts` budget from other cases.
+Add `--omniinteract-scenario-focus` to run only cases that match those tags. Example smoke coverage:
+
+```bash
+  --num-prompts 5 \
+  --omniinteract-scenario-tags realtime proactive nested interrupted 1qna
+```
+
 Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. All selected media is decoded
 before timing and remains in client memory for the run, so `--max-concurrency` does not limit media preparation memory; use
 explicit `--num-prompts 0` only when the client has enough RAM for the full dataset. Media commands are bounded by
@@ -315,6 +325,48 @@ arrives, checkpointing the response's history position so a later committed user
 `playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. Clipped or cancelled
 outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
 horizon.
+
+Accuracy evaluation is opt-in and requires an already-running text judge with an OpenAI-compatible Chat Completions API. The
+benchmark does not launch or stop the judge server. Add the following options to the command above:
+
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --served-model-name Qwen2.5-7B-Instruct \
+  --port 8001
+```
+
+Then add to the benchmark command:
+
+```bash
+  --omniinteract-evaluate \
+  --omniinteract-judge-base-url http://127.0.0.1:8001 \
+  --omniinteract-judge-model Qwen2.5-7B-Instruct
+```
+
+`--omniinteract-judge-model` must match that judge process's `--served-model-name` (or its `--model`
+string if `--served-model-name` is omitted). It is not a checkpoint path to load, and it is not the
+Omni DUT `--served-model-name`. Point `--omniinteract-judge-base-url` at the judge, not at the Omni
+realtime endpoint.
+
+The early / core / interrupted-partial judge prompts follow the official English
+templates in [Lucky-Lance/OmniInteract](https://github.com/Lucky-Lance/OmniInteract)
+`eval/evaluation/llm_judge.py` (commit `de304cef35fd9a50a5caadb5090c34cfbf0dd868`).
+They correspond to the OmniInteract paper appendix
+([arXiv:2605.26485](https://arxiv.org/abs/2605.26485)) Listing A.1 (early-stage),
+Listing A.2 (interrupted partial quality), and Listing A.3 (core-stage).
+A local OpenAI-compatible judge is not the paper's GPT-4o judge, so reported
+IA-QTF1 numbers are protocol-compatible rather than official paper-table scores.
+
+After artifact publication, the evaluator builds `[start, t_a, end)` slots, judges early and core response text, writes
+per-case details plus `evaluation/unified_eval_summary.json`, and prints IA-QTF1 columns
+(1Q1A realtime / proactive / nested / Global, 1QnA, All Global), interruption diagnostics (NOR / PAQ / CSM), and nested
+metrics (NCCS, inner / outer IA-QTF1, missed outer). Slices and sections with no slots in the evaluated sample are
+omitted from the terminal report. The header lists how many evaluated cases carry each scenario tag
+(`realtime`, `proactive`, `nested`, `interrupted`, `1qna`). Realtime and proactive
+exclude nested inner/outer slots; 1Q1A Global recomputes F1 from those three TP/FP/FN aggregates; All Global includes every
+scored slot plus unmatched-chunk false positives. Plain `wav_transcript.json` timestamps provide chunk-level approximate
+timing. If transcript chunks include `aligned_words`, the evaluator splits boundary-crossing chunks and derives trigger
+timing from word alignment.
 
 TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
 every token interval is present.

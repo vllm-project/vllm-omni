@@ -22,6 +22,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.transformers_utils.repo_utils import hf_fs
 
 OMNIINTERACT_SUBSETS = ("1q1a", "1q1a_math", "1qna")
+OMNIINTERACT_SCENARIO_TAGS = ("realtime", "proactive", "nested", "interrupted", "1qna")
 DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
 DEFAULT_MAX_VIDEO_DURATION_S = 3600.0
 logger = logging.getLogger(__name__)
@@ -37,6 +38,18 @@ class OmniInteractCase:
 
 
 @dataclass(frozen=True)
+class OmniInteractEvaluationOptions:
+    judge_base_url: str
+    judge_model: str
+    judge_api_key: str
+    judge_timeout_s: float
+    judge_max_tokens: int
+    workers: int
+    output_dir: Path
+    skip_existing: bool = False
+
+
+@dataclass(frozen=True)
 class OmniInteractSessionOptions:
     output_root: Path
     timeout_s: float
@@ -44,6 +57,7 @@ class OmniInteractSessionOptions:
     ref_audio: str
     require_response: bool = False
     max_video_duration_s: float = DEFAULT_MAX_VIDEO_DURATION_S
+    evaluation: OmniInteractEvaluationOptions | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +84,8 @@ class OmniInteractDataset(BenchmarkDataset):
         subsets: Sequence[str] = OMNIINTERACT_SUBSETS,
         random_seed: int = 0,
         disable_shuffle: bool = False,
+        scenario_tags: Sequence[str] = (),
+        scenario_focus: bool = False,
     ) -> None:
         super().__init__(
             dataset_path=data_root or dataset_repo,
@@ -78,6 +94,10 @@ class OmniInteractDataset(BenchmarkDataset):
         )
         self.root = resolve_omniinteract_root(data_root, dataset_repo)
         self.subsets = tuple(subsets)
+        self.scenario_tags = normalize_scenario_tags(scenario_tags)
+        self.scenario_focus = bool(scenario_focus)
+        if self.scenario_focus and not self.scenario_tags:
+            raise ValueError("scenario_focus requires at least one scenario tag")
 
     def sample(
         self,
@@ -95,6 +115,8 @@ class OmniInteractDataset(BenchmarkDataset):
             num_prompts=num_requests,
             seed=self.random_seed,
             disable_shuffle=self.disable_shuffle,
+            scenario_tags=self.scenario_tags,
+            scenario_focus=self.scenario_focus,
         )
         return [
             OmniInteractSampleRequest(
@@ -259,6 +281,182 @@ def _one_to_many_cases(root: Path) -> list[OmniInteractCase]:
     return cases
 
 
+def normalize_scenario_tags(tags: Sequence[str] | None) -> tuple[str, ...]:
+    """Validate and dedupe scenario tags while preserving caller order."""
+
+    if not tags:
+        return ()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    invalid: list[str] = []
+    for raw in tags:
+        tag = str(raw or "").strip().lower()
+        if not tag:
+            continue
+        if tag not in OMNIINTERACT_SCENARIO_TAGS:
+            invalid.append(tag)
+            continue
+        if tag not in seen:
+            seen.add(tag)
+            normalized.append(tag)
+    if invalid:
+        raise ValueError(
+            "Unsupported OmniInteract scenario tags: "
+            f"{sorted(set(invalid))}; choose from {list(OMNIINTERACT_SCENARIO_TAGS)}"
+        )
+    return tuple(normalized)
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "t"}
+
+
+def _annotation_rows(root: object) -> list[dict[str, object]]:
+    if isinstance(root, list):
+        return [row for row in root if isinstance(row, dict)]
+    if not isinstance(root, dict):
+        return []
+    rows: list[dict[str, object]] = []
+    items = root.get("items")
+    if isinstance(items, list):
+        rows.extend(row for row in items if isinstance(row, dict))
+    answers = root.get("answers")
+    if isinstance(answers, list):
+        rows.extend(row for row in answers if isinstance(row, dict))
+    conversations = root.get("conversations")
+    if isinstance(conversations, list):
+        rows.extend(row for row in conversations if isinstance(row, dict))
+    return rows
+
+
+def case_scenario_tags(case: OmniInteractCase) -> frozenset[str]:
+    """Infer paper-table scenario tags from a case's scene type and annotation."""
+
+    tags: set[str] = set()
+    scene = str(case.scene_type or "").strip().lower()
+    if scene == "1qna":
+        tags.add("1qna")
+    elif scene == "nested":
+        tags.add("nested")
+
+    try:
+        payload = json.loads(case.annotation_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid OmniInteract annotation: {case.annotation_path}") from exc
+
+    for row in _annotation_rows(payload):
+        question_type = str(row.get("question_type") or row.get("label") or "").strip().lower()
+        if scene == "multi_turn":
+            if question_type == "realtime":
+                tags.add("realtime")
+            elif question_type == "proactive":
+                tags.add("proactive")
+        if _truthy(row.get("is_interrupted")) or _truthy(row.get("interrupted")):
+            tags.add("interrupted")
+    return frozenset(tags)
+
+
+def _select_with_scenario_tags(
+    cases: list[OmniInteractCase],
+    *,
+    num_prompts: int,
+    seed: int,
+    disable_shuffle: bool,
+    scenario_tags: Sequence[str],
+    scenario_focus: bool,
+) -> list[OmniInteractCase]:
+    tags = normalize_scenario_tags(scenario_tags)
+    if not tags:
+        ordered = list(cases)
+        if not disable_shuffle:
+            random.Random(seed).shuffle(ordered)
+        if num_prompts:
+            if num_prompts > len(ordered):
+                logger.warning(
+                    "Requested %d OmniInteract prompts but only %d are available; using all cases",
+                    num_prompts,
+                    len(ordered),
+                )
+            return ordered[:num_prompts]
+        return ordered
+
+    tag_sets = {case.video_path: case_scenario_tags(case) for case in cases}
+    if scenario_focus:
+        pool = [case for case in cases if tag_sets[case.video_path] & set(tags)]
+        missing = [tag for tag in tags if not any(tag in tag_sets[case.video_path] for case in pool)]
+        if missing:
+            raise ValueError(
+                f"No OmniInteract cases match scenario tags {missing} under the selected subsets (focus mode)"
+            )
+        if not pool:
+            raise ValueError(f"No OmniInteract cases match scenario tags {list(tags)}")
+        ordered = list(pool)
+        if not disable_shuffle:
+            random.Random(seed).shuffle(ordered)
+        if num_prompts:
+            if num_prompts > len(ordered):
+                logger.warning(
+                    "Requested %d OmniInteract prompts but only %d match tags %s; using all matches",
+                    num_prompts,
+                    len(ordered),
+                    list(tags),
+                )
+            return ordered[:num_prompts]
+        return ordered
+
+    rng = random.Random(seed)
+    buckets: dict[str, list[OmniInteractCase]] = {tag: [] for tag in tags}
+    for case in cases:
+        owned = tag_sets[case.video_path]
+        for tag in tags:
+            if tag in owned:
+                buckets[tag].append(case)
+    for tag, bucket in buckets.items():
+        if not bucket:
+            logger.warning(
+                "No OmniInteract cases available for scenario tag %r under the selected subsets",
+                tag,
+            )
+        elif not disable_shuffle:
+            rng.shuffle(bucket)
+
+    selected: list[OmniInteractCase] = []
+    selected_paths: set[Path] = set()
+    covered_tags: set[str] = set()
+    requested = set(tags)
+    for tag in tags:
+        if tag in covered_tags:
+            continue
+        for case in buckets[tag]:
+            if case.video_path in selected_paths:
+                continue
+            selected.append(case)
+            selected_paths.add(case.video_path)
+            covered_tags.update(tag_sets[case.video_path] & requested)
+            break
+
+    remaining = [case for case in cases if case.video_path not in selected_paths]
+    if not disable_shuffle:
+        rng.shuffle(remaining)
+
+    if num_prompts == 0:
+        return selected + remaining
+
+    if len(selected) > num_prompts:
+        logger.warning(
+            "OmniInteract cover tags need %d cases but --num-prompts=%d; truncating coverage set",
+            len(selected),
+            num_prompts,
+        )
+        return selected[:num_prompts]
+
+    return selected + remaining[: num_prompts - len(selected)]
+
+
 def discover_omniinteract_cases(
     root: Path,
     subsets: Sequence[str],
@@ -266,6 +464,8 @@ def discover_omniinteract_cases(
     num_prompts: int,
     seed: int = 0,
     disable_shuffle: bool = False,
+    scenario_tags: Sequence[str] = (),
+    scenario_focus: bool = False,
 ) -> list[OmniInteractCase]:
     invalid = set(subsets) - set(OMNIINTERACT_SUBSETS)
     if invalid:
@@ -276,6 +476,9 @@ def discover_omniinteract_cases(
         raise ValueError("OmniInteract subsets must not contain duplicates")
     if num_prompts < 0:
         raise ValueError("num_prompts must be non-negative")
+    tags = normalize_scenario_tags(scenario_tags)
+    if scenario_focus and not tags:
+        raise ValueError("scenario_focus requires at least one scenario tag")
     data_root, cases = _data_dir(root.resolve()), []
     for subset in subsets:
         subset_root = data_root / subset
@@ -285,15 +488,14 @@ def discover_omniinteract_cases(
         cases.extend(selected)
     if len({case.video_path for case in cases}) != len(cases):
         raise ValueError("OmniInteract dataset contains duplicate video paths")
-    if not disable_shuffle:
-        random.Random(seed).shuffle(cases)
-    if num_prompts:
-        if num_prompts > len(cases):
-            logger.warning(
-                "Requested %d OmniInteract prompts but only %d are available; using all cases", num_prompts, len(cases)
-            )
-        cases = cases[:num_prompts]
-    return cases
+    return _select_with_scenario_tags(
+        cases,
+        num_prompts=num_prompts,
+        seed=seed,
+        disable_shuffle=disable_shuffle,
+        scenario_tags=tags,
+        scenario_focus=scenario_focus,
+    )
 
 
 def case_manifest(case: OmniInteractCase, output_dir: Path) -> dict[str, Any]:
