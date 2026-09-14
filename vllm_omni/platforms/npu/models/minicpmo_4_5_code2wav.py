@@ -141,6 +141,11 @@ def _patched_estimator_step(
     if (cnn_cache is None) != (att_cache is None):
         raise ValueError("estimator CNN and attention caches must both be present or absent")
 
+    # valid_frames only matters for padded inputs; skip forwarding it for
+    # unpadded calls so platform-owned graphable bodies that predate the
+    # padding feature keep working with the old signature.
+    graphable_kwargs = {"valid_frames": valid_frames} if valid_frames is not None else {}
+
     # The upstream embedder creates a frequency tensor on the host. Keep it
     # outside capture while retaining the tensor-only estimator body in graph.
     time_embedding = estimator.t_embedder(time).unsqueeze(1)
@@ -159,7 +164,7 @@ def _patched_estimator_step(
                 cond=step_cond,
                 cnn_cache=None,
                 att_cache=None,
-                valid_frames=valid_frames,
+                **graphable_kwargs,
             ),
         )
 
@@ -177,7 +182,7 @@ def _patched_estimator_step(
             cond=step_cond,
             cnn_cache=step_cnn,
             att_cache=step_att,
-            valid_frames=valid_frames,
+            **graphable_kwargs,
         ),
     )
 
