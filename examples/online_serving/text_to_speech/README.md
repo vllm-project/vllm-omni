@@ -259,21 +259,25 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
 0.6B DualAR TTS at 44.1 kHz, 11 languages, zero-shot voice cloning.
 
 ### Prerequisites
+
 None beyond the base install: the neural audio codec is implemented in tree and
 its weights (`codec.pth`) ship with the checkpoint.
 
 ### Launch
+
 ```bash
 vllm serve Audio8/Audio8-TTS-Preview-0.6b --omni --port 8092
 # or:
 ./audio8_tts/run_server.sh
 ```
+
 The deploy config auto-loads from `vllm_omni/deploy/audio8_tts.yaml` (HF
 `model_type` is `arktts`). Do **not** pass `--trust-remote-code`: vllm-omni
 registers its own `arktts` config, and transformers would otherwise prefer the
 checkpoint's remote code and bypass it.
 
 ### Text-only synthesis
+
 ```bash
 curl -X POST http://localhost:8092/v1/audio/speech \
     -H "Content-Type: application/json" \
@@ -284,6 +288,7 @@ curl -X POST http://localhost:8092/v1/audio/speech \
 ```
 
 ### Voice cloning
+
 ```bash
 curl -X POST http://localhost:8092/v1/audio/speech \
     -H "Content-Type: application/json" \
@@ -293,18 +298,21 @@ curl -X POST http://localhost:8092/v1/audio/speech \
         "ref_text": "The exact transcript of the reference recording."
     }' --output cloned.wav
 ```
+
 `ref_audio` also accepts a `data:audio/wav;base64,...` URL. `ref_text` is
 mandatory whenever `ref_audio` is present and must match the recording.
 Uploading a voice via `POST /v1/audio/voices` lets the server reuse the encoded
 reference codes across requests (`voice: "<name>"`).
 
 ### Streaming
+
 ```bash
 python audio8_tts/speech_client.py --text "Welcome to Audio8 TTS." --stream --output out.pcm
 ffplay -f s16le -ar 44100 -ac 1 out.pcm
 ```
 
 ### Gradio demo
+
 ```bash
 ./audio8_tts/run_gradio_demo.sh          # server + demo
 python audio8_tts/gradio_demo.py --api-base http://localhost:8092   # demo only
@@ -328,7 +336,7 @@ these as a lower bound. 20 prompts from `seed_tts_smoke/en`, mean audio 4.5 s,
 deploy defaults:
 
 | | HF reference (batch=1) | vllm-omni c=1 | c=4 | c=8 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | RTF (mean) | 1.008 | **0.19** | 0.30 | 0.54 |
 | Throughput (req/s) | 0.23 | 1.18 | 2.84 | **2.93** |
 | E2E latency (mean, ms) | 4375 | 850 | 1349 | 2361 |
@@ -347,7 +355,7 @@ job holding ~80% SM, no repeats), so read them as directional, not as measured
 speedups. Same setup, varying stage 0's `max_num_seqs` (stage 1 stays at 1):
 
 | stage-0 `max_num_seqs` | client concurrency | req/s | RTF | TTFP mean / p99 (ms) | underrun p99 (s) |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 4 (default) | 1 | 1.18 | 0.19 | 63 / 67 | 0.00 |
 | 4 | 4 | 2.84 | 0.30 | 105 / 148 | 0.00 |
 | 4 | 8 | 2.93 | 0.54 | 1124 / 1642 | 0.00 |
@@ -376,6 +384,7 @@ underrun. Raise it to 8 if first-packet latency under load matters more than a
 rare sub-300 ms gap.
 
 ### Notes
+
 - Output: 44.1 kHz mono; ~21.5 codec frames per second.
 - No built-in speaker presets. Omit `voice` for a random timbre, or clone one.
 - `max_new_tokens` caps generated codec frames (1 frame ~= 46 ms).
@@ -552,6 +561,46 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 - For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../../ming_flash_omni/).
 
 ---
+
+## MOSS-TTS Local Transformer v1.5
+
+For a single H200, the optional
+[`moss_tts_local_h200.yaml`](../../../vllm_omni/deploy/moss_tts_local_h200.yaml)
+deployment places both the talker and codec on logical GPU 0:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VLLM_OMNI_EVENT_DRIVEN_ORCH=1 \
+    vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+    --omni --trust-remote-code \
+    --deploy-config vllm_omni/deploy/moss_tts_local_h200.yaml \
+    --disable-log-stats
+```
+
+Run from the repository root and select an available physical GPU with
+`CUDA_VISIBLE_DEVICES`. The command enables event-driven orchestration and
+disables detailed per-request statistics logging to reduce CPU overhead at
+high concurrency. Remove `--disable-log-stats` when those statistics are needed;
+keep these settings identical when comparing performance.
+This preset configures 256 request slots per stage,
+a 32 GiB talker KV cache, talker CUDA Graph buckets through 512 scheduled tokens,
+and codec batch buckets through 256. It requires more than 80 GiB of GPU memory;
+request capacity also depends on input and generated lengths. The default
+[`moss_tts_local.yaml`](../../../vllm_omni/deploy/moss_tts_local.yaml) remains
+available for smaller deployments.
+
+The preset enables the optional codec backend with
+`hf_overrides.codec_attention_backend: triton` on stage 1. It preserves the
+streaming ring-cache mask and uses BF16 attention with 64-dimensional heads;
+other attention shapes use PyTorch SDPA. Set the backend to `sdpa` to use the
+default attention implementation. Codec terminal tails share execution only
+when they already map to the same padded CUDA Graph; returned audio retains
+each request's actual length.
+
+Voice cloning requests use `ref_audio` and `ref_text`. For streaming output,
+set `stream: true`, `stream_format: "audio"`, and `response_format: "pcm"`;
+the native PCM format is 48 kHz, stereo, signed 16-bit little-endian. Compute
+audio throughput as `PCM bytes / (48000 * 2 * 2) / elapsed seconds`, and compare
+the same requests, concurrency, and reference-cache state.
 
 ## MOSS-TTS-Nano
 

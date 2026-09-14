@@ -21,8 +21,8 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
@@ -37,7 +37,8 @@ import uuid
 import wave
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from enum import Enum
+from typing import Any, Final, Protocol, TypeAlias, runtime_checkable
 
 import torch
 from fastapi import WebSocket, WebSocketDisconnect
@@ -50,6 +51,7 @@ from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilte
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
 )
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -61,7 +63,14 @@ _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
-_BAD_FRAME = object()
+
+
+class _FrameStatus(Enum):
+    BAD = "bad"
+
+
+_BAD_FRAME: Final = _FrameStatus.BAD
+PrewarmedFrame: TypeAlias = tuple[Any, str] | _FrameStatus
 
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
@@ -83,7 +92,7 @@ class VideoStreamPipelineHooks(Protocol):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
         *,
         frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -171,7 +180,7 @@ class OmniStreamingVideoHandler:
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
         *,
         frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -223,7 +232,7 @@ class OmniStreamingVideoHandler:
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
             frame_metadata: list[dict[str, Any]] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
-            frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
+            frame_pil_cache: dict[str, PrewarmedFrame] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
             frame_filter = (
                 FrameSimilarityFilter(threshold=config.frame_filter_threshold) if config.enable_frame_filter else None
             )
@@ -310,7 +319,6 @@ class OmniStreamingVideoHandler:
                         await self._engine_client.abort(prev_request_id)
                     except Exception:
                         pass
-                    await asyncio.sleep(0.1)
                 prev_was_interrupted = False
 
                 request_id = f"video-{uuid.uuid4().hex[:12]}"
@@ -433,8 +441,12 @@ class OmniStreamingVideoHandler:
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:
                                 try:
                                     pil = await asyncio.to_thread(_decode_frame_bytes, b)
-                                    frame_pil_cache[b64] = (pil, u)
+                                    # The frame may have been evicted while decoding.
+                                    if b64 in frame_buffer:
+                                        frame_pil_cache[b64] = (pil, u)
                                 except Exception:
+                                    if b64 not in frame_buffer:
+                                        return
                                     frame_pil_cache[b64] = _BAD_FRAME
                                     logger.warning("prewarm decode failed for frame (len=%d)", len(b))
                                     try:
@@ -581,7 +593,7 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
@@ -620,10 +632,13 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
+        engine_client = self._engine_client
+        assert engine_client is not None, "_process_query must validate the engine client"
+
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
         )
@@ -654,11 +669,13 @@ class OmniStreamingVideoHandler:
             request_kwargs["mm_processor_kwargs"] = {
                 "use_audio_in_video": True,
             }
-        if config.sampling_params_list:
-            request_kwargs["sampling_params_list"] = config.sampling_params_list
-
+        sampling_kwargs: dict[str, Any] = {}
         try:
             chat_request = ChatCompletionRequest(**request_kwargs)
+            if config.sampling_params_list:
+                params = self._chat_service._to_sampling_params_list(config.sampling_params_list)
+                # Explicit params must retain the engine's streaming output mode.
+                sampling_kwargs["sampling_params_list"] = coerce_param_message_types(params, is_streaming=True)
         except Exception as e:
             await self._send_error(websocket, f"Failed to build request: {e}")
             return
@@ -694,10 +711,11 @@ class OmniStreamingVideoHandler:
         audio_tail_tensors: list[Any] = []
 
         try:
-            result_gen = self._engine_client.generate(
+            result_gen = engine_client.generate(
                 prompt=engine_prompt,
                 request_id=request_id,
                 output_modalities=config.modalities,
+                **sampling_kwargs,
             )
 
             async for output in result_gen:
@@ -757,7 +775,7 @@ class OmniStreamingVideoHandler:
                         if b64:
                             await websocket.send_json(
                                 {
-                                    "type": "response.audio.delta",
+                                    "type": "response.output_audio.delta",
                                     "data": b64,
                                     "format": "wav",
                                 }
@@ -801,7 +819,7 @@ class OmniStreamingVideoHandler:
                     if b64:
                         await websocket.send_json(
                             {
-                                "type": "response.audio.delta",
+                                "type": "response.output_audio.delta",
                                 "data": b64,
                                 "format": "wav",
                             }
@@ -810,7 +828,7 @@ class OmniStreamingVideoHandler:
                     logger.exception("Failed to coalesce off-path audio")
 
             if audio_chunk_count > 0:
-                await websocket.send_json({"type": "response.audio.done"})
+                await websocket.send_json({"type": "response.output_audio.done"})
 
             response_text = "".join(text_parts)
             self.on_turn_complete(message_history, user_message, response_text)
@@ -997,6 +1015,8 @@ class OmniStreamingVideoHandler:
         )
         mixin = AudioMixin()
         resp = mixin.create_audio(audio_obj)
+        # base64_encode=True selects the string result of create_audio().
+        assert isinstance(resp.audio_data, str)
         return resp.audio_data
 
     @staticmethod
@@ -1062,7 +1082,7 @@ class OmniStreamingVideoHandler:
     def _sample_frame_indices(
         frame_buffer: list[str],
         num_frames: int,
-        prewarmed_frames: Mapping[str, object],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
     ) -> list[int]:
         """Stride-sample with the last frame, then drop known bad frames without refilling."""
         n_buf = len(frame_buffer)

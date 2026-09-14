@@ -51,9 +51,9 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
-    from vllm.inputs.preprocess import InputPreprocessor
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
+    from vllm.v1.engine.input_processor import InputProcessor
 
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
@@ -1714,7 +1714,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== EngineClient Interface ====================
 
-    async def get_input_preprocessor(self) -> InputPreprocessor:
+    async def get_input_preprocessor(self) -> InputProcessor:
         """Get input preprocessor."""
         return self.input_processor
 
@@ -1755,10 +1755,12 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         logger.debug("Weight update start requested (no-op in omni)")
 
-    async def finish_weight_update(self) -> None:
+    async def finish_weight_update(self, weight_version: str | None = None) -> None:
         """Finish the current weight update.
 
         Omni does not currently support weight transfer, so this is a no-op.
+        ``weight_version`` is accepted for upstream ``EngineClient`` protocol
+        compatibility (RLHF weight-transfer routers pass it positionally).
         """
         logger.debug("Weight update finish requested (no-op in omni)")
 

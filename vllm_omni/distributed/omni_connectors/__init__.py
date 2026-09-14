@@ -22,6 +22,11 @@ try:
     from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
 except ImportError:
     MoriTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mori) not installed
+
+try:
+    from .connectors.nixl_connector import NixlConnector
+except ImportError:
+    NixlConnector = None  # NIXL deps not installed
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
@@ -50,6 +55,7 @@ __all__ = [
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",
     "MoriTransferEngineConnector",
+    "NixlConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
     "YuanrongTransferEngineConnector",

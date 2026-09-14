@@ -244,7 +244,7 @@ def _audio_frame_stats(
 def _response_ids(client: RawRealtimeProbe) -> set[str]:
     return {
         str(event["response_id"])
-        for event in _events(client, "response.audio.delta")
+        for event in _events(client, "response.output_audio.delta")
         if isinstance(event.get("response_id"), str)
     }
 
@@ -268,7 +268,7 @@ def _session_result(
         raise AssertionError(f"output audio is non-finite or silent: samples={pcm.size}, rms={rms}")
     rates = {
         int(event["sample_rate_hz"])
-        for event in _events(client, "response.audio.delta")
+        for event in _events(client, "response.output_audio.delta")
         if isinstance(event.get("sample_rate_hz"), int)
     }
     if rates != {SAMPLE_RATE_HZ}:
@@ -289,7 +289,7 @@ def _session_result(
         )
     runtime_metadata = [
         metadata["vllm_omni"]
-        for event in _events(client, "response.audio.delta")
+        for event in _events(client, "response.output_audio.delta")
         if isinstance((metadata := event.get("metadata")), dict) and isinstance(metadata.get("vllm_omni"), dict)
     ]
     if not any(

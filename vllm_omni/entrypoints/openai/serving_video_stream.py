@@ -18,19 +18,21 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
+    PrewarmedFrame,
     StreamingVideoSessionConfig,
     VideoStreamTurnTrigger,
 )
@@ -58,7 +60,7 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
         *,
         frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -70,6 +72,8 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             frame_b64 = frame_buffer[index]
             cached = prewarmed.get(frame_b64)
             if cached is not None:
+                # The shared selector excludes failed decodes before this point.
+                assert isinstance(cached, tuple)
                 pil, pil_uuid = cached
                 user_content.append(
                     {
