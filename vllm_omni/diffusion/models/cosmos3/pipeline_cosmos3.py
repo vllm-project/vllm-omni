@@ -948,6 +948,20 @@ class Cosmos3OmniDiffusersPipeline(
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
 
+        # Validate guidance parallelism from checkpoint metadata before loading
+        # components. Distilled checkpoints have only a conditional branch.
+        scheduler_config = FlowUniPCMultistepScheduler.load_config(
+            model_path,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+        )
+        self.is_distilled_model = scheduler_config.get("_class_name") == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS
+        if self.is_distilled_model and od_config.parallel_config.cfg_parallel_size > 1:
+            raise ValueError(
+                "Distilled Cosmos3 checkpoints run without classifier-free guidance. "
+                "Set --cfg-parallel-size 1 and use --ulysses-degree for multi-GPU inference."
+            )
+
         # --- Tokenizer ---
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -1010,20 +1024,7 @@ class Cosmos3OmniDiffusersPipeline(
             logger.info("Cosmos3: session state manager enabled (max_sessions=%d)", mm_max_sessions)
 
         # --- Scheduler ---
-        # Distilled model differs from regular one only by scheduler,
-        # distilled one uses FlowMatchEulerDiscreteScheduler, while
-        # regular should use FlowUniPCMultistepScheduler
-
-        scheduler_config = FlowUniPCMultistepScheduler.load_config(
-            model_path,
-            subfolder="scheduler",
-            local_files_only=local_files_only,
-        )
-
-        scheduler_class_name = scheduler_config.get("_class_name")
-
-        self.is_distilled_model = False
-        if scheduler_class_name == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS:
+        if self.is_distilled_model:
             fixed_step_config = scheduler_config.get("fixed_step_sampler_config")
             if not isinstance(fixed_step_config, dict) or fixed_step_config.get("sample_type") != "sde":
                 raise ValueError("Cosmos3 distilled scheduler requires fixed_step_sampler_config.sample_type=sde.")
@@ -1035,7 +1036,6 @@ class Cosmos3OmniDiffusersPipeline(
                 stochastic_sampling=True,
             )
             self._scheduler_init_t_list = list(t_list)
-            self.is_distilled_model = True
         else:
             # Preserve compatible solver settings from the checkpoint, but keep
             # the base shift neutral. The concrete request shift is applied when
@@ -1811,6 +1811,11 @@ class Cosmos3OmniDiffusersPipeline(
 
     def _resolve_guidance_scale(self, sp: OmniDiffusionSamplingParams, default: float) -> float:
         if self.is_distilled_model:
+            if sp.guidance_scale_provided and float(sp.guidance_scale) != 1.0:
+                logger.warning_once(
+                    "Distilled Cosmos3 checkpoints run without classifier-free guidance. "
+                    "The requested guidance_scale is overridden to 1.0; negative_prompt does not affect generation."
+                )
             return 1.0
         if sp.guidance_scale_provided:
             return float(sp.guidance_scale)

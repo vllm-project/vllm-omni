@@ -87,6 +87,11 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "AuKForConditionalGeneration": (
+        "auk",
+        "auk",
+        "AuKForConditionalGeneration",
+    ),
     "NemotronDenseForCausalLM": (
         "audex",
         "audex_thinker",

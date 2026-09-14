@@ -284,7 +284,8 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
     assert recorder.denoise_timestep is None
 
 
-def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
+@pytest.mark.parametrize("batch_frames", [1, 33])
+def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=8)
@@ -293,6 +294,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
     context = {
         "height": 96,
         "width": 64,
+        "preencode_mp4": True,
+        "preencode_batch_frames": batch_frames,
         "latent_t": 2,
         "latent_h": 4,
         "latent_w": 6,
@@ -334,6 +337,18 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
     torch.testing.assert_close(state.current_timestep, torch.tensor(1.0 - sigmas_video[0]))
     assert state.extra[mod._STEP_BRANCH] is branch
     assert state.extra[mod._STEP_SHAPE]["height"] == 96
+
+    pipeline.od_config = SimpleNamespace()
+    monkeypatch.setattr(pipeline, "_unpack_denoised_rows", lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)))
+    calls = []
+
+    def decode_to_mp4(*args, **kwargs):
+        calls.append(kwargs)
+        return b"mp4"
+
+    monkeypatch.setattr(pipeline, "decode_to_mp4", decode_to_mp4)
+    assert pipeline.post_decode(state).output == (b"mp4", None)
+    assert calls[0]["batch_frames"] == batch_frames
 
 
 def test_prepare_encode_rejects_request_mode_only_features():
