@@ -199,6 +199,7 @@ def test_wan_diffuse_batches_transformer_once_per_denoise_step() -> None:
     pipeline.transformer = FakeTransformer()
     pipeline.transformer_2 = None
     pipeline.expand_timesteps = False
+    pipeline.is_dmd = False
     pipeline.progress_bar = progress_bar
     pipeline.scheduler_step_maybe_with_cfg = lambda noise, timestep, latents, do_true_cfg: noise
 
@@ -312,6 +313,7 @@ def test_wan_denoise_dummy_run_synthesizes_prompt_embeds(stage_role: DiffusionSt
     pipeline = object.__new__(Wan22Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.stage_role = stage_role
+    pipeline.expand_timesteps = False
     pipeline.device = torch.device("cpu")
     pipeline.transformer = SimpleNamespace(dtype=torch.float32)
     pipeline.transformer_config = SimpleNamespace(text_dim=8)

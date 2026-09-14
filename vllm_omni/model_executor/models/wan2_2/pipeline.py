@@ -8,9 +8,9 @@ denoise + VAE decode fused on one worker). These topologies describe the
 legacy ``platforms/.../stage_configs/*.yaml`` file:
 
   Encode/Generation (EG), 2 stages:
-    Stage 0 (encode):  UMT5 text encoder only -> prompt embeddings.
-    Stage 1 (denoise): DiT denoise + VAE decode -> video, consuming the
-                       stage-0 embeddings (no text encoding in stage 1).
+    Stage 0 (encode):  UMT5 + optional TI2V VAE encoder -> conditioning.
+    Stage 1 (denoise): DiT denoise + decoder-only VAE -> video, consuming
+                       stage-0 conditioning (no text or VAE encoding).
 
 The stages are wired model-agnostically via ``DiffusionStageRole`` and the
 generic cross-stage handoff processor
@@ -33,8 +33,14 @@ from vllm_omni.config.stage_config import (
 _WAN_MODEL_ARCH = "WanPipeline"
 _DIFFUSION_HANDOFF = "vllm_omni.model_executor.stage_input_processors.diffusion_disagg.diffusion_stage_handoff"
 
-# Prompt-embedding payload transferred across the encode -> denoise edge.
-_ENCODE_PAYLOAD_KEYS = ("prompt_embeds", "negative_prompt_embeds")
+# Optional keys are omitted by the producer for pure T2V/no-image requests.
+# Keep versioned metadata on the same transport as the conditioning tensor.
+_ENCODE_PAYLOAD_KEYS = (
+    "prompt_embeds",
+    "negative_prompt_embeds",
+    "wan_image_condition",
+    "wan_conditioning_metadata",
+)
 _DENOISE_PAYLOAD_KEYS = ("latents",)
 
 

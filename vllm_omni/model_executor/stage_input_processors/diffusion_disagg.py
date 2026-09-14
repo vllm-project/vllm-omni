@@ -38,6 +38,9 @@ _PASSTHROUGH_KEYS: tuple[str, ...] = (
     "fps",
     "seed",
     "modalities",
+    "output_type",
+    "num_outputs_per_prompt",
+    "max_sequence_length",
 )
 
 # Suffix marking connector transfer-handle entries on ``custom_output`` (e.g.
@@ -117,8 +120,8 @@ def diffusion_stage_handoff(
         if not payload_keys and not handle_keys:
             logger.warning(
                 "[diffusion_stage_handoff] request %d: upstream custom_output "
-                "carried no payload (keys=%s); downstream stage will fall back "
-                "to running the upstream work itself.",
+                "carried no payload (keys=%s); downstream stages requiring "
+                "conditioning will reject this request.",
                 i,
                 list(custom_output.keys()),
             )

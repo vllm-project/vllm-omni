@@ -9,9 +9,9 @@
 # ``vllm_omni/model_executor/models/wan2_2/pipeline.py`` (registry key
 # ``wan2_2_eg``, per RFC #4021). This YAML only supplies runtime wiring:
 #
-#   Stage 0 (encode):  UMT5 text encoder only -> prompt embeddings (card 0).
-#   Stage 1 (denoise): DiT denoise + VAE decode -> video (card 1), consuming
-#                      the stage-0 embeddings (no text encoding in stage 1).
+#   Stage 0 (encode): UMT5 + optional TI2V VAE encoder -> conditioning (card 0).
+#   Stage 1 (generation): DiT + decoder-only VAE -> video (card 1), consuming
+#                       stage-0 conditioning without text or VAE encoding.
 
 pipeline: wan2_2_eg
 async_chunk: false
@@ -30,8 +30,8 @@ connectors:
       transfer_timeout_s: 300
 
 stages:
-  # Stage 0 — encode: Wan22Pipeline loads ONLY the UMT5 text encoder and
-  # tokenizer (no DiT / VAE); its DiffusionStageRole resolves to ``encode``.
+  # Stage 0 — encode: UMT5/tokenizer; TI2V also retains the VAE encoder half.
+  # Pure T2V does not load a VAE here. No DiT is loaded.
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
@@ -42,7 +42,7 @@ stages:
     default_sampling_params:
       seed: 42
 
-  # Stage 1 — denoise: DiT denoise + VAE decode; consumes stage-0 embeddings.
+  # Stage 1 — generation: DiT + decoder-only VAE; consumes complete conditioning.
   - stage_id: 1
     devices: "1"
     max_num_seqs: 1

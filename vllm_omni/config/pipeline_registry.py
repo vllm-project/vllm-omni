@@ -212,8 +212,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # Disaggregated diffusion variant (opt-in): Wan Encode/Generation split.
     "wan2_2_eg": WAN2_2_EG_PIPELINE,
     "wan2_2_egd": WAN2_2_EGD_PIPELINE,
-    "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
-    "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
 }
 
 
