@@ -18,8 +18,8 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """

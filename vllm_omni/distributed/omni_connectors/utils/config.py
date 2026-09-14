@@ -13,6 +13,7 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
         "MooncakeTransferEngineConnector",
         "MoriTransferEngineConnector",
         "YuanrongTransferEngineConnector",
+        "NixlConnector",
     }
 )
 

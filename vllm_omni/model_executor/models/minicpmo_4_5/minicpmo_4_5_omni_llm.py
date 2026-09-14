@@ -4580,6 +4580,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 multimodal_embeddings += tuple(audio_embeddings)
         return multimodal_embeddings
 
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
+        return self.get_multimodal_embeddings(**kwargs)
+
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,

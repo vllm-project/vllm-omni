@@ -34,6 +34,169 @@ def _turbo_spec(filename: str) -> TurboSpec:
     return spec
 
 
+def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    class FakeEncoder:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.pushes = []
+            self.kwargs = kwargs
+            self.__class__.instances.append(self)
+
+        def push(self, frames):
+            self.pushes.append(np.array(frames, copy=True))
+
+        def finish(self):
+            return b"mp4"
+
+        def abort(self):
+            raise AssertionError("unexpected abort")
+
+    class FakeAudioVAE:
+        def decode_latent(self, latent):
+            return torch.zeros(1, 1, 2)
+
+    class FakeVideoVAE:
+        def decode_with_chunks(self, latent, *, on_chunk):
+            for value in (0.0, 0.25, 0.5):
+                on_chunk(torch.full((1, 3, 3, 2, 2), value))
+
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae = FakeAudioVAE()
+    pipeline.video_vae = FakeVideoVAE()
+    pipeline.device = torch.device("cpu")
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder",
+        FakeEncoder,
+    )
+
+    output = pipeline.decode_to_mp4(
+        torch.zeros(1),
+        torch.zeros(1),
+        height=2,
+        width=2,
+        batch_frames=4,
+    )
+
+    assert output == b"mp4"
+    encoder = FakeEncoder.instances[-1]
+    assert [frames.shape[0] for frames in encoder.pushes] == [6, 3]
+    assert np.array_equal(encoder.pushes[0][0], np.full((2, 2, 3), 0, dtype=np.uint8))
+    assert np.array_equal(encoder.pushes[0][3], np.full((2, 2, 3), 64, dtype=np.uint8))
+    assert encoder.pushes[1].shape == (3, 2, 2, 3)
+
+
+def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatch):
+    """A client's encoder options must survive the worker-side pre-encode path."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    class FakeEncoder:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.__class__.instances.append(self)
+
+        def push(self, frames):
+            del frames
+
+        def finish(self):
+            return b"mp4"
+
+        def abort(self):
+            raise AssertionError("unexpected abort")
+
+    class FakeAudioVAE:
+        def decode_latent(self, latent):
+            return torch.zeros(1, 1, 2)
+
+    class FakeVideoVAE:
+        def decode_with_chunks(self, latent, *, on_chunk):
+            on_chunk(torch.zeros(1, 3, 1, 2, 2))
+
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae = FakeAudioVAE()
+    pipeline.video_vae = FakeVideoVAE()
+    pipeline.device = torch.device("cpu")
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
+    monkeypatch.setattr("vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder", FakeEncoder)
+
+    pipeline.decode_to_mp4(
+        torch.zeros(1),
+        torch.zeros(1),
+        height=2,
+        width=2,
+        video_codec_options={"preset": "ultrafast"},
+    )
+
+    assert FakeEncoder.instances[-1].kwargs["video_codec_options"] == {"preset": "ultrafast"}
+
+
+@pytest.mark.parametrize(
+    ("codec_extra", "expected"),
+    [
+        ({}, {"preset": "ultrafast", "threads": "0"}),
+        ({"video_codec_options": {"preset": "slow", "threads": 2}}, {"preset": "slow", "threads": "2"}),
+        ({"video_codec_options": {}}, {}),
+        ({"video_codec_options": None}, None),
+    ],
+)
+@pytest.mark.parametrize("batch_extra, batch_frames", [({}, 17), ({"preencode_batch_frames": 5}, 5)])
+def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expected, batch_extra, batch_frames):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va"})
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace()
+    pipeline.text_encoder = object()
+    pipeline.encode_prompt = Mock(return_value=(torch.ones(1, 2), torch.ones(1, dtype=torch.long)))
+    pipeline._quality_policy = Mock()
+    pipeline._cache_dit_runtime = Mock()
+    pipeline.diffuse = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    pipeline.decode_to_mp4 = Mock(return_value=b"mp4")
+    sampling = OmniDiffusionSamplingParams(
+        width=1344,
+        height=768,
+        fps=24,
+        num_frames=124,
+        num_inference_steps=50,
+        extra_args={"task": "t2va", "aspect_ratio": "16:9", "preencode_mp4": True, **codec_extra, **batch_extra},
+    )
+    batch = DiffusionRequestBatch(
+        [OmniDiffusionRequest(prompt="test", sampling_params=sampling, request_id="codec-defaults")]
+    )
+
+    pipeline.forward(batch)
+
+    assert pipeline.decode_to_mp4.call_args.kwargs["video_codec_options"] == expected
+    assert pipeline.decode_to_mp4.call_args.kwargs["batch_frames"] == batch_frames
+
+
+def test_video_codec_options_are_normalized_for_the_encoder():
+    from vllm_omni.diffusion.utils.media_utils import normalize_video_codec_options
+
+    assert normalize_video_codec_options({"preset": "ultrafast", "threads": 0}) == {
+        "preset": "ultrafast",
+        "threads": "0",
+    }
+    assert normalize_video_codec_options(None) is None
+    with pytest.raises(ValueError, match="video_codec_options"):
+        normalize_video_codec_options("preset=ultrafast")
+
+
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
