@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass, field, fields
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput

@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -88,6 +89,7 @@ def _stub_encode_prompt(
 def _make_pipeline() -> Wan22Pipeline:
     pipeline = object.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
+    pipeline.stage_role = DiffusionStageRole.FULL
     pipeline.device = torch.device("cpu")
     pipeline.transformer = _StubTransformer()
     pipeline.transformer_2 = None
@@ -509,6 +511,7 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
 def _make_gate_loading_pipeline():
     pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
+    pipeline.encode_only = False
     gate = WanSelfAttention.__new__(WanSelfAttention)
     nn.Module.__init__(gate)
     gate.to_gate_compress = nn.Linear(1, 1)
@@ -529,6 +532,8 @@ def test_wan_pipeline_loaders_share_optional_gate_cleanup(monkeypatch, module_na
     module = importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}")
     pipeline_cls = getattr(module, class_name)
     pipeline = pipeline_cls.__new__(pipeline_cls)
+    if class_name == "Wan22Pipeline":
+        pipeline.encode_only = False
     expected = {"loaded"}
 
     def fake_loader(model, weights):

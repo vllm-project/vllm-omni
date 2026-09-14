@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -78,6 +81,38 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     assert output is not None
     assert output.request_id == "req-1"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_inline_dispatch_preserves_payload_sender_info(client, mock_engine, streaming):
+    async def _run_test():
+        requests = []
+
+        async def _step_streaming(request):
+            requests.append(request)
+            yield [OmniRequestOutput.from_diffusion(request_id=request.request_id, images=[MagicMock()])]
+
+        mock_engine.step_streaming = _step_streaming
+        client.od_config.streaming_output = streaming
+        payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50071}
+        kv_transfer_params = {"remote_engine_id": "mooncake-producer", "remote_block_ids": [1, 2]}
+        await client.add_request_async(
+            "req-payload",
+            "A test prompt",
+            OmniDiffusionSamplingParams(),
+            kv_transfer_params=kv_transfer_params,
+            payload_sender_info=payload_sender_info,
+        )
+
+        for _ in range(10):
+            if requests:
+                break
+            await asyncio.sleep(0.01)
+
+        assert requests[0].payload_sender_info == payload_sender_info
+        assert requests[0].kv_transfer_params == kv_transfer_params
+
+    asyncio.run(_run_test())
 
 
 @pytest.mark.asyncio
