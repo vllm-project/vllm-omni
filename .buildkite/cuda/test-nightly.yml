@@ -53,80 +53,62 @@ steps:
       - label: ":full_moon: Omni · Accuracy Test"
         source_file_dependencies: omni_qwen3_omni_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - |
-            set +e
-            pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and H100 and B200 and A100 and cards_2" --run-level full_model
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and H100 and B200 and A100 and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
         source_file_dependencies: omni_minicpmo_4_5_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/minicpmo_4_5/results/*.json
         commands:
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - |
-            set +e
-            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and H100 and B200 and A100 and cuda and (cards_1 or cards_2)" --run-level full_model
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and H100 and B200 and A100 and cuda and (cards_1 or cards_2)" --run-level full_model
 
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
         source_file_dependencies: omni_qwen3_omni_perf
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 300
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json -m "H100 and B200 and A100 and cards_2"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json -m "H100 and B200 and A100 and cards_2"
 
       - label: ":full_moon: Omni · Perf Test · Async Chunk"
         source_file_dependencies: omni_qwen3_omni_perf
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and B200 and A100 and full_model and cards_2"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and B200 and A100 and full_model and cards_2"
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -m "H100 and B200 and A100 and cards_1"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -m "H100 and B200 and A100 and cards_1"
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_perf
         key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_duplex_seed_tts.json -m "H100 and B200 and A100 and cards_1"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_duplex_seed_tts.json -m "H100 and B200 and A100 and cards_1"
 
       - label: ":full_moon: Omni · Multi-Replica Startup Test with 4x H100"
         source_file_dependencies: omni_qwen3_omni_function
@@ -153,29 +135,23 @@ steps:
         source_file_dependencies: tts_qwen3_tts_perf
         key: nightly-tts-performance-single
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m "H100 and B200 and A100 and cards_1"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m "H100 and B200 and A100 and cards_1"
 
       - label: ":full_moon: TTS · Perf Test · 2-GPU"
         source_file_dependencies: tts_qwen3_tts_perf
         key: nightly-tts-performance-2gpu
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m "H100 and B200 and A100 and cards_2"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m "H100 and B200 and A100 and cards_2"
 
   - group: ":card_index_dividers: Tiny Model Tests [Multi-GPU]"
     key: nightly-tiny-model-test-group
@@ -266,33 +242,27 @@ steps:
         source_file_dependencies: diffusion_qwen_image_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-single
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/diffusion_result_*.json
+          - tests/dfx/perf/results/logs/*.log
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export CACHE_DIT_VERSION=1.5.0
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and A100 and cards_1"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and A100 and cards_1"
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · 4-GPU"
         source_file_dependencies: diffusion_qwen_image_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-4gpu
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/diffusion_result_*.json
+          - tests/dfx/perf/results/logs/*.log
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export CACHE_DIT_VERSION=1.5.0
           # Do not pin DIFFUSION_ATTENTION_BACKEND: H100 auto-selects FLASH_ATTN;
           # B200 rejects explicit FLASH_ATTN without FA4 and uses CUDNN/TRTLLM.
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and A100 and cards_4"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and A100 and cards_4"
 
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
@@ -388,15 +358,12 @@ steps:
         source_file_dependencies: diffusion_wan22_perf
         key: nightly-diffusion-x2v-performance-single
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/diffusion_result_*.json
+          - tests/dfx/perf/results/logs/*.log
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and A100 and cards_1"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and A100 and cards_1"
 
       - label: ":full_moon: Diffusion X2V · Perf Test · 2-GPU"
         source_file_dependencies:
@@ -404,6 +371,9 @@ steps:
           - diffusion_cosmos3_perf
         key: nightly-diffusion-x2v-performance-2gpu
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/diffusion_result_*.json
+          - tests/dfx/perf/results/logs/*.log
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - |
@@ -412,8 +382,6 @@ steps:
             EXIT1=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json -m "H100 and B200 and A100 and cards_2"
             EXIT2=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
             exit $$EXIT2
 
@@ -421,6 +389,9 @@ steps:
         source_file_dependencies: diffusion_hunyuan_video_perf
         key: nightly-diffusion-x2v-performance-hunyuanvideo15
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/diffusion_result_*.json
+          - tests/dfx/perf/results/logs/*.log
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - |
@@ -429,8 +400,6 @@ steps:
             EXIT1=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_i2v_vllm_omni.json -m "H100 and B200 and A100 and (cards_1 or cards_2)"
             EXIT2=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
             exit $$EXIT2
 
@@ -438,15 +407,12 @@ steps:
         source_file_dependencies: diffusion_minimax_h3_perf
         key: nightly-diffusion-x2v-performance-minimax-h3
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/diffusion_result_*.json
+          - tests/dfx/perf/results/logs/*.log
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json -m "H100 and B200 and A100 and cards_4"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json -m "H100 and B200 and A100 and cards_4"
 
   - group: ":card_index_dividers: Diffusion Test"
     key: nightly-diffusion-test-group
@@ -522,6 +488,9 @@ steps:
       - nightly-diffusion-x2v-performance-single
       - nightly-diffusion-x2v-performance-2gpu
     if: build.env("NIGHTLY") == "1" && build.env("EMAIL_DISTRIBUTION") == "1"
+    artifact_paths:
+      - tests/dfx/perf/results/*.xlsx
+      - tests/dfx/perf/results/*.html
     commands:
       - pip install openpyxl
       - export DEFAULT_INPUT_DIR=tests/dfx/perf/results
@@ -537,7 +506,5 @@ steps:
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/generate_nightly_perf_html.py
       - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"
-      - buildkite-agent artifact upload "tests/dfx/perf/results/*.xlsx"
-      - buildkite-agent artifact upload "tests/dfx/perf/results/*.html"
     agents:
       queue: "cpu_queue_premerge"

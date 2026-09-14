@@ -7,7 +7,7 @@ Boots ``vllm serve --omni --deploy-config pi0.yaml`` and drives the real OpenPI
 websocket (``/v1/realtime/robot/openpi``) — the same wire path a robot uses
 (handshake metadata → send observation → receive action chunk). Mirrors
 ``tests/e2e/online_serving/test_dreamzero_expansion.py``. Needs a GPU + a
-pi0_base checkpoint; skipped in CI unless explicitly run.
+pi0_base checkpoint. Weekly L5 collects it as ``slow`` + ``H100`` + ``cards_1``.
 
 The in-process LeRobot parity oracle lives separately in
 ``tests/diffusion/models/pi0/test_pi0_parity.py``.
@@ -56,9 +56,9 @@ test_params = [
 ]
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": ["H100", "B200", "A100"]})
+@hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_pi0_openpi_online(omni_server):
     try:

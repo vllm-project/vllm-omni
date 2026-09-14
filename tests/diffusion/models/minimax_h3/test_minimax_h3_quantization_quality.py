@@ -15,6 +15,7 @@ from tests.diffusion.quantization.test_quantization_quality import (
     _free_gpu_memory,
     _maybe_save_output,
 )
+from tests.e2e.accuracy.helpers import resolve_device_threshold
 from tests.helpers.mark import hardware_marks
 
 _MINIMAX_H3_REPO = "MiniMaxAI/MiniMax-H3"
@@ -214,7 +215,7 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
             f"Unexpected H3 audio sample rate: baseline={baseline_sample_rate}, quantized={quant_sample_rate}"
         )
     audio_spectral_cosine, audio_rms_ratio = _audio_quality_metrics(baseline_audio, quant_audio)
-    gpu_key, max_lpips = config.lpips_threshold()
+    gpu_key, max_lpips = resolve_device_threshold(config.max_lpips, label=f"{config.id} max_lpips")
     assert lpips_score <= max_lpips, (
         f"LPIPS {lpips_score:.4f} exceeds threshold {max_lpips} ({gpu_key}) "
         f"for {config.quantization_ref()} on {config.quantized_ref()}"

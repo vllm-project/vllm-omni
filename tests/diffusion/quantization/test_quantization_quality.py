@@ -99,10 +99,6 @@ class QualityTestConfig:
             return None
         return self.quantization
 
-    def lpips_threshold(self) -> tuple[str, float]:
-        """Return ``(gpu_key, threshold)`` for the current CUDA device."""
-        return resolve_device_threshold(self.max_lpips, label=f"{self.id} max_lpips")
-
     def validate(self) -> None:
         uses_explicit_models = self.baseline_model is not None or self.quantized_model is not None
         uses_model_plus_method = self.model is not None or self.quantization is not None
@@ -592,7 +588,7 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- Similarity metrics ---
     lpips_score = _compute_lpips(baseline_out, quant_out, config.task)
     psnr_score, mae_score = _compute_psnr_and_mae(baseline_out, quant_out, config.task)
-    gpu_key, max_lpips = config.lpips_threshold()
+    gpu_key, max_lpips = resolve_device_threshold(config.max_lpips, label=f"{config.id} max_lpips")
     assert lpips_score <= max_lpips, (
         f"LPIPS {lpips_score:.4f} exceeds threshold {max_lpips} ({gpu_key}) "
         f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"
