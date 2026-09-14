@@ -45,8 +45,8 @@ WebSocket /v1/video/chat/stream
 | Server -> Client | `response.start` | none | Query generation started. |
 | Server -> Client | `response.text.delta` | `delta` | Incremental text output. |
 | Server -> Client | `response.text.done` | `text` | Final text output for the query. |
-| Server -> Client | `response.audio.delta` | `data`, `format` | Incremental generated audio, base64 WAV. |
-| Server -> Client | `response.audio.done` | none | Audio output finished. |
+| Server -> Client | `response.output_audio.delta` | `data`, `format` | Incremental generated audio, base64 WAV. |
+| Server -> Client | `response.output_audio.done` | none | Audio output finished. |
 | Server -> Client | `session.done` | none | Session closed. |
 | Server -> Client | `error` | `message` | Recoverable protocol or generation error. |
 

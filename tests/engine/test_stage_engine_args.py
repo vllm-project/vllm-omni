@@ -366,6 +366,44 @@ def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
     assert inherited_defaults.isdisjoint(engine_args)
 
 
+def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
+
+    pipeline = OMNI_PIPELINES["mammoth_moda2"]
+    deploy = load_deploy_config(_DEPLOY_DIR / "mammoth_moda2_fp8_kv.yaml")
+    legacy_stages, omni_config = _legacy_and_typed_stages(
+        pipeline,
+        deploy,
+        model="test-model",
+    )
+
+    assert deploy.stages[0].engine_extras["kv_cache_dtype"] == "fp8_e4m3"
+    assert "kv_cache_dtype" not in deploy.stages[1].engine_extras
+
+    legacy_args = [build_legacy_engine_args_dict(stage, "test-model") for stage in legacy_stages]
+    typed_args = [
+        build_engine_args_dict_from_omni_stage_config(
+            omni_config.stage_by_id(stage_id),
+            "test-model",
+        )
+        for stage_id in (0, 1)
+    ]
+
+    ar_stage = omni_config.stage_by_id(0)
+    dit_stage = omni_config.stage_by_id(1)
+
+    assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
+    assert legacy_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
+    assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
+    assert typed_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+
+    assert "kv_cache_dtype" not in legacy_args[1]
+    assert dit_stage.cache_config.cache_dtype == "auto"
+    assert "cache_dtype" not in dit_stage.cache_config._omni_explicit_fields
+    assert "kv_cache_dtype" not in typed_args[1]
+
+
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
     stage_config = VllmOmniARStageConfig(
         stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),

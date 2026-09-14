@@ -1,11 +1,23 @@
+<!-- markdownlint-disable MD001 MD025 -->
+
 # --8<-- [start:requirements]
 
 - GPU: Validated on gfx942 (It should be supported on the AMD GPUs that are supported by vLLM.)
 
 # --8<-- [end:requirements]
+
 # --8<-- [start:set-up-using-python]
 
-vLLM-Omni current recommends the steps in under setup through Docker Images.
+For ROCm, vLLM-Omni currently recommends the setup steps through Docker Images.
+
+vLLM-Omni depends on the matching major/minor release of vLLM. The 0.29
+development line uses vLLM 0.29.x. Published 0.28.0 wheels and images use vLLM
+0.28.x.
+
+The Dockerfile's `BASE_IMAGE` pin applies only to Docker builds. The
+`vllm-omni` package does not install vLLM as a dependency, so non-Docker source
+installs must install the matching ROCm vLLM release explicitly before
+installing vLLM-Omni, as shown below.
 
 # --8<-- [start:pre-built-wheels]
 
@@ -14,6 +26,7 @@ vLLM-Omni current recommends the steps in under setup through Docker Images.
 These pre-built wheel instructions install the published vLLM-Omni 0.28.0 release. For the 0.29 development line, use the source-install instructions below.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
+
 ```bash
 uv pip install vllm==0.28.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.28.0/rocm723
 ```
@@ -36,6 +49,7 @@ uv pip install onnxruntime-rocm
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
+
 If you do not need to modify source code of vLLM, you can directly install the stable 0.29.0 release version of the library
 
 ```bash
@@ -45,7 +59,9 @@ uv pip install vllm==0.29.0+rocm723 --extra-index-url https://wheels.vllm.ai/roc
 The pre-built 0.29.0 vLLM wheel targets ROCm 7.2.3. If you need a different ROCm stack or want to reuse an existing PyTorch installation, build vLLM from source instead.
 
 #### Installation of vLLM-Omni
+
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
+
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
@@ -71,15 +87,31 @@ python3 setup.py develop
 
 #### Build docker image
 
+The source build defaults to the published upstream base image
+`vllm/vllm-openai-rocm:v0.29.0`, aligned with the vLLM release used by CI.
+Older or custom bases must provide the vLLM APIs checked by the Dockerfile's
+image-build canary. This upstream base is distinct from the prebuilt
+`vllm/vllm-omni-rocm` images discussed below; their published-tag availability
+is tracked in [#7405](https://github.com/vllm-project/vllm-omni/issues/7405).
+
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
+```
+
+To select the upstream ROCm base explicitly, pass `BASE_IMAGE`:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.rocm \
+  --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:v0.29.0 \
+  -t vllm-omni-rocm .
 ```
 
 #### Launch the docker image
 
 ##### Launch with OpenAI API Server
 
-```
+```bash
 docker run --rm \
 --group-add=video \
 --ipc=host \
@@ -97,7 +129,7 @@ vllm-omni-rocm \
 
 ##### Launch with interactive session for development
 
-```
+```bash
 docker run --rm -it \
 --network=host \
 --group-add=video \
@@ -119,7 +151,9 @@ vllm-omni-rocm
 vLLM-Omni offers an official docker image for deployment. These images are built on top of vLLM docker images and available on Docker Hub as [vllm/vllm-omni-rocm](https://hub.docker.com/r/vllm/vllm-omni-rocm/tags). The version of vLLM-Omni indicates which release of vLLM it is based on.
 
 #### Launch vLLM-Omni Server
+
 Here's an example deployment command that has been verified on 2 x MI300's:
+
 ```bash
 docker run --rm \
   --group-add=video \
@@ -136,8 +170,10 @@ docker run --rm \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-#### Launch an interactive terminal with prebuilt docker image.
+#### Launch an interactive terminal with prebuilt docker image
+
 If you want to run in dev environment you can launch the docker image as follows:
+
 ```bash
 docker run --rm -it \
   --network=host \

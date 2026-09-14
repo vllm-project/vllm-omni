@@ -34,11 +34,13 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
 }
 
 __all__ = [
     "Audio8TTSConfig",
+    "AuKConfig",
     "Audio8TTSFastARConfig",
     "Audio8TTSSlowARConfig",
     "HiggsAudioV3Config",
@@ -82,6 +84,7 @@ def __dir__():
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import dots_tts as _dots_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
