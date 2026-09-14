@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Offline E2E test for InternVLA-A1 open-loop inference."""
 
@@ -26,6 +26,7 @@ def _required_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
         pytest.skip(f"{name} is not set")
+    assert value
     return value
 
 

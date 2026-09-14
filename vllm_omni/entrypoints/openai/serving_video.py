@@ -13,12 +13,14 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
+import pybase64 as base64
 from fastapi import HTTPException
 from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -99,7 +101,12 @@ def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[
     if not artifacts.videos:
         return metadata
 
-    num_frames = count_video_frames(artifacts.videos[0])
+    video = artifacts.videos[0]
+    # Pre-encoded outputs arrive as MP4 bytes, which carry no tensor shape.
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        num_frames = count_mp4_frames(bytes(video))
+    else:
+        num_frames = count_video_frames(video)
     if num_frames is not None and num_frames > 0:
         metadata["num_frames"] = num_frames
         if artifacts.output_fps > 0:
@@ -402,6 +409,11 @@ class OmniOpenAIServingVideo:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
+            if request.extra_params.get("preencode_mp4") and "preencode_batch_frames" in request.extra_params:
+                try:
+                    normalize_preencode_batch_frames(request.extra_params["preencode_batch_frames"])
+                except ValueError as exc:
+                    raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
 
@@ -479,26 +491,22 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
+        def encode_video_result(idx: int, video: Any) -> str:
+            if isinstance(video, bytes):
+                return base64.b64encode(video).decode("utf-8")
+            return encode_video_base64(
+                video,
+                fps=artifacts.output_fps,
+                audio=artifacts.audios[idx],
+                audio_sample_rate=artifacts.audio_sample_rate,
+                video_codec_options=video_codec_options,
+                frame_converter=self._video_frame_converter,
+            )
+
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
-                b64_json=(
-                    encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                    if artifacts.audios[idx] is None
-                    else encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        audio=artifacts.audios[idx],
-                        audio_sample_rate=artifacts.audio_sample_rate,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                ),
+                b64_json=encode_video_result(idx, video),
                 action=artifacts.actions[idx],
             )
             for idx, video in enumerate(artifacts.videos)
@@ -549,6 +557,17 @@ class OmniOpenAIServingVideo:
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
 
         _t_encode_start = time.perf_counter()
+        if isinstance(artifacts.videos[0], bytes):
+            video_bytes = artifacts.videos[0]
+            _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+            logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", _t_encode_ms)
+            return (
+                video_bytes,
+                artifacts.stage_durations,
+                artifacts.peak_memory_mb,
+                artifacts.actions[0],
+                video_metadata,
+            )
         video_bytes = _encode_video_bytes(
             artifacts.videos[0],
             fps=artifacts.output_fps,

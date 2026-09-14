@@ -339,11 +339,14 @@ steps:
         mirror_hardwares: h100_1
 
       - label: "Diffusion · SANA-Video · H100 · Single-GPU"
-        timeout_in_minutes: 90
+        source_file_dependencies: diffusion_sana_video_function
+        timeout_in_minutes: 180
         commands:
+          - export SANA_VIDEO_GOLDEN_BASE_URL=https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/sana-video/v2
           - >-
             pytest -sv
             tests/e2e/online_serving/test_sana_video_expansion.py
+            tests/e2e/accuracy/sana_video/
             -m "slow and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1
@@ -487,6 +490,15 @@ steps:
             -m "slow and diffusion and H100 and cards_2"
             --run-level "full_model"
         mirror_hardwares: h100_2
+
+      - label: "Diffusion · H100 · 3-GPU"
+        timeout_in_minutes: 120
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/ -m "slow and diffusion and H100 and cards_3"
+            --run-level "full_model"
+        mirror_hardwares: h100_3
 
       - label: "Diffusion · H100 · 4-GPU"
         timeout_in_minutes: 90

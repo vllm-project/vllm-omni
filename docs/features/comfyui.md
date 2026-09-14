@@ -13,7 +13,6 @@ It can send model inference requests to either a locally running vLLM-Omni servi
 !!! tip
     If you run both ComfyUI and vLLM-Omni on the same device, you can create separate virtual environments and use different Python versions for them.
 
-
 ## Installation
 
 Copy the `apps/ComfyUI-vLLM-Omni` folder to the `custom_nodes` subfolder of your ComfyUI installation. Your directory should look like `ComfyUI/custom_nodes/ComfyUI-vLLM-Omni`.
@@ -21,9 +20,10 @@ Copy the `apps/ComfyUI-vLLM-Omni` folder to the `custom_nodes` subfolder of your
 If you are running ComfyUI during copying, you should restart ComfyUI to load this extension.
 
 !!! tip
-    You can use utility websites such as https://download-directory.github.io/ to download a subdirectory of a repo. Also checkout community discussions (e.g., https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository) for more info.
+    You can use utility websites such as <https://download-directory.github.io/> to download a subdirectory of a repo. Also checkout community discussions (e.g., <https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository>) for more info.
 
 On the device and virtual environment you run ComfyUI, launch ComfyUI with
+
 ```bash
 cd ComfyUI
 
@@ -35,6 +35,7 @@ python main.py --cpu
 ```
 
 On the device and virtual environment you run vLLM-Omni, start a model service with
+
 ```bash
 vllm serve The_Model_ID_to_Serve --omni --port 8000
 ```
@@ -55,6 +56,20 @@ This extension also offers example workflows (at **ComfyUI sidebar -> Templates 
 
 !!! info
     The node UI and feature designs are intended to match vLLM-Omni online serving interfaces. It cannot offer more than what the interfaces support.
+
+Every node carries the vLLM-Omni mark in its title bar and is tinted by what it outputs, so a graph is readable at a glance:
+
+| Colour | Nodes | What they produce |
+| --- | --- | --- |
+| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
+| Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
+| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Teal | Video References | Reference media |
+
+Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
+
+**Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
 
 To build a simple workflow yourself,
 
