@@ -403,7 +403,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     self.od_config.model_class_name,
                 )
                 self.cache_backend = None
-                self.od_config.cache_backend = "none"
+                self.od_config.cache_backend = None
             else:
                 # Install configured cache capability once at startup. A model
                 # may explicitly adopt the enabled Cache-DiT backend and then
