@@ -1027,6 +1027,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 try_set_exception(pending, exc)
             else:
                 try_set_result(pending, result)
+        else:
+            # Waiter already cancelled or resolved. Do not re-cache the delivered
+            # tensors, but remember the id so a later ``wait_output_ready`` on
+            # the same id fails fast instead of allocating a fresh Future that
+            # would never complete (fully-async abort overlap: ``step_streaming``
+            # took a live waiter, ``asyncio.wrap_future`` cancelled it, then
+            # ``OUTPUT_READY`` lands here).
+            self._remember_dropped(async_output_id)
 
     def _remember_dropped(self, async_output_id: str) -> None:
         dropped = self._dropped_output_ids
@@ -1092,13 +1100,24 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             cached = self._completed_outputs.pop(async_output_id, None)
             if cached is not None:
                 return cached
-            # Share an already-registered Future (a genuine waiter or a
-            # drop_output placeholder) rather than clobbering it.
+            # Share an already-registered Future (a genuine pending waiter or a
+            # drop_output placeholder) rather than clobbering it. But if the
+            # registered entry is already cancelled or resolved, it is not a
+            # live waiter — evict it, remember the id, and fall through to the
+            # dropped path so abort-after-cancel installs terminal state
+            # instead of returning a Future that never completes.
             existing = self._output_futures.get(async_output_id)
             if existing is not None:
-                return existing
+                if isinstance(existing, _DropPlaceholder) or not existing.done():
+                    return existing
+                self._output_futures.pop(async_output_id, None)
+                self._remember_dropped(async_output_id)
             if async_output_id in self._dropped_output_ids:
-                del self._dropped_output_ids[async_output_id]
+                # Keep the id in the bounded LRU so *every* late wait on a
+                # dropped id fails the same way. Deleting here would make
+                # fail-fast one-shot and the next wait would hang on a fresh
+                # Future.
+                self._dropped_output_ids.move_to_end(async_output_id)
                 dropped: concurrent.futures.Future = concurrent.futures.Future()
                 dropped.set_exception(_dropped_output_error(async_output_id))
                 return dropped
