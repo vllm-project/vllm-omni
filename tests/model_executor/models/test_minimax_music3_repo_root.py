@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.model_executor.models.minimax_music3.weights import (
     _COMPONENT_WEIGHT_NAME,
     _REQUIRED_COMPONENTS,
@@ -47,16 +48,14 @@ def test_resolve_repo_root_walks_up_from_a_model_subdir(tmp_path):
 
 def test_resolve_repo_root_resolves_a_hub_id_to_a_local_snapshot(monkeypatch, tmp_path):
     """A hub id must resolve through the cache, not against the working directory."""
-    from huggingface_hub import HfApi
-
     root = _make_root(tmp_path / "snapshots" / "deadbeef")
     seen = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         seen.append(kwargs)
         return str(root)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == root
     # Cache-first, and only the component folders.
@@ -66,18 +65,16 @@ def test_resolve_repo_root_resolves_a_hub_id_to_a_local_snapshot(monkeypatch, tm
 
 
 def test_resolve_repo_root_falls_back_to_the_hub_when_the_cache_is_incomplete(monkeypatch, tmp_path):
-    from huggingface_hub import HfApi
-
     root = _make_root(tmp_path / "snapshots" / "deadbeef")
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if kwargs.get("local_files_only"):
             raise OSError("incomplete snapshot")
         return str(root)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == root
     assert len(calls) == 2
@@ -89,19 +86,17 @@ def test_resolve_repo_root_retries_online_when_the_local_lookup_returns_a_partia
     A returned partial root must fall through to the online call all the same,
     or startup fails without ever consulting the Hub.
     """
-    from huggingface_hub import HfApi
-
     snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
     (snapshot / "language_model").mkdir(parents=True)
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if not kwargs.get("local_files_only"):
             _make_root(snapshot)
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == snapshot
     assert [bool(call.get("local_files_only")) for call in calls] == [True, False]
@@ -109,32 +104,28 @@ def test_resolve_repo_root_retries_online_when_the_local_lookup_returns_a_partia
 
 def test_resolve_repo_root_redownloads_weightless_marker_dirs(monkeypatch, tmp_path):
     """Marker folders without their component weights are an interrupted download."""
-    from huggingface_hub import HfApi
-
     snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
     for marker in _ROOT_MARKERS:
         (snapshot / marker).mkdir(parents=True)
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if not kwargs.get("local_files_only"):
             _make_root(snapshot)
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == snapshot
     assert any(not call.get("local_files_only") for call in calls)
 
 
 def test_resolve_repo_root_reports_the_original_reference_when_unresolvable(monkeypatch):
-    from huggingface_hub import HfApi
-
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         raise OSError("offline")
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     with pytest.raises(FileNotFoundError, match="MiniMaxAI/MiniMax-Music3"):
         resolve_repo_root("MiniMaxAI/MiniMax-Music3")
@@ -147,19 +138,17 @@ def test_resolve_repo_root_downloads_components_for_a_cold_cache_model_subdir(mo
     the marker walk fails although the repo id is recoverable from the cache
     layout and one snapshot_download away from working.
     """
-    from huggingface_hub import HfApi
-
     snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
     (snapshot / "language_model").mkdir(parents=True)
     (snapshot / "tokenizer").mkdir()
     seen = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         seen.append(repo_id)
         _make_root(snapshot)
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root(str(snapshot / "language_model")) == snapshot
     assert seen == ["MiniMaxAI/MiniMax-Music3"]
@@ -167,12 +156,11 @@ def test_resolve_repo_root_downloads_components_for_a_cold_cache_model_subdir(mo
 
 def test_resolve_repo_root_does_not_guess_a_repo_id_for_plain_directories(monkeypatch, tmp_path):
     """A directory outside the HF cache has no recoverable repo id."""
-    from huggingface_hub import HfApi
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         raise AssertionError("must not reach the Hub for a plain directory")
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     plain = tmp_path / "language_model"
     plain.mkdir()
@@ -187,8 +175,6 @@ def test_resolve_repo_root_rejects_a_snapshot_missing_condition_encoder(monkeypa
     acoustic stage would still fail, so completeness must cover every required
     component rather than the identification markers alone.
     """
-    from huggingface_hub import HfApi
-
     snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
     for marker in _ROOT_MARKERS:
         folder = snapshot / marker
@@ -196,13 +182,13 @@ def test_resolve_repo_root_rejects_a_snapshot_missing_condition_encoder(monkeypa
         (folder / _COMPONENT_WEIGHT_NAME).write_bytes(b"x")
     repaired = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         if not kwargs.get("local_files_only"):
             repaired.append(repo_id)
             _make_root(snapshot)
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root(str(snapshot)) == snapshot
     assert repaired == ["MiniMaxAI/MiniMax-Music3"]
@@ -210,8 +196,6 @@ def test_resolve_repo_root_rejects_a_snapshot_missing_condition_encoder(monkeypa
 
 def test_resolve_repo_root_rejects_a_partial_shard_run(monkeypatch, tmp_path):
     """One shard of a multi-shard component satisfies a bare glob but cannot load."""
-    from huggingface_hub import HfApi
-
     stem = _COMPONENT_WEIGHT_NAME.removesuffix(".safetensors")
     snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "deadbeef"
     for component in _REQUIRED_COMPONENTS:
@@ -223,14 +207,14 @@ def test_resolve_repo_root_rejects_a_partial_shard_run(monkeypatch, tmp_path):
     (partial / f"{stem}-00001-of-00003.safetensors").write_bytes(b"x")
     repaired = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         if not kwargs.get("local_files_only"):
             repaired.append(repo_id)
             for index in (2, 3):
                 (partial / f"{stem}-0000{index}-of-00003.safetensors").write_bytes(b"x")
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root(str(snapshot)) == snapshot
     assert repaired == ["MiniMaxAI/MiniMax-Music3"]
@@ -242,17 +226,15 @@ def test_resolve_repo_root_threads_revision_and_download_dir(monkeypatch, tmp_pa
     Resolving components against the default branch while the AR backbone is
     pinned elsewhere would combine weights from two different commits.
     """
-    from huggingface_hub import HfApi
-
     snapshot = tmp_path / "snapshot"
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         _make_root(snapshot)
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3", revision="abc123", download_dir="/tmp/hub-cache") == snapshot
     assert calls
@@ -266,18 +248,16 @@ def test_resolve_repo_root_reuses_the_snapshot_revision_from_the_cache_path(monk
     Re-resolving the repo id alone would fetch the default branch rather than
     the snapshot the caller is already sitting in.
     """
-    from huggingface_hub import HfApi
-
     snapshot = tmp_path / "models--MiniMaxAI--MiniMax-Music3" / "snapshots" / "cafebabe"
     (snapshot / "language_model").mkdir(parents=True)
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         _make_root(snapshot)
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root(str(snapshot / "language_model")) == snapshot
     assert calls
@@ -292,8 +272,6 @@ def test_resolve_repo_root_accepts_shard_names_the_loader_can_read(monkeypatch, 
     loadable. Judging it incomplete would force a needless re-download and, with
     no network, fail on weights that are present and readable.
     """
-    from huggingface_hub import HfApi
-
     stem = _COMPONENT_WEIGHT_NAME.removesuffix(".safetensors")
     root = tmp_path / "snapshot"
     for component in _REQUIRED_COMPONENTS:
@@ -303,18 +281,16 @@ def test_resolve_repo_root_accepts_shard_names_the_loader_can_read(monkeypatch, 
     (unsharded / _COMPONENT_WEIGHT_NAME).unlink()
     (unsharded / f"{stem}-fp16.safetensors").write_bytes(b"x")
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         raise AssertionError("must not reach the Hub for readable weights")
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     assert resolve_repo_root(str(root)) == root
 
 
 def test_resolve_repo_root_still_rejects_a_partial_run_beside_an_extra_file(monkeypatch, tmp_path):
     """An unparsable extra must not mask a genuinely short ``-of-`` run."""
-    from huggingface_hub import HfApi
-
     stem = _COMPONENT_WEIGHT_NAME.removesuffix(".safetensors")
     root = tmp_path / "snapshot"
     for component in _REQUIRED_COMPONENTS:
@@ -326,13 +302,13 @@ def test_resolve_repo_root_still_rejects_a_partial_run_beside_an_extra_file(monk
     (partial / f"{stem}-extra.safetensors").write_bytes(b"x")
     repaired = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         repaired.append(repo_id)
         for index in (2, 3):
             (partial / f"{stem}-0000{index}-of-00003.safetensors").write_bytes(b"x")
         return str(root)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     with pytest.raises(FileNotFoundError, match="components are incomplete"):
         resolve_repo_root(str(root))

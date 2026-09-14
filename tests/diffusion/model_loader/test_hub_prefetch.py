@@ -3,9 +3,9 @@
 
 import contextlib
 
-import huggingface_hub
 import pytest
 
+from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.diffusion.model_loader import hub_prefetch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -14,10 +14,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 def test_prefetch_subfolders_propagates_revision(monkeypatch):
     calls = []
 
-    def fake_snapshot_download(self, **kwargs):
+    def fake_snapshot_download(**kwargs):
         calls.append(kwargs)
 
-    monkeypatch.setattr(huggingface_hub.HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
     monkeypatch.setattr(hub_prefetch, "_repo_prefetch_lock", lambda _model: contextlib.nullcontext())
 
     hub_prefetch.prefetch_subfolders(
