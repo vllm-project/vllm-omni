@@ -93,6 +93,8 @@ class ServingRuntimeSessionState(Protocol):
     pending_silence_task: asyncio.Task[bool] | None
     pending_silence_owner_id: str | None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None
+    last_native_submit_monotonic: float | None
+    silence_deadline_monotonic: float | None
 
     def retain_committed_audio(
         self,
