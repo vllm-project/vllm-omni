@@ -7,6 +7,7 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 import torch
@@ -16,7 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -83,6 +84,9 @@ class Attention(nn.Module):
         custom_attention: nn.Module | None = None,
         # Preserve dense FP32 inference for models opting into CUDA auto fallback.
         allow_fp32_fallback: bool = False,
+        # Model-owned specializations of a selected backend. The platform
+        # still resolves and validates the underlying execution backend.
+        backend_overrides: Mapping[str, type[AttentionBackend]] | None = None,
     ):
         super().__init__()
 
@@ -181,7 +185,9 @@ class Attention(nn.Module):
                 self.backend_pref = attn_backend_cls.get_name()
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
-            self.attn_backend = attn_backend_cls
+            if backend_overrides is not None:
+                attn_backend_cls = backend_overrides.get(attn_backend_cls.get_name(), attn_backend_cls)
+            self.attn_backend: type[AttentionBackend] | None = attn_backend_cls
             self.attn_impl_cls = self.attn_backend.get_impl_cls()
             self.attention = self.attn_impl_cls(
                 num_heads=num_heads,
@@ -197,7 +203,7 @@ class Attention(nn.Module):
             )
             # Compatibility kernels run inside shared dispatch, between the
             # parallel strategy's input preparation and output restoration.
-            self.sdpa_fallback = SDPABackend.get_impl_cls()(
+            self.sdpa_fallback: AttentionImpl | None = SDPABackend.get_impl_cls()(
                 num_heads=num_heads,
                 head_size=head_size,
                 softmax_scale=softmax_scale,
@@ -296,6 +302,29 @@ class Attention(nn.Module):
                 return self._no_parallel_strategy
         return self.parallel_strategy
 
+    @property
+    def supports_qk_input_landing(self) -> bool:
+        """Expose the static producer-direct capability to model layers."""
+        if self.skip_sequence_parallel:
+            return False
+        return bool(getattr(self.parallel_strategy, "supports_qk_input_landing", False))
+
+    @torch.compiler.disable
+    def prepare_qk_input_landings(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Acquire Q/K landing buffers only from the existing eager island."""
+        strategy = self._get_active_parallel_strategy()
+        prepare = getattr(strategy, "prepare_qk_input_landings", None)
+        if prepare is None:
+            return None
+        return prepare(
+            query,
+            key,
+        )
+
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None or self._has_custom_attention:
             return
@@ -305,6 +334,7 @@ class Attention(nn.Module):
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype:
+            assert self.attn_backend is not None
             if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
@@ -400,6 +430,7 @@ class Attention(nn.Module):
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
+            assert self.attn_backend is not None
             raise NotImplementedError(
                 f"Diffusion paged KV requires an Omni backend with paged support; "
                 f"selected {self.attn_backend.get_name()}"
@@ -496,8 +527,10 @@ class Attention(nn.Module):
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:
+            assert callable(self.attention)
             return self.attention(query, key, value, attn_metadata)
 
+        assert self.attn_backend is not None and self.sdpa_fallback is not None
         self._assert_metadata_compatible(attn_metadata)
 
         if (
