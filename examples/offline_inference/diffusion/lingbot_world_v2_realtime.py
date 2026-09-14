@@ -4,8 +4,9 @@
 
 This example exercises the internal session API. It is not a public HTTP or
 WebSocket protocol. Each JSONL event advances the world by one three-latent
-frame AR block and writes the latent plus its identity metadata. A bounded
-blank-tail image condition supports open-ended contiguous realtime ticks.
+frame AR block and writes the latent plus its identity metadata. Session-owned
+causal VAE encoder state produces each condition block without retaining or
+repeating a full image-condition horizon.
 """
 
 from __future__ import annotations
