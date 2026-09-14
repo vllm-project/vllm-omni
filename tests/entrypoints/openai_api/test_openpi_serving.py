@@ -440,3 +440,17 @@ def test_extract_actions_does_not_iterate_result_object():
     actions = serving._extract_actions(IterableResult())
 
     np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+
+def test_drop_session_calls_dreamzero_close_hook():
+    closed: list[str] = []
+    pipeline = SimpleNamespace(close_ar_diffusion_session=lambda session_id: closed.append(session_id))
+    engine_client = SimpleNamespace(
+        model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG},
+        model_runner=SimpleNamespace(pipeline=pipeline),
+    )
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+
+    serving.drop_session("rollout-1")
+
+    assert closed == ["rollout-1"]
