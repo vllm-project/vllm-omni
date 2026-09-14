@@ -86,9 +86,12 @@ def wait_for_gpu_memory_to_clear(
             return used / total <= ratio
 
     print(f"[Device Memory Monitor] Waiting for device(s) {device_list} to free memory, Condition: {condition_str}")
-    whisper_allowance_gib = _whisper_vram_allowance_gib()
-    if whisper_allowance_gib > 0:
-        print(f"[Device Memory Monitor] Whisper worker allowance {whisper_allowance_gib:.1f}GiB ")
+    whisper_allowance_gib, whisper_device = _whisper_vram_allowance()
+    if whisper_allowance_gib > 0 and whisper_device is not None:
+        print(
+            f"[Device Memory Monitor] Whisper worker allowance {whisper_allowance_gib:.1f}GiB "
+            f"on device {whisper_device}"
+        )
 
     while True:
         used_by_device: dict[int, tuple[float, float]] = {}
@@ -96,10 +99,11 @@ def wait_for_gpu_memory_to_clear(
             with current_omni_platform.device(device):
                 free_bytes, total_bytes = current_omni_platform.mem_get_info()
             used_by_device[device] = ((total_bytes - free_bytes) / 2**30, total_bytes / 2**30)
-        whisper_device = max(used_by_device) if whisper_allowance_gib > 0 and used_by_device else None
         output_raw: dict[int, tuple[float, float, float]] = {}
         for device, (used_gib, total_gib) in used_by_device.items():
-            whisper_gib = min(used_gib, whisper_allowance_gib) if device == whisper_device else 0.0
+            whisper_gib = (
+                min(used_gib, whisper_allowance_gib) if whisper_device is not None and device == whisper_device else 0.0
+            )
             output_raw[device] = (max(0.0, used_gib - whisper_gib), total_gib, whisper_gib)
         print("[Device Memory Status] Current usage (engine view excludes Whisper worker):")
         for device_id, (used, total, whisper) in output_raw.items():
@@ -133,12 +137,20 @@ def wait_for_gpu_memory_to_clear(
         time.sleep(5)
 
 
-def _whisper_vram_allowance_gib() -> float:
+def _whisper_vram_allowance() -> tuple[float, int | None]:
+    """Whisper GPU footprint and physical device, or ``(0.0, None)`` on CPU / unknown."""
     try:
-        from tests.helpers.media import whisper_resident_vram_gib
+        from tests.helpers.media import whisper_resident_device_index, whisper_resident_vram_gib
     except Exception:
-        return 0.0
-    return whisper_resident_vram_gib()
+        return 0.0, None
+    gib = whisper_resident_vram_gib()
+    logical = whisper_resident_device_index()
+    if gib <= 0.0 or logical is None:
+        return 0.0, None
+    mapped = get_physical_device_indices([logical])
+    if not mapped:
+        return 0.0, None
+    return gib, mapped[0]
 
 
 def _run_smi(label: str, cmd: list[str], head_lines: int, timeout: float = 5) -> None:
