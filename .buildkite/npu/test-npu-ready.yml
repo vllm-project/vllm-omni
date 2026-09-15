@@ -12,13 +12,14 @@ steps:
             -m 'core_model and npu and A3 and omni'
             --run-level 'core_model'
 
-      - label: "Diffusion NPU layer tests - A2"
+      - label: "NPU layer and runner tests - A2"
         key: ready-diffusion-npu-layer-tests-a2
         mirror_hardwares: a2b3_npu_1
         commands:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/platforms/npu/test_pooling_prefix_cache.py
             -m 'core_model and npu and A2'
             --run-level 'core_model'
 
