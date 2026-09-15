@@ -52,6 +52,7 @@ from vllm_omni.diffusion.offloader.offload_plan import (
     OffloadPlan,
     get_offload_plan,
 )
+from vllm_omni.diffusion.offloader.plan_resolver import resolve_offload_plan
 from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
 from vllm_omni.host_weight_runtime import MappedHostRegion
 from vllm_omni.platforms import current_omni_platform
@@ -2813,18 +2814,21 @@ class TestDistributedComponentSelection:
 
     def test_encoder_allgather_rejects_stub_rank_before_block_discovery(self):
         """Every rank must reject an unsafe encoder group, including stub ranks."""
-        backend = DistributedLayerwiseOffloadBackend(
-            OffloadConfig(
-                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
-                pin_cpu_memory=False,
-                dp_size=2,
-                components=frozenset({"text_encoder"}),
-                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
-            ),
-            torch.device("cpu"),
+
+        class StubEncoderPipeline(nn.Module):
+            _offload_plan = OffloadPlan(encoder_block_attrs={"text_encoder": ("missing.blocks",)})
+
+            def __init__(self):
+                super().__init__()
+                self.text_encoder = nn.Module()
+
+        config = OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dp_size=2,
+            components=frozenset({"text_encoder"}),
+            dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
         )
-        backend.dp_group = object()
-        stub_plan = OffloadPlan(encoder_block_attrs={"text_encoder": ("missing.blocks",)})
 
         with pytest.raises(ValueError, match="not declared replicated"):
-            backend._try_layerwise_offload_encoder(nn.Module(), "text_encoder", stub_plan)
+            resolve_offload_plan(StubEncoderPipeline(), config)

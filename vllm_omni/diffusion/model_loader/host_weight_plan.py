@@ -322,6 +322,7 @@ def build_checkpoint_mmap_plan(
     tensor_parallel_size: int,
     use_hsdp: bool,
     online_quantization: bool,
+    has_distilled_lora: bool = False,
 ) -> HostWeightPlanResult:
     """Build a complete direct-checkpoint plan or return a fallback reason."""
     if tensor_parallel_size != 1:
@@ -330,6 +331,8 @@ def build_checkpoint_mmap_plan(
         return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
     if online_quantization:
         return HostWeightPlanResult(None, "online quantization requires the ordinary loader")
+    if has_distilled_lora:
+        return HostWeightPlanResult(None, "distilled LoRA requires the ordinary loader")
 
     remap_fn = getattr(type(pipeline), "_remap_ckpt_key", None)
     if not callable(remap_fn):

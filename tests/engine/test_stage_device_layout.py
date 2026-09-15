@@ -156,6 +156,43 @@ def test_replica_guard_and_splitter_share_local_world_size(devices, expected):
     assert replica_devices_map == {0: expected}
 
 
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize("local_dp", [None, 0, 1, 2])
+@pytest.mark.parametrize("pool_devices", [False, True], ids=["template", "pool"])
+def test_replica_layout_preserves_local_dp_semantics(typed, local_dp, pool_devices):
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
+    from vllm_omni.engine.stage_engine_startup import get_headless_replica_devices
+
+    engine_args = {
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 4,
+        "data_parallel_size_local": local_dp,
+        "pipeline_parallel_size": 2,
+    }
+    width = 2 * max(1, local_dp if local_dp is not None else 4) * 2
+    devices = ",".join(str(i) for i in range(width * (2 if pool_devices else 1)))
+    if typed:
+        pipeline = PipelineConfig(
+            model_type="test",
+            model_arch="TestModel",
+            stages=(StagePipelineConfig(stage_id=0, model_stage="ar", final_output=True),),
+        )
+        stage = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            cli_overrides={
+                f"stage_0_{key}": value for key, value in {**engine_args, "devices": devices, "num_replicas": 2}.items()
+            },
+        ).stage_configs[0]
+    else:
+        stage = _stage(0, devices=devices, num_replicas=2, engine_args=engine_args)
+    expected = [",".join(str(i) for i in range(r * width, (r + 1) * width)) for r in range(2)]
+
+    assert get_stage_devices_per_replica(stage) == width
+    assert compute_replica_layout([stage]) == ([2], {0: expected})
+    assert get_headless_replica_devices(stage, stage_id=0, omni_dp_size_local=2) == expected
+
+
 def test_non_tp_layout_error_uses_generic_guidance():
     """A PP mismatch must not be reported as a top-level TP broadcast."""
     stage = _stage(0, devices="0")

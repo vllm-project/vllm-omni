@@ -29,6 +29,7 @@ thinker_only_models = ["Qwen/Qwen3-Omni-30B-A3B-Captioner"]
 # Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
 # platforms: section. Only CUDA needs an extra enforce_eager tweak.
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+_PRODUCTION_DEPLOY = get_deploy_config_path("qwen3_omni_moe.yaml")
 
 
 def get_cuda_graph_config():
@@ -50,6 +51,7 @@ else:
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+production_test_params = [(model, _PRODUCTION_DEPLOY) for model in models]
 # we can use the same config for a model that only has thinker (i.e., does not
 # enable audio output) because the resolver should figure out that it doesn't
 # need the full pipeline based on the HF config.
@@ -66,8 +68,8 @@ def get_question(prompt_type="video"):
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_structured_multistage_config_reaches_runtime(omni_runner) -> None:
+@pytest.mark.parametrize("omni_runner", production_test_params, indirect=True)
+def test_structured_multistage_config_reaches_runtime(omni_runner, offline_client) -> None:
     """User deploy settings survive resolution and affect the live stages."""
     stage_configs = omni_runner.omni.engine.stage_configs
     assert len(stage_configs) == 3
@@ -89,26 +91,38 @@ def test_structured_multistage_config_reaches_runtime(omni_runner) -> None:
     assert code2wav.cache_config.gpu_memory_utilization == 0.1
     assert all(stage.cache_config.enable_prefix_caching is False for stage in stage_configs)
     assert all(stage.model_config.trust_remote_code is True for stage in stage_configs)
-    assert thinker.model_config.default_sampling_params == {"temperature": 0.0, "max_tokens": 2048}
-    assert talker.model_config.default_sampling_params == {
-        "temperature": 0.9,
-        "top_k": 50,
-        "max_tokens": 4096,
-        "repetition_penalty": 1.05,
-    }
-    assert code2wav.model_config.default_sampling_params == {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": -1,
-        "max_tokens": 65536,
-        "repetition_penalty": 1.1,
-    }
+    expected_sampling = (
+        (thinker, {"temperature": 0.0, "max_tokens": 2048}),
+        (talker, {"temperature": 0.9, "top_k": 50, "max_tokens": 4096, "repetition_penalty": 1.05}),
+        (code2wav, {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "max_tokens": 65536,
+            "repetition_penalty": 1.1,
+        }),
+    )
+    for stage, expected in expected_sampling:
+        # SamplingParams normalization may add backend defaults (for example
+        # ``detokenize=True``). Verify deploy-owned values without rejecting
+        # those non-lossy normalized fields.
+        actual = stage.model_config.default_sampling_params or {}
+        assert all(actual.get(name) == value for name, value in expected.items())
     assert talker.connector_config.input_connectors == {"from_stage_0": "connector_of_shared_memory"}
     assert code2wav.connector_config.input_connectors == {"from_stage_1": "connector_of_shared_memory"}
 
     if current_omni_platform.is_cuda():
-        assert thinker.model_config.enforce_eager is True
-        assert talker.model_config.enforce_eager is True
+        assert thinker.model_config.enforce_eager is False
+        assert talker.model_config.enforce_eager is False
+
+    # Exercise the same production-resolved stage list with a real request;
+    # this test is not merely a dataclass shape check.
+    offline_client.send_omni_request(
+        {
+            "prompts": "Answer with one short sentence: what is the capital of China?",
+            "modalities": ["text"],
+        }
+    )
 
 
 @pytest.mark.advanced_model

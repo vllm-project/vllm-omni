@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Serving layer for robot policy inference via `/v1/realtime/robot/openpi`.
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ActionOutput = np.ndarray | dict[str, np.ndarray]
+ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -103,6 +103,14 @@ class ServingRealtimeRobotOpenPI:
             for stage_config in getattr(engine_client, "stage_configs", []) or []:
                 if getattr(stage_config, "stage_type", None) != "diffusion":
                     continue
+                # Typed diffusion stages keep model-owned OpenPI handshake
+                # metadata in diffusion_config.model_config. The out-of-process
+                # head only has this stage view because full od_config lives in
+                # the worker.
+                diffusion_config = getattr(stage_config, "diffusion_config", None)
+                model_config = getattr(diffusion_config, "model_config", None)
+                if model_config is not None:
+                    break
                 engine_args = getattr(stage_config, "engine_args", None)
                 model_config = getattr(engine_args, "model_config", None)
                 if model_config is not None:
@@ -119,10 +127,32 @@ class ServingRealtimeRobotOpenPI:
     def reset(self, obs: dict) -> None:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
 
+    def drop_session(self, session_id: str) -> None:
+        """Best-effort release of model-side session state for a closed rollout."""
+        drop = getattr(self.engine_client, "drop_session", None)
+        if callable(drop):
+            drop(session_id)
+            return
+        pipeline = self._pipeline()
+        for name in ("close_ar_diffusion_session", "drop_session_state"):
+            close = getattr(pipeline, name, None)
+            if callable(close):
+                close(session_id)
+                return
+
+    def _pipeline(self) -> Any:
+        engine = self.engine_client
+        for attr in ("model_runner", "runner", "diffusion_model_runner"):
+            runner = getattr(engine, attr, None)
+            pipeline = getattr(runner, "pipeline", None) if runner is not None else None
+            if pipeline is not None:
+                return pipeline
+        return getattr(engine, "pipeline", None)
+
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni
-        request = self._build_request(obs, session_id=session_id, reset=reset)
+        request = self.build_request(obs, session_id=session_id, reset=reset)
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
@@ -141,6 +171,10 @@ class ServingRealtimeRobotOpenPI:
     def _next_request_id(self, session_id: str) -> str:
         return f"robot-{session_id}-{next(self._request_counter)}"
 
+    def build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
+        """Build an engine request from raw robot obs."""
+        return self._build_request(obs, session_id=session_id, reset=reset)
+
     def _build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
         """Build engine request from raw robot obs.
 
@@ -148,16 +182,38 @@ class ServingRealtimeRobotOpenPI:
         `AsyncOmni.generate()` and routed to the diffusion stage.
         """
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.entrypoints.openai.stage_params import (
+            clone_sampling_params,
+            get_default_sampling_params_list,
+        )
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        extra_args = {
-            "reset": reset,
-            "session_id": session_id,
-            "robot_obs": obs,
-        }
+        # The engine applies stage default_sampling_params only to requests
+        # that carry no explicit params; this endpoint always passes explicit
+        # params, so start from a clone of the diffusion stage's defaults
+        # (e.g. a policy deploy yaml's ``extra_args``) and layer the OpenPI
+        # protocol fields on top.
+        seed = obs.pop("seed", None)
+        sampling_params = OmniDiffusionSamplingParams()
+        for default_params in get_default_sampling_params_list(self.engine_client):
+            if isinstance(default_params, OmniDiffusionSamplingParams):
+                sampling_params = clone_sampling_params(default_params)
+                break
+
+        extra_args = sampling_params.extra_args or {}
+        extra_args.update(
+            {
+                "reset": reset,
+                "session_id": session_id,
+                "robot_obs": obs,
+            }
+        )
 
         prompt = obs.get("prompt", "")
-        sampling_params = OmniDiffusionSamplingParams(extra_args=extra_args)
+        sampling_params = OmniDiffusionSamplingParams(
+            seed=int(seed) if seed is not None else None,
+            extra_args=extra_args,
+        )
         return OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,

@@ -454,11 +454,10 @@ class HunyuanImage3Pipeline(
 
         # Note: guidance_emb and timestep_r_emb are no longer skipped
         # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
-        return loader.load_weights(weights)
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed

@@ -20,6 +20,7 @@ from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
     maybe_enable_stage_metrics,
     set_print_stage,
+    set_request_timeout_s,
     should_request_stage_metrics,
 )
 
@@ -62,6 +63,9 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
     if getattr(args, "daily_omni_save_eval_items", False):
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
+    request_timeout_s = getattr(args, "omni_request_timeout_s", None)
+    if request_timeout_s is not None:
+        set_request_timeout_s(request_timeout_s)
     _use_endpoint_backend_when_implicit(args)
     set_print_stage(getattr(args, "print_stage", False))
     args.extra_body = maybe_enable_stage_metrics(

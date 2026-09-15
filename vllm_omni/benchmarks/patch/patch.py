@@ -211,6 +211,61 @@ def _seed_tts_capture_pcm_for_wer() -> bool:
     )
 
 
+_DEFAULT_REQUEST_TIMEOUT_S = 900.0
+_LEGACY_REQUEST_TIMEOUT_S = 6 * 60 * 60.0
+
+# Set from the ``--omni-request-timeout-s`` CLI flag by ``vllm bench serve``
+# before the benchmark session is built (``None`` = use the default above).
+_REQUEST_TIMEOUT_OVERRIDE_S: float | None = None
+
+
+def set_request_timeout_s(value: float) -> None:
+    """Record the explicitly requested per-request timeout (from the CLI)."""
+    global _REQUEST_TIMEOUT_OVERRIDE_S
+    _REQUEST_TIMEOUT_OVERRIDE_S = float(value)
+
+
+def _omni_request_timeout_s() -> float:
+    """Per-request total timeout for the shared benchmark ``aiohttp`` session.
+
+    An explicit ``--omni-request-timeout-s`` value wins over the 900 s default;
+    ``<= 0`` restores the legacy 6 h cap. A bounded per-request timeout makes a
+    hung server surface as ``failed`` requests once the deadline fires instead
+    of pinning the benchmark slot indefinitely.
+    """
+    value = _REQUEST_TIMEOUT_OVERRIDE_S
+    if value is None:
+        return _DEFAULT_REQUEST_TIMEOUT_S
+    if value <= 0:
+        return _LEGACY_REQUEST_TIMEOUT_S
+    return value
+
+
+def _build_benchmark_session(
+    max_concurrency: int | None,
+    ssl_setting: ssl.SSLContext | bool,
+) -> aiohttp.ClientSession:
+    """Build the session shared by every benchmark request.
+
+    Connections are reused across requests to reduce TLS handshake overhead;
+    the per-request total timeout comes from ``_omni_request_timeout_s()``.
+    """
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrency or 0,
+        limit_per_host=max_concurrency or 0,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        enable_cleanup_closed=True,
+        force_close=True,
+        ssl=ssl_setting,
+    )
+    return aiohttp.ClientSession(
+        connector=connector,
+        trust_env=True,
+        timeout=aiohttp.ClientTimeout(total=_omni_request_timeout_s()),
+    )
+
+
 def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict | None:
     """Shallow-merge ``extra_body`` dicts; deep-merge ``mm_processor_kwargs`` if both set."""
     if not base and not overlay:
@@ -2616,21 +2671,8 @@ async def benchmark(
 
     # Reuses connections across requests to reduce TLS handshake overhead.
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
-    connector = aiohttp.TCPConnector(
-        limit=max_concurrency or 0,
-        limit_per_host=max_concurrency or 0,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-        enable_cleanup_closed=True,
-        force_close=True,
-        ssl=ssl_setting,
-    )
-
-    session = aiohttp.ClientSession(
-        connector=connector,
-        trust_env=True,
-        timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
-    )
+    session = _build_benchmark_session(max_concurrency, ssl_setting)
+    print(f"Per-request timeout: {_omni_request_timeout_s():g}s")
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
@@ -2933,7 +2975,9 @@ async def benchmark(
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
+            "total_input_sequences": metrics.total_input_sequences,
             "request_throughput": metrics.request_throughput,
+            "input_sequence_throughput": metrics.input_sequence_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],

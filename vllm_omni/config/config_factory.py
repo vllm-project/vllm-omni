@@ -25,6 +25,7 @@ from vllm_omni.config.stage_config import (
     DeployConfig,
     PipelineConfig,
     StageConfig,
+    StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
     StageType,
@@ -732,7 +733,6 @@ class StageConfigFactory:
                     execution_type=StageExecutionType.DIFFUSION,
                     final_output=True,
                     final_output_type=final_output_type,
-                    sampling_constraints=default_sampling_params,
                 ),
             ),
         )
@@ -748,7 +748,12 @@ class StageConfigFactory:
             or kwargs.get("devices")
             or ",".join(str(i) for i in range(parallel_config.world_size))
         )
-        return VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides={"model": model, **stage_overrides})
+        # Caller defaults belong to deployment, not immutable pipeline constraints:
+        # explicit request sampling parameters must still be able to override them.
+        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)])
+        return VllmOmniConfig.from_pipeline_config(
+            pipeline, user_deploy_config=deploy, cli_overrides={"model": model, **stage_overrides}
+        )
 
     @classmethod
     def _merge_cli_overrides(

@@ -186,7 +186,7 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
         ltx2_components.initialize_pipeline_components(pipe, od_config)
 
     assert str(exc_info.value) == (
-        "LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15."
+        "LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.13.0,<5.15."
     )
 
 
@@ -387,7 +387,7 @@ def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
         MissingNattenProcessor,
     )
 
-    with pytest.raises(RuntimeError, match=r"kernels==0\.15\.2.*supported GPU.*allow Hub access"):
+    with pytest.raises(RuntimeError, match=r"kernels==0\.16\.1.*supported GPU.*allow Hub access"):
         ltx2_components._create_ltx25_natten_processor()
 
 

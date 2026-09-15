@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runtime behavior tests for VideoStreamHandler.
 
 Every test creates a mock WebSocket, drives handle_session through a
@@ -281,7 +281,7 @@ class TestHandleQueryErrors:
     @pytest.mark.asyncio
     async def test_query_returns_error_response(self):
         """create_chat_completion returns ErrorResponse → error forwarded."""
-        from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
+        from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 
         err = ErrorResponse(
             error=ErrorInfo(

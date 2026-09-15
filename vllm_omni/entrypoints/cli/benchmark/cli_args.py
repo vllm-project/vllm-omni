@@ -92,6 +92,16 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
             "and tpop controls both text TPOP and internal stream TPOP."
         ),
     )
+    group.add_argument(
+        "--omni-request-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Total per-request timeout in seconds for benchmark HTTP requests. Timed-out requests are "
+            "recorded as failed instead of stalling the run on a hung server. Defaults to 900 when "
+            "omitted; set <= 0 to restore the legacy 6 h cap."
+        ),
+    )
 
 
 def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:

@@ -970,10 +970,7 @@ def test_remote_replicas_use_distinct_init_group_keys():
         replica.launch_mode = "remote"
         replica.metadata.runtime_cfg = None
 
-    assert [runtime._replica_init_group_key(replica) for replica in plan.replicas] == [
-        "remote:1:0",
-        "remote:1:1",
-    ]
+    assert runtime._init_group_keys(plan.replicas) == ["remote:1:0", "remote:1:1"]
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
@@ -1640,73 +1637,58 @@ def test_model_path_resolver_is_generic_and_model_owned(tmp_path):
     assert "model_path_resolver" not in engine_args
 
 
-def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
+def test_build_stage0_input_processor_uses_omni_renderer_subclass(monkeypatch):
+    from vllm.renderers import BaseRenderer
+
     import vllm_omni.engine.stage_init_utils as init_mod
+    from vllm_omni.inputs.preprocess import OmniRenderer, omni_renderer_cls
 
-    class DummyInputProcessor:
-        def __init__(self, vllm_config, renderer=None):
-            self.vllm_config = vllm_config
-            self.renderer = renderer or object()
-            self.input_preprocessor = None
+    class _Base(BaseRenderer):
+        def __init__(self, config, tokenizer):
+            self.config, self.tokenizer = config, tokenizer
 
-    class DummyOmniInputPreprocessor:
-        def __init__(self, vllm_config, renderer=None):
-            self.vllm_config = vllm_config
-            self.renderer = renderer
+        def render_messages(self, messages, params):  # pragma: no cover - abstract stub
+            raise NotImplementedError
 
-    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
-    monkeypatch.setattr(init_mod, "OmniInputPreprocessor", DummyOmniInputPreprocessor)
-
-    input_processor = build_stage0_input_processor(
-        types.SimpleNamespace(model_config=types.SimpleNamespace(try_get_generation_config=lambda: {}))
-    )
-
-    assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
-    assert input_processor.input_preprocessor.renderer is input_processor.renderer
-
-
-def test_build_stage0_input_processor_does_not_resolve_tokenizer_when_skipped(
-    monkeypatch,
-):
-    import vllm_omni.engine.stage_init_utils as init_mod
-
-    token_only_renderer = object()
+    config = types.SimpleNamespace(model_config=types.SimpleNamespace(try_get_generation_config=lambda: {}))
+    built = omni_renderer_cls(_Base)(config, "tok")
     seen = {}
 
     class DummyInputProcessor:
         def __init__(self, vllm_config, renderer=None):
-            if renderer is None:
-                raise AssertionError("skip_tokenizer_init must supply a renderer")
             seen["renderer"] = renderer
             self.renderer = renderer
-            self.input_preprocessor = None
-
-    class DummyOmniInputPreprocessor:
-        def __init__(self, vllm_config, renderer=None):
-            seen["preprocessor_renderer"] = renderer
 
     monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
-    monkeypatch.setattr(
-        init_mod,
-        "_build_token_only_renderer",
-        lambda _config: token_only_renderer,
-    )
-    monkeypatch.setattr(
-        init_mod,
-        "OmniInputPreprocessor",
-        DummyOmniInputPreprocessor,
-    )
+    monkeypatch.setattr(init_mod, "build_omni_renderer", lambda cfg: built if cfg is config else None)
+    processor = build_stage0_input_processor(config)
+    assert seen["renderer"] is built
+    assert isinstance(processor.renderer, OmniRenderer)
+    assert isinstance(processor.renderer, _Base)
+    assert not hasattr(processor, "input_preprocessor")
 
+
+def test_build_stage0_input_processor_does_not_resolve_tokenizer_when_skipped(monkeypatch):
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    original = object()
+
+    class DummyInputProcessor:
+        def __init__(self, vllm_config, renderer=None):
+            assert renderer is original
+            self.renderer = renderer
+
+    def _must_not_resolve(_cfg):
+        raise AssertionError("tokenizer must not be resolved when skip_tokenizer_init=True")
+
+    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
+    monkeypatch.setattr(init_mod, "_build_token_only_renderer", lambda _: original)
+    monkeypatch.setattr(init_mod, "build_omni_renderer", _must_not_resolve)
     config = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(
-            skip_tokenizer_init=True,
-            try_get_generation_config=lambda: {},
-        )
+        model_config=types.SimpleNamespace(skip_tokenizer_init=True, try_get_generation_config=lambda: {})
     )
-    build_stage0_input_processor(config)
-
-    assert seen["renderer"] is token_only_renderer
-    assert seen["preprocessor_renderer"] is token_only_renderer
+    processor = build_stage0_input_processor(config)
+    assert processor.renderer is original
 
 
 def test_inject_kv_stage_info_infers_sender_tp_topology():
@@ -1938,14 +1920,20 @@ def test_port_from_zmq_address_parsing():
     assert _port_from_zmq_address("tcp://host:not-a-port") is None
 
 
-def test_dist_stage_runtime_applies_local_dp_to_typed_and_legacy_configs():
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
     from vllm_omni.engine.stage_runtime import DistStageRuntime
 
-    legacy = types.SimpleNamespace(stage_id=0, runtime=types.SimpleNamespace(num_replicas=1))
-    typed = types.SimpleNamespace(stage_id=0, runtime_config=types.SimpleNamespace(num_replicas=1))
+    if typed:
+        stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="ar"))
+        runtime_cfg = stage.runtime_config
+    else:
+        runtime_cfg = types.SimpleNamespace(num_replicas=1)
+        stage = types.SimpleNamespace(stage_id=0, runtime=runtime_cfg)
     runtime = DistStageRuntime(
-        stage_configs=[legacy],
-        typed_stage_configs=[typed],
+        stage_configs=[stage],
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
@@ -1958,27 +1946,52 @@ def test_dist_stage_runtime_applies_local_dp_to_typed_and_legacy_configs():
 
     runtime._validate_single_stage_mode_replica_constraints()
 
-    assert legacy.runtime.num_replicas == 2
-    assert typed.runtime_config.num_replicas == 2
+    assert runtime_cfg.num_replicas == 2
 
 
-def test_dist_stage_runtime_applies_local_dp_to_typed_only_configs():
-    from vllm_omni.engine.stage_runtime import DistStageRuntime
+@pytest.mark.parametrize("num_replicas", [1, 2, 3])
+def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(mocker, num_replicas):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.engine import stage_runtime as runtime_module
 
-    typed = types.SimpleNamespace(stage_id=0, runtime_config=types.SimpleNamespace(num_replicas=1))
-    runtime = DistStageRuntime(
-        stage_configs=[typed],
-        typed_stage_configs=[typed],
+    stage = StageConfigFactory.create_typed_default_diffusion(
+        "generic-diffusion", {"model_class_name": "QwenImagePipeline"}
+    ).stage_configs[0]
+    devices = ",".join(str(i) for i in range(num_replicas))
+    stage.runtime_config.devices = devices
+    stage.runtime_config.num_replicas = num_replicas
+    runtime = StageRuntime(
+        stage_configs=[stage],
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
         async_chunk=False,
-        single_stage_id_filter=0,
-        omni_master_address="127.0.0.1",
-        omni_master_port=12345,
-        omni_dp_size_local=2,
     )
+    mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+    mocker.patch.object(runtime, "_stage_device_scope", side_effect=lambda *_: contextlib.nullcontext())
+    client = mocker.Mock()
+    launch = mocker.patch.object(runtime_module, "launch_diffusion_stage_replica", return_value=(client, None))
 
-    runtime._validate_single_stage_mode_replica_constraints()
+    # Replanning must not inherit the first replica's narrowed device slice.
+    for _ in range(2):
+        counts, device_map = compute_replica_layout([stage])
+        plans = runtime._build_logical_stage_init_plans(
+            omni_transfer_config=None,
+            replicas_per_stage=counts,
+            replica_devices_map=device_map,
+        )
+        replicas = plans[0].replicas
+        assert stage.runtime_config.devices == devices
+        assert len({id(plan.stage_cfg) for plan in replicas}) == num_replicas
+        for i, plan in enumerate(replicas):
+            assert plan.metadata.runtime_cfg is plan.stage_cfg.runtime_config
+            assert plan.stage_cfg.runtime_config.devices == str(i)
+            if num_replicas > 1:
+                assert plan.stage_cfg is not stage
+            assert runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1) is client
+            assert launch.call_args.kwargs["stage_config"] is plan.stage_cfg
+            assert launch.call_args.kwargs["metadata"] is plan.metadata
+            assert launch.call_args.kwargs["use_inline"] is (num_replicas == 1)
 
-    assert typed.runtime_config.num_replicas == 2
+    assert launch.call_count == 2 * num_replicas

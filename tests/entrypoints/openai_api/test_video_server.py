@@ -37,6 +37,12 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
+from vllm_omni.entrypoints.openai.video.generation.helpers import (
+    MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
+    _read_upload_limited,
+    _reference_video_decode_spec,
+)
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -128,6 +134,60 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     handler.shutdown()
 
 
+@pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
+def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(
+        prompt="test", extra_params={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+    )
+    try:
+        with pytest.raises(HTTPException, match="preencode_batch_frames") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "invalid-batch"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
+    from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
+
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    # Resolved frame count differs from anything the request asked for, so the
+    # metadata has to come from the encoded stream rather than request defaults.
+    preencoded = _make_test_video_bytes((32, 24), num_frames=7)
+    artifacts = VideoGenerationArtifacts(
+        videos=[preencoded],
+        audios=[None],
+        actions=[None],
+        audio_sample_rate=24000,
+        output_fps=24.0,
+        stage_durations={"decode": 0.5},
+        peak_memory_mb=123.0,
+        metrics={"generation_time": 1.25},
+    )
+    mocker.patch.object(handler, "_run_and_extract", return_value=artifacts)
+    encoder = mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes")
+    try:
+        result = asyncio.run(handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "preencoded"))
+        assert result == (
+            preencoded,
+            {"decode": 0.5},
+            123.0,
+            None,
+            {
+                "fps": 24.0,
+                "num_frames": 7,
+                "duration_s": 7 / 24.0,
+                "metrics": {"generation_time": 1.25},
+            },
+        )
+        encoder.assert_not_called()
+    finally:
+        handler.shutdown()
+
+
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
     od_config = SimpleNamespace(model_class_name="WanPipeline")
     handler = OmniOpenAIServingVideo.for_diffusion(
@@ -192,6 +252,8 @@ def isolated_video_backends(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server, "VIDEO_STORE", store)
     monkeypatch.setattr(api_server, "VIDEO_TASKS", tasks)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
+    monkeypatch.setattr(video_generation_helpers, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_generation_helpers, "STORAGE_MANAGER", storage)
     return store, tasks, storage
 
 
@@ -245,7 +307,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
-    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
+    monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
 
@@ -978,9 +1040,38 @@ def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
         extra_params={"condition_frame_indexes_vision": [0, 2]},
     )
 
-    spec = api_server._reference_video_decode_spec(request, _cosmos3_stage_configs())
+    spec = _reference_video_decode_spec(request, _cosmos3_stage_configs())
     assert spec.max_frames == 9
     assert spec.keep == "first"
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize(
+    ("num_frames", "extra_params", "expected"),
+    [
+        (189, {"condition_frame_indexes_vision": [0, 2], "condition_video_keep": "last"}, (9, "last")),
+        (189, {"condition_frame_indexes_vision": [0, 2]}, (9, "first")),
+        (5, {"condition_frame_indexes_vision": [0, 20]}, (5, "first")),
+        (None, {"action_mode": "inverse_dynamics", "action_chunk_size": 16}, (17, "first")),
+    ],
+)
+def test_cosmos3_reference_video_decode_policy_with_runtime_configs(typed, num_frames, extra_params, expected):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    if typed:
+        stages = list(
+            StageConfigFactory.create_typed_default_diffusion(
+                "cosmos3",
+                {"model_class_name": "Cosmos3OmniDiffusersPipeline"},
+            ).stage_configs
+        )
+    else:
+        stages = _cosmos3_stage_configs()
+    request = VideoGenerationRequest(prompt="Continue this motion.", num_frames=num_frames, extra_params=extra_params)
+
+    spec = _reference_video_decode_spec(request, stages)
+
+    assert (spec.max_frames, spec.keep) == expected
 
 
 def test_cosmos3_reference_video_limit_preserves_action_frames():
@@ -990,7 +1081,7 @@ def test_cosmos3_reference_video_limit_preserves_action_frames():
         extra_params={"action_mode": "inverse_dynamics", "action_chunk_size": 16},
     )
 
-    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 17
+    assert _reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 17
 
 
 def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
@@ -1000,7 +1091,7 @@ def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
         extra_params={"condition_frame_indexes_vision": [0, 20]},
     )
 
-    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
+    assert _reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
 
 
 def test_s2v_video_generation_with_audio_reference_form(test_client, mocker: MockerFixture):
@@ -1630,7 +1721,8 @@ def test_generic_video_model_rejects_mixed_image_and_video_references(test_clien
     assert "does not support mixed image and video" in response.json()["detail"].lower()
 
 
-def test_h3_multipart_rejects_bmp_image_reference(test_client):
+def test_h3_multipart_rejects_bmp_image_reference(test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
     image = Image.new("RGB", (64, 64), color="blue")
     image_buffer = io.BytesIO()
     image.save(image_buffer, format="BMP")
@@ -1646,18 +1738,49 @@ def test_h3_multipart_rejects_bmp_image_reference(test_client):
     assert "must use jpg" in response.json()["detail"].lower()
 
 
+@pytest.mark.parametrize("field", ["input_reference", "input_references"])
+def test_h3_multipart_rejects_image_over_pixel_limit(field, test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "reject oversized image", "extra_params": '{"task":"ref2va"}'},
+        files=[(field, ("reference.png", _make_test_image_bytes((20, 20)), "image/png"))],
+    )
+
+    assert response.status_code == 400
+    assert "VLLM_MAX_IMAGE_PIXELS" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("field", ["input_reference", "input_references"])
+def test_h3_multipart_maps_pillow_pixel_limit_error(field, test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 0)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "reject decoder bomb", "extra_params": '{"task":"ref2va"}'},
+        files=[(field, ("reference.png", _make_test_image_bytes((20, 20)), "image/png"))],
+    )
+
+    assert response.status_code == 400
+    assert "decoder pixel limit" in response.json()["detail"]
+
+
 @pytest.mark.asyncio
 async def test_h3_upload_limit_checks_declared_size_before_read():
     class OversizedUpload:
-        size = api_server.MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES + 1
+        size = MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES + 1
 
         async def read(self, _size):
             raise AssertionError("the oversized upload must be rejected before reading")
 
     with pytest.raises(HTTPException, match="size limit"):
-        await api_server._read_upload_limited(
+        await _read_upload_limited(
             OversizedUpload(),
-            max_bytes=api_server.MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
+            max_bytes=MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
         )
 
 
@@ -2406,7 +2529,7 @@ def test_cosmos3_control_upload_rejects_existing_control_source(test_client):
 )
 def test_cosmos3_control_upload_rejects_invalid_size(control_bytes, message, test_client, monkeypatch):
     test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3OmniDiffusersPipeline"
-    monkeypatch.setattr(api_server, "CONTROL_REFERENCE_MAX_BYTES", 3)
+    monkeypatch.setattr(video_generation_helpers, "CONTROL_REFERENCE_MAX_BYTES", 3)
 
     response = test_client.post(
         "/v1/videos/sync",

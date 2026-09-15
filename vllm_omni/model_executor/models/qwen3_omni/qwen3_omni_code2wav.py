@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe Code2Wav model."""
 
@@ -336,11 +336,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["thinker.", "talker."],  # Already loaded above
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(
+            weights,
+            mapper=(self.hf_to_vllm_mapper) | WeightsMapper(orig_to_new_prefix={"thinker.": None, "talker.": None}),
         )
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
         # Log load summary
         try:

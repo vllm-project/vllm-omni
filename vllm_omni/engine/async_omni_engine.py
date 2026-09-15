@@ -224,7 +224,7 @@ class AsyncOmniEngine:
                 trust_remote_code=bool(trust_remote_code),
                 deploy_config_path=deploy_config_path,
             )
-            self._set_pipeline_runtime_config(pipeline_config, deploy_config_path)
+            self._set_pipeline_runtime_config(pipeline_config, self.config_path)
         else:
             self._set_pipeline_runtime_config(
                 self._config_resolution.pipeline_config,
@@ -317,7 +317,6 @@ class AsyncOmniEngine:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
         self._runtime = create_stage_runtime(
             stage_configs=self.stage_configs,
-            typed_stage_configs=self.stage_configs,
             model=self.model,
             config_path=self.config_path,
             single_stage_mode=self.single_stage_mode,
@@ -1025,6 +1024,9 @@ class AsyncOmniEngine:
             if legacy_arg in kwargs:
                 raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
 
+        # log_stats is captured by __init__; its CLI-only negative alias must
+        # not cross into per-stage structured config ownership validation.
+        kwargs.pop("disable_log_stats", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
         # CLI callers arrive pre-parsed; offline Python callers may use the

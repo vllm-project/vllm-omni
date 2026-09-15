@@ -102,9 +102,11 @@ class FakeAsyncOmniEngine:
     ) -> None:
         self.model = model
         self.config_path = None
-        self.stage_configs: list[Any] = []
         self.stage_metadata = stage_metadata or [THREE_STAGE_META[-1]]
         self.num_stages = len(self.stage_metadata)
+        self.stage_configs = [
+            StageConfig(stage_id=i, model_stage="dummy-model").to_omegaconf() for i in range(self.num_stages)
+        ]
         self.default_sampling_params_list = default_sampling_params_list or [
             SamplingParams(max_tokens=8) for _ in range(self.num_stages)
         ]
@@ -200,17 +202,29 @@ def _make_base():
     return obj
 
 
-def test_resolve_sampling_params_list_preserves_stage_constraints():
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_resolve_sampling_params_list_preserves_stage_constraints(typed):
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
+
     base = _make_base()
     base.engine.num_stages = 1
     base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
-    base.engine.stage_configs = [
-        StageConfig(
+    if typed:
+        stage = VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=0,
+                model_stage="dummy-model",
+                sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+            )
+        )
+    else:
+        stage = StageConfig(
             stage_id=0,
             model_stage="dummy-model",
             sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
         ).to_omegaconf()
-    ]
+    base.engine.stage_configs = [stage]
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
     assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
     caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
@@ -233,6 +247,24 @@ def test_sampling_constraints_are_forwarded_by_typed_stage_configs():
     constraints = OmniBase._get_sampling_constraints_list(config.stage_configs)
 
     assert constraints == [dict(stage.stage_pipeline_config.sampling_constraints) for stage in config.stage_configs]
+
+@pytest.mark.parametrize("use_defaults", [False, True])
+def test_moss_local_output_policy_preserves_codec_streaming(use_defaults):
+    from vllm_omni.model_executor.models.moss_tts.pipeline import MOSS_TTS_LOCAL_PIPELINE
+
+    base = _make_base()
+    base.engine.num_stages = 2
+    base.sampling_constraints_list = [stage.sampling_constraints for stage in MOSS_TTS_LOCAL_PIPELINE.stages]
+    base.default_sampling_params_list = [
+        base._apply_sampling_constraints(SamplingParams(), constraints)
+        for constraints in base.sampling_constraints_list
+    ]
+    caller = [SamplingParams(output_kind=RequestOutputKind.DELTA) for _ in range(2)]
+    result = base.resolve_sampling_params_list(None if use_defaults else caller, allow_delta_coercion=True)
+
+    assert [params.output_kind for params in result] == [RequestOutputKind.FINAL_ONLY, RequestOutputKind.DELTA]
+    assert all(params.output_kind == RequestOutputKind.DELTA for params in caller)
+    assert base.default_sampling_params_list[0].output_kind == RequestOutputKind.FINAL_ONLY
 
 
 def _stage_spec(

@@ -160,6 +160,14 @@ AUDIO_FRAMES_METRIC = METRIC_PREFIX + AUDIO_FRAMES
 AUDIO_UNDERRUN_S = METRIC_PREFIX + AUDIO_UNDERRUN + "_s"
 AUDIO_CONTINUITY_OK_METRIC = METRIC_PREFIX + AUDIO_CONTINUITY_OK
 AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
+SPEECH_STREAM_ABORTED_METRIC = METRIC_PREFIX + "speech_stream_aborted"
+SPEECH_STREAM_COMPLETED_METRIC = METRIC_PREFIX + "speech_stream_completed"
+
+# Realtime Server VAD serving metrics.
+REALTIME_VAD_ACTIVE_SESSIONS = METRIC_PREFIX + "realtime_vad_active_sessions"
+REALTIME_VAD_INFERENCE_LATENCY_S = METRIC_PREFIX + "realtime_vad_inference_latency_s"
+REALTIME_VAD_ENDPOINT_DELAY_S = METRIC_PREFIX + "realtime_vad_endpoint_delay_s"
+REALTIME_VAD_ERRORS = METRIC_PREFIX + "realtime_vad_errors"
 
 
 # ============================================================================

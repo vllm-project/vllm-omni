@@ -241,6 +241,33 @@ def test_default_stage_config_includes_default_sampling_params():
     }
 
 
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize("sampling_defaults", [{"0": {"guidance_scale": 7.5}}, '{"0":{"guidance_scale":7.5}}'])
+def test_generic_diffusion_sampling_defaults_remain_overridable(typed, sampling_defaults):
+    from vllm_omni.config.yaml_util import create_config
+    from vllm_omni.entrypoints.omni_base import OmniBase
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    kwargs = {"model_class_name": "QwenImagePipeline", "default_sampling_params": sampling_defaults}
+    if typed:
+        stage = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs[0]
+        metadata = stage_init_utils.extract_stage_metadata_from_omni_stage_config(stage)
+    else:
+        stage = create_config(StageConfigFactory.create_default_diffusion(kwargs))[0]
+        metadata = stage_init_utils.extract_legacy_stage_metadata(stage)
+    base = OmniBase.__new__(OmniBase)
+    base.engine = SimpleNamespace(num_stages=1, stage_configs=[stage])
+    base.default_sampling_params_list = [metadata.default_sampling_params]
+    base.sampling_constraints_list = base._get_sampling_constraints_list([stage])
+
+    assert base.resolve_sampling_params_list(None)[0].guidance_scale == 7.5
+    requested = OmniDiffusionSamplingParams(guidance_scale=2.0)
+    assert base.resolve_sampling_params_list(requested)[0].guidance_scale == 2.0
+    assert requested.guidance_scale == 2.0
+    assert base.default_sampling_params_list[0].guidance_scale == 7.5
+    assert base.sampling_constraints_list == [{}]
+
+
 def test_default_stage_config_includes_diffusion_attention_backend():
     """Ensure diffusion attention shorthand lands in engine_args.diffusion_attention_config."""
     stage_cfg = StageConfigFactory.create_default_diffusion(
@@ -816,7 +843,6 @@ def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
 
     runtime = StageRuntime(
         stage_configs=list(resolved.stage_configs),
-        typed_stage_configs=list(resolved.stage_configs),
         model="generic-diffusion",
         config_path="",
         stage_init_timeout=10,

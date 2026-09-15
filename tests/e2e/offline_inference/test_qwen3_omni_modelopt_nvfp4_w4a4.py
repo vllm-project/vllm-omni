@@ -65,7 +65,12 @@ def _stage_config():
     # gains enough VRAM headroom for a no-eager run, add a companion test.
     return modify_stage_config(
         _CI_DEPLOY,
-        updates={"stages": {0: {"enforce_eager": True}, 1: {"enforce_eager": True}}},
+        updates={
+            "stages": {
+                0: {"enforce_eager": True, "moe_backend": "auto"},
+                1: {"enforce_eager": True},
+            }
+        },
     )
 
 
