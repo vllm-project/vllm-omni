@@ -786,6 +786,45 @@ def test_s2v_preencode_aborts_encoders_when_a_later_clip_fails(monkeypatch) -> N
     assert all(not encoder._thread.is_alive() for encoder in sessions[0]._encoders)
 
 
+def test_s2v_preencode_skips_encoding_on_a_vae_patch_parallel_peer(monkeypatch) -> None:
+    """A peer still receives every clip for the motion loop but encodes none of them."""
+    pipeline = _make_s2v_preencode_pipeline()
+    pipeline.encode_audio = MagicMock(return_value=(torch.zeros(1, 1, 2, 8), 2, 16))
+    # A peer's patch-parallel decode returns an empty placeholder.
+    pipeline.vae.decode.return_value = (torch.empty(0),)
+    pipeline.vae._vae_pp_group = object()
+    broadcasts = []
+    monkeypatch.setattr(
+        "torch.distributed.broadcast",
+        lambda tensor, src, group: broadcasts.append(tensor.zero_()),
+    )
+    batch = _make_s2v_preencode_batch(
+        np.zeros(16000, dtype=np.float32),
+        np.ones(16000, dtype=np.float32),
+        extra_args={"preencode_mp4": True, "preencode_batch_frames": 1},
+    )
+    sessions = []
+
+    from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
+
+    def capture_session(**kwargs):
+        session = ChunkedVideoMP4Session(**kwargs)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.ChunkedVideoMP4Session", capture_session)
+
+    with patch("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform") as platform:
+        platform.is_available.return_value = False
+        outputs = pipeline.forward(batch)
+
+    assert len(broadcasts) == 2, "the peer must still join the broadcast for both clips"
+    # Once for the initial motion latents, once more from the peer's broadcast clip.
+    assert pipeline.prepare_motion_latents.call_count == 2, "the motion loop still consumes the peer's frames"
+    assert sessions[0]._encoders == []
+    assert [request_output.output for request_output in outputs] == [[], []]
+
+
 def test_s2v_preencode_keeps_the_full_decode_path_untouched() -> None:
     """Without the flag the loop still returns the (video, audio, rate) tuple."""
     pipeline = _make_s2v_preencode_pipeline()

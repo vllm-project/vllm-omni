@@ -1452,6 +1452,9 @@ class Wan22S2VPipeline(
                 decode_latents = self._denormalize_latents(decode_latents)
                 decode_latents = decode_latents.to(self.vae.dtype)
                 clip_video = self.vae.decode(decode_latents, return_dict=False)[0]  # [1, C, T, H, W]
+                # Under VAE patch parallelism only the output-owning rank decodes a
+                # real clip; peers get an empty placeholder filled by the broadcast.
+                owns_output = clip_video.numel() > 0
 
                 # Handle VAE patch parallel: only rank 0 gets result, broadcast to all ranks
                 # This is needed for S2V's autoregressive loop where all ranks need the decoded frames
@@ -1493,7 +1496,11 @@ class Wan22S2VPipeline(
                     motion_latents = self.prepare_motion_latents(videos_last_frames, device=device).to(dtype=dtype)
 
                 if mp4_session is not None:
-                    mp4_session.push(clip_video)
+                    # Every rank needs the frames for the motion loop above, but the
+                    # executor keeps only the owner's response, so a peer skips the
+                    # encode and finishes with no containers, like T2V's non-owners.
+                    if owns_output:
+                        mp4_session.push(clip_video)
                 else:
                     clips.append(clip_video.cpu())
 
