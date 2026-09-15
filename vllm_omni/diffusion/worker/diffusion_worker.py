@@ -364,10 +364,17 @@ class DiffusionWorker:
                 gc.collect()
                 current_omni_platform.empty_cache()
                 self.init_snapshot = MemorySnapshot(device=self.device)
-                self.requested_memory = request_memory(
-                    self.init_snapshot,
-                    vllm_config.cache_config,
-                )
+                if self.od_config.hbm_limit_gb is not None:
+                    from vllm_omni.config.static_budget import initial_budget
+
+                    self.requested_memory = initial_budget(
+                        self.od_config.hbm_limit_gb, self.od_config.hbm_reserved_gb,
+                        self.init_snapshot.free_memory,
+                    )
+                else:
+                    self.requested_memory = request_memory(
+                        self.init_snapshot, vllm_config.cache_config,
+                    )
                 logger.debug(
                     "Worker %d: Diffusion KV initial memory snapshot: %r; requested=%s GiB",
                     self.rank,
@@ -445,7 +452,7 @@ class DiffusionWorker:
             if self.init_snapshot is None or self.requested_memory is None:
                 raise RuntimeError("Diffusion KV memory snapshot was not captured before model loading")
             override = self.vllm_config.cache_config.kv_cache_memory_bytes
-            if override:
+            if override and self.od_config.hbm_limit_gb is None:
                 # Match native vLLM: an explicit cache budget skips automatic
                 # capacity derivation, but still runs the maximum-shape model
                 # request so lazy kernels and communication buffers initialize.
@@ -467,7 +474,20 @@ class DiffusionWorker:
             ) as profile_result:
                 self.model_runner.profile_run(profile_requests)
 
-            available_memory = self.requested_memory - profile_result.non_kv_cache_memory
+            if self.od_config.hbm_limit_gb is not None:
+                from vllm_omni.config.static_budget import derive_kv_budget
+
+                available_memory = derive_kv_budget(
+                    self.od_config.hbm_limit_gb, self.od_config.hbm_reserved_gb,
+                    profile_result.non_kv_cache_memory, override,
+                )
+                logger.info(
+                    "[StaticHBM] diffusion rank=%s total_gib=%s reserve_gib=%s non_kv_bytes=%s kv_bytes=%s",
+                    self.rank, self.od_config.hbm_limit_gb, self.od_config.hbm_reserved_gb,
+                    profile_result.non_kv_cache_memory, available_memory,
+                )
+            else:
+                available_memory = self.requested_memory - profile_result.non_kv_cache_memory
             if available_memory <= 0:
                 raise RuntimeError(
                     "No memory remains for Diffusion KV cache after profiling: "

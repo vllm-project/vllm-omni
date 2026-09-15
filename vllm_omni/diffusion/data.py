@@ -1045,6 +1045,10 @@ class OmniDiffusionConfig:
     # Native vLLM KV-cache sizing inputs used only by paged_scheduler mode.
     # These mirror the structured stage cache/scheduler config until all
     # diffusion runtime construction consumes VllmOmniConfig directly.
+    # Per replica, per worker GPU total profiled envelope (GiB), not KV-only.
+    hbm_limit_gb: float | None = None
+    # Included in the total: graphs, transfers and unprofiled runtime slack.
+    hbm_reserved_gb: float = 2.0
     kv_cache_memory_bytes: int | None = None
     gpu_memory_utilization: float = 0.9
     max_num_batched_tokens: int | None = None
@@ -1149,6 +1153,11 @@ class OmniDiffusionConfig:
             and self.diffusion_kv_max_rows_per_request is None
         ):
             raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
+        from vllm_omni.config.static_budget import budget_bytes
+
+        budget_bytes(self.hbm_limit_gb, self.hbm_reserved_gb)
+        if self.hbm_limit_gb is not None and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError("Static hbm_limit_gb requires diffusion_kv_mode='paged_scheduler' with a profile envelope")
         if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 0:
             raise ValueError("kv_cache_memory_bytes must be non-negative")
         if not 0.0 < self.gpu_memory_utilization <= 1.0:

@@ -111,7 +111,9 @@ class OmniGPUWorkerBase(GPUWorker):
             correct, conservative budget. The NVML helpers in
             ``gpu_memory_utils`` are retained for diffusion memory reporting.
         """
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+        limit = getattr(self.vllm_config.model_config, "hbm_limit_gb", None)
+        kv_cache_memory_bytes = self.cache_config.kv_cache_memory_bytes
+        if limit is None and kv_cache_memory_bytes:
             self.model_runner.profile_run()
             if current_omni_platform.is_rocm():
                 torch.accelerator.synchronize()
@@ -136,7 +138,20 @@ class OmniGPUWorkerBase(GPUWorker):
             + profile_result.torch_peak_increase
             + profile_result.non_torch_increase
         )
-        self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
+        if limit is not None:
+            from vllm_omni.config.static_budget import derive_kv_budget
+
+            reserve = self.vllm_config.model_config.hbm_reserved_gb
+            self.available_kv_cache_memory_bytes = derive_kv_budget(
+                limit, reserve, profiled_usage, kv_cache_memory_bytes
+            )
+            logger.info(
+                "[StaticHBM] stage=%s rank=%s total_gib=%s reserve_gib=%s non_kv_bytes=%s kv_bytes=%s",
+                self.vllm_config.model_config.stage_id, self.rank, limit, reserve,
+                profiled_usage, self.available_kv_cache_memory_bytes,
+            )
+        else:
+            self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(
             "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
             os.getpid(),

@@ -789,6 +789,8 @@ def test_sub_config_fields_match_structured_scopes():
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
         "mamba_ssm_cache_dtype",
+        "hbm_limit_gb",
+        "hbm_reserved_gb",
     }
     assert issubclass(OmniStageSchedulerConfig, VllmSchedulerConfig)
     assert {f.name for f in fields(OmniStageSchedulerConfig)} == {f.name for f in fields(VllmSchedulerConfig)} | {

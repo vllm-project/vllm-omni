@@ -457,7 +457,12 @@ class StageRuntime:
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
 
-        if self._parallel_stage_init:
+        from vllm_omni.engine.stage_admission import replica_hbm_limit
+
+        static_budget_enabled = any(
+            replica_hbm_limit(replica) is not None for plan in stage_plans for replica in plan.replicas
+        )
+        if self._parallel_stage_init or static_budget_enabled:
             # Refuse executor backends the phase locks cannot cover, then prove
             # every physical device's summed budget fits BEFORE any stage spawns.
             # Both fail fast here rather than OOM at allocation time.
