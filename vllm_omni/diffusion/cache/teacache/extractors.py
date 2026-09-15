@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -1188,6 +1189,158 @@ def extract_flux_context(
     )
 
 
+def extract_boogu_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor | list[torch.Tensor],
+    timestep: torch.Tensor,
+    instruction_hidden_states: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    instruction_attention_mask: torch.Tensor,
+    ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for BooguImageTransformer2DModel.
+
+    Boogu-Image refines noise/reference-image/context tokens, runs a small
+    dual-stream stage, fuses to a single joint sequence, then runs the bulk of
+    the network as single-stream blocks. Only the single-stream stage (the
+    repeated, torch.compile-eligible block) is wrapped by TeaCache; the
+    refiners and dual-stream layers (kept out of compile upstream for
+    numerical stability) always run so the joint sequence used for the cache
+    decision has a timestep-invariant shape.
+    """
+    if not hasattr(module, "single_stream_layers") or len(module.single_stream_layers) == 0:
+        raise ValueError("Module must have single_stream_layers")
+
+    instruction_hidden_states = module.preprocess_instruction_hidden_states(instruction_hidden_states)
+
+    is_hidden_states_tensor = isinstance(hidden_states, torch.Tensor)
+    if is_hidden_states_tensor:
+        hidden_states = [_hs for _hs in hidden_states]
+
+    temb, instruction_hidden_states = module.time_caption_embed(
+        timestep, instruction_hidden_states, hidden_states[0].dtype
+    )
+
+    (
+        flat_hidden_states,
+        flat_ref_image_hidden_states,
+        img_mask,
+        ref_img_mask,
+        l_effective_ref_img_len,
+        l_effective_img_len,
+        ref_img_sizes,
+        img_sizes,
+    ) = module.flat_and_pad_to_seq(hidden_states, ref_image_hidden_states)
+
+    (
+        context_rotary_emb,
+        ref_img_rotary_emb,
+        noise_rotary_emb,
+        rotary_emb,
+        encoder_seq_lengths,
+        seq_lengths,
+        combined_img_rotary_emb,
+        combined_img_seq_lengths,
+    ) = module.rope_embedder(
+        freqs_cis,
+        instruction_attention_mask,
+        l_effective_ref_img_len,
+        l_effective_img_len,
+        ref_img_sizes,
+        img_sizes,
+        flat_hidden_states.device,
+    )
+
+    for layer in module.context_refiner:
+        instruction_hidden_states = layer(instruction_hidden_states, instruction_attention_mask, context_rotary_emb)
+
+    combined_img_hidden_states = module.img_patch_embed_and_refine(
+        flat_hidden_states,
+        flat_ref_image_hidden_states,
+        img_mask,
+        ref_img_mask,
+        noise_rotary_emb,
+        ref_img_rotary_emb,
+        l_effective_ref_img_len,
+        l_effective_img_len,
+        temb,
+    )
+
+    instruct_hidden_states = instruction_hidden_states
+    img_hidden_states = combined_img_hidden_states
+
+    batch_size = len(flat_hidden_states) if isinstance(flat_hidden_states, list) else flat_hidden_states.shape[0]
+    max_seq_len = max(seq_lengths)
+    joint_attention_mask = img_hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
+    for i, seq_len in enumerate(seq_lengths):
+        joint_attention_mask[i, :seq_len] = True
+
+    if module.num_double_stream_layers > 0:
+        max_img_len = max(combined_img_seq_lengths)
+        img_attention_mask = img_hidden_states.new_zeros(batch_size, max_img_len, dtype=torch.bool)
+        for i, img_seq_len in enumerate(combined_img_seq_lengths):
+            img_attention_mask[i, :img_seq_len] = True
+
+        for layer in module.double_stream_layers:
+            img_hidden_states, instruct_hidden_states = layer(
+                img_hidden_states,
+                instruct_hidden_states,
+                img_attention_mask,
+                joint_attention_mask,
+                combined_img_rotary_emb,
+                rotary_emb,
+                temb,
+                encoder_seq_lengths,
+                seq_lengths,
+            )
+
+    joint_hidden_states = img_hidden_states.new_zeros(batch_size, max(seq_lengths), module.hidden_size)
+    for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        joint_hidden_states[i, :encoder_seq_len] = instruct_hidden_states[i, :encoder_seq_len]
+        joint_hidden_states[i, encoder_seq_len:seq_len] = img_hidden_states[i, : seq_len - encoder_seq_len]
+
+    first_layer = module.single_stream_layers[0]
+    modulated_input, *_ = first_layer.norm1(joint_hidden_states, temb)
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        h = joint_hidden_states
+        for layer in module.single_stream_layers:
+            h = layer(h, joint_attention_mask, rotary_emb, temb)
+        return (h,)
+
+    def postprocess(h: torch.Tensor) -> torch.Tensor:
+        h = module.norm_out(h, temb)
+        p = module.patch_size
+        output = []
+        for i, (img_size, img_len, seq_len) in enumerate(zip(img_sizes, l_effective_img_len, seq_lengths)):
+            height, width = img_size
+            img_tokens = h[i][seq_len - img_len : seq_len]
+            img_output = rearrange(
+                img_tokens,
+                "(h w) (p1 p2 c) -> c (h p1) (w p2)",
+                h=height // p,
+                w=width // p,
+                p1=p,
+                p2=p,
+            )
+            output.append(img_output)
+
+        if is_hidden_states_tensor:
+            output = torch.stack(output, dim=0)
+        return output
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=joint_hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 def extract_sensenova_u1_context(
     module: nn.Module,
     input_ids: torch.Tensor | None = None,
@@ -1474,6 +1627,7 @@ def extract_minimax_h3_context(
 # on the transformer module and multiple pipelines can share the same transformer.
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
+    "BooguImageTransformer2DModel": extract_boogu_context,
     "Bagel": extract_bagel_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
