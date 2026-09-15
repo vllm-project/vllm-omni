@@ -25,6 +25,8 @@ import os
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -39,8 +41,9 @@ MODEL_PATH = os.environ.get("MAMMOTH_MODA2_MODEL", "bytedance-research/MammothMo
 QUANTIZATION_CASES = [None, "fp8"]
 
 # Hardware gate: any CUDA GPU (H100/B200 datacenter or RTX PRO 6000
-# workstation). ``@hardware_test`` pins specific SKUs, so use a plain skip
-# so local workstation cards can run the A/B gate too.
+# workstation). ``@hardware_test`` supplies the CI SKU/cards marks (H100,
+# cards_1) used by the nightly ``-m`` selector; the plain skip below keeps
+# non-CUDA hosts from erroring out locally, and does not restrict the marks.
 _CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 
 # Minimum token-level agreement between BF16 and a quantized run, required for
@@ -55,7 +58,11 @@ MIN_LOGPROB_COSINE = 0.90
 
 _PROMPT = "Explain multimodal generation in three sentences."
 
-pytestmark = [pytest.mark.slow]
+# L4 nightly suite selected by the dedicated H100 step in
+# ``.buildkite/cuda/test-nightly.yml``. Not ``slow``: that marker routes tests
+# into the weekly ``-m "slow and ..."`` sweeps, which would run this full
+# checkpoint A/B gate a second time.
+pytestmark = [pytest.mark.full_model]
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +141,7 @@ def _mean_abs_diff(a: list[float], b: list[float]) -> float:
 
 @_CUDA_ONLY
 @pytest.mark.omni
+@hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("quantization", QUANTIZATION_CASES, ids=["bf16", "fp8"])
 def test_ar_generation_smoke(quantization: str | None):
     """Each supported format loads and produces a non-empty greedy sequence."""
@@ -143,6 +151,7 @@ def test_ar_generation_smoke(quantization: str | None):
 
 @_CUDA_ONLY
 @pytest.mark.omni
+@hardware_test(res={"cuda": "H100"})
 def test_bf16_vs_fp8_generation_consistency():
     """A/B: BF16 vs FP8 — report token agreement + logprob similarity + MAE."""
     bf16_ids, bf16_lp = _generate(MODEL_PATH, None)
@@ -344,6 +353,7 @@ def _image_metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
 
 @_CUDA_ONLY
 @pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"})
 def test_bf16_vs_fp8_t2i_image_consistency():
     """A/B: BF16 vs FP8 t2i — decoded image must match (gen experts + head OK)."""
     bf16_img = _generate_t2i_image(MODEL_PATH, None)
