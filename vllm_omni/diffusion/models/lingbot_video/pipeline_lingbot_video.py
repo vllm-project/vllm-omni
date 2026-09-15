@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     LingBotGenerationMode,
     normalize_lingbot_request,
 )
+from vllm_omni.diffusion.models.lingbot_video.rewriter_backends import build_lingbot_rewriter
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -338,6 +339,7 @@ class LingBotVideoPipeline(
         local_files_only = os.path.exists(model)
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model_config = getattr(od_config, "model_config", None) or {}
+        self.prompt_rewriter = build_lingbot_rewriter(model_config)
         transformer_dtype = _dtype_from_name(model_config.get("transformer_dtype"), dtype)
         text_encoder_dtype = _dtype_from_name(model_config.get("text_encoder_dtype"), dtype)
         vae_dtype = _dtype_from_name(model_config.get("vae_dtype"), torch.float32)
@@ -845,11 +847,23 @@ class LingBotVideoPipeline(
         sampling.guidance_scale = request_config.guidance_scale
         sampling.output_type = request_config.output_type
 
+        prompt = request_config.prompt
+        negative_prompt = request_config.negative_prompt
+        if self.prompt_rewriter is not None:
+            prompt, negative_prompt = self.prompt_rewriter.rewrite_request(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                mode=request_config.mode,
+                num_frames=request_config.num_frames,
+                fps=request_config.fps,
+                input_image=request_config.input_image,
+            )
+
         frames = self._generate(
-            prompt=request_config.prompt,
+            prompt=prompt,
             mode=request_config.mode,
             input_image=request_config.input_image,
-            negative_prompt=request_config.negative_prompt,
+            negative_prompt=negative_prompt,
             height=request_config.height,
             width=request_config.width,
             num_frames=request_config.num_frames,
