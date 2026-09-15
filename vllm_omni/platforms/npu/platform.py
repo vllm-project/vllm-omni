@@ -293,6 +293,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return False
 
     @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        """NPU cannot capture the talker MTP Python sampling loop via ACLGraph."""
+        return False
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         if local_rank is None:
             return torch.device("npu")
