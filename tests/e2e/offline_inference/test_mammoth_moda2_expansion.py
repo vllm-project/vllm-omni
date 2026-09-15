@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,8 @@ _AR_PATCH_SIZE = 16
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
+_BF16_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
+_FP8_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG, {"quantization": "fp8"})
 
 # Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
@@ -104,21 +106,26 @@ def _sample_pixels(img_tensor: torch.Tensor) -> list[float]:
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.diffusion,
-    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
+    pytest.mark.parametrize(
+        ("omni_runner", "precision"),
+        [(_BF16_RUNNER_PARAM, "bf16"), (_FP8_RUNNER_PARAM, "fp8")],
+        indirect=["omni_runner"],
+        ids=["bf16", "online_fp8"],
+    ),
 ]
 
 
 @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3201")
 @hardware_test(res={"cuda": "H100"})
-def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
+def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner, precision: str):
     """
     End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
 
     Verifies:
       - Omni pipeline initialises with the two-stage YAML config.
       - DiT stage outputs an image tensor with the correct shape.
-      - A fixed set of pixel values matches a golden reference
-        (regenerate with ``UPDATE_GOLDEN=1``).
+      - BF16 matches the fixed golden reference; online FP8 produces finite image values.
+        (Regenerate the BF16 golden with ``UPDATE_GOLDEN=1``).
     """
     gen_cfg = _load_t2i_gen_config(MODEL_PATH)
     eol_token_id = int(gen_cfg["eol_token_id"])
@@ -184,20 +191,21 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
                 continue
             for completion in completion_outputs:
                 mm = getattr(completion, "multimodal_output", None)
-                if not (isinstance(mm, dict) and "image" in mm):
+                if not (isinstance(mm, Mapping) and "image" in mm):
                     continue
                 img_list = mm["image"] if isinstance(mm["image"], list) else [mm["image"]]
                 for img_tensor in img_list:
                     assert isinstance(img_tensor, torch.Tensor), f"Expected image tensor, got {type(img_tensor)}"
                     assert img_tensor.ndim in (3, 4), f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
 
+                    assert torch.isfinite(img_tensor).all()
                     sampled = _sample_pixels(img_tensor)
 
-                    if os.environ.get("UPDATE_GOLDEN"):
+                    if os.environ.get("UPDATE_GOLDEN") and precision == "bf16":
                         _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
                         _GOLDEN_T2I_PATH.write_text(json.dumps({"pixels": sampled}, indent=2))
                         print(f"\nGolden file written to {_GOLDEN_T2I_PATH}")
-                    elif _GOLDEN_T2I_PATH.exists():
+                    elif precision == "bf16" and _GOLDEN_T2I_PATH.exists():
                         golden = json.loads(_GOLDEN_T2I_PATH.read_text())["pixels"]
                         for i, (got, exp) in enumerate(zip(sampled, golden)):
                             assert abs(got - exp) < 1e-4, f"Pixel {i} mismatch: got {got}, expected {exp}"
