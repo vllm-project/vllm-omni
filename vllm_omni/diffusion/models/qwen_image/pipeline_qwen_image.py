@@ -820,6 +820,9 @@ class QwenImagePipeline(
         state.negative_txt_seq_lens = ctx["negative_txt_seq_lens"]
         # QwenImage always normalizes CFG output (matching forward())
         state.sampling.cfg_normalize = True
+        extra_args = getattr(state.sampling, "extra_args", {}) or {}
+        if bool(extra_args.get("enable_mixfusion", False)):
+            state.extra["use_ragged_latents"] = True
 
         return state
 
@@ -915,6 +918,120 @@ class QwenImagePipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
+    @staticmethod
+    def _qwen_mixfusion_candidate(
+        latents: list[torch.Tensor],
+        *,
+        min_chunk_tokens: int,
+        max_chunks: int,
+    ) -> tuple[bool, str, int, int]:
+        chunk_size = int(latents[0].shape[1])
+        for sample in latents[1:]:
+            chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
+        chunk_count = sum(int(sample.shape[1]) // chunk_size for sample in latents)
+        if chunk_size < min_chunk_tokens:
+            return False, f"chunk_size={chunk_size} < min_chunk_tokens={min_chunk_tokens}", chunk_size, chunk_count
+        if chunk_count > max_chunks:
+            return False, f"chunk_count={chunk_count} > max_chunks={max_chunks}", chunk_size, chunk_count
+        return True, "ok", chunk_size, chunk_count
+
+    def _denoise_step_serial_ragged(self, input_batch: "InputBatch") -> list[torch.Tensor]:
+        latents = input_batch.latents
+        if not isinstance(latents, list):
+            raise TypeError("_denoise_step_serial_ragged expects list latents.")
+
+        outputs: list[torch.Tensor] = []
+        for req_idx, sample_latents in enumerate(latents):
+            prompt_embeds = input_batch.prompt_embeds[req_idx : req_idx + 1]
+            prompt_embeds_mask = (
+                None
+                if input_batch.prompt_embeds_mask is None
+                else input_batch.prompt_embeds_mask[req_idx : req_idx + 1]
+            )
+            guidance = None if input_batch.guidance is None else input_batch.guidance[req_idx : req_idx + 1]
+            positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
+                latents=sample_latents,
+                timestep=input_batch.timesteps[req_idx : req_idx + 1],
+                guidance=guidance,
+                prompt_embeds=prompt_embeds,
+                prompt_embeds_mask=prompt_embeds_mask,
+                img_shapes=[input_batch.img_shapes[req_idx]],
+                txt_seq_lens=None if input_batch.txt_seq_lens is None else [input_batch.txt_seq_lens[req_idx]],
+                do_true_cfg=input_batch.do_true_cfg,
+                negative_prompt_embeds=(
+                    None
+                    if input_batch.negative_prompt_embeds is None
+                    else input_batch.negative_prompt_embeds[req_idx : req_idx + 1]
+                ),
+                negative_prompt_embeds_mask=(
+                    None
+                    if input_batch.negative_prompt_embeds_mask is None
+                    else input_batch.negative_prompt_embeds_mask[req_idx : req_idx + 1]
+                ),
+                negative_txt_seq_lens=(
+                    None if input_batch.negative_txt_seq_lens is None else [input_batch.negative_txt_seq_lens[req_idx]]
+                ),
+                image_latents=None,
+                extra_transformer_kwargs={
+                    "attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                },
+            )
+            outputs.append(
+                self.predict_noise_maybe_with_cfg(
+                    input_batch.do_true_cfg,
+                    input_batch.true_cfg_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                    input_batch.cfg_normalize,
+                    output_slice,
+                )
+            )
+        return outputs
+
+    def _denoise_step_mixfusion(self, input_batch: "InputBatch") -> list[torch.Tensor]:
+        latents = input_batch.latents
+        if not isinstance(latents, list):
+            raise TypeError("_denoise_step_mixfusion expects list latents.")
+        if input_batch.do_true_cfg or input_batch.image_latents is not None:
+            return self._denoise_step_serial_ragged(input_batch)
+        if self.parallel_config.sequence_parallel_size > 1:
+            return self._denoise_step_serial_ragged(input_batch)
+
+        request_extras = input_batch.request_extras or []
+        min_chunk_tokens = 256
+        max_chunks = 128
+        if request_extras:
+            min_chunk_tokens = int(request_extras[0].get("mixfusion_min_chunk_tokens", min_chunk_tokens))
+            max_chunks = int(request_extras[0].get("mixfusion_max_chunks", max_chunks))
+        accepted, reason, chunk_size, chunk_count = self._qwen_mixfusion_candidate(
+            latents,
+            min_chunk_tokens=min_chunk_tokens,
+            max_chunks=max_chunks,
+        )
+        if not accepted:
+            logger.warning(
+                "Qwen MixFusion disabled for this batch: %s (chunk_size=%d, chunk_count=%d). "
+                "Falling back to per-request denoise.",
+                reason,
+                chunk_size,
+                chunk_count,
+            )
+            return self._denoise_step_serial_ragged(input_batch)
+
+        positive_kwargs = {
+            "hidden_states": latents,
+            "timestep": input_batch.timesteps.to(device=latents[0].device, dtype=latents[0].dtype) / 1000,
+            "guidance": input_batch.guidance,
+            "encoder_hidden_states_mask": input_batch.prompt_embeds_mask,
+            "encoder_hidden_states": input_batch.prompt_embeds,
+            "img_shapes": input_batch.img_shapes,
+            "txt_seq_lens": input_batch.txt_seq_lens,
+            "attention_kwargs": self.attention_kwargs,
+            "return_dict": False,
+        }
+        return self.transformer(**positive_kwargs)
+
     def denoise_step(
         self,
         input_batch: "InputBatch",
@@ -933,6 +1050,9 @@ class QwenImagePipeline(
         t = input_batch.timesteps
         self._current_timestep = t
         self.transformer.do_true_cfg = input_batch.do_true_cfg
+
+        if isinstance(input_batch.latents, list):
+            return self._denoise_step_mixfusion(input_batch)
 
         positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
             latents=input_batch.latents,
