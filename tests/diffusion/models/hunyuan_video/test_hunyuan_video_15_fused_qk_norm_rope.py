@@ -18,6 +18,7 @@ _DIM = _HEADS * _HEAD_DIM
 
 @pytest.fixture
 def _dist_env():
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -26,10 +27,13 @@ def _dist_env():
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29520")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    # vLLM 0.28+: parallel-state init, CustomOp construction and the linear
+    # layers' forward all read the current vLLM config.
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        initialize_model_parallel()
+        yield
+        cleanup_dist_env_and_memory()
 
 
 def test_packed_table_video_rows_then_identity_text_rows(monkeypatch):
@@ -75,8 +79,6 @@ def test_identity_rotation_rows_are_exact():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_hunyuan_attention_fused_matches_eager(_dist_env):
-    from vllm.config import VllmConfig, set_current_vllm_config
-
     from vllm_omni.diffusion.forward_context import set_forward_context
     from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
         HunyuanVideo15Attention,
@@ -84,7 +86,7 @@ def test_hunyuan_attention_fused_matches_eager(_dist_env):
     )
 
     torch.manual_seed(3)
-    with set_current_vllm_config(VllmConfig()), torch.device("cuda"):
+    with torch.device("cuda"):
         attn = HunyuanVideo15Attention(
             query_dim=_DIM, heads=_HEADS, dim_head=_HEAD_DIM, added_kv_proj_dim=_DIM, out_dim=_DIM, bias=True, eps=1e-6
         )
