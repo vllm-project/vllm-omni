@@ -88,6 +88,91 @@ except Exception as e:  # pragma: no cover - import guard
     )
 
 
+if not hasattr(torch.ops.vllm_omni, "trtllm_ragged_attention"):
+
+    @torch.library.custom_op(
+        "vllm_omni::trtllm_ragged_attention",
+        mutates_args=("workspace_buffer",),
+    )
+    def _trtllm_ragged_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        sage_q_sf: torch.Tensor | None,
+        sage_k_sf: torch.Tensor | None,
+        sage_v_sf: torch.Tensor | None,
+        max_q_len: int,
+        max_kv_len: int,
+        batch_size: int,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        skip_softmax_threshold_scale_factor: float,
+        sage_q_block_size: int,
+        sage_k_block_size: int,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        sage_kwargs = {}
+        if sage_q_sf is not None:
+            sage_kwargs = {
+                "sage_attn_sfs": (sage_q_sf, sage_k_sf, None, sage_v_sf),
+                "num_elts_per_sage_attn_blk": (sage_q_block_size, sage_k_block_size, 0, 1),
+            }
+        return trtllm_ragged_attention_deepseek(
+            query=query,
+            key=key,
+            value=value,
+            workspace_buffer=workspace_buffer,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            o_sf_scale=-1.0,
+            batch_size=batch_size,
+            window_left=-1,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            enable_pdl=False,
+            is_causal=is_causal,
+            return_lse=False,
+            skip_softmax_threshold_scale_factor=(
+                None if skip_softmax_threshold_scale_factor < 0.0 else skip_softmax_threshold_scale_factor
+            ),
+            **sage_kwargs,
+        )
+
+    @_trtllm_ragged_attention_op.register_fake
+    def _trtllm_ragged_attention_fake(
+        query,
+        key,
+        value,
+        workspace_buffer,
+        seq_lens,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        sage_q_sf,
+        sage_k_sf,
+        sage_v_sf,
+        max_q_len,
+        max_kv_len,
+        batch_size,
+        bmm1_scale,
+        bmm2_scale,
+        skip_softmax_threshold_scale_factor,
+        sage_q_block_size,
+        sage_k_block_size,
+        is_causal,
+    ):
+        return torch.empty_like(query)
+
+
+_trtllm_ragged_attention_op = torch.ops.vllm_omni.trtllm_ragged_attention
+
+
 @functools.lru_cache(maxsize=1)
 def _sage_kernel_available() -> bool:
     if not HAS_FLASHINFER:
@@ -461,10 +546,6 @@ class TrtllmAttentionImpl(AttentionImpl):
 
         _skip_factor = self._resolve_skip_factor(max_kv_len)
 
-        # SAGE kwargs are only understood by newer FlashInfer builds; pass them exclusively when
-        # SAGE quant is active (which already requires the kernel, checked at init) so the dense
-        # path stays compatible with older builds that lack these parameters.
-        sage_kwargs: dict = {}
         # The SAGE kernel requires every KV sequence to contain at least one full
         # quantization block. Small auxiliary attention sites use the dense kernel.
         use_sage = False
@@ -481,31 +562,33 @@ class TrtllmAttentionImpl(AttentionImpl):
                 "attention for this input."
             )
             logger.warning_once(message)
+        sage_q_sf = sage_k_sf = sage_v_sf = None
+        sage_q_block_size = sage_k_block_size = 0
         if use_sage:
             q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(q, k, v, self._sage_quantize_fn)
-            sage_kwargs["sage_attn_sfs"] = sage_attn_sfs
-            sage_kwargs["num_elts_per_sage_attn_blk"] = sage_block_sizes
+            sage_q_sf, sage_k_sf, _, sage_v_sf = sage_attn_sfs
+            sage_q_block_size, sage_k_block_size, _, _ = sage_block_sizes
 
-        out = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=workspace,
-            seq_lens=seq_lens,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            o_sf_scale=-1.0,
-            batch_size=batch,
-            window_left=-1,
-            cum_seq_lens_q=cu_seq_lens_q,
-            cum_seq_lens_kv=cu_seq_lens_kv,
-            enable_pdl=False,
-            is_causal=self.causal,
-            return_lse=False,
-            skip_softmax_threshold_scale_factor=_skip_factor,
-            **sage_kwargs,
+        out = _trtllm_ragged_attention_op(
+            q,
+            k,
+            v,
+            workspace,
+            seq_lens,
+            cu_seq_lens_q,
+            cu_seq_lens_kv,
+            sage_q_sf,
+            sage_k_sf,
+            sage_v_sf,
+            max_q_len,
+            max_kv_len,
+            batch,
+            bmm1_scale,
+            bmm2_scale,
+            -1.0 if _skip_factor is None else _skip_factor,
+            sage_q_block_size,
+            sage_k_block_size,
+            self.causal,
         )
         if out.shape[0] != output_tokens:
             padded_out = torch.zeros(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import functools
 import math
 from unittest.mock import Mock
 
@@ -8,6 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends import trtllm_attn as tg
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -46,6 +48,50 @@ def _packed_padding(cu_seqlens_q, cu_seqlens_k, q_length, kv_length):
         cu_seqlens_q=cu_seqlens_q[:2],
         cu_seqlens_k=cu_seqlens_k[:2],
     )
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("use_sage", [False, True], ids=["dense", "sage"])
+def test_trtllm_dispatcher_is_opaque_to_torch_compile(monkeypatch, tmp_path, use_sage):
+    marker = tmp_path / "kernel"
+    marker.write_text("loaded", encoding="utf-8")
+
+    @functools.cache
+    def cached_kernel_loader():
+        with open(marker, encoding="utf-8") as handle:
+            handle.read()
+
+    def fake_attention(query, **_kwargs):
+        cached_kernel_loader()
+        return torch.empty_like(query)
+
+    monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention)
+    monkeypatch.setattr(
+        TrtllmAttentionImpl,
+        "_get_workspace",
+        classmethod(lambda cls, device: torch.empty(0, dtype=torch.uint8, device=device)),
+    )
+
+    backend_kwargs = {}
+    if use_sage:
+
+        def fake_quantize(q, k, v, **_kwargs):
+            scale = torch.ones(1, device=q.device)
+            return q, k, v, scale, scale, scale
+
+        monkeypatch.setattr(tg, "_sage_kernel_available", lambda: True)
+        monkeypatch.setattr(tg, "_sage_quantize_fn", lambda: fake_quantize)
+        backend_kwargs = {"quant": {"dtype_qk": "fp8_e4m3"}}
+
+    impl = _impl(**backend_kwargs)
+    q = torch.randn(1, 16, 8, 128, device="cuda", dtype=torch.bfloat16)
+    compiled = torch.compile(
+        lambda query, key, value: impl.forward_cuda(query, key, value),
+        fullgraph=True,
+    )
+    out = compiled(q, q, q)
+
+    assert out.shape == q.shape
 
 
 def test_skip_config_pure_resolution():
