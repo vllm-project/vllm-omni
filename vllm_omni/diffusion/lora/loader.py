@@ -13,6 +13,7 @@ from diffusers.loaders.lora_conversion_utils import (
 from safetensors.torch import load_file
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -281,6 +282,11 @@ class LoraLoaderMixin:
                 continue
 
             compute_dev = params.device if params.device.type != "cpu" else None
+            if compute_dev is None:
+                try:
+                    compute_dev = get_local_device()
+                except Exception:
+                    pass
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,
@@ -335,6 +341,11 @@ class LoraLoaderMixin:
                 continue
 
             compute_dev = param.device if param.device.type != "cpu" else None
+            if compute_dev is None:
+                try:
+                    compute_dev = get_local_device()
+                except Exception:
+                    pass
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,
