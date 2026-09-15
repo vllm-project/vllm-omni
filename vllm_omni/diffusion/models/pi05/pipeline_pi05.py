@@ -284,6 +284,7 @@ class Pi05Pipeline(nn.Module):
             lang_tokens=lang_tokens,
             lang_masks=lang_masks,
             num_steps=num_steps,
+            generator=req.sampling_params.generator,
         )
 
         return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})

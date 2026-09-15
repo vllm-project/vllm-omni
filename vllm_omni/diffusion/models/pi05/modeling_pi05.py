@@ -693,6 +693,7 @@ class Pi05ForActionPrediction(nn.Module):
         lang_masks: torch.Tensor,
         noise: torch.Tensor | None = None,
         num_steps: int | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
     ) -> torch.Tensor:
         """Generate an action chunk via iterative flow-matching denoising.
 
@@ -707,13 +708,21 @@ class Pi05ForActionPrediction(nn.Module):
         bsize = lang_tokens.shape[0]
         device = lang_tokens.device
         if noise is None:
-            noise = torch.randn(
-                bsize,
-                self.action_horizon,
-                self.action_dim,
-                dtype=torch.float32,
-                device=device,
-            )
+            noise_shape = (self.action_horizon, self.action_dim)
+            if isinstance(generator, list):
+                if len(generator) != bsize:
+                    raise ValueError(f"Expected {bsize} generators, got {len(generator)}.")
+                noise = torch.stack(
+                    [torch.randn(noise_shape, dtype=torch.float32, device=device, generator=item) for item in generator]
+                )
+            else:
+                noise = torch.randn(
+                    bsize,
+                    *noise_shape,
+                    dtype=torch.float32,
+                    device=device,
+                    generator=generator,
+                )
 
         # 1. Prefix embeddings + mask building.
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(

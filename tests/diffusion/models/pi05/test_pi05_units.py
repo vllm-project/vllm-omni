@@ -823,6 +823,33 @@ def test_sample_actions_shape_and_determinism(tiny_model):
     assert torch.equal(a1, a2)
 
 
+@pytest.mark.slow
+def test_sample_actions_uses_request_generator(tiny_model):
+    model = tiny_model.eval()
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+
+    def run(seed):
+        return model.sample_actions(
+            images=images,
+            image_masks=masks,
+            lang_tokens=lang,
+            lang_masks=lang_mask,
+            num_steps=2,
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+    with torch.no_grad():
+        first = run(42)
+        repeated = run(42)
+        different = run(43)
+
+    assert torch.equal(first, repeated)
+    assert not torch.equal(first, different)
+
+
 # ----------------------------------------------------------------------------
 # Serving dtype
 # ----------------------------------------------------------------------------
@@ -916,6 +943,7 @@ def test_bfloat16_runs_and_tracks_float32(tiny_model):
         # ``std + eps``; replacing a small std with 1.0 would be a different map.
         ({"mode": "mean_std", "mean": [0.0], "std": [1e-7]}, [1e-7], 1e-7 / (1e-7 + 1e-8)),
         ({"mode": "quantile", "q01": [0.0], "q99": [1e-7]}, [1e-7], 1.0),
+        ({"mode": "quantile", "q01": [0.0], "q99": [1e-9]}, [1e-9], 1.0),
         # An exactly zero range maps the bound to -1 instead of dividing by zero.
         ({"mode": "quantile", "q01": [2.0], "q99": [2.0]}, [2.0], -1.0),
     ],
@@ -951,10 +979,12 @@ class _SpyModel:
 
     def __init__(self):
         self.seen: list = []
+        self.generators: list = []
 
-    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps):
+    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator):
         del images, image_masks, lang_tokens, lang_masks
         self.seen.append(num_steps)
+        self.generators.append(generator)
         return torch.zeros(1, 50, 32)
 
 
@@ -970,7 +1000,7 @@ def _spy_pipeline(spy: _SpyModel):
     return pipeline
 
 
-def _spy_request(num_inference_steps):
+def _spy_request(num_inference_steps, generator=None):
     params = type("_Params", (), {})()
     params.extra_args = {
         "robot_obs": {
@@ -979,6 +1009,7 @@ def _spy_request(num_inference_steps):
         }
     }
     params.num_inference_steps = num_inference_steps
+    params.generator = generator
     request = type("_Request", (), {})()
     request.sampling_params = params
     return request
@@ -993,6 +1024,15 @@ def test_request_denoising_steps_reach_sample_actions(requested):
 
     assert spy.seen == [requested]
     assert output.output["actions"].shape == (50, 32)
+
+
+def test_request_generator_reaches_sample_actions():
+    generator = torch.Generator().manual_seed(42)
+    spy = _SpyModel()
+
+    _spy_pipeline(spy).forward(_spy_request(2, generator))
+
+    assert spy.generators == [generator]
 
 
 @pytest.mark.parametrize("bad", [0, -1, 2.5, True, "4"])

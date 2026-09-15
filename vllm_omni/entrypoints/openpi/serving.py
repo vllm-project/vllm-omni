@@ -205,11 +205,11 @@ class ServingRealtimeRobotOpenPI:
         )
 
         prompt = obs.get("prompt", "")
-        sampling_params = OmniDiffusionSamplingParams(
-            seed=int(seed) if seed is not None else None,
-            num_inference_steps=sampling.get("num_inference_steps"),
-            extra_args=extra_args,
-        )
+        if seed is not None:
+            sampling_params.seed = int(seed)
+        if "num_inference_steps" in sampling:
+            sampling_params.num_inference_steps = sampling["num_inference_steps"]
+        sampling_params.extra_args = extra_args
         return OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,

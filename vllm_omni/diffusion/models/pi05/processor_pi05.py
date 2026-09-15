@@ -197,7 +197,8 @@ def apply_norm(x: torch.Tensor, stats: NormStats | None, *, inverse: bool = Fals
     if stats.mode == "mean_std":
         head = head * upper + lower if inverse else (head - lower) / (upper + NORM_EPS)
     else:
-        span = (upper - lower).clamp_min(NORM_EPS)
+        span = upper - lower
+        span = torch.where(span == 0, NORM_EPS, span)
         head = (head + 1.0) * 0.5 * span + lower if inverse else 2.0 * (head - lower) / span - 1.0
 
     if valid == x.shape[-1]:

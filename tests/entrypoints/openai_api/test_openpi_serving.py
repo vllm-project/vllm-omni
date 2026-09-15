@@ -240,12 +240,14 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
 
 def test_build_request_clones_stage_defaults_before_protocol_fields():
     default_params = OmniDiffusionSamplingParams(
+        num_inference_steps=12,
+        output_type="latent",
         extra_args={
             "format_prompt_as_json": True,
             "session_id": "configured-session-must-not-win",
             "reset": False,
             "nested": {"values": []},
-        }
+        },
     )
     od_config = SimpleNamespace(model_config={"policy_server_config": {}})
     engine_client = SimpleNamespace(
@@ -267,10 +269,18 @@ def test_build_request_clones_stage_defaults_before_protocol_fields():
         session_id="wire-session",
         reset=False,
     )
+    request_c = serving._build_request(
+        {"prompt": "pick up the object", "sampling_params": {"num_inference_steps": 4}},
+        session_id="wire-session",
+        reset=False,
+    )
 
     assert request_a.sampling_params.extra_args["format_prompt_as_json"] is True
     assert request_a.sampling_params.extra_args["session_id"] == "wire-session"
     assert request_a.sampling_params.extra_args["reset"] is True
+    assert request_a.sampling_params.num_inference_steps == 12
+    assert request_a.sampling_params.output_type == "latent"
+    assert request_c.sampling_params.num_inference_steps == 4
     request_a.sampling_params.extra_args["nested"]["values"].append("request-a")
     assert request_b.sampling_params.extra_args["nested"] == {"values": []}
     assert default_params.extra_args["nested"] == {"values": []}
