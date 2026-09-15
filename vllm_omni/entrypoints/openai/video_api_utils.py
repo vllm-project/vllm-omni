@@ -74,6 +74,58 @@ AudioSample = int | float
 AudioInput: TypeAlias = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
 
 
+def validate_control_media_file(
+    path: str,
+    *,
+    allow_image: bool = False,
+    max_duration: float = 15.0,
+    max_frames: int = 3600,
+) -> None:
+    """Validate uploaded conditioning media without retaining decoded frames.
+
+    A static mask can be an image. Video inputs must contain a non-empty,
+    fixed-size video stream. Audio streams are not used for conditioning.
+    Inspect only the usable prefix, with a frame cap for missing/broken
+    timestamps. Long clips remain valid: the model trims to output duration.
+    """
+    import av
+
+    try:
+        if allow_image:
+            try:
+                with Image.open(path) as image:
+                    _validate_image_pixel_limit(image)
+                    image.verify()
+                return
+            except UnidentifiedImageError:
+                pass
+        with av.open(path) as container:
+            if not container.streams.video:
+                raise ValueError("no video stream")
+            shape = None
+            first_time = None
+            for index, frame in enumerate(container.decode(video=0)):
+                timestamp = frame.time
+                if first_time is None and timestamp is not None:
+                    first_time = timestamp
+                if shape is not None and (
+                    index >= max_frames
+                    or (timestamp is not None and first_time is not None and timestamp - first_time >= max_duration)
+                ):
+                    break
+                current_shape = (frame.width, frame.height)
+                if shape is not None and current_shape != shape:
+                    raise ValueError("video frame dimensions must be consistent")
+                shape = current_shape
+                max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+                if max_pixels > 0 and frame.width * frame.height > max_pixels:
+                    raise ValueError("video frame exceeds the decoder pixel limit")
+            if shape is None:
+                raise ValueError("no decodable video frames")
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise InvalidInputReferenceError(f"Invalid conditioning media: {exc}") from exc
+
+
 class VideoFrames(list[Image.Image]):
     """Decoded video frames plus source metadata."""
 

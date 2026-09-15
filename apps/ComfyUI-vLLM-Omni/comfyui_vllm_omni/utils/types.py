@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from enum import Enum, auto
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, get_args
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -28,6 +28,19 @@ class WanModelSpecificParams(dict):
 
 class MiniMaxH3ModelSpecificParams(dict):
     pass
+
+
+MiniMaxH3ControlType: TypeAlias = Literal["canny", "depth", "hed", "mlsd", "pose", "inpaint"]
+MINIMAX_H3_CONTROL_TYPES = get_args(MiniMaxH3ControlType)
+
+
+class MiniMaxH3Control(TypedDict):
+    control_type: MiniMaxH3ControlType
+    control_context_scale: float
+    control_video: NotRequired[Any]
+    source_video: NotRequired[Any]
+    mask: NotRequired[Any]
+    mask_video: NotRequired[Any]
 
 
 class VideoReferences(dict):

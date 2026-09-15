@@ -138,6 +138,28 @@ You can configure per-stage sampling parameters for multi-stage models.
 > For reference-conditioned generation (MiniMax-H3 Ref2VA), connect a **Video References** node instead.
 >
 > Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
+>
+> For MiniMax-H3 Fun ControlNet Union, connect a **MiniMax-H3 Control** node. It cannot be combined with `frame` or `references` either.
+
+#### MiniMax-H3 Fun ControlNet Union
+
+The **MiniMax-H3 Control** node conditions generation on a prepared control video, and supports `canny`, `depth`, `hed`, `mlsd`, `pose` and `inpaint`. Connect its `control` output to **Generate Video**.
+
+| Input | Type | Notes |
+| --- | --- | --- |
+| `control_type` | enum | Which conditioning mode to request |
+| `strength` | `FLOAT` | Conditioning strength for the selected mode, 0-10, default 1 |
+| `control_video` | `VIDEO` | Required for the five structure modes, optional for `inpaint` |
+| `source_video` | `VIDEO` | Optional original video; requires a mask |
+| `mask` | `MASK` | Static mask for the whole clip; white/1 marks what to regenerate |
+| `mask_video` | `VIDEO` | Per-frame mask; mutually exclusive with `mask` |
+
+The server must be started with the Fun ControlNet checkpoint, otherwise it rejects the request with the control upload types it does accept.
+
+> [!TIP]
+> The node does not run any preprocessor. Build the control video in the workflow, for example `SDPose Keypoint Extractor` -> `SDPose Draw Keypoints` -> `Create Video` for `pose`, and pass an `IMAGE` batch through **Create Video** before connecting it.
+>
+> `inpaint` needs a mask. `source_video` without a mask, a structure mode without `control_video`, or `mask` together with `mask_video` are rejected before the request is sent.
 
 #### H3 video upscale (WF-07)
 
@@ -177,6 +199,14 @@ Open the **vLLM-Omni FastH3 Text to Video** template, then:
 
 The node records which server the workflow targets; it does not start one, nor switch adapters or attention backends on a running server.
 
+### MiniMax-H3 Fun ControlNet Union (WF-06)
+
+The [ControlNet workflow](example_workflows/vLLM-Omni%20MiniMax-H3%20Fun%20ControlNet%20Union.json)
+shares one remote generation chain across **Canny, Depth, HED, MLSD, Pose, and Inpaint**.
+It includes a default Canny path, an SDPose extraction subgraph, prepared-hint inputs,
+and static/dynamic mask inputs. See the [setup and mode-switching guide](docs/minimax-h3-controlnet.md)
+for models, source preparation, parameters and validation.
+
 ### TTS (e.g., Qwen TTS series)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni TTS**)
@@ -211,6 +241,7 @@ Node tints and the title-bar mark are applied in `web/main.js`, keyed off each n
 ## Limitation and Non-Goals
 
 - Single server mode only. No automatic load balancing or failover.
+- Control conditioning is prepared client-side. The nodes upload prepared control, source and mask media; they neither run preprocessors nor load ControlNet weights in the ComfyUI process.
 - Features set is bounded to vLLM-Omni's online service capability, including
     - The types of models supported in online mode,
     - The types of sampling parameters supported in the online mode,
