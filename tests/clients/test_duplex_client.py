@@ -408,6 +408,32 @@ async def test_error_event_surfaces_on_response_path():
         sock.feed(SESSION_CLOSED)
 
 
+async def test_close_after_error_reports_the_server_reason_to_a_sender():
+    # A client streaming input sits in send(), not in responses(), so the
+    # error text has to survive into the close marker or the session looks
+    # like it ended for no reason.
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+        sock.feed(
+            {
+                "type": "error",
+                "error": {
+                    "code": "runtime_data_plane_stream_failed",
+                    "message": "context_length_exceeded: streaming session prompt would grow to 41207 tokens",
+                },
+                "server_event_seq": 2,
+            }
+        )
+        sock.feed(SESSION_CLOSED)
+        await _drain(lambda: client._closed.is_set())
+        with pytest.raises(DuplexSessionClosedError) as excinfo:
+            await client.send({"type": "input_audio_buffer.append", "audio": ""})
+    assert "runtime_data_plane_stream_failed" in str(excinfo.value)
+    assert "context_length_exceeded" in str(excinfo.value)
+
+
 async def test_slow_audio_consumer_drops_oldest_instead_of_stalling():
     from vllm_omni.clients.duplex import AudioDelta, ResponseHandle
 

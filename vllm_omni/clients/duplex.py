@@ -659,6 +659,7 @@ class DuplexClient:
         self._closing = False
         self._closed = asyncio.Event()
         self._closed_marker: _ClosedMarker | None = None
+        self._last_error_reason: str | None = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -1100,12 +1101,16 @@ class DuplexClient:
             # on the response path too so a consumer waiting in responses()
             # is not left waiting forever (see the responses() docstring).
             _put_drop_oldest(self._response_queue, _ErrorMarker(event))
+            # Keep the text for the close that usually follows: a client that
+            # is streaming input is inside send(), not draining responses(),
+            # and would otherwise only ever see "closed".
+            self._last_error_reason = f"{event.code}: {event.message}" if event.code else event.message
 
         for queue in list(self._subscribers):
             _put_drop_oldest(queue, event)
 
         if isinstance(event, SessionClosed):
-            self._finalize("closed", expected=True)
+            self._finalize(self._last_error_reason or "closed", expected=True)
         elif isinstance(event, SessionExpired):
             reason = data.get("reason")
             self._finalize(f"expired: {reason}" if reason else "expired", expected=False)
