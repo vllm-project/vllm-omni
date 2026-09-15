@@ -159,12 +159,8 @@ def test_bf16_vs_fp8_generation_consistency():
 
     # The logprob gate must actually run: assert both sides reported a top-1
     # logprob for every generated token instead of silently skipping on NaN.
-    assert len(bf16_lp) == len(bf16_ids), (
-        f"BF16 top-1 logprobs missing: got {len(bf16_lp)} for {len(bf16_ids)} tokens"
-    )
-    assert len(fp8_lp) == len(fp8_ids), (
-        f"FP8 top-1 logprobs missing: got {len(fp8_lp)} for {len(fp8_ids)} tokens"
-    )
+    assert len(bf16_lp) == len(bf16_ids), f"BF16 top-1 logprobs missing: got {len(bf16_lp)} for {len(bf16_ids)} tokens"
+    assert len(fp8_lp) == len(fp8_ids), f"FP8 top-1 logprobs missing: got {len(fp8_lp)} for {len(fp8_ids)} tokens"
 
     lp_common = min(len(bf16_lp), len(fp8_lp))
     logprob_cos = _cosine_sim(bf16_lp[:lp_common], fp8_lp[:lp_common])
