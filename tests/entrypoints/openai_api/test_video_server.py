@@ -212,16 +212,11 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
     assert handler._resolve_diffusion_od_config() is getter_config
 
 
-class BlockingVideoHandler:
+class BlockingVideoHandler(OmniOpenAIServingVideo):
     def __init__(self):
-        self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-        self.stage_configs = None
+        super().__init__(FakeAsyncOmni(), model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers")
         self.started = threading.Event()
         self.cancelled = threading.Event()
-
-    def set_stage_configs_if_missing(self, stage_configs):
-        if self.stage_configs is None:
-            self.stage_configs = stage_configs
 
     async def generate_video_bytes(
         self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
@@ -1813,19 +1808,31 @@ def test_negative_prompt_and_seed_pass_through(test_client, mocker: MockerFixtur
     assert captured_params.seed == 123
 
 
-def test_invalid_lora_returns_400(test_client):
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize(
+    "lora",
+    [
+        {"name": "bad-lora"},
+        {"name": "h3-turbo", "scale": {}},
+        {"name": "h3-turbo", "scale": "nan"},
+        {"name": "h3-turbo", "int_id": {}},
+    ],
+)
+def test_invalid_lora_returns_400_before_upload_or_generation(test_client, endpoint, monkeypatch, lora):
+    from unittest.mock import AsyncMock
+
+    test_client.app.state.openai_serving_video._lora_modules = {"h3-turbo": "/server/turbo.safetensors"}
+    read_upload = AsyncMock(side_effect=AssertionError("LoRA must be validated before reading uploads"))
+    monkeypatch.setattr(video_generation_helpers, "_read_upload_limited", read_upload)
     response = test_client.post(
-        "/v1/videos",
-        data={
-            "prompt": "lora test",
-            "lora": '{"name": "bad-lora"}',
-        },
+        endpoint,
+        data={"prompt": "lora test", "lora": json.dumps(lora)},
+        files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
     )
-    assert response.status_code == 200
-    video_id = response.json()["id"]
-    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
-    assert failed["error"]["code"] == 400
-    assert "lora object" in failed["error"]["message"].lower()
+    assert response.status_code == 400
+    assert "Invalid lora object" in response.json()["detail"]
+    read_upload.assert_not_called()
+    assert test_client.app.state.openai_serving_video._engine_client.captured_prompt is None
 
 
 def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_backends, mocker: MockerFixture):
@@ -2766,3 +2773,38 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("adapter_path", ["/server-a/turbo.safetensors", "/server-b/models/turbo.safetensors"])
+def test_named_lora_video_endpoints_and_base_isolation(test_client, endpoint, adapter_path):
+    from vllm_omni.lora.utils import stable_lora_int_id
+
+    handler = test_client.app.state.openai_serving_video
+    handler._lora_modules = {"h3-turbo": adapter_path}
+    engine = handler._engine_client
+
+    async def generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult([np.zeros((2, 16, 16, 3), dtype=np.uint8)])
+
+    engine.generate = generate
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "named adapter", "lora": json.dumps({"name": "h3-turbo", "scale": 0.75})},
+    )
+    assert response.status_code == 200, response.text
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    params = handler._engine_client.captured_sampling_params_list[0]
+    assert params.lora_request.lora_path == adapter_path
+    assert params.lora_request.lora_int_id == stable_lora_int_id(adapter_path)
+    assert params.lora_scale == 0.75
+
+    response = test_client.post(endpoint, data={"prompt": "base without adapter"})
+    assert response.status_code == 200, response.text
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    assert handler._engine_client.captured_sampling_params_list[0].lora_request is None
+    assert handler._engine_client.default_sampling_params_list[0].lora_request is None

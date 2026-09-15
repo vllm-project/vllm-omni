@@ -6,7 +6,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -172,6 +172,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     # Diffusion mode attributes
     _diffusion_mode: bool = False
+    _diffusion_lora_modules: Mapping[str, str] | None = None
     _diffusion_engine: AsyncOmni | None = None
     _diffusion_model_name: str = ""
     _supported_speakers: set[str] | None = None
@@ -340,6 +341,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         cls,
         diffusion_engine: AsyncOmni,
         model_name: str,
+        lora_modules: Mapping[str, str] | None = None,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
 
@@ -356,6 +358,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """
         instance = cls.__new__(cls)
         instance._diffusion_mode = True
+        instance._diffusion_lora_modules = lora_modules
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_extra_body_params = None
@@ -3194,15 +3197,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if lora_body and isinstance(lora_body, dict):
-                    try:
-                        lora_req, lora_scale = parse_lora_request(lora_body)
-                        if lora_req is not None:
-                            default_stage_params.lora_request = lora_req
-                            if lora_scale is not None:
-                                default_stage_params.lora_scale = lora_scale
-                    except Exception as e:  # pragma: no cover - safeguard
-                        logger.warning("Failed to parse LoRA request: %s", e)
+                lora_req, lora_scale = parse_lora_request(lora_body, self._diffusion_lora_modules)
+                if lora_req is not None:
+                    default_stage_params.lora_request = lora_req
+                    if lora_scale is not None:
+                        default_stage_params.lora_scale = lora_scale
 
         return engine_prompt, sampling_params_list
 
@@ -3256,15 +3255,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             strength=extra_body.get("strength"),
         )
 
-        if lora_body and isinstance(lora_body, dict):
+        if lora_body is not None:
             try:
-                lora_req, lora_scale = parse_lora_request(lora_body)
+                lora_req, lora_scale = parse_lora_request(lora_body, self._diffusion_lora_modules)
                 if lora_req is not None:
                     gen_params.lora_request = lora_req
                     if lora_scale is not None:
                         gen_params.lora_scale = lora_scale
-            except Exception as e:  # pragma: no cover - safeguard
-                logger.warning("Failed to parse LoRA request: %s", e)
+            except ValueError as e:
+                return self._create_error_response(str(e), status_code=400)
 
         gen_prompt: OmniTextPrompt = {
             "prompt": prompt,
@@ -3666,15 +3665,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.resolution = resolution
 
             # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
+            if lora_body is not None:
                 try:
-                    lora_req, lora_scale = parse_lora_request(lora_body)
+                    lora_req, lora_scale = parse_lora_request(lora_body, self._diffusion_lora_modules)
                     if lora_req is not None:
                         gen_params.lora_request = lora_req
                         if lora_scale is not None:
                             gen_params.lora_scale = lora_scale
-                except Exception as exc:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", exc)
+                except ValueError as exc:
+                    return self._create_error_response(str(exc), status_code=400)
 
             # Route text modality for single-stage diffusion (img2text / text2text)
             requested_modalities = extra_body.get("modalities") or []

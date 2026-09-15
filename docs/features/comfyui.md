@@ -81,6 +81,19 @@ To build a simple workflow yourself,
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
 
+## MiniMax H3 text-to-video workflow
+
+The **MiniMax H3 Text to Video** template uses the existing remote Generate Video,
+H3 Params, sampling, and Remote LoRA nodes. It includes Base settings and an
+optional Turbo preset, with native resolution, 24 FPS, and `17k+5` frame counts.
+ComfyUI receives the generated video and audio from the server; it does not load
+H3 weights locally. Register Turbo with the server's `--lora-modules` option to
+select it by name without putting a server file path in the workflow.
+
+See the [H3 workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/minimax-h3-t2v.md)
+for server setup, template import, Turbo configuration, recorded validation,
+and saved-video/audio checks.
+
 ## Examples & Screenshots
 
 Please read the [ComfyUI integration's README](https://github.com/vllm-project/vllm-omni/tree/main/apps/ComfyUI-vLLM-Omni) for more info.

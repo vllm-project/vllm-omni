@@ -2383,3 +2383,30 @@ def test_image_edits_omitted_bot_task_stop_tokens_match_prompt_default(
         f"{ar_params.stop_token_ids} -- this is the full ratio range, meaning "
         "resolve_stop_token_ids disagreed with build_prompt_tokens's default."
     )
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/images/generations", "/v1/images/edits"])
+@pytest.mark.parametrize("name", ["portable-adapter", "missing"])
+def test_named_lora_image_endpoints(test_client, mock_async_diffusion, endpoint, name):
+    adapter_path = "/server/models/adapter.safetensors"
+    test_client.app.state.diffusion_lora_modules = {"portable-adapter": adapter_path}
+    lora = {"name": name, "scale": 0.75}
+    if endpoint.endswith("generations"):
+        response = test_client.post(endpoint, json={"prompt": "test", "lora": lora})
+    else:
+        image = io.BytesIO()
+        Image.new("RGB", (32, 32)).save(image, format="PNG")
+        response = test_client.post(
+            endpoint,
+            data={"prompt": "test", "lora": json.dumps(lora)},
+            files={"image": ("input.png", image.getvalue(), "image/png")},
+        )
+    if name == "missing":
+        assert response.status_code == 400
+        assert "unknown LoRA name" in response.json()["detail"]
+        assert mock_async_diffusion.generate_calls == 0
+    else:
+        assert response.status_code == 200, response.text
+        params = mock_async_diffusion.captured_sampling_params_list[0]
+        assert params.lora_request.lora_path == adapter_path
+        assert params.lora_scale == 0.75

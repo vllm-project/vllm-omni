@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.lora import _parse_lora_request
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
     VideoData,
@@ -32,13 +33,14 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.metrics import count_video_frames
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
@@ -126,10 +128,12 @@ class OmniOpenAIServingVideo:
         engine_client: EngineClient,
         model_name: str | None = None,
         stage_configs: list[Any] | None = None,
+        lora_modules: Mapping[str, str] | None = None,
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        self._lora_modules = lora_modules
         self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
         logger.info(
             "Video response frame conversion pool configured: workers=%d",
@@ -246,11 +250,13 @@ class OmniOpenAIServingVideo:
         diffusion_engine: EngineClient,
         model_name: str,
         stage_configs: list[Any] | None = None,
+        lora_modules: Mapping[str, str] | None = None,
     ) -> OmniOpenAIServingVideo:
         return cls(
             diffusion_engine,
             model_name=model_name,
             stage_configs=stage_configs,
+            lora_modules=lora_modules,
         )
 
     def shutdown(self) -> None:
@@ -619,15 +625,12 @@ class OmniOpenAIServingVideo:
                     return copy.deepcopy(params)
         return OmniDiffusionSamplingParams()
 
-    @staticmethod
-    def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
-        try:
-            lora_request, lora_scale = parse_lora_request(lora_body)
-        except ValueError as e:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=str(e),
-            ) from e
+    def resolve_lora_request(self, lora_body: Any) -> tuple[LoRARequest | None, float | None]:
+        """Validate adapter selection before accepting uploads or creating a job."""
+        return _parse_lora_request(lora_body, self._lora_modules)
+
+    def _apply_lora(self, lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
+        lora_request, lora_scale = self.resolve_lora_request(lora_body)
 
         if lora_request is None:
             return
