@@ -719,6 +719,15 @@ def resolve_model_class_name(
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
+        model_type == "sensenova_vision"
+        or "OmniSenseNovaVisionForConditionalGeneration" in architectures
+        or cfg.get("model_name") == "SenseNova-Vision-7B-MoT"
+    ):
+        # SenseNova-Vision-7B-MoT: a Bagel fork. Its config.json carries no
+        # model_type/architectures (metadata-only keys), so the model_name
+        # check is what resolves the diffusion stage to SenseNovaVisionPipeline.
+        return "SenseNovaVisionPipeline"
+    if (
         model_type == "lance"
         or "LancePipeline" in architectures
         or cfg.get("model_name") == "Lance"
@@ -1545,6 +1554,18 @@ class OmniDiffusionConfig:
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif (
+                    model_type == "sensenova_vision"
+                    or "OmniSenseNovaVisionForConditionalGeneration" in architectures
+                    or cfg.get("model_name") == "SenseNova-Vision-7B-MoT"
+                ):
+                    # SenseNova-Vision-7B-MoT: a Bagel fork. Its config.json
+                    # carries no model_type/architectures (metadata-only keys),
+                    # so the model_name check is what resolves the diffusion
+                    # stage to SenseNovaVisionPipeline.
+                    self.model_class_name = "SenseNovaVisionPipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif (
                     model_type == "lance"
                     or "LancePipeline" in architectures
                     or cfg.get("model_name") == "Lance"
@@ -1611,6 +1632,14 @@ class OmniDiffusionConfig:
                         or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
                     ):
                         self.model_class_name = architecture
+                elif self.model_class_name is not None:
+                    # Configs that carry no model_type/architectures (e.g.
+                    # SenseNova-Vision-7B-MoT, whose config.json is metadata-only)
+                    # cannot self-describe their pipeline. Honor an explicit
+                    # model_class_name already resolved by the deploy config or
+                    # pipeline registry instead of raising.
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 else:
                     raise
 
