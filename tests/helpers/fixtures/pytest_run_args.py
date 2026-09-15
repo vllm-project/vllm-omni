@@ -16,6 +16,17 @@ def pytest_addoption(parser):
         choices=["core_model", "advanced_model", "full_model"],
         help="Test level to run: L2, L3, L4",
     )
+    # Nightly stability always passes --run-slow (vLLM skip-gate). Register it
+    # here when missing; ignore if vLLM or another plugin already added it.
+    try:
+        parser.addoption(
+            "--run-slow",
+            action="store_true",
+            default=False,
+            help="Run tests marked slow. Required by some vLLM pytest plugins; ignored otherwise.",
+        )
+    except ValueError:
+        pass
 
 
 @pytest.fixture(scope="session")
