@@ -883,6 +883,11 @@ def register_custom_dit_enablers() -> None:
             "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
+            # The disaggregated generator stage owns ``gen_layers`` and runs the
+            # denoise loop, so the Cosmos3 enabler applies to it verbatim. Its
+            # reasoner counterpart is deliberately absent: that stage has no
+            # gen_layers and no denoising steps, so there is nothing to cache.
+            "Cosmos3GeneratorPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
             "Magi2Pipeline": enable_cache_for_magi2,
         }

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -672,6 +672,85 @@ def test_install_discovers_generation_and_opt_in_reasoner(monkeypatch) -> None:
     runtime.install(transformer)
     assert isinstance(reasoner.quant_method, Cosmos3MixedPrecisionLinearMethod)
     assert all(isinstance(layer.quant_method, Cosmos3MixedPrecisionLinearMethod) for layer in generation)
+
+
+class TestInstallOnATowerDisaggregatedStage:
+    """A stage that owns one tower must not be failed for the other's absence.
+
+    Tower disaggregation gives each stage exactly one tower and leaves the other
+    as an empty ``ModuleList`` (``Cosmos3VFMTransformer.owned_towers``). Scanning
+    an unowned tower therefore finds no linears, which the unwrapped-linear guard
+    would otherwise read as "this checkpoint is not quantized" and turn into a
+    load-time failure of a perfectly valid stage.
+    """
+
+    @staticmethod
+    def _fake_linear_cls():
+        class _FakeLinear(torch.nn.Module):
+            def __init__(self, prefix: str) -> None:
+                super().__init__()
+                self.prefix = prefix
+                self.input_size_per_partition = 4
+                self.output_size_per_partition = 2
+                self.quant_method = SimpleNamespace(name="fp8")
+
+        return _FakeLinear
+
+    @pytest.fixture
+    def linear_cls(self, monkeypatch):
+        cls = self._fake_linear_cls()
+        monkeypatch.setattr(runtime_impl, "LinearBase", cls)
+        strategy = Fp8W8A8W8A16Strategy()
+        monkeypatch.setattr(strategy, "accepts", lambda method: getattr(method, "name", None) == "fp8")
+        monkeypatch.setattr(runtime_impl, "_STRATEGIES", (strategy,))
+        return cls
+
+    @staticmethod
+    def _transformer(linear_cls, *, owns_reasoner: bool, owns_generator: bool):
+        return SimpleNamespace(
+            owns_reasoner=owns_reasoner,
+            owns_generator=owns_generator,
+            # The unowned tower is built empty, not omitted.
+            gen_layers=torch.nn.Sequential(*([linear_cls("generation.q_proj")] if owns_generator else [])),
+            language_model=SimpleNamespace(
+                layers=torch.nn.Sequential(*([linear_cls("reasoner.q_proj")] if owns_reasoner else [])),
+            ),
+        )
+
+    @pytest.mark.parametrize("reasoner", ["native", "a16"])
+    def test_reasoner_only_stage_installs(self, linear_cls, reasoner: str) -> None:
+        """``reasoner="native"`` on a reasoner-only stage is a legitimate no-op.
+
+        There is no denoising schedule on this stage and the UND tower is asked
+        to stay at checkpoint precision, so nothing should be wrapped -- and that
+        must not raise.
+        """
+        transformer = self._transformer(linear_cls, owns_reasoner=True, owns_generator=False)
+        runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner=reasoner))
+
+        runtime.install(transformer)
+
+        wrapped = isinstance(transformer.language_model.layers[0].quant_method, Cosmos3MixedPrecisionLinearMethod)
+        assert wrapped is (reasoner == "a16")
+
+    @pytest.mark.parametrize("reasoner", ["native", "a16"])
+    def test_generator_only_stage_wraps_the_generation_path(self, linear_cls, reasoner: str) -> None:
+        """``reasoner="a16"`` must not look for layers on a replay stub."""
+        transformer = self._transformer(linear_cls, owns_reasoner=False, owns_generator=True)
+        runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner=reasoner))
+
+        runtime.install(transformer)
+
+        assert isinstance(transformer.gen_layers[0].quant_method, Cosmos3MixedPrecisionLinearMethod)
+
+    def test_unquantized_checkpoint_is_still_rejected(self, linear_cls) -> None:
+        """The guard the no-op path bypasses must still fire where it can apply."""
+        transformer = self._transformer(linear_cls, owns_reasoner=True, owns_generator=True)
+        transformer.gen_layers[0].quant_method = SimpleNamespace(name="bf16")
+        transformer.language_model.layers[0].quant_method = SimpleNamespace(name="bf16")
+
+        with pytest.raises(ValueError, match="no compatible FP8 or NVFP4 ModelOpt linears"):
+            Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner="a16")).install(transformer)
 
 
 def test_pipeline_helpers_forward_and_reset_schedule() -> None:
