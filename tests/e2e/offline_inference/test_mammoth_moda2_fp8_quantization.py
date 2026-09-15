@@ -167,7 +167,7 @@ def test_bf16_vs_fp8_generation_consistency():
     )
 
     lp_common = min(len(bf16_lp), len(fp8_lp))
-        logprob_cos = _cosine_sim(bf16_lp[:lp_common], fp8_lp[:lp_common])
+    logprob_cos = _cosine_sim(bf16_lp[:lp_common], fp8_lp[:lp_common])
     logprob_mae = _mean_abs_diff(bf16_lp[:lp_common], fp8_lp[:lp_common])
 
     print(f"[FP8 A/B] token_agreement={token_agree:.4f} logprob_cosine={logprob_cos:.4f} logprob_mae={logprob_mae:.4f}")
