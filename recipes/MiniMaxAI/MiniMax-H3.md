@@ -1230,11 +1230,9 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
-- The serving path accepts fewer references than the model supports. H3 documents up
-  to 9 images, 3 video clips, and 3 audio clips (12 files) per Omni Reference
-  request; the current vLLM-Omni path takes exactly one image plus one audio
-  reference, or one or more videos with no separate `audio_reference` (it uses the
-  source soundtracks).
+- Ref2VA accepts up to 9 images, 3 video clips, and 3 audio clips, with at most
+  12 references in total. At least one image or video is required; audio-only
+  requests are rejected.
 - The 768 px short-edge mode is available for T2VA and FL2VA; 1344x768 is the
   documented 16:9 request shape.
 - `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
@@ -1247,9 +1245,6 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   in host memory on every rank during startup before retaining only each rank's
   shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional standalone
-  audio reference.
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.
