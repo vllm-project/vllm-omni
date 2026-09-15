@@ -13,6 +13,8 @@ import yaml
 
 from vllm_omni.config.stage_config import load_deploy_config
 
+QWEN3_OMNI_CI_SAMPLING_SEED = int(os.environ.get("VLLM_CI_QWEN3_OMNI_SEED", "42"))
+
 
 def modify_stage_config(
     yaml_path: str,
@@ -332,7 +334,13 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 5,
                 "gpu_memory_utilization": 0.5,
                 "max_model_len": 32768,
-                "default_sampling_params": {"max_tokens": 1000},
+                # Qwen3-Omni's talker intentionally samples at temperature 0.9.
+                # Pin the CI request seed so audio/text similarity and the
+                # aggregate Seed-TTS WER gate measure one reproducible stream.
+                "default_sampling_params": {
+                    "max_tokens": 1000,
+                    "seed": QWEN3_OMNI_CI_SAMPLING_SEED,
+                },
             },
             {
                 "stage_id": 2,

@@ -63,7 +63,10 @@ def get_batch_token_config(default_path):
 # The overlay explicitly sets ``async_chunk: False``, so ``default`` tests the
 # sync path and ``async_chunk`` tests the streaming path with a longer thinker
 # output — two distinct scenarios, kept as separate parametrizations.
-default_path = get_deploy_config_path("qwen3_omni_moe.yaml")
+# Use the CI overlay rather than the production config directly. The overlay
+# preserves production sampling parameters and pins only the test seed so
+# stochastic talker output is repeatable across CUDA and ROCm runs.
+default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 test_params = [
     pytest.param(
