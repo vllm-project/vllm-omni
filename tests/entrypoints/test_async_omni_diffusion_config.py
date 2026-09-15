@@ -726,3 +726,26 @@ def test_default_stage_config_includes_quantization_config():
     stage_cfg = StageConfigFactory.create_default_diffusion({"quantization_config": quantization_config})[0]
 
     assert stage_cfg["engine_args"]["quantization_config"] == quantization_config
+
+
+@pytest.mark.parametrize("buckets", [None, 0, 4])
+def test_serve_cli_forwards_chunk_and_head_settings(buckets):
+    from vllm_omni.diffusion.offloader.base import OffloadConfig
+
+    parser = TrackingArgumentParser()
+    OmniServeCommand().subparser_init(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-chunk-size-mb",
+            "32",
+        ]
+        + ([] if buckets is None else ["--dlo-attention-head-buckets", str(buckets)])
+    )
+    stage = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    config = OffloadConfig.from_od_config(_terminal_config(stage))
+    assert config.chunk_size_bytes == 32 * 1024 * 1024
+    assert config.attention_head_buckets == (buckets or 0)

@@ -321,13 +321,14 @@ class TestDistributedLayerwiseOffloadHook:
                 # CUDA online int8: Parameter(qweight.t().data) -> transposed
                 # view (stride (1, K)) over the (N, K) storage, scalar scale
                 self.cuda_weight = nn.Parameter((logical + 100).to(torch.int8).t(), requires_grad=False)
-                self.cuda_weight_scale = nn.Parameter(torch.tensor([0.5]), requires_grad=False)
+                self.cuda_weight_scale = nn.Parameter(torch.tensor(0.5), requires_grad=False)
+                self.register_buffer("scalar_buffer", torch.tensor(2.0))
 
         current_block = OnlineInt8Block()
         rank0_block = OnlineInt8Block()
         rank1_block = OnlineInt8Block()
-        expected = {name: tensor.detach().clone() for name, tensor in rank0_block.named_parameters()}
-        expected_strides = {name: tensor.stride() for name, tensor in rank0_block.named_parameters()}
+        expected = {name: tensor.detach().clone() for name, tensor in rank0_block.state_dict().items()}
+        expected_strides = {name: tensor.stride() for name, tensor in rank0_block.state_dict().items()}
 
         def make_hook(block: OnlineInt8Block, rank: int) -> DistributedLayerwiseOffloadHook:
             return DistributedLayerwiseOffloadHook(
@@ -357,16 +358,14 @@ class TestDistributedLayerwiseOffloadHook:
             output[shard_size : 2 * shard_size].copy_(remote_shard)
 
         monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
-        rank0_hook.prefetch_layer(slot=0, non_blocking=False)
-
-        for name, tensor in rank0_block.named_parameters():
-            assert tensor.stride() == expected_strides[name]
-            torch.testing.assert_close(
-                tensor.float(),
-                expected[name].float(),
-                rtol=0,
-                atol=0,
-            )
+        for restore in (False, True):
+            if restore:
+                rank0_hook.restore_next_block_to_cpu()
+            else:
+                rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+            for name, tensor in rank0_block.state_dict().items():
+                assert tensor.stride() == expected_strides[name]
+                torch.testing.assert_close(tensor.float(), expected[name].float(), rtol=0, atol=0)
 
     def test_allgather_reconstructs_online_mxfp8_weight_and_scale(
         self,

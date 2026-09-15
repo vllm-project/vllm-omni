@@ -888,6 +888,8 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    dlo_chunk_size_mb: int = 64
+    dlo_attention_head_buckets: int = 0
     # Final-layout Host Weight Runtime policy. The loader only activates this
     # for eligible no-AllGather DLO; all other configurations preserve their
     # existing loader/storage path.
