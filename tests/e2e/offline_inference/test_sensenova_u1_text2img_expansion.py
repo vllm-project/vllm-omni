@@ -168,3 +168,17 @@ def test_sensenova_u1_text2img_cache_dit():
         cache_backend="cache_dit",
     ) as runner:
         _generate_sensenova_u1_image(runner.omni)
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"})
+def test_sensenova_u1_text2img_step_execution():
+    """Test SenseNova-U1 text2img with step-execution dynamic batching."""
+    with OmniRunner(
+        "SenseNova/SenseNova-U1-8B-MoT",
+        stage_configs_path=None,
+        step_execution=True,
+        max_num_seqs=4,
+    ) as runner:
+        _generate_sensenova_u1_image(runner.omni)
