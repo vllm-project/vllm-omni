@@ -7,7 +7,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 
-See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
+See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
 !!! tip "Deployment recipes"
     TTS deployment recipes are published at
@@ -777,11 +777,51 @@ hidden-state dtype before the output projection. Consequently, a float32 stage c
 | ------- | ------------- |
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
 
+#### Startup LoRA adapter
+
+To serve a fine-tuned VoxCPM2 voice, set
+`voxcpm2_runtime_config.startup_lora_path` in the stage's `hf_overrides`.
+Copy `vllm_omni/deploy/voxcpm2.yaml` to a local deploy config and add this key
+alongside its existing runtime settings:
+
+```yaml
+# Under stages[0].engine_extras.hf_overrides.voxcpm2_runtime_config:
+startup_lora_path: /absolute/path/to/adapter
+```
+
+Then launch with the modified config:
+
+```bash
+vllm serve openbmb/VoxCPM2 --omni --deploy-config /absolute/path/to/voxcpm2-lora.yaml
+```
+
+The directory must be accessible to the worker and contain the native VoxCPM2
+training export: `lora_config.json` (with a `lora_config` object containing
+`r`, `alpha`, enabled groups, and target module names) and
+`lora_weights.safetensors`. PEFT checkpoints and pickle checkpoints are not
+accepted. Missing, unexpected, non-finite, or incorrectly shaped adapter
+tensors fail model loading rather than silently loading a partial adapter.
+
+The adapter is merged into the base LM, residual LM, LocDiT, and optional
+projection layers selected by its configuration, after base weight loading
+and before compilation or CUDA graph capture. All requests use that adapter;
+`voice` still selects a reference voice, not a LoRA adapter. Changing adapters
+requires restarting the server. Runtime loading/unloading, per-request
+multi-LoRA selection, and `load_format=dummy` are not supported by this path.
+Weight fusion rounds to the base model's dtype, so numerical and speech-quality
+parity should be checked against the upstream adapter on your deployment.
+
 ### MOSS-TTS-Nano
 
 | Model | Description |
 | ------- | ------------- |
 | `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
+
+### Breeze-TTS-2
+
+| Model | Description |
+| ------- | ------------- |
+| `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
 
 ## Error Responses
 

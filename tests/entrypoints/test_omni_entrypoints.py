@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -200,20 +201,28 @@ def _make_base():
     return obj
 
 
-def test_resolve_sampling_params_list_preserves_stage_constraints():
+def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base = _make_base()
     base.engine.num_stages = 1
-    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    required_stop_ids = [151704, 151645]
+    base.default_sampling_params_list = [
+        SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[99, *required_stop_ids])
+    ]
     base.engine.stage_configs = [
         StageConfig(
             stage_id=0,
             model_stage="dummy-model",
-            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+            sampling_constraints={"detokenize": False, "stop_token_ids": required_stop_ids},
         ).to_omegaconf()
     ]
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
-    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
-    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": required_stop_ids}]
+
+    resolved_defaults = base.resolve_sampling_params_list(None)
+
+    assert resolved_defaults[0].stop_token_ids == [99, 151704, 151645]
+
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[100, 151704])
 
     resolved = base.resolve_sampling_params_list(caller_params)
 
@@ -221,10 +230,10 @@ def test_resolve_sampling_params_list_preserves_stage_constraints():
     assert resolved[0].seed == 1234
     assert resolved[0].max_tokens == 7
     assert resolved[0].detokenize is False
-    assert resolved[0].stop_token_ids == [42]
-    assert 42 in resolved[0]._all_stop_token_ids
+    assert resolved[0].stop_token_ids == [100, 151704, 151645]
+    assert {100, 151704, 151645}.issubset(resolved[0]._all_stop_token_ids)
     assert caller_params.detokenize is True
-    assert caller_params.stop_token_ids == [7]
+    assert caller_params.stop_token_ids == [100, 151704]
 
 
 @pytest.mark.parametrize("use_defaults", [False, True])
@@ -758,7 +767,7 @@ def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkey
         f"{engine.submitted[1]['request_id']}-stage0-0",
         f"{engine.submitted[1]['request_id']}-stage2-final",
     ]
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_generate_returns_list_when_not_using_generator(monkeypatch: pytest.MonkeyPatch):
@@ -804,7 +813,7 @@ def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatc
         [f"{engine.submitted[0]['request_id']}-image"],
         [f"{engine.submitted[1]['request_id']}-image"],
     ]
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
@@ -837,7 +846,7 @@ def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
         [f"{engine.submitted[1]['request_id']}-image"],
     ]
     assert engine.submitted[0]["sampling_params_list"][0].output_kind == RequestOutputKind.FINAL_ONLY
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
@@ -1318,3 +1327,57 @@ def test_omni_errored_property_dead_stage(monkeypatch: pytest.MonkeyPatch):
         assert app.errored is False
     finally:
         app.shutdown()
+
+
+def test_omni_pygenerator_does_not_kill_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    # Evaluating the generator should not shut down the engine
+    list(app.generate(["hello"], py_generator=True))
+    assert not engine.shutdown_called
+
+
+def test_omni_generator_close_cleans_up(monkeypatch: pytest.MonkeyPatch):
+    """Ensure that a closed generator cleans things up properly."""
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+
+    # Create a generator and start to evaluate it to make sure the request isn't aborted yet
+    my_gen = app.generate(["hello"], py_generator=True)
+    next(my_gen)
+    request_id = engine.submitted[0]["request_id"]
+    assert engine.aborted == []
+    assert request_id in app.request_states
+
+    # Close it and make sure the sure it's aborted, but without killing engine
+    my_gen.close()
+    assert engine.aborted == [[request_id]]
+    assert request_id not in app.request_states
+    assert not engine.shutdown_called
+
+
+def test_del_shutsdown_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    assert not engine.shutdown_called
+    del app
+    gc.collect()
+    assert engine.shutdown_called

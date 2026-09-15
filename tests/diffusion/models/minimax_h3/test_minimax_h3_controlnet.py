@@ -285,7 +285,7 @@ def test_lossless_temporal_mask_sampling(tmp_path):
                 output.mux(packet)
         for packet in stream.encode():
             output.mux(packet)
-    pixels = load_control_pixels(str(path), num_frames=5, mask=True)
+    pixels = load_control_pixels(str(path), height=8, width=8, num_frames=5, mask=True)
     assert pixels[0, 0, :, 0, 0].tolist() == [0, 0, 1, 1, 1]
 
 
@@ -412,7 +412,7 @@ def test_startup_rejects_public_and_legacy_offload(tmp_path, monkeypatch, offloa
         model="/unused/FL2VA",
         task_type="fl2va",
         model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1),
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
         controlnet_model_path=str(path),
         **offload,
     )
@@ -432,7 +432,7 @@ def test_control_rejects_secondary_or_ref2va_partition_before_loading(tmp_path, 
         model="/unused/MiniMax-H3",
         task_type="auto",
         model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1),
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
         controlnet_model_path=str(path),
     )
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
@@ -451,7 +451,7 @@ def test_startup_accepts_resident_default_policy(tmp_path, monkeypatch):
         model="/unused/FL2VA",
         task_type="fl2va",
         model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1),
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
         controlnet_model_path=str(path),
         diffusion_offload_config=None,
         revision=None,
@@ -507,7 +507,152 @@ def test_millisecond_container_timestamps_preserve_24fps_and_vfr_hold(tmp_path, 
             output.mux(packet)
     with av.open(str(path)) as source:
         assert source.streams.video[0].time_base == Fraction(1, 1000)
-    pixels = load_control_pixels(str(path), num_frames=7, mask=True)
+    pixels = load_control_pixels(str(path), height=8, width=8, num_frames=7)
     assert (pixels[0, 0, :, 0, 0] * 255).round().int().tolist() == expected
-    truncated = load_control_pixels(str(path), num_frames=2, mask=True)
+    truncated = load_control_pixels(str(path), height=8, width=8, num_frames=2)
     assert (truncated[0, 0, :, 0, 0] * 255).round().int().tolist() == expected[:2]
+
+
+def test_control_decode_resizes_each_frame_before_accumulation(tmp_path, monkeypatch):
+    import av
+    import numpy as np
+
+    path = tmp_path / "control.mkv"
+    y, x = np.indices((48, 64))
+    originals = [np.stack(((x * 3 + i * 11) % 256, y * 5, (x + y) * 2), axis=-1).astype(np.uint8) for i in range(3)]
+    with av.open(str(path), "w") as output:
+        stream = output.add_stream("ffv1", rate=24)
+        stream.width, stream.height = 64, 48
+        stream.pix_fmt = "bgr0"
+        for pixels in originals:
+            for packet in stream.encode(av.VideoFrame.from_ndarray(pixels, format="rgb24")):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    expected = F.interpolate(
+        torch.from_numpy(np.stack(originals)).permute(0, 3, 1, 2).float() / 255,
+        (6, 8),
+        mode="bilinear",
+        align_corners=False,
+    )
+    expected = torch.cat((expected, expected[-1:].expand(2, -1, -1, -1))).permute(1, 0, 2, 3)[None]
+    interpolate = F.interpolate
+    from_numpy = torch.from_numpy
+    resized_shapes = []
+
+    def resize_one_frame(value, *args, **kwargs):
+        resized_shapes.append(tuple(value.shape))
+        assert value.shape == (1, 3, 48, 64)
+        assert value.device.type == "cpu"
+        return interpolate(value, *args, **kwargs)
+
+    def convert_one_frame(value):
+        # A whole source-sized video must never be stacked for tensor conversion.
+        assert value.ndim <= 3
+        return from_numpy(value)
+
+    monkeypatch.setattr(F, "interpolate", resize_one_frame)
+    monkeypatch.setattr(torch, "from_numpy", convert_one_frame)
+    actual = load_control_pixels(str(path), height=6, width=8, num_frames=5)
+    assert len(resized_shapes) == 3
+    assert actual.device.type == "cpu"
+    assert actual.shape == (1, 3, 5, 6, 8)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("static", [True, False], ids=["static-mask", "temporal-mask"])
+def test_control_mask_threshold_resize_threshold_boundary(tmp_path, static):
+    import av
+    import numpy as np
+    from PIL import Image
+
+    pixels = np.tile(np.array([102, 230, 255, 255, 0, 0, 230, 102], dtype=np.uint8), (8, 1))
+    path = tmp_path / ("mask.png" if static else "mask.mkv")
+    if static:
+        Image.fromarray(pixels).save(path)
+    else:
+        with av.open(str(path), "w") as output:
+            stream = output.add_stream("ffv1", rate=24)
+            stream.width = stream.height = 8
+            stream.pix_fmt = "gray"
+            for frame_pixels in (pixels, pixels[:, ::-1].copy()):
+                for packet in stream.encode(av.VideoFrame.from_ndarray(frame_pixels, format="gray")):
+                    output.mux(packet)
+            for packet in stream.encode():
+                output.mux(packet)
+    actual = load_control_pixels(str(path), height=2, width=4, num_frames=4, mask=True)
+    expected = torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]], dtype=torch.float32)
+    if static:
+        assert actual.shape == (1, 1, 1, 2, 4)
+        torch.testing.assert_close(actual[0, 0, 0], expected)
+    else:
+        assert actual.shape == (1, 1, 4, 2, 4)
+        torch.testing.assert_close(actual[0, 0, 0], expected)
+        torch.testing.assert_close(actual[0, 0, 1:], expected.flip(-1).expand(3, -1, -1))
+    # Raw grayscale resize would mark the mixed 102/230 pairs as regenerated;
+    # the reference first binarizes them, then thresholds their 0.5 average off.
+    assert set(actual.flatten().tolist()) == {0.0, 1.0}
+
+
+@pytest.mark.parametrize("degree", ["ulysses_degree", "ring_degree", "allgather_degree"])
+def test_control_rejects_sequence_parallel_before_weight_loading(tmp_path, monkeypatch, degree):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    path = tmp_path / "control.safetensors"
+    path.touch()
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    parallel = SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1)
+    setattr(parallel, degree, 2)
+    config = SimpleNamespace(
+        model="/unused/FL2VA",
+        task_type="fl2va",
+        model_loaded={"text_encoder": True},
+        parallel_config=parallel,
+        controlnet_model_path=str(path),
+    )
+    with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
+        with pytest.raises(ValueError, match="no cache/offload/SP"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+        resolve_root.assert_not_called()
+
+
+def test_control_rows_and_padded_sequence_survive_denoise_preparation():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    control_rows = torch.ones(12, 196)
+    context = dict(
+        task="t2va",
+        text_embeddings=torch.ones(7, 2),
+        text_tags=torch.ones(7, dtype=torch.long),
+        seed=0,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+        num_frames=5,
+        num_steps=2,
+        video_shift=12.0,
+        audio_shift=3.0,
+        base_schedule=None,
+        visual_condition=None,
+        visual_condition_shape=None,
+        audio_condition=None,
+        ref_audio_t=None,
+        ref_blocks=None,
+        visual_condition_shapes=None,
+        audio_condition_lengths=None,
+        keyframe_frame_indices=None,
+        control_rows=control_rows,
+        control_context_scale=0.75,
+        pad_seq_len=192,
+    )
+    inputs = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))
+    branch = inputs["branch"]
+    assert branch.seq_len == 192
+    assert branch.used_len < branch.seq_len
+    assert branch.static_kwargs["control_rows"] is control_rows
+    assert branch.static_kwargs["control_context_scale"] == 0.75
+    assert inputs["video_rows"].shape == (12, 96)

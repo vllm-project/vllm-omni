@@ -122,7 +122,7 @@ def validate_control_media_file(
                     raise ValueError("video frame exceeds the decoder pixel limit")
             if shape is None:
                 raise ValueError("no decodable video frames")
-    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+    except (av.error.FFmpegError, OSError, ValueError, Image.DecompressionBombError) as exc:
         raise InvalidInputReferenceError(f"Invalid conditioning media: {exc}") from exc
 
 

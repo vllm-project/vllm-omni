@@ -64,20 +64,37 @@ def parse_control(extra: dict[str, Any]) -> dict[str, Any] | None:
     return value
 
 
-def load_control_pixels(path: str, *, num_frames: int, mask: bool = False) -> torch.Tensor:
-    """Sample presentation timestamps at 24 FPS; do not decode an unbounded tail."""
+def load_control_pixels(path: str, *, height: int, width: int, num_frames: int, mask: bool = False) -> torch.Tensor:
+    """Sample at 24 FPS, retaining only resized CPU frames for the requested window."""
     import av
     import numpy as np
     from PIL import Image
+
+    if min(height, width, num_frames) < 1:
+        raise ValueError("Control canvas dimensions and frame count must be positive")
+
+    def fit_frame(pixels: np.ndarray) -> torch.Tensor:
+        if pixels.ndim == 2:
+            pixels = pixels[..., None]
+        value = torch.from_numpy(pixels).permute(2, 0, 1).float().div_(255)
+        if mask:
+            value.gt_(0.5)
+        if value.shape[-2:] != (height, width):
+            value = F.interpolate(value[None], (height, width), mode="bilinear", align_corners=False)[0]
+        if mask:
+            value.gt_(0.5)
+        return value
 
     if mask:
         try:
             with Image.open(path) as image:
                 pixels = np.asarray(image.convert("L")).copy()
-            return torch.from_numpy(pixels)[None, None, None].float() / 255
         except (OSError, ValueError):
             pass  # A temporal mask uses the same timestamp policy as the hint.
-    frames = []
+        else:
+            return fit_frame(pixels)[None, :, None]
+    frames = None
+    frame_count = 0
     with av.open(path) as container:
         if not container.streams.video:
             raise ValueError("Control media has no video stream")
@@ -86,9 +103,14 @@ def load_control_pixels(path: str, *, num_frames: int, mask: bool = False) -> to
         first_time = None
         previous = None
         previous_time = -1.0
+        source_shape = None
         for index, frame in enumerate(container.decode(stream)):
             if index >= 3600:
                 raise ValueError("Control media exceeds the bounded decode budget for the requested window")
+            shape = (frame.height, frame.width)
+            if source_shape is not None and shape != source_shape:
+                raise ValueError("Control video frame dimensions must be consistent")
+            source_shape = shape
             timestamp = float(frame.time) if frame.time is not None else index / rate
             if first_time is None:
                 first_time = timestamp
@@ -96,26 +118,28 @@ def load_control_pixels(path: str, *, num_frames: int, mask: bool = False) -> to
             if not math.isfinite(timestamp) or timestamp <= previous_time:
                 timestamp = previous_time + 1 / rate
             previous_time = timestamp
-            pixels = frame.to_ndarray(format="gray" if mask else "rgb24")
-            if pixels.ndim == 2:
-                pixels = pixels[..., None]
+            pixels = fit_frame(frame.to_ndarray(format="gray" if mask else "rgb24"))
             if previous is None:
                 previous = pixels
+            if frames is None:
+                frames = torch.empty((1, pixels.shape[0], num_frames, height, width), dtype=torch.float32, device="cpu")
             # Container PTS is quantized: Matroska commonly represents 1/24 s
             # as 42 ms. Treat times within half a tick as the same boundary,
             # otherwise a 24 FPS source repeats frame 0 and drops frame 1.
             time_base = frame.time_base or stream.time_base
             tolerance = float(time_base) / 2 + 1e-9 if time_base is not None else 1e-9
-            while len(frames) < num_frames and len(frames) / 24 < timestamp - tolerance:
-                frames.append(previous)
+            while frame_count < num_frames and frame_count / 24 < timestamp - tolerance:
+                frames[0, :, frame_count].copy_(previous)
+                frame_count += 1
             previous = pixels
-            if len(frames) >= num_frames:
+            if frame_count >= num_frames:
                 break
-        if previous is None:
+        if frames is None or previous is None:
             raise ValueError("Control media contains no decoded frames")
-        while len(frames) < num_frames:
-            frames.append(previous)
-    return torch.from_numpy(np.stack(frames)).permute(3, 0, 1, 2)[None].float() / 255
+        while frame_count < num_frames:
+            frames[0, :, frame_count].copy_(previous)
+            frame_count += 1
+    return frames
 
 
 def fit_control_canvas(pixels: torch.Tensor, height: int, width: int, num_frames: int) -> torch.Tensor:
@@ -156,7 +180,7 @@ def build_control_rows(
     def fit(value: torch.Tensor, channels: int) -> torch.Tensor:
         if value.ndim != 5 or value.shape[1] != channels:
             raise ValueError(f"Expected control media with {channels} channels")
-        return fit_control_canvas(value.to(device), height, width, num_frames)
+        return fit_control_canvas(value, height, width, num_frames).to(device)
 
     def patch(latent: torch.Tensor) -> torch.Tensor:
         if tuple(latent.shape[2:]) != latent_shape:

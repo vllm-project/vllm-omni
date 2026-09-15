@@ -264,7 +264,10 @@ upload all three roles.
 
 Output uses H3's 24 FPS and `17k+5` frame grid. Media is aligned to the requested
 output canvas and time grid; extra frames are truncated and short inputs hold
-their final frame. Masks follow the same geometry as the source. Control
+their final frame. Frames are resized on the CPU before the sampled clip is
+retained or transferred to the accelerator, so retained pixel storage scales
+with the requested canvas rather than the uploaded resolution. Masks follow
+the same geometry as the source. Control
 videos' audio streams are not conditioning inputs; generated H3 audio is
 returned with the video.
 

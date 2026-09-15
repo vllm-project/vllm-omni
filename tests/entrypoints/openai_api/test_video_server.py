@@ -11,7 +11,7 @@ import json
 import os
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -636,6 +636,32 @@ def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
         "model": "org/model",
         "revision": "pinned-revision",
     }
+
+
+def test_i2v_minimax_h3_preserves_reference_geometry():
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="MiniMaxAI/MiniMax-H3",
+    )
+    image = Image.new("RGB", (48, 32))
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A bear playing with yarn.", width=96, height=64),
+            "minimax-h3-reference-geometry",
+            reference_image=ReferenceImage(image),
+        )
+    )
+
+    assert engine.captured_prompt is not None
+    assert engine.captured_sampling_params_list is not None
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (48, 32)
+    sampling_params = engine.captured_sampling_params_list[0]
+    assert (sampling_params.width, sampling_params.height) == (96, 64)
 
 
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
@@ -2933,6 +2959,59 @@ def test_h3_corrupt_mask_releases_prior_source(endpoint, test_client, mocker):
     assert response.status_code == 400, response.text
     assert "Invalid conditioning media" in response.json()["detail"]
     assert created and all(not Path(path).exists() for path in created)
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("failure_stage", ["open", "decode"])
+@pytest.mark.parametrize("error_type", [av.error.EOFError, av.error.DecoderNotFoundError])
+def test_h3_ffmpeg_mask_failure_releases_all_uploads(endpoint, failure_stage, error_type, test_client, mocker):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    payload = _make_test_video_bytes()
+    created = []
+    original_mkstemp = video_generation_helpers.tempfile.mkstemp
+    original_open = av.open
+
+    def track(*args, **kwargs):
+        result = original_mkstemp(*args, **kwargs)
+        created.append(result[1])
+        return result
+
+    @contextmanager
+    def failing_decode(path, *args, **kwargs):
+        with original_open(path, *args, **kwargs) as container:
+
+            def decode(**decode_kwargs):
+                yield next(container.decode(**decode_kwargs))
+                raise error_type(1, "test mask decoder failure")
+
+            yield SimpleNamespace(streams=container.streams, decode=decode)
+
+    def open_media(path, *args, **kwargs):
+        if Path(path).name.startswith("vllm_omni_mask_reference_"):
+            if failure_stage == "open":
+                raise error_type(1, "test mask decoder failure")
+            return failing_decode(path, *args, **kwargs)
+        return original_open(path, *args, **kwargs)
+
+    mocker.patch.object(video_generation_helpers.tempfile, "mkstemp", side_effect=track)
+    mocker.patch.object(av, "open", side_effect=open_media)
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Invalid mask video.", "control_type": "canny"},
+        files={
+            "control_reference": ("hint.mp4", payload, "video/mp4"),
+            "source_reference": ("source.mp4", payload, "video/mp4"),
+            "mask_reference": ("mask.mp4", payload, "video/mp4"),
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "Invalid conditioning media" in response.json()["detail"]
+    assert "test mask decoder failure" in response.json()["detail"]
+    assert len(created) == 3 and all(not Path(path).exists() for path in created)
+    assert engine.captured_prompt is None
     assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
 
 

@@ -138,6 +138,8 @@ from .npu.lora import (
     load_minimax_h3_native_lora,
 )
 from .packed_sequence import (
+    MINIMAX_H3_MAX_PAD_SEQ_LEN,
+    MINIMAX_H3_SEQ_ALIGN,
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
@@ -291,6 +293,7 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "visual_condition_shapes",
     "audio_condition_lengths",
     "keyframe_frame_indices",
+    "pad_seq_len",
 )
 
 # ``StepRequestState.extra`` keys owned by the step-execution path.
@@ -544,6 +547,28 @@ def _resolve_minimax_h3_num_outputs(value: Any) -> int:
     if not 1 <= value <= 10:
         raise OmniClientError(f"MiniMax H3 num_outputs_per_prompt must be in [1, 10], got {value}")
     return value
+
+
+def _resolve_pad_seq_len(value: object) -> int | None:
+    """Validate the optional packed-length pin from ``extra_args``.
+
+    The packer itself only needs a value that covers the used rows. A request
+    field needs two more guards: an unaligned value would silently open yet
+    another compiled shape, and an unbounded one would size every structural
+    tensor the packer allocates.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise OmniClientError("MiniMax H3 pad_seq_len must be an integer")
+    pinned = int(value)
+    if pinned <= 0:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be positive, got {pinned}")
+    if pinned % MINIMAX_H3_SEQ_ALIGN:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be a multiple of {MINIMAX_H3_SEQ_ALIGN}, got {pinned}")
+    if pinned > MINIMAX_H3_MAX_PAD_SEQ_LEN:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be at most {MINIMAX_H3_MAX_PAD_SEQ_LEN}, got {pinned}")
+    return pinned
 
 
 def _minimax_h3_output_seeds(seed: int, num_outputs: int) -> list[int]:
@@ -927,6 +952,7 @@ class MiniMaxH3Pipeline(
             unsupported = (
                 int(self.parallel_config.ulysses_degree) != 1
                 or int(self.parallel_config.ring_degree) != 1
+                or int(self.parallel_config.allgather_degree) != 1
                 or getattr(self.parallel_config, "use_hsdp", False)
                 or getattr(od_config, "step_execution", False)
                 or getattr(od_config, "quantization_config", None)
@@ -1111,11 +1137,13 @@ class MiniMaxH3Pipeline(
             os.path.join(model_path, "video_vae"),
             device=self.device,
             load_device=component_load_device,
+            trust_remote_code=od_config.trust_remote_code,
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             os.path.join(model_path, "audio_vae"),
             device=self.device,
             load_device=component_load_device,
+            trust_remote_code=od_config.trust_remote_code,
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
@@ -1711,6 +1739,31 @@ class MiniMaxH3Pipeline(
                             logger.exception("Failed to release retained allocator cache after offload failure")
                     raise
 
+    @staticmethod
+    def _is_output_owner_rank() -> bool:
+        """Whether this rank's output is returned by the diffusion executor."""
+        return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+    def _offload_model_cpu_stage_output(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Release a decoded output's storage before a later seed reloads the DiT.
+
+        Model-level CPU offload makes the VAE hook evict the DiT before decode.
+        For a multi-output request, however, the next seed reloads the DiT while
+        the preceding decoded output would otherwise still occupy the device.
+        The reply rank performs the D2H copy early; ranks whose outputs are not
+        consumed retain only a metadata placeholder for the final concatenation.
+
+        Call this on the tensor that is actually returned to the engine. Audio is
+        released inside ``decode``; video is released by the callers of ``decode``
+        only after ``_prepare_minimax_h3_video_output`` has quantized it, so the
+        early D2H copy carries ``uint8`` frames rather than the decoded floats.
+        """
+        if not getattr(self, "_model_cpu_offload_modules", None):
+            return tensor
+        if self._is_output_owner_rank():
+            return tensor.cpu()
+        return torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+
     def _encode_visual_conditions(
         self,
         images: list[Image.Image],
@@ -1971,6 +2024,7 @@ class MiniMaxH3Pipeline(
         keyframe_frame_indices: list[int] | None = None,
         control_rows: torch.Tensor | None = None,
         control_context_scale: float = 1.0,
+        pad_seq_len: int | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -2000,6 +2054,7 @@ class MiniMaxH3Pipeline(
                 latent_w=latent_w,
                 audio_t=audio_t,
                 ref_blocks=ref_blocks,
+                seq_len=pad_seq_len,
             )
         else:
             packed = minimax_h3_packed_sequence(
@@ -2011,7 +2066,19 @@ class MiniMaxH3Pipeline(
                 include_keyframe_cond=task == "fl2va",
                 keyframe_frame_indices=keyframe_frame_indices if task == "fl2va" else None,
                 frame_count=num_frames if task == "fl2va" else None,
+                seq_len=pad_seq_len,
             )
+        # Report the effective shape at info level exactly when a request pins
+        # it, so a deployment can confirm the pin landed without raising the
+        # log level for every request.
+        log = logger.info if pad_seq_len is not None else logger.debug
+        log(
+            "MiniMax H3 packed sequence: task=%s pad_seq_len=%s used=%d seq_len=%d",
+            task,
+            pad_seq_len,
+            int(packed["cu_seqlens"][1]),
+            int(packed["seq_len"]),
+        )
 
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"]] = text_tags.cpu()
@@ -2152,6 +2219,7 @@ class MiniMaxH3Pipeline(
         keyframe_frame_indices: list[int] | None = None,
         control_rows: torch.Tensor | None = None,
         control_context_scale: float = 1.0,
+        pad_seq_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -2177,6 +2245,7 @@ class MiniMaxH3Pipeline(
             keyframe_frame_indices=keyframe_frame_indices,
             control_rows=control_rows,
             control_context_scale=control_context_scale,
+            pad_seq_len=pad_seq_len,
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
@@ -2299,6 +2368,7 @@ class MiniMaxH3Pipeline(
         video = video[..., :height, :width].contiguous()
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
+        audio = self._offload_model_cpu_stage_output(audio)
         return video, audio
 
     @staticmethod
@@ -2619,7 +2689,9 @@ class MiniMaxH3Pipeline(
         if control is not None and control_scale != 0:
             try:
                 media = {
-                    role: load_control_pixels(control[role], num_frames=num_frames, mask=role == "mask_path")
+                    role: load_control_pixels(
+                        control[role], height=height, width=width, num_frames=num_frames, mask=role == "mask_path"
+                    )
                     if control.get(role)
                     else None
                     for role in ("control_path", "source_path", "mask_path")
@@ -2643,6 +2715,7 @@ class MiniMaxH3Pipeline(
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        pad_seq_len = _resolve_pad_seq_len(extra.get("pad_seq_len"))
         quality_plan = self._quality_policy.resolve(
             quality=quality,
             num_inference_steps=num_steps,
@@ -2671,6 +2744,7 @@ class MiniMaxH3Pipeline(
             "visual_condition_shapes": visual_shapes,
             "audio_condition_lengths": audio_lengths,
             "keyframe_frame_indices": keyframe_frame_indices,
+            "pad_seq_len": pad_seq_len,
             "seed": seed,
             "num_steps": num_steps,
             "video_shift": video_shift,
@@ -2727,7 +2801,13 @@ class MiniMaxH3Pipeline(
                     height=context["height"],
                     width=context["width"],
                 )
-                videos.append(_prepare_minimax_h3_video_output(video))
+                # Rebind rather than append the expression: the local would
+                # otherwise keep the decoded frames' device storage alive for the
+                # rest of the iteration, and the next seed's diffuse() -- the DiT
+                # reload this release exists to make room for -- runs before the
+                # loop rebinds it. post_decode() rebinds for the same reason.
+                video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
+                videos.append(video)
                 audios.append(audio)
         if videos and isinstance(videos[0], bytes):
             video = videos[0] if len(videos) == 1 else videos
@@ -3050,7 +3130,7 @@ class MiniMaxH3Pipeline(
                 height=shape["height"],
                 width=shape["width"],
             )
-            video = _prepare_minimax_h3_video_output(video)
+            video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
