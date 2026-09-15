@@ -1,19 +1,21 @@
 # LTX-2 Family
 
-> LTX-2 and LTX-2.3 text-to-video and image-to-video generation with synchronized audio
+> LTX-2 and LTX-2.3 text-to-video, image-to-video, and text-to-audio generation
 
 ## Pipelines
 
 | `--model-class-name` | Task | Required checkpoint repositories |
-|---|---|---|
+| --- | --- | --- |
 | `LTX2Pipeline` | LTX-2 one-stage T2V/I2V | `Lightricks/LTX-2` |
 | `LTX2TwoStagePipeline` | LTX-2 ordinary two-stage T2V/I2V | `Lightricks/LTX-2` |
 | `LTX2DistilledOneStagePipeline` | LTX-2 merged-distilled one-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
 | `LTX2DistilledTwoStagePipeline` | LTX-2 merged-distilled two-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
+| `LTX2TextToAudioPipeline` | LTX-2 T2A | `Lightricks/LTX-2` |
 | `LTX2Pipeline` | LTX-2.3 one-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers` |
 | `LTX2TwoStagePipeline` | LTX-2.3 ordinary two-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers`<br>`Lightricks/LTX-2.3` |
 | `LTX2DistilledOneStagePipeline` | LTX-2.3 merged-distilled one-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers` |
 | `LTX2DistilledTwoStagePipeline` | LTX-2.3 merged-distilled two-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers`<br>`Lightricks/LTX-2.3` |
+| `LTX2TextToAudioPipeline` | LTX-2.3 T2A | `diffusers/LTX-2.3-Diffusers` |
 
 Repositories in the table are download units. A full pipeline repository
 contains the Transformer, text encoder, connectors, VAEs, vocoder, scheduler,
@@ -35,6 +37,47 @@ T2V and I2V; select their class explicitly. The deprecated
 `LTX2DistilledPipeline` name remains an alias for
 `LTX2DistilledTwoStagePipeline`.
 
+## Text-to-Audio
+
+Select `LTX2TextToAudioPipeline` explicitly. LTX-2 defaults to 40 denoise
+steps, while LTX-2.3 defaults to 30. The output sample rate is read from the
+checkpoint vocoder rather than supplied by the request.
+
+```bash
+# LTX-2
+python examples/offline_inference/text_to_audio/text_to_audio.py \
+  --model Lightricks/LTX-2 \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A fingerpicked acoustic guitar in a quiet studio" \
+  --audio-length 5 \
+  --num-inference-steps 40 \
+  --output ltx2_audio.wav
+
+# LTX-2.3
+python examples/offline_inference/text_to_audio/text_to_audio.py \
+  --model diffusers/LTX-2.3-Diffusers \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A fingerpicked acoustic guitar in a quiet studio" \
+  --audio-length 5 \
+  --num-inference-steps 30 \
+  --output ltx23_audio.wav
+```
+
+For serving, launch either checkpoint with the same explicit pipeline class:
+
+```bash
+vllm serve Lightricks/LTX-2 --omni \
+  --model-class-name LTX2TextToAudioPipeline \
+  --stage-init-timeout 600
+
+# Or use: diffusers/LTX-2.3-Diffusers
+```
+
+Send requests to `/v1/audio/generate`; see the
+[audio generation API](../../docs/serving/audio_generate_api.md) for the
+request and response format. The audio-only pipeline currently requires
+tensor parallel size 1, sequence parallel size 1, and no Cache-DiT backend.
+
 ## API Migration
 
 Only `req` may be passed positionally to `LTX2Pipeline`; every optional
@@ -53,7 +96,7 @@ pipe(req, image=image, prompt=prompt)
 The consolidation also removes these registry names without aliases:
 
 | Removed name | Replacement |
-|---|---|
+| --- | --- |
 | `LTX23Pipeline` | `LTX2Pipeline`; checkpoint metadata selects LTX-2.3 |
 | `LTX2ImageToVideoPipeline` | `LTX2Pipeline` with `image=` |
 | `LTX23ImageToVideoPipeline` | `LTX2Pipeline` with `image=`; checkpoint metadata selects LTX-2.3 |
@@ -67,7 +110,7 @@ offline and serving entrypoints already use named fields and are unaffected.
 ## One-Stage Defaults
 
 | Parameter | LTX-2 | LTX-2.3 |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Width × height | 768 × 512 | 768 × 512 |
 | Frames / frame rate | 121 / 24 | 121 / 24 |
 | Denoise steps | 40 | 30 |
@@ -85,7 +128,7 @@ default to `121`.
 ## Two-Stage Defaults
 
 | Parameter | Ordinary | Full-distilled |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Final width × height | 1536 × 1024 | 1536 × 1024 |
 | Stage 1 width × height | 768 × 512 | 768 × 512 |
 | Frames / frame rate | 121 / 24 | 121 / 24 |
@@ -172,7 +215,7 @@ spatio-temporal guidance (STG), cross-modality guidance, and rescaling.
 Distilled stages and ordinary Stage 2 are fixed positive-only.
 
 | Parameter | Default | Effect | Alias |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | `video_cfg_scale` | 3.0 | Video text CFG; `1.0` disables it | `video_cfg_guidance_scale` |
 | `audio_cfg_scale` | 7.0 | Audio text CFG; `1.0` disables it | `audio_cfg_guidance_scale` |
 | `video_stg_scale` | 1.0 | Video STG; `0.0` disables it | `video_stg_guidance_scale` |
@@ -210,7 +253,7 @@ per denoise step: `cond`, `uncond`, `ptb` (STG), and `mod`
 (cross-modality). The useful balanced configurations are therefore:
 
 | `--cfg-parallel-size` | Passes per rank | Guidance-slot utilization | Notes |
-|---:|---:|---:|---|
+| ---: | ---: | ---: | --- |
 | `1` | 4 | 100% | Single-rank fused guidance batch |
 | `2` | 2 | 100% | Recommended two-rank configuration |
 | `4` | 1 | 100% | One guidance pass per rank |
@@ -269,7 +312,7 @@ noted below.
 ### Complete `forward` Surface
 
 | Argument | Type/default | Meaning and constraints |
-|---|---|---|
+| --- | --- | --- |
 | `req` | `DiffusionRequestBatch`, required | Only positional argument; contains prompts and per-request sampling parameters. |
 | `image` | image or batch, `None` | Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
 | `prompt` | string or list, `None` | Positive-text fallback; request prompts win. Mutually exclusive with `prompt_embeds`. |
@@ -306,7 +349,7 @@ request prompt payload; LTX guidance fields live in sampling `extra_args`.
 ### Recipe-Specific Request Capabilities
 
 | Override | One-stage | Ordinary two-stage | Distilled two-stage |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Guidance | Supported | Stage 1 only; Stage 2 is positive-only | Fixed positive-only |
 | Negative prompt/embeddings | Supported | Supported by Stage 1 | Rejected |
 | `num_inference_steps` | Supported | Controls Stage 1; Stage 2 uses 3 | Fixed at 8 for Stage 1; Stage 2 uses 3 |

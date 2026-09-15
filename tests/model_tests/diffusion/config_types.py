@@ -36,7 +36,7 @@ class DiffusionTasks(str, Enum):
     IMAGE_TO_IMAGE = "image_to_image"
     TEXT_TO_VIDEO = "text_to_video"
     IMAGE_TO_VIDEO = "image_to_video"
-    # Text to audio, etc should be added here as needed
+    TEXT_TO_AUDIO = "text_to_audio"
 
 
 class DiffusionModelTestOpts(NamedTuple):
