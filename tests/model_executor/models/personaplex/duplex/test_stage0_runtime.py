@@ -2,18 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import base64
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from tests.model_executor.models.personaplex.test_prefill_embeddings import _make_talker, _reference_prefill
+from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
 from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     SILENCE_TOKENS,
     SINE_TOKENS,
 )
 from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
     PersonaPlexStage0DuplexRuntime,
+    PersonaPlexStage0PreparedAppend,
 )
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
     PersonaPlexTalkerForConditionalGeneration,
@@ -103,7 +107,7 @@ def _duplex_info(*, seq: int, session_id: str = "session", incarnation: int = 1)
 
 def _runtime(*codecs: _FakeCodec) -> PersonaPlexStage0DuplexRuntime:
     voice_embeddings = torch.arange(8, dtype=torch.float32).reshape(2, 1, 1, 4)
-    codec_args = {"codec": codecs[0]}
+    codec_args: dict[str, _FakeCodec | Callable[[], _FakeCodec] | int] = {"codec": codecs[0]}
     if len(codecs) > 1:
         available = iter(codecs)
         codec_args = {
@@ -139,6 +143,33 @@ def test_first_append_prepends_voice_and_persona_once() -> None:
     assert second.user_codes.shape == (2, 8)
     assert second.inputs_embeds.shape == (1, 4)
     assert codec.encode_calls == 2
+
+
+@torch.inference_mode()
+def test_first_append_uses_real_prefill_embeddings_once(monkeypatch, mocker) -> None:
+    runtime = _runtime(_FakeCodec())
+    device = torch.device("cpu")
+    talker = _make_talker(device, torch.float32, PersonaPlexConfig(temporal_config={"hidden_size": 4}))
+    prefill = mocker.spy(talker, "_build_prefill_embed")
+    # Exercise real prefill while retaining the codec/live-frame fixture.
+    monkeypatch.setattr(runtime.stage_model, "_build_prefill_embed", prefill)
+    first = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    second = runtime.prepare_append(_duplex_info(seq=2), prompt_len=18)
+    expected = _reference_prefill(
+        talker,
+        torch.tensor([3] * 6 + [7, 8, 9] + [3] * 6),
+        0,
+        15,
+        device,
+        torch.tensor(SILENCE_TOKENS),
+        torch.tensor(SINE_TOKENS),
+    )
+    prefill.assert_called_once()
+    assert torch.equal(first.inputs_embeds[:2], torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    assert torch.equal(first.inputs_embeds[2:17].view(torch.uint8), expected.view(torch.uint8))
+    assert first.inputs_embeds.shape == (18, 4)
+    assert second.inputs_embeds.shape == (1, 4)
+    assert second.prefill_applied is False
 
 
 @pytest.mark.parametrize(
@@ -248,7 +279,12 @@ def test_decoded_pcm_is_writable_for_torch_zero_copy() -> None:
 
 def _prepare_two_sessions(
     runtime: PersonaPlexStage0DuplexRuntime,
-) -> tuple[object, object, object, object]:
+) -> tuple[
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+]:
     first_1 = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
     second_1 = runtime.prepare_append(
         _duplex_info(seq=1, session_id="other", incarnation=2),
