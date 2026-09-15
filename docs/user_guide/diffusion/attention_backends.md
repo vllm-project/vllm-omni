@@ -16,6 +16,7 @@ For the internal selector, registry, and platform contract, see
 | Need | Guide |
 | --- | --- |
 | Select a conservative or platform-native dense kernel | [Dense Backends](attention_backends/dense_backends.md) |
+| Use AITER MHA v4 quantized attention on AMD Instinct GPUs | [AITER Quantized Attention](attention_backends/aiter_quant.md) |
 | Use FlashInfer trtllm-gen FMHA, Skip-Softmax, or TRTLLM SAGE quantization | [TRTLLM Attention](attention_backends/trtllm.md) |
 | Install and use SageAttention 2.2 or SageAttention3 | [SageAttention](attention_backends/sage.md) |
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
@@ -31,6 +32,7 @@ For the internal selector, registry, and platform contract, see
 | `CUDNN_ATTN` | Dense | Mask-heavy DiTs on Blackwell with cuDNN 9.5 or newer | [Dense Backends](attention_backends/dense_backends.md#cudnn_attn) |
 | `FLASHINFER_ATTN` | Dense or quantized | FlashInfer batch prefill; optional mixed Q/K and V dtypes | [Dense Backends](attention_backends/dense_backends.md#flashinfer_attn) |
 | `TRTLLM_ATTN` | Dense, sparse, or quantized | Datacenter Blackwell with `head_dim=128` and compatible packed paths | [TRTLLM Attention](attention_backends/trtllm.md) |
+| `AITER_QUANT_ATTN` | Quantized | AITER MHA v4 on gfx942 and gfx950 | [AITER Quantized Attention](attention_backends/aiter_quant.md) |
 | `SAGE_ATTN` | Quantized | SageAttention 2.2 INT8 attention | [SageAttention](attention_backends/sage.md#sage_attn) |
 | `SAGE_ATTN_3` | Quantized | SageAttention3 on Blackwell | [SageAttention](attention_backends/sage.md#sage_attn_3) |
 | `FLASH_ATTN_HUB` | Hub kernel | FlashAttention 2 from Hugging Face `kernels` | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
@@ -105,6 +107,7 @@ Backend-specific typed blocks are documented with their consumers:
 
 - `quant`: [FlashInfer](attention_backends/dense_backends.md#flashinfer-quantized-attention)
   and [TRTLLM SAGE](attention_backends/trtllm.md#sage-quantization).
+- `aiter_quant`: [AITER MHA v4 format selection](attention_backends/aiter_quant.md#configuration).
 - `skip_softmax`: [TRTLLM Skip-Softmax](attention_backends/trtllm.md#skip-softmax).
 - `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
 - `fastvideo_vsa_topk`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#choose-top-k).
@@ -131,6 +134,13 @@ unsupported mask.
 
 The CUDA auto-route uses `FLASH_ATTN` when available and otherwise falls back
 to `TORCH_SDPA`. `CUDNN_ATTN` and `FLASHINFER_ATTN` remain explicit options.
+
+### ROCm
+
+ROCm automatically selects `FLASH_ATTN` when a compatible AITER installation
+is available and otherwise falls back to `TORCH_SDPA`. `AITER_QUANT_ATTN` is
+an explicit option; selecting it never changes the backend or quantization
+format silently.
 
 Other platforms validate an explicit backend and choose their own default
 through the platform implementation. Check the startup log to confirm the

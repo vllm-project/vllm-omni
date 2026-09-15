@@ -1822,6 +1822,21 @@ class AttnQuantSpec:
         return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
+@dataclass
+class AiterQuantSpec:
+    """Typed configuration for the ROCm AITER quantized attention backend."""
+
+    format: str = "fp8"
+    _VALID_FORMATS = frozenset({"bf16", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"})
+
+    def __post_init__(self) -> None:
+        self.format = str(self.format).lower()
+        if self.format not in self._VALID_FORMATS:
+            raise ValueError(
+                f"aiter_quant.format={self.format!r} unsupported; use one of {sorted(self._VALID_FORMATS)}."
+            )
+
+
 # Backends that select key blocks instead of attending densely, and so accept
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
@@ -1880,6 +1895,7 @@ class AttentionSpec:
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
+    aiter_quant: AiterQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
@@ -1889,6 +1905,7 @@ class AttentionSpec:
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.aiter_quant = self._coerce(self.aiter_quant, AiterQuantSpec, "aiter_quant")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
@@ -1899,6 +1916,12 @@ class AttentionSpec:
             raise ValueError(
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
+            )
+        if self.backend.upper() == "AITER_QUANT_ATTN":
+            self.aiter_quant = self.aiter_quant or AiterQuantSpec()
+        elif self.aiter_quant is not None:
+            raise ValueError(
+                f"aiter_quant is only supported by the AITER_QUANT_ATTN backend, but backend={self.backend!r}."
             )
         if self.fastvideo_vsa_topk is not None:
             if self.backend.upper() != "FASTVIDEO_VSA":
@@ -1947,6 +1970,8 @@ class AttentionSpec:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
             if quant_kw:
                 kw["quant"] = quant_kw
+        if self.aiter_quant is not None:
+            kw["format"] = self.aiter_quant.format
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
         if self.block_sparse is not None:
