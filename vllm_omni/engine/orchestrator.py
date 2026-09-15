@@ -1143,6 +1143,11 @@ class Orchestrator:
             iteration_stats=iteration_stats,
         )
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
+            key = (stage_id, replica_id)
+            if key not in self._stage_replica_to_engine_idx:
+                engine_idx = len(self._stage_replica_to_engine_idx)
+                self._stat_logger.register_replica(engine_idx, str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[key] = engine_idx
             self._stat_logger.record(
                 raw_outputs.scheduler_stats,
                 iteration_stats,
