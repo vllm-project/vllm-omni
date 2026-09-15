@@ -73,53 +73,84 @@ def wait_for_gpu_memory_to_clear(
 
     device_list = ", ".join(str(d) for d in devices)
     if threshold_bytes is not None:
-        condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB"
+        condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB (excl. Whisper worker)"
 
         def is_free(used, total):
             return used <= threshold_bytes / 2**30
     else:
         ratio = threshold_ratio
         assert ratio is not None
-        condition_str = f"Memory usage ratio ≤ {ratio * 100:.1f}%"
+        condition_str = f"Memory usage ratio ≤ {ratio * 100:.1f}% (excl. Whisper worker)"
 
         def is_free(used, total):
             return used / total <= ratio
 
     print(f"[Device Memory Monitor] Waiting for device(s) {device_list} to free memory, Condition: {condition_str}")
-
-    def get_mem_gib(device: int) -> tuple[float, float]:
-        with current_omni_platform.device(device):
-            free_bytes, total_bytes = current_omni_platform.mem_get_info()
-        return (total_bytes - free_bytes) / 2**30, total_bytes / 2**30
+    whisper_allowance_gib, whisper_device = _whisper_vram_allowance()
+    if whisper_allowance_gib > 0 and whisper_device is not None:
+        print(
+            f"[Device Memory Monitor] Whisper worker allowance {whisper_allowance_gib:.1f}GiB "
+            f"on device {whisper_device}"
+        )
 
     while True:
-        output_raw = {d: get_mem_gib(d) for d in devices}
-        output = {
-            d: f"{used:.1f}GiB/{total:.1f}GiB ({(used / total) * 100 if total > 0 else 0:.1f}%)"
-            for d, (used, total) in output_raw.items()
-        }
-
-        print("[Device Memory Status] Current usage:")
-        for device_id, mem_info in output.items():
-            print(f"  Device {device_id}: {mem_info}")
+        used_by_device: dict[int, tuple[float, float]] = {}
+        for device in devices:
+            with current_omni_platform.device(device):
+                free_bytes, total_bytes = current_omni_platform.mem_get_info()
+            used_by_device[device] = ((total_bytes - free_bytes) / 2**30, total_bytes / 2**30)
+        output_raw: dict[int, tuple[float, float, float]] = {}
+        for device, (used_gib, total_gib) in used_by_device.items():
+            whisper_gib = (
+                min(used_gib, whisper_allowance_gib) if whisper_device is not None and device == whisper_device else 0.0
+            )
+            output_raw[device] = (max(0.0, used_gib - whisper_gib), total_gib, whisper_gib)
+        print("[Device Memory Status] Current usage (engine view excludes Whisper worker):")
+        for device_id, (used, total, whisper) in output_raw.items():
+            ratio_pct = (used / total) * 100 if total > 0 else 0.0
+            line = f"  Device {device_id}: {used:.1f}GiB/{total:.1f}GiB ({ratio_pct:.1f}%)"
+            if whisper > 0:
+                line += f" [Whisper worker {whisper:.1f}GiB excluded]"
+            print(line)
 
         dur_s = time.time() - start_time
-        if all(is_free(used, total) for used, total in output_raw.values()):
+        if all(is_free(used, total) for used, total, _whisper in output_raw.values()):
             print(f"[Device Memory Freed] Device(s) {device_list} meet memory condition")
             print(f"   Condition: {condition_str}")
             print(f"   Wait time: {dur_s:.1f} seconds ({dur_s / 60:.1f} minutes)")
             break
 
         if dur_s >= timeout_s:
+            status = "\n".join(
+                f"  Device {d}: {used:.1f}GiB/{total:.1f}GiB"
+                + (f" (+Whisper {whisper:.1f}GiB excluded)" if whisper > 0 else "")
+                for d, (used, total, whisper) in output_raw.items()
+            )
             raise ValueError(
                 f"[Device Memory Timeout] Device(s) {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
                 f"Condition: {condition_str}\n"
-                f"Current status:\n" + "\n".join(f"  Device {d}: {output[d]}" for d in devices)
+                f"Current status:\n{status}"
             )
 
         gc.collect()
         current_omni_platform.empty_cache()
         time.sleep(5)
+
+
+def _whisper_vram_allowance() -> tuple[float, int | None]:
+    """Whisper GPU footprint and physical device, or ``(0.0, None)`` on CPU / unknown."""
+    try:
+        from tests.helpers.media import whisper_resident_device_index, whisper_resident_vram_gib
+    except Exception:
+        return 0.0, None
+    gib = whisper_resident_vram_gib()
+    logical = whisper_resident_device_index()
+    if gib <= 0.0 or logical is None:
+        return 0.0, None
+    mapped = get_physical_device_indices([logical])
+    if not mapped:
+        return 0.0, None
+    return gib, mapped[0]
 
 
 def _run_smi(label: str, cmd: list[str], head_lines: int, timeout: float = 5) -> None:

@@ -163,9 +163,8 @@ class OmniServer:
     ) -> None:
         cleanup_test_environment()
         self.model = model
-        args = list(serve_args)
-        self.serve_args = args
-        self.log_stats = "--disable-log-stats" not in args and "--log-stats" in args
+        self.serve_args = list(serve_args)
+        self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
