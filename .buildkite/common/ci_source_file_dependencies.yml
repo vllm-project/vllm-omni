@@ -219,6 +219,8 @@ source_file_dependencies:
   omni_minicpmo_4_5_accuracy:
     - *minicpmo_4_5
     - tests/e2e/accuracy/minicpmo_4_5/
+    - vllm_omni/benchmarks/data_modules/daily_omni_dataset.py
+    - vllm_omni/benchmarks/media_preflight.py
 
   omni_minicpmo_4_5_perf:
     - *minicpmo_4_5
