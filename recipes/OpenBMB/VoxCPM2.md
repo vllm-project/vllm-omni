@@ -77,7 +77,8 @@ tenant on the GPU, the defaults from `voxcpm2.yaml` work as-is:
 
 ```bash
 vllm serve openbmb/VoxCPM2 --omni \
-    --host 0.0.0.0 --port 8000
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name voxcpm2 openbmb/VoxCPM2
 ```
 
 The deploy config at
@@ -88,8 +89,8 @@ Pass `--deploy-config <path>` to override.
 #### Verification
 
 **Server cold-start**: ~60 s from `vllm serve` to `Application startup
-complete` (subprocess fork + vLLM 0.21 init + model load + flashinfer JIT
-+ torch.compile of LocDiT / feat_encoder / AudioVAE + CUDA-Graph warmup).
+complete` (subprocess fork + vLLM 0.21 init + model load + flashinfer JIT +
+torch.compile of LocDiT / feat_encoder / AudioVAE + CUDA-Graph warmup).
 The first request after startup pays a small additional cost; steady-state
 requests are much faster.
 
@@ -199,7 +200,7 @@ after a one-off ~28 s engine init:
 | ---- | -------- | --------- | ----- | ------------------------------------------------ |
 | #1   | 6.72 s   | 11.97 s   | 1.782 | cold: torch.compile + CUDA-Graph capture         |
 | #2   | 6.24 s   | 11.43 s   | 1.831 | still runtime warmup                             |
-| #3   | 6.88 s   | 0.82 s    | 0.120 | ⚡ steady-state                                   |
+| #3   | 6.88 s   | 0.82 s    | 0.120 | ⚡ steady-state                                  |
 | #4   | 6.56 s   | 0.78 s    | 0.119 | steady-state                                     |
 | #5   | 5.76 s   | 0.70 s    | 0.121 | steady-state                                     |
 
@@ -231,7 +232,7 @@ Same 5-call methodology as the zero-shot table, this time with a
 | ---- | -------- | --------- | ----- | ------------------------------------------------ |
 | #1   | 5.44 s   | 12.38 s   | 2.276 | cold: compile + CUDA-Graph capture + ref encode  |
 | #2   | 5.12 s   | 2.47 s    | 0.482 | most warmup done                                 |
-| #3   | 5.44 s   | 0.76 s    | 0.139 | ⚡ steady-state                                   |
+| #3   | 5.44 s   | 0.76 s    | 0.139 | ⚡ steady-state                                  |
 | #4   | 4.96 s   | 0.68 s    | 0.137 | steady-state                                     |
 | #5   | 5.28 s   | 0.71 s    | 0.134 | steady-state                                     |
 

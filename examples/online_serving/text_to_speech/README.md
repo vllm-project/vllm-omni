@@ -13,7 +13,7 @@ For the full list of supported architectures across all modalities, see
 ## Supported Models
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
@@ -942,7 +942,7 @@ Single-stage native AR TTS at 48 kHz.
 ### Launch
 
 ```bash
-vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
+vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000 --served-model-name voxcpm2 openbmb/VoxCPM2
 ```
 
 Deploy config auto-loads from `vllm_omni/deploy/voxcpm2.yaml`. Pass `--deploy-config <path>` to override or `--stage-N-<field> <value>` for per-stage runtime tweaks.
