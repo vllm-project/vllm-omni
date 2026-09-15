@@ -77,6 +77,21 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
             )
 
         self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
+
+        # Schedule-based profiling (wait/warmup/active) mirrors vLLM's
+        # TorchProfilerWrapper. The schedule is advanced once per worker step
+        # via _profiler_step(), and _stop() drains any remaining RECORD steps
+        # before calling stop() so trace export never runs mid-capture.
+        self._uses_schedule = bool(
+            getattr(profiler_config, "warmup_iterations", 0) or getattr(profiler_config, "wait_iterations", 0)
+        )
+        # Subtract 1 because start() already consumes step 0 (WAIT or WARMUP),
+        # so only wait + warmup - 1 non-active steps remain to advance through.
+        self._warmup_steps_remaining = max(
+            getattr(profiler_config, "wait_iterations", 0) + getattr(profiler_config, "warmup_iterations", 0) - 1,
+            0,
+        )
+
         self.profiler = self._create_profiler(profiler_config, activities)
 
     def _rank(self) -> int:
@@ -89,6 +104,24 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """
         return ["CPU", "CUDA"]
 
+    def _build_schedule(self, schedule_fn: Any) -> Any | None:
+        """Build the profiler schedule for schedule-based profiling.
+
+        Returns ``None`` when schedule-based profiling is disabled (no wait or
+        warmup iterations configured), in which case the profiler records every
+        step and has no WAIT/WARMUP/RECORD state machine to advance.
+        """
+        cfg = self.profiler_config
+        if not (getattr(cfg, "warmup_iterations", 0) or getattr(cfg, "wait_iterations", 0)):
+            return None
+        return schedule_fn(
+            skip_first=0,
+            wait=getattr(cfg, "wait_iterations", 0),
+            warmup=getattr(cfg, "warmup_iterations", 0),
+            active=getattr(cfg, "active_iterations", 5),
+            repeat=1,
+        )
+
     def _create_profiler(
         self,
         profiler_config: ProfilerConfig,
@@ -100,6 +133,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """
         return torch.profiler.profile(
             activities=[TorchProfilerActivityMap[a] for a in activities],
+            schedule=self._build_schedule(torch.profiler.schedule),
             record_shapes=profiler_config.torch_profiler_record_shapes,
             profile_memory=profiler_config.torch_profiler_with_memory,
             with_stack=profiler_config.torch_profiler_with_stack,
@@ -390,13 +424,65 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self.profiler.start()
 
     @override
+    def _profiler_step(self) -> bool:
+        """Advance the profiler schedule once per worker step.
+
+        With schedule-based profiling the underlying profiler only moves
+        through WAIT/WARMUP/RECORD via ``step()`` calls, so forward the
+        schedule here. Warmup steps return False so only active (RECORD) steps
+        count toward the ``max_iterations`` auto-stop limit.
+        """
+        if self._uses_schedule:
+            self.profiler.step()
+            if self._warmup_steps_remaining > 0:
+                self._warmup_steps_remaining -= 1
+                return False
+        return True
+
+    @override
     def _stop(self) -> None:
-        """Stop profiler, export trace via on_trace_ready, and dump table."""
+        """Stop profiler, export trace via on_trace_ready, and dump table.
+
+        ``stop_profile`` is an out-of-band call that can arrive mid-RECORD.
+        Stopping a schedule-based profiler while it is still capturing
+        segfaults the NPU profiler (and yields incomplete traces elsewhere),
+        so first drain the schedule to IDLE so trace export always runs on a
+        consistent, non-capturing state.
+        """
+        self._drain_schedule()
         self.profiler.stop()
         try:
             self._on_stop_hook()
         finally:
             self._try_dump_memory_snapshot()
+
+    def _drain_schedule(self) -> None:
+        """Advance the profiler schedule out of the capture window before stop.
+
+        Each ``step()`` advances the state machine by one transition; a RECORD
+        window needs up to wait + warmup + active steps to fully drain to IDLE.
+        Draining more than the remaining steps is harmless because ``step()``
+        is a no-op once the schedule reaches IDLE. Profilers without a schedule
+        have no state machine to advance and are left untouched.
+        """
+        if not self._uses_schedule:
+            return
+        cfg = self.profiler_config
+        drain = (
+            int(getattr(cfg, "wait_iterations", 0) or 0)
+            + int(getattr(cfg, "warmup_iterations", 0) or 0)
+            + int(getattr(cfg, "active_iterations", 5) or 0)
+        )
+        for _ in range(max(drain, 1)):
+            try:
+                self.profiler.step()
+            except Exception as e:
+                logger.warning(
+                    "[Rank %s] Profiler schedule drain interrupted: %s",
+                    self._rank(),
+                    e,
+                )
+                break
 
     def _on_stop_hook(self) -> None:
         """Hook called after profiler.stop().
