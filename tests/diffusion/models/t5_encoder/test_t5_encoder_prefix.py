@@ -6,8 +6,10 @@ import pytest
 import torch
 from transformers import T5Config
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import init_parameters
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -63,6 +65,32 @@ def setup_vllm_config(monkeypatch, mocker):
         yield
 
 
+class TestInitParameters:
+    def test_materializes_meta_parameter_without_dropping_parameter_subclass(self):
+        class CustomParameter(torch.nn.Parameter):
+            @property
+            def weight_loader(self):
+                return self._weight_loader
+
+        module = torch.nn.Module()
+
+        def weight_loader(*args):
+            return None
+
+        param = CustomParameter(torch.empty((2, 3), device="meta"), requires_grad=False)
+        param._weight_loader = weight_loader
+        param.tp_rank = 0
+        module.register_parameter("weight", param)
+
+        init_parameters(module, dtype=torch.float16, device=torch.device("cpu"))
+
+        assert isinstance(module.weight, CustomParameter)
+        assert module.weight.device == torch.device("cpu")
+        assert module.weight.dtype == torch.float16
+        assert module.weight.weight_loader is weight_loader
+        assert module.weight.tp_rank == 0
+
+
 class TestT5EncoderModelPrefixHandling:
     """Test that T5EncoderModel correctly handles prefix attribute."""
 
@@ -78,6 +106,22 @@ class TestT5EncoderModelPrefixHandling:
         model = T5EncoderModel(t5_config)
         assert hasattr(model, "prefix")
         assert model.prefix == ""
+
+    def test_quant_config_receives_component_prefixed_linears(self, mocker):
+        """Test that quantized T5 linears receive fully qualified prefixes."""
+        config = T5Config(**{**_SMALL_T5_CONFIG, "num_layers": 1})
+        quant_config = mocker.MagicMock()
+        quant_config.get_quant_method.side_effect = lambda layer, prefix: UnquantizedLinearMethod()
+
+        T5EncoderModel(config, prefix="text_encoder", quant_config=quant_config)
+
+        prefixes = {call.kwargs["prefix"] for call in quant_config.get_quant_method.call_args_list}
+        assert {
+            "text_encoder.encoder.block.0.layer.0.SelfAttention.qkv_proj",
+            "text_encoder.encoder.block.0.layer.0.SelfAttention.o",
+            "text_encoder.encoder.block.0.layer.1.DenseReluDense.wi",
+            "text_encoder.encoder.block.0.layer.1.DenseReluDense.wo",
+        }.issubset(prefixes)
 
 
 class TestT5EncoderModelWeightLoadingWithPrefix:
