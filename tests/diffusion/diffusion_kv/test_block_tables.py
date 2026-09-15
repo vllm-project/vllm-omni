@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -279,17 +279,17 @@ def _install_native_modules(monkeypatch: pytest.MonkeyPatch, events: list[tuple]
         group = SimpleNamespace(get_metadata_builder=lambda _index: SimpleNamespace(reorder_batch_threshold=None))
         return [[group], [group]], "cg-support", [4, 8]
 
+    # vLLM 0.29 dropped attn_groups and cache_dtype from init_kv_cache: the
+    # layout now rides on the resolved CacheConfig.kv_cache_layout instead.
     def init_cache(
         runner_kv_caches,
         forward_context,
         kv_cache_config,
-        attn_groups,
         device,
-        cache_dtype,
         kernel_block_sizes,
         vllm_config,
     ):
-        events.append(("cache", kv_cache_config, attn_groups, kernel_block_sizes))
+        events.append(("cache", kv_cache_config, kernel_block_sizes))
         runner_kv_caches.extend(["cache-0", "cache-1"])
         return {"layer-0": "tensor-0", "layer-1": "tensor-1"}
 
@@ -485,8 +485,16 @@ def test_valid_sequence_and_context_install_into_native_rows(monkeypatch: pytest
     assert runner.get_diffusion_kv_row("req-0", 0, "text") == 1
     sequence_binding = runner._resolve_paged_attention_row("req-0", 0, None)
     context_binding = runner._resolve_paged_attention_row("req-0", None, "text")
-    assert (sequence_binding.row_index, sequence_binding.max_seq_len) == (0, 9)
-    assert (context_binding.row_index, context_binding.max_seq_len) == (1, 5)
+    assert (sequence_binding.row_index, sequence_binding.max_seq_len, sequence_binding.block_ids) == (
+        0,
+        9,
+        ((1, 2, 3), (4, 5)),
+    )
+    assert (context_binding.row_index, context_binding.max_seq_len, context_binding.block_ids) == (
+        1,
+        5,
+        ((6, 7), (8,)),
+    )
 
 
 def test_block_table_mutations_invalidate_prepared_attention_batches(

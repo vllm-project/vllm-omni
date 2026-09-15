@@ -9,12 +9,15 @@
 # That breakage is now handled in code instead of by pinning:
 # MossTTSNanoForGeneration wraps weight loading in
 # transformers_keys_to_ignore_compat (vllm_omni/model_executor/models/utils.py).
-transformers >= 5.10.1, < 5.15
+# Floor is 5.13.0 so transformers.integrations.hub_kernels LayerRepository
+# entries always pass version=/revision= required by kernels>=0.16 (#6971).
+transformers >= 5.13.0, < 5.15
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.40.0
-# Hub kernels, including LTX-2.5 NATTEN
-kernels==0.14.1
+# Hub kernels, including LTX-2.5 NATTEN. 0.16+ resolves torch-stable-abi*
+# FA3 builds on torch 2.13 / cu130; keep in sync with transformers above.
+kernels==0.16.1
 safetensors>=0.8.0
 accelerate==1.12.0
 soundfile>=0.13.1

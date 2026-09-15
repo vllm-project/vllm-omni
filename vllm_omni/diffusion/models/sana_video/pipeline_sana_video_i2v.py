@@ -16,6 +16,10 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
     DistributedAutoencoderKLLTX2Video,
 )
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    model_parallel_is_initialized,
+)
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.sana_video.pipeline_sana_video import (
     ASPECT_RATIO_480_BIN,
@@ -192,7 +196,11 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             default_num_frames=81,
             is_dummy_run=req.is_dummy_run(),
         )
-        num_steps = sampling.num_inference_steps if sampling.num_inference_steps is not None else 50
+        num_steps = (
+            sampling.num_inference_steps
+            if sampling.num_inference_steps is not None
+            else self.default_num_inference_steps
+        )
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 6.0
         generator = sampling.generator
         if generator is None and sampling.seed is not None:
@@ -224,6 +232,91 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             output_type="latent" if sampling.output_type == "latent" else "raw",
         )
         return DiffusionOutput(output=video)
+
+    def diffuse(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_prompt_attention_mask: torch.Tensor | None,
+        guidance_scale: float,
+        conditioning_mask: torch.Tensor,
+        extra_step_kwargs: dict,
+        dtype: torch.dtype,
+        output_slice: int | None,
+    ) -> torch.Tensor:
+        do_true_cfg = self.do_classifier_free_guidance
+        # Single-process runs never initialize the parallel groups.
+        cfg_parallel = model_parallel_is_initialized() and get_classifier_free_guidance_world_size() > 1
+        if cfg_parallel:
+            self.check_cfg_parallel_validity(guidance_scale, negative_prompt_embeds is not None)
+
+        if do_true_cfg and not cfg_parallel:
+            # Concatenate neg/pos and the mask for a single batch-2 forward.
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask])
+            conditioning_mask = torch.cat([conditioning_mask, conditioning_mask])
+
+        with self.progress_bar(total=len(timesteps)) as progress_bar:
+            for timestep_value in timesteps:
+                # Conditioning frames keep timestep 0 so they are not denoised.
+                timestep = timestep_value.expand(conditioning_mask.shape) * (1 - conditioning_mask)
+
+                if cfg_parallel:
+                    latent_model_input = latents.to(dtype)
+                    positive_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "encoder_hidden_states": prompt_embeds.to(dtype),
+                        "encoder_attention_mask": prompt_attention_mask,
+                        "timestep": timestep,
+                    }
+                    negative_kwargs = (
+                        {
+                            "hidden_states": latent_model_input,
+                            "encoder_hidden_states": negative_prompt_embeds.to(dtype),
+                            "encoder_attention_mask": negative_prompt_attention_mask,
+                            "timestep": timestep,
+                        }
+                        if do_true_cfg
+                        else None
+                    )
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                        output_slice=output_slice,
+                    ).float()
+                else:
+                    latent_input = torch.cat([latents, latents]) if do_true_cfg else latents
+                    noise_pred = self.transformer(
+                        latent_input.to(dtype),
+                        encoder_hidden_states=prompt_embeds.to(dtype),
+                        encoder_attention_mask=prompt_attention_mask,
+                        timestep=timestep,
+                        return_dict=False,
+                    )[0].float()
+                    if do_true_cfg:
+                        uncond, cond = noise_pred.chunk(2)
+                        noise_pred = uncond + guidance_scale * (cond - uncond)
+                    if output_slice is not None:
+                        noise_pred = noise_pred[:, :output_slice]
+
+                # Only the non-conditioning frames are denoised; the first frame is carried through.
+                denoised = self.scheduler.step(
+                    noise_pred[:, :, 1:],
+                    timestep_value,
+                    latents[:, :, 1:],
+                    **extra_step_kwargs,
+                    return_dict=False,
+                )[0]
+                latents = torch.cat([latents[:, :, :1], denoised], dim=2)
+                progress_bar.update()
+
+        return latents
 
     @torch.no_grad()
     def _generate_i2v(
@@ -282,10 +375,6 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             max_sequence_length=max_sequence_length,
             complex_human_instruction=complex_human_instruction,
         )
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_embeds, prompt_embeds])
-            prompt_mask = torch.cat([negative_mask, prompt_mask])
-
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps=num_inference_steps,
@@ -319,39 +408,24 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             latents.shape[4] // patch_w,
         )
         conditioning_mask[:, :, 0] = 1
-        if self.do_classifier_free_guidance:
-            conditioning_mask = torch.cat([conditioning_mask, conditioning_mask])
 
         self._num_timesteps = len(timesteps)
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        transformer_dtype = self.transformer.dtype
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for index, timestep_value in enumerate(timesteps):
-                latent_input = torch.cat([latents, latents]) if self.do_classifier_free_guidance else latents
-                timestep = timestep_value.expand(conditioning_mask.shape) * (1 - conditioning_mask)
-                noise_pred = self.transformer(
-                    latent_input.to(transformer_dtype),
-                    encoder_hidden_states=prompt_embeds.to(transformer_dtype),
-                    encoder_attention_mask=prompt_mask,
-                    timestep=timestep,
-                    return_dict=False,
-                )[0].float()
-                if self.do_classifier_free_guidance:
-                    uncond, cond = noise_pred.chunk(2)
-                    noise_pred = uncond + guidance_scale * (cond - uncond)
-                if self.transformer.config.out_channels // 2 == latent_channels:
-                    noise_pred = noise_pred.chunk(2, dim=1)[0]
-
-                denoised = self.scheduler.step(
-                    noise_pred[:, :, 1:],
-                    timestep_value,
-                    latents[:, :, 1:],
-                    **extra_step_kwargs,
-                    return_dict=False,
-                )[0]
-                latents = torch.cat([latents[:, :, :1], denoised], dim=2)
-                if index == len(timesteps) - 1 or (index + 1) % self.scheduler.order == 0:
-                    progress_bar.update()
+        # learned sigma: transformer predicts 2x latent channels; keep the first half.
+        output_slice = latent_channels if self.transformer.config.out_channels // 2 == latent_channels else None
+        latents = self.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_mask,
+            negative_prompt_embeds=negative_embeds,
+            negative_prompt_attention_mask=negative_mask,
+            guidance_scale=guidance_scale,
+            conditioning_mask=conditioning_mask,
+            extra_step_kwargs=extra_step_kwargs,
+            dtype=self.transformer.dtype,
+            output_slice=output_slice,
+        )
 
         if output_type == "latent":
             return latents

@@ -1,0 +1,79 @@
+# Single-GPU JoyAI-VL-Interaction -> Qwen3-TTS all-sync profile.
+pipeline: joyai_vl_interaction
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      initial_codec_chunk_frames: 1
+      # Qwen3-TTS Code2Wav buckets: 25, 72+1, 72+25, 72+72+25, and 300+25 frames.
+      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+
+stages:
+  # GPU 0: JoyAI action model.
+  - stage_id: 0
+    model: jdopensource/JoyAI-VL-Interaction-Preview
+    devices: "0"
+    gpu_memory_utilization: 0.5
+    max_num_seqs: 4
+    # Some OmniInteract video prompts contain more than 12K input tokens.
+    max_model_len: 16384
+    max_num_batched_tokens: 16384
+    limit_mm_per_prompt: {image: 256, video: 1}
+    enable_prefix_caching: true
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.9
+      top_k: 40
+      max_tokens: 256
+      repetition_penalty: 1.1
+      presence_penalty: 1.5
+
+  # GPU 0: Qwen3-TTS Talker.
+  - stage_id: 1
+    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    devices: "0"
+    gpu_memory_utilization: 0.2
+    max_num_seqs: 8
+    max_model_len: 4096
+    max_num_batched_tokens: 512
+    enable_prefix_caching: false
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      min_tokens: 2
+      max_tokens: 4096
+      repetition_penalty: 1.05
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  # GPU 0: Qwen3-TTS Code2Wav.
+  - stage_id: 2
+    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    devices: "0"
+    gpu_memory_utilization: 0.2
+    max_num_seqs: 8
+    max_model_len: 65536
+    max_num_batched_tokens: 65536
+    enable_prefix_caching: false
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.0

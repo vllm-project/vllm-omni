@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ratchet on the TTS adapter migration (RFC #4327, #4855).
 
 Per-model behaviour is being moved out of ``serving_speech.py`` and into
@@ -28,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVING_SPEECH = Path("vllm_omni/entrypoints/openai/serving_speech.py")
 
 # Budgets. These may only go DOWN. See the module docstring.
-MAX_MODEL_TYPE_BRANCHES = 9
+MAX_MODEL_TYPE_BRANCHES = 6
 
 _GUIDANCE = """
 Move the per-model behaviour into its adapter under

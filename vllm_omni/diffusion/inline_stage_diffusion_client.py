@@ -48,7 +48,6 @@ class InlineStageDiffusionClient(StageClientBase):
         model: str,
         od_config: OmniDiffusionConfig,
         metadata: StageMetadata,
-        batch_size: int = 1,
     ) -> None:
         self.model = model
         self.od_config = od_config
@@ -63,7 +62,6 @@ class InlineStageDiffusionClient(StageClientBase):
         self.prompt_transform_func = None
         self.prompt_expand_func = None
         self.engine_input_source = metadata.engine_input_source
-        self.batch_size = batch_size
 
         self._enrich_config()
         self._engine = DiffusionEngine.make_engine(self.od_config)
@@ -79,10 +77,10 @@ class InlineStageDiffusionClient(StageClientBase):
         self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
         logger.info(
-            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (max_num_seqs=%d)",
             self.stage_id,
             self.replica_id,
-            self.batch_size,
+            self.od_config.max_num_seqs,
         )
 
     def _enrich_config(self) -> None:
@@ -109,6 +107,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None:
         # Each request mutates its sampling state while it is normalized and
         # executed. Callers commonly reuse one params object for concurrent
@@ -126,6 +125,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 prompt,
                 sampling_params,
                 kv_sender_info,
+                kv_transfer_params,
             )
         )
         self._tasks[request_id] = task
@@ -136,6 +136,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: Any,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -143,6 +144,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
+                kv_transfer_params=kv_transfer_params,
             )
 
             if self.od_config.streaming_output:

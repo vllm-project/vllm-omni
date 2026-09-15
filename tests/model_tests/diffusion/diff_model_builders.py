@@ -1,3 +1,4 @@
+import json
 from functools import partial
 from pathlib import Path
 
@@ -49,15 +50,17 @@ def tiny_ltx2_builder() -> str:
     return build_tiny_from_configs("LTX2Pipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline")
 
 
-def tiny_sana_video_builder() -> str:
+def _build_tiny_sana_video(pipeline_name: str) -> str:
     """Build a tiny 480p SANA-Video model without downloading model weights.
 
     The tokenizer is the only component loaded from the upstream repository.
     All modules with weights are initialized locally from intentionally small
-    configs, and the scheduler is constructed from its weight-free config.
+    configs, and the scheduler is constructed from its weight-free config. The
+    I2V pipeline shares this diffusers layout, so it reuses the same components
+    and only rewrites model_index.json's ``_class_name`` to its own class.
     """
     model_id = "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
-    model_dir = _get_tiny_model_path("SanaVideoPipeline")
+    model_dir = _get_tiny_model_path(pipeline_name)
 
     tokenizer = GemmaTokenizerFast.from_pretrained(model_id, subfolder="tokenizer")
     scheduler = DPMSolverMultistepScheduler(
@@ -85,7 +88,7 @@ def tiny_sana_video_builder() -> str:
         out_channels=16,
         num_attention_heads=2,
         attention_head_dim=16,
-        num_layers=1,
+        num_layers=2,
         num_cross_attention_heads=2,
         cross_attention_head_dim=16,
         cross_attention_dim=32,
@@ -112,7 +115,20 @@ def tiny_sana_video_builder() -> str:
         scheduler=scheduler,
     )
     pipeline.to(dtype=torch.bfloat16).save_pretrained(model_dir)
+    if pipeline_name != "SanaVideoPipeline":
+        index_path = Path(model_dir) / "model_index.json"
+        index = json.loads(index_path.read_text())
+        index["_class_name"] = pipeline_name
+        index_path.write_text(json.dumps(index, indent=2))
     return model_dir
+
+
+def tiny_sana_video_builder() -> str:
+    return _build_tiny_sana_video("SanaVideoPipeline")
+
+
+def tiny_sana_video_i2v_builder() -> str:
+    return _build_tiny_sana_video("SanaImageToVideoPipeline")
 
 
 def _shrink_flux_clip_text_encoder(config: dict) -> dict:

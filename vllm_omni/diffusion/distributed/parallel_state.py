@@ -322,6 +322,11 @@ def is_pipeline_last_stage():
 
 
 # CFG
+def is_cfg_group_initialized() -> bool:
+    """Return whether the classifier-free-guidance group has been created."""
+    return _CFG is not None
+
+
 def get_cfg_group() -> GroupCoordinator:
     assert _CFG is not None, "classifier_free_guidance parallel group is not initialized"
     return _CFG

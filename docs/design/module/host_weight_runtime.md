@@ -136,8 +136,16 @@ so only when it is marked retryable; unsupported capabilities, identity
 collisions, producer failures, and publication failures remain visible as
 startup failures.
 
-`coordination_timeout_seconds` bounds acquisition of lookup and build locks; it
-is not a hard wall-clock deadline for in-process validation, production, or
+`coordination_timeout_seconds` bounds acquisition of the domain-initialization
+lock and lookup/build locks. Store construction and each later resolution or
+publication operation receive separate coordination budgets from the same
+`WaitPolicy`; they do not share an end-to-end startup deadline. A domain-init
+lock timeout is a retryable domain failure: preferred mode may fall back and
+required mode fails. Retrying initialization requires constructing a fresh
+runtime after contention ends; a waiter never cancels or unlocks the owner.
+
+The coordination budget is not a hard wall-clock deadline for filesystem I/O,
+in-process validation, production, or
 atomic publication. Once this V1 implementation becomes the producer, the
 synchronous producer and publication run to completion. A hung producer blocks
 its owning process and requires external process supervision; enforceable

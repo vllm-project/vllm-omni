@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -10,12 +10,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from vllm.config import AttentionConfig, CacheConfig, VllmConfig, set_current_vllm_config
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
+from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionLayerAdapter,
@@ -88,12 +90,7 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
     canonical_spec = native_layer.spec
     kv_cache_config = KVCacheConfig(
         num_blocks=4,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=canonical_spec.page_size_bytes * 4,
-                shared_by=[_LAYER_NAME],
-            )
-        ],
+        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, 4, [_LAYER_NAME])],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 layer_names=[_LAYER_NAME],
@@ -101,6 +98,9 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
             )
         ],
     )
+    # 0.29 reads the resolved physical layout when allocating; the diffusion
+    # control plane pins it, so this standalone harness must too.
+    resolve_diffusion_kv_cache_layout(vllm_config)
     with set_current_vllm_config(vllm_config):
         attn_groups, _, kernel_block_sizes = init_attn_backend(
             kv_cache_config,
@@ -108,13 +108,13 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
             device,
         )
         runner_kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
+        # vLLM 0.29 dropped attn_groups and cache_dtype here: the layout now
+        # comes from the resolved CacheConfig.kv_cache_layout inside the call.
         init_kv_cache(
             runner_kv_caches,
             vllm_config.compilation_config.static_forward_context,
             kv_cache_config,
-            attn_groups,
             device,
-            vllm_config.cache_config.cache_dtype,
             kernel_block_sizes,
             vllm_config,
         )
@@ -154,8 +154,17 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
 
     torch.manual_seed(1)
     query = torch.randn(19, _NUM_HEADS, _HEAD_SIZE, dtype=torch.float16, device=device)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
+    packed_qkv = torch.randn(
+        19,
+        3 * _NUM_HEADS * _HEAD_SIZE,
+        dtype=torch.float16,
+        device=device,
+    )
+    _, key_flat, value_flat = packed_qkv.split(_NUM_HEADS * _HEAD_SIZE, dim=-1)
+    key = key_flat.reshape(19, _NUM_HEADS, _HEAD_SIZE)
+    value = value_flat.reshape(19, _NUM_HEADS, _HEAD_SIZE)
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
     omni_backend = FlashAttentionImpl(
         num_heads=_NUM_HEADS,
         head_size=_HEAD_SIZE,

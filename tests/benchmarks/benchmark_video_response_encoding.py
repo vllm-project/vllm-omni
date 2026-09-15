@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Benchmark legacy and automatic MP4 response encoding on synthetic input."""
 
 from __future__ import annotations
@@ -11,13 +11,16 @@ import statistics
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _encode_video_bytes_legacy,
+    _PlanarFrameConverter,
 )
 
 
@@ -42,12 +45,19 @@ def _build_inputs(
     fps: int,
     audio_sample_rate: int,
     seed: int,
+    input_layout: str = "planar-backed",
 ) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     planar = rng.random((3, frames, height, width), dtype=np.float32)
     video = planar.transpose(1, 2, 3, 0)
-    if not all(video[..., channel].flags.c_contiguous for channel in range(3)):
+    if input_layout == "interleaved":
+        video = np.ascontiguousarray(video)
+        if not video.flags.c_contiguous:
+            raise RuntimeError("synthetic video is not C-contiguous")
+    elif input_layout == "planar-backed" and not all(video[..., channel].flags.c_contiguous for channel in range(3)):
         raise RuntimeError("synthetic video does not expose contiguous channel planes")
+    elif input_layout != "planar-backed":
+        raise ValueError(f"unsupported input layout: {input_layout}")
 
     sample_count = max(1, round(frames / fps * audio_sample_rate))
     timeline = np.arange(sample_count, dtype=np.float32) / audio_sample_rate
@@ -86,8 +96,8 @@ def _measure(
 
 def _summarize(records: list[dict[str, object]], label: str) -> dict[str, object]:
     selected = [record for record in records if record["label"] == label]
-    wall_values = [float(record["wall_ms"]) for record in selected]
-    cpu_values = [float(record["process_cpu_ms"]) for record in selected]
+    wall_values = [cast(float, record["wall_ms"]) for record in selected]
+    cpu_values = [cast(float, record["process_cpu_ms"]) for record in selected]
     return {
         "runs": len(selected),
         "wall_ms": {
@@ -113,6 +123,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--rounds", type=_positive_int, default=3)
     parser.add_argument("--seed", type=int, default=20260817)
+    parser.add_argument(
+        "--input-layout",
+        choices=("planar-backed", "interleaved"),
+        default="planar-backed",
+    )
+    parser.add_argument(
+        "--frame-conversion-workers",
+        type=_positive_int,
+        default=8,
+    )
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
     if args.warmup < 0:
@@ -129,33 +149,41 @@ def main() -> None:
         fps=args.fps,
         audio_sample_rate=args.audio_sample_rate,
         seed=args.seed,
+        input_layout=args.input_layout,
     )
     baseline = BenchmarkVariant("legacy", _encode_video_bytes_legacy)
-    candidate = BenchmarkVariant("automatic", _encode_video_bytes)
+    converter = _PlanarFrameConverter(max_workers=args.frame_conversion_workers)
+    candidate = BenchmarkVariant(
+        "automatic",
+        partial(_encode_video_bytes, frame_converter=converter),
+    )
 
-    for _ in range(args.warmup):
-        for variant in (baseline, candidate):
-            _measure(
-                variant,
-                video=video,
-                audio=audio,
-                fps=args.fps,
-                audio_sample_rate=args.audio_sample_rate,
-            )
+    try:
+        for _ in range(args.warmup):
+            for variant in (baseline, candidate):
+                _measure(
+                    variant,
+                    video=video,
+                    audio=audio,
+                    fps=args.fps,
+                    audio_sample_rate=args.audio_sample_rate,
+                )
 
-    records: list[dict[str, object]] = []
-    for round_index in range(args.rounds):
-        order = (baseline, candidate) if round_index % 2 == 0 else (candidate, baseline)
-        for variant in order:
-            _, record = _measure(
-                variant,
-                video=video,
-                audio=audio,
-                fps=args.fps,
-                audio_sample_rate=args.audio_sample_rate,
-            )
-            record["round"] = round_index + 1
-            records.append(record)
+        records: list[dict[str, object]] = []
+        for round_index in range(args.rounds):
+            order = (baseline, candidate) if round_index % 2 == 0 else (candidate, baseline)
+            for variant in order:
+                _, record = _measure(
+                    variant,
+                    video=video,
+                    audio=audio,
+                    fps=args.fps,
+                    audio_sample_rate=args.audio_sample_rate,
+                )
+                record["round"] = round_index + 1
+                records.append(record)
+    finally:
+        converter.shutdown()
 
     output_hashes = {str(record["output_sha256"]) for record in records}
     if len(output_hashes) != 1:
@@ -165,8 +193,8 @@ def main() -> None:
     paired_savings_percent = []
     for round_index in range(args.rounds):
         pair = [record for record in records if record["round"] == round_index + 1]
-        baseline_ms = float(next(record["wall_ms"] for record in pair if record["label"] == baseline.label))
-        candidate_ms = float(next(record["wall_ms"] for record in pair if record["label"] == candidate.label))
+        baseline_ms = cast(float, next(record["wall_ms"] for record in pair if record["label"] == baseline.label))
+        candidate_ms = cast(float, next(record["wall_ms"] for record in pair if record["label"] == candidate.label))
         paired_savings_ms.append(baseline_ms - candidate_ms)
         paired_savings_percent.append((baseline_ms - candidate_ms) / baseline_ms * 100)
 
@@ -180,6 +208,8 @@ def main() -> None:
             "warmup": args.warmup,
             "rounds": args.rounds,
             "seed": args.seed,
+            "input_layout": args.input_layout,
+            "frame_conversion_workers": args.frame_conversion_workers,
             "video_shape": list(video.shape),
             "video_strides": list(video.strides),
             "codec_options": {"preset": "ultrafast", "threads": "0"},

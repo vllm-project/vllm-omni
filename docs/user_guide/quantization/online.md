@@ -7,16 +7,16 @@ loading the model. Use it when you want memory savings without preparing a
 separate quantized checkpoint.
 
 This mode is different from pre-quantized checkpoint formats such as GGUF,
-AutoRound, msModelSlim, or serialized Int8 checkpoints. Those formats are
-prepared before serving and are documented in their method-specific guides.
-For MXFP8 and MXFP4, use this page for load-time quantization from BF16
-checkpoints, and use the method-specific pages for offline checkpoints produced
-by msModelSlim and the merge tools.
+AutoRound, msModelSlim, serialized TorchAO checkpoints, or serialized Int8
+checkpoints. Those formats are prepared before serving and are documented in
+their method-specific guides. For MXFP8 and MXFP4, use this page for load-time
+quantization from BF16 checkpoints, and use the method-specific pages for
+offline checkpoints produced by msModelSlim and the merge tools.
 
 ## Hardware Support
 
 | Device | FP8 W8A8 | Int8 W8A8 | MXFP8 W8A8 | MXFP4 W4A4 |
-|--------|----------|-----------|------------|------------|
+| -------- | ---------- | ----------- | ------------ | ------------ |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ⭕ | ⭕ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ⭕ | ⭕ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ⭕ | ⭕ |
@@ -33,7 +33,7 @@ MXFP4 are documented for the Ascend NPU path.
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
 | Method | Guide | Example models | Status |
-|--------|-------|----------------|--------|
+| -------- | ------- | ---------------- | -------- |
 | FP8 W8A8 | [FP8](fp8.md) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
 | Int8 W8A8 | [Int8](int8.md) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
 | MXFP8 W8A8 | [MXFP8](mxfp8.md) | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B, Wan2.2-TI2V-5B | Validated on Ascend NPU and Intel XPU |
@@ -88,7 +88,7 @@ config = build_quant_config({
 ## Parameters
 
 | Parameter | Methods | Description |
-|-----------|---------|-------------|
+| ----------- | --------- | ------------- |
 | `method` | FP8, Int8, MXFP8, MXFP4 | Quantization method: `"fp8"`, `"int8"`, `"mxfp8"`, `"mxfp4"`, or `"mxfp4_dualscale"` |
 | `ignored_layers` | FP8, Int8, MXFP8, MXFP4 | Layer name patterns to keep in BF16/FP16 |
 | `activation_scheme` | FP8, Int8 | The runtime value `"dynamic"` selects online activation scaling |

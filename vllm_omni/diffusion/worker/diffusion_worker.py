@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 import queue
 import signal
+import sys
 import threading
 import traceback
 import uuid
@@ -45,6 +46,10 @@ from vllm_omni.diffusion.data import (
     OmniWakeTask,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.kv_connector import (
+    init_worker_kv_connector,
+    shutdown_kv_connector,
+)
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -59,7 +64,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
+from vllm_omni.diffusion.ipc import (
+    DIFFUSION_RPC_RESULT_ENVELOPE,
+    pack_diffusion_output_shm,
+    payload_carries_typed_media,
+)
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -248,11 +257,6 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
-        if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
-            logger.warning_once(
-                "paged_scheduler initializes native paged KV storage, but no production diffusion model uses the "
-                "paged-attention adapter yet; model attention remains on the dense path."
-            )
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -526,6 +530,7 @@ class DiffusionWorker:
         self.vllm_config.model_config.max_model_len = resolved_max_model_len
         kv_cache_config = kv_cache_configs[self.rank]
         self.vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        init_worker_kv_connector(self.vllm_config, kv_cache_config)
         with self._maybe_get_memory_pool_context("kv_cache"):
             self.model_runner.set_kv_cache_config(kv_cache_config)
 
@@ -537,7 +542,16 @@ class DiffusionWorker:
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
-        if self.model_runner.pipeline is None:
+        pipeline = self.model_runner.pipeline
+        if pipeline is None:
+            return
+
+        # A release whose weights cannot be expressed as switchable LoRA layers
+        # is fused into the checkpoint while the pipeline loads. There is then
+        # no adapter left to register, and handing the same path to the manager
+        # would only fail on a format it does not accept.
+        if getattr(pipeline, "lora_is_fused", False):
+            logger.info("LoRA was fused into the checkpoint at load time; skipping the dynamic LoRA manager.")
             return
 
         lora_path = self.od_config.lora_path
@@ -560,6 +574,7 @@ class DiffusionWorker:
                 if self.od_config.lora_scale > 1.0:
                     logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
                 pipeline.load_lora_weights(lora_path)
+                pipeline.lora_is_fused = True
             else:
                 logger.warning("Pipeline does not support loading distilled LoRA weights for now.")
         else:
@@ -738,11 +753,15 @@ class DiffusionWorker:
             logger.warning("LoRA activation skipped: %s", exc)
 
     def remove_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.remove_adapter(adapter_id)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         # NOTE (Alex): We have not implemented the API routing
         # for the frontend server yet.
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.add_adapter(lora_request)
 
     def submit_interaction(
@@ -755,9 +774,13 @@ class DiffusionWorker:
         self.model_runner.submit_interaction(request_id, interaction)
 
     def list_loras(self) -> list[int]:
+        if self.lora_manager is None:
+            return []
         return self.lora_manager.list_adapters()
 
     def pin_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.pin_adapter(adapter_id)
 
     def sleep(self, level: int = 1) -> int:
@@ -773,9 +796,8 @@ class DiffusionWorker:
         usage_before = allocator.get_current_usage()
 
         if level == 2 and self.model_runner is not None:
-            if hasattr(self.model_runner, "graph_runners"):
-                self.model_runner.graph_runners.clear()
-                logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
+            self.model_runner.release_captured_graphs()
+            logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
             model = self.model_runner.pipeline
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
@@ -964,7 +986,17 @@ class DiffusionWorker:
                     if mgr is not None:
                         mgr.shutdown_prefetch()
         finally:
-            destroy_distributed_env()
+            try:
+                shutdown_kv_connector()
+            finally:
+                try:
+                    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+                    if a2a_permute is not None:
+                        a2a_permute.clear_a2a_permute_workspaces()
+                except Exception:
+                    logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                finally:
+                    destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:
@@ -1103,7 +1135,15 @@ class WorkerProc:
         # Sync path (original, or async fallback).
         try:
             pack_diffusion_output_shm(output)
+        except (TypeError, ValueError):
+            raise
         except Exception as e:
+            # Typed media that fails to pack is left unprepared/on device (the
+            # pack is failure-atomic and does not mutate it), so enqueueing it
+            # would ship a broken payload. Re-raise memory/packing failures here
+            # instead of swallowing them for typed media.
+            if payload_carries_typed_media(output):
+                raise
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
         self._enqueue_result(output)
@@ -1308,6 +1348,14 @@ class WorkerProc:
 
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
+        if not should_reply:
+            # A rank that will not reply must not hand the result back: the busy
+            # loop binds it to a local that stays alive until the next request
+            # overwrites it, so a device-resident output -- for diffusion, an
+            # entire decoded video -- would occupy accelerator memory for the
+            # whole idle period on every rank that did not produce the reply.
+            # The `collect_rank_status` branch above already returns None here.
+            return None, False
         return result, should_reply
 
     def recv_message(self) -> Any:

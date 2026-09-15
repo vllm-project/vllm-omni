@@ -42,7 +42,10 @@ def make_metadata(request_id: str = "req-0") -> DiffusionKVMetadata:
 
 def make_runner(mode: DiffusionKVCacheMode) -> DiffusionModelRunner:
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(diffusion_kv_mode=mode)
+    runner.od_config = SimpleNamespace(
+        diffusion_kv_mode=mode,
+        parallel_config=SimpleNamespace(cfg_parallel_size=1),
+    )
     return runner
 
 
@@ -83,6 +86,51 @@ def test_new_request_data_carries_scheduler_allocation_atomically() -> None:
 
     assert new_req.req is req
     assert new_req.diffusion_kv_metadata is metadata
+
+
+def test_runner_builds_prefill_and_denoise_rows_from_scheduler_metadata() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    metadata = DiffusionKVMetadata(
+        request_id="req-0",
+        allocation_generation=1,
+        sequences=(
+            DiffusionKVSequenceMetadata(0, 4, 2, 8, ([1, 2],)),
+            DiffusionKVSequenceMetadata(1, 5, 2, 9, ([3, 4],)),
+        ),
+    )
+
+    attn_metadata = runner._build_paged_attention_metadata([metadata])
+
+    assert [
+        (row.request_id, row.sequence_id, row.kv_start_pos, row.query_len, row.seq_len)
+        for row in attn_metadata.prefill_rows
+    ] == [("req-0", 0, 0, 8, 8), ("req-0", 1, 0, 9, 9)]
+    assert [
+        (row.request_id, row.sequence_id, row.kv_start_pos, row.query_len, row.seq_len)
+        for row in attn_metadata.denoise_rows
+    ] == [("req-0", 0, 4, 2, 6), ("req-0", 1, 5, 2, 7)]
+
+
+def test_runner_selects_only_local_cfg_parallel_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.od_config.parallel_config.cfg_parallel_size = 2
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.worker.diffusion_model_runner.get_classifier_free_guidance_rank",
+        lambda: 1,
+    )
+    metadata = DiffusionKVMetadata(
+        request_id="req-0",
+        allocation_generation=1,
+        sequences=(
+            DiffusionKVSequenceMetadata(0, 4, 2, 8, ([1, 2],)),
+            DiffusionKVSequenceMetadata(1, 5, 2, 9, ([3, 4],)),
+        ),
+    )
+
+    attn_metadata = runner._build_paged_attention_metadata([metadata])
+
+    assert [row.sequence_id for row in attn_metadata.prefill_rows] == [1]
+    assert [row.sequence_id for row in attn_metadata.denoise_rows] == [1]
 
 
 def test_paged_request_without_metadata_fails_before_request_forward() -> None:

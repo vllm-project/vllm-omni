@@ -49,6 +49,51 @@ cache — see the note under *1x L40S 48GB*.
 
 ## GPU
 
+### Optional FP8 AR KV cache
+
+For CUDA deployments, `mammoth_moda2_fp8_kv.yaml` is an opt-in preset that
+stores the Stage 0 AR KV cache as FP8 E4M3. Stage 1 remains on
+`kv_cache_dtype=auto`; its DiT execution is unaffected. This setting quantizes
+only the autoregressive KV cache. It is neither FP8 weight/activation
+quantization nor vLLM-Omni diffusion KV-cache quantization.
+
+Use the preset in place of the default deploy config:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ./MammothModa2-Preview \
+  --deploy-config vllm_omni/deploy/mammoth_moda2_fp8_kv.yaml \
+  --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --extra-body '{"text_guidance_scale": 4.0, "cfg_range": [0.0, 1.0], "num_inference_steps": 50}' \
+  --output mammoth_t2i.png
+```
+
+The preset was validated on one NVIDIA H800 80GB with CUDA and
+FlashAttention 3. The native and FP8 runs used the same model, code revision,
+and downstream configuration.
+
+| Metric | Native BF16 (`kv_cache_dtype=auto`) | FP8 E4M3 (`fp8_e4m3`) | Change |
+| --- | ---: | ---: | ---: |
+| KV cache memory | 15.59 GiB | 15.55 GiB | -0.04 GiB |
+| GPU KV cache size | 145,904 tokens | 291,232 tokens | +99.6% |
+| Maximum concurrency at 8,192 tokens | 17.81x | 35.55x | +99.6% |
+| Steady-state AR median | 71.191 s | 79.816 s | +12.1% |
+| Steady-state end-to-end median | 83.840 s | 92.473 s | +10.3% |
+| Steady-state DiT median | 12.574 s | 12.561 s | effectively unchanged |
+
+The FP8 run used `kv_cache_dtype=fp8_e4m3` only for Stage 0; Stage 1 used
+`kv_cache_dtype=auto`. The nearly unchanged reserved cache memory holds almost
+twice as many tokens because FP8 reduces the bytes per cached token. This is a
+capacity/concurrency tradeoff: the measured AR and end-to-end latencies were
+higher than the native-BF16 baseline.
+
+1024x1024 fixed-seed smoke test completed successfully with no obvious visual
+failure. FP8 is lossy, so numerical or image-quality equivalence with BF16 is
+not implied.
+
 ### 1x L40S 48GB
 
 > **48 GB config adjustment:** the committed

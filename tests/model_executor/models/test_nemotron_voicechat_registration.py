@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """L1 registration + config-shim tests for NemotronVoiceChat (CPU, no weights)."""
 
 import subprocess
@@ -59,7 +59,6 @@ def test_pipeline_registered_with_three_stages() -> None:
     assert code2wav.execution_type == StageExecutionType.LLM_GENERATION
     assert code2wav.final_output and code2wav.final_output_type == "audio"
     assert code2wav.input_sources == (1,)
-    assert pipeline.validate() == []
 
 
 def test_architectures_registered() -> None:

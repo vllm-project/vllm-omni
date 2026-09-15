@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/audio_tokenizer/istft.py
 
 import torch
@@ -60,6 +60,26 @@ class ISTFT(nn.Module):
         return x, buffer
 
     def forward(
+        self,
+        spec: torch.Tensor,
+        audio_buffer: torch.Tensor | None = None,
+        window_buffer: torch.Tensor | None = None,
+        streaming: bool = False,
+        last_chunk: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if self.padding == "same" and spec.is_cuda and not torch.is_grad_enabled():
+            from .fused_istft import fused_istft, fused_istft_supported
+
+            if fused_istft_supported(
+                spec, self.window, self.n_fft, self.hop_length, audio_buffer, window_buffer, streaming
+            ):
+                frames = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+                return fused_istft(
+                    frames, self.window, self.hop_length, audio_buffer, window_buffer, streaming, last_chunk
+                )
+        return self.forward_native(spec, audio_buffer, window_buffer, streaming, last_chunk)
+
+    def forward_native(
         self,
         spec: torch.Tensor,
         audio_buffer: torch.Tensor | None = None,
