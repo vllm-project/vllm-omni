@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """GPU memory utilities for vLLM Omni workers.
 
 Includes a tolerant version of the upstream request_memory() that handles
@@ -8,6 +11,7 @@ memory instead of raising ValueError.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
@@ -53,3 +57,15 @@ def request_memory_tolerant(
         return capped
 
     return requested_memory
+
+
+@contextmanager
+def patch_xpu_worker_request_memory():
+    import vllm.v1.worker.xpu_worker as xpu_worker
+
+    orig = xpu_worker.request_memory
+    xpu_worker.request_memory = request_memory_tolerant
+    try:
+        yield
+    finally:
+        xpu_worker.request_memory = orig
