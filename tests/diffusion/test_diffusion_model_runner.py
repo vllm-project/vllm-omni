@@ -263,8 +263,11 @@ def _make_compile_runner(
     runner = object.__new__(DiffusionModelRunner)
     runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
     runner.od_config = SimpleNamespace(
+        enforce_eager=False,
+        diffusion_compile_backend="auto",
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
+        diffusion_compile_aclgraph=False,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
     )
     return runner
@@ -424,6 +427,126 @@ def test_execute_stepwise_rejects_mixed_step_and_full_forward_batch():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("granularity", ["regional", "full"])
+def test_compile_transformer_passes_explicit_backend(monkeypatch, granularity):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity=granularity, compile_dynamic=False)
+    backend = object()
+    calls = []
+    monkeypatch.setattr(model_runner_module, "regionally_compile", lambda target, **kw: calls.append(kw) or target)
+    runner._compile_transformer("transformer", backend=backend)
+    expected = {"backend": backend, "dynamic": False}
+    assert (calls if granularity == "regional" else [model.compile_calls[0][1]]) == [expected]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_explicit_backend_setup_failure_is_not_silenced(monkeypatch):
+    runner = _make_compile_runner()
+    runner.od_config.diffusion_compile_backend = "mindiesd"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("backend setup failed")
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", fail)
+    with pytest.raises(RuntimeError, match="Requested diffusion compile setup failed") as error:
+        runner._compile_transformer("transformer", backend=object())
+    assert str(error.value.__cause__) == "backend setup failed"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("eager", [False, True])
+def test_compile_backend_resolution_precedes_model_runtime(monkeypatch, eager):
+    runner = _make_compile_runner()
+    runner.od_config.enforce_eager = eager
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    events = []
+
+    def resolve(config):
+        events.append("backend")
+        return object()
+
+    def stop_before_load(**kwargs):
+        events.append("runtime")
+        raise RuntimeError("stop before loading weights")
+
+    class _CompilePlatform:
+        get_diffusion_compile_backend = staticmethod(resolve)
+        init_diffusion_model_runner_runtime = staticmethod(stop_before_load)
+
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _CompilePlatform)
+    with pytest.raises(RuntimeError, match="stop before loading weights"):
+        runner.load_model()
+    assert events == (["runtime"] if eager else ["backend", "runtime"])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_model_uses_declared_transformers(monkeypatch):
+    runner = _make_compile_runner()
+    runner.pipeline._dit_modules = ["transformer"]
+    calls = []
+    monkeypatch.setattr(runner, "_compile_transformer", lambda name, **kw: calls.append((name, kw)))
+    backend = object()
+    runner._compile_model(backend)
+    assert calls == [("transformer", {"backend": backend})]
+    runner.od_config.enforce_eager = True
+    runner._compile_model(backend)
+    assert len(calls) == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_model_skips_unavailable_backend(monkeypatch):
+    runner = _make_compile_runner()
+
+    class _UnavailableCompilePlatform:
+        get_torch_device = staticmethod(lambda: torch.device("cpu"))
+
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _UnavailableCompilePlatform)
+    monkeypatch.setattr(runner, "_compile_transformer", lambda *a, **kw: pytest.fail("unexpected compilation"))
+    runner._compile_model(None)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_custom_setup_is_used_for_inductor_only(monkeypatch):
+    runner = _make_compile_runner()
+    calls = []
+    runner.pipeline.setup_compile = lambda: calls.append("setup")
+    runner._compile_model("inductor")
+    assert calls == ["setup"]
+    runner.od_config.diffusion_compile_backend = "mindiesd"
+    monkeypatch.setattr(runner, "_compile_transformer", lambda name, **kw: calls.append((name, kw)))
+    backend = object()
+    runner._compile_model(backend)
+    assert calls == [
+        "setup",
+        ("transformer", {"backend": backend}),
+        ("transformer_2", {"backend": backend}),
+    ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_explicit_inductor_setup_failure_is_not_silenced():
+    runner = _make_compile_runner()
+    runner.od_config.diffusion_compile_backend = "inductor"
+
+    def fail() -> None:
+        raise RuntimeError("setup failure")
+
+    runner.pipeline.setup_compile = fail
+
+    with pytest.raises(RuntimeError, match="Requested diffusion compile setup failed") as error:
+        runner._compile_model("inductor")
+    assert str(error.value.__cause__) == "setup failure"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_update_states_carries_prepared_layout() -> None:
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
     request = _make_request()
@@ -504,6 +627,42 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
     assert model.compile_calls == [((), {"dynamic": False})]
     assert regional_calls == []
     assert runner.pipeline.transformer is model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_requires_fullgraph_for_mindiesd_full_compile(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity="full", compile_dynamic=False)
+    runner.od_config.diffusion_compile_backend = "mindiesd"
+    runner.od_config.diffusion_compile_aclgraph = True
+    backend = object()
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer", backend=backend)
+
+    assert model.compile_calls == [
+        (
+            (),
+            {
+                "backend": backend,
+                "dynamic": False,
+                "fullgraph": True,
+            },
+        )
+    ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_does_not_force_fullgraph_without_aclgraph():
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity="full", compile_dynamic=False)
+    runner.od_config.diffusion_compile_backend = "mindiesd"
+    backend = object()
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer", backend=backend)
+
+    assert model.compile_calls == [((), {"backend": backend, "dynamic": False})]
 
 
 @pytest.mark.core_model

@@ -775,8 +775,10 @@ class _DiffusionConfigProjection:
     host_weight_runtime_root: str | None = None
     dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
+    diffusion_compile_backend: Literal["auto", "inductor", "mindiesd"] = "auto"
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
+    diffusion_compile_aclgraph: bool = Field(default=False, strict=True)
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False

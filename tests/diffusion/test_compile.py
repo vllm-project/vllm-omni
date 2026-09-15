@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 import torch.nn as nn
 
 import vllm_omni.diffusion.compile as compile_module
@@ -119,8 +120,6 @@ def test_compiled_block_preserves_forward_signature_for_inspection(monkeypatch):
     """
     import inspect
 
-    import torch
-
     class _SignatureBlock(nn.Module):
         def forward(self, hidden_states, encoder_hidden_states=None) -> "torch.Tensor":
             return hidden_states
@@ -140,3 +139,58 @@ def test_compiled_block_preserves_forward_signature_for_inspection(monkeypatch):
     assert set(sig.parameters.keys()) == {"hidden_states", "encoder_hidden_states"}
     assert "torch.Tensor" in str(sig.return_annotation)
     assert model.blocks[0].forward("x") == "x"
+
+
+def test_regionally_compile_forwards_backend(monkeypatch):
+    model = _ModelWithWrappedRepeatedBlocks()
+    backend = object()
+    calls = []
+
+    def compile_forward(fn, **kwargs):
+        calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(compile_module.torch, "compile", compile_forward)
+    regionally_compile(model, backend=backend, dynamic=False)
+    assert calls == [{"backend": backend, "dynamic": False}] * 2
+
+
+@pytest.mark.parametrize("fail_backend", [False, True])
+def test_regional_backend_is_invoked_on_first_forward(fail_backend):
+    class Block(nn.Module):
+        def forward(self, x):
+            return x.sin() + 1
+
+    class Model(nn.Module):
+        _repeated_blocks = ["Block"]
+
+        def __init__(self):
+            super().__init__()
+            self.block = Block()
+
+    graphs = []
+
+    def counting_backend(graph, inputs):
+        graphs.append(graph)
+        if fail_backend:
+            raise RuntimeError("lazy backend failure")
+        return graph.forward
+
+    model = Model()
+    x = torch.randn(4)
+    expected = model.block(x)
+    torch.compiler.reset()
+    try:
+        regionally_compile(model, backend=counting_backend, dynamic=False)
+        assert graphs == []
+        if fail_backend:
+            with pytest.raises(torch._dynamo.exc.BackendCompilerFailed, match="lazy backend failure"):
+                model.block(x)
+            assert len(graphs) == 1
+            return
+        torch.testing.assert_close(model.block(x), expected)
+        assert len(graphs) == 1
+        torch.testing.assert_close(model.block(x), expected)
+        assert len(graphs) == 1
+    finally:
+        torch.compiler.reset()
