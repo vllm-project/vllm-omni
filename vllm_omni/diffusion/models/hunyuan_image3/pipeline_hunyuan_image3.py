@@ -31,6 +31,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.step_execution_batch import run_step_execution_to_completion
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
@@ -336,7 +337,9 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
-    supports_request_batch = False
+    # True multi-request batches go through the step-execution bridge (see
+    # forward()); the legacy single-request path is unaffected.
+    supports_request_batch = True
     support_image_input = True
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
@@ -2279,6 +2282,56 @@ class HunyuanImage3Pipeline(
         )
 
     def forward(
+        self,
+        req: DiffusionRequestBatch,
+        prompt: str | list[str] = "",
+        image_size="auto",
+        height: int = 1024,
+        width: int = 1024,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 5.0,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        **kwargs,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        """Dispatch to the single-request path or the step-execution batch bridge.
+
+        The single-request path below supports image-editing (conditioning
+        image) requests; the step-execution contract (``prepare_encode`` et
+        al.) explicitly does not yet (see ``allow_cond_image=False`` there),
+        so a multi-request batch containing any image-editing request is
+        serialized through the single-request path instead of being sent
+        through the bridge, which would reject it outright.
+        """
+        if req.num_reqs > 1:
+            if any(request_layout_utils.request_prompt_has_cond_image(p) for p in req.prompts):
+                return [
+                    self._forward_single_request(
+                        DiffusionRequestBatch(requests=[single_req]),
+                        prompt=prompt,
+                        image_size=image_size,
+                        height=height,
+                        width=width,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        **kwargs,
+                    )
+                    for single_req in req.requests
+                ]
+            return run_step_execution_to_completion(self, req.requests)
+        return self._forward_single_request(
+            req,
+            prompt=prompt,
+            image_size=image_size,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            **kwargs,
+        )
+
+    def _forward_single_request(
         self,
         req: DiffusionRequestBatch,
         prompt: str | list[str] = "",

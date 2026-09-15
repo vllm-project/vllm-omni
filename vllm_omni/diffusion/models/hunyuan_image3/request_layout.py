@@ -190,6 +190,17 @@ def extract_hunyuan_prompt_inputs(
     return prompt, cot_text_list, system_prompt, batch_cond_image_info, tokenizer_bot_task
 
 
+def request_prompt_has_cond_image(prompt: Any) -> bool:
+    """Whether a single request's prompt carries conditioning image(s) for image editing."""
+    if isinstance(prompt, str):
+        return False
+    additional_info = prompt.get("additional_information") or {}
+    cond_infos = additional_info.get("batch_cond_image_info", [])
+    if isinstance(cond_infos, JointImageInfo | dict):
+        cond_infos = [cond_infos]
+    return bool(cond_infos)
+
+
 def resolve_hunyuan_guidance_scale(sampling: Any, default_scale: float = 5.0) -> float:
     if getattr(sampling, "guidance_scale_provided", False):
         return sampling.guidance_scale
