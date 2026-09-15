@@ -387,6 +387,9 @@ class StageDeployConfig:
     num_replicas: int = 1
     env: dict[str, Any] | None = None
 
+    # False opts this stage out of pipeline-wide async chunking.
+    async_chunk: bool | None = None
+
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
@@ -578,6 +581,7 @@ class DeployConfig:
 
 _STAGE_RESERVED_KEYS = frozenset(
     {
+        "async_chunk",
         "stage_id",
         "devices",
         "num_replicas",
@@ -636,6 +640,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
         if name in flat_args:
             kwargs[name] = flat_args.pop(name)
 
+    kwargs["async_chunk"] = stage_data.get("async_chunk")
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
@@ -879,6 +884,10 @@ def _resolve_execution_mode(
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
 
 
+def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | None) -> bool:
+    return bool(deploy.async_chunk and (stage is None or stage.async_chunk is not False))
+
+
 def _select_processor_funcs(
     ps: StagePipelineConfig,
     async_chunk: bool,
@@ -955,9 +964,7 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
-    # Materialize the resolved pipeline-wide async_chunk value into every
-    # stage so explicit False overrides do not get lost downstream.
-    engine_args["async_chunk"] = bool(deploy.async_chunk)
+    engine_args["async_chunk"] = resolve_stage_async_chunk(deploy, ds)
     engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
         # The engine admission limit is also the authoritative capacity for
@@ -1055,7 +1062,7 @@ def merge_pipeline_deploy(
     for ps in pipeline.stages:
         ds = deploy_by_id.get(ps.stage_id)
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
-        input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
+        input_proc, next_stage_proc = _select_processor_funcs(ps, resolve_stage_async_chunk(deploy, ds))
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
         # Downstream stages may share a multimodal wrapper class without owning
         # an encoder. Do not make vLLM profile dummy multimodal inputs for them.

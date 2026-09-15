@@ -126,3 +126,26 @@ def test_escalated_transcript_keeps_declared_language(monkeypatch):
 
     assert captured["model_size"] == "large-v3"
     assert captured["language"] == "en"
+
+
+def test_speech_timestamp_header_is_required_and_decoded():
+    import time
+
+    import httpx
+    from openai._legacy_response import HttpxBinaryResponseContent
+
+    from tests.helpers.client import OnlineOmniClient
+
+    client = object.__new__(OnlineOmniClient)
+    request = {"word_timestamps": True}
+    for headers in ({}, {"X-Word-Timestamps": '[{"word":"Hello","start_ms":0,"end_ms":300}]'}):
+        response = client._process_non_stream_audio_speech_response(
+            HttpxBinaryResponseContent(httpx.Response(200, content=b"audio", headers=headers)),
+            wall_start=time.perf_counter(),
+        )
+        if headers:
+            assert_audio_speech_response(response, request)
+            assert response.word_timestamps == [{"word": "Hello", "start_ms": 0, "end_ms": 300}]
+        else:
+            with pytest.raises(AssertionError, match="X-Word-Timestamps"):
+                assert_audio_speech_response(response, request)
