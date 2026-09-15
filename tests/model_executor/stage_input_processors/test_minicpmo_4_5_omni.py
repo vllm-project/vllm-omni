@@ -25,6 +25,11 @@ def _output(
 ):
     mm_output = dict(multimodal_output or {})
     mm_output["latent"] = latent
+    if "duplex_prompt_token_ids" in mm_output and "latent_input_ids" not in mm_output:
+        forwarded_ids = [*prompt_ids, *output_ids]
+        assert len(forwarded_ids) == latent.shape[0]
+        mm_output["latent_input_ids"] = torch.tensor(forwarded_ids).reshape(-1, 1)
+        mm_output["latent_positions"] = torch.arange(len(forwarded_ids)).reshape(-1, 1)
     completion = SimpleNamespace(
         token_ids=output_ids if token_list is None else token_list,
         text="hello",
@@ -140,6 +145,103 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["meta"]["segment_end"] is True
     assert info["duplex"]["epoch"] == 3
     assert info["duplex"]["turn_id"] == 7
+
+
+def test_native_duplex_uses_forwarded_row_ledger_after_later_audio_prefill() -> None:
+    prompt_ids = [101, 102]
+    output_ids = [9304, 21, 22, 9308]
+    row_ids = [101, 102, 9304, 21, 22, 999, 999]
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    metadata = {
+        "tts_bos_token_id": 9301,
+        "tts_eos_token_id": 9302,
+        "listen_token_id": 9303,
+        "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308,
+        "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.arange(len(row_ids)).reshape(-1, 1),
+            "meta": metadata,
+        },
+    )
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+
+    converted = llm2tts([source], prompt=[{}], _streaming_context=context)[0]
+
+    info = converted["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+
+
+def test_native_duplex_selects_latest_contiguous_forwarded_span() -> None:
+    prompt_ids = [101, 102]
+    output_ids = [9304, 21, 22, 9308]
+    row_ids = [101, 21, 22, 102, 9304, 21, 22, 999]
+    positions = [0, 1, 3, 4, 5, 6, 7, 8]
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.tensor(positions).reshape(-1, 1),
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+
+    converted = llm2tts([source], prompt=[{}], _streaming_context=context)[0]
+
+    info = converted["model_intermediate_buffer"]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[5:7])
+
+
+def test_native_duplex_rejects_missing_forwarded_terminal_token() -> None:
+    prompt_ids = [101, 102]
+    output_ids = [9304, 21, 9310, 9308]
+    row_ids = [101, 102, 9304, 21, 999, 999]
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.arange(len(row_ids)).reshape(-1, 1),
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+
+    with pytest.raises(ValueError, match="no forwarded span"):
+        llm2tts([source], prompt=[{}], _streaming_context=context)
 
 
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:

@@ -231,7 +231,8 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "chunk_eos_token_id",
             "chunk_tts_eos_token_id",
             "listen_token_id",
-            "turn_eos_token_id",
+            # turn_eos conditions the Talker: consume it in the next forward
+            # before a unit terminator stops native generation, as HF does.
         )
         for field in stop_token_fields:
             token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
