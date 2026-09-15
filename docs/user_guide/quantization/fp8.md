@@ -89,7 +89,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | LTX-2 | `Lightricks/LTX-2`, `rootonchair/LTX-2-19b-distilled` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers`, `diffusers/LTX-2.3-Distilled-Diffusers` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None | ✅︎ |
-| FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | |
+| FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | ✅︎ |
 | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | Yes | Not validated | All layers | None | ✅︎ |
 | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B` | Yes | Yes | All layers | None | |
 | HunyuanImage-3.0 | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | All layers; use the Hunyuan deploy config for multi-stage runs | None | |
