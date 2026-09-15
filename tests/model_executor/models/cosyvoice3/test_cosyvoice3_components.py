@@ -15,6 +15,7 @@ from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
+    HiFTGenerator,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -74,6 +75,39 @@ def test_causal_hift_stft_moves_window_to_input_device(causal_hift):
     assert real.device == waveform.device
     assert imag.device == waveform.device
     assert causal_hift.stft_window.device == waveform.device
+
+
+class _MinimalF0Predictor(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Conv1d(80, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x).squeeze(1).abs()
+
+
+@pytest.mark.parametrize("sampling_rate", [22050, 24000])
+def test_noncausal_hift_inference_runs_with_real_sinegen(sampling_rate):
+    """Base (non-causal) HiFTGenerator with a real SineGen/SineGen2 (not a
+    test double) must still run: SourceModuleHnNSF/SineGen/SineGen2/_f02sine
+    all branch on `self.causal` to return the pre-streaming (shorter) tuple
+    contract for non-causal callers, and any one of them regressing back to
+    always returning the streaming-length tuple breaks this immediately.
+    """
+    hift = HiFTGenerator(
+        base_channels=32,
+        sampling_rate=sampling_rate,
+        upsample_rates=[8, 5, 3],
+        upsample_kernel_sizes=[16, 11, 7],
+        source_resblock_kernel_sizes=[7, 7, 11],
+        source_resblock_dilation_sizes=[[1, 3, 5]] * 3,
+        f0_predictor=_MinimalF0Predictor(),
+    ).eval()
+
+    speech, _ = hift.inference(torch.randn(1, 80, 20))
+
+    assert speech.shape[0] == 1
+    assert torch.isfinite(speech).all()
 
 
 class TestPreLookaheadLayer:
@@ -559,7 +593,11 @@ def test_code2wav_forward_finalizes_hift_tail():
 
         def inference(self, speech_feat, finalize=True):
             self.finalize_calls.append(bool(finalize))
-            return torch.zeros((speech_feat.shape[0], 1, speech_feat.shape[-1]), dtype=speech_feat.dtype), None
+            return (
+                torch.zeros((speech_feat.shape[0], 1, speech_feat.shape[-1]), dtype=speech_feat.dtype),
+                None,
+                None,
+            )
 
     model = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)

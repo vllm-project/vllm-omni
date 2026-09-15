@@ -9,10 +9,8 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 3. HiFiGAN vocoder for waveform synthesis
 """
 
-from __future__ import annotations
-
 from collections import Counter
-from typing import cast
+from typing import TypedDict, cast
 
 import numpy as np
 import torch
@@ -37,6 +35,21 @@ from vllm_omni.model_executor.models.cosyvoice3.runtime import (
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
+
+
+class StreamingFlowItem(TypedDict, total=False):
+    """One entry of the batched-streaming item list passed to forward_streaming_batch."""
+
+    index: int
+    req_id: str | None
+    stream_finished: bool
+    token: torch.Tensor
+    prompt_token: torch.Tensor
+    prompt_feat: torch.Tensor
+    embedding: torch.Tensor
+    cache_state: dict[str, torch.Tensor] | None
+    token_offset_tokens: int
+    finalize: bool
 
 
 class CosyVoice3Code2Wav(nn.Module):
@@ -119,6 +132,10 @@ class CosyVoice3Code2Wav(nn.Module):
         self.mel_cache_len = 20
         self.source_cache_len = int(self.mel_cache_len * 256)
         self.speech_window = np.hamming(2 * self.source_cache_len)
+        # Must cover decode()'s own causal receptive field, not just the F0
+        # margin; window_len=48 already passes
+        # test_incremental_hift_bounded_window_is_close, so 64 has headroom.
+        self._hift_window_len = 64
 
     @property
     def input_frame_rate(self) -> int:
@@ -226,40 +243,75 @@ class CosyVoice3Code2Wav(nn.Module):
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
 
         cached_mel = None if not cache_state else cache_state.get("mel")
-        speech_offset_obj = None if not cache_state else cache_state.get("speech_offset")
-        try:
-            speech_offset = int(speech_offset_obj) if speech_offset_obj is not None else 0
-        except (TypeError, ValueError):
-            speech_offset = 0
-
+        cached_offset = 0 if not cache_state else int(cache_state.get("mel_offset", 0))
+        window_len = self._hift_window_len
+        samples_per_mel = int(np.prod(self.hift.upsample_rates) * self.hift.istft_params["hop_len"])
+        trim = int(self.hift.f0_predictor.condnet[0].causal_padding)
+        f0_margin_frames = int(self.hift.f0_predictor.left_context_frames)
+        f0_margin = 0
         if isinstance(cached_mel, torch.Tensor) and cached_mel.numel() > 0:
             cached_mel = cached_mel.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
-            tts_mel = torch.cat([cached_mel, chunk_mel], dim=-1) if chunk_mel.numel() > 0 else cached_mel
+            total_hist = cached_mel.shape[-1]
+            overlap = min(window_len + trim, total_hist)
+            window_mel = torch.cat([cached_mel[..., -overlap:], chunk_mel], dim=-1)
+            window_offset = cached_offset + total_hist - overlap
+            uv_offset = window_offset * samples_per_mel
+            f0_margin = min(f0_margin_frames, total_hist - overlap)
+            f0_input_mel = (
+                torch.cat(
+                    [cached_mel[..., total_hist - overlap - f0_margin : total_hist - overlap], window_mel], dim=-1
+                )
+                if f0_margin > 0
+                else window_mel
+            )
         else:
-            tts_mel = chunk_mel
+            window_mel = chunk_mel
+            f0_input_mel = chunk_mel
+            window_offset = 0
+            uv_offset = 0
 
-        if tts_mel.shape[-1] == 0:
+        phase_acc = None if not cache_state else cache_state.get("phase_acc")
+        if phase_acc is not None:
+            phase_acc = phase_acc.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
+
+        if window_mel.shape[-1] == 0:
             tts_speech = torch.zeros((chunk_mel.shape[0], 1, 0), device=chunk_mel.device, dtype=chunk_mel.dtype)
+            new_phase_acc = phase_acc
         else:
-            tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+            next_overlap = min(window_len + trim, window_mel.shape[-1])
+            tts_speech, _, new_phase_acc = self.hift.inference(
+                speech_feat=f0_input_mel,
+                finalize=finalize,
+                phase_acc=phase_acc,
+                uv_offset=uv_offset,
+                next_overlap=next_overlap,
+                trim=trim,
+                f0_margin=f0_margin,
+            )
 
         tts_speech = tts_speech.reshape(tts_speech.shape[0], -1)
-        speech_offset = max(0, min(speech_offset, int(tts_speech.shape[-1])))
-        emitted_speech = tts_speech[:, speech_offset:]
+        new_samples = chunk_mel.shape[-1] * samples_per_mel
+        if finalize:
+            frames_withheld_per_chunk = trim + self.hift.conv_pre_look_right + 1
+            released = frames_withheld_per_chunk * samples_per_mel
+            emitted_speech = tts_speech[:, -(new_samples + released) :]
+        else:
+            emitted_speech = tts_speech[:, -new_samples:] if new_samples > 0 else tts_speech[:, :0]
 
         if finalize:
             return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), None
 
         new_state = {
-            "mel": tts_mel.detach().cpu().contiguous(),
-            "speech_offset": int(tts_speech.shape[-1]),
+            "mel": f0_input_mel.detach().cpu().contiguous(),
+            "mel_offset": window_offset - f0_margin,
+            "phase_acc": new_phase_acc.detach().cpu().contiguous() if new_phase_acc is not None else None,
         }
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
     @torch.inference_mode()
     def forward_streaming_batch(
         self,
-        items: list[dict[str, object]],
+        items: list[StreamingFlowItem],
         *,
         n_timesteps: int = 10,
     ) -> list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
@@ -270,20 +322,16 @@ class CosyVoice3Code2Wav(nn.Module):
         group and passed to the flow as per-row token lengths.
         """
         results: list[tuple[torch.Tensor, dict[str, torch.Tensor] | None] | None] = [None] * len(items)
-        groups: dict[tuple[int, int, int, bool], list[tuple[int, dict[str, object]]]] = {}
+        groups: dict[tuple[int, int, int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
-            token = item["token"]
-            prompt_token = item["prompt_token"]
-            prompt_feat = item["prompt_feat"]
-            embedding = item["embedding"]
-            assert isinstance(token, torch.Tensor)
-            assert isinstance(prompt_token, torch.Tensor)
-            assert isinstance(prompt_feat, torch.Tensor)
-            assert isinstance(embedding, torch.Tensor)
+            assert isinstance(item["token"], torch.Tensor)
+            assert isinstance(item["prompt_token"], torch.Tensor)
+            assert isinstance(item["prompt_feat"], torch.Tensor)
+            assert isinstance(item["embedding"], torch.Tensor)
             key = (
-                int(prompt_token.shape[1]),
-                int(prompt_feat.shape[1]),
-                int(embedding.shape[1]),
+                int(item["prompt_token"].shape[1]),
+                int(item["prompt_feat"].shape[1]),
+                int(item["embedding"].shape[1]),
                 bool(item.get("finalize", False)),
             )
             groups.setdefault(key, []).append((index, item))
@@ -305,11 +353,11 @@ class CosyVoice3Code2Wav(nn.Module):
             if len(group) == 1:
                 index, item = group[0]
                 result = self.forward_streaming(
-                    token=item["token"],  # type: ignore[arg-type]
-                    prompt_token=item["prompt_token"],  # type: ignore[arg-type]
-                    prompt_feat=item["prompt_feat"],  # type: ignore[arg-type]
-                    embedding=item["embedding"],  # type: ignore[arg-type]
-                    cache_state=item.get("cache_state"),  # type: ignore[arg-type]
+                    token=item["token"],
+                    prompt_token=item["prompt_token"],
+                    prompt_feat=item["prompt_feat"],
+                    embedding=item["embedding"],
+                    cache_state=item.get("cache_state"),
                     n_timesteps=n_timesteps,
                     token_offset_tokens=int(item.get("token_offset_tokens", 0)),
                     finalize=bool(item.get("finalize", False)),
@@ -318,15 +366,13 @@ class CosyVoice3Code2Wav(nn.Module):
                 continue
 
             token_tensors = [item["token"] for _, item in group]
-            assert all(isinstance(token, torch.Tensor) for token in token_tensors)
             token_lens = torch.tensor(
-                [int(token.shape[1]) for token in token_tensors],  # type: ignore[union-attr]
+                [int(token.shape[1]) for token in token_tensors],
                 dtype=torch.int32,
             )
             max_token_len = int(token_lens.max().item())
             padded_tokens = []
             for token in token_tensors:
-                assert isinstance(token, torch.Tensor)
                 if int(token.shape[1]) == max_token_len:
                     padded_tokens.append(token)
                 else:
@@ -337,9 +383,9 @@ class CosyVoice3Code2Wav(nn.Module):
                     )
                     padded_tokens.append(torch.cat([token, pad], dim=1))
             tokens = torch.cat(padded_tokens, dim=0)
-            prompt_tokens = torch.cat([item["prompt_token"] for _, item in group], dim=0)  # type: ignore[list-item]
-            prompt_feats = torch.cat([item["prompt_feat"] for _, item in group], dim=0)  # type: ignore[list-item]
-            embeddings = torch.cat([item["embedding"] for _, item in group], dim=0)  # type: ignore[list-item]
+            prompt_tokens = torch.cat([item["prompt_token"] for _, item in group], dim=0)
+            prompt_feats = torch.cat([item["prompt_feat"] for _, item in group], dim=0)
+            embeddings = torch.cat([item["embedding"] for _, item in group], dim=0)
             prompt_token_lens = torch.full((len(group),), prompt_tokens.shape[1], dtype=torch.int32)
             prompt_feat_lens = torch.full((len(group),), prompt_feats.shape[1], dtype=torch.int32)
             finalize = bool(group[0][1].get("finalize", False))
@@ -370,7 +416,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     row_feat = row_feat[:, :, trim_mel:]
                 results[index] = self._stream_hift_from_feat(
                     row_feat,
-                    cache_state=item.get("cache_state"),  # type: ignore[arg-type]
+                    cache_state=item.get("cache_state"),
                     finalize=finalize,
                 )
 
@@ -443,7 +489,7 @@ class CosyVoice3Code2Wav(nn.Module):
                 dtype=tts_mel.dtype,
             )
         else:
-            tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=True)
+            tts_speech, _, _ = self.hift.inference(speech_feat=tts_mel, finalize=True)
 
         return tts_speech
 
