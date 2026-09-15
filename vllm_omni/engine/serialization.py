@@ -27,6 +27,13 @@ def serialize_additional_information(
     if isinstance(raw_info, AdditionalInformationPayload):
         return raw_info
 
+    # Validate that raw_info conforms to expected OmniPayload structure
+    if not isinstance(raw_info, dict) or "text" not in raw_info:
+        logger.warning(
+            "Received invalid additional_information payload from text-only request. "
+            "Returning empty payload to avoid CUDA errors."
+        )
+        return AdditionalInformationPayload()  # or {} depending on your signature
     payload: OmniPayload = raw_info  # type: ignore[assignment]
     return serialize_payload(payload)
 
