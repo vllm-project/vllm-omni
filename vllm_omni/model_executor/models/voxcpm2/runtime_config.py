@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class _VoxCPM2RuntimeConfig:
+    startup_lora_path: str | None = None
     enable_profiling: bool = False
     enable_nvtx_profile: bool = False
     enable_loc_dit_layer_nvtx: bool = False
@@ -105,6 +106,10 @@ class _VoxCPM2RuntimeConfig:
 
     @staticmethod
     def _coerce_value(key: str, value: Any, default: Any) -> Any:
+        if key == "startup_lora_path":
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("VoxCPM2 startup_lora_path must be a non-empty local directory path or null")
+            return value
         if isinstance(default, bool):
             if isinstance(value, str):
                 return value.strip().lower() in ("1", "true", "yes", "on")

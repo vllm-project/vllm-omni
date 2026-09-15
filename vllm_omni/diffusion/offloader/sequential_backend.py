@@ -13,7 +13,6 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
-from .config import DIT_COMPONENT
 from .plan_resolver import resolve_offload_plan
 
 logger = init_logger(__name__)
@@ -333,6 +332,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
         encoders = [component.module for component in resolved.encoders]
         vaes = [component.module for component in resolved.vaes]
         residents = [component.module for component in resolved.residents]
+        selected_dits = [component.module for component in resolved.dits if component.selected]
         selected_encoders = [component.module for component in resolved.encoders if component.selected]
 
         all_modules = [*dits, *encoders, *vaes, *residents]
@@ -360,7 +360,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
                 device=self.device,
                 pin_memory=self.config.pin_cpu_memory,
                 use_hsdp=self.config.use_hsdp,
-                offload_dit_modules=(dits if self.config.offloads(DIT_COMPONENT) else ()),
+                offload_dit_modules=selected_dits,
                 offload_encoder_modules=selected_encoders,
             )
         except BaseException:
