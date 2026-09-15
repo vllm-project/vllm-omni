@@ -321,7 +321,7 @@ class HiDreamAttention(nn.Module):
         else:
             query_1, query_2 = query.chunk(2, dim=-1)
             key_1, key_2 = key.chunk(2, dim=-1)
-            key_1 = self.rope(query_1, cos, sin)
+            query_1 = self.rope(query_1, cos, sin)
             key_1 = self.rope(key_1, cos, sin)
             query = torch.cat([query_1, query_2], dim=-1)
             key = torch.cat([key_1, key_2], dim=-1)
