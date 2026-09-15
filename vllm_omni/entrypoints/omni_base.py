@@ -18,6 +18,7 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -372,12 +373,12 @@ class OmniBase(PDDisaggregationMixin):
 
     @staticmethod
     def _apply_sampling_constraints(params: Any, constraints: Mapping[str, Any]) -> Any:
-        """Rebuild params with pipeline-required settings without mutating caller input."""
+        """Apply pipeline requirements, merging required stops with caller stops."""
         if not constraints:
             return params
         if isinstance(params, Mapping):
-            return {**params, **constraints}
-        if is_dataclass(params):
+            values = dict(params)
+        elif is_dataclass(params):
             values = {field.name: getattr(params, field.name) for field in fields(params) if field.init}
         elif struct_fields := getattr(params, "__struct_fields__", None):
             values = {
@@ -387,7 +388,11 @@ class OmniBase(PDDisaggregationMixin):
             }
         else:
             raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
-        return type(params)(**{**values, **constraints})
+
+        resolved = merge_sampling_constraints(values, constraints)
+        if isinstance(params, Mapping):
+            return resolved
+        return type(params)(**resolved)
 
     def _record_request_failure_once(self, request_id: str, reason: str) -> None:
         req_state = self.request_states.get(request_id)
