@@ -15,10 +15,11 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import time as _time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any
@@ -76,6 +77,13 @@ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_k
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
+from vllm_omni.experimental.ar_diffusion.stage_lifecycle import (
+    DiffusionStageLifecycleCoordinator,
+    DiffusionStageLifecycleTopology,
+    SessionLifecycleError,
+    SessionNotLiveError,
+    read_session_controls,
+)
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -84,6 +92,28 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 logger = init_logger(__name__)
+
+
+# Cleanup runs on teardown paths, so a wedged worker must surface as a failure
+# instead of stalling the orchestrator.
+_SESSION_LIFECYCLE_RPC_TIMEOUT_S = 30.0
+
+# Control operations routed through the lifecycle coordinator instead of being
+# fanned out to workers, so the live session registry is updated with them.
+CLOSE_COORDINATED_SESSION = "close_coordinated_session"
+_COORDINATED_SESSION_OPERATIONS = frozenset({CLOSE_COORDINATED_SESSION})
+
+
+@dataclass
+class _DeferredTerminal:
+    """A terminal output waiting on its lifecycle settlement.
+
+    ``settled`` is set only once settlement positively succeeded; presence in the
+    pending map is not itself evidence of confirmation.
+    """
+
+    message: OutputMessage
+    settled: bool = False
 
 
 def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
@@ -444,6 +474,7 @@ class Orchestrator:
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = False,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
+        stage_configs: Sequence[Any] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -516,6 +547,280 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+        # Opt-in cross-stage session lifecycle, declared per stage by the
+        # topology; absent for every pipeline that does not ask for it.
+        self._session_lifecycle: DiffusionStageLifecycleCoordinator | None = None
+        # In-flight coordinated lifecycle operations, settled on shutdown.
+        self._session_lifecycle_tasks: set[asyncio.Task[None]] = set()
+        # Terminal outputs held back until their lifecycle settles.
+        self._deferred_terminals: dict[str, _DeferredTerminal] = {}
+        lifecycle_topology = DiffusionStageLifecycleTopology.from_stage_configs(stage_configs or [])
+        if lifecycle_topology is not None:
+            self._session_lifecycle = DiffusionStageLifecycleCoordinator(
+                lifecycle_topology,
+                self._stage_lifecycle_rpc,
+                replica_count=lambda stage_id: len(self.stage_pools[stage_id].live_replica_ids()),
+            )
+            logger.info(
+                "[Orchestrator] Coordinated session lifecycle enabled: stages=%s state_owning=%s",
+                list(lifecycle_topology.stage_ids),
+                list(lifecycle_topology.state_owning_stage_ids),
+            )
+
+    async def _stage_lifecycle_rpc(self, method: str, stage_id: int, args: tuple[Any, ...]) -> list[Any]:
+        """Run one lifecycle RPC against a stage's live replicas.
+
+        Dispatches to the stage pools directly: enqueueing a collective RPC back
+        to this same orchestrator would wait on itself.
+        """
+        if not (0 <= stage_id < self.num_stages):
+            raise ValueError(f"lifecycle RPC target stage {stage_id} is out of range")
+        pool = self.stage_pools[stage_id]
+        results: list[Any] = []
+        for replica_id in pool.live_replica_ids():
+            results.append(
+                await pool.collective_rpc(
+                    replica_id=replica_id,
+                    method=method,
+                    # A timeout surfaces as a cleanup failure, which blocks reuse.
+                    timeout=_SESSION_LIFECYCLE_RPC_TIMEOUT_S,
+                    args=args,
+                )
+            )
+        return results
+
+    async def _drain_session_lifecycle_tasks(self) -> None:
+        """Let pending lifecycle operations answer their callers before teardown."""
+        tasks = list(self._session_lifecycle_tasks)
+        if not tasks:
+            return
+        logger.info("[Orchestrator] settling %d pending session lifecycle operation(s)", len(tasks))
+        done, pending = await asyncio.wait(tasks, timeout=_SESSION_LIFECYCLE_RPC_TIMEOUT_S)
+        del done
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _spawn_session_lifecycle_operation(
+        self,
+        rpc_id: str,
+        method: str,
+        args: tuple[Any, ...],
+        timeout: float | None,
+    ) -> None:
+        """Run one coordinated lifecycle operation and answer its correlated RPC."""
+
+        async def _run() -> None:
+            result: Any
+            cancelled: BaseException | None = None
+            try:
+                if self._session_lifecycle is None:
+                    raise SessionLifecycleError(
+                        f"{method} requires a topology that declares coordinated_session_lifecycle; "
+                        "this deployment has none, so there is no session registry to update."
+                    )
+                if not args or not isinstance(args[0], str) or not args[0].strip():
+                    raise SessionLifecycleError(f"{method} requires a non-empty session id")
+                session_id = args[0]
+                coroutine = self._session_lifecycle.close(session_id)
+                if timeout is not None:
+                    await asyncio.wait_for(coroutine, timeout=timeout)
+                else:
+                    await coroutine
+                result = True
+            except (SessionLifecycleError, TimeoutError, asyncio.TimeoutError) as exc:
+                # A timed-out close has an unknown outcome; the coordinator has
+                # already fenced it, so the caller gets the failure.
+                logger.error("[Orchestrator] %s failed: %s", method, exc)
+                result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
+            except asyncio.CancelledError as exc:
+                # Shutdown cancelled it; answer the caller before propagating.
+                cancelled = exc
+                result = {
+                    "supported": False,
+                    "error": f"{method} was cancelled before it completed; session cleanup is unconfirmed",
+                }
+            except Exception as exc:  # noqa: BLE001 - one client-visible failure
+                logger.exception("[Orchestrator] %s raised", method)
+                result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
+            with contextlib.suppress(Exception):
+                await self.rpc_async_queue.put(
+                    CollectiveRPCResultMessage(
+                        rpc_id=rpc_id,
+                        method=method,
+                        stage_ids=list(self._session_lifecycle.topology.stage_ids)
+                        if self._session_lifecycle is not None
+                        else [],
+                        results=[result],
+                    )
+                )
+            if cancelled is not None:
+                raise cancelled
+
+        task = asyncio.create_task(_run(), name=f"orchestrator-session-lifecycle-{rpc_id}")
+        self._session_lifecycle_tasks.add(task)
+        task.add_done_callback(self._session_lifecycle_tasks.discard)
+
+    async def _admit_session_lifecycle(
+        self,
+        request_id: str,
+        stage_id: int,
+        sampling_params_list: Sequence[Any],
+    ) -> bool:
+        """Take the topology's admission slot; False when the request was failed.
+
+        The coordinator's gate queues this request behind the one in flight. That
+        parks the request-handler task, not the event loop -- stage outputs are
+        polled by a separate task, so the in-flight request still completes.
+        """
+        coordinator = self._session_lifecycle
+        if coordinator is None:
+            return True
+        controls = read_session_controls(sampling_params_list)
+        if controls is None:
+            return True
+        try:
+            generation = await coordinator.admit(request_id, controls)
+        except SessionNotLiveError as exc:
+            await self._fail_request_client_error(
+                request_id,
+                stage_id,
+                str(exc),
+                status_code=HTTPStatus.CONFLICT.value,
+                error_type="session_state_lost",
+            )
+            return False
+        except SessionLifecycleError as exc:
+            await self._fail_request_client_error(
+                request_id,
+                stage_id,
+                str(exc),
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                error_type="session_lifecycle_error",
+            )
+            return False
+        logger.debug(
+            "[Orchestrator] req=%s admitted for session=%s generation=%d",
+            request_id,
+            controls.session_id,
+            generation,
+        )
+        return True
+
+    async def _finalize_deferred_terminals(self) -> None:
+        """Decide every held terminal at shutdown, so no caller waits forever.
+
+        Publishing an unsettled terminal unchanged would defeat the ordering it
+        was held for, so only a confirmed settlement is published and anything
+        else becomes one lifecycle error. Idempotent: each entry is removed as
+        part of its single decision.
+        """
+        while self._deferred_terminals:
+            request_id, deferred = self._deferred_terminals.popitem()
+            if deferred.settled:
+                # Confirmed; only its publication was interrupted.
+                logger.info(
+                    "[Orchestrator] req=%s: publishing a settled terminal held at shutdown",
+                    request_id,
+                )
+                await self.output_async_queue.put(deferred.message)
+                continue
+            logger.error(
+                "[Orchestrator] req=%s: shut down before session lifecycle cleanup was confirmed; "
+                "reporting a lifecycle failure instead of the pending success",
+                request_id,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=request_id,
+                    stage_id=deferred.message.stage_id,
+                    error=(
+                        "Engine shut down before session lifecycle cleanup was confirmed; "
+                        "the request cannot be reported as successful."
+                    ),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    error_type="session_lifecycle_error",
+                )
+            )
+
+    async def _emit_output(self, msg: OutputMessage) -> None:
+        """Publish one stage output, holding back a coordinated terminal.
+
+        A coordinated topology must not tell the client the rollout finished
+        before the cross-stage cleanup that finish implies has been confirmed, so
+        the terminal message waits for ``_complete_session_lifecycle`` to settle
+        it. Every other output, and every other pipeline, is unaffected.
+        """
+        coordinator = self._session_lifecycle
+        request_id = msg.request_id
+        if coordinator is None or request_id is None or not getattr(msg, "finished", False):
+            await self.output_async_queue.put(msg)
+            return
+        if request_id in self._deferred_terminals:
+            # A second terminal would bypass the settlement the first awaits.
+            logger.warning(
+                "[Orchestrator] req=%s: dropping a duplicate terminal while its outcome is pending",
+                request_id,
+            )
+            return
+        req_state = self.request_states.get(request_id)
+        if not coordinator.is_inflight(request_id) or (
+            # A duplex session's outputs are not followed by request cleanup, so
+            # a deferral there would never be published.
+            req_state is not None and self._is_duplex_session_request(req_state)
+        ):
+            await self.output_async_queue.put(msg)
+            return
+        self._deferred_terminals[request_id] = _DeferredTerminal(message=msg)
+
+    async def _complete_session_lifecycle(self, request_ids: Sequence[str], *, success: bool) -> None:
+        """Settle coordinated lifecycle, publish the outcome, reopen admission.
+
+        Exactly one terminal message reaches the client per request: the deferred
+        success when the topology synchronized, or one lifecycle error instead of
+        it when it did not. A request whose inference already failed has had its
+        error published, so a cleanup failure is logged rather than sent twice.
+        """
+        coordinator = self._session_lifecycle
+        if coordinator is None:
+            return
+        for request_id in request_ids:
+            if not coordinator.is_inflight(request_id):
+                # Already settled: no duplicate finalization or second terminal.
+                continue
+            try:
+                await coordinator.settle(request_id, success=success)
+            except SessionLifecycleError as exc:
+                deferred = self._deferred_terminals.pop(request_id, None)
+                logger.error(
+                    "[Orchestrator] req=%s: coordinated session cleanup failed; blocking reuse: %s",
+                    request_id,
+                    exc,
+                )
+                if deferred is not None:
+                    # The actions were produced but the close they imply was
+                    # not, so this is not a success.
+                    await self.output_async_queue.put(
+                        ErrorMessage(
+                            request_id=request_id,
+                            stage_id=deferred.message.stage_id,
+                            error=str(exc),
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                            error_type="session_lifecycle_error",
+                        )
+                    )
+            else:
+                deferred = self._deferred_terminals.get(request_id)
+                if deferred is not None:
+                    # Marked before publishing, so an interrupted publication is
+                    # finalized as the confirmed success it already is.
+                    deferred.settled = True
+                    await self.output_async_queue.put(deferred.message)
+                    self._deferred_terminals.pop(request_id, None)
+            finally:
+                await coordinator.release_admission(request_id)
 
     def _init_metrics_state(
         self,
@@ -654,6 +959,12 @@ class Orchestrator:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+            # Settle first: a drained operation may confirm a held terminal.
+            # Both run before the stages are torn down, so an unresolved output
+            # still gets its error while the client transport is alive.
+            await self._drain_session_lifecycle_tasks()
+            await self._finalize_deferred_terminals()
+
             if self.duplex_control_plane is not None:
                 await self.duplex_control_plane.shutdown()
 
@@ -748,6 +1059,13 @@ class Orchestrator:
             # dispatch. Runs before request state / running counter registration,
             # so the helper's cleanup is a no-op here.
             await self._fail_request_dead_stage(request_id, stage_id)
+            return
+
+        # Order this request against the topology before anything is submitted:
+        # a reset must not reach encode while the previous request is still
+        # denoising, and a continuation with no state must fail before it
+        # half-applies across the stages.
+        if not await self._admit_session_lifecycle(request_id, stage_id, sampling_params_list):
             return
 
         logger.debug(
@@ -1033,6 +1351,13 @@ class Orchestrator:
         args = tuple(msg.args)
         kwargs = dict(msg.kwargs or {})
         requested_stage_ids = msg.stage_ids
+
+        if method in _COORDINATED_SESSION_OPERATIONS:
+            # Through the coordinator, not a worker fan-out, so the live
+            # registry is updated too. Tracked rather than awaited here: it waits
+            # on the admission gate, and this loop also carries output routing.
+            self._spawn_session_lifecycle_operation(rpc_id, method, args, timeout)
+            return
 
         target_pools: list[StagePool] = []
         if requested_stage_ids is None:
@@ -1587,6 +1912,10 @@ class Orchestrator:
         )
         pool.evict_replica(replica_id)
         self._remove_stage_replica_waiting(stage_id, replica_id)
+        # A dead participant took its paged KV with it and can no longer report
+        # its release events, so nothing that spanned it may continue.
+        if self._session_lifecycle is not None and stage_id in self._session_lifecycle.topology.stage_ids:
+            await self._session_lifecycle.invalidate_all(reason=f"stage-{stage_id} replica-{replica_id} died")
         stage_has_live = bool(pool.live_replica_ids())
         failed_ids: list[str] = []
         for req_id, req_state in list(self.request_states.items()):
@@ -1841,6 +2170,11 @@ class Orchestrator:
             raise
         if closing_session_ids and self.duplex_control_plane is not None:
             self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
+        # Every teardown and completion path funnels through here, so coordinated
+        # lifecycle settles here too: releases are replayed onto the peers before
+        # the next topology request is admitted. ``abort=True`` is exactly the
+        # set of paths whose generation must be invalidated rather than kept.
+        await self._complete_session_lifecycle(cleanup_ids, success=not abort)
         return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
@@ -1904,7 +2238,7 @@ class Orchestrator:
                 final_output_type=final_output_type,
                 audio_sample_rate=pool._infer_audio_sample_rate(),
             )
-            await self.output_async_queue.put(
+            await self._emit_output(
                 OutputMessage(
                     request_id=request_id,
                     stage_id=stage_id,
@@ -1999,7 +2333,7 @@ class Orchestrator:
             stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment(0).finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
-            await self.output_async_queue.put(
+            await self._emit_output(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -2261,7 +2595,7 @@ class Orchestrator:
             ),
             decision,
         )
-        await self.output_async_queue.put(
+        await self._emit_output(
             OutputMessage(
                 request_id=req_id,
                 stage_id=stage_id,
@@ -2591,7 +2925,7 @@ class Orchestrator:
                         src_stage_id,
                         next_logical,
                     )
-                    await self.output_async_queue.put(
+                    await self._emit_output(
                         OutputMessage(
                             request_id=req_id,
                             stage_id=next_logical,
@@ -2617,6 +2951,8 @@ class Orchestrator:
                             src_stage_id,
                             next_logical,
                         )
+                        # Published directly: this terminal carries the error
+                        # itself, so it must not wait on lifecycle settlement.
                         await self.output_async_queue.put(
                             OutputMessage(
                                 request_id=req_id,
@@ -2805,7 +3141,7 @@ class Orchestrator:
                 final_output_type or "text",
                 final_stage_id,
             )
-            await self.output_async_queue.put(
+            await self._emit_output(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,

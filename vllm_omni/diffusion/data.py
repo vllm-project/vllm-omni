@@ -785,6 +785,12 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Legacy stage name; resolved when stage_role is not provided.
+    model_stage: str | None = None
+
+    # Component role; see resolve_diffusion_stage_role for legacy fallback.
+    stage_role: str | None = None
+
     # Optional model-defined startup task. Pipelines may use this to select
     # task-specific components or weights before serving requests.
     task_type: str | None = None
@@ -1015,6 +1021,16 @@ class OmniDiffusionConfig:
 
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
+
+    # Declared receive payload keys; empty disables stage-payload reception.
+    stage_input_payload_keys: tuple[str, ...] = ()
+
+    # Declared send payload keys; empty disables stage-payload sending.
+    stage_output_payload_keys: tuple[str, ...] = ()
+
+    # Orchestrator owns reset/close/eviction ordering; the runner reports its
+    # own releases back instead of acting on them.
+    coordinated_session_lifecycle: bool = False
 
     # Quantization: str method name, dict config, QuantizationConfig, or None.
     # str is resolved to {"method": <str>} internally.
@@ -1651,6 +1667,9 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    # Cross-process stage payload: plain containers, tensors and scalars only.
+    # Live modules, generators and session state must stay on their owner stage.
+    custom_output: dict[str, Any] = field(default_factory=dict)
     async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
@@ -1719,6 +1738,7 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        self.custom_output = _maybe_to_cpu(self.custom_output)
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":

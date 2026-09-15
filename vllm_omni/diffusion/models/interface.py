@@ -146,6 +146,27 @@ def supports_step_execution(pipeline: object) -> bool:
     return isinstance(pipeline, SupportsStepExecution)
 
 
+# Component groups constructed by each role. Pipelines skip unlisted
+# groups before loading weights; the runner stays model-independent.
+_ROLE_COMPONENT_GROUPS: dict[str, frozenset[str]] = {
+    "full": frozenset({"encoder", "dit", "vae"}),
+    "encode": frozenset({"encoder"}),
+    "denoise": frozenset({"dit"}),
+    "denoise_decode": frozenset({"dit", "vae"}),
+    "decode": frozenset({"vae"}),
+}
+
+
+def stage_component_groups(role: str) -> frozenset[str]:
+    """Return the component groups (``encoder``/``dit``/``vae``) a role loads."""
+    return _ROLE_COMPONENT_GROUPS.get(role, _ROLE_COMPONENT_GROUPS["full"])
+
+
+def role_loads_component(role: str, group: Literal["encoder", "dit", "vae"]) -> bool:
+    """Whether role should construct component_group; call before loading weights."""
+    return group in stage_component_groups(role)
+
+
 @runtime_checkable
 class SupportsInteractionApply(Protocol):
     """Optional protocol for pipelines with unified mid-generation, chunk-boundary hooks."""

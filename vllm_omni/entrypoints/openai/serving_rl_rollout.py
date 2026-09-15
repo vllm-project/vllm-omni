@@ -12,6 +12,7 @@ contract without pretending the latent is already an image observation.
 from __future__ import annotations
 
 import binascii
+import inspect
 import time
 from collections import abc
 from typing import Any
@@ -134,7 +135,7 @@ class ServingRLRollout:
         session = await self._store.reset(session_id)
         # Next infer still passes reset=True; drop GPU KV now if the engine
         # session is reachable from this process.
-        self._drop_engine_session(session_id)
+        await self._drop_engine_session(session_id)
         logger.info("Reset rollout session %s", session_id)
         return ResetSessionResponse(
             session_id=session_id,
@@ -143,8 +144,8 @@ class ServingRLRollout:
 
     async def close_session(self, session_id: str) -> None:
         await self._store.close(session_id)
-        self._drop_engine_session(session_id)
-        self._drop_engine_session(f"{session_id}:stateless")
+        await self._drop_engine_session(session_id)
+        await self._drop_engine_session(f"{session_id}:stateless")
         logger.info("Closed rollout session %s", session_id)
 
     async def get_status(self, session_id: str) -> SessionStatusResponse:
@@ -283,7 +284,9 @@ class ServingRLRollout:
         async for output in self._openpi.engine_client.generate(
             prompt=self._request_prompt(request),
             request_id=request.request_id,
-            sampling_params_list=[request.sampling_params],
+            # One parameter object per configured stage; a policy split across
+            # encode/denoise/decode needs all of them, not just stage 0.
+            sampling_params_list=self._request_sampling_params_list(request),
         ):
             result = output
 
@@ -297,6 +300,13 @@ class ServingRLRollout:
         if prompt is not None:
             return prompt
         return request.prompts[0]
+
+    @staticmethod
+    def _request_sampling_params_list(request: Any) -> list[Any]:
+        params_list = getattr(request, "sampling_params_list", None)
+        if isinstance(params_list, list) and params_list:
+            return params_list
+        return [request.sampling_params]
 
     @staticmethod
     def _extract_video_output(result: Any) -> Any:
@@ -320,12 +330,21 @@ class ServingRLRollout:
             "Confirm DreamZero formatter placement for world_model_env."
         )
 
-    def _drop_engine_session(self, session_id: str) -> None:
+    async def _drop_engine_session(self, session_id: str) -> None:
+        close = getattr(self._openpi, "close_session", None)
+        if callable(close):
+            try:
+                await close(session_id)
+            except Exception:
+                logger.exception("Failed to drop engine session %s", session_id)
+            return
         drop = getattr(self._openpi, "drop_session", None)
         if not callable(drop):
             return
         try:
-            drop(session_id)
+            result = drop(session_id)
+            if inspect.isawaitable(result):
+                await result
         except Exception:
             logger.exception("Failed to drop engine session %s", session_id)
 

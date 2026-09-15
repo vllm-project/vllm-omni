@@ -199,6 +199,54 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
+class DiffusionStageRole(str, Enum):
+    """Component role within a diffusion pipeline, independent of engine type.
+
+    FULL runs all phases; ENCODE produces conditioning; DENOISE produces
+    latents; DENOISE_DECODE also decodes them; DECODE decodes or postprocesses
+    upstream output.
+    """
+
+    FULL = "full"
+    ENCODE = "encode"
+    DENOISE = "denoise"
+    DENOISE_DECODE = "denoise_decode"
+    DECODE = "decode"
+
+
+# Map legacy model_stage names for existing stage configs and deploy YAML.
+_MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
+    "text_encode": DiffusionStageRole.ENCODE,
+    "encode": DiffusionStageRole.ENCODE,
+    "dit": DiffusionStageRole.DENOISE_DECODE,
+    "denoise": DiffusionStageRole.DENOISE,
+    "denoise_decode": DiffusionStageRole.DENOISE_DECODE,
+    "decode": DiffusionStageRole.DECODE,
+    "vae_decode": DiffusionStageRole.DECODE,
+    "diffusion": DiffusionStageRole.FULL,
+    "full": DiffusionStageRole.FULL,
+}
+
+
+def resolve_diffusion_stage_role(
+    stage_role: DiffusionStageRole | str | None,
+    model_stage: str | None = None,
+) -> DiffusionStageRole:
+    """Resolve explicit stage_role, then legacy model_stage, defaulting to FULL."""
+    if isinstance(stage_role, DiffusionStageRole):
+        return stage_role
+    if isinstance(stage_role, str) and stage_role:
+        try:
+            return DiffusionStageRole(stage_role)
+        except ValueError:
+            resolved = _MODEL_STAGE_TO_ROLE.get(stage_role)
+            if resolved is not None:
+                return resolved
+    if model_stage:
+        return _MODEL_STAGE_TO_ROLE.get(model_stage, DiffusionStageRole.FULL)
+    return DiffusionStageRole.FULL
+
+
 def _resolve_scheduler(
     execution_type: StageExecutionType,
     async_scheduling: bool = True,
@@ -233,6 +281,8 @@ class StagePipelineConfig:
     stage_id: int
     model_stage: str
     execution_type: StageExecutionType = StageExecutionType.LLM_AR
+    # Diffusion component role; None falls back through model_stage to FULL.
+    stage_role: DiffusionStageRole | None = None
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
@@ -256,6 +306,13 @@ class StagePipelineConfig:
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
+    # Declared receive payload keys; empty disables stage-payload reception.
+    stage_input_payload_keys: tuple[str, ...] = ()
+    # Declared send payload keys for diffusion producers; empty disables sending.
+    stage_output_payload_keys: tuple[str, ...] = ()
+    # Opt in to orchestrator-owned reset/close/eviction ordering across these
+    # stages; each runner then stops doing its own request-driven cleanup.
+    coordinated_session_lifecycle: bool = False
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -941,6 +998,12 @@ def _build_engine_args(
     if ps.model_path_resolver:
         engine_args["model_path_resolver"] = ps.model_path_resolver
     engine_args["inline_diffusion"] = ps.inline_diffusion
+    if ps.stage_input_payload_keys:
+        engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
+    if ps.stage_output_payload_keys:
+        engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
+    if ps.coordinated_session_lifecycle:
+        engine_args["coordinated_session_lifecycle"] = True
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -1081,6 +1144,8 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                stage_role=ps.stage_role.value if ps.stage_role is not None else None,
+                coordinated_session_lifecycle=ps.coordinated_session_lifecycle,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -1109,6 +1174,8 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    stage_role: str | None = None
+    coordinated_session_lifecycle: bool = False
     session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
@@ -1133,6 +1200,10 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
+        if self.stage_role is not None:
+            engine_args["stage_role"] = self.stage_role
+        if self.coordinated_session_lifecycle:
+            engine_args["coordinated_session_lifecycle"] = True
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:
