@@ -1,0 +1,87 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_omniinteract",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "local_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "omniinteract",
+        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          2
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_subsets": "1q1a",
+        "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a",
+        "omniinteract_max_video_duration_s": 600,
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+      },
+      {
+        "dataset_name": "omniinteract",
+        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          2
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_subsets": "1q1a_math",
+        "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a_math",
+        "omniinteract_max_video_duration_s": 600,
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+      },
+      {
+        "dataset_name": "omniinteract",
+        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          2
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_subsets": "1qna",
+        "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1qna",
+        "omniinteract_max_video_duration_s": 600,
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]

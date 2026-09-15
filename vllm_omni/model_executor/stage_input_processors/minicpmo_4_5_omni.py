@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
@@ -10,12 +10,14 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
-from vllm_omni.experimental.fullduplex.engine.intermediate import (
+from vllm_omni.engine.duplex.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -70,13 +72,30 @@ def _extract_first_audio_ref(multi_modal_data):
     return waveform.reshape(-1).cpu(), int(sample_rate)
 
 
+def _extract_prompt_reference_audio(
+    prompt_item: OmniTokensPrompt | TextPrompt | None,
+) -> tuple[torch.Tensor, int] | None:
+    if isinstance(prompt_item, Mapping):
+        multi_modal_data = prompt_item.get("multi_modal_data")
+        serving_reference_audio = prompt_item.get(MINICPMO45_REFERENCE_AUDIO_KEY)
+    else:
+        multi_modal_data = getattr(prompt_item, "multi_modal_data", None)
+        serving_reference_audio = getattr(prompt_item, MINICPMO45_REFERENCE_AUDIO_KEY, None)
+
+    reference_audio = _extract_first_audio_ref(multi_modal_data)
+    if reference_audio is not None:
+        return reference_audio
+
+    return _extract_first_audio_ref({"audio": serving_reference_audio})
+
+
 def _extract_native_runtime_ref_audio(data_plane_metadata):
     if not isinstance(data_plane_metadata, dict):
         return None
     runtime_config = data_plane_metadata.get("runtime_config")
     if not isinstance(runtime_config, dict):
         return None
-    from vllm_omni.experimental.fullduplex.minicpmo45.input import decode_native_ref_audio_from_config
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import decode_native_ref_audio_from_config
 
     waveform = decode_native_ref_audio_from_config({"extra_body": runtime_config})
     if waveform is None:
@@ -139,6 +158,17 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
             f"codec_left_context_frames={left_context_frames}"
         )
     return chunk_frames, left_context_frames
+
+
+def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    for attribute in ("additional_information", "model_intermediate_buffer"):
+        information = getattr(request, attribute, None)
+        if isinstance(information, Mapping):
+            values = information.get(section)
+            if isinstance(values, Mapping):
+                merged.update(values)
+    return merged
 
 
 def _codec_scalars(value: Any) -> list[int]:
@@ -348,15 +378,13 @@ def tts2code2wav_async_chunk(
     ref_audio = None
     ref_audio_sr = None
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
-        request_info = getattr(request, "additional_information", None)
-        if isinstance(request_info, Mapping):
-            codes_info = request_info.get("codes")
-            meta_info = request_info.get("meta")
-            raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
-            raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
-            ref_audio_sr = _coerce_int(raw_ref_audio_sr)
-            if raw_ref_audio is not None:
-                ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+        codes_info = _request_intermediate_section(request, "codes")
+        meta_info = _request_intermediate_section(request, "meta")
+        raw_ref_audio = codes_info.get("ref")
+        raw_ref_audio_sr = meta_info.get("ref_audio_sr")
+        ref_audio_sr = _coerce_int(raw_ref_audio_sr)
+        if raw_ref_audio is not None:
+            ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -408,18 +436,9 @@ def tts2code2wav_full_payload(
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 
-    request_info = getattr(request, "additional_information", None)
-    if not isinstance(request_info, Mapping):
-        request_info = {}
-    codes_info = request_info.get("codes")
-    if not isinstance(codes_info, Mapping):
-        codes_info = {}
-    meta_info = request_info.get("meta")
-    if not isinstance(meta_info, Mapping):
-        meta_info = {}
-    duplex_info = request_info.get("duplex")
-    if not isinstance(duplex_info, Mapping):
-        duplex_info = {}
+    codes_info = _request_intermediate_section(request, "codes")
+    meta_info = _request_intermediate_section(request, "meta")
+    duplex_info = _request_intermediate_section(request, "duplex")
 
     ref_audio = codes_info.get("ref")
     finished = torch.tensor(True, dtype=torch.bool)
@@ -618,6 +637,7 @@ def _native_duplex_segment_output_ids(
         state["request_id"] = request_id
         state["sent_output_len"] = 0
         state["sent_output_ids"] = []
+        state["condition_seq"] = -1
     previous_turn_id = state.get("turn_id")
     sent_len = state.get("sent_output_len", 0)
     prev_output_ids = state.get("sent_output_ids", [])
@@ -721,11 +741,13 @@ def llm2tts(
         prompt = [prompt]
 
     multi_modal_data = {}
+    reference_audio_by_request_id = {}
     for llm_output, p in zip(llm_outputs, prompt):
         if isinstance(p, dict):
             multi_modal_data[llm_output.request_id] = p.get("multi_modal_data", None)
         else:
             multi_modal_data[llm_output.request_id] = getattr(p, "multi_modal_data", None)
+        reference_audio_by_request_id[llm_output.request_id] = _extract_prompt_reference_audio(p)
 
     for llm_output in llm_outputs:
         output = llm_output.outputs[0]
@@ -960,8 +982,7 @@ def llm2tts(
             meta["turn_start"] = native_turn_start
             if native_segment_end:
                 meta["segment_end"] = True
-        req_mm_data = multi_modal_data.get(llm_output.request_id)
-        ref_audio = _extract_first_audio_ref(req_mm_data)
+        ref_audio = reference_audio_by_request_id.get(llm_output.request_id)
         if ref_audio is None:
             ref_audio = _extract_native_runtime_ref_audio(
                 model_intermediate_buffer.get("duplex"),
@@ -980,6 +1001,8 @@ def llm2tts(
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 
+        condition_sequence_state = None
+        condition_sequence_value = None
         if handoff_ids is not None and handoff_hidden is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
@@ -989,6 +1012,22 @@ def llm2tts(
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
+            if is_native_duplex_handoff:
+                handoff_meta["next_stage_generation_tokens"] = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                bridge_states = getattr(_streaming_context, "bridge_states", None)
+                handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
+                if not isinstance(handoff_state, dict) or handoff_state.get("request_id") != str(llm_output.request_id):
+                    raise ValueError("native duplex Talker handoff is missing request-local streaming state")
+                previous_condition_seq = handoff_state.get("condition_seq", -1)
+                if (
+                    not isinstance(previous_condition_seq, int)
+                    or isinstance(previous_condition_seq, bool)
+                    or previous_condition_seq < -1
+                ):
+                    raise ValueError("native duplex Talker condition sequence state is invalid")
+                condition_sequence_state = handoff_state
+                condition_sequence_value = previous_condition_seq + 1
+                handoff_meta["streaming_condition_seq"] = condition_sequence_value
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
             if not is_native_duplex_handoff or native_turn_start:
@@ -1011,6 +1050,8 @@ def llm2tts(
                 mm_processor_kwargs=None,
             )
         )
+        if condition_sequence_state is not None:
+            condition_sequence_state["condition_seq"] = condition_sequence_value
         if native_turn_end_handoff:
             bridge_states = getattr(_streaming_context, "bridge_states", None)
             duplex_state = bridge_states.get("duplex") if isinstance(bridge_states, dict) else None

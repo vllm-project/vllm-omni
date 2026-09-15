@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -29,11 +29,19 @@ class ForwardContext:
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
+    # Runner-owned paged execution metadata/runtime. Attention resolves the
+    # active Worker adapter from it; model code must not construct BlockTable
+    # rows or activate the runtime directly.
+    paged_kv_runtime: object | None = None
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
     # the diffusion_kv implementation.
     paged_kv_adapter: Any | None = None
+    # Startup-only memory profiling runs before Scheduler-owned pages exist.
+    # Attention layers use this explicit scope to distinguish that probe from
+    # a malformed paged request whose Worker adapter was not activated.
+    in_diffusion_kv_memory_profile: bool = False
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
@@ -58,6 +66,10 @@ class ForwardContext:
     # Tracks the depth of SP sharding - incremented on shard, decremented on gather
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
+    # One entry per active SP split boundary: whether it auto-pads, which makes
+    # every rank's shard the same length and lets attention collectives skip a
+    # runtime length all-gather. Pushed on split, popped on gather.
+    _sp_equal_pad_stack: list[bool] = field(default_factory=list)
 
     @property
     def sp_active(self) -> bool:
@@ -79,6 +91,15 @@ class ForwardContext:
 
         sp_size = self.omni_diffusion_config.parallel_config.sequence_parallel_size
         return sp_size is not None and sp_size > 1
+
+    @property
+    def sp_rank_local_seq_lens_equal(self) -> bool:
+        """Whether every active SP boundary guarantees equal local shard sizes.
+
+        Only framework-managed auto_pad boundaries provide this contract; a
+        region that also shards manually keeps the dynamic length exchange.
+        """
+        return bool(self._sp_equal_pad_stack) and all(self._sp_equal_pad_stack)
 
     def __post_init__(self):
         pass
@@ -154,6 +175,8 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: object | None = None,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -161,6 +184,8 @@ def create_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -186,6 +211,8 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: object | None = None,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -197,6 +224,8 @@ def set_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -246,6 +275,11 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+        if step_idx is not None:
+            paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
+            ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
+            if callable(ensure_active):
+                ensure_active(step_idx)
 
 
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:

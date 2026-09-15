@@ -86,7 +86,7 @@
     url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('duplex', '1');
     url.searchParams.set('model', config.model || 'openbmb/MiniCPM-o-4_5');
-    url.searchParams.set('minicpmo45_native_duplex', '1');
+    url.searchParams.set('native_duplex', '1');
     url.searchParams.set('autostart', '0');
     return url.toString();
   }
@@ -356,7 +356,7 @@
       case 'response.speak':
         beginAssistant(responseId);
         break;
-      case 'response.audio.delta':
+      case 'response.output_audio.delta':
         currentResponseId = responseId || currentResponseId;
         assistantActive = true;
         setModel('Speaking');
@@ -364,13 +364,13 @@
           .then((decoded) => feedPlayback(decoded, responseId))
           .catch((error) => appendLog(`audio decode failed: ${error.message || error}`, true));
         break;
-      case 'response.audio.done':
+      case 'response.output_audio.done':
         requestPlaybackDrain(responseId);
         break;
-      case 'response.audio_transcript.delta':
+      case 'response.output_audio_transcript.delta':
         addTranscript('assistant', event.delta || '');
         break;
-      case 'response.audio_transcript.done':
+      case 'response.output_audio_transcript.done':
         finishTranscript('assistant', event.transcript || '');
         break;
       case 'conversation.item.input_audio_transcription.delta':
@@ -458,7 +458,7 @@
         settled = true;
         const extraBody = {
           auto_response: true,
-          minicpmo45_native_duplex: true,
+          native_duplex: true,
         };
         const session = {
           modalities: ['audio', 'text'],

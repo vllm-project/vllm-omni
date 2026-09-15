@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 from collections import deque
@@ -37,6 +37,8 @@ class OmniTransferAdapterBase:
         self._save_cond = threading.Condition()
         self._send_failures: dict[str, str] = {}
         self._send_failure_lock = threading.Lock()
+        self._receive_failures: dict[str, str] = {}
+        self._receive_failure_lock = threading.Lock()
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -100,6 +102,17 @@ class OmniTransferAdapterBase:
         """Drain and return the requests whose send gave up."""
         with self._send_failure_lock:
             failures, self._send_failures = self._send_failures, {}
+        return failures
+
+    def record_receive_failure(self, request_id: str, reason: str) -> None:
+        """Record an invalid received chunk that cannot be retried."""
+        with self._receive_failure_lock:
+            self._receive_failures.setdefault(request_id, reason)
+
+    def collect_failed_receive_request_ids(self) -> dict[str, str]:
+        """Drain and return requests whose received chunk was invalid."""
+        with self._receive_failure_lock:
+            failures, self._receive_failures = self._receive_failures, {}
         return failures
 
     def save_loop(self):

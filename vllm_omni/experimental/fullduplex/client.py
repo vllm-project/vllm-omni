@@ -130,7 +130,7 @@ def build_realtime_url(
     if model:
         query["model"] = model
     if native_duplex is not None:
-        query["minicpmo45_native_duplex"] = "1" if native_duplex else "0"
+        query["native_duplex"] = "1" if native_duplex else "0"
     if autostart is not None:
         query["autostart"] = "1" if autostart else "0"
     if session_id:
@@ -234,7 +234,7 @@ class RealtimeEventCollector:
         event_type = stored_event.get("type")
         if event_type == "response.created" and response_id and response_id not in self.response_ids:
             self.response_ids.append(response_id)
-        if event_type == "response.audio.delta":
+        if event_type == "response.output_audio.delta":
             delta = stored_event.get("delta") or stored_event.get("audio")
             if isinstance(delta, str) and response_id:
                 try:
@@ -263,10 +263,15 @@ class RealtimeEventCollector:
             if self.response_id(event) == response_id
             and event.get("type")
             in {
-                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
                 "response.output_text.delta",
                 "response.text.delta",
             }
+        )
+
+    def response_is_done(self, response_id: str) -> bool:
+        return any(
+            event.get("type") == "response.done" and self.response_id(event) == response_id for event in self.events
         )
 
     def errors(self) -> list[dict[str, object]]:
@@ -317,7 +322,7 @@ class RealtimeEventCollector:
             if (
                 event.get("type")
                 in {
-                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
                     "response.output_text.delta",
                     "response.text.delta",
                 }
@@ -332,7 +337,7 @@ class RealtimeEventCollector:
             if isinstance(stage0, dict):
                 stage0_metrics = stage0
 
-            if event.get("type") != "response.audio.delta" or (
+            if event.get("type") != "response.output_audio.delta" or (
                 response_id is not None and event_response_id != response_id
             ):
                 continue
@@ -521,12 +526,12 @@ class RealtimeDuplexClient:
             session_extra_body.update(
                 {
                     "auto_response": auto_response,
-                    "minicpmo45_native_duplex": True,
+                    "native_duplex": True,
                     "force_listen_count": 0,
                 }
             )
         else:
-            session_extra_body["minicpmo45_native_duplex"] = False
+            session_extra_body["native_duplex"] = False
         session: dict[str, object] = {
             "model": model,
             "modalities": ["audio", "text"],
@@ -673,7 +678,7 @@ class RealtimeDuplexClient:
     async def acknowledge_playback(self) -> None:
         for response_id in self.events.response_ids:
             pcm16 = self.events.audio_bytes(response_id)
-            if not pcm16:
+            if not pcm16 and self.events.response_is_done(response_id):
                 continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
             await self.send_playback_ack(response_id, played_ms)

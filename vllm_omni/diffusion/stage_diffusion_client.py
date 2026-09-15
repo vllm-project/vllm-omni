@@ -49,14 +49,13 @@ def create_diffusion_client(
     od_config: OmniDiffusionConfig,
     metadata: StageMetadata,
     stage_init_timeout: int,
-    batch_size: int = 1,
     use_inline: bool = False,
 ) -> Any:
     """Factory to create either an inline or out-of-process diffusion client."""
     if use_inline:
         from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 
-        return InlineStageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
+        return InlineStageDiffusionClient(model, od_config, metadata)
     proc_manager = StageDiffusionProcManager(
         model=model,
         od_config=od_config,
@@ -67,7 +66,6 @@ def create_diffusion_client(
         request_address=proc_manager.addresses.inputs[0],
         response_address=proc_manager.addresses.outputs[0],
         proc_manager=proc_manager,
-        batch_size=batch_size,
     )
 
 
@@ -91,14 +89,12 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
-        batch_size: int = 1,
     ) -> None:
         self._initialize_client(
             metadata,
             request_address,
             response_address,
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
 
     @classmethod
@@ -109,7 +105,6 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
-        batch_size: int = 1,
     ) -> StageDiffusionClient:
         """Create a client for an already-running diffusion subprocess."""
         return cls(
@@ -117,7 +112,6 @@ class StageDiffusionClient(StageClientBase):
             request_address,
             response_address,
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
 
     def _initialize_client(
@@ -127,7 +121,6 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
-        batch_size: int,
     ) -> None:
         self._set_stage_metadata(metadata)
         self._proc_manager = proc_manager
@@ -144,11 +137,10 @@ class StageDiffusionClient(StageClientBase):
             self._start_proc_monitor()
 
         logger.info(
-            "[StageDiffusionClient] stage-%s [rep-%s] initialized (owns_process=%s, batch_size=%d)",
+            "[StageDiffusionClient] stage-%s [rep-%s] initialized (owns_process=%s)",
             self.stage_id,
             self.replica_id,
             self._proc_manager is not None,
-            batch_size,
         )
 
     def _set_stage_metadata(self, metadata: StageMetadata) -> None:
@@ -347,6 +339,7 @@ class StageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None:
         if self._engine_dead:
             raise EngineDeadError()
@@ -364,6 +357,7 @@ class StageDiffusionClient(StageClientBase):
                     "prompt": prompt,
                     "sampling_params": self._sampling_params_to_dict(sampling_params),
                     "kv_sender_info": kv_sender_info,
+                    "kv_transfer_params": kv_transfer_params,
                 }
             )
         )

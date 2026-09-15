@@ -38,6 +38,7 @@ def _pipeline():
         cache_backend=None,
         diffusion_kv_cache_skip_step_indices=None,
     )
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=False, use_meanflow=False)
     pipeline._pipeline = SimpleNamespace()
     return pipeline
 
@@ -268,6 +269,17 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline = _pipeline()
 
     pipeline._ensure_grouped_attention_backend_supported(2)
+
+
+def test_scheduler_paged_step_execution_is_rejected():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    state = _state("paged-step", 0)
+
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.prepare_encode(state)
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.denoise_step(InputBatch.make_batch([state]))
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
@@ -524,3 +536,44 @@ def test_forward_batches_multiple_requests_through_step_execution_bridge(monkeyp
     assert prepare_calls == ["req-0", "req-1"]
     assert decode_calls == ["req-0", "req-1"]
     assert [out.output.item() for out in outputs] == [1.0, 2.0]
+
+
+def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=True, use_meanflow=True)
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    state = _state("distilled", 1)
+    state.latents = torch.zeros(1, 1)
+    state.extra[_STEP_GUIDANCE_SCALE] = 2.5
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 2, 4, dtype=torch.bool),
+            "full_attn_spans": [[(2, 4)]],
+        }
+    )
+    state.extra[_STEP_PROMPT_KV] = [
+        {
+            "key": torch.zeros(1, 2, 1, 1),
+            "value": torch.zeros(1, 2, 1, 1),
+            "lens": torch.tensor([2]),
+        }
+    ]
+    state.scheduler = SimpleNamespace(get_timestep_r=lambda _timestep: torch.tensor(0.25))
+    captured = {}
+
+    pipeline._restore_prompt_kv_cache = lambda *_args: None
+
+    def fake_prepare_inputs(input_ids, images, timestep, **model_kwargs):
+        del input_ids, images, timestep
+        captured.update(model_kwargs)
+        return {"model_kwargs": model_kwargs}
+
+    pipeline.prepare_inputs_for_generation = fake_prepare_inputs
+    pipeline.forward_call = lambda **_kwargs: {"diffusion_prediction": torch.tensor([[1.0]])}
+    pipeline._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
+
+    output = pipeline.denoise_step(InputBatch.make_batch([state]))
+
+    torch.testing.assert_close(output, torch.tensor([[1.0]]))
+    torch.testing.assert_close(captured["guidance"], torch.tensor([2500.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(captured["timesteps_r"], torch.tensor([0.25]))

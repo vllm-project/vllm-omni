@@ -16,7 +16,7 @@ Use this recipe for 24 kHz multilingual TTS with voice cloning (20 languages inc
 Chinese and English). Choose a variant based on your latency and quality requirements:
 
 | Model | Params | Use case |
-|---|---|---|
+| --- | --- | --- |
 | MOSS-TTS | 8B | General TTS, highest quality |
 | MOSS-TTS-v1.5 | 8B | General TTS upgrade of 1.0: 31 languages, steadier cloning, `[pause Xs]` markers (set `language` for best results); same `MossTTSDelay` API |
 | MOSS-TTS-Realtime | 1.7B | Lowest latency (TTFB ~180 ms), streaming-first |
@@ -24,8 +24,16 @@ Chinese and English). Choose a variant based on your latency and quality require
 | MOSS-SoundEffect | 8B | Sound effect synthesis from text description |
 | MOSS-VoiceGenerator | 1.7B | Zero-shot voice design |
 
-All variants share the same codec (`OpenMOSS-Team/MOSS-Audio-Tokenizer`, ~7 GB) and
+The variants above share the same codec (`OpenMOSS-Team/MOSS-Audio-Tokenizer`, ~7 GB) and
 output 24 kHz mono audio.
+
+MOSS-TTS-Local-Transformer-v1.5 uses MOSS-Audio-Tokenizer-v2 and outputs 48 kHz
+stereo audio. For Local voice cloning through `/v1/audio/speech`, provide an
+accurate `ref_text` transcript alongside `ref_audio`. The adapter uses the
+reference transcript and audio as a continuation prefix, then generates only
+the requested `input` speech. Without a nonblank `ref_text`, Local uses
+audio-reference generation. Reference transcripts must match the reference
+audio; they are not style instructions.
 
 ## References
 

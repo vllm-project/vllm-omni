@@ -25,6 +25,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     lora_a_stacked: tuple[torch.Tensor, ...]
     lora_b_stacked: tuple[torch.Tensor, ...]
 
+    # Mask saved while the adapter is suspended; None means "not suspended".
+    _diffusion_lora_suspended_slices: tuple[bool, ...] | None = None
+
     def _move_lora_buffers(self, device: torch.device) -> None:
         self.lora_a_stacked = tuple(tensor.to(device=device) for tensor in self.lora_a_stacked)
         self.lora_b_stacked = tuple(tensor.to(device=device) for tensor in self.lora_b_stacked)
@@ -54,11 +57,14 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         object.__setattr__(self, "_diffusion_base_layer_ref", base_layer)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
+        self._diffusion_lora_suspended_slices = None
 
     def reset_lora(self, index: int):
         super().reset_lora(index)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
+        # The upload is gone, so a saved mask no longer describes the buffers.
+        self._diffusion_lora_suspended_slices = None
 
     def set_lora(
         self,
@@ -81,6 +87,30 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         else:
             # Single-slice layer.
             self._diffusion_lora_active_slices = (True,)
+
+    def suspend_lora(self) -> None:
+        """Gate every slice off without dropping the uploaded weights.
+
+        `apply()` reads the stacked buffers only for slices this mask marks
+        active, so a suspended adapter costs nothing while staying resident.
+        A saved mask means the layer is already suspended; keep the original
+        rather than overwriting it with the all-False mask now in place.
+        """
+        if self._diffusion_lora_suspended_slices is not None:
+            return
+        self._diffusion_lora_suspended_slices = self._diffusion_lora_active_slices
+        self._diffusion_lora_active_slices = (False,) * len(self._diffusion_lora_active_slices)
+
+    def resume_lora(self) -> None:
+        """Restore the mask captured by `suspend_lora()`.
+
+        A layer registered after the suspend, or one whose buffers were torn
+        down meanwhile, has no mask to restore and keeps its own inactive one.
+        """
+        saved = self._diffusion_lora_suspended_slices
+        if saved is not None:
+            self._diffusion_lora_active_slices = saved
+            self._diffusion_lora_suspended_slices = None
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """
@@ -143,8 +173,17 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # LoRA shrink & expand as in add_lora_linear():
             #   buffer = (x @ A.T)
             #   y += buffer @ B.T
-            delta = (x_flat @ A.t()) @ B.t()
-            y_flat[:, offset : offset + slice_size] = y_flat[:, offset : offset + slice_size] + delta
+            buffer = x_flat @ A.t()
+            y_slice = y_flat[:, offset : offset + slice_size]
+
+            # In inference, accumulate the expand GEMM directly into the base
+            # output. This avoids materializing both a full-width delta and the
+            # result of the following elementwise addition. ``out=`` does not
+            # support autograd, so training keeps the functional fallback.
+            if not torch.is_grad_enabled() and y_slice.dtype == buffer.dtype == B.dtype:
+                torch.addmm(y_slice, buffer, B.t(), out=y_slice)
+            else:
+                y_slice[:] = y_slice + buffer @ B.t()
             offset += slice_size
 
         return y_flat.view(original_shape)

@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
-from functools import partial
+from functools import cache, partial
 
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
@@ -21,6 +17,15 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+@cache
+def _get_npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
+    """Return the shared block mask used by NPU right-down causal attention."""
+    return torch.triu(
+        torch.ones((2048, 2048), dtype=torch.bool, device=device),
+        diagonal=1,
+    ).contiguous()
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -52,7 +57,8 @@ class FlashAttentionBackend(AttentionBackend):
         return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
         return True
 
     @staticmethod
@@ -68,7 +74,7 @@ class FlashAttentionBackend(AttentionBackend):
         return FlashAttentionImpl
 
 
-class FlashAttentionImpl(AttentionImpl):
+class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     # Per-platform FP8 KV quantization support.
     # To enable FP8 on a new platform, add its OmniPlatformEnum value here
     # and handle kv_cache_dtype in the corresponding forward_{platform}().
@@ -161,6 +167,8 @@ class FlashAttentionImpl(AttentionImpl):
             flash_attn_varlen_func,
         )
 
+        if flash_attn_varlen_func is None:
+            raise ImportError("Masked variable-length attention requires flash_attn_varlen_func")
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         batch_size, query_length = query.shape[:2]
         if not self.is_cross_attn and query_length == key.size(1):
@@ -254,6 +262,8 @@ class FlashAttentionImpl(AttentionImpl):
             flash_attn_varlen_func,
         )
 
+        if flash_attn_varlen_func is None:
+            raise ImportError("Dense variable-length attention requires flash_attn_varlen_func")
         batch_size, q_len = query.size()[:2]
         k_len = key.size(1)
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
@@ -285,7 +295,9 @@ class FlashAttentionImpl(AttentionImpl):
         rank-local native cache context.  The adapter no longer performs the
         attention call itself; this method is the backend-owned execution
         boundary.  Its native layer wrapper keeps vLLM version-specific cache
-        and kernel details out of Omni's common ``Attention`` layer.
+        and kernel details out of Omni's common ``Attention`` layer. CUDA uses
+        the native vLLM FlashAttention writer/kernel contract. Ascend writes
+        the complete K/V span once before its piecewise FIA calls.
         """
 
         layer = getattr(paged_kv_context, "layer", None)
@@ -297,8 +309,18 @@ class FlashAttentionImpl(AttentionImpl):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
-        if not layer.attn_backend.forward_includes_kv_cache_update:
-            native_impl.do_kv_cache_update(
+        prewrite_kv = current_omni_platform.requires_diffusion_paged_kv_prewrite()
+        read_kv_from_cache = prewrite_kv and layer.attn_backend.forward_includes_kv_cache_update
+        # The GPU/default path preserves native cache-update ownership. Ascend
+        # prewrites through vLLM-Ascend's normal-layout writer so piecewise FIA
+        # segments do not repeatedly scatter the same layer K/V.
+        if not layer.attn_backend.forward_includes_kv_cache_update or prewrite_kv:
+            cache_update = getattr(native_impl, "do_kv_cache_update", None)
+            if not callable(cache_update):
+                raise RuntimeError(
+                    f"Native attention implementation for {layer.layer_name!r} cannot update the KV cache"
+                )
+            cache_update(
                 layer,
                 paged_kv_context.key_write,
                 paged_kv_context.value_write,
@@ -308,33 +330,52 @@ class FlashAttentionImpl(AttentionImpl):
 
         def run_native_attention(
             query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
+            key: torch.Tensor | None,
+            value: torch.Tensor | None,
             native_metadata,
+            output: torch.Tensor | None,
         ) -> torch.Tensor:
-            output = torch.empty(
-                (query.shape[0], layer.num_heads, layer.head_size_v),
-                dtype=query.dtype,
-                device=query.device,
-            )
+            if output is None:
+                output = torch.empty(
+                    (query.shape[0], layer.num_heads, layer.head_size_v),
+                    dtype=query.dtype,
+                    device=query.device,
+                )
             return native_impl.forward(
                 layer,
                 query,
-                key,
-                value,
+                None if read_kv_from_cache else key,
+                None if read_kv_from_cache else value,
                 kv_cache,
                 native_metadata,
                 output,
             )
 
         if paged_kv_context.piecewise_plan is not None:
+            # Ascend FIA can execute identical CFG rows as one batched call
+            # per piece.  Keep that batch layout through the piecewise runner
+            # so it can concatenate row-major results instead of emitting an
+            # indexed ScatterUpdate for every segment.  The CUDA path keeps
+            # its existing output-buffer contract (including graph capture).
+            use_homogeneous_batch = (
+                current_omni_platform.is_npu() and paged_kv_context.piecewise_plan.homogeneous_batch_shape is not None
+            )
+            output = None
+            if not use_homogeneous_batch:
+                output = torch.empty(
+                    (paged_kv_context.query.shape[0], layer.num_heads, layer.head_size_v),
+                    dtype=paged_kv_context.query.dtype,
+                    device=paged_kv_context.query.device,
+                )
             output = run_paged_piecewise_plan(
                 paged_kv_context.query,
-                paged_kv_context.key_write,
-                paged_kv_context.value_write,
+                None if read_kv_from_cache else paged_kv_context.key_write,
+                None if read_kv_from_cache else paged_kv_context.value_write,
                 paged_kv_context.piecewise_plan,
                 paged_kv_context.piecewise_native_metadata,
                 run_native_attention,
+                output_buffer=output,
+                use_homogeneous_batch=use_homogeneous_batch,
             )
         else:
             output = run_native_attention(
@@ -342,6 +383,7 @@ class FlashAttentionImpl(AttentionImpl):
                 paged_kv_context.key_write,
                 paged_kv_context.value_write,
                 paged_kv_context.native_metadata,
+                None,
             )
         return paged_kv_context.restore_output(output)
 
@@ -350,7 +392,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
@@ -394,7 +436,7 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
-                query_ranges=attn_metadata.query_ranges,
+                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
             )
 
         packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
@@ -445,7 +487,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
@@ -480,7 +522,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
 
@@ -494,7 +536,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
 
@@ -514,17 +556,57 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        try:
-            from mindiesd import attention_forward
-        except ImportError:
-            raise ImportError(
-                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
-                "Please install MindIE-SD to enable NPU attention support. "
-                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
-                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
-            )
+        attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        if self.causal:
+            import torch_npu
+
+            if attention_mask is None:
+                # The compressed upper-triangular mask with sparse_mode=3
+                # applies FlashAttention's bottom-right causal alignment when
+                # Sq != Skv without materializing the full attention matrix.
+                npu_attention_mask = _get_npu_compressed_causal_mask(query.device)
+                sparse_mode = 3
+                # Explicitly enable invalid-row handling for Sq > Skv. Equal
+                # and shorter query sequences have no fully causal-masked rows.
+                inner_precise = 2 if query.shape[1] > key.shape[1] else 0
+            else:
+                # A custom keep-mask cannot be combined with the compressed
+                # sparse_mode=3 mask. Materialize the composed block-mask and
+                # use allMask mode instead. The explicit mask follows the
+                # framework convention (True=keep), while npu_fusion_attention
+                # uses True=block.
+                explicit_keep_mask = _maybe_reshape_attn_mask(
+                    query,
+                    key,
+                    attention_mask,
+                    mask_mode="full_qk",
+                ).to(device=query.device, dtype=torch.bool)
+                query_positions = torch.arange(query.shape[1], device=query.device).unsqueeze(1)
+                key_positions = torch.arange(key.shape[1], device=query.device).unsqueeze(0)
+                causal_block_mask = key_positions > query_positions + (key.shape[1] - query.shape[1])
+                npu_attention_mask = (causal_block_mask | ~explicit_keep_mask).contiguous()
+                sparse_mode = 1
+                # An explicit mask can create fully masked rows regardless of
+                # the Sq/Skv relationship.
+                inner_precise = 2
+
+            return torch_npu.npu_fusion_attention(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                head_num=query.shape[2],
+                input_layout="BSND",
+                atten_mask=npu_attention_mask,
+                scale=float(self.softmax_scale),
+                keep_prob=1.0,
+                inner_precise=inner_precise,
+                sparse_mode=sparse_mode,
+            )[0]
+
+        from mindiesd import attention_forward
+
         # Opt-in mask-free paths (mirror the CUDA cu_seqlens behavior): the
         # model marks extra["npu_attn_varlen"] and carries packed metadata, so
         # the padding document is excluded without reading or materializing
@@ -541,7 +623,6 @@ class FlashAttentionImpl(AttentionImpl):
                 out = self._forward_varlen_packed_npu(query, key, value, extra)
             if out is not None:
                 return out
-        attention_mask = attn_metadata.attn_mask if attn_metadata else None
         if attention_mask is None and extra.get("npu_attn_varlen", False):
             # Models skip mask construction when this opt-in is set
             # (FlashAttentionBackend.supports_packed_mask_free). The packed
@@ -633,15 +714,8 @@ class FlashAttentionImpl(AttentionImpl):
             return None
         seq_q, seq_k = resolved
 
-        try:
-            from mindiesd import attention_forward_varlen
-        except ImportError:
-            raise ImportError(
-                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
-                "Please install MindIE-SD to enable NPU attention support. "
-                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
-                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
-            )
+        from mindiesd import attention_forward_varlen
+
         q = query.squeeze(0)  # [T, N, D] == TND
         k = key.squeeze(0)
         v = value.squeeze(0)
@@ -689,15 +763,8 @@ class FlashAttentionImpl(AttentionImpl):
         _, seq_k = resolved
         used_k = seq_k[0]  # real document length (first cumulative end)
 
-        try:
-            from mindiesd import attention_forward
-        except ImportError:
-            raise ImportError(
-                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
-                "Please install MindIE-SD to enable NPU attention support. "
-                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
-                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
-            )
+        from mindiesd import attention_forward
+
         # mindiesd always takes BSND input regardless of `layout`; the arg
         # selects the op-internal layout and laser only supports BNSD, so do
         # NOT forward the model's qkv_layout ("BSND" for MiniMax-H3) here.
@@ -705,8 +772,12 @@ class FlashAttentionImpl(AttentionImpl):
         key = key[:, :used_k]
         value = value[:, :used_k]
 
-        input_scale = extra.get("laser_input_scale")
-        preserve_input_range = isinstance(input_scale, (int, float)) and input_scale > 1
+        input_scale_raw = extra.get("laser_input_scale")
+        if isinstance(input_scale_raw, (int, float)) and input_scale_raw > 1:
+            input_scale = float(input_scale_raw)
+        else:
+            input_scale = 1.0
+        preserve_input_range = input_scale > 1
         if preserve_input_range:
             query = query / input_scale
             key = key / input_scale

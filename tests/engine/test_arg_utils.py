@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for Omni config utils. For stability, these tests should largely be
 invariant to the specific attributes of vLLM config except in cases where we
@@ -63,7 +66,7 @@ def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
     class ConnectorWorker:
         model_runner_cls = ConnectorRunner
 
-    worker_module.ConnectorWorker = ConnectorWorker
+    setattr(worker_module, "ConnectorWorker", ConnectorWorker)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
     monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda _self: None)
@@ -95,7 +98,7 @@ def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch)
     class WorkerWithoutConnector:
         model_runner_cls = object
 
-    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
     args = OmniEngineArgs(
@@ -113,7 +116,7 @@ def test_full_payload_capability_requires_selected_worker_connector(monkeypatch)
     class WorkerWithoutConnector:
         model_runner_cls = object
 
-    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
     with pytest.raises(ValueError, match="does not provide an Omni connector model runner"):
@@ -130,7 +133,7 @@ def test_full_payload_capability_validates_platform_selected_worker(monkeypatch)
     class WorkerWithoutConnector:
         model_runner_cls = object
 
-    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
     monkeypatch.setattr(
         current_omni_platform,
@@ -286,6 +289,28 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     }
 
 
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+    """A successful remote tokenizer download must not enter the error path."""
+    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir.mkdir()
+    baseline_config = Mock()
+    warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
+
+    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    assert args.create_model_config() is baseline_config
+    assert args.tokenizer == str(tokenizer_dir)
+    warning.assert_not_called()
+
+
 def test_patch_missing_local_hf_config(tmp_path):
     """Native model bundles may only contain a checkpoints/ directory."""
     (tmp_path / "checkpoints").mkdir()
@@ -317,6 +342,7 @@ def test_patch_missing_local_hf_config(tmp_path):
 def test_non_missing_local_hf_config_error_reaches_parent_loader(tmp_path, monkeypatch, config_entry):
     """Non-missing config errors must reach vLLM's normal loader."""
     config_path = tmp_path / "config.json"
+    loader_error: Exception
     if config_entry == "malformed":
         config_path.write_text("{not valid json", encoding="utf-8")
         loader_error = json.JSONDecodeError("invalid config", "{not valid json", 1)
