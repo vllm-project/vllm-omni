@@ -35,78 +35,117 @@ MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
 MING_STOP_REASON_BY_CODE = {code: reason for reason, code in MING_STOP_REASON_CODES.items()}
 
 
-def _extract_last_patch(pooling_output: Mapping[str, Any] | None) -> torch.Tensor | None:
-    if not isinstance(pooling_output, Mapping):
-        return None
-    has_patch = pooling_output.get("ming_has_patch")
-    patch = pooling_output.get("ming_latent_patch")
-    if not isinstance(patch, torch.Tensor) or patch.numel() == 0:
-        return None
-
-    if isinstance(has_patch, torch.Tensor) and has_patch.numel() > 0:
-        active = (has_patch.reshape(-1) > 0).nonzero(as_tuple=True)[0]
-        if active.numel() == 0:
-            return None
-        patch = patch[int(active[-1].item())]
-    elif patch.ndim == 3:
-        patch = patch[-1]
-
-    if patch.ndim != 2:
-        raise ValueError(f"Invalid Ming latent patch shape: {tuple(patch.shape)}")
-    return patch.to(torch.float32).cpu()
-
-
-def _extract_all_patches(pooling_output: Mapping[str, Any] | None) -> torch.Tensor | None:
-    if not isinstance(pooling_output, Mapping):
-        return None
-    has_patch = pooling_output.get("ming_has_patch")
-    patch = pooling_output.get("ming_latent_patch")
-    if not isinstance(patch, torch.Tensor) or patch.numel() == 0:
-        return None
-
-    if patch.ndim == 2:
-        patch = patch.unsqueeze(0)
-    if patch.ndim != 3:
-        raise ValueError(f"Invalid Ming latent patch tensor shape: {tuple(patch.shape)}")
-
-    if isinstance(has_patch, torch.Tensor) and has_patch.numel() > 0:
-        active = (has_patch.reshape(-1) > 0).nonzero(as_tuple=True)[0]
-        if active.numel() == 0:
-            return None
-        patch = patch.index_select(0, active.to(device=patch.device))
-
-    if patch.numel() == 0:
-        return None
-    return patch.to(torch.float32).cpu()
-
-
-def _extract_last_value(pooling_output: Mapping[str, Any] | None, key: str) -> Any:
-    if not isinstance(pooling_output, Mapping):
-        return None
-    value = pooling_output.get(key)
-    if value is None:
-        return None
-
-    has_patch = pooling_output.get("ming_has_patch")
-    selected_index = -1
-    if isinstance(has_patch, torch.Tensor) and has_patch.numel() > 0:
-        active = (has_patch.reshape(-1) > 0).nonzero(as_tuple=True)[0]
-        if active.numel() == 0:
-            return None
-        selected_index = int(active[-1].item())
-
+def _select_snapshot_value(value: Any, selected_index: int | torch.Tensor) -> Any:
     if isinstance(value, torch.Tensor):
         flat = value.reshape(-1)
         if flat.numel() == 0:
             return None
-        return flat[min(selected_index, flat.numel() - 1)].item()
+        if isinstance(selected_index, torch.Tensor):
+            value_index = selected_index.to(device=flat.device).clamp_max(flat.numel() - 1)
+        else:
+            value_index = min(selected_index, flat.numel() - 1)
+        return flat[value_index]
     if isinstance(value, (list, tuple)):
         if not value:
             return None
-        if selected_index < 0:
-            return value[-1]
-        return value[min(selected_index, len(value) - 1)]
+        value_index = int(selected_index.item()) if isinstance(selected_index, torch.Tensor) else selected_index
+        return value[-1] if value_index < 0 else value[min(value_index, len(value) - 1)]
     return value
+
+
+def _extract_snapshot_metadata(
+    pooling_output: Mapping[str, Any],
+    selected_index: int | torch.Tensor,
+) -> tuple[Any, Any]:
+    decode_step_value = pooling_output.get("ming_decode_step")
+    stop_reason_value = pooling_output.get(MING_STOP_REASON_KEY)
+    if isinstance(selected_index, torch.Tensor) and (
+        isinstance(decode_step_value, (list, tuple)) or isinstance(stop_reason_value, (list, tuple))
+    ):
+        selected_index = int(selected_index.item())
+
+    final_decode_step = _select_snapshot_value(decode_step_value, selected_index)
+    stop_reason_code = _select_snapshot_value(stop_reason_value, selected_index)
+
+    if (
+        isinstance(final_decode_step, torch.Tensor)
+        and isinstance(stop_reason_code, torch.Tensor)
+        and final_decode_step.device == stop_reason_code.device
+    ):
+        final_decode_step, stop_reason_code = (
+            torch.stack(
+                (
+                    final_decode_step.to(torch.int64),
+                    stop_reason_code.to(torch.int64),
+                )
+            )
+            .cpu()
+            .tolist()
+        )
+    else:
+        if isinstance(final_decode_step, torch.Tensor):
+            final_decode_step = final_decode_step.item()
+        if isinstance(stop_reason_code, torch.Tensor):
+            stop_reason_code = stop_reason_code.item()
+    return final_decode_step, stop_reason_code
+
+
+def _extract_ming_output_snapshot(
+    pooling_output: Mapping[str, Any] | None,
+    *,
+    all_patches: bool = False,
+) -> tuple[torch.Tensor | None, Any, str | None]:
+    if not isinstance(pooling_output, Mapping):
+        return None, None, None
+
+    has_patch = pooling_output.get("ming_has_patch")
+    active: torch.Tensor | None = None
+    selected_index: int | torch.Tensor = -1
+    if isinstance(has_patch, torch.Tensor) and has_patch.numel() > 0:
+        patch_mask = has_patch.reshape(-1) > 0
+        if all_patches:
+            active = patch_mask.nonzero(as_tuple=True)[0]
+            if active.numel() == 0:
+                return None, None, None
+            selected_index = active[-1]
+        else:
+            reversed_mask = patch_mask.flip(0)
+            reverse_offset, has_active = (
+                torch.stack(
+                    (
+                        reversed_mask.to(torch.int64).argmax(),
+                        reversed_mask.any().to(torch.int64),
+                    )
+                )
+                .cpu()
+                .tolist()
+            )
+            if not has_active:
+                return None, None, None
+            selected_index = patch_mask.numel() - 1 - reverse_offset
+
+    patch = pooling_output.get("ming_latent_patch")
+    selected_patch: torch.Tensor | None = None
+    if isinstance(patch, torch.Tensor) and patch.numel() > 0:
+        if all_patches:
+            if patch.ndim == 2:
+                patch = patch.unsqueeze(0)
+            if patch.ndim != 3:
+                raise ValueError(f"Invalid Ming latent patch tensor shape: {tuple(patch.shape)}")
+            selected_patch = patch if active is None else patch.index_select(0, active.to(device=patch.device))
+        else:
+            if patch.ndim == 3:
+                if isinstance(selected_index, torch.Tensor):
+                    selected_index = selected_index.to(device=patch.device)
+                patch = patch[selected_index]
+            if patch.ndim != 2:
+                raise ValueError(f"Invalid Ming latent patch shape: {tuple(patch.shape)}")
+            selected_patch = patch
+
+        selected_patch = selected_patch.to(torch.float32).cpu() if selected_patch.numel() > 0 else None
+
+    final_decode_step, stop_reason_code = _extract_snapshot_metadata(pooling_output, selected_index)
+    return selected_patch, final_decode_step, _decode_stop_reason(stop_reason_code)
 
 
 def _decode_stop_reason(value: Any) -> str | None:
@@ -187,8 +226,7 @@ def llm2audio_vae_async_chunk(
     request_id = request.external_req_id
     chunk_id = int(transfer_manager.put_req_chunk[request_id])
     finished = bool(is_finished or request.is_finished())
-    final_decode_step = _extract_last_value(pooling_output, "ming_decode_step")
-    stop_reason = _decode_stop_reason(_extract_last_value(pooling_output, MING_STOP_REASON_KEY))
+    patch, final_decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
     request_payload = transfer_manager.request_payload
     request_state = request_payload.get(request_id)
     if not isinstance(request_state, dict) or "_ming_async_state" not in request_state:
@@ -203,7 +241,6 @@ def llm2audio_vae_async_chunk(
     if bool(state.get("terminal_sent", False)):
         return None
 
-    patch = _extract_last_patch(pooling_output)
     if patch is not None:
         transfer_manager.code_prompt_token_ids[request_id].append(patch)
 
@@ -290,7 +327,10 @@ def llm2audio_vae(
         if not finished:
             continue
         output = stage_output.outputs[0]
-        patches = _extract_all_patches(output.multimodal_output)
+        patches, final_decode_step, stop_reason = _extract_ming_output_snapshot(
+            output.multimodal_output,
+            all_patches=True,
+        )
         additional_information = {
             "ming_latent_patches": patches
             if patches is not None
@@ -298,8 +338,6 @@ def llm2audio_vae(
             KEY_REQUEST_ID: getattr(stage_output, "request_id", None),
             "finished": torch.tensor(finished, dtype=torch.bool),
         }
-        final_decode_step = _extract_last_value(output.multimodal_output, "ming_decode_step")
-        stop_reason = _decode_stop_reason(_extract_last_value(output.multimodal_output, MING_STOP_REASON_KEY))
         if final_decode_step is not None:
             additional_information[MING_FINAL_DECODE_STEP_KEY] = int(final_decode_step)
         if stop_reason is not None:
