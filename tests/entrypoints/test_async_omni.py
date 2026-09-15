@@ -13,6 +13,8 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model]
@@ -572,6 +574,46 @@ def test_output_kind_is_preserved_with_explicit_sampling_params(output_kind):
 
     asyncio.run(run())
     assert captured_params[0].output_kind == output_kind
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "input_kind", [None, RequestOutputKind.CUMULATIVE, RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY]
+)
+def test_qwen_video_sampling_keeps_all_three_stages_delta(input_kind):
+    """Real generate/resolution preserves the video handler's DELTA contract."""
+    captured = []
+
+    async def submit(*, sampling_params_list, **kwargs):
+        captured.extend(sampling_params_list)
+
+    async def run():
+        omni = get_async_omni_instance(fake_add_request=submit)
+        # The common fixture bypasses resolution; this test must execute it.
+        del omni.resolve_sampling_params_list
+        omni.engine.num_stages = 3
+        omni.default_sampling_params_list = [SamplingParams(output_kind=RequestOutputKind.CUMULATIVE) for _ in range(3)]
+        omni.sampling_constraints_list = omni._get_sampling_constraints_list(QWEN3_OMNI_PIPELINE.stages)
+        params = None
+        if input_kind is not None:
+            # The video handler applies this coercion to explicit overrides.
+            params = coerce_param_message_types(
+                [SamplingParams(output_kind=input_kind) for _ in range(3)], is_streaming=True
+            )
+        async for _ in omni.generate(
+            prompt={"prompt": "video"},
+            request_id="video-sampling",
+            sampling_params_list=params,
+            output_modalities=["text", "audio"],
+        ):
+            pass
+        assert len(captured) == 3
+        assert all(param.output_kind == RequestOutputKind.DELTA for param in captured)
+        assert captured[1].stop_token_ids == [2150]
+        assert [param.detokenize for param in captured] == [True, False, True]
+        assert all(param.output_kind == RequestOutputKind.CUMULATIVE for param in omni.default_sampling_params_list)
+
+    asyncio.run(run())
 
 
 # End to end tests for ensuring internal manipulation of request ID

@@ -93,7 +93,7 @@ The server accepts these legacy field names and rewrites them before validation.
 | Variable | Values | Default | Description |
 | -------- | ------ | ------- | ----------- |
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on`, `off` | `on` | Wire-level streaming switch. `off` buffers server-side deltas and emits coalesced outputs at the end of a query. |
-| `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast`, `slow` | `fast` | Audio delta extraction strategy. `fast` emits only newly produced chunks; `slow` recomputes from accumulated audio and exists for A/B verification. |
+| `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast`, `slow` | `fast` | Both settings forward every fresh engine audio delta. `slow` is retained as a compatibility alias for `fast`. |
 
 ## EVS Semantics
 
