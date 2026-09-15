@@ -16,7 +16,7 @@ transformer execution, and postprocessing logic.
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -199,7 +199,7 @@ def extract_qwen_context(
     hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
     image_rotary_emb = (vid_freqs, txt_freqs)
 
-    timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    timestep = cast(torch.Tensor, timestep).to(device=hidden_states.device, dtype=hidden_states.dtype)
 
     # Call modulate_index_prepare instead of handling timestep directly.
     # For zero_cond_t=False: timestep unchanged, modulate_index=None.
@@ -618,7 +618,7 @@ def extract_flux2_klein_context(
     # ============================================================================
     dtype = hidden_states.dtype
 
-    num_txt_tokens = encoder_hidden_states.shape[1]
+    num_txt_tokens = cast(torch.Tensor, encoder_hidden_states).shape[1]
 
     timestep = timestep.to(dtype=dtype) * 1000
     if guidance is not None:
@@ -1260,7 +1260,7 @@ def extract_minimax_h3_context(
     preprocessing via ``_embed``, cacheable ``blocks`` loop, and
     ``final_layer`` postprocessing with row selection and update masks.
     """
-    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import indexed_scale_shift_
+    from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,

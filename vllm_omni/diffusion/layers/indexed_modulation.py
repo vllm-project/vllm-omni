@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fused MiniMax H3 modulation with FP32 accumulation."""
+"""Fused indexed modulation with FP32 accumulation."""
 
 from __future__ import annotations
 
@@ -244,7 +244,7 @@ def rms_norm_indexed_scale_shift(
     indices: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Fuse H3 RMSNorm with its indexed AdaLN affine transform."""
+    """Fuse RMSNorm with an indexed affine transform."""
     if x.is_cpu:
         input_dtype = x.dtype
         normalized = x.float()

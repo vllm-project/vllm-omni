@@ -123,6 +123,11 @@ fa4 = [
     "flash-attn-4[cu13]==4.0.0b18",
 ]
 
+# FastVideo VSA kernels for the supported Linux/Python 3.12 wheel environment.
+vsa = [
+    "fastvideo-kernel==0.3.4",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
