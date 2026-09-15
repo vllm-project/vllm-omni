@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import os
 import urllib.request
+from pathlib import Path
 
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.multimodal.utils import fetch_audio
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
@@ -90,10 +92,11 @@ def _build_request(
     Upstream forbids ``prompt_text`` in ``voice_clone`` mode; only forward
     it when explicitly supplied (and typically with ``mode='continuation'``).
     """
+    audio, sr = fetch_audio(Path(prompt_audio_path).resolve().as_uri())
     additional: dict = {
         "text": [text],
         "mode": [mode],
-        "prompt_audio_path": [prompt_audio_path],
+        "prompt_audio_array": [(audio, sr)],
         "max_new_frames": [max_new_frames],
         "seed": [seed],
     }
