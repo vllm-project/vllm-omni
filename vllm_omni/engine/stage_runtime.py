@@ -10,8 +10,8 @@ import copy
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -306,17 +306,6 @@ class StageRuntime:
         """Hook for runtimes that own extra infrastructure during init."""
         return None
 
-    @contextmanager
-    def _scoped_spawn_device_env(self, physical_devices: str | None) -> Iterator[None]:
-        """Briefly scope device visibility for spawn-sensitive setup steps."""
-        from vllm_omni.engine.stage_engine_startup import scoped_spawn_device_env
-
-        with scoped_spawn_device_env(
-            physical_devices,
-            self._spawn_device_lock,
-        ):
-            yield
-
     def _resolve_replica_physical_devices(self, stage_id: int, runtime_cfg: Any) -> str | None:
         if runtime_cfg is None:
             runtime_cfg = {}
@@ -326,13 +315,6 @@ class StageRuntime:
             devices,
             visible_baseline=self._init_visible_devices_baseline,
         )
-
-    @contextmanager
-    def _stage_device_scope(self, stage_id: int, runtime_cfg: Any) -> Iterator[None]:
-        """Temporarily apply the stage device env while launching a replica."""
-        physical_devices = self._resolve_replica_physical_devices(stage_id, runtime_cfg)
-        with self._scoped_spawn_device_env(physical_devices):
-            yield
 
     # ---- Internal methods ----
 
@@ -750,12 +732,16 @@ class StageRuntime:
             # READY handshake.
             if not self._parallel_stage_init:
                 g3_start = time.perf_counter()
-                with self._scoped_spawn_device_env(physical_devices):
-                    lock_fds = acquire_device_locks(
-                        plan.metadata.stage_id,
-                        plan.engine_args_dict,
-                        stage_init_timeout,
-                    )
+                # Pass devices explicitly rather than scoping the device env:
+                # the flock wait must stay outside the spawn-env lock, else it
+                # deadlocks against a replica that already holds device locks
+                # and needs the spawn-env lock to launch (AB-BA lock ordering).
+                lock_fds = acquire_device_locks(
+                    plan.metadata.stage_id,
+                    plan.engine_args_dict,
+                    stage_init_timeout,
+                    visible_devices=physical_devices,
+                )
                 logger.debug(
                     "[stage_init] Stage-%s G3 device-lock acquire took %.3fs",
                     plan.metadata.stage_id,
@@ -849,10 +835,10 @@ class StageRuntime:
         client = None
         resources = None
         try:
-            with (
-                stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg),
-                self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg),
-            ):
+            # The device env is scoped inside launch_diffusion_stage_replica,
+            # around the spawn only, so the device flock wait in there runs
+            # outside the spawn lock (see _initialize_local_llm_replica).
+            with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                 omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                 if omni_conn_cfg:
                     if omni_from is None or omni_to is None:
@@ -880,6 +866,11 @@ class StageRuntime:
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),
+                    stage_visible_devices=self._resolve_replica_physical_devices(
+                        plan.metadata.stage_id,
+                        plan.metadata.runtime_cfg,
+                    ),
+                    spawn_device_lock=self._spawn_device_lock,
                 )
 
             logger.info(
