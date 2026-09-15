@@ -34,22 +34,44 @@
     }
   },
   "3": {
-    "class_type": "UpscaleModelLoader",
+    "class_type": "SeedVR2LoadDiTModel",
     "inputs": {
-      "model_name": "RealESRGAN_x2plus.pth"
+      "model": "seedvr2_ema_3b_fp16.safetensors",
+      "device": "cuda:0",
+      "blocks_to_swap": 32,
+      "swap_io_components": false,
+      "offload_device": "cpu",
+      "cache_model": false,
+      "attention_mode": "sdpa"
     }
   },
   "4": {
-    "class_type": "ImageUpscaleWithModel",
+    "class_type": "SeedVR2VideoUpscaler",
     "inputs": {
       "image": [
         "2",
         0
       ],
-      "upscale_model": [
+      "dit": [
         "3",
         0
-      ]
+      ],
+      "vae": [
+        "12",
+        0
+      ],
+      "seed": 42,
+      "resolution": 1536,
+      "max_resolution": 0,
+      "batch_size": 5,
+      "uniform_batch_size": true,
+      "color_correction": "lab",
+      "temporal_overlap": 1,
+      "prepend_frames": 0,
+      "input_noise_scale": 0.0,
+      "latent_noise_scale": 0.0,
+      "offload_device": "cpu",
+      "enable_debug": false
     }
   },
   "5": {
@@ -123,6 +145,22 @@
       "filename_prefix": "WF07/generated",
       "format": "mp4",
       "codec": "auto"
+    }
+  },
+  "12": {
+    "class_type": "SeedVR2LoadVAEModel",
+    "inputs": {
+      "model": "ema_vae_fp16.safetensors",
+      "device": "cuda:0",
+      "encode_tiled": true,
+      "encode_tile_size": 1024,
+      "encode_tile_overlap": 128,
+      "decode_tiled": true,
+      "decode_tile_size": 768,
+      "decode_tile_overlap": 128,
+      "tile_debug": "false",
+      "offload_device": "cpu",
+      "cache_model": false
     }
   }
 }

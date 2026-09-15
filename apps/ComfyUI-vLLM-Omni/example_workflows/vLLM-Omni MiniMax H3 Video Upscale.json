@@ -1,18 +1,18 @@
 {
   "version": 0.4,
-  "last_node_id": 11,
-  "last_link_id": 12,
+  "last_node_id": 12,
+  "last_link_id": 13,
   "nodes": [
     {
       "id": 1,
       "type": "VLLMOmniGenerateVideo",
       "pos": [
-        440,
-        130
+        360,
+        20
       ],
       "size": [
-        370,
-        500
+        330,
+        480
       ],
       "flags": {},
       "order": 1,
@@ -83,11 +83,11 @@
       "id": 2,
       "type": "GetVideoComponents",
       "pos": [
-        900,
-        160
+        730,
+        20
       ],
       "size": [
-        270,
+        250,
         125
       ],
       "flags": {},
@@ -136,72 +136,87 @@
     },
     {
       "id": 3,
-      "type": "UpscaleModelLoader",
+      "type": "SeedVR2LoadDiTModel",
       "pos": [
-        900,
-        440
+        730,
+        290
       ],
       "size": [
-        320,
-        85
+        340,
+        245
       ],
       "flags": {},
-      "order": 2,
+      "order": 4,
       "mode": 0,
       "inputs": [
         {
-          "name": "model_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "model_name"
-          },
+          "localized_name": "torch_compile_args",
+          "name": "torch_compile_args",
+          "shape": 7,
+          "type": "TORCH_COMPILE_ARGS",
           "link": null
         }
       ],
       "outputs": [
         {
-          "name": "UPSCALE_MODEL",
-          "type": "UPSCALE_MODEL",
+          "localized_name": "SEEDVR2_DIT",
+          "name": "SEEDVR2_DIT",
+          "type": "SEEDVR2_DIT",
           "links": [
             3
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "UpscaleModelLoader"
+        "Node name for S&R": "SeedVR2LoadDiTModel"
       },
       "widgets_values": [
-        "RealESRGAN_x2plus.pth"
+        "seedvr2_ema_3b_fp16.safetensors",
+        "cuda:0",
+        32,
+        false,
+        "cpu",
+        false,
+        "sdpa"
       ]
     },
     {
       "id": 4,
-      "type": "ImageUpscaleWithModel",
+      "type": "SeedVR2VideoUpscaler",
       "pos": [
-        1280,
-        160
+        1120,
+        290
       ],
       "size": [
-        280,
-        90
+        340,
+        415
       ],
       "flags": {},
-      "order": 3,
+      "order": 8,
       "mode": 0,
       "inputs": [
         {
-          "name": "upscale_model",
-          "type": "UPSCALE_MODEL",
-          "link": 3
-        },
-        {
+          "localized_name": "image",
           "name": "image",
           "type": "IMAGE",
           "link": 2
+        },
+        {
+          "localized_name": "dit",
+          "name": "dit",
+          "type": "SEEDVR2_DIT",
+          "link": 3
+        },
+        {
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "SEEDVR2_VAE",
+          "link": 13
         }
       ],
       "outputs": [
         {
+          "localized_name": "IMAGE",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
@@ -210,19 +225,34 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ImageUpscaleWithModel"
-      }
+        "Node name for S&R": "SeedVR2VideoUpscaler"
+      },
+      "widgets_values": [
+        42,
+        "fixed",
+        1536,
+        0,
+        5,
+        true,
+        "lab",
+        1,
+        0,
+        0.0,
+        0.0,
+        "cpu",
+        false
+      ]
     },
     {
       "id": 5,
       "type": "CreateVideo",
       "pos": [
-        1640,
-        160
+        1490,
+        290
       ],
       "size": [
-        290,
-        165
+        250,
+        175
       ],
       "flags": {},
       "order": 4,
@@ -277,12 +307,12 @@
       "id": 6,
       "type": "SaveVideo",
       "pos": [
-        2010,
-        160
+        1790,
+        290
       ],
       "size": [
-        390,
-        410
+        330,
+        280
       ],
       "flags": {},
       "order": 5,
@@ -322,7 +352,7 @@
         {
           "name": "video",
           "type": "VIDEO",
-          "links": null
+          "links": []
         }
       ],
       "properties": {
@@ -338,12 +368,12 @@
       "id": 7,
       "type": "VLLMOmniMiniMaxH3Params",
       "pos": [
-        30,
-        40
+        0,
+        20
       ],
       "size": [
-        330,
-        140
+        320,
+        120
       ],
       "flags": {},
       "order": 7,
@@ -370,11 +400,11 @@
       "id": 8,
       "type": "VLLMOmniDiffusionSampling",
       "pos": [
-        30,
-        225
+        0,
+        200
       ],
       "size": [
-        330,
+        320,
         280
       ],
       "flags": {},
@@ -408,12 +438,12 @@
       "id": 9,
       "type": "VLLMOmniRemoteLoRA",
       "pos": [
-        30,
-        560
+        0,
+        530
       ],
       "size": [
-        370,
-        180
+        320,
+        210
       ],
       "flags": {},
       "order": 9,
@@ -442,12 +472,12 @@
       "id": 10,
       "type": "SaveVideo",
       "pos": [
-        960,
-        650
+        1120,
+        20
       ],
       "size": [
-        390,
-        410
+        330,
+        190
       ],
       "flags": {},
       "order": 10,
@@ -487,7 +517,7 @@
         {
           "name": "video",
           "type": "VIDEO",
-          "links": null
+          "links": []
         }
       ],
       "properties": {
@@ -504,11 +534,11 @@
       "id": 11,
       "type": "Note",
       "pos": [
-        1430,
-        650
+        360,
+        560
       ],
       "size": [
-        520,
+        330,
         260
       ],
       "flags": {},
@@ -520,7 +550,57 @@
         "Node name for S&R": "Note"
       },
       "widgets_values": [
-        "WF-07: remote H3 generation -> frame upscale -> original FPS + audio -> MP4.\nConfigure the remote URL and a server-side Turbo path. The relative LoRA path is resolved on the vLLM-Omni server.\nThis preset: FL2VA server, LightX2V v1.0 768p Turbo, 5 sigma points, video shift 6, audio shift 3; 5.167 seconds -> 124 frames at 24 FPS.\nBase H3: disconnect LoRA, set steps to 50 and video shift to 12.\nRequires ComfyUI-vLLM-Omni with PR #7456 (duration input, automatic H3 aspect ratio, audio decode fix), and RealESRGAN_x2plus.pth in ComfyUI models/upscale_models."
+        "WF-07: H3 + SeedVR2\n\nInstall ComfyUI-SeedVR2_VideoUpscaler. The DiT and VAE loaders use SeedVR2 3B FP16 and ema_vae_fp16.\n\nSet the H3 service URL/model and the server-side Turbo LoRA path.\n\n1536 is the target short edge for this 1344 x 768 preset (2x). Original audio and FPS connect directly to Create Video.\n\nFor base H3: disconnect LoRA, use 50 steps and video flow shift 12."
+      ]
+    },
+    {
+      "id": 12,
+      "type": "SeedVR2LoadVAEModel",
+      "pos": [
+        730,
+        590
+      ],
+      "size": [
+        340,
+        315
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "torch_compile_args",
+          "name": "torch_compile_args",
+          "shape": 7,
+          "type": "TORCH_COMPILE_ARGS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "SEEDVR2_VAE",
+          "name": "SEEDVR2_VAE",
+          "type": "SEEDVR2_VAE",
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SeedVR2LoadVAEModel"
+      },
+      "widgets_values": [
+        "ema_vae_fp16.safetensors",
+        "cuda:0",
+        true,
+        1024,
+        128,
+        true,
+        768,
+        128,
+        "false",
+        "cpu",
+        false
       ]
     }
   ],
@@ -538,7 +618,7 @@
       2,
       0,
       4,
-      1,
+      0,
       "IMAGE"
     ],
     [
@@ -546,8 +626,8 @@
       3,
       0,
       4,
-      0,
-      "UPSCALE_MODEL"
+      1,
+      "SEEDVR2_DIT"
     ],
     [
       4,
@@ -620,16 +700,24 @@
       1,
       3,
       "REMOTE_LORA"
+    ],
+    [
+      13,
+      12,
+      0,
+      4,
+      2,
+      "SEEDVR2_VAE"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.55,
+      "scale": 0.52,
       "offset": [
-        20,
-        40
+        100,
+        100
       ]
     }
   }
