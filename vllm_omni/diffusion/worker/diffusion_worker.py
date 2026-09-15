@@ -985,6 +985,10 @@ class DiffusionWorker:
                 finally:
                     if mgr is not None:
                         mgr.shutdown_prefetch()
+                    # Allow model runner to flush persistent caches etc.
+                    runner_shutdown = getattr(self.model_runner, "shutdown", None)
+                    if runner_shutdown is not None:
+                        runner_shutdown()
         finally:
             try:
                 shutdown_kv_connector()

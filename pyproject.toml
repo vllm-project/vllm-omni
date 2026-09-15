@@ -35,6 +35,13 @@ classifiers = [
 
 [project.optional-dependencies]
 
+# Cross-request DiT cache reuse (cache_backend="inter_request"):
+# CPU→disk tiered latent storage via LMCache's ECCacheEngine. The allocator
+# patch in cache_store.py is verified against this pin.
+inter_request = [
+    "lmcache==0.5.1",
+]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
