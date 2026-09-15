@@ -58,7 +58,15 @@ class SupportsChunkedVAEDecode(Protocol):
     Implementations must drain decoding before surfacing callback errors. In a
     distributed VAE, every rank invokes the method so collectives stay in
     lockstep, while ``on_chunk`` is called only on the rank that owns output.
+
+    ``chunk_value_range`` is the closed interval the delivered floats occupy,
+    which differs per checkpoint: a Wan VAE emits ``(-1.0, 1.0)`` while a
+    MiniMax-H3 VAE reverts through its processor to ``(0.0, 1.0)``. A consumer
+    cannot quantize chunks to pixels without it, so it is part of the
+    capability rather than knowledge each consumer hard-codes per model.
     """
+
+    chunk_value_range: ClassVar[tuple[float, float]]
 
     def decode_with_chunks(
         self,

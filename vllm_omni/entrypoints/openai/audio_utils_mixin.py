@@ -1,5 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Audio serving utility mixin.
+
+PUT HERE:
+  - AudioMixin helpers that convert audio tensors/bytes/formats for speech
+    and audio serving classes (shared by multiple serving paths).
+
+DO NOT PUT HERE:
+  - FastAPI route / form / job orchestration peeled from ``api_server.py``.
+    Put those under an audio package ``helpers.py`` (or audio serving modules)
+    when extracted.
+
+LONGEVITY:
+  - This root mixin is a **temporary shared home**.
+  - TODO(#5227, P1.1): tidy up / move with the audio/speech family split
+    in the Phase 1 audio PR; do not treat this file as the long-term owner.
+  - Endpoint-family helpers under an audio package are the longer home for
+    route-adjacent logic.
+
+See ``openai/README.md`` (utils vs helpers, no overlap).
+"""
 
 import math
 from io import BytesIO
@@ -9,7 +29,12 @@ import torch
 import torchaudio
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.protocol.audio import DEFAULT_AUDIO_FORMAT, AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    DEFAULT_AUDIO_FORMAT,
+    AudioChunkMetadata,
+    AudioResponse,
+    CreateAudio,
+)
 
 try:
     import soundfile
@@ -224,7 +249,16 @@ class AudioMixin:
 
             audio_data = base64.b64encode(audio_data).decode("utf-8")
 
-        return AudioResponse(audio_data=audio_data, media_type=media_type)
+        return AudioResponse(
+            audio_data=audio_data,
+            media_type=media_type,
+            audio_metadata=AudioChunkMetadata(
+                format=response_format,
+                sample_rate_hz=int(sample_rate),
+                frame_count=int(audio_tensor.shape[0]),
+                channels=1 if audio_tensor.ndim == 1 else int(audio_tensor.shape[1]),
+            ),
+        )
 
     @staticmethod
     def _resample_audio(audio_tensor: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:

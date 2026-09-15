@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from enum import Enum
@@ -1113,13 +1114,20 @@ class NativeRuntimeBridgeMixin:
         if response_id is None:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
-            await send_json(
-                self._response_created_payload(
-                    session,
-                    response_id,
-                    epoch=session.epoch,
-                )
+        response_request_metrics = session.mark_response_first_outputs(
+            observed_at_s=time.monotonic(),
+            has_text=has_text,
+            has_audio=has_audio,
+        )
+        if response_created:
+            response_created_payload = self._response_created_payload(
+                session,
+                response_id,
+                epoch=session.epoch,
             )
+            if response_request_metrics:
+                response_created_payload["response_request_metrics"] = response_request_metrics
+            await send_json(response_created_payload)
         response_stage_metrics = session.accumulate_response_stage_metrics(
             native_result.get("stage_metrics") if isinstance(native_result.get("stage_metrics"), Mapping) else None
         )
@@ -1137,6 +1145,7 @@ class NativeRuntimeBridgeMixin:
                 speak_payload,
                 native_result,
                 stage_metrics=response_stage_metrics,
+                response_request_metrics=response_request_metrics,
             )
             await send_json(speak_payload)
         previous_sent_ms = session.playback.sent_ms
@@ -1205,6 +1214,7 @@ class NativeRuntimeBridgeMixin:
             payload,
             native_result,
             stage_metrics=response_stage_metrics,
+            response_request_metrics=response_request_metrics,
         )
         await send_json(payload)
         if (
@@ -1365,6 +1375,7 @@ class NativeRuntimeBridgeMixin:
         native_result: dict[str, object],
         *,
         stage_metrics: Mapping[str, object] | None = None,
+        response_request_metrics: Mapping[str, object] | None = None,
     ) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = native_result.get("runtime_impl")
@@ -1390,6 +1401,8 @@ class NativeRuntimeBridgeMixin:
                 for stage_id, values in effective_stage_metrics.items()
                 if isinstance(values, Mapping)
             }
+        if response_request_metrics:
+            metadata["response_request_metrics"] = dict(response_request_metrics)
         if metadata:
             payload["vllm_omni"] = metadata
 

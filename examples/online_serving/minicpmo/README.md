@@ -183,10 +183,20 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --output-dir /tmp/minicpmo_realtime_duplex_video_demo
 ```
 
-Detail inside a composite is capped by `scale_resolution=448` at
-`max_slice_nums=1`: official suggests HD slicing (`max_slice_nums=[2, 1]`) for
-stacked frames, which the duplex adapter does not implement yet. Reading small
-text or digits out of a wide scene is limited by that, not by frame timing.
+Stage 0 processes a stacked unit the way official HD mode does
+(`max_slice_nums=[2, 1]`): the base frame keeps its own 66-token block plus the
+patches `get_sliced_grid` cuts for its size at `scale_resolution=448`, and the
+composite adds one block. The wire still rejects a caller-supplied
+`max_slice_nums`, so slicing is Stage 0's decision, not the client's.
+
+That detail costs context. One 960x540 frame is 66 vision tokens per unit and a
+stacked pair is 264, on top of the unit's audio, so the Stage 0 prompt grows by
+277 tokens per second stacked against 79 with a single frame. Against the
+40960-token context this model ships with, a listen-heavy call reaches the limit
+after about 2.5 minutes stacked and about 8.5 minutes unstacked (measured on a
+264 s 960x540 clip). Duplex sessions cannot yet evict old units, so keep
+multi-minute calls on the default `--stack-frames 1`; a stacked session that
+outgrows the context ends with a context-length error.
 
 ## Open the experimental browser client
 

@@ -145,15 +145,22 @@ class _MossCodecStreamSession:
         terminal_slots = terminal_slots or set()
         if not terminal_slots.issubset(slot_codes):
             raise ValueError("terminal_slots must be a subset of the decode batch slots.")
-        step_lengths = {int(codes.shape[1]) for codes in slot_codes.values()}
-        if len(step_lengths) != 1:
-            raise ValueError(f"MOSS codec streaming step needs uniform T, got {sorted(step_lengths)}")
-        (step_t,) = step_lengths
+        step_t = max(int(codes.shape[1]) for codes in slot_codes.values())
+        if any(int(codes.shape[1]) != step_t and slot not in terminal_slots for slot, codes in slot_codes.items()):
+            raise ValueError("Only terminal codec rows may be padded to a larger step length")
         slots = list(slot_codes)
         if any(slot not in self._leased_slots for slot in slots):
             raise RuntimeError(f"Streaming decode references an unleased state slot: {slots}")
         codes_step = torch.stack(
-            [slot_codes[slot].to(device=self._device, dtype=torch.long) for slot in slots],
+            [
+                torch.nn.functional.pad(
+                    slot_codes[slot].to(device=self._device, dtype=torch.long),
+                    (0, step_t - int(slot_codes[slot].shape[1])),
+                )
+                if int(slot_codes[slot].shape[1]) != step_t
+                else slot_codes[slot].to(device=self._device, dtype=torch.long)
+                for slot in slots
+            ],
             dim=1,
         )
         state_slot_ids = torch.tensor(slots, device=self._device, dtype=torch.long)
@@ -197,9 +204,9 @@ class _MossCodecStreamSession:
             self._reset_slot_ids(terminal_slot_ids)
 
         audio = audio_tensor.detach().to("cpu", torch.float32)
-        audio_length = step_t * self._samples_per_frame
         out: dict[int, torch.Tensor] = {}
         for row, slot in enumerate(slots):
+            audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
             out[slot] = audio[row, ..., :audio_length].contiguous()
         return out
 
@@ -518,6 +525,8 @@ class MossTTSCodecDecoder(nn.Module):
         outputs: dict[int, torch.Tensor] = {}
         grouped: dict[int, list[tuple[int, str, int, torch.Tensor, bool]]] = {}
         max_step_frames = max(1, int(self._stream_max_step_frames))
+        graph = session._cudagraph_wrapper
+        coalesce_tails = graph is not None and max(graph.batch_sizes, default=0) >= self._stream_state_capacity
 
         for output_index, request_id, codes_nq_t, finished in items:
             slot = self._stream_req_slots.get(request_id)
@@ -548,9 +557,13 @@ class MossTTSCodecDecoder(nn.Module):
                     )
                 continue
 
-            grouped.setdefault(int(codes_nq_t.shape[1]), []).append(
-                (output_index, request_id, slot, codes_nq_t, finished)
-            )
+            frame_count = int(codes_nq_t.shape[1])
+            # Only combine tails that already used the same padded graph.
+            # Preserve exact-size graphs (including T=1) and the eager path.
+            group_frames = frame_count
+            if coalesce_tails and finished:
+                group_frames = graph._select_frame_size(frame_count, allow_padding=True) or frame_count
+            grouped.setdefault(group_frames, []).append((output_index, request_id, slot, codes_nq_t, finished))
 
         for group in grouped.values():
             plan = {slot: codes_nq_t for _, _, slot, codes_nq_t, _ in group}
@@ -756,6 +769,17 @@ class MossTTSCodecDecoder(nn.Module):
         codec.eval()
         if device.type != "cpu":
             codec.decoder.to(dtype=torch.bfloat16)
+        attention_backend = getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa")
+        if attention_backend != "sdpa":
+            if attention_backend != "triton" or device.type != "cuda":
+                raise ValueError(f"Unsupported codec attention backend/device: {attention_backend}/{device.type}")
+            from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerMultiheadAttention
+            from vllm_omni.model_executor.models.moss_tts.streaming_attention import masked_attention
+
+            for module in codec.decoder.modules():
+                if isinstance(module, MossAudioTokenizerMultiheadAttention):
+                    module._streaming_attention = masked_attention
+            logger.info("Enabled Triton masked attention for the streaming codec decoder")
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
             lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
