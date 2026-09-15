@@ -17,6 +17,7 @@ import re as re_module
 from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -120,6 +121,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     KV is managed by the AR-Diffusion engine through the explicit capability
     methods below. The runner binds one session state only for ``forward()``.
     """
+
+    # Generic warmup cannot synthesize robot observations. AR-Diffusion uses
+    # ar_diffusion_warmup_requests() for model-specific warmup instead.
+    dummy_run_num_frames: ClassVar[int] = 0
 
     _POSITIVE_BRANCH = "positive"
     _NEGATIVE_BRANCH = "negative"
