@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from typing import ClassVar
+
 import torch
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -293,16 +295,6 @@ class AttnProcessor:
         kv_heads = key.shape[-1] // head_dim
         dtype = query.dtype
 
-        if sequence_length == 0 or key.shape[1] == 0:
-            # The pipeline's default unconditional branch is a text stream with
-            # zero tokens (negative_prompt_embeds has no rows), so under CFG the
-            # context refiner attends over an empty sequence. SDPA returns an
-            # empty tensor for that; the flash-attention varlen fallback builds
-            # cu_seqlens with arange(step=seq_len) and rejects step 0. Nothing
-            # to attend to either way, so hand the projection an empty input.
-            empty = query.new_zeros(batch_size, sequence_length, attn.heads * head_dim)
-            return attn.to_out[1](attn.to_out[0](empty))
-
         query = query.view(batch_size, -1, attn.heads, head_dim)
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
@@ -437,6 +429,9 @@ class TransformerBlock(nn.Module):
 
 class Transformer2DModel(ModelMixin, ConfigMixin):
     """MammothModa2 DiT transformer"""
+
+    # Target class for ``regionally_compile``.
+    _repeated_blocks: ClassVar[list[str]] = ["TransformerBlock"]
 
     @register_to_config
     def __init__(
@@ -686,8 +681,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         noise_rotary_emb: torch.Tensor,
         temb: torch.Tensor,
     ):
-        for layer in self.context_refiner:
-            text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
+        # Skip context_refiner on empty text (CFG unconditional branch). Kept
+        # outside the compiled region so the SymInt branch doesn't reach Dynamo.
+        if text_hidden_states.shape[1] > 0:
+            for layer in self.context_refiner:
+                text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
 
         for layer in self.noise_refiner:
             img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
