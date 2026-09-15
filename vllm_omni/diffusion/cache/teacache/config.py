@@ -24,6 +24,15 @@ _MODEL_COEFFICIENTS = {
         -3.82021401e00,
         2.64230861e-01,
     ],
+    # Ovis-Image transformer coefficients
+    # Estimated via polyfit on 3920 data points (80 prompts x 50 steps)
+    "OvisImageTransformer2DModel": [
+        -2.349283489951150e03,
+        9.201816692707802e02,
+        -1.101012944687145e02,
+        6.273505263138824e00,
+        -1.114396215400739e-01,
+    ],
     # Qwen-Image transformer coefficients from ComfyUI-TeaCache
     # Tuned specifically for Qwen's dual-stream transformer architecture
     # Used for all Qwen-Image Family pipelines, in general
