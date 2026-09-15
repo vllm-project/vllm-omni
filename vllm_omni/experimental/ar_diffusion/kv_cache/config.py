@@ -19,10 +19,12 @@ class ARDiffusionKVConfig:
     chunk_size: int = 0
     # Resident window in chunks. ``None`` means full attention (no eviction).
     window_chunks: int | None = None
-    # Protected leading chunks (attention sink); never evicted.
-    sink_chunks: int = 0
-    # Boundary reset vs. sliding replacement.
-    reset_at_boundary: bool = False
+    # Protected leading chunks (attention sink); never evicted. ``None`` uses
+    # the model capability default, while 0 explicitly disables the sink.
+    sink_chunks: int | None = None
+    # Boundary reset vs. sliding replacement. ``None`` uses the model
+    # capability default, while False explicitly selects sliding replacement.
+    reset_at_boundary: bool | None = None
     # Fraction of free device memory used to admit additional resident
     # sessions. One session is admitted whenever it fits actual free memory.
     gpu_memory_fraction: float = 0.1
