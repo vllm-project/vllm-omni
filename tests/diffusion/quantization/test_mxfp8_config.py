@@ -127,6 +127,82 @@ def test_get_quant_method_offline_npu(mocker: MockerFixture):
     assert type(method).__name__ == "NPUMxfp8LinearMethod"
 
 
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="Native MXFP8 offline only supported on NPU")
+def test_get_quant_method_offline_npu_wraps_moe_scheme(mocker: MockerFixture):
+    """The Ascend MoE scheme must be adapted to vLLM's FusedMoEMethodBase API."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    layer = object.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = mocker.sentinel.moe_config
+    scheme = mocker.sentinel.scheme
+    adapter = mocker.sentinel.adapter
+    scheme_cls = mocker.patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8.AscendW8A8MXFP8DynamicFusedMoEMethod",
+        return_value=scheme,
+    )
+    adapter_cls = mocker.patch(
+        "vllm_ascend.quantization.method_adapters.AscendFusedMoEMethod",
+        return_value=adapter,
+    )
+    config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True)
+    method = config.get_quant_method(
+        layer,
+        "layers.0.mlp.experts.routed_experts",
+    )
+
+    assert method is adapter
+    scheme_cls.assert_called_once_with()
+    adapter_cls.assert_called_once_with(scheme, layer.moe_config)
+
+
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="Native MXFP8 offline only supported on NPU")
+def test_get_quant_method_offline_npu_skips_ignored_moe(mocker: MockerFixture):
+    """Ignored routed experts must use vLLM's unquantized MoE fallback."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    layer = object.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    config = DiffusionMXFP8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        ignored_layers=["layers.0"],
+    )
+    scheme_cls = mocker.patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8.AscendW8A8MXFP8DynamicFusedMoEMethod",
+    )
+
+    method = config.get_quant_method(
+        layer,
+        "layers.0.mlp.experts.routed_experts",
+    )
+
+    assert method is None
+    scheme_cls.assert_not_called()
+
+
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="Native MXFP8 offline only supported on NPU")
+def test_get_quant_method_offline_npu_skips_child_linear(mocker: MockerFixture):
+    """A block prefix must skip every linear module inside that block."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    config = DiffusionMXFP8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        ignored_layers=["model.layers.7"],
+    )
+    layer = mocker.Mock(spec=LinearBase)
+
+    method = config.get_quant_method(
+        layer,
+        "layers.7.self_attn.qkv_proj",
+    )
+
+    assert type(method).__name__ == "UnquantizedLinearMethod"
+
+
 @pytest.mark.skipif(not current_omni_platform.is_xpu(), reason="XPU platform not available")
 def test_get_quant_method_offline_xpu_raises(mocker: MockerFixture):
     """XPU offline mode must raise NotImplementedError (use AutoRound MXFP8 instead)."""
