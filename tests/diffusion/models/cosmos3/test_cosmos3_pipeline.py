@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -75,6 +75,12 @@ def test_component_selective_model_offload_fails_before_component_loading(monkey
 
     with pytest.raises(ValueError, match="does not support the dit/text_encoder component selector"):
         pipeline_module.Cosmos3OmniDiffusersPipeline(od_config=config)
+
+
+def test_sampling_dtype_defaults_to_float32() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    assert Cosmos3OmniDiffusersPipeline.sampling_dtype == torch.float32
 
 
 class StubScheduler:
@@ -225,6 +231,7 @@ class StubCosmos3Transformer(nn.Module):
             {
                 "token": token,
                 "has_control": control_latents is not None,
+                "hidden_states_dtype": hidden_states.dtype,
                 "timestep": timestep.clone(),
                 "text_mask": text_mask.clone(),
                 "cache_before": self.cached_kv,
@@ -2020,6 +2027,43 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(action, clean)
 
 
+def test_sampling_state_casts_transformer_execution_to_model_dtype(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+
+    latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
+    assert pipeline.sampling_dtype == torch.float32
+    assert latents.dtype == torch.float32
+
+    prediction = pipeline.predict_noise(
+        hidden_states=latents,
+        timestep=torch.tensor([1]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+    )
+
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert prediction.dtype == torch.float32
+
+
+def test_sampling_dtype_can_use_model_dtype(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+    pipeline.sampling_dtype = pipeline.dtype
+
+    latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
+    prediction = pipeline.predict_noise(
+        hidden_states=latents,
+        timestep=torch.tensor([1]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+    )
+
+    assert latents.dtype == torch.bfloat16
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert prediction.dtype == torch.bfloat16
+
+
 def test_prepare_latents_i2v_encodes_only_conditioning_frame(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     calls: list[tuple[str, tuple[int, ...]]] = []
@@ -2103,6 +2147,7 @@ def test_prepare_inverse_dynamics_latents_encodes_full_video(make_cosmos3_pipeli
 
 def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
     latents = torch.zeros(1, 2, 1, 1, 1)
 
     result = pipeline.diffuse(
@@ -2117,6 +2162,8 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         guidance_interval=(500.0, 1000.0),
     )
     assert [call["token"] for call in pipeline.transformer.calls] == [2, 1, 2]
+    assert all(call["hidden_states_dtype"] == torch.bfloat16 for call in pipeline.transformer.calls)
+    assert result.dtype == torch.float32
     torch.testing.assert_close(result, torch.full_like(latents, 6.0))
 
     i2v = pipeline.diffuse(
@@ -2131,6 +2178,8 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         velocity_mask=torch.tensor([[[[[0.0]], [[1.0]]]]]),
         image_latent=torch.full((1, 2, 1, 1, 1), 7.0),
     )
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert i2v.dtype == torch.float32
     torch.testing.assert_close(i2v[:, :, 0:1], torch.full((1, 2, 1, 1, 1), 7.0))
     i2v_noise = pipeline.scheduler.step_calls[-1][0]
     torch.testing.assert_close(i2v_noise[:, :, 0:1], torch.zeros(1, 2, 1, 1, 1))
@@ -2150,6 +2199,9 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         guidance_scale=1.0,
         shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "action_domain_ids": torch.tensor([0])},
     )
+    assert all(call["hidden_states_dtype"] == torch.bfloat16 for call in pipeline.transformer.calls)
+    assert video_result.dtype == torch.float32
+    assert action_result.dtype == torch.float32
     torch.testing.assert_close(video_result, torch.full_like(latents, 4.0))
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
 
