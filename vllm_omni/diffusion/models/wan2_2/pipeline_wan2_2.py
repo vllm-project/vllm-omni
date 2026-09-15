@@ -59,9 +59,11 @@ FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
+        # Keep native Wan's unshifted training endpoints; set_timesteps applies
+        # the requested shift to the interpolated inference sigmas.
         return FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
     if sample_solver == "euler":
@@ -774,7 +776,10 @@ class Wan22Pipeline(
                 self._sample_solver = sample_solver
                 self._flow_shift = flow_shift
 
-            self.scheduler.set_timesteps(num_steps, device=device)
+            if sample_solver == "unipc":
+                self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+            else:
+                self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
