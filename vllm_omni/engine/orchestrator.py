@@ -81,6 +81,7 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.audio_accumulation import AudioChunkBuffer
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -228,6 +229,9 @@ class OrchestratorRequestState:
     duplex_config_generation: int = -1
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
+    # DELTA audio needed by a sentence-final aligner; released with the request
+    # on abort/error, and drained at each completed audio segment.
+    alignment_audio: dict[int, AudioChunkBuffer] = field(default_factory=dict)
 
 
 @dataclass
@@ -1831,6 +1835,7 @@ class Orchestrator:
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)
                 if req_state is not None:
+                    req_state.alignment_audio.clear()
                     cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
@@ -2027,6 +2032,16 @@ class Orchestrator:
                 )
             )
 
+        try:
+            output = self._assemble_alignment_audio(stage_id, output, req_state, finished or segment_finished)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            logger.exception("Failed to assemble alignment audio for request %s", req_id)
+            await self._handle_stage_error(
+                stage_id,
+                ErrorMessage(request_id=req_id, error=f"Failed to assemble alignment audio: {exc}"),
+            )
+            return
+
         if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
@@ -2097,6 +2112,26 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _assemble_alignment_audio(
+        self, stage_id: int, output: RequestOutput, req_state: OrchestratorRequestState, finished: bool
+    ) -> RequestOutput:
+        if stage_id >= req_state.final_stage_id:
+            return output
+        next_config = getattr(self.stage_pools[stage_id + 1], "stage_vllm_config", None)
+        model_config = getattr(next_config, "model_config", None)
+        if getattr(model_config, "model_stage", None) != "forced_aligner":
+            return output
+        if self._stage_receives_async_chunks(stage_id + 1):
+            return output
+        params = req_state.sampling_params_list[stage_id]
+        if getattr(params, "output_kind", None) != RequestOutputKind.DELTA:
+            return output
+        buffer = req_state.alignment_audio.setdefault(stage_id, AudioChunkBuffer())
+        result = buffer.append(output, finished=finished)
+        if finished:
+            req_state.alignment_audio.pop(stage_id, None)
+        return result
 
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""

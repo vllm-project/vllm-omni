@@ -13,7 +13,7 @@ For the full list of supported architectures across all modalities, see
 ## Supported Models
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
@@ -891,6 +891,15 @@ python qwen3_tts/streaming_speech_client.py \
 
 The client writes one PCM file per sentence and a matching
 `sentence_XXX_timestamps.json` sidecar.
+
+Audio remains incremental, but word alignment is sentence-final: the server
+collects the complete audio for the aligner while forwarding the original
+audio chunks to the client. The timestamp-only chunk arrives after the audio;
+its offsets refer to the complete utterance, not to the last audio chunk.
+Clients should not expect timestamps on each audio chunk or interpret missing
+intermediate timestamps as an error. Audio retained for alignment is scoped to
+the request and released when it finishes or is cancelled; longer utterances
+therefore require more host memory than audio-only streaming.
 
 Non-streaming requests can also ask for timestamps: pass
 `"word_timestamps": true` to `POST /v1/audio/speech` and read the
