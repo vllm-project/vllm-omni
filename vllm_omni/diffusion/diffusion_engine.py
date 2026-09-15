@@ -1133,14 +1133,15 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        # Dummy warmup must exercise at least one denoising iteration in
+        # every execution mode. Some pipelines (for example BAGEL) perform
+        # ``num_inference_steps - 1`` scheduler updates and reject an empty
+        # one-step schedule. PipeFusion also needs both sync and async
+        # branches warmed to avoid recompilation.
         req = self._make_dummy_request(
             height=512,
             width=512,
             guidance_scale=0.0,
-            # Dummy warmup must exercise at least one denoising iteration in
-            # every execution mode. Some pipelines (for example BAGEL) perform
-            # ``num_inference_steps - 1`` scheduler updates and reject an empty
-            # one-step schedule.
             num_inference_steps=2,
         )
         if req is None:
