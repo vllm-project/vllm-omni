@@ -17,6 +17,7 @@ _DIM = _HEADS * _HEAD_DIM
 
 @pytest.fixture
 def _dist_env():
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -25,10 +26,13 @@ def _dist_env():
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29517")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    # vLLM 0.28+: parallel-state init, CustomOp construction and the linear
+    # layers' forward all read the current vLLM config.
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        initialize_model_parallel()
+        yield
+        cleanup_dist_env_and_memory()
 
 
 def _rope(seq_len: int):
@@ -54,8 +58,6 @@ def test_table_gate_and_kwargs(monkeypatch):
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("double_stream", [True, False])
 def test_flux_attention_fused_matches_eager(_dist_env, double_stream):
-    from vllm.config import VllmConfig, set_current_vllm_config
-
     from vllm_omni.diffusion.models.flux.flux_transformer import (
         _QK_NORM_ROPE_TABLE_KEY,
         FluxAttention,
@@ -63,7 +65,7 @@ def test_flux_attention_fused_matches_eager(_dist_env, double_stream):
     )
 
     torch.manual_seed(3)
-    with set_current_vllm_config(VllmConfig()), torch.device("cuda"):
+    with torch.device("cuda"):
         attn = FluxAttention(
             query_dim=_DIM,
             heads=_HEADS,
