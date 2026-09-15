@@ -13,6 +13,8 @@ Server rows:
 - ``default`` — no extra ``server_args``.
 - ``vae_slicing_tiling`` — ``--vae-use-slicing --vae-use-tiling`` (the recipe's
   OOM mitigation; applied generically in ``registry.initialize_model``).
+- ``cache_dit`` — single-card Cache-DiT, including the paired-CFG and
+  single-pass request profiles.
 - ``cfg_parallel_2`` — two-card CFG branch parallelism.
 
 Cases (one per test, each parametrized over all server rows):
@@ -23,9 +25,9 @@ Cases (one per test, each parametrized over all server rows):
 - ``test_high_resolution`` — 1024x1024, the recipe-recommended resolution.
 
 Boogu-Image reads ``sp.guidance_scale`` (not ``true_cfg_scale``). These stay
-smoke-depth (``num_inference_steps=2``); numeric parity vs. Diffusers is covered
-by the local parity harness (support plan, step 14). CPU offload, Cache-DiT, and
-non-CFG multi-GPU parallelism remain unsupported.
+smoke-depth (``num_inference_steps=2``); Cache-DiT quality vs. dense inference
+is covered by ``tests/e2e/accuracy/test_boogu_image_cache_dit.py``. CPU offload
+and non-CFG multi-GPU parallelism remain unsupported.
 
 From ``tests/``::
 
@@ -47,6 +49,12 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 MODEL = "Boogu/Boogu-Image-0.1-Base"
 T2I_PROMPT = "A mountain lake at sunset, photorealistic, cinematic lighting"
 NEGATIVE_PROMPT = ""
+CACHE_DIT_ARGS = [
+    "--cache-backend",
+    "cache_dit",
+    "--cache-config",
+    '{"max_warmup_steps":4,"max_continuous_cached_steps":6,"residual_diff_threshold":0.12}',
+]
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
@@ -66,6 +74,11 @@ def _get_diffusion_feature_cases(model: str):
                 server_args=["--vae-use-slicing", "--vae-use-tiling"],
             ),
             id="vae_slicing_tiling",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=CACHE_DIT_ARGS),
+            id="cache_dit",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
         pytest.param(
