@@ -41,7 +41,7 @@ Output geometry is not the raw input size. With `resolution=640` and a
 
 | Profile | Devices | Purpose | Qualification |
 | --- | ---: | --- | --- |
-| TP=2 + model-level CPU offload | 2 | Fit the model on 48 GB cards | Command below; performance numbers pending re-measurement on current main |
+| TP=2 + model-level CPU offload | 2 | Fit the model on 48 GB cards | Measured 2026-09-16 on this host; see Performance |
 
 ## References
 
@@ -75,16 +75,26 @@ Output geometry is not the raw input size. With `resolution=640` and a
 ## Software environment
 
 - OS: Ubuntu 22.04
-- Python: 3.12 (repository current requirement)
-- Driver / runtime: NVIDIA Driver 570.172.18, CUDA 12.8
-- vLLM: 0.29.0, matching the current vLLM-Omni development line
-- vLLM-Omni version or commit: current `main` checkout after rebase
+- Python: 3.11.14
+- NVIDIA driver / runtime: 570.172.18 / CUDA 12.8
+- PyTorch: 2.13.0+cu129
+- Transformers / Diffusers: 5.14.1 / 0.40.0
+- vLLM: 0.29.0+cu129
+- vLLM-Omni: source install of this PR branch
 
-Install from source on the 0.29 line, as in
-[`docs/getting_started/installation/gpu.md`](../../docs/getting_started/installation/gpu.md).
-The default vLLM 0.29.0 wheel targets CUDA 13.0; if the host driver cannot
-run that variant, install a CUDA 12.x-compatible vLLM wheel or build vLLM
-from source before `uv pip install -e .`.
+The default vLLM 0.29.0 wheel targets CUDA 13.0, which driver 570 cannot run.
+This qualification used the official CUDA 12.9 wheel instead; no driver or
+system CUDA change is required, because CUDA 12.x minor-version compatibility
+lets a cu129 build run on a 12.8 driver:
+
+```bash
+uv venv --python 3.11 --seed
+source .venv/bin/activate
+uv pip install \
+  'https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl' \
+  --torch-backend=cu129
+uv pip install -e .
+```
 
 ## Command
 
@@ -128,7 +138,8 @@ ls -lh layered_0.png layered_1.png layered_2.png layered_3.png
 ```
 
 Expected: four RGBA PNG files. For a 720×1280 input at `resolution=640`, each
-layer is 480×864. Inspect mode and size with:
+layer is 480×864. The 2026-09-16 qualification produced four 480×864 RGBA
+PNGs (`layered_0.png` … `layered_3.png`) from a 720×1280 input.
 
 ```bash
 python - <<'PY'
@@ -146,39 +157,46 @@ PY
 
 ## Notes
 
-- Memory: with TP=2 and CPU offload, weights previously loaded at ~15.7 GiB
-  per GPU and peak reserved memory was ~34.2 GB per GPU. Re-measure these
-  numbers on the current checkout before treating them as current.
 - `--tensor-parallel-size 2` is required on 48 GB cards. The full model does
   not fit on one 48 GB device.
 - `--enable-cpu-offload` is strongly recommended. Without it, each rank keeps
-  a full text-encoder copy and per-GPU usage previously rose to ~41.8 GiB,
-  leaving little headroom for denoising and VAE decode. See the
+  a full text-encoder copy. An earlier measurement on this host without offload
+  rose to ~41.8 GiB per GPU, leaving little headroom for denoising and VAE
+  decode. See the
   [tensor-parallel limitation](../../docs/user_guide/diffusion/parallelism/tensor_parallel.md)
   that the text encoder is not sharded.
 - `--enable-cpu-offload` remains the compatibility flag for model-level
   (`mode="module"`) offload. Do not combine it with `--enable-layerwise-offload`
   on this profile; the offload strategies are mutually exclusive.
+- An empty `--prompt` triggers Qwen2.5-VL captioning before denoising. That
+  path needs the text encoder on GPU for the whole `generate()` call; the
+  pipeline activates the sequential-offload hook around captioning so this
+  profile does not hit a CPU/GPU `input_ids` mismatch.
 - If VAE decode is tight on memory, add `--vae-use-tiling`.
-- Increasing `--layers` (within 3–10) mainly grows the denoising latent; text
-  encoding stays essentially unchanged because it is dominated by CPU↔GPU
-  transfer of the encoder.
+- Increasing `--layers` (within 3–10) mainly grows the denoising latent. The
+  empty-prompt caption cost stays essentially unchanged.
 
 ## Performance
 
-Numbers below are from the original April 2026 qualification on this hardware
-(`vLLM-Omni` `a683b1dd`, `--layers 4`, 50 steps, 720×1280 input). They are
-**not** yet re-measured on current `main` and should be replaced after the
-command above is re-run with `--enable-diffusion-pipeline-profiler`.
+Single-request measurement on 2026-09-16, 2x RTX 5880-Ada-48Q, 50 steps,
+`resolution=640`, `layers=4`, empty prompt, TP=2, model-level CPU offload,
+720×1280 input. Parallel stages use rank max. `--enable-diffusion-pipeline-profiler`
+named stages are `text_encoder.forward` (prompt encode after captioning),
+`vae.encode`, `diffuse`, and `vae.decode`.
 
 | Phase | Time | Notes |
 | --- | --- | --- |
-| Pre-processing (VAE encode) | ~38 ms | Image → latent |
-| Text encoding (incl. CPU↔GPU offload) | ~24 s | Qwen2.5-VL encoder moved from CPU to GPU, executed, then moved back |
-| Denoising (50 steps) | ~61 s | ~1.23 s/step |
-| VAE decode + post-processing | < 1 s | Latent → output images |
-| **End-to-end total** | **~85.9 s** | |
-| Peak GPU memory | 34.23 GB | Reserved per GPU; dominated by model weights |
+| Image caption (empty prompt) | ~28.2 s | Qwen2.5-VL `generate()`; not a named profiler stage. Residual of `forward` after the stages below |
+| Prompt encode (`text_encoder.forward`) | 0.036 s | After captioning |
+| VAE encode | 0.043 s | Image → latent |
+| Denoising (`diffuse`, 50 steps) | 61.96 s | ~1.24 s/step |
+| VAE decode | 0.26 s | Latent → RGBA layers |
+| Pipeline `forward` | 90.48 s | Rank max |
+| **End-to-end total** | **90.58 s** | `Omni.generate()` wall time |
+
+This re-run completed without OOM on 48 GB cards. Per-GPU peak was not sampled
+with `nvidia-smi` here. The April 2026 run on the same host with TP=2 and CPU
+offload reserved 34.23 GB per GPU.
 
 ## Supported features
 
