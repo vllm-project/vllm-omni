@@ -50,6 +50,7 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    merge_sampling_constraints,
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
 )
@@ -1373,10 +1374,10 @@ def _stage_sampling_params(
     stage_deploy: StageDeployConfig | None,
     topology: StagePipelineConfig,
 ) -> dict[str, Any] | None:
-    sampling: dict[str, Any] = {}
-    if stage_deploy is not None and stage_deploy.default_sampling_params:
-        sampling.update(_copy_value(stage_deploy.default_sampling_params))
-    sampling.update(_copy_value(topology.sampling_constraints))
+    sampling = merge_sampling_constraints(
+        _copy_value(stage_deploy.default_sampling_params) if stage_deploy is not None else None,
+        _copy_value(topology.sampling_constraints),
+    )
     return sampling or None
 
 
