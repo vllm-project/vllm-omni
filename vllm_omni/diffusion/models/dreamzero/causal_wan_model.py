@@ -70,6 +70,12 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
 
 def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
     """Precompute complex-valued RoPE frequencies (polar form).
+
+    The angles are accumulated in float64 -- at the far end of the table they
+    reach 1e4 radians, where float32 would resolve them to only ~1e-3 -- and the
+    table is handed out as complex64, since cos and sin land in [-1, 1] and the
+    rotation they feed ends in bfloat16.
+
     Returns: complex tensor [max_seq_len, dim // 2]
     """
     if dim % 2 != 0:
@@ -79,16 +85,40 @@ def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
         1.0 / torch.pow(10000, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
     )
     freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+    return freqs.to(torch.complex64)
 
 
 def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Apply RoPE to x using precomputed complex freqs."""
+    """Apply RoPE to x, with ``freqs`` as a real ``(..., 2)`` cos/sin table.
+
+    Two forms of the same rotation, picked by whether inductor is generating code.
+
+    Compiled: inductor cannot generate code for complex operators, so a complex
+    multiply here falls back to eager, and being opaque to the scheduler it also
+    splits the surrounding qk-norm and layout work into separate fusion groups.
+    Written out in real arithmetic the whole segment fuses instead, measured on
+    gfx950 as three kernels collapsing to one.
+
+    Eager: the real form is the slower one by about 4x, because each of its
+    multiply-adds becomes its own pass over a temporary while the complex
+    multiply is a single elementwise kernel.
+
+    Both branches evaluate the same products in the same order and agree bitwise
+    once the caller casts back to bfloat16.
+
+    The rotation runs in float32. Only the angles need anything wider, and they
+    are already spent by the time ``rope_params`` hands over cos and sin: those
+    live in [-1, 1], where float32 carries four more decimal digits than the
+    bfloat16 this result is cast back to.
+    """
     B, seq_len, n, _ = x.shape
-    x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
-    freqs = freqs.unsqueeze(0)
-    x = torch.view_as_real(x * freqs).flatten(3)
-    return x
+    pairs = x.to(torch.float32).reshape(B, seq_len, n, -1, 2)
+    if not torch.compiler.is_compiling():
+        rotated = torch.view_as_complex(pairs) * torch.view_as_complex(freqs).unsqueeze(0)
+        return torch.view_as_real(rotated).flatten(3)
+    x_re, x_im = pairs[..., 0], pairs[..., 1]
+    cos, sin = freqs[..., 0].unsqueeze(0), freqs[..., 1].unsqueeze(0)
+    return torch.stack((x_re * cos - x_im * sin, x_re * sin + x_im * cos), dim=-1).flatten(3)
 
 
 def rope_action_apply(
@@ -102,7 +132,7 @@ def rope_action_apply(
 ) -> torch.Tensor:
     """RoPE with action/state frequency tables for multi-step sequences."""
     B, seq_len, n, _ = x.shape
-    x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
+    x = torch.view_as_complex(x.to(torch.float32).reshape(B, seq_len, n, -1, 2))
     if action_register_length is not None:
         if num_action_per_block is None:
             raise ValueError("num_action_per_block is required when action_register_length is set.")
@@ -119,8 +149,7 @@ def rope_action_apply(
     return x
 
 
-def causal_rope_action_apply(
-    x: torch.Tensor,
+def causal_rope_action_freqs(
     freqs: torch.Tensor,
     freqs_action: torch.Tensor,
     freqs_state: torch.Tensor,
@@ -129,27 +158,31 @@ def causal_rope_action_apply(
     num_state_per_block: int,
     action_state_index: int,
 ) -> torch.Tensor:
-    """RoPE for single inference step (causal / KV-cache mode)."""
-    B, seq_len, n, _ = x.shape
-    x = torch.view_as_complex(x.to(torch.float64).reshape(B, seq_len, n, -1, 2))
-    if action_register_length is not None:
-        expected_length = num_action_per_block + num_state_per_block
-        if action_register_length != expected_length:
-            raise ValueError(
-                f"action_register_length must equal num_action_per_block + num_state_per_block "
-                f"({expected_length}), got {action_register_length}."
-            )
-        freqs_action = freqs_action[
-            action_state_index * num_action_per_block : (action_state_index + 1) * num_action_per_block
-        ]
-        freqs_state = freqs_state[
-            action_state_index * num_state_per_block : (action_state_index + 1) * num_state_per_block
-        ]
-        freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
-        freqs = torch.cat([freqs, freqs_1d], dim=0)
-    freqs = freqs.unsqueeze(0)
-    x = torch.view_as_real(x * freqs).flatten(3)
-    return x
+    """Video RoPE table with the current step's action/state rows appended.
+
+    Single inference step (causal / KV-cache mode). A function of the step index
+    only, so all layers and both q and k share one build -- see ``_forward_blocks``,
+    which calls this once per forward and passes the result down.
+
+    Returned as a real ``(..., 2)`` cos/sin table: the complex form is only used
+    to build it, so no complex tensor reaches the compiled blocks, where inductor
+    would fall back to eager. Converting here costs one view of a table that is
+    four orders of magnitude smaller than the tensors it rotates.
+    """
+    if action_register_length is None:
+        return torch.view_as_real(freqs)
+    expected_length = num_action_per_block + num_state_per_block
+    if action_register_length != expected_length:
+        raise ValueError(
+            f"action_register_length must equal num_action_per_block + num_state_per_block "
+            f"({expected_length}), got {action_register_length}."
+        )
+    freqs_action = freqs_action[
+        action_state_index * num_action_per_block : (action_state_index + 1) * num_action_per_block
+    ]
+    freqs_state = freqs_state[action_state_index * num_state_per_block : (action_state_index + 1) * num_state_per_block]
+    freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
+    return torch.view_as_real(torch.cat([freqs, freqs_1d], dim=0))
 
 
 # ── Normalization ───────────────────────────────────────────────────
@@ -521,14 +554,15 @@ class CausalWanSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         freqs: torch.Tensor,
-        freqs_action: torch.Tensor,
-        freqs_state: torch.Tensor,
         action_register_length: int | None,
         kv_cache: torch.Tensor | Any | None = None,
-        current_start_frame: int = 0,
         is_tf: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Inference-only forward (KV cache path)."""
+        """Inference-only forward (KV cache path).
+
+        ``freqs`` is the real cos/sin table already carrying this step's
+        action/state rows (built once per forward by ``causal_rope_action_freqs``).
+        """
         n, d = self.tp_num_heads, self.head_dim
 
         # Single fused QKV GEMM, then split into the per-rank q/k/v shards.
@@ -546,28 +580,8 @@ class CausalWanSelfAttention(nn.Module):
         if kv_cache is None:
             raise RuntimeError("Inference only: kv_cache is required.")
 
-        action_state_index = max(0, (current_start_frame - 1) // self.num_frame_per_block)
-
-        roped_query = causal_rope_action_apply(
-            q,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length,
-            self.num_action_per_block,
-            self.num_state_per_block,
-            action_state_index,
-        ).type_as(v)
-        roped_key = causal_rope_action_apply(
-            k,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length,
-            self.num_action_per_block,
-            self.num_state_per_block,
-            action_state_index,
-        ).type_as(v)
+        roped_query = rope_apply(q, freqs).type_as(v)
+        roped_key = rope_apply(k, freqs).type_as(v)
 
         roped_action_query = None
         roped_action_key = None
@@ -676,13 +690,10 @@ class CausalWanAttentionBlock(nn.Module):
         x: torch.Tensor,
         e: torch.Tensor,
         freqs: torch.Tensor,
-        freqs_action: torch.Tensor,
-        freqs_state: torch.Tensor,
         context: torch.Tensor,
         action_register_length: int | None = None,
         kv_cache: torch.Tensor | Any | None = None,
         crossattn_cache: dict | None = None,
-        current_start_frame: int = 0,
         is_tf: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
@@ -690,12 +701,9 @@ class CausalWanAttentionBlock(nn.Module):
         y, updated_kv_cache = self.self_attn(
             x=(self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)),
             freqs=freqs,
-            freqs_action=freqs_action,
-            freqs_state=freqs_state,
             action_register_length=action_register_length,
             kv_cache=kv_cache,
             is_tf=is_tf,
-            current_start_frame=current_start_frame,
         )
         x = x + (y * e[2].squeeze(2))
 
@@ -1021,19 +1029,28 @@ class CausalWanModel(nn.Module):
             )
             kv_cache = [c.to_layer_inputs() for c in kv_cache]
 
+        # Append this step's action/state RoPE rows once, outside the compiled blocks:
+        # the table is the same for all 40 layers and for both q and k.
+        freqs = causal_rope_action_freqs(
+            freqs,
+            self.freqs_action,
+            self.freqs_state,
+            action_register_length,
+            self.num_action_per_block,
+            self.num_state_per_block,
+            max(0, (current_start_frame - 1) // self.num_frame_per_block),
+        )
+
         updated_kv_caches: list[torch.Tensor | None] = []
         for block_index, block in enumerate(self.blocks):
             x, updated_kv_cache = block(
                 x=x,
                 e=e0,
                 freqs=freqs,
-                freqs_action=self.freqs_action,
-                freqs_state=self.freqs_state,
                 context=context,
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index] if kv_cache else None,
                 crossattn_cache=crossattn_cache[block_index] if crossattn_cache else None,
-                current_start_frame=current_start_frame,
             )
             updated_kv_caches.append(updated_kv_cache)
 
