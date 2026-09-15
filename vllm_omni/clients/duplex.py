@@ -1475,7 +1475,7 @@ class EventCollector:
             if (
                 event.get("type")
                 in {
-                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
                     "response.output_text.delta",
                     "response.text.delta",
                 }

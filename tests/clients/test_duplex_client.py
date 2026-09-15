@@ -776,7 +776,7 @@ def test_event_collector_reports_global_metrics_across_responses():
         )
         collector.add(
             {
-                "type": "response.audio_transcript.delta",
+                "type": "response.output_audio_transcript.delta",
                 "response_id": response_id,
                 "delta": response_id,
             },
@@ -785,7 +785,7 @@ def test_event_collector_reports_global_metrics_across_responses():
         for received_at_s, duration_ms in zip(audio_times, durations, strict=True):
             collector.add(
                 {
-                    "type": "response.audio.delta",
+                    "type": "response.output_audio.delta",
                     "response_id": response_id,
                     "delta": base64.b64encode(b"audio").decode("ascii"),
                     "sample_rate_hz": 16_000,
@@ -856,7 +856,7 @@ def test_event_collector_prefers_server_request_start_for_ttf():
     for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
         collector.add(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": "resp-a",
                 "delta": base64.b64encode(b"audio").decode("ascii"),
                 "sample_rate_hz": 16_000,
@@ -868,7 +868,7 @@ def test_event_collector_prefers_server_request_start_for_ttf():
             received_at_s=received_at_s,
         )
     collector.add(
-        {"type": "response.audio_transcript.delta", "response_id": "resp-a", "delta": "hello"},
+        {"type": "response.output_audio_transcript.delta", "response_id": "resp-a", "delta": "hello"},
         received_at_s=10.15,
     )
 
