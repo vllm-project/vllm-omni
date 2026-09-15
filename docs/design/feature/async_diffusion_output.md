@@ -117,7 +117,7 @@ After (async D2H):
 
 ### Batch Split
 
-When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_id` for the entire batch, the executor splits it into per-request `async_output_id`s (format `{batch_id}/{request_id}`) via `_batch_split_map`. When `OUTPUT_READY` arrives, the pump extracts per-request results from the batch output and resolves each request's output future independently. If `OUTPUT_READY` arrives before `execute_batch` registers the split map, `execute_batch` directly adopts the early output.
+When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_id` for the entire batch, the executor splits it into per-request `async_output_id`s (format `{batch_id}/{request_id}`) via `_batch_split_map`. When `OUTPUT_READY` arrives, the pump extracts per-request results from the batch output and resolves each request's output future independently. If `OUTPUT_READY` arrives before `execute_batch` registers the split map, `execute_batch` directly adopts the early output. Per-request extraction is contained: a request whose result cannot be read from the batch output is resolved with a `DiffusionOutput(error=...)` of its own, so the rest of the batch still completes.
 
 ### Reliability, Lifecycle & Timeout Behavior
 
@@ -133,6 +133,9 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 
 4. **Storage-Aware IPC Packing**:
    `pack_diffusion_output_shm()` evaluates `max(view_bytes, storage_bytes)` against `_SHM_TENSOR_THRESHOLD` (1 MB) to ensure that per-request slices sharing a large batch storage are moved to POSIX shared memory rather than serialized through pickle over the MessageQueue inline buffer.
+
+5. **Pump Fault Containment & Liveness**:
+   A pump thread is the sole reader of its worker's result queue, so anything escaping it costs every later result rather than one message. Dispatch of each dequeued message is therefore wrapped: a bad message is logged with its traceback and dropped, and the pump keeps draining. Within a batch split the containment is per request, because the split map is popped before delivery starts. Outputs whose waiter has already been cancelled or aborted are dropped instead of cached, since nobody will ever collect them and `_completed_outputs` has no TTL or abort cleanup (a decoded video would stay pinned until shutdown). Finally, `check_health()` treats a dead pump thread as `EngineDeadError`: the processes are all alive and the GPU work still runs, so without that check the engine reports healthy forever while no result ever comes back. Intentional shutdown is excluded, since `shutdown()` sets the stop event before joining.
 
 ## Model Coverage
 
