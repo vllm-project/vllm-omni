@@ -149,15 +149,21 @@ def test_serve_parser_accepts_video_output_transport() -> None:
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(
-        ["serve", "fake-model", "--omni", "--video-output-transport", '{"enable_device_postprocess": true}']
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--video-output-transport",
+            '{"enable_device_postprocess": true, "transport_mode": "url", "output_format": "webm"}',
+        ]
     )
 
-    expected = {"enable_device_postprocess": True}
+    expected = {"enable_device_postprocess": True, "transport_mode": "url", "output_format": "webm"}
     assert args.video_output_transport == expected
     assert args.get_explicit_kwargs_dict()["video_output_transport"] == expected
 
 
-@pytest.mark.parametrize("value", ["{not json", "[]"])
+@pytest.mark.parametrize("value", ["{not json", "[]", "1", "null"])
 def test_serve_parser_rejects_invalid_video_output_transport(value: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")

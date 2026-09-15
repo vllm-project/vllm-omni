@@ -270,11 +270,13 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     )
 
 
-async def _cleanup_video(video_id: str):
+async def _cleanup_video(storage_key: str | None) -> None:
+    if storage_key is None:
+        return
     try:
-        await STORAGE_MANAGER.delete(video_id)
+        await STORAGE_MANAGER.delete(storage_key)
     except Exception:
-        logger.warning("Failed to cleanup partial video file '%s'", video_id)
+        logger.warning("Failed to cleanup partial video file '%s'", storage_key, exc_info=True)
 
 
 def _cleanup_video_references(
@@ -332,7 +334,10 @@ async def _run_video_generation_job(
 
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
+    storage_key: str | None = None
     try:
+        settings = handler._resolve_video_output_settings(request)
+        storage_key = f"{video_id}.{settings.output_format}"
         video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
             await handler.generate_video_bytes(
                 request,
@@ -343,13 +348,14 @@ async def _run_video_generation_job(
             )
         )
 
-        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
+        save_context = await STORAGE_MANAGER.save(video_bytes, storage_key)
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
         updated_fields = {
             "status": VideoGenerationStatus.COMPLETED,
             "progress": 100,
-            "file_name": f"{video_id}.{job.file_extension}",
+            "file_name": storage_key,
+            "media_type": settings.media_type,
             "completed_at": save_context.created_at,
             "inference_time_s": time.perf_counter() - started_at,
             "stage_durations": stage_durations,
@@ -364,7 +370,7 @@ async def _run_video_generation_job(
     except (EngineGenerateError, EngineDeadError) as exc:
         logger.exception("Video generation failed (engine error) for id=%s", video_id)
 
-        await _cleanup_video(video_id)
+        await _cleanup_video(storage_key)
         await VIDEO_STORE.update_fields(
             video_id,
             {
@@ -384,7 +390,7 @@ async def _run_video_generation_job(
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
 
-        await _cleanup_video(video_id)
+        await _cleanup_video(storage_key)
         await VIDEO_STORE.update_fields(
             video_id,
             {
@@ -395,7 +401,7 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        await _cleanup_video(video_id)
+        await _cleanup_video(storage_key)
         await VIDEO_STORE.pop(video_id)
         raise
     finally:

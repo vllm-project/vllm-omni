@@ -1597,11 +1597,19 @@ def test_video_output_transport_mapping_is_normalized() -> None:
     from vllm_omni.diffusion.data import VideoOutputTransportConfig
 
     cfg = omni_config_module._DiffusionConfigProjection(
-        video_output_transport={"enable_device_postprocess": True},
+        video_output_transport={
+            "enable_device_postprocess": True,
+            "transport_mode": "url",
+            "output_format": "webm",
+            "video_codec_options": {"deadline": "realtime"},
+        },
     )
 
     assert isinstance(cfg.video_output_transport, VideoOutputTransportConfig)
     assert cfg.video_output_transport.enable_device_postprocess is True
+    assert cfg.video_output_transport.transport_mode == "url"
+    assert cfg.video_output_transport.output_format == "webm"
+    assert cfg.video_output_transport.video_codec_options == {"deadline": "realtime"}
 
 
 def test_omni_diffusion_config_normalizes_video_output_transport_mapping() -> None:

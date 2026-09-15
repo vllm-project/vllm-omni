@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import io
 import json
 import sys
 from contextlib import contextmanager
@@ -90,33 +91,20 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     assert encoder.pushes[1].shape == (3, 2, 2, 3)
 
 
-def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatch):
-    """A client's encoder options must survive the worker-side pre-encode path."""
+@pytest.mark.parametrize(("codec", "expected_codec"), [("libx264", "h264"), ("libx265", "hevc")])
+def test_resolved_video_codec_policy_reaches_the_preencoded_mp4_encoder(monkeypatch, mocker, codec, expected_codec):
+    """Use the real worker encoder: an accepted HEVC policy must not produce H.264."""
+    av = pytest.importorskip("av")
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
-
-    class FakeEncoder:
-        instances = []
-
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.__class__.instances.append(self)
-
-        def push(self, frames):
-            del frames
-
-        def finish(self):
-            return b"mp4"
-
-        def abort(self):
-            raise AssertionError("unexpected abort")
+    from vllm_omni.diffusion.utils import media_utils
 
     class FakeAudioVAE:
         def decode_latent(self, latent):
-            return torch.zeros(1, 1, 2)
+            return torch.zeros(1, 1, 4800)
 
     class FakeVideoVAE:
         def decode_with_chunks(self, latent, *, on_chunk):
-            on_chunk(torch.zeros(1, 3, 1, 2, 2))
+            on_chunk(torch.zeros(1, 3, 2, 32, 32))
 
     pipeline = object.__new__(mod.MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -124,17 +112,26 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     pipeline.video_vae = FakeVideoVAE()
     pipeline.device = torch.device("cpu")
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
-    monkeypatch.setattr("vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder", FakeEncoder)
+    encoder = mocker.spy(media_utils, "ChunkedMP4Encoder")
+    options = {"preset": "ultrafast", "threads": "1", "crf": "0"}
+    if codec == "libx265":
+        options["x265-params"] = "pools=none:frame-threads=1:log-level=error"
 
-    pipeline.decode_to_mp4(
+    encoded = pipeline.decode_to_mp4(
         torch.zeros(1),
         torch.zeros(1),
-        height=2,
-        width=2,
-        video_codec_options={"preset": "ultrafast"},
+        height=32,
+        width=32,
+        video_codec=codec,
+        video_codec_options=options,
     )
 
-    assert FakeEncoder.instances[-1].kwargs["video_codec_options"] == {"preset": "ultrafast"}
+    assert encoder.call_args.kwargs["video_codec"] == codec
+    assert encoder.call_args.kwargs["video_codec_options"] == options
+    with av.open(io.BytesIO(encoded)) as container:
+        assert container.streams.video[0].codec_context.name == expected_codec
+        assert container.streams.audio[0].codec_context.name == "aac"
+        assert len(list(container.decode(video=0))) == 2
 
 
 @pytest.mark.parametrize(
@@ -173,7 +170,14 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
         fps=24,
         num_frames=124,
         num_inference_steps=50,
-        extra_args={"task": "t2va", "aspect_ratio": "16:9", "preencode_mp4": True, **codec_extra, **batch_extra},
+        extra_args={
+            "task": "t2va",
+            "aspect_ratio": "16:9",
+            "preencode_mp4": True,
+            "video_codec": "libx264",
+            **codec_extra,
+            **batch_extra,
+        },
     )
     batch = DiffusionRequestBatch(
         [OmniDiffusionRequest(prompt="test", sampling_params=sampling, request_id="codec-defaults")]
@@ -181,6 +185,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
 
     pipeline.forward(batch)
 
+    assert pipeline.decode_to_mp4.call_args.kwargs["video_codec"] == "libx264"
     assert pipeline.decode_to_mp4.call_args.kwargs["video_codec_options"] == expected
     assert pipeline.decode_to_mp4.call_args.kwargs["batch_frames"] == batch_frames
 
