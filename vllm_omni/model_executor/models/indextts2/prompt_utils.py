@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Prompt helpers for IndexTTS2 talker prefill."""
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ def estimate_indextts2_prefill_prompt_len(
     lang: str = "zh",
     text_normalization: bool = True,
     tokenizer_file: str = INDEXTTS25_TOKENIZER_FILE,
+    text_preprocessed: bool = False,
 ) -> int:
     """Return the placeholder prompt length expected by the IndexTTS2 talker.
 
@@ -56,6 +57,7 @@ def estimate_indextts2_prefill_prompt_len(
             model_dir=model_id_or_path,
             text_normalization=text_normalization,
             tokenizer_file=tokenizer_file,
+            text_preprocessed=text_preprocessed,
         )
         conditioning_prefix_tokens = _V25_CONDITIONING_PREFIX_TOKENS
         text_token_count = (

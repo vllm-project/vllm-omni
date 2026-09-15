@@ -902,6 +902,54 @@ class TestSpeechAPI:
 class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
 
+    @pytest.mark.asyncio
+    async def test_segmented_request_encodes_all_audio_once(self, speech_server, mocker):
+        from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import IndexTTS25Adapter
+
+        server = speech_server
+        server._tts_model_type = "indextts2_5"
+        adapter = IndexTTS25Adapter(SpeechServingContext(server=server))
+        mocker.patch.object(server, "_get_tts_adapter", return_value=adapter)
+        mocker.patch.object(adapter, "validate", return_value=None)
+        mocker.patch.object(
+            adapter,
+            "build",
+            new=mocker.AsyncMock(
+                return_value=PreparedRequest(
+                    prompt={"part": 0},
+                    additional_prompts=[{"part": 1}],
+                    model_type="indextts2_5",
+                    segment_silence_ms=0,
+                )
+            ),
+        )
+        server.engine_client.default_sampling_params_list = []
+        server.engine_client.abort = mocker.AsyncMock()
+        calls = []
+
+        async def engine_generate(**kwargs):
+            calls.append(kwargs["request_id"])
+            yield OmniRequestOutput(
+                _multimodal_output={"audio": torch.full((4,), float(kwargs["prompt"]["part"])), "sr": 22050},
+                metrics={"stage_metrics": {"0": {"num_tokens_out": 3}}},
+            )
+
+        server.engine_client.generate = engine_generate
+        create_audio = mocker.patch.object(
+            server,
+            "create_audio",
+            return_value=SimpleNamespace(
+                audio_data=b"encoded",
+                media_type="audio/wav",
+            ),
+        )
+        result = await server._generate_audio_bytes(OpenAICreateSpeechRequest(input="full text", seed=42))
+
+        assert result == (b"encoded", "audio/wav")
+        create_audio.assert_called_once()
+        assert create_audio.call_args.args[0].audio_tensor.tolist() == [0.0] * 4 + [1.0] * 4
+        assert len(calls) == 2 and calls[0] != calls[1]
+
     @pytest.fixture
     def speech_server(self, mocker, tmp_path, monkeypatch):
         monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))

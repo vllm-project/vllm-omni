@@ -138,6 +138,10 @@ class PreparedRequest:
     #: Cross-cutting per-request state the orchestrator still owns (e.g. the
     #: Qwen3-TTS ref-audio warmup artifact key tracked after ``generate()``).
     warmup_artifact_key: str | None = None
+    #: Additional complete prompts, executed in order after ``prompt``. Only
+    #: non-streaming audio without word timestamps supports this path.
+    additional_prompts: list[dict[str, Any]] = field(default_factory=list)
+    segment_silence_ms: int = 200
 
 
 @dataclass

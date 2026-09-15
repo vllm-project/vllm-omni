@@ -429,6 +429,11 @@ def test_indextts25_build_uses_configured_tokenizer_file(
     hf_config,
     expected_tokenizer_file,
 ):
+    from vllm_omni.model_executor.models.indextts2 import text_processing_v2_5, tokenizer_v2_5
+
+    hf_config.gpt = {"max_text_tokens": 600}
+    monkeypatch.setattr(text_processing_v2_5, "normalize_indextts25_text", lambda text, **kwargs: text)
+    monkeypatch.setattr(tokenizer_v2_5, "encode_indextts25_text", lambda text, **kwargs: [42])
     captured = {}
 
     def fake_estimate(*args, **kwargs):
@@ -459,6 +464,125 @@ def test_indextts25_build_uses_configured_tokenizer_file(
 
     assert prepared.prompt["prompt_token_ids"] == [1] * 4
     assert captured["tokenizer_file"] == expected_tokenizer_file
+
+
+@pytest.mark.parametrize("normalized, expected", [("ONE.TWO.THREE.", ["ONE.", "TWO.", "THREE."]), ("ONE.", ["ONE."])])
+def test_indextts25_segments_normalize_once_and_preserve_conditioning(monkeypatch, mocker, normalized, expected):
+    from vllm_omni.model_executor.models.indextts2 import text_processing_v2_5, tokenizer_v2_5
+    from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import IndexTTS25Config
+
+    calls = []
+    voice = [[0.1, 0.2], 22050]
+    shared_params = {
+        "text": ["original"],
+        "lang": ["en"],
+        "text_normalization": [True],
+        "voice": [voice],
+        "duration_factor": [0.5],
+        "emo_alpha": [0.8],
+    }
+
+    async def build_params(request):
+        calls.append("resolve_reference")
+        return shared_params
+
+    def normalize(text, *, lang, text_normalization):
+        assert text == "original"
+        assert lang == "en"
+        assert text_normalization is True
+        calls.append("normalize")
+        return normalized
+
+    def encode(text, *, model_dir, tokenizer_file):
+        assert model_dir == "/model"
+        assert tokenizer_file == "custom.tiktoken"
+        return [ord(char) + 2 for char in text]
+
+    monkeypatch.setattr(text_processing_v2_5, "normalize_indextts25_text", normalize)
+    monkeypatch.setattr(text_processing_v2_5, "encode_indextts25_text", encode)
+    monkeypatch.setattr(tokenizer_v2_5, "encode_indextts25_text", encode)
+    server = mocker.Mock()
+    server.engine_client.model_config.model = "/model"
+    server.engine_client.model_config.hf_config = IndexTTS25Config(
+        tokenizer_file="custom.tiktoken", gpt={"max_text_tokens": 13}
+    )
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=server))
+    monkeypatch.setattr(adapter, "_build_params", build_params)
+    request = OpenAICreateSpeechRequest(input="original")
+
+    prepared = asyncio.run(adapter.build_segments(request))
+
+    assert calls == ["resolve_reference", "normalize"]
+    assert [item.tts_params["text"][0] for item in prepared] == expected
+    assert len({item.prompt["cache_salt"] for item in prepared}) == len(expected)
+    for item in prepared:
+        params = item.tts_params
+        assert params is not shared_params
+        assert params["voice"] is shared_params["voice"]
+        assert params["duration_factor"] == [0.5]
+        assert params["emo_alpha"] == [0.8]
+        assert params["_indextts25_text_preprocessed"] == [True]
+        assert item.prompt["additional_information"] is params
+        # Language-prefixed text + 2 wrappers + 3 conditioning + 1 start-mel.
+        assert len(item.prompt["prompt_token_ids"]) == len("<|en|> " + params["text"][0]) + 6
+    assert shared_params["text"] == ["original"]
+    assert "_indextts25_text_preprocessed" not in shared_params
+
+
+def test_indextts25_preprocessing_mode_changes_cache_salt():
+    request = OpenAICreateSpeechRequest(input="hello")
+    params = {"text": ["hello"]}
+    assert indextts2_conditioning_cache_salt(request, params) != indextts2_conditioning_cache_salt(
+        request, dict(params, _indextts25_text_preprocessed=[True])
+    )
+
+
+@pytest.mark.parametrize("mode", ["stream", "timestamps", "plain"])
+def test_indextts25_long_request_response_scope(mocker, mode):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+    mocker.patch.object(
+        adapter,
+        "build_segments",
+        new=mocker.AsyncMock(
+            return_value=[
+                PreparedRequest(prompt={"part": 0}),
+                PreparedRequest(prompt={"part": 1}),
+            ]
+        ),
+    )
+    request = OpenAICreateSpeechRequest(input="text", stream=mode == "stream", word_timestamps=mode == "timestamps")
+    if mode == "plain":
+        prepared = asyncio.run(adapter.build(request, [], False))
+        assert prepared.additional_prompts == [{"part": 1}]
+    else:
+        with pytest.raises(ValueError, match="non-streaming"):
+            asyncio.run(adapter.build(request, [], False))
+
+
+@pytest.mark.parametrize("emotion_text", [None, "", "happy"])
+def test_indextts25_prepares_off_loop_and_preserves_full_emotion_text(mocker, emotion_text):
+    import threading
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+
+    loop_thread = threading.get_ident()
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+    params = {"use_emo_text": [True], "emo_text": [emotion_text]}
+    mocker.patch.object(adapter, "_build_params", new=mocker.AsyncMock(return_value=params))
+    prepared = [PreparedRequest(prompt={"prompt_token_ids": [1]})]
+
+    def prepare(request, params):
+        assert threading.get_ident() != loop_thread
+        assert params["emo_text"] == [request.input if emotion_text is None else emotion_text]
+        return prepared
+
+    mocker.patch.object(adapter, "_prepare_segments", side_effect=prepare)
+    request = OpenAICreateSpeechRequest(input="The entire input, before splitting.")
+    assert asyncio.run(adapter.build_segments(request)) is prepared
 
 
 def test_diffusion_adapter_extra_body_params_fallback():

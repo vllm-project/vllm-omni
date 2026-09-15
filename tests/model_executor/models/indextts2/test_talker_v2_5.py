@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -81,6 +81,37 @@ def test_v25_text_tokens_filter_existing_start_and_stop_ids(monkeypatch):
 
     assert token_ids.tolist() == [[0, 58838, 42, 1]]
     assert language_id.tolist() == [7]
+
+
+def test_v25_preprocessed_text_is_identical_in_prompt_sizing_and_talker(monkeypatch):
+    from vllm_omni.model_executor.models.indextts2 import prompt_utils, text_processing_v2_5
+
+    encoded_inputs = []
+
+    def fail_normalization(*args, **kwargs):
+        raise AssertionError("Preprocessed segments must not be normalized again")
+
+    def encode(text, **kwargs):
+        encoded_inputs.append(text)
+        return [58838, 42, 43]
+
+    monkeypatch.setattr(text_processing_v2_5, "normalize_indextts25_text", fail_normalization)
+    monkeypatch.setattr(text_processing_v2_5, "encode_indextts25_text", encode)
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    talker.conditioning_policy = resolve_indextts_conditioning_policy("indextts2_5")
+    talker.model_path = "/model"
+    talker.config = SimpleNamespace(tokenizer_file="tokenizer.tiktoken")
+    text = "<|SPECIAL_TOKEN_2|>XING2<|SPECIAL_TOKEN_2|>"
+
+    prompt_len = prompt_utils.estimate_indextts2_prefill_prompt_len(
+        "/model", text, model_type="indextts2_5", lang="zh", text_preprocessed=True
+    )
+    token_ids, language_id = talker._tokenize_text(text, torch.device("cpu"), lang="zh", text_preprocessed=True)
+
+    assert encoded_inputs == ["<|zh|> " + text] * 2
+    assert prompt_len == token_ids.shape[1] + 3 + 1
+    assert language_id is not None
+    assert language_id.tolist() == [1]
 
 
 def test_native_fsdp_checkpoint_keys_are_normalized_at_every_nesting_level():
