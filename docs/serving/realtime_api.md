@@ -5,7 +5,7 @@ receive incremental transcription and synthesized response audio. This is a
 turn-based streaming API: it starts one generation over an audio stream and
 finishes after the client closes that input stream.
 
-For a model that listens while it is already speaking, use the experimental
+For a model that listens while it is already speaking, use the
 [Full-Duplex API](full_duplex_api.md) instead.
 
 ## Quick Start
@@ -35,7 +35,7 @@ Messages in both directions are JSON text frames. Audio carried inside an
 event is base64-encoded raw PCM16.
 
 | Direction | Event | Purpose |
-|-----------|-------|---------|
+| ----------- | ------- | --------- |
 | Server to client | `session.created` | Confirms that the WebSocket connection is ready |
 | Client to server | `session.update` | Selects and validates the served model |
 | Client to server | `input_audio_buffer.commit` with `final: false` | Starts generation over the incoming stream |
@@ -43,8 +43,8 @@ event is base64-encoded raw PCM16.
 | Client to server | `input_audio_buffer.commit` with `final: true` | Marks the end of input |
 | Server to client | `transcription.delta` | Carries incremental response text |
 | Server to client | `transcription.done` | Carries final text and token usage |
-| Server to client | `response.audio.delta` | Carries incremental PCM16 response audio |
-| Server to client | `response.audio.done` | Marks the end of response audio |
+| Server to client | `response.output_audio.delta` | Carries incremental PCM16 response audio |
+| Server to client | `response.output_audio.done` | Marks the end of response audio |
 | Server to client | `error` | Reports an invalid event, model, or audio payload |
 
 A minimal client sends events in this order:
@@ -63,7 +63,7 @@ engine is consuming the stream.
 ## Audio Handling
 
 - Input is mono PCM16 at 16 kHz for the Qwen3-Omni example.
-- `response.audio.delta.audio` contains base64-encoded PCM16 bytes.
+- `response.output_audio.delta.audio` contains base64-encoded PCM16 bytes.
 - Read `sample_rate_hz` from each audio event instead of assuming an output
   rate. Qwen3-Omni output is typically 24 kHz.
 - Concatenate audio deltas in receive order to construct the output waveform.

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TTS model detection: registry-driven stage -> model-type resolution.
 
 ``serving_speech.py`` used to carry a hand-written 20-branch ladder mapping
@@ -132,10 +133,13 @@ _PIPELINE_STAGES = [
     "audex_thinker",
     "audex_tta_thinker",
     "audex_xcodec",
+    "audio8_tts_codec_decoder",
+    "audio8_tts_slow_ar",
     "audio_generation",
     "audio_tokenizer",
     "audio_vae",
     "aura",
+    "breeze_tts_2",
     "code2wav",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
@@ -182,6 +186,7 @@ _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]
 _ARCHS = [
     None,
     "VoxCPM2TalkerForConditionalGeneration",
+    "BreezeForConditionalGeneration",
     "MingTTSForConditionalGeneration",
     "CovoAudioForConditionalGeneration",
     "MyCovoAudioThing",
@@ -253,6 +258,11 @@ def test_arch_matching_is_a_fallback_not_an_override():
     # Where the two real Ming deployments live, they agree.
     assert detect_tts_model_type("llm", "MingTTSForConditionalGeneration") == "ming_tts"
     assert detect_tts_model_type("ming_tts", "MingTTSForConditionalGeneration") == "ming_flash_omni_tts"
+
+
+def test_shared_latent_generator_resolves_by_architecture_priority():
+    assert detect_tts_model_type("latent_generator", "VoxCPM2TalkerForConditionalGeneration") == "voxcpm2"
+    assert detect_tts_model_type("latent_generator", "DotsTTSForConditionalGeneration") == "dots_tts"
 
 
 def test_stage_keys_cover_legacy_stage_set():

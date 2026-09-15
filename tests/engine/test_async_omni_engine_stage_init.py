@@ -11,7 +11,7 @@ import types
 
 import pytest
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, normalize_omni_diffusion_kwargs
+from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
@@ -205,6 +205,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     engine._omni_lb_policy = "random"
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = True
+    engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
     runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
@@ -925,10 +926,7 @@ def test_remote_replicas_use_distinct_init_group_keys():
         replica.launch_mode = "remote"
         replica.metadata.runtime_cfg = None
 
-    assert [runtime._replica_init_group_key(replica) for replica in plan.replicas] == [
-        "remote:1:0",
-        "remote:1:1",
-    ]
+    assert runtime._init_group_keys(plan.replicas) == ["remote:1:0", "remote:1:1"]
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
@@ -1595,73 +1593,58 @@ def test_model_path_resolver_is_generic_and_model_owned(tmp_path):
     assert "model_path_resolver" not in engine_args
 
 
-def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
+def test_build_stage0_input_processor_uses_omni_renderer_subclass(monkeypatch):
+    from vllm.renderers import BaseRenderer
+
     import vllm_omni.engine.stage_init_utils as init_mod
+    from vllm_omni.inputs.preprocess import OmniRenderer, omni_renderer_cls
 
-    class DummyInputProcessor:
-        def __init__(self, vllm_config, renderer=None):
-            self.vllm_config = vllm_config
-            self.renderer = renderer or object()
-            self.input_preprocessor = None
+    class _Base(BaseRenderer):
+        def __init__(self, config, tokenizer):
+            self.config, self.tokenizer = config, tokenizer
 
-    class DummyOmniInputPreprocessor:
-        def __init__(self, vllm_config, renderer=None):
-            self.vllm_config = vllm_config
-            self.renderer = renderer
+        def render_messages(self, messages, params):  # pragma: no cover - abstract stub
+            raise NotImplementedError
 
-    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
-    monkeypatch.setattr(init_mod, "OmniInputPreprocessor", DummyOmniInputPreprocessor)
-
-    input_processor = build_stage0_input_processor(
-        types.SimpleNamespace(model_config=types.SimpleNamespace(try_get_generation_config=lambda: {}))
-    )
-
-    assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
-    assert input_processor.input_preprocessor.renderer is input_processor.renderer
-
-
-def test_build_stage0_input_processor_does_not_resolve_tokenizer_when_skipped(
-    monkeypatch,
-):
-    import vllm_omni.engine.stage_init_utils as init_mod
-
-    token_only_renderer = object()
+    config = types.SimpleNamespace(model_config=types.SimpleNamespace(try_get_generation_config=lambda: {}))
+    built = omni_renderer_cls(_Base)(config, "tok")
     seen = {}
 
     class DummyInputProcessor:
         def __init__(self, vllm_config, renderer=None):
-            if renderer is None:
-                raise AssertionError("skip_tokenizer_init must supply a renderer")
             seen["renderer"] = renderer
             self.renderer = renderer
-            self.input_preprocessor = None
-
-    class DummyOmniInputPreprocessor:
-        def __init__(self, vllm_config, renderer=None):
-            seen["preprocessor_renderer"] = renderer
 
     monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
-    monkeypatch.setattr(
-        init_mod,
-        "_build_token_only_renderer",
-        lambda _config: token_only_renderer,
-    )
-    monkeypatch.setattr(
-        init_mod,
-        "OmniInputPreprocessor",
-        DummyOmniInputPreprocessor,
-    )
+    monkeypatch.setattr(init_mod, "build_omni_renderer", lambda cfg: built if cfg is config else None)
+    processor = build_stage0_input_processor(config)
+    assert seen["renderer"] is built
+    assert isinstance(processor.renderer, OmniRenderer)
+    assert isinstance(processor.renderer, _Base)
+    assert not hasattr(processor, "input_preprocessor")
 
+
+def test_build_stage0_input_processor_does_not_resolve_tokenizer_when_skipped(monkeypatch):
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    original = object()
+
+    class DummyInputProcessor:
+        def __init__(self, vllm_config, renderer=None):
+            assert renderer is original
+            self.renderer = renderer
+
+    def _must_not_resolve(_cfg):
+        raise AssertionError("tokenizer must not be resolved when skip_tokenizer_init=True")
+
+    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
+    monkeypatch.setattr(init_mod, "_build_token_only_renderer", lambda _: original)
+    monkeypatch.setattr(init_mod, "build_omni_renderer", _must_not_resolve)
     config = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(
-            skip_tokenizer_init=True,
-            try_get_generation_config=lambda: {},
-        )
+        model_config=types.SimpleNamespace(skip_tokenizer_init=True, try_get_generation_config=lambda: {})
     )
-    build_stage0_input_processor(config)
-
-    assert seen["renderer"] is token_only_renderer
-    assert seen["preprocessor_renderer"] is token_only_renderer
+    processor = build_stage0_input_processor(config)
+    assert processor.renderer is original
 
 
 def test_inject_kv_stage_info_infers_sender_tp_topology():
@@ -1729,133 +1712,6 @@ def test_inject_kv_stage_info_infers_receiver_tp_topology():
     assert stage1.engine_args["omni_kv_config"]["stage_id"] == 1
     assert stage1.engine_args["omni_kv_config"]["engine_input_source"] == [0]
     assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
-
-
-def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=None,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-        trust_remote_code=False,
-    )
-
-    diffusion_attention_config = stage_configs[0].engine_args.diffusion_attention_config
-    assert isinstance(diffusion_attention_config, AttentionConfig)
-    assert diffusion_attention_config.default is not None
-    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
-
-
-def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    existing_attention = AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=existing_attention,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-        trust_remote_code=False,
-    )
-
-    assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
-
-
-def test_resolve_stage_configs_does_not_inject_over_stage_diffusion_attention_backend(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_backend="TORCH_SDPA",
-            diffusion_attention_config=None,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-        trust_remote_code=False,
-    )
-
-    engine_args = stage_configs[0].engine_args
-    assert engine_args.diffusion_attention_backend == "TORCH_SDPA"
-    assert engine_args.diffusion_attention_config is None
-    normalized = normalize_omni_diffusion_kwargs(vars(engine_args))
-    assert normalized["diffusion_attention_config"].default.backend == "TORCH_SDPA"
-
-
-def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stage(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="llm",
-        engine_args=types.SimpleNamespace(
-            attention_config={"backend": "FLASH_ATTN"},
-            enable_sleep_mode=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "TORCH_SDPA"},
-        trust_remote_code=False,
-    )
-
-    assert stage_configs[0].engine_args.attention_config == {"backend": "FLASH_ATTN"}
-    assert not hasattr(stage_configs[0].engine_args, "diffusion_attention_config")
 
 
 def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):

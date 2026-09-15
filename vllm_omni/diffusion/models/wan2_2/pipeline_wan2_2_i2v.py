@@ -32,6 +32,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
@@ -192,6 +193,7 @@ class Wan22I2VPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
         self,

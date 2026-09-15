@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Contract tests for the fullduplex core (PR #3907 alignment).
 
 Covers the DuplexFence identity value, the session identity rules (epoch only
@@ -14,6 +14,7 @@ import dataclasses
 
 import pytest
 
+from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.core import protocol as ev
 from vllm_omni.experimental.fullduplex.core.adapter import (
     DuplexAdapter,
@@ -26,7 +27,6 @@ from vllm_omni.experimental.fullduplex.core.session import (
     DuplexSessionConfig,
     DuplexState,
 )
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

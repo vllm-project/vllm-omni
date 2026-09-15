@@ -90,6 +90,13 @@ depends on the installed kernels and model path.
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on` or `off`; default `on` | Streaming video output; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `on`. | Experimental |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast` or `slow`; default `fast` | Streaming video audio deltas; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `fast`. | Experimental |
 
+### NIXL stage transfer
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; default `3600` | Unclaimed producer payload expiry; connector construction | Nonempty environment value overrides `lease_seconds`; empty falls back to config/default. Invalid floats raise `ValueError`. Claimed READ allocations never expire by time. | Experimental |
+| `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; default `300` | Receiver READ wait; connector construction | Nonempty environment value overrides `transfer_timeout_s`; empty falls back to config/default. Invalid floats raise `ValueError`. Timeout does not cancel DMA or release active allocations. | Experimental |
+
 ### Server storage
 
 Storage names use Pydantic's nested-settings delimiter (`__`). They are read
@@ -112,6 +119,7 @@ settings.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
+| `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS` | Non-negative integer; unset or empty means each consumer's own default (Boogu-Image: `2048`) | Token gate of the shared `fused_qk_norm_rope` op: a rotary table is packed for the fused kernel only when it spans at least this many positions (`B*S`); read at forward time | Environment-only. `0` = always fuse; a very large value disables the fused path. Any other value raises `ValueError` on the first forward. The crossover is host-dependent; re-benchmark before overriding. | Experimental performance control |
 | `VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | ModelOpt NVFP4 compatibility patch; read when `vllm_omni.patch` imports | Environment-only escape hatch. Any other value means false. Set only to diagnose the upstream NaN-scale issue. | Diagnostic and temporary |
 | `VLLM_OMNI_USE_QUACK_FP8` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; unset means hardware auto-detection | FP8 scaled matrix multiplication; evaluated when quack capability is selected | A set value overrides auto-detection. Any non-truthy value forces quack off. If quack cannot load, vLLM-Omni warns and falls back to FlashInfer. | Experimental performance control |
 
@@ -151,7 +159,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.28 environment-variable reference](https://docs.vllm.ai/en/v0.28.0/configuration/env_vars.html)
+the [vLLM 0.29 environment-variable reference](https://docs.vllm.ai/en/v0.29.0/configuration/env_vars.html)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 
@@ -179,7 +187,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The audit found 56 variables read by a single model or pipeline family. They are
+The audit found 58 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -188,7 +196,7 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 33 | Move a stable setting into typed stage or model configuration. |
+| Promote | 35 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 6 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
 | Internalize | 11 | Keep a debug or diagnostic switch out of public documentation and configuration. |

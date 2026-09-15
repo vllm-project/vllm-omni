@@ -21,6 +21,20 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.engine.duplex.control_plane import DuplexControlPlane
+from vllm_omni.engine.duplex.messages import (
+    AppendDuplexInputMessage,
+    CloseDuplexSessionMessage,
+    DuplexFence,
+    OpenDuplexSessionMessage,
+    SignalDuplexTurnMessage,
+)
+from vllm_omni.engine.duplex.runtime import (
+    DuplexInputMode,
+    DuplexRuntimeCapabilities,
+    DuplexSessionRuntimeState,
+    duplex_resource_request_id,
+)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -39,22 +53,8 @@ from vllm_omni.engine.orchestrator import (
     _build_terminal_empty_output,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
-from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
-    DuplexInputMode,
-    DuplexRuntimeCapabilities,
-    DuplexSessionRuntimeState,
-    duplex_resource_request_id,
-)
-from vllm_omni.experimental.fullduplex.engine.messages import (
-    AppendDuplexInputMessage,
-    CloseDuplexSessionMessage,
-    DuplexFence,
-    OpenDuplexSessionMessage,
-    SignalDuplexTurnMessage,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -2665,7 +2665,10 @@ async def test_duplex_reaper_loop_waits_between_ticks():
 
 
 @pytest.mark.asyncio
-async def test_duplex_reaper_loop_survives_one_cleanup_failure():
+@pytest.mark.parametrize("first_cleanup_delay", [0.0, 0.05], ids=["immediate", "delayed"])
+async def test_duplex_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: float) -> None:
+    recovered = asyncio.Event()
+
     class _Plane:
         def __init__(self) -> None:
             self.calls = 0
@@ -2673,7 +2676,9 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
         async def reap_expired(self) -> int:
             self.calls += 1
             if self.calls == 1:
+                await asyncio.sleep(first_cleanup_delay)
                 raise RuntimeError("transient cleanup failure")
+            recovered.set()
             return 0
 
     orchestrator = object.__new__(Orchestrator)
@@ -2682,11 +2687,13 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
     orchestrator._shutdown_event = asyncio.Event()
 
     task = asyncio.create_task(orchestrator._duplex_reaper_loop())
-    await asyncio.sleep(0.035)
-    orchestrator._shutdown_event.set()
-    await task
-
-    assert orchestrator.duplex_control_plane.calls >= 2
+    try:
+        # Wait for recovery itself, including when cleanup exceeds the old 35 ms window.
+        await asyncio.wait_for(recovered.wait(), timeout=5.0)
+        assert orchestrator.duplex_control_plane.calls >= 2
+    finally:
+        orchestrator._shutdown_event.set()
+        await asyncio.wait_for(task, timeout=5.0)
 
 
 @pytest.mark.asyncio

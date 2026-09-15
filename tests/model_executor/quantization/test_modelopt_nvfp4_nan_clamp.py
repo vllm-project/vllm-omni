@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the NVFP4 W4A4 weight_scale NaN clamp installed by
 ``vllm_omni.patch``.
 
@@ -198,7 +198,7 @@ def test_reload_does_not_nest_wrapper():
         print("NESTED" if nested else "FLAT")
         """
     )
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     if result.stdout.strip().startswith("SKIP:"):
         pytest.skip(result.stdout.strip())
     assert "FLAT" in result.stdout, (
@@ -265,9 +265,12 @@ def test_env_var_escape_hatch_disables_install(env_value, acceptable):
     )
     env = os.environ.copy()
     env["VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP"] = env_value
-    # 120s rather than 60s: cold CI containers can take 30-50s just to
-    # import vllm_omni → vllm → torch before the subprocess does any work.
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120, env=env)
+    # Generous timeout: cold CI containers can take 30-50s just to import
+    # vllm_omni → vllm → torch, and heavily loaded shared machines have
+    # been observed taking >2min for the same import under disk I/O
+    # contention. The subprocess does a single import + flag print, so 600s
+    # only bounds pathological hangs, not normal runtime.
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600, env=env)
     if result.stdout.strip().startswith("SKIP:"):
         pytest.skip("modelopt not available in subprocess")
     # Exact token match on the final stdout line — not a substring test, since

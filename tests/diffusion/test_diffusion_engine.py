@@ -600,6 +600,34 @@ class TestDiffusionCompileConfig:
             ),
             ({"enable_cpu_offload": True}, "CPU offload"),
             ({"enable_layerwise_offload": True}, "layerwise offload"),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "module",
+                        "components": ["dit"],
+                    }
+                },
+                "CPU offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                    }
+                },
+                "layerwise offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                        "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                    }
+                },
+                "distributed layerwise offload",
+            ),
         ],
     )
     def test_full_compile_rejects_incompatible_features(self, kwargs, feature) -> None:
@@ -608,6 +636,34 @@ class TestDiffusionCompileConfig:
                 model="test",
                 diffusion_compile_granularity="full",
                 **kwargs,
+            )
+
+    def test_raw_parallel_mapping_is_normalized_before_allgather_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache decisions"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": 2},
+                cache_backend="tea_cache",
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["dit"],
+                    "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                },
+            )
+
+    def test_auto_dp_is_resolved_before_encoder_prompt_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache hits"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": None},
+                enable_prompt_embed_cache=True,
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["text_encoder"],
+                    "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+                },
             )
 
 

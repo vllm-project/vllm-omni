@@ -8,8 +8,9 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan
 from vllm_omni.platforms import current_omni_platform
 
-from .base import OffloadBackend, OffloadConfig, OffloadStrategy, SupportsModelCpuOffload
+from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
 from .block_discovery import get_blocks_attr_names, get_blocks_from_dit, set_blocks_attr_names
+from .config import OffloadStrategy
 from .distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -19,6 +20,12 @@ from .distributed_layerwise_backend import (
 from .layerwise_backend import LayerWiseOffloadBackend
 from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 from .offload_plan import OffloadPlan, get_offload_plan
+from .plan_resolver import (
+    BlockStack,
+    ResolvedComponent,
+    ResolvedOffloadPlan,
+    resolve_offload_plan,
+)
 from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
@@ -41,6 +48,10 @@ __all__ = [
     "OffloadConfig",
     "OffloadPlan",
     "OffloadStrategy",
+    "BlockStack",
+    "ResolvedComponent",
+    "ResolvedOffloadPlan",
+    "resolve_offload_plan",
     "SupportsModelCpuOffload",
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",
