@@ -13,13 +13,15 @@ import gc
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import cast
 
 import numpy as np
 import torch
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, graph_capture
 from vllm.forward_context import set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -37,7 +39,12 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
+from vllm.v1.worker.workspace import lock_workspace
 
+from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
+    SupportsVocoderCUDAGraph,
+    supports_vocoder_cudagraph,
+)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
@@ -47,6 +54,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
+from vllm_omni.worker.vocoder_cudagraph_manager import VocoderCUDAGraphManager
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +69,81 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.vocoder_cudagraph_manager: VocoderCUDAGraphManager | None = None
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )
+
+    def _vocoder_cudagraph_enabled(self) -> bool:
+        return (
+            not self.model_config.enforce_eager
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and supports_vocoder_cudagraph(self.get_model())
+        )
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        if not self._vocoder_cudagraph_enabled():
+            return
+
+        raw_model = self.get_model()
+        manager = VocoderCUDAGraphManager(
+            vllm_config=self.vllm_config,
+            device=self.device,
+        )
+        manager.prepare(cast(SupportsVocoderCUDAGraph, raw_model))
+        self.vocoder_cudagraph_manager = manager
+        logger.info("Initialized runner-owned vocoder CUDA Graph manager")
+
+    @torch.inference_mode()
+    def profile_cudagraph_memory(self) -> int:
+        manager = self.vocoder_cudagraph_manager
+        if manager is not None:
+            set_cudagraph_capturing_enabled(True)
+            try:
+                with self._freeze_gc(), graph_capture(device=self.device):
+                    torch.accelerator.synchronize()
+                    torch.accelerator.empty_cache()
+                    return manager.profile_memory()
+            finally:
+                set_cudagraph_capturing_enabled(False)
+        return super().profile_cudagraph_memory()
+
+    @torch.inference_mode()
+    def capture_model(self) -> int:
+        manager = self.vocoder_cudagraph_manager
+        if manager is None:
+            return super().capture_model()
+
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with self._freeze_gc(), graph_capture(device=self.device):
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                free_before = torch.accelerator.get_memory_info()[0]
+                manager.capture_and_bind()
+                torch.accelerator.synchronize()
+                free_after = torch.accelerator.get_memory_info()[0]
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        lock_workspace()
+        captured_bytes = max(0, free_before - free_after)
+        logger.info(
+            "Runner-owned vocoder CUDA Graph capture replaced upstream model capture (%.2f MiB)",
+            captured_bytes / (1 << 20),
+        )
+        return captured_bytes
+
+    def shutdown(self) -> None:
+        if self.vocoder_cudagraph_manager is not None:
+            self.vocoder_cudagraph_manager.clear()
+            self.vocoder_cudagraph_manager = None
+        super().shutdown()
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
@@ -223,6 +301,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                # The raw model's declared Components own graph replay for this
+                # stage. Keep the upstream root wrapper on its eager runnable.
+                force_eager=self.vocoder_cudagraph_manager is not None,
             )
 
             logger.debug(
@@ -602,6 +683,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
         """
+        if self.vocoder_cudagraph_manager is not None:
+            # Warmup/profile calls must not accidentally trigger the upstream
+            # root CUDAGraphWrapper once vocoder Components own graph capture.
+            cudagraph_runtime_mode = CUDAGraphMode.NONE
+
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
