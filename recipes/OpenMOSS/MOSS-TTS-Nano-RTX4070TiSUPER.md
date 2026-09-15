@@ -1,7 +1,7 @@
 # MOSS-TTS-Nano on RTX 4070 Ti SUPER 16GB
 
-> Single-stage 0.1B AR TTS with a mandatory reference clip, measured on one
-> 16 GB consumer GPU.
+> Single-stage 0.1B AR TTS driven by a reference clip, measured on one 16 GB
+> consumer GPU.
 
 ## Summary
 
@@ -26,12 +26,13 @@ This recipe adds only the hardware qualification for this card.
 | Property | Value |
 | --- | --- |
 | Checkpoint | `OpenMOSS-Team/MOSS-TTS-Nano` (0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec) |
-| Input | Text plus a mandatory `ref_audio` clip; there are no built-in speaker presets |
+| Input | Text plus a reference clip, supplied inline as `ref_audio` in this qualification; there are no built-in speaker presets |
 | Output | 48 kHz mono WAV, or PCM when streaming |
 | Qualified profile | Single GPU, one request at a time, as set by the bundled deploy config |
 
-The OpenAI-schema `voice` and `ref_text` fields are accepted but ignored; see the
-shared guide linked above for why.
+This qualification sent an inline `ref_audio` on every request. There are no
+built-in speaker presets. When `ref_audio` is present, `voice` and `ref_text`
+are unused. Uploaded voices via `/v1/audio/voices` were not exercised.
 
 ## References
 
@@ -72,8 +73,8 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8091
 
 ## Verification
 
-Every request must carry a reference clip. This run used `zh_1.wav` from the
-upstream repository. The Base64 clip is about 419,000 characters, which exceeds
+This qualification supplied the reference clip inline on every request, using
+`zh_1.wav` from the upstream repository. The Base64 clip is about 419,000 characters, which exceeds
 the per-argument limit of `execve` (`MAX_ARG_STRLEN`, 128 KiB), so the request
 body is written to a file and posted with `--data-binary` instead of being
 inlined in `-d`.
@@ -150,6 +151,6 @@ not otherwise idle.
 | --- | --- | --- |
 | Non-streaming `/v1/audio/speech` | Measured, three requests | [Speech API](../../docs/serving/speech_api.md) |
 | Streaming PCM | Implemented upstream, not exercised here | [shared TTS guide](../../examples/online_serving/text_to_speech/README.md#moss-tts-nano) |
-| `ref_audio` voice cloning | Required on every request; no speaker presets | [shared TTS guide](../../examples/online_serving/text_to_speech/README.md#moss-tts-nano) |
+| `ref_audio` voice cloning | Supplied inline on every request here; uploaded voices not exercised | [shared TTS guide](../../examples/online_serving/text_to_speech/README.md#moss-tts-nano) |
 | Concurrent generation | Capped at one sequence by the deploy config, for correctness rather than memory | [`moss_tts_nano.yaml`](../../vllm_omni/deploy/moss_tts_nano.yaml) |
 | CUDA graph capture | Disabled by the deploy config (`enforce_eager: true`) | [`moss_tts_nano.yaml`](../../vllm_omni/deploy/moss_tts_nano.yaml) |
