@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -95,6 +98,21 @@ class CUDAGraphStreamingDecoderWrapper:
         compile_config.compilation_config = copy.copy(vllm_config.compilation_config)
         compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compile_config.compilation_config.static_forward_context = {}
+        from . import codec_gemm, streaming_attention
+
+        # AOT drops Python guards. Include choices and the contents of the
+        # offline whitelist, not merely its filename, in the cache key.
+        extra = compile_config.additional_config
+        compile_config.additional_config = (
+            dict(extra) if isinstance(extra, dict) else {"base_hash": extra.compute_hash()}
+        )
+        compile_config.additional_config["moss_codec_kernels"] = {
+            "gemm": codec_gemm.CONFIG,
+            "fusion": codec_gemm.FUSE,
+            "bthd": streaming_attention.OUTPUT_BTHD,
+            "skip_empty": streaming_attention.SKIP_EMPTY,
+        }
+
         with set_current_vllm_config(compile_config):
             self._compiled_decode: nn.Module | None = _MossStreamingDecodeCompileAdapter(
                 codec,

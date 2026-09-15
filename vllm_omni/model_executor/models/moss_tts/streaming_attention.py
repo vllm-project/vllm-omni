@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Masked streaming attention preserving ring-cache position semantics."""
 
+import os
+
 import torch
 from vllm.triton_utils import tl, triton
 
@@ -34,6 +36,8 @@ def _attention(
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
+    output_bthd: tl.constexpr = True,
+    skip_empty: tl.constexpr = True,
 ):
     rows = tl.program_id(0) * block_m + tl.arange(0, block_m)
     bh = tl.program_id(1)
@@ -49,42 +53,55 @@ def _attention(
     denominator = tl.full((block_m,), 0.0, tl.float32)
     for first in range(tl.cdiv(kv_len, block_n)):
         cols = first * block_n + tl.arange(0, block_n)
-        k = tl.load(
-            k_ptr + batch * ks0 + head * ks1 + cols[None, :] * ks2 + dims[:, None] * ks3,
-            mask=cols[None, :] < kv_len,
-            other=0,
-        )
         allowed = tl.load(
             mask_ptr + batch * ms0 + rows[:, None] * ms2 + cols[None, :] * ms3,
             mask=(rows[:, None] < q_len) & (cols[None, :] < kv_len),
             other=0,
         )
-        score = tl.dot(q, k).to(tl.float32) * (head_dim**-0.5)
-        score = tl.where(allowed & (cols[None, :] < kv_len), score, -float("inf"))
-        next_max = tl.maximum(maximum, tl.max(score, axis=1))
-        safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
-        rescale = tl.exp(maximum - safe_max)
-        p = tl.exp(score - safe_max[:, None])
-        denominator = denominator * rescale + tl.sum(p, axis=1)
-        v = tl.load(
-            v_ptr + batch * vs0 + head * vs1 + cols[:, None] * vs2 + dims[None, :] * vs3,
-            mask=cols[:, None] < kv_len,
-            other=0,
-        )
-        acc = acc * rescale[:, None] + tl.dot(p.to(v.dtype), v)
-        maximum = next_max
+        if not skip_empty or tl.sum(allowed.to(tl.int32)) > 0:
+            k = tl.load(
+                k_ptr + batch * ks0 + head * ks1 + cols[None, :] * ks2 + dims[:, None] * ks3,
+                mask=cols[None, :] < kv_len,
+                other=0,
+            )
+            score = tl.dot(q, k).to(tl.float32) * (head_dim**-0.5)
+            score = tl.where(allowed & (cols[None, :] < kv_len), score, -float("inf"))
+            next_max = tl.maximum(maximum, tl.max(score, axis=1))
+            safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
+            rescale = tl.exp(maximum - safe_max)
+            p = tl.exp(score - safe_max[:, None])
+            denominator = denominator * rescale + tl.sum(p, axis=1)
+            v = tl.load(
+                v_ptr + batch * vs0 + head * vs1 + cols[:, None] * vs2 + dims[None, :] * vs3,
+                mask=cols[:, None] < kv_len,
+                other=0,
+            )
+            acc = acc * rescale[:, None] + tl.dot(p.to(v.dtype), v)
+            maximum = next_max
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
+    if output_bthd:
+        offsets = ((batch * q_len + rows[:, None]) * num_heads + head) * head_dim + dims[None, :]
+    else:
+        offsets = ((batch * num_heads + head) * q_len + rows[:, None]) * head_dim + dims[None, :]
     tl.store(
-        out_ptr + ((batch * num_heads + head) * q_len + rows[:, None]) * head_dim + dims[None, :],
+        out_ptr + offsets,
         out,
         mask=rows[:, None] < q_len,
     )
 
 
+OUTPUT_BTHD = os.getenv("MOSS_CODEC_ATTN_BTHD", "1") == "1"
+SKIP_EMPTY = os.getenv("MOSS_CODEC_ATTN_SKIP_EMPTY", "0") == "1"
+
+
 @torch.library.custom_op("moss_streaming::masked_attention", mutates_args=())
 def masked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     b, h, t, d = q.shape
-    out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    out = (
+        torch.empty((b, t, h, d), device=q.device, dtype=q.dtype).transpose(1, 2)
+        if OUTPUT_BTHD
+        else torch.empty_like(q, memory_format=torch.contiguous_format)
+    )
     # Small query tiles expose parallelism for short streaming chunks. Larger
     # tiles reuse K/V for steady chunks. Keep 64-key softmax blocks to retain
     # the same accumulation granularity across both paths.
@@ -108,6 +125,8 @@ def masked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: to
         d,
         bm,
         64,
+        output_bthd=OUTPUT_BTHD,
+        skip_empty=SKIP_EMPTY,
         num_warps=num_warps,
         num_stages=2,
     )
@@ -116,4 +135,9 @@ def masked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: to
 
 @masked_attention.register_fake
 def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    b, h, t, d = q.shape
+    return (
+        torch.empty((b, t, h, d), device=q.device, dtype=q.dtype).transpose(1, 2)
+        if OUTPUT_BTHD
+        else torch.empty_like(q, memory_format=torch.contiguous_format)
+    )
