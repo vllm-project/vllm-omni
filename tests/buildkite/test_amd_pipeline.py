@@ -52,4 +52,7 @@ def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     assert '"$$PWD"' in staging_command
     assert '"$${BUILDKITE_BUILD_CHECKOUT_PATH:?}"' in staging_command
     assert '"$$artifact_dir"' in staging_command
-    assert step["artifact_paths"] == ["tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"]
+    assert step["artifact_paths"] == [
+        "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json",
+        "artifacts/rocm-qwen3-omni-accuracy/**/*",
+    ]
