@@ -1270,14 +1270,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         *,
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        inputs_embeds = self._embed_text_input_ids(
-            input_ids,
-            self.language_model.embed_input_ids,
-            is_multimodal=is_multimodal,
-        )
-
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
+            return self._embed_text_input_ids(
+                input_ids,
+                self.language_model.embed_input_ids,
+                is_multimodal=is_multimodal,
+            )
 
         # Detect interleaved audio-in-video early, since it affects
         # both the deepstack path and the final embedding merge.
@@ -1292,12 +1290,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         is_interleaved = check_interleaved_audio_video(is_video, is_audio, num_video, num_audio)
 
-        deepstack_input_embeds = None
         # split the feat dim to obtain multi-scale visual feature
         has_vision_embeddings = [
             embeddings.shape[-1] != self.config.text_config.hidden_size for embeddings in multimodal_embeddings
         ]
-        if self.visual.deepstack_visual_indexes is not None and any(has_vision_embeddings):
+        has_deepstack_embeddings = self.visual.deepstack_visual_indexes is not None and any(has_vision_embeddings)
+        if has_deepstack_embeddings:
             multiscale_len = len(self.visual.deepstack_visual_indexes)
             multimodal_embeddings_multiscale = []
 
@@ -1340,6 +1338,28 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 if not is_interleaved:
                     mm_position_idx += num_tokens
 
+        if is_interleaved:
+            inputs_embeds = self._embed_text_input_ids(
+                input_ids,
+                self.language_model.embed_input_ids,
+                is_multimodal=is_multimodal,
+            )
+            inputs_embeds = merge_interleaved_embeddings(
+                inputs_embeds,
+                multimodal_embeddings,
+                is_video,
+                is_audio,
+                is_mm_device,
+            )
+        else:
+            # multimodal_embeddings now contains the main-scale features.
+            inputs_embeds = super().embed_input_ids(
+                input_ids,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+
+        if has_deepstack_embeddings:
             deepstack_input_embeds = inputs_embeds.new_zeros(
                 inputs_embeds.size(0), multiscale_len * inputs_embeds.size(1)
             )
@@ -1355,24 +1375,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             )
             self._set_deepstack_input_embeds(deepstack_input_embeds)
 
-        if is_interleaved:
-            return merge_interleaved_embeddings(
-                inputs_embeds,
-                multimodal_embeddings,
-                is_video,
-                is_audio,
-                is_mm_device,
-            )
-
-        # Default: standard merge (no interleaving), same as parent class.
-        # multimodal_embeddings may have been updated above (deepstack
-        # main-scale). Use super() to stay consistent with the parent
-        # implementation and avoid issues seen in Qwen2.5-Omni (#34506).
-        return super().embed_input_ids(
-            input_ids,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_multimodal,
-        )
+        return inputs_embeds
 
     def forward(
         self,
