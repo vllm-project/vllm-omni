@@ -2124,11 +2124,26 @@ class HunyuanImage3Pipeline(
         The single-request path below supports image-editing (conditioning
         image) requests; the step-execution contract (``prepare_encode`` et
         al.) explicitly does not yet (see ``allow_cond_image=False`` there),
-        so only true multi-request batches - which the single-request path
-        cannot serve anyway (``DiffusionRequestBatch.sampling_params`` asserts
-        exactly one request) - go through the bridge.
+        so a multi-request batch containing any image-editing request is
+        serialized through the single-request path instead of being sent
+        through the bridge, which would reject it outright.
         """
         if req.num_reqs > 1:
+            if any(request_layout_utils.request_prompt_has_cond_image(p) for p in req.prompts):
+                return [
+                    self._forward_single_request(
+                        DiffusionRequestBatch(requests=[single_req]),
+                        prompt=prompt,
+                        image_size=image_size,
+                        height=height,
+                        width=width,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        **kwargs,
+                    )
+                    for single_req in req.requests
+                ]
             return run_step_execution_to_completion(self, req.requests)
         return self._forward_single_request(
             req,

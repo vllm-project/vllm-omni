@@ -476,6 +476,7 @@ def test_forward_batches_multiple_requests_through_step_execution_bridge(monkeyp
     step-execution bridge, which ``DiffusionRequestBatch.sampling_params``
     could not have served anyway (it asserts exactly one request)."""
     pipeline = _pipeline()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
     prepare_calls = []
     decode_calls = []
 

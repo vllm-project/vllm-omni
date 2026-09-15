@@ -20,7 +20,7 @@ from vllm_omni.diffusion.worker.step_execution_batch import (
     run_step_execution_to_completion,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu, pytest.mark.cuda]
 
 
 def _require_cuda() -> torch.device:

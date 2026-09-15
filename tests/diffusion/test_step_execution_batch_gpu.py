@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 import torch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu, pytest.mark.cuda]
 
 _HIDDEN = 8
 
