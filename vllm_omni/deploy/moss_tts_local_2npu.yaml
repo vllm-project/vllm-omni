@@ -1,0 +1,56 @@
+# MOSS-TTS-Local-Transformer-v1.5 2-NPU deploy: Stage0 talker on NPU 0, Stage1 codec on NPU 1.
+# Splits AR (talker+depth) and codec across devices to remove AR/codec contention.
+# Launch: ASCEND_RT_VISIBLE_DEVICES=5,6 vllm-omni serve ... --deploy-config this.yaml
+async_chunk: true
+
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 1000
+      connector_get_max_wait: 300
+      initial_codec_chunk_frames: 1
+      codec_chunk_frames: 15
+      codec_left_context_frames: 0
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.80
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 1.7
+      top_p: 0.8
+      top_k: 25
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.50
+    enforce_eager: false
+    enable_prefix_caching: false
+    async_scheduling: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+      cudagraph_num_of_warmups: 1
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "1"
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0
