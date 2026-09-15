@@ -492,7 +492,39 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
 
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
+
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+
+        if full_attn_spans is not None:
+            self._warn_fa_deterministic_non_dense("piecewise")
+            logger.debug("Using piecewise Flash Attention for mixed causal/full mask (XPU)")
+            if flash_attn_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_wrapper,
+                    attn_func=flash_attn_func,
+                )
+            elif flash_attn_varlen_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_varlen_wrapper,
+                    attn_func=flash_attn_varlen_func,
+                )
+            else:
+                raise ImportError("Piecewise FlashAttention requires a dense or varlen FlashAttention function")
+
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                full_attn_spans,
+                self.softmax_scale,
+                attn_func,
+                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
+            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
