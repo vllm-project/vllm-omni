@@ -71,7 +71,7 @@ class QualityTestConfig:
     id: str  # pytest ID, e.g. "fp8_z_image"
     task: str  # "t2i" or "t2v"
     prompt: str  # generation prompt
-    max_lpips: float | dict[str, float]  # threshold, or {"H100": 0.15, "B200": 0.17}
+    max_lpips: float | dict[str, float]  # threshold, or {"H100": 0.15, "A100": 0.15, "B200": 0.17}
     model: str | None = None  # HF model name
     quantization: str | dict[str, object] | None = None  # quantization method/config, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
@@ -190,7 +190,7 @@ QUALITY_CONFIGS = [
         quantization={"text_encoder": "fp8", "transformer": None, "vae": None},
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips={"H100": 0.15, "B200": 0.17},
+        max_lpips={"H100": 0.15, "A100": 0.15, "B200": 0.17},
         num_inference_steps=10,
         enable_cpu_offload=True,
         height=1024,
@@ -528,7 +528,7 @@ def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
     assert captured.sampling.guidance_scale is None
 
 
-_marks = hardware_marks(res={"cuda": ["H100", "B200"]})
+_marks = hardware_marks(res={"cuda": ["H100", "B200", "A100"]})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
 

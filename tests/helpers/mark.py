@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     import pytest
 
     # CUDA (and only CUDA) may list several SKUs so one item matches H100 nightly
-    # and B200 mirror collection: ``res={"cuda": ["H100", "B200"]}``.
+    # and B200/A100 mirror collection: ``res={"cuda": ["H100", "B200", "A100"]}``.
     # Kept under TYPE_CHECKING so Python 3.9 agents do not evaluate ``str | list``.
     SkuSpec = str | list[str] | tuple[str, ...]
 

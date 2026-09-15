@@ -15,6 +15,7 @@ from tests.diffusion.quantization.test_quantization_quality import (
     _free_gpu_memory,
     _maybe_save_output,
 )
+from tests.e2e.accuracy.helpers import resolve_device_threshold
 from tests.helpers.mark import hardware_marks
 
 _MINIMAX_H3_REPO = "MiniMaxAI/MiniMax-H3"
@@ -175,7 +176,7 @@ def _generate_joint_output(omni, config: QualityTestConfig):
         pytest.param(
             _QUALITY_CONFIG,
             id=_QUALITY_CONFIG.id,
-            marks=hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
+            marks=hardware_marks(res={"cuda": ["H100", "B200", "A100"]}, num_cards=2),
         )
     ],
 )
@@ -214,8 +215,9 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
             f"Unexpected H3 audio sample rate: baseline={baseline_sample_rate}, quantized={quant_sample_rate}"
         )
     audio_spectral_cosine, audio_rms_ratio = _audio_quality_metrics(baseline_audio, quant_audio)
-    assert lpips_score <= config.max_lpips, (
-        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
+    gpu_key, max_lpips = resolve_device_threshold(config.max_lpips, label=f"{config.id} max_lpips")
+    assert lpips_score <= max_lpips, (
+        f"LPIPS {lpips_score:.4f} exceeds threshold {max_lpips} ({gpu_key}) "
         f"for {config.quantization_ref()} on {config.quantized_ref()}"
     )
     assert audio_spectral_cosine >= _MIN_AUDIO_SPECTRAL_COSINE, (
@@ -234,7 +236,7 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
     print(f"  Baseline:      {config.baseline_ref()}")
     print(f"  Quantized:     {config.quantized_ref()}")
     print(f"  Method:        {config.quantization_ref()}")
-    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {config.max_lpips})")
+    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {max_lpips}, gpu: {gpu_key})")
     print(f"  PSNR:          {psnr_score:.4f} dB  (higher is better)")
     print(f"  MAE:           {mae_score:.6f}  (lower is better)")
     print(f"  Audio cosine:  {audio_spectral_cosine:.4f}  (threshold: {_MIN_AUDIO_SPECTRAL_COSINE})")

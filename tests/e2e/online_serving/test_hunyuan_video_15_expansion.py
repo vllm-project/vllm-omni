@@ -69,7 +69,7 @@ def _get_diffusion_feature_cases(model: str):
             ),
             id="single_card_cachedit_layerwise",
             marks=[
-                *hardware_marks(res={"cuda": ["H100", "B200"]}),
+                *hardware_marks(res={"cuda": ["H100", "B200", "A100"]}),
                 pytest.mark.full_model,
             ],
         ),
@@ -89,7 +89,7 @@ def _get_diffusion_feature_cases(model: str):
             ),
             id="parallel_cachedit_tp2_vae2",
             marks=[
-                *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
+                *hardware_marks(res={"cuda": ["H100", "B200", "A100"]}, num_cards=2),
                 pytest.mark.full_model,
             ],
         ),

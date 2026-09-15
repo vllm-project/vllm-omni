@@ -40,7 +40,7 @@ MODEL_MARKS = {
     ],
     "stabilityai/stable-audio-open-1.0": [
         pytest.mark.full_model,
-        *hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}),
+        *hardware_marks(res={"cuda": ["L4", "B200", "A100"], "rocm": "MI325"}),
     ],
 }
 

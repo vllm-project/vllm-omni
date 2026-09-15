@@ -24,8 +24,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
-_L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)
+_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200", "A100"]}, num_cards=2)
+_L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200", "A100"]}, num_cards=4)
 
 DeviceKind = Literal["cpu", "cuda"]
 

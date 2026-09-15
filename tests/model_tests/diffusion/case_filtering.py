@@ -55,7 +55,7 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
     if current_omni_platform.is_cuda() and device_count < required_devices:
         marks.append(pytest.mark.skip(reason=f"Need {required_devices} devices, got {device_count}"))
     if required_devices > 1:
-        marks.extend(hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=required_devices))
+        marks.extend(hardware_marks(res={"cuda": ["L4", "B200", "A100"]}, num_cards=required_devices))
         marks.append(pytest.mark.full_model)
     else:
         marks.extend(hardware_marks(res={"cuda": "L4"}, num_cards=1))

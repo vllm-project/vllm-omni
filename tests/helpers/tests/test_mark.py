@@ -25,7 +25,7 @@ def test_gpu_platforms_come_from_pyproject_gpu_tag():
 
 def test_get_skus_for_platform_cuda_excludes_other_accelerators():
     cuda_skus = get_skus_for_platform("cuda")
-    assert cuda_skus >= {"H100", "H200", "H800", "L4", "B200"}
+    assert cuda_skus >= {"H100", "H200", "H800", "L4", "A100", "B200"}
     assert "MI325" not in cuda_skus
     assert "A2" not in cuda_skus
     assert get_skus_for_platform("rocm") == {"MI325"}

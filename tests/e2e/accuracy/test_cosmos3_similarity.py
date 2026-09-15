@@ -57,7 +57,7 @@ def _image_data_url(image: Image.Image) -> str:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=1)
 def test_cosmos3_t2i_serving_smoke(accuracy_artifact_root: Path) -> None:
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
     with OmniServer(_model_name(), _server_args(), use_omni=True) as server:
@@ -98,7 +98,7 @@ def test_cosmos3_t2i_serving_smoke(accuracy_artifact_root: Path) -> None:
     ],
 )
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=1)
 def test_cosmos3_video_serving_smoke(
     accuracy_artifact_root: Path,
     name: str,

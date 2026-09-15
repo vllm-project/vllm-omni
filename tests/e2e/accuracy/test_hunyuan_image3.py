@@ -354,7 +354,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         elapsed = time.perf_counter() - t0
 
     assert outputs, "Pipeline produced no outputs"
-    images = None
+    output_images = None
     cot_text = ""
     for out in outputs:
         ro = out
@@ -374,12 +374,12 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if not imgs and ro and hasattr(ro, "images"):
             imgs = ro.images
         if imgs:
-            images = imgs
+            output_images = imgs
 
-    assert images, "Pipeline output had no images"
+    assert output_images, "Pipeline output had no images"
     cot_text = cot_text.lstrip("\n")
 
-    image = images[0].convert("RGB")
+    image = output_images[0].convert("RGB")
     image.save(output_path / "image_offline.png")
     (output_path / "cot_offline.txt").write_text(cot_text, encoding="utf-8")
     gc.collect()
