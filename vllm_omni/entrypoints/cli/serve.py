@@ -552,6 +552,7 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "Use dynamic shapes for the selected generic diffusion compile scope. "
+                "Defaults to disabled for Cosmos3MultiviewPipeline and enabled for other models. "
                 "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
             ),
         )

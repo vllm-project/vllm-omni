@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import math
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import count_video_frames
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
+from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
@@ -91,6 +93,21 @@ class VideoGenerationArtifacts:
     stage_durations: dict[str, float]
     peak_memory_mb: float
     metrics: dict[str, object] | None = None
+    lidar: DiffusionPayloadValue | None = None
+    lidar_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EncodedVideoResult:
+    """Binary artifacts kept separate from public JSON job metadata."""
+
+    video_bytes: bytes
+    stage_durations: dict[str, float]
+    peak_memory_mb: float
+    action: VideoAction | None
+    video_metadata: dict[str, object]
+    lidar_bytes: bytes
+    lidar_metadata: dict[str, Any]
 
 
 def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[str, object]:
@@ -212,13 +229,13 @@ class OmniOpenAIServingVideo:
         return capability is True or metadata_capability
 
     @property
-    def supported_control_upload_types(self) -> frozenset[str]:
-        """Return multipart control types accepted by the active pipeline.
+    def supports_multiview_reference_inputs(self) -> bool:
+        return any(
+            get_diffusion_model_metadata(arch).supports_multiview_reference_inputs
+            for arch in self._video_model_architectures()
+        )
 
-        Unknown pipelines deliberately return an empty set.  This keeps the
-        generic video API isolated from model-specific controls unless a model
-        explicitly opts into the ``control_path`` contract in metadata.
-        """
+    def _video_model_architectures(self) -> list[str | None]:
         od_config = self._resolve_diffusion_od_config()
         model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
         for stage_config in self.stage_configs or ():
@@ -235,8 +252,13 @@ class OmniOpenAIServingVideo:
                 )
             )
 
+        return model_archs
+
+    @property
+    def supported_control_upload_types(self) -> frozenset[str]:
+        """Return multipart control types explicitly accepted by the active pipeline."""
         supported: set[str] = set()
-        for model_arch in model_archs:
+        for model_arch in self._video_model_architectures():
             supported.update(get_diffusion_model_metadata(model_arch).supported_control_upload_types)
         return frozenset(supported)
 
@@ -349,6 +371,13 @@ class OmniOpenAIServingVideo:
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
             gen_params.height = vp.height
+        elif self.supports_multiview_reference_inputs:
+            # Automatic multiview sizing validates even a single dimension
+            # constraint after inspecting the first camera's WSM input.
+            if vp.width is not None:
+                gen_params.width = vp.width
+            if vp.height is not None:
+                gen_params.height = vp.height
         if vp.num_frames is not None:
             gen_params.num_frames = vp.num_frames
         gen_params.num_outputs_per_prompt = request.num_outputs_per_prompt
@@ -458,6 +487,10 @@ class OmniOpenAIServingVideo:
         output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
         raw_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
         metrics = {str(key): value for key, value in raw_metrics.items()} if isinstance(raw_metrics, Mapping) else None
+        lidar = multimodal_output.get("lidar")
+        if lidar_output_requested(request.extra_params) and lidar is None:
+            raise ValueError("The requested LiDAR output was not returned by the model.")
+        lidar_metadata = metadata.get("lidar", {}) if isinstance(metadata, Mapping) else {}
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -467,6 +500,8 @@ class OmniOpenAIServingVideo:
             stage_durations=self._extract_stage_durations(result),
             peak_memory_mb=self._extract_peak_memory_mb(result),
             metrics=metrics,
+            lidar=lidar,
+            lidar_metadata=dict(lidar_metadata),
         )
 
     async def generate_videos(
@@ -478,6 +513,8 @@ class OmniOpenAIServingVideo:
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
     ) -> VideoGenerationResponse:
+        if lidar_output_requested(request.extra_params):
+            raise HTTPException(status_code=400, detail="LiDAR output requires asynchronous POST /v1/videos.")
         artifacts = await self._run_and_extract(
             request,
             reference_id,
@@ -528,7 +565,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
-    ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
+    ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]] | EncodedVideoResult:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
             request,
@@ -553,6 +590,8 @@ class OmniOpenAIServingVideo:
         action = artifacts.actions[0]
         video_metadata = _video_metadata_from_artifacts(artifacts)
         if action is not None and isinstance(artifacts.videos[0], dict):
+            if artifacts.lidar is not None:
+                raise ValueError("LiDAR output requires video; action-only output with LiDAR is unsupported.")
             logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
 
@@ -577,6 +616,19 @@ class OmniOpenAIServingVideo:
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
+        if artifacts.lidar is not None:
+            lidar_bytes, lidar_metadata = await asyncio.to_thread(
+                serialize_lidar_output, artifacts.lidar, artifacts.lidar_metadata
+            )
+            return EncodedVideoResult(
+                video_bytes=video_bytes,
+                stage_durations=artifacts.stage_durations,
+                peak_memory_mb=artifacts.peak_memory_mb,
+                action=action,
+                video_metadata=video_metadata,
+                lidar_bytes=lidar_bytes,
+                lidar_metadata=lidar_metadata,
+            )
         return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0], video_metadata
 
     @staticmethod
@@ -736,7 +788,7 @@ class OmniOpenAIServingVideo:
         if audio is None:
             return [None] * expected_count
 
-        if isinstance(audio, (list, tuple)):
+        if isinstance(audio, list | tuple):
             if len(audio) == expected_count and any(hasattr(item, "shape") or hasattr(item, "ndim") for item in audio):
                 return list(audio)
             if expected_count == 1:
@@ -852,7 +904,7 @@ class OmniOpenAIServingVideo:
             value = value.cpu()
         if hasattr(value, "tolist"):
             return cls._to_jsonable(value.tolist())
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list | tuple):
             return [cls._to_jsonable(item) for item in value]
         if hasattr(value, "item"):
             try:
@@ -869,7 +921,7 @@ class OmniOpenAIServingVideo:
                 return [int(dim) for dim in shape]
             except (TypeError, ValueError):
                 pass
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list | tuple):
             if not value:
                 return [0]
             return [len(value)] + cls._shape_of(value[0])

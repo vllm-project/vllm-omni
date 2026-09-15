@@ -545,6 +545,43 @@ def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
     assert engine_args["dlo_host_registration_limit_gib"] == 80
 
 
+@pytest.mark.parametrize(
+    "model_class_name", ["Cosmos3MultiviewPipeline", "Cosmos3OmniDiffusersPipeline", "WanPipeline"]
+)
+@pytest.mark.parametrize(
+    "compile_args, expected_granularity, explicit_dynamic",
+    [
+        ([], "regional", None),
+        (["--diffusion-compile-dynamic"], "regional", True),
+        (["--no-diffusion-compile-dynamic"], "regional", False),
+        (["--diffusion-compile-granularity", "full"], "full", None),
+        (["--diffusion-compile-granularity", "full", "--diffusion-compile-dynamic"], "full", True),
+    ],
+)
+def test_serve_model_specific_compile_defaults(
+    mocker, model_class_name, compile_args, expected_granularity, explicit_dynamic
+):
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(["serve", "/models/video", "--omni", *compile_args])
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, model_class_name),
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "/models/video", args.get_explicit_kwargs_dict(), trust_remote_code=False
+    )
+    config = _terminal_config(stage_configs[0])
+
+    expected_dynamic = model_class_name != "Cosmos3MultiviewPipeline" if explicit_dynamic is None else explicit_dynamic
+    assert config.diffusion_compile_granularity == expected_granularity
+    assert config.diffusion_compile_dynamic is expected_dynamic
+
+
 def test_serve_cli_accepts_diffusion_compile_controls():
     """Ensure both compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()

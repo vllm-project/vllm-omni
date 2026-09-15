@@ -11,6 +11,23 @@ from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize(
+    "model_class_name, multiview, controls",
+    [
+        ("Cosmos3MultiviewPipeline", True, ()),
+        ("Cosmos3OmniDiffusersPipeline", False, ("edge", "blur", "depth", "seg", "wsm")),
+        ("WanPipeline", False, ()),
+        ("UnknownPipeline", False, ()),
+    ],
+)
+def test_multiview_upload_capability_is_explicit(model_class_name, multiview, controls):
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    metadata = get_diffusion_model_metadata(model_class_name)
+    assert metadata.supports_multiview_reference_inputs is multiview
+    assert metadata.supported_control_upload_types == controls
+
+
 def test_video_pipeline_requires_declared_final_video_stage():
     assert is_video_generation_pipeline(
         [
@@ -61,6 +78,7 @@ def test_video_pipeline_rejects_non_video_final_outputs(stage_configs):
         "WanDMDPipeline",
         "LingBotWorldCausalDMDPipeline",
         "LongCatVideoAvatarPipeline",
+        "Cosmos3MultiviewPipeline",
         "SanaVideoPipeline",
         "SanaImageToVideoPipeline",
         "SanaWmPipeline",
