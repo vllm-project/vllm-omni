@@ -310,21 +310,41 @@ def omni() -> Generator[Omni, None, None]:
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs for this test.")
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
-    """Mixed-pipeline deploy settings affect the live structured stages."""
-    stage_configs = omni.engine.stage_configs
-    assert len(stage_configs) == 2
-    ar_stage, diffusion_stage = stage_configs
+    """Mixed-pipeline deploy settings reach both terminal engine configs."""
+    engine = omni.engine
+
+    # Topology, connector selection, and placement remain Omni-owned.
+    resolved_stages = engine.stage_configs
+    assert len(resolved_stages) == 2
+    ar_stage, diffusion_stage = resolved_stages
     assert isinstance(ar_stage, VllmOmniARStageConfig)
     assert ar_stage.stage_id == 0
     assert ar_stage.model_stage == "AR"
-    assert ar_stage.model_config.enforce_eager is True
     assert ar_stage.final_output_type == "text"
     assert ar_stage.runtime_config.devices == "0,1"
-    assert ar_stage.parallel_config.tensor_parallel_size == 2
-    assert ar_stage.scheduler_config.max_num_seqs == 1
-    assert ar_stage.scheduler_config.max_num_batched_tokens == 32768
-    assert ar_stage.cache_config.gpu_memory_utilization == 0.95
-    assert ar_stage.model_config.default_sampling_params == {
+    assert ar_stage.connector_config.output_connectors == {"to_stage_1": "rdma_connector"}
+    assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
+    assert diffusion_stage.stage_id == 1
+    assert diffusion_stage.model_stage == "dit"
+    assert diffusion_stage.final_output_type == "image"
+    assert diffusion_stage.input_sources == [0]
+    assert diffusion_stage.runtime_config.devices == "2,3"
+    assert diffusion_stage.connector_config.input_connectors == {"from_stage_0": "rdma_connector"}
+
+    # Stage 0 is materialized as the VllmConfig actually passed to its engine.
+    ar_vllm_config, diffusion_vllm_config = engine.stage_vllm_configs
+    assert ar_vllm_config is not None
+    assert diffusion_vllm_config is None
+    assert ar_vllm_config.model_config.enforce_eager is True
+    assert ar_vllm_config.model_config.trust_remote_code is True
+    assert ar_vllm_config.parallel_config.tensor_parallel_size == 2
+    assert ar_vllm_config.scheduler_config.max_num_seqs == 1
+    assert ar_vllm_config.scheduler_config.max_num_batched_tokens == 32768
+    assert ar_vllm_config.cache_config.gpu_memory_utilization == 0.95
+    ar_omni_config = ar_vllm_config.model_config.omni_config
+    assert ar_omni_config.omni_kv_config["need_send_cache"] is True
+
+    expected_ar_sampling = {
         "temperature": 0.0,
         "top_p": 1,
         "top_k": -1,
@@ -333,26 +353,25 @@ def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
         "skip_special_tokens": False,
         "include_stop_str_in_output": True,
     }
-    assert ar_stage.connector_config.omni_kv_config["need_send_cache"] is True
-    assert ar_stage.connector_config.output_connectors == {"to_stage_1": "rdma_connector"}
-    assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
-    assert diffusion_stage.stage_id == 1
-    assert diffusion_stage.model_stage == "dit"
-    assert diffusion_stage.model_config.enforce_eager is True
-    assert diffusion_stage.final_output_type == "image"
-    assert diffusion_stage.input_sources == [0]
-    assert diffusion_stage.runtime_config.devices == "2,3"
-    assert diffusion_stage.runtime_config.distributed_executor_backend == "mp"
-    assert diffusion_stage.parallel_config.tensor_parallel_size == 2
-    assert diffusion_stage.parallel_config.enable_expert_parallel is True
-    assert diffusion_stage.scheduler_config.max_num_seqs == 1
-    assert diffusion_stage.model_config.default_sampling_params == {"num_inference_steps": 50, "guidance_scale": 0}
-    diffusion_kv = diffusion_stage.connector_config.omni_kv_config
-    assert diffusion_kv is not None
+    ar_sampling, diffusion_sampling = engine.default_sampling_params_list
+    assert all(getattr(ar_sampling, name) == value for name, value in expected_ar_sampling.items())
+    assert diffusion_sampling.num_inference_steps == 50
+    assert diffusion_sampling.guidance_scale == 0
+
+    # Stage 1 is a diffusion engine, so its terminal owner is the launched
+    # OmniDiffusionConfig rather than a VllmConfig.
+    od_config = omni.get_diffusion_od_config()
+    assert od_config is not None
+    assert od_config.model == MODEL_NAME
+    assert od_config.enforce_eager is True
+    assert od_config.distributed_executor_backend == "mp"
+    assert od_config.parallel_config.tensor_parallel_size == 2
+    assert od_config.parallel_config.enable_expert_parallel is True
+    assert od_config.max_num_seqs == 1
+    diffusion_kv = od_config.omni_kv_config
     assert diffusion_kv["need_recv_cache"] is True
     assert diffusion_kv["enable_kv_async_prefetch"] is True
     assert diffusion_kv["kv_prefetch_min_free_mem_ratio"] == 0.2
-    assert diffusion_stage.connector_config.input_connectors == {"from_stage_0": "rdma_connector"}
 
 
 def _extract_generated_image(outputs: list[object]) -> Image.Image:
@@ -405,9 +424,7 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
         bot_task="think",
         sys_type=use_system_prompt or "None",
     )
-    stop_token_ids = resolve_stop_token_ids(
-        task="t2i", bot_task="think", tokenizer=tokenizer, image_size="1024x1024"
-    )
+    stop_token_ids = resolve_stop_token_ids(task="t2i", bot_task="think", tokenizer=tokenizer, image_size="1024x1024")
     params_list = copy.deepcopy(omni.default_sampling_params_list)
     generator_device = current_omni_platform.device_type or "cuda"
     for params in params_list:
@@ -437,6 +454,7 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
 # Matches the threshold test_shared_script_ar_path_reaches_generation uses
 # for its own (seed=1234, en_recaption) comparison below.
 MIN_SEMANTIC_SIMILARITY = 0.5
+
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs for this test.")
 @pytest.mark.parametrize("system_prompt_name,use_system_prompt,expected_embedding", SYSTEM_PROMPT_CASES)

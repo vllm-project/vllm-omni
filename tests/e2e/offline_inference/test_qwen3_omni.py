@@ -70,53 +70,72 @@ def get_question(prompt_type="video"):
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", production_test_params, indirect=True)
 def test_structured_multistage_config_reaches_runtime(omni_runner, offline_client) -> None:
-    """User deploy settings survive resolution and affect the live stages."""
-    stage_configs = omni_runner.omni.engine.stage_configs
-    assert len(stage_configs) == 3
-    thinker, talker, code2wav = stage_configs
+    """Deploy settings reach the materialized configs used by live stages."""
+    engine = omni_runner.omni.engine
+
+    # The resolved typed stages remain the Omni-owned source for topology and
+    # placement, which are not fields of the terminal vLLM config.
+    resolved_stages = engine.stage_configs
+    assert len(resolved_stages) == 3
+    thinker, talker, code2wav = resolved_stages
     assert isinstance(thinker, VllmOmniARStageConfig)
     assert isinstance(talker, VllmOmniARStageConfig)
     assert isinstance(code2wav, VllmOmniGenerationStageConfig)
-    assert [stage.stage_id for stage in stage_configs] == [0, 1, 2]
-    assert [stage.model_stage for stage in stage_configs] == ["thinker", "talker", "code2wav"]
+    assert [stage.stage_id for stage in resolved_stages] == [0, 1, 2]
+    assert [stage.model_stage for stage in resolved_stages] == ["thinker", "talker", "code2wav"]
     assert code2wav.final_output_type == "audio"
     assert thinker.runtime_config.devices == "0"
     assert talker.runtime_config.devices == code2wav.runtime_config.devices == "1"
-    assert thinker.scheduler_config.max_num_seqs == talker.scheduler_config.max_num_seqs == 64
-    assert code2wav.scheduler_config.max_num_seqs == 64
-    assert thinker.scheduler_config.max_num_batched_tokens == talker.scheduler_config.max_num_batched_tokens == 32768
-    assert code2wav.scheduler_config.max_num_batched_tokens == 65536
-    assert thinker.cache_config.gpu_memory_utilization == 0.9
-    assert talker.cache_config.gpu_memory_utilization == 0.6
-    assert code2wav.cache_config.gpu_memory_utilization == 0.1
-    assert all(stage.cache_config.enable_prefix_caching is False for stage in stage_configs)
-    assert all(stage.model_config.trust_remote_code is True for stage in stage_configs)
+    assert talker.connector_config.input_connectors == {"from_stage_0": "connector_of_shared_memory"}
+    assert code2wav.connector_config.input_connectors == {"from_stage_1": "connector_of_shared_memory"}
+
+    # Engine-owned deploy settings must survive the startup projection into
+    # the actual VllmConfig objects retained by the stage pools.
+    assert len(engine.stage_vllm_configs) == 3
+    thinker_vllm, talker_vllm, code2wav_vllm = engine.stage_vllm_configs
+    assert thinker_vllm is not None
+    assert talker_vllm is not None
+    assert code2wav_vllm is not None
+    assert thinker_vllm.scheduler_config.max_num_seqs == 64
+    assert talker_vllm.scheduler_config.max_num_seqs == 64
+    assert code2wav_vllm.scheduler_config.max_num_seqs == 64
+    assert thinker_vllm.scheduler_config.max_num_batched_tokens == 32768
+    assert talker_vllm.scheduler_config.max_num_batched_tokens == 32768
+    assert code2wav_vllm.scheduler_config.max_num_batched_tokens == 65536
+    assert thinker_vllm.cache_config.gpu_memory_utilization == 0.9
+    assert talker_vllm.cache_config.gpu_memory_utilization == 0.6
+    assert code2wav_vllm.cache_config.gpu_memory_utilization == 0.1
+    assert all(config.cache_config.enable_prefix_caching is False for config in engine.stage_vllm_configs)
+    assert all(config.model_config.trust_remote_code is True for config in engine.stage_vllm_configs)
+    assert code2wav_vllm.scheduler_config.enable_chunked_prefill is False
+    assert code2wav_vllm.scheduler_config.async_scheduling is False
+
+    # Sampling defaults are consumed from StageClient metadata, rather than
+    # from either the resolver output or VllmConfig.
     expected_sampling = (
-        (thinker, {"temperature": 0.0, "max_tokens": 2048}),
-        (talker, {"temperature": 0.9, "top_k": 50, "max_tokens": 4096, "repetition_penalty": 1.05}),
-        (code2wav, {
+        {"temperature": 0.0, "max_tokens": 2048},
+        {"temperature": 0.9, "top_k": 50, "max_tokens": 4096, "repetition_penalty": 1.05},
+        {
             "temperature": 0.0,
             "top_p": 1.0,
             "top_k": -1,
             "max_tokens": 65536,
             "repetition_penalty": 1.1,
-        }),
+        },
     )
-    for stage, expected in expected_sampling:
+    assert len(engine.default_sampling_params_list) == len(expected_sampling)
+    for runtime_params, expected in zip(engine.default_sampling_params_list, expected_sampling, strict=True):
         # SamplingParams normalization may add backend defaults (for example
         # ``detokenize=True``). Verify deploy-owned values without rejecting
         # those non-lossy normalized fields.
-        actual = stage.model_config.default_sampling_params or {}
-        assert all(actual.get(name) == value for name, value in expected.items())
-    assert talker.connector_config.input_connectors == {"from_stage_0": "connector_of_shared_memory"}
-    assert code2wav.connector_config.input_connectors == {"from_stage_1": "connector_of_shared_memory"}
+        assert all(getattr(runtime_params, name) == value for name, value in expected.items())
 
     if current_omni_platform.is_cuda():
-        assert thinker.model_config.enforce_eager is False
-        assert talker.model_config.enforce_eager is False
+        assert thinker_vllm.model_config.enforce_eager is False
+        assert talker_vllm.model_config.enforce_eager is False
 
-    # Exercise the same production-resolved stage list with a real request;
-    # this test is not merely a dataclass shape check.
+    # Exercise the materialized stages and their connector path with a real
+    # request; the assertions above are not merely resolver-shape checks.
     offline_client.send_omni_request(
         {
             "prompts": "Answer with one short sentence: what is the capital of China?",

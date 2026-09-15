@@ -381,6 +381,7 @@ def test_typed_llm_projection_omits_diffusion_only_and_process_only_defaults():
         "log_level",
     }.isdisjoint(engine_args)
 
+
 def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
 

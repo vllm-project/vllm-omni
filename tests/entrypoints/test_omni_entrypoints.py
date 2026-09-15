@@ -263,12 +263,14 @@ def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
     assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": required_stop_ids}]
 
+
 def test_sampling_constraints_are_forwarded_by_typed_stage_configs():
     config = VllmOmniConfig.from_pipeline_config(OMNI_PIPELINES["qwen3_tts"])
 
     constraints = OmniBase._get_sampling_constraints_list(config.stage_configs)
 
     assert constraints == [dict(stage.stage_pipeline_config.sampling_constraints) for stage in config.stage_configs]
+
 
 @pytest.mark.parametrize("use_defaults", [False, True])
 def test_moss_local_output_policy_preserves_codec_streaming(use_defaults):

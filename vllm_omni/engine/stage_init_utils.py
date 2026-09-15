@@ -1127,8 +1127,7 @@ def _project_omni_stage_engine_args(
         ),
         (
             stage_config.runtime_config,
-            frozenset(runtime_excluded_fields)
-            | (frozenset({"additional_config"}) if is_diffusion else frozenset()),
+            frozenset(runtime_excluded_fields) | (frozenset({"additional_config"}) if is_diffusion else frozenset()),
         ),
     ):
         engine_args.update(

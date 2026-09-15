@@ -19,16 +19,23 @@ NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 @pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
 def test_structured_diffusion_config_reaches_runtime(omni_runner) -> None:
     """The default WAN resolver launches the typed diffusion config itself."""
-    stage_configs = omni_runner.omni.engine.stage_configs
-    assert len(stage_configs) == 1
-    stage_config = stage_configs[0]
+    omni = omni_runner.omni
+    resolved_stages = omni.engine.stage_configs
+    assert len(resolved_stages) == 1
+    stage_config = resolved_stages[0]
 
     assert isinstance(stage_config, VllmOmniDiffusionStageConfig)
     assert stage_config.stage_id == 0
     assert stage_config.model_stage == "dit"
-    assert stage_config.model_config.model == MODEL
-    assert stage_config.diffusion_config.model_class_name == "WanPipeline"
     assert stage_config.final_output_type == "video"
+
+    assert omni.engine.stage_vllm_configs == [None]
+    od_config = omni.get_diffusion_od_config()
+    assert od_config is not None
+    assert od_config.stage_id == 0
+    assert od_config.model == MODEL
+    assert od_config.model_class_name == "WanPipeline"
+    assert od_config.output_type == "pil"
 
 
 @pytest.mark.advanced_model
