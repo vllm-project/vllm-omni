@@ -3,6 +3,15 @@
 
 """DreamZero model constants shared by the pipeline."""
 
+# Both stage edges share one transport key; payload.boundary identifies the edge.
+DREAMZERO_STAGE_PAYLOAD_KEY = "dreamzero_stage_payload"
+
+DREAMZERO_BOUNDARY_ENCODE_TO_DIT = "encode_to_dit"
+DREAMZERO_BOUNDARY_DIT_TO_DECODE = "dit_to_decode"
+
+# Bump on incompatible schema changes; consumers reject unknown versions.
+DREAMZERO_PAYLOAD_VERSION = 1
+
 DEFAULT_NUM_INFERENCE_STEPS = 16
 DEFAULT_CFG_SCALE = 5.0
 DEFAULT_SIGMA_SHIFT = 5.0

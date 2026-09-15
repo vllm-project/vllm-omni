@@ -1,0 +1,68 @@
+# DreamZero-DROID runtime placement; stage ownership and edges are defined
+# in vllm_omni/model_executor/models/dreamzero/pipeline.py.
+# Payloads use inline IPC unless connector edges are configured.
+# Paged KV remains local to the denoise stage.
+
+pipeline: dreamzero_disaggregated
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  # Stage 0: encode.
+  - stage_id: 0
+    devices: "4"
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+
+  # Stage 1: denoise. All four ranks share the payload and run their DiT shard.
+  - stage_id: 1
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: DreamZeroPipeline
+    # Only denoise hosts the AR-Diffusion engine and paged KV.
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    parallel_config:
+      tensor_parallel_size: 4
+      cfg_parallel_size: 1
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+    cache_backend: step_cache
+    cache_config:
+      step_cache_dit_enabled: true
+      velocity_sim_thresholds: [0.95, 0.93]
+      velocity_skip_countdowns: [4, 2]
+
+  # Stage 2: action postprocess, co-located with encode; no weights or VAE decode.
+  - stage_id: 2
+    devices: "4"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position

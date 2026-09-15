@@ -29,6 +29,7 @@ mappings.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections import OrderedDict
 from typing import Any
 
@@ -169,6 +170,8 @@ class RobotRealtimeConnection:
         websocket: WebSocket,
         serving: ServingRealtimeRobotOpenPI,
         idle_timeout: float | None = _DEFAULT_IDLE_TIMEOUT,
+        *,
+        release_sessions_on_disconnect: bool = True,
     ) -> None:
         self.websocket = websocket
         self.serving = serving
@@ -176,22 +179,83 @@ class RobotRealtimeConnection:
         self._current_session_id: str | None = None
         # Session ids seen on this connection, most-recently-used last.
         self._seen_sessions: OrderedDict[str, None] = OrderedDict()
+        # Ownership: this connection holds a reference on every session it
+        # began and drops it on reset, tracking eviction, or disconnect. Serving
+        # reference-counts the holds, so a shared id closes only when the last
+        # connection using it is gone.
+        self._release_sessions_on_disconnect = release_sessions_on_disconnect
+        self._held_sessions: set[str] = set()
 
-    def reset(self) -> None:
+    async def reset(self) -> None:
+        """Release the sessions this connection owns and forget its bookkeeping.
+
+        Raises when a release could not be confirmed, so the caller does not
+        acknowledge a reset that left model state behind.
+
+        A session another connection still holds is deliberately left alone and
+        keeps its seen-marker: releasing it would end their rollout, and
+        forgetting it would make this connection's next observation carry
+        ``reset``, restarting the rollout underneath them.
+        """
+        shared: list[str] = []
+        for session_id in sorted(self._held_sessions):
+            if self.serving.session_refcount(session_id) > 1:
+                shared.append(session_id)
+                continue
+            await self._release_session(session_id, propagate=True)
+        for session_id in shared:
+            logger.info(
+                "Robot OpenPI reset kept session %s: another connection still holds it",
+                session_id,
+            )
         self._current_session_id = None
-        self._seen_sessions.clear()
+        for session_id in list(self._seen_sessions):
+            if session_id not in shared:
+                self._seen_sessions.pop(session_id, None)
 
-    def _mark_session_seen(self, session_id: str) -> bool:
+    async def _release_held_sessions(self) -> None:
+        """Release every held session, continuing past a failure.
+
+        Used on disconnect, where there is no client left to acknowledge: one
+        failed release must not skip the others.
+        """
+        for session_id in sorted(self._held_sessions):
+            await self._release_session(session_id)
+
+    async def _release_session(self, session_id: str, *, propagate: bool = False) -> None:
+        """Drop this connection's hold on ``session_id``.
+
+        ``propagate`` re-raises the failure for callers that owe the client an
+        acknowledgement; otherwise it is logged and the caller moves on.
+        """
+        if session_id not in self._held_sessions:
+            return
+        self._held_sessions.discard(session_id)
+        try:
+            result = self.serving.release_session(session_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("Failed to release robot OpenPI session %s", session_id)
+            if propagate:
+                raise
+
+    async def _mark_session_seen(self, session_id: str) -> bool:
         """Record ``session_id``; return True when it is the first sighting.
 
         A session's first observation is the one that carries ``reset`` to the
-        policy, so this needs per-session memory.
+        policy, so this needs per-session memory. An evicted id would look like a
+        fresh rollout later, so its model state is released with it.
         """
         if session_id in self._seen_sessions:
             self._seen_sessions.move_to_end(session_id)
             return False
 
+        # Acquire first: a refused id (closing, or with an unresolved failed
+        # close) must not leave this connection believing it holds one.
+        self.serving.acquire_session(session_id)
         self._seen_sessions[session_id] = None
+        self._held_sessions.add(session_id)
         if len(self._seen_sessions) > MAX_TRACKED_SESSIONS:
             evicted, _ = self._seen_sessions.popitem(last=False)
             logger.debug(
@@ -199,6 +263,7 @@ class RobotRealtimeConnection:
                 MAX_TRACKED_SESSIONS,
                 evicted,
             )
+            await self._release_session(evicted)
         return True
 
     async def _send_error(self, message: str) -> None:
@@ -260,7 +325,15 @@ class RobotRealtimeConnection:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
-                        self.reset()
+                        # Acknowledge only after the releases are confirmed: a
+                        # "reset successful" over unreleased worker state is the
+                        # bug this endpoint used to have.
+                        try:
+                            await self.reset()
+                        except Exception:
+                            logger.exception("Robot OpenPI reset could not release session state")
+                            await self._send_error("Reset failed to release session state")
+                            continue
                         self.serving.reset(obs)
                         await self.websocket.send_bytes(_pack({"status": "reset successful"}))
                     else:
@@ -274,13 +347,21 @@ class RobotRealtimeConnection:
                                 )
                             self._current_session_id = session_id
 
-                        reset = self._mark_session_seen(session_id)
+                        close_session = bool(obs.pop("close_session", False))
+                        reset = await self._mark_session_seen(session_id)
                         actions = await self.serving.infer(
                             obs,
                             session_id=session_id,
                             reset=reset,
+                            close_session=close_session,
                         )
                         await self.websocket.send_bytes(_pack(actions))
+                        if close_session:
+                            # The rollout ended; drop the hold so the id is reusable.
+                            await self._release_session(session_id)
+                            self._seen_sessions.pop(session_id, None)
+                            if self._current_session_id == session_id:
+                                self._current_session_id = None
                 except Exception:
                     logger.exception("Error handling request")
                     try:
@@ -292,3 +373,8 @@ class RobotRealtimeConnection:
             pass
         except Exception:
             logger.exception("Connection error")
+        finally:
+            # Disconnect, idle timeout and internal error all land here; a
+            # rollout this connection began must not outlive it.
+            if self._release_sessions_on_disconnect:
+                await self._release_held_sessions()

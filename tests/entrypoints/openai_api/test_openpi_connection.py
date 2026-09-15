@@ -47,6 +47,7 @@ def _serving_mock():
         }
     )
     serving.infer = AsyncMock(return_value=[0.0])
+    serving.release_session = AsyncMock(return_value=True)
     return serving
 
 
@@ -272,6 +273,7 @@ def test_handle_connection_returns_structured_error_for_infer_exception(monkeypa
         {"prompt": "pick up the object"},
         session_id="default",
         reset=True,
+        close_session=False,
     )
 
 
@@ -361,9 +363,9 @@ def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
     asyncio.run(openpi_connection.RobotRealtimeConnection(websocket_b, serving).handle_connection())
 
     calls = serving.infer.await_args_list
-    assert calls[0].kwargs == {"session_id": "session-a", "reset": True}
-    assert calls[1].kwargs == {"session_id": "session-a", "reset": False}
-    assert calls[2].kwargs == {"session_id": "session-b", "reset": True}
+    assert calls[0].kwargs == {"session_id": "session-a", "reset": True, "close_session": False}
+    assert calls[1].kwargs == {"session_id": "session-a", "reset": False, "close_session": False}
+    assert calls[2].kwargs == {"session_id": "session-b", "reset": True, "close_session": False}
 
 
 def test_handle_connection_keeps_interleaved_parallel_session_state(monkeypatch):
@@ -384,10 +386,10 @@ def test_handle_connection_keeps_interleaved_parallel_session_state(monkeypatch)
     asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
 
     assert [call.kwargs for call in serving.infer.await_args_list] == [
-        {"session_id": "session-a", "reset": True},
-        {"session_id": "session-b", "reset": True},
-        {"session_id": "session-a", "reset": False},
-        {"session_id": "session-b", "reset": False},
+        {"session_id": "session-a", "reset": True, "close_session": False},
+        {"session_id": "session-b", "reset": True, "close_session": False},
+        {"session_id": "session-a", "reset": False, "close_session": False},
+        {"session_id": "session-b", "reset": False, "close_session": False},
     ]
 
 
@@ -457,3 +459,153 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     serving.reset.assert_called_once_with({})
     assert websocket.sent_bytes[2] == {"status": "reset successful"}
     assert websocket.sent_texts == []
+
+
+def _run_connection(websocket, serving, **kwargs):
+    connection = openpi_connection.RobotRealtimeConnection(websocket, serving, **kwargs)
+    asyncio.run(connection.handle_connection())
+    return connection
+
+
+def test_reset_endpoint_releases_model_session_before_forgetting_it(monkeypatch):
+    """The old rollout's KV/model state must be released, not just forgotten."""
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first", "session_id": "session-a"},
+        b"reset": {"endpoint": "reset"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.receive", "bytes": b"reset"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    connection = _run_connection(websocket, serving)
+
+    serving.release_session.assert_awaited_once_with("session-a")
+    # Bookkeeping is cleared only after the release, and the hold is not
+    # released a second time by the disconnect path.
+    assert connection._seen_sessions == {}
+    assert connection._held_sessions == set()
+
+
+def test_disconnect_releases_sessions_the_connection_began(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first", "session_id": "session-a"},
+        b"b1": {"prompt": "first", "session_id": "session-b"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.receive", "bytes": b"b1"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    _run_connection(websocket, serving)
+
+    assert [call.args[0] for call in serving.release_session.await_args_list] == [
+        "session-a",
+        "session-b",
+    ]
+    assert serving.acquire_session.call_count == 2
+
+
+def test_idle_timeout_releases_sessions(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda _data: {"prompt": "pick"})
+    serving = _serving_mock()
+
+    received = {"count": 0}
+
+    async def receive_then_hang():
+        if received["count"] == 0:
+            received["count"] += 1
+            return {"type": "websocket.receive", "bytes": b"a1"}
+        await asyncio.sleep(1)
+
+    websocket = FakeWebSocket([])
+    websocket.receive = receive_then_hang
+
+    _run_connection(websocket, serving, idle_timeout=0.01)
+
+    assert websocket.closed is True
+    serving.release_session.assert_awaited_once_with("default")
+
+
+def test_tracking_eviction_releases_the_evicted_session(monkeypatch):
+    """An id dropped from tracking would look like a fresh rollout later, so
+    its model state has to go with it."""
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "MAX_TRACKED_SESSIONS", 2)
+    keys = [f"s{index}".encode() for index in range(4)]
+    requests = {key: {"prompt": "pick", "session_id": key.decode()} for key in keys}
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [{"type": "websocket.receive", "bytes": key} for key in keys] + [{"type": "websocket.disconnect"}]
+    )
+
+    connection = _run_connection(websocket, serving)
+
+    released = [call.args[0] for call in serving.release_session.await_args_list]
+    # s0 and s1 are evicted by s2/s3 and released at eviction time; the two
+    # still-tracked ids are released by the disconnect.
+    assert released[:2] == ["s0", "s1"]
+    assert sorted(released[2:]) == ["s2", "s3"]
+    assert connection._held_sessions == set()
+
+
+def test_close_session_request_releases_and_forgets_the_session(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first", "session_id": "session-a"},
+        b"a2": {"prompt": "last", "session_id": "session-a", "close_session": True},
+        b"a3": {"prompt": "new rollout", "session_id": "session-a"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.receive", "bytes": b"a2"},
+            {"type": "websocket.receive", "bytes": b"a3"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    _run_connection(websocket, serving)
+
+    kwargs = [call.kwargs for call in serving.infer.await_args_list]
+    assert [call["close_session"] for call in kwargs] == [False, True, False]
+    # Reusing the id after an explicit close begins a fresh rollout.
+    assert [call["reset"] for call in kwargs] == [True, False, True]
+    assert [call.args[0] for call in serving.release_session.await_args_list] == [
+        "session-a",
+        "session-a",
+    ]
+    # ``close_session`` is a control, not observation data.
+    assert all("close_session" not in call.args[0] for call in serving.infer.await_args_list)
+
+
+def test_release_on_disconnect_can_be_disabled_for_externally_owned_sessions(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda _data: {"prompt": "pick", "session_id": "shared"})
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    _run_connection(websocket, serving, release_sessions_on_disconnect=False)
+
+    serving.release_session.assert_not_awaited()

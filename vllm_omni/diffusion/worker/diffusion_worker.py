@@ -17,7 +17,7 @@ import sys
 import threading
 import traceback
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -601,16 +601,42 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
+    # Runner lifecycle method -> the pipeline hook standing in for it on a stage
+    # with no AR runner. A plain diffusion runner has no reset_session, so the
+    # RPC alone did nothing on the stage owning the VAE history.
+    _AR_LIFECYCLE_PIPELINE_HOOKS = {
+        "reset_session": "reset_ar_diffusion_session",
+        "close_session": "close_ar_diffusion_session",
+    }
+
     def _run_ar_diffusion_session_lifecycle(self, method: str, session_id: str) -> bool:
-        """Delegate an optional AR session lifecycle call to the model runner."""
+        """Run one session lifecycle operation on whatever owns state here.
+
+        Prefers the AR runner, which releases paged KV before notifying the local
+        model, and otherwise falls back to the model's own hook so every
+        state-owning participant answers the same RPC. False means the stage
+        implements neither, which the caller treats as unsupported.
+        """
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a non-empty string.")
         assert self.model_runner is not None, "Model runner not initialized"
-        lifecycle_method = getattr(self.model_runner, method, None)
-        if not callable(lifecycle_method):
-            return False
-        lifecycle_method(session_id)
-        return True
+        runner = self.model_runner
+
+        suppress = getattr(runner, "suppress_release_events", None)
+        # Coordinator-driven, so recording it would fan the same cleanup out again.
+        with suppress(session_id) if callable(suppress) else nullcontext():
+            lifecycle_method = getattr(runner, method, None)
+            if callable(lifecycle_method):
+                lifecycle_method(session_id)
+                return True
+
+            hook_name = self._AR_LIFECYCLE_PIPELINE_HOOKS.get(method)
+            pipeline = getattr(runner, "pipeline", None)
+            hook = getattr(pipeline, hook_name, None) if hook_name else None
+            if callable(hook):
+                hook(session_id)
+                return True
+        return False
 
     def reset_ar_diffusion_session(self, session_id: str) -> bool:
         """Reset runner-owned AR state through the collective RPC boundary."""
@@ -619,6 +645,36 @@ class DiffusionWorker:
     def close_ar_diffusion_session(self, session_id: str) -> bool:
         """Close runner-owned AR state through the collective RPC boundary."""
         return self._run_ar_diffusion_session_lifecycle("close_session", session_id)
+
+    def get_ar_diffusion_release_events(self) -> list[dict[str, object]]:
+        """Report releases this worker performed on its own, without consuming them."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        report = getattr(self.model_runner, "get_ar_diffusion_release_events", None)
+        if not callable(report):
+            return []
+        return list(report())
+
+    def ack_ar_diffusion_release_events(self, event_ids: Sequence[str]) -> int:
+        """Acknowledge release records the coordinator has finished acting on."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        ack = getattr(self.model_runner, "ack_ar_diffusion_release_events", None)
+        if not callable(ack):
+            return 0
+        return int(ack(event_ids))
+
+    def register_ar_diffusion_generation(self, session_id: str, generation: int) -> bool:
+        """Bind a coordinator-issued generation token to this worker's session."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string.")
+        assert self.model_runner is not None, "Model runner not initialized"
+        register = getattr(self.model_runner, "register_ar_diffusion_generation", None)
+        if callable(register):
+            return bool(register(session_id, int(generation)))
+        pipeline = getattr(self.model_runner, "pipeline", None)
+        pipeline_register = getattr(pipeline, "register_session_generation", None)
+        if callable(pipeline_register):
+            return bool(pipeline_register(session_id, int(generation)))
+        return False
 
     def execute_model(
         self,

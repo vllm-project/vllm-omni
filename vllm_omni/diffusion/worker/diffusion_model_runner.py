@@ -147,6 +147,18 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
+def _to_device(value: Any, device: torch.device) -> Any:
+    """Move tensors (including those nested in containers) onto ``device``."""
+    if isinstance(value, torch.Tensor):
+        return value.to(device) if value.device != device else value
+    if isinstance(value, dict):
+        return {k: _to_device(v, device) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        moved = [_to_device(v, device) for v in value]
+        return type(value)(moved) if isinstance(value, list) else tuple(moved)
+    return value
+
+
 class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
@@ -155,6 +167,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     operations including loading, compilation, offloading, caching, and execution.
     The Worker only handles infrastructure (device, distributed env).
     """
+
+    # Explicit transfer-handle key, overriding the implicit stage/chunk convention.
+    _STAGE_PAYLOAD_HANDLE_KEY = "_stage_payload_transfer"
 
     def __init__(
         self,
@@ -598,6 +613,182 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         return peak_memory_mb
 
+    def _stage_payload_connector(self) -> Any | None:
+        """Return the connector configured on this stage's incoming edge."""
+        try:
+            return self.kv_transfer_manager.connector
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Stage payload connector unavailable: %s", exc)
+            return None
+
+    def _stage_payload_broadcast_group(self) -> Any | None:
+        """Return the group whose ranks share one stage payload."""
+        tp_group = self._get_local_tp_group()
+        if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+            return tp_group
+        try:
+            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+            sp_group = get_sp_group()
+        except (AssertionError, ImportError):
+            return None
+        return sp_group if getattr(sp_group, "world_size", 1) > 1 else None
+
+    def _stage_input_payload_keys(self) -> tuple[str, ...]:
+        """Declared receive keys; empty leaves stage-payload reception disabled."""
+        keys = getattr(self.od_config, "stage_input_payload_keys", None)
+        return tuple(keys) if keys else ()
+
+    def _maybe_recv_stage_payload(self, req: OmniDiffusionRequest) -> None:
+        """Receive connector payload into prompt["additional_information"].
+
+        Declared keys or an explicit handle enable reception. On failure,
+        retain any inline payload already present.
+        """
+        prompt = getattr(req, "prompt", None)
+        if not isinstance(prompt, dict):
+            return
+
+        handle = prompt.pop(self._STAGE_PAYLOAD_HANDLE_KEY, None)
+        expected_keys = self._stage_input_payload_keys()
+        if not isinstance(handle, dict) and not expected_keys:
+            return
+
+        from_stage, to_stage = self.kv_transfer_manager.recv_stages
+        broadcast_group = self._stage_payload_broadcast_group()
+        group_active = broadcast_group is not None
+        is_transfer_rank = not group_active or getattr(broadcast_group, "rank_in_group", 0) == 0
+
+        connector = None
+        if is_transfer_rank:
+            # Only the matching transfer rank receives; broadcast the TP-identical
+            # payload below. Use the request-forwarding endpoint, not the KV endpoint.
+            sender_info = getattr(req, "payload_sender_info", None)
+            if not sender_info:
+                sender_info = getattr(req, "kv_sender_info", None)
+            if sender_info:
+                self.kv_transfer_manager.update_sender_info(sender_info, sender_stage_id=from_stage)
+            connector = self._stage_payload_connector()
+
+        metadata = None
+        if isinstance(handle, dict):
+            get_key = handle.get("key")
+            from_stage = str(handle.get("from_stage", from_stage))
+            to_stage = str(handle.get("to_stage", to_stage))
+            metadata = handle.get("metadata")
+        elif from_stage is None or to_stage is None:
+            logger.warning(
+                "Stage %s expects an input payload but has no incoming connector edge",
+                getattr(self.od_config, "stage_id", "?"),
+            )
+            return
+        else:
+            # Match the producer's request/stage/chunk key; diffusion uses chunk 0.
+            get_key = f"{req.request_id}_{from_stage}_0"
+
+        if not get_key:
+            return
+
+        result = None
+        if connector is not None:
+            try:
+                result = connector.get(str(from_stage), str(to_stage), str(get_key), metadata=metadata)
+            except Exception as exc:
+                logger.warning("Stage payload get failed for %s: %s", get_key, exc)
+
+        payload = result[0] if result else None
+        if broadcast_group is not None:
+            delivered = broadcast_group.broadcast_object(isinstance(payload, dict) if is_transfer_rank else None, src=0)
+            if delivered:
+                payload = broadcast_group.broadcast_tensor_dict(payload if is_transfer_rank else None, src=0)
+
+        if payload is None:
+            if is_transfer_rank:
+                logger.warning("Stage payload %s was not delivered; falling back to the inline prompt", get_key)
+            return
+
+        if not isinstance(payload, dict):
+            logger.warning("Stage payload %s has unexpected type %s", get_key, type(payload).__name__)
+            return
+
+        target_device = self._target_device or self.device
+        additional = prompt.setdefault("additional_information", {})
+        for name, value in payload.items():
+            if expected_keys and name not in expected_keys:
+                continue
+            additional[name] = _to_device(value, target_device)
+
+    def _stage_output_payload_keys(self) -> tuple[str, ...]:
+        """Declared send keys; empty leaves stage-payload sending disabled."""
+        keys = getattr(self.od_config, "stage_output_payload_keys", None)
+        return tuple(keys) if keys else ()
+
+    def _maybe_send_stage_payload(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        outputs: list[DiffusionOutput],
+    ) -> None:
+        """Send declared payloads through the leader and broadcast transfer handles.
+
+        A successful put replaces inline payload keys with its handle on every
+        rank, avoiding duplicate transfer. Failed puts retain the inline payload.
+        Every rank must participate in the handle broadcast.
+        """
+        payload_keys = self._stage_output_payload_keys()
+        if not payload_keys:
+            return
+        from_stage, to_stage = self.kv_transfer_manager.send_stages
+        if not from_stage or not to_stage:
+            logger.warning(
+                "Stage %s declares output payload keys but has no outgoing connector edge",
+                getattr(self.od_config, "stage_id", "?"),
+            )
+            return
+
+        # Every rank must reach the broadcast below, so the leader-only work is
+        # confined to this block rather than short-circuiting the whole method.
+        handles: dict[str, dict[str, Any]] = {}
+        if self.is_data_transfer_rank():
+            connector = self._stage_payload_connector()
+            if connector is not None:
+                for req, output in zip(reqs, outputs):
+                    custom = getattr(output, "custom_output", None)
+                    if not isinstance(custom, dict):
+                        continue
+                    payload = {key: custom[key] for key in payload_keys if custom.get(key) is not None}
+                    if not payload:
+                        continue
+                    put_key = f"{req.request_id}_{from_stage}_0"
+                    try:
+                        success, size, metadata = connector.put(from_stage, to_stage, put_key, payload)
+                    except Exception as exc:
+                        logger.warning("Stage payload put failed for %s: %s", put_key, exc)
+                        continue
+                    if not success:
+                        logger.warning("Stage payload %s was rejected; keeping the inline payload", put_key)
+                        continue
+                    handles[req.request_id] = {
+                        "key": put_key,
+                        "from_stage": from_stage,
+                        "to_stage": to_stage,
+                        "size_bytes": int(size),
+                        "metadata": metadata,
+                        "payload_keys": list(payload),
+                    }
+                    logger.debug("Stage payload put %s size=%s keys=%s", put_key, size, list(payload))
+
+        handles = self._broadcast_tp_payload_packet(handles) or {}
+        if not handles:
+            return
+        for req, output in zip(reqs, outputs):
+            handle = handles.get(req.request_id)
+            custom = getattr(output, "custom_output", None)
+            if handle is None or not isinstance(custom, dict):
+                continue
+            custom[self._STAGE_PAYLOAD_HANDLE_KEY] = handle
+            for name in handle["payload_keys"]:
+                custom.pop(name, None)
+
     def _prepare_request_for_forward(
         self,
         req: OmniDiffusionRequest,
@@ -606,6 +797,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         use_prefetch: bool = False,
     ) -> None:
+        self._maybe_recv_stage_payload(req)
+
         # Receive AR KV. Single-request execution can use the prefetch path:
         # consume prior-forward payload, sync-fallback on miss; request-batch
         # execution keeps the synchronous per-request receive path.
@@ -783,7 +976,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 paged_kv_context,
             ):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
+                    # The pipeline owns role dispatch; the generic runner calls run_stage.
+                    run_stage = getattr(self.pipeline, "run_stage", None)
+                    if callable(run_stage):
+                        raw_outputs = run_stage(batch)
+                    else:
+                        raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(
                         raw_outputs,
                         expected_count=len(reqs),
@@ -813,6 +1011,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):
                 cache_summary(self.pipeline, details=True)
+
+        self._maybe_send_stage_payload(reqs, outputs)
 
         return self._runner_output_from_outputs(reqs, outputs)
 

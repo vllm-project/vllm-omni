@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 
 import torch
@@ -25,7 +25,12 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.release_events import (
+    ARDiffusionReleaseEventLog,
+    SessionGenerationUnsupportedError,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+from vllm_omni.experimental.world_models.session_state import SessionStateLostError
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -71,6 +76,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
         # modes instead of one entry per denoise step.
         self._stepwise_chunk_started: dict[str, float] = {}
+        # A coordinated stage reports releases upward and lets the orchestrator
+        # own reset/close ordering; a single-stage deployment does its own.
+        self.lifecycle_externally_coordinated = bool(getattr(od_config, "coordinated_session_lifecycle", False))
+        stage_id = getattr(od_config, "stage_id", None)
+        self.release_events = ARDiffusionReleaseEventLog(
+            stage_id=-1 if stage_id is None else int(stage_id),
+        )
 
     @staticmethod
     def _require_capability(pipeline: object) -> SupportsARDiffusionPipeline:
@@ -91,6 +103,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._preallocate_kv_cache()
         if not self.od_config.enforce_eager and self.ar_diffusion_kv_config.warmup_cudagraph:
             self._warmup_ar_rollout()
+        # Warmup releases real rollouts, but they are not user sessions.
+        self.release_events.set_ready()
 
     def _available_memory_bytes(self) -> int:
         if self.device is None or torch.device(self.device).type != "cuda":
@@ -208,6 +222,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
                 errors.append(exc)
         logger.debug("AR-Diffusion released session=%s reason=%s", session_id, reason)
+        # Record before raising: peers must learn this stage dropped the session
+        # even when local cleanup only partly succeeded.
+        self.release_events.record(session_id, reason=reason, cleanup_failed=bool(errors))
+        # The event above captured the generation, so the binding can go; keeping
+        # one per session id ever seen would grow without bound.
+        self.release_events.forget_generation(session_id)
         if errors:
             if suppress_errors:
                 logger.warning(
@@ -227,6 +247,70 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def close_session(self, session_id: str) -> None:
         """Release KV and notify the pipeline to drop model-owned state."""
         self._release_session(session_id, reset_model=False, reason="close")
+
+    def suppress_release_events(self, session_id: str):
+        """Context manager marking a release as coordinator-driven."""
+        return self.release_events.coordinated(session_id)
+
+    def get_ar_diffusion_release_events(self) -> list[dict[str, object]]:
+        """Report self-initiated releases without consuming them."""
+        return self.release_events.pending()
+
+    def ack_ar_diffusion_release_events(self, event_ids: Sequence[str]) -> int:
+        """Drop release records the coordinator has finished acting on."""
+        return self.release_events.acknowledge(event_ids)
+
+    def register_ar_diffusion_generation(self, session_id: str, generation: int) -> bool:
+        """Bind one generation to both the release log and the loaded model.
+
+        The runner owns registration for a stage that has one: reporting only to
+        its own event log would leave the model unable to fence a stale payload.
+        A model that does not implement the hook cannot be fenced, so on a
+        coordinated topology that is a failure rather than a silent success.
+        """
+        pipeline = getattr(self, "pipeline", None)
+        register = getattr(pipeline, "register_session_generation", None)
+        if not callable(register):
+            if self.lifecycle_externally_coordinated:
+                raise SessionGenerationUnsupportedError(
+                    f"{type(pipeline).__name__} does not implement register_session_generation(), so "
+                    "it cannot reject a payload from a replaced generation. A coordinated topology "
+                    "requires it on every participant."
+                )
+            self.release_events.register_generation(session_id, generation)
+            return True
+        if not bool(register(session_id, int(generation))):
+            raise SessionGenerationUnsupportedError(
+                f"{type(pipeline).__name__}.register_session_generation() refused generation "
+                f"{generation} for session {session_id!r}."
+            )
+        # Only after the model accepted it, so a failed registration cannot leave
+        # the log stamping releases with a generation the model never took.
+        self.release_events.register_generation(session_id, generation)
+        return True
+
+    def has_ar_diffusion_session(self, session_id: str) -> bool:
+        """Whether runner-owned KV for ``session_id`` is currently resident."""
+        return str(session_id) in self._sessions
+
+    def _reject_unknown_continuation(self, session_id: str, *, reset: bool) -> None:
+        """Refuse a continuation of a session this runner no longer holds.
+
+        Otherwise ``_get_or_create_session`` evicts a healthy session to make
+        room for the unknown one, and only then does the pipeline reject the
+        request. Opt-in, since only a coordinated topology can rely on the
+        coordinator having already retired what it released.
+        """
+        if reset or not self.lifecycle_externally_coordinated:
+            return
+        if session_id in self._sessions:
+            return
+        raise SessionStateLostError(
+            f"AR-Diffusion session {session_id!r} has no resident KV on this stage, so this "
+            "request cannot continue it. Its paged KV was released (explicit close, LRU "
+            "eviction, or a failed forward) and cannot be rebuilt from a later chunk. Begin a "
+            'new rollout with extra_args["reset"]=True.'
+        )
 
     def _get_or_create_session(self, session_id: str) -> ARDiffusionKVState:
         state = self._sessions.get(session_id)
@@ -318,13 +402,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         session_id, extra_args, tick = self._request_session(req)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-        if reset:
+        # The orchestrator already retired the old generation before admission
+        # and closes after the request itself; repeating the reset here would
+        # discard the conditioning the upstream stage just produced. The
+        # begin/reset intent still reaches the pipeline through extra_args.
+        if reset and not self.lifecycle_externally_coordinated:
             self.reset_session(session_id)
+        self._reject_unknown_continuation(session_id, reset=reset)
         started = time.perf_counter()
         with self._bound_ar_session(session_id, description="forward"):
             output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
         self._perf_e2e_times.append(time.perf_counter() - started)
-        if close_session:
+        if close_session and not self.lifecycle_externally_coordinated:
             self.close_session(session_id)
         return output
 

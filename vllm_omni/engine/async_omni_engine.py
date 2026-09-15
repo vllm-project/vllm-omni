@@ -423,6 +423,7 @@ class AsyncOmniEngine:
                 duplex_runtime_extension=duplex_runtime_extension,
                 enable_duplex_control=self._duplex_control_enabled,
                 duplex_session_config=self.duplex_session_config,
+                stage_configs=self.stage_configs,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

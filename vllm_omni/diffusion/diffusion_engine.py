@@ -535,6 +535,17 @@ class DiffusionEngine:
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
+        if output.media is None and output.output is None:
+            # Non-final stages may carry a payload without emitting media.
+            custom_output = output.custom_output or {}
+            if not custom_output:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+            return format_empty_diffusion_outputs(
+                request,
+                finished=output.finished,
+                custom_output=custom_output,
+            )
+
         if output.media is not None:
             if output.output is not None:
                 raise ValueError("DiffusionOutput cannot contain both media and legacy output")
@@ -542,10 +553,6 @@ class DiffusionEngine:
             output_data = media.video.tensor
             outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
         else:
-            if output.output is None:
-                logger.warning("Output is None, returning empty OmniRequestOutput")
-                return format_empty_diffusion_outputs(request, finished=output.finished)
-
             # When CPU offload is enabled, move output to CPU before
             # post-processing to avoid device OOM — model weights may still
             # reside on the device and leave no headroom for intermediates.
