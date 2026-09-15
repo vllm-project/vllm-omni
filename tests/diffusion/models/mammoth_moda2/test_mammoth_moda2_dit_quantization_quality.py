@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""BF16 versus DiT-only online-FP8 quality and memory test for MammothModa2."""
+"""BF16 versus DiT-only online-FP8 quality, memory, and latency test for MammothModa2."""
 
 from __future__ import annotations
 
 import gc
-import json
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -22,12 +22,15 @@ from tests.diffusion.quantization.test_quantization_quality import (
     _compute_lpips,
     _compute_psnr_and_mae,
 )
+from tests.e2e.offline_inference.test_mammoth_moda2_expansion import (
+    _format_t2i_prompt,
+    _load_t2i_gen_config,
+)
 from tests.helpers.mark import hardware_test
 from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
@@ -43,23 +46,6 @@ _IMAGE_TOKEN_ID = 151655
 _VIDEO_TOKEN_ID = 151656
 _VISION_START_TOKEN_ID = 151652
 _VISION_END_TOKEN_ID = 151653
-
-
-def _load_generation_config() -> dict:
-    weights_dir = Path(hf_api().snapshot_download(MODEL_PATH))
-    config_path = weights_dir / "t2i_generation_config.json"
-    if not config_path.is_file():
-        pytest.skip(f"t2i_generation_config.json not found at {config_path}")
-    return json.loads(config_path.read_text())
-
-
-def _format_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
-    return (
-        "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
-        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        f"<|image start|>{ar_width}*{ar_height}<|image token|>"
-    )
 
 
 def _extract_image(outputs, *, height: int = HEIGHT, width: int = WIDTH) -> torch.Tensor:
@@ -110,10 +96,10 @@ def _to_pil(image: torch.Tensor) -> Image.Image:
     )[0]
 
 
-def _generate(deploy_config: str) -> tuple[Image.Image, float]:
-    generation_config = _load_generation_config()
+def _generate(deploy_config: str) -> tuple[Image.Image, float, float]:
+    generation_config = _load_t2i_gen_config(MODEL_PATH)
     expected_grid_tokens = AR_HEIGHT * (AR_WIDTH + 1)
-    prompt = _format_prompt("A cat sitting on a laptop keyboard", AR_WIDTH, AR_HEIGHT)
+    prompt = _format_t2i_prompt("A cat sitting on a laptop keyboard", AR_WIDTH, AR_HEIGHT)
 
     ar_sampling = SamplingParams(
         temperature=float(generation_config["temperature"]),
@@ -159,7 +145,9 @@ def _generate(deploy_config: str) -> tuple[Image.Image, float]:
             deploy_config=deploy_config,
             enforce_eager=True,
         ) as runner:
+            generation_start = time.perf_counter()
             outputs = list(runner.omni.generate([request], [ar_sampling, dit_sampling]))
+            generation_latency_s = time.perf_counter() - generation_start
             image = _extract_image(outputs, height=HEIGHT, width=WIDTH)
         device_peak_memory_mb = monitor.peak_used_mb
     finally:
@@ -170,7 +158,7 @@ def _generate(deploy_config: str) -> tuple[Image.Image, float]:
     pil_image = _to_pil(image)
     assert pil_image.mode == "RGB"
     assert pil_image.size == (WIDTH, HEIGHT)
-    return pil_image, device_peak_memory_mb
+    return pil_image, device_peak_memory_mb, generation_latency_s
 
 
 @pytest.fixture(scope="module")
@@ -192,21 +180,25 @@ def dit_fp8_deploy_config(tmp_path_factory: pytest.TempPathFactory) -> str:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 def test_mammoth_moda2_dit_online_fp8_quality_and_memory(dit_fp8_deploy_config: str):
-    baseline, bf16_device_mem = _generate(DEPLOY_CONFIG)
-    quantized, fp8_device_mem = _generate(dit_fp8_deploy_config)
+    baseline, bf16_device_mem, bf16_latency_s = _generate(DEPLOY_CONFIG)
+    quantized, fp8_device_mem, fp8_latency_s = _generate(dit_fp8_deploy_config)
 
     lpips_score = _compute_lpips(baseline, quantized, "t2i")
     psnr_score, mae_score = _compute_psnr_and_mae(baseline, quantized, "t2i")
     assert lpips_score <= MAX_LPIPS, f"MammothModa2 DiT online-FP8 LPIPS {lpips_score:.4f} exceeds {MAX_LPIPS}"
 
     device_reduction = (bf16_device_mem - fp8_device_mem) / bf16_device_mem * 100 if bf16_device_mem > 0 else 0.0
+    latency_reduction = (bf16_latency_s - fp8_latency_s) / bf16_latency_s * 100 if bf16_latency_s > 0 else 0.0
     print("\nMammothModa2 BF16 versus DiT-only online FP8")
     print(f"  LPIPS:           {lpips_score:.4f} (threshold: {MAX_LPIPS})")
     print(f"  PSNR:            {psnr_score:.4f} dB")
     print(f"  MAE:             {mae_score:.6f}")
     print(f"  BF16 device:     {bf16_device_mem:.2f} MiB")
     print(f"  FP8 device:      {fp8_device_mem:.2f} MiB ({device_reduction:.1f}% reduction)")
+    print(f"  BF16 latency:    {bf16_latency_s:.4f} s")
+    print(f"  FP8 latency:     {fp8_latency_s:.4f} s ({latency_reduction:.1f}% reduction)")
 
     assert np.isfinite(psnr_score) or np.isinf(psnr_score)
     assert np.isfinite(mae_score)
     assert bf16_device_mem > 0 and fp8_device_mem > 0
+    assert bf16_latency_s > 0 and fp8_latency_s > 0
