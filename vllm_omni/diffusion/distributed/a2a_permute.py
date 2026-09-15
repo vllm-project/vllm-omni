@@ -21,6 +21,7 @@ from __future__ import annotations
 import glob
 import math
 import os
+import shlex
 import sysconfig
 import threading
 from dataclasses import dataclass
@@ -73,14 +74,16 @@ def _ensure_built() -> None:
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
         if not any(os.path.isfile(os.path.join(path, "nccl.h")) for path in include_paths):
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl nccl.h")
+        # PyTorch adds its selected toolkit with -isystem. Vendor -I paths
+        # would take precedence even if the same toolkit were also passed as
+        # -I (compilers keep duplicate system directories in their system slot).
+        # Append vendor directories as system includes after toolkit defaults.
+        vendor_includes = [f"-isystem {shlex.quote(path)}" for path in include_paths]
         load(
             name="vllm_omni_a2a_permute",
             sources=[src],
-            # PyTorch wheel-only installations keep headers such as cusparse.h
-            # under nvidia/{cu13,cusparse}/include rather than CUDA_HOME.
-            extra_include_paths=list(include_paths),
-            extra_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3"],
-            extra_cuda_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", "--expt-relaxed-constexpr"],
+            extra_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", *vendor_includes],
+            extra_cuda_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", "--expt-relaxed-constexpr", *vendor_includes],
             extra_ldflags=[nccl_libs[0]],
             is_python_module=False,
             verbose=False,
