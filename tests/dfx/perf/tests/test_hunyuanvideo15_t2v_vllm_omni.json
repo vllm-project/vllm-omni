@@ -54,7 +54,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": ["H100", "B200"]
+            "cuda": ["H100", "B200"],
+            "npu": "A2"
           },
           "num_cards": 2
         }
