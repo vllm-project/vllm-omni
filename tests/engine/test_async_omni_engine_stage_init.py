@@ -222,6 +222,50 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     assert captured["log_stats"] is True
 
 
+def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_configs = [types.SimpleNamespace()]
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.single_stage_mode = False
+    engine.async_chunk = False
+    engine.tokenizer = None
+    engine._single_stage_id_filter = None
+    engine._omni_master_address = None
+    engine._omni_master_port = None
+    engine._omni_dp_size_local = 1
+    engine._omni_heartbeat_timeout = 30.0
+    engine._omni_lb_policy = "random"
+    engine.request_queue = types.SimpleNamespace()
+    engine._log_stats = False
+    engine._parallel_stage_init = False
+
+    prompt_transform = object()
+    client = types.SimpleNamespace(
+        prompt_transform_func=prompt_transform,
+        prompt_expand_func=None,
+        default_sampling_params=types.SimpleNamespace(),
+        final_output=True,
+        final_output_type="text",
+        stage_type="llm",
+        model_stage="text_encoder",
+        is_comprehension=True,
+    )
+    pool = types.SimpleNamespace(
+        stage_client=client,
+        stage_vllm_config=None,
+        output_processor=None,
+    )
+    runtime = types.SimpleNamespace(stage_pools=[pool], initialize=lambda: None)
+    monkeypatch.setattr(engine_mod, "create_stage_runtime", lambda **_kwargs: runtime)
+
+    engine._initialize_stages(stage_init_timeout=7)
+
+    assert engine.prompt_transform_func is prompt_transform
+
+
 def test_compute_replica_layout_splits_diffusion_devices_by_world_size():
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1714,6 +1758,51 @@ def test_inject_kv_stage_info_infers_receiver_tp_topology():
     assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
 
 
+def test_inject_kv_stage_info_updates_typed_connector_config():
+    from vllm_omni.config.omni_config import (
+        OmniStageConnectorConfig,
+        OmniStageDiffusionParallelConfig,
+        VllmOmniDiffusionStageConfig,
+    )
+    from vllm_omni.config.stage_config import StageExecutionType, StagePipelineConfig
+    from vllm_omni.engine.stage_init_utils import inject_kv_stage_info
+    from vllm_omni.entrypoints.utils import inject_omni_kv_config
+
+    stage0 = VllmOmniDiffusionStageConfig(
+        stage_pipeline_config=StagePipelineConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
+        ),
+        connector_config=OmniStageConnectorConfig(
+            omni_kv_config={
+                "need_send_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            }
+        ),
+        parallel_config=OmniStageDiffusionParallelConfig(tensor_parallel_size=4),
+    )
+    stage1 = VllmOmniDiffusionStageConfig(
+        stage_pipeline_config=StagePipelineConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(0,),
+        ),
+        connector_config=OmniStageConnectorConfig(omni_kv_config={"need_recv_cache": True}),
+        parallel_config=OmniStageDiffusionParallelConfig(tensor_parallel_size=2),
+    )
+
+    inject_omni_kv_config(stage0, {"kv_connector": "P2pNcclConnector"}, "0", "1")
+    inject_kv_stage_info(stage0, 0, [stage0, stage1])
+
+    assert stage0.connector_config.omni_kv_config["stage_id"] == 0
+    assert stage0.connector_config.omni_kv_config["connector_config"] == {"kv_connector": "P2pNcclConnector"}
+    assert stage0.connector_config.omni_kv_config["engine_input_source"] == []
+    assert stage0.connector_config.omni_kv_config["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+
+
 def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
     """ROCm default attention logic only applies to LLM stages, not diffusion."""
     from vllm_omni.engine.stage_init_utils import extract_legacy_stage_metadata
@@ -1829,3 +1918,80 @@ def test_port_from_zmq_address_parsing():
     assert _port_from_zmq_address(None) is None
     assert _port_from_zmq_address("ipc:///tmp/sock") is None
     assert _port_from_zmq_address("tcp://host:not-a-port") is None
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
+    from vllm_omni.engine.stage_runtime import DistStageRuntime
+
+    if typed:
+        stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="ar"))
+        runtime_cfg = stage.runtime_config
+    else:
+        runtime_cfg = types.SimpleNamespace(num_replicas=1)
+        stage = types.SimpleNamespace(stage_id=0, runtime=runtime_cfg)
+    runtime = DistStageRuntime(
+        stage_configs=[stage],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+        single_stage_id_filter=0,
+        omni_master_address="127.0.0.1",
+        omni_master_port=12345,
+        omni_dp_size_local=2,
+    )
+
+    runtime._validate_single_stage_mode_replica_constraints()
+
+    assert runtime_cfg.num_replicas == 2
+
+
+@pytest.mark.parametrize("num_replicas", [1, 2, 3])
+def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(mocker, num_replicas):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.engine import stage_runtime as runtime_module
+
+    stage = StageConfigFactory.create_typed_default_diffusion(
+        "generic-diffusion", {"model_class_name": "QwenImagePipeline"}
+    ).stage_configs[0]
+    devices = ",".join(str(i) for i in range(num_replicas))
+    stage.runtime_config.devices = devices
+    stage.runtime_config.num_replicas = num_replicas
+    runtime = StageRuntime(
+        stage_configs=[stage],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+    mocker.patch.object(runtime, "_stage_device_scope", side_effect=lambda *_: contextlib.nullcontext())
+    client = mocker.Mock()
+    launch = mocker.patch.object(runtime_module, "launch_diffusion_stage_replica", return_value=(client, None))
+
+    # Replanning must not inherit the first replica's narrowed device slice.
+    for _ in range(2):
+        counts, device_map = compute_replica_layout([stage])
+        plans = runtime._build_logical_stage_init_plans(
+            omni_transfer_config=None,
+            replicas_per_stage=counts,
+            replica_devices_map=device_map,
+        )
+        replicas = plans[0].replicas
+        assert stage.runtime_config.devices == devices
+        assert len({id(plan.stage_cfg) for plan in replicas}) == num_replicas
+        for i, plan in enumerate(replicas):
+            assert plan.metadata.runtime_cfg is plan.stage_cfg.runtime_config
+            assert plan.stage_cfg.runtime_config.devices == str(i)
+            if num_replicas > 1:
+                assert plan.stage_cfg is not stage
+            assert runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1) is client
+            assert launch.call_args.kwargs["stage_config"] is plan.stage_cfg
+            assert launch.call_args.kwargs["metadata"] is plan.metadata
+            assert launch.call_args.kwargs["use_inline"] is (num_replicas == 1)
+
+    assert launch.call_count == 2 * num_replicas

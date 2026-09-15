@@ -136,10 +136,6 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
-def _stage_engine_args(stage_cfg: Any) -> Any:
-    return _config_get(stage_cfg, "engine_args", {}) or {}
-
-
 def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     if not stage_configs:
         return []
@@ -150,7 +146,10 @@ def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     for stage_cfg in stage_configs:
         if get_stage_type(stage_cfg) != "diffusion":
             continue
-        model_class_name = _config_get(_stage_engine_args(stage_cfg), "model_class_name")
+        diffusion_config = _config_get(stage_cfg, "diffusion_config")
+        if diffusion_config is None:
+            diffusion_config = _config_get(stage_cfg, "engine_args", {})
+        model_class_name = _config_get(diffusion_config, "model_class_name")
         if not model_class_name:
             continue
         model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)

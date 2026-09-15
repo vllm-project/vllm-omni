@@ -3331,6 +3331,76 @@ stages: []
     assert should_enable_duplex_endpoint([], config_path=str(config_path)) is True
 
 
+@pytest.mark.parametrize("session_mode", ["duplex", "turn"])
+@pytest.mark.parametrize("explicit_config_path", [False, True])
+def test_duplex_endpoint_reads_typed_stage_session_mode(session_mode, explicit_config_path):
+    from tests.helpers.stage_config import get_deploy_config_path
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.stage_config import load_deploy_config
+    from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
+
+    config_path = get_deploy_config_path("minicpmo_4_5.yaml")
+    deploy = load_deploy_config(config_path)
+    assert deploy.session_mode == "duplex"
+    deploy.session_mode = session_mode
+    config = VllmOmniConfig.from_pipeline_config(MINICPMO_4_5_PIPELINE, user_deploy_config=deploy)
+
+    # The production MiniCPM YAML explicitly contains duplex_session; that
+    # endpoint opt-in is independent of the effective scheduler mode.
+    expected = session_mode == "duplex" or explicit_config_path
+    assert (
+        should_enable_duplex_endpoint(
+            list(config.stage_configs), config_path=config_path if explicit_config_path else None
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("raw_mode", ["turn", "duplex"])
+@pytest.mark.parametrize("inherited", [False, True], ids=["direct", "inherited"])
+@pytest.mark.parametrize(
+    "session_yaml,expected",
+    [
+        pytest.param("", False, id="absent"),
+        pytest.param("duplex_session: null\n", False, id="null"),
+        pytest.param("duplex_session: {}\n", True, id="empty-opt-in"),
+        pytest.param(
+            "duplex_session:\n  server_vad_model_path: /models/silero_vad.onnx\n",
+            True,
+            id="server-vad",
+        ),
+    ],
+)
+def test_typed_qwen_turn_preserves_realtime_opt_in(tmp_path, raw_mode, inherited, session_yaml, expected):
+    from tests.helpers.stage_config import get_deploy_config_path
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.stage_config import load_deploy_config
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+
+    production_path = get_deploy_config_path("qwen3_omni_moe.yaml")
+    config_path = tmp_path / "qwen.yaml"
+    config_path.write_text(
+        f"base_config: {json.dumps(production_path)}\nsession_mode: {raw_mode}\n{session_yaml}",
+        encoding="utf-8",
+    )
+    if inherited:
+        config_path = tmp_path / "inherited.yaml"
+        config_path.write_text("base_config: qwen.yaml\n", encoding="utf-8")
+
+    deploy = load_deploy_config(str(config_path))
+    # session_mode belongs to DeployConfig, not the stage-engine CLI surface.
+    # The typed deployment may differ from the original YAML mode.
+    deploy.session_mode = "turn"
+    config = VllmOmniConfig.from_pipeline_config(QWEN3_OMNI_PIPELINE, user_deploy_config=deploy)
+    stages = list(config.stage_configs)
+    assert [stage.model_config.session_mode for stage in stages] == ["turn"] * 3
+
+    assert should_enable_duplex_endpoint(stages, config_path=str(config_path)) is expected
+
+    # Enabling the handler must not switch the model to a duplex scheduler.
+    assert [stage.model_config.session_mode for stage in stages] == ["turn"] * 3
+
+
 def test_duplex_handler_splits_data_plane_audio_list_into_deltas():
     import torch
 

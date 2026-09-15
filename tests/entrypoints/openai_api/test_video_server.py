@@ -1071,6 +1071,35 @@ def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
     assert spec.keep == "first"
 
 
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize(
+    ("num_frames", "extra_params", "expected"),
+    [
+        (189, {"condition_frame_indexes_vision": [0, 2], "condition_video_keep": "last"}, (9, "last")),
+        (189, {"condition_frame_indexes_vision": [0, 2]}, (9, "first")),
+        (5, {"condition_frame_indexes_vision": [0, 20]}, (5, "first")),
+        (None, {"action_mode": "inverse_dynamics", "action_chunk_size": 16}, (17, "first")),
+    ],
+)
+def test_cosmos3_reference_video_decode_policy_with_runtime_configs(typed, num_frames, extra_params, expected):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    if typed:
+        stages = list(
+            StageConfigFactory.create_typed_default_diffusion(
+                "cosmos3",
+                {"model_class_name": "Cosmos3OmniDiffusersPipeline"},
+            ).stage_configs
+        )
+    else:
+        stages = _cosmos3_stage_configs()
+    request = VideoGenerationRequest(prompt="Continue this motion.", num_frames=num_frames, extra_params=extra_params)
+
+    spec = _reference_video_decode_spec(request, stages)
+
+    assert (spec.max_frames, spec.keep) == expected
+
+
 def test_cosmos3_reference_video_limit_preserves_action_frames():
     request = VideoGenerationRequest(
         prompt="Predict the action.",

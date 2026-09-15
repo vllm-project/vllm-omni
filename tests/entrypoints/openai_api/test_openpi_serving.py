@@ -138,6 +138,36 @@ def test_policy_server_config_reads_stage_config_model_config():
     assert serving.policy_server_config.to_dict() == policy_config
 
 
+@pytest.mark.parametrize("inline", [False, True], ids=["out_of_process", "inline"])
+def test_policy_server_config_reads_typed_runtime(inline):
+    from tests.helpers.stage_config import get_deploy_config_path
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    typed_stage = VllmOmniConfig.from_pipeline_config(
+        PI0_PIPELINE, deploy_config_path=get_deploy_config_path("pi0.yaml")
+    ).stage_configs[0]
+    policy_config = typed_stage.diffusion_config.model_config["policy_server_config"]
+    stage_client = SimpleNamespace(stage_type="diffusion")
+    if inline:
+        # Worker-enriched inline metadata remains authoritative over the
+        # startup stage config; only the process client needs the fallback.
+        policy_config = {**policy_config, "worker_metadata": "loaded"}
+        stage_client.od_config = SimpleNamespace(model_config={"policy_server_config": policy_config})
+    engine_client = AsyncOmni.__new__(AsyncOmni)
+    engine_client.engine = SimpleNamespace(
+        stage_clients=[stage_client],
+        stage_configs=[typed_stage],
+        stage_vllm_configs=[None],
+        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="Pi0Pipeline"),
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+
+    assert serving.policy_server_config.to_dict() == policy_config
+
+
 def test_policy_server_config_reads_omegaconf_stage_config():
     engine_client = SimpleNamespace(
         get_diffusion_od_config=lambda: None,
