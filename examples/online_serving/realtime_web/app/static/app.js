@@ -1,8 +1,10 @@
 (() => {
   'use strict';
 
-  const config = window.FULL_DUPLEX_CONFIG || {};
+  const config = window.OMNI_REALTIME_CONFIG || window.FULL_DUPLEX_CONFIG || {};
+  const profile = window.OmniRealtimeProfiles[config.profile || 'minicpm-native'](config);
   const callButton = document.getElementById('callButton');
+  const sendTurnButton = document.getElementById('sendTurnButton');
   const muteButton = document.getElementById('muteButton');
   const cameraButton = document.getElementById('cameraButton');
   const cameraPreview = document.getElementById('cameraPreview');
@@ -27,18 +29,23 @@
   const INITIAL_PLAYBACK_BUFFER_MS = 400;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
 
-  // Default prompts mirroring the official MiniCPM-o-Demo presets
-  // (assets/presets/{omni,audio_duplex}/*.yaml).
-  const PROMPT_PRESETS = {
-    omni: 'Streaming Omni Conversation.',
-    chinese_call: '扮演一个具有以上声音特征的助手。请认真、高质量地回复用户的问题。'
-      + '请用高自然度的方式和用户聊天。你处于双工模式，可以一边听、一边说。'
-      + '你是由面壁智能开发的人工智能助手：面壁小钢炮。',
-    english_call: 'Replicate the tone and style from the input audio. Your task is to be '
-      + 'a helpful assistant using this voice pattern. Please answer the user\'s questions '
-      + 'seriously and in a high quality. Please chat with the user in a high naturalness '
-      + 'style. You are in duplex mode, where you can listen and speak at the same time.',
-  };
+  const PROMPT_PRESETS = profile.presets;
+  document.title = profile.title;
+  document.getElementById('pageTitle').textContent = profile.title;
+  document.getElementById('pageEyebrow').textContent = profile.eyebrow;
+  document.getElementById('profileDescription').textContent = profile.description;
+  document.getElementById('policyLabel').textContent = profile.policy;
+  cameraButton.hidden = !profile.camera;
+  sendTurnButton.hidden = !profile.clientCommit;
+  promptPreset.replaceChildren();
+  for (const name of [...Object.keys(PROMPT_PRESETS), 'custom']) {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name.replaceAll('_', ' ');
+    promptPreset.appendChild(option);
+  }
+  systemPromptInput.value = Object.values(PROMPT_PRESETS)[0];
+  document.getElementById('promptControls').hidden = !profile.instructions;
 
   let socket = null;
   let mediaStream = null;
@@ -65,6 +72,63 @@
   let liveUserTurn = null;
   let liveAssistantTurn = null;
   let sessionCloseResolver = null;
+  let responseComplete = false;
+  let playbackComplete = true;
+  let turnSubmitted = false;
+  let echoTimer = null;
+  let sessionGeneration = 0;
+  let audioChain = Promise.resolve();
+  let assistantTextChannel = null;
+  let connectionReady = false;
+  let turnCounter = 0;
+  let stopping = null;
+  let turnTimeout = null;
+
+  function markBusy() {
+    assistantActive = true;
+    if (profile.halfDuplex) pendingCapture = [];
+  }
+
+  function armTurnTimeout() {
+    clearTimeout(turnTimeout);
+    turnTimeout = window.setTimeout(() => {
+      failSession('Timed out waiting for the model response. Check the backend event log and restart the session.');
+    }, 120000);
+  }
+
+  async function failSession(message) {
+    appendLog(message, true);
+    await stopSession({ terminal: false });
+    setConnection('Error', 'error');
+    runtimeDetail.textContent = message;
+  }
+
+  function finishResponseIfReady() {
+    if (!responseComplete || !playbackComplete || echoTimer !== null) return;
+    const generation = sessionGeneration;
+    echoTimer = window.setTimeout(async () => {
+      echoTimer = null;
+      if (!running || generation !== sessionGeneration) return;
+      if (profile.reconnectEachTurn) {
+        connectionReady = false;
+        const previous = socket;
+        socket = null;
+        if (previous) { previous.onclose = null; previous.onmessage = null; previous.close(); }
+        try { await openSocket(); }
+        catch (error) { await failSession(error.message); return; }
+        if (!running || generation !== sessionGeneration) return;
+      }
+      assistantActive = false;
+      responseComplete = false;
+      turnSubmitted = false;
+      currentResponseId = null;
+      responseHasAudio = false;
+      assistantTextChannel = null;
+      if (profile.halfDuplex) pendingCapture = [];
+      sendTurnButton.disabled = !profile.clientCommit;
+      setModel(profile.waiting);
+    }, ECHO_GUARD_MS);
+  }
 
   function staticAssetUrl(path) {
     const version = String(config.appVersion || '').trim();
@@ -82,13 +146,7 @@
   }
 
   function realtimeUrl() {
-    const url = new URL(config.realtimePath, window.location.href);
-    url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    url.searchParams.set('duplex', '1');
-    url.searchParams.set('model', config.model || 'openbmb/MiniCPM-o-4_5');
-    url.searchParams.set('native_duplex', '1');
-    url.searchParams.set('autostart', '0');
-    return url.toString();
+    return profile.url(config, window.location.href);
   }
 
   function setConnection(label, kind) {
@@ -251,7 +309,7 @@
   }
 
   function microphoneUploadEnabled() {
-    return running && !muted;
+    return running && connectionReady && !muted && (!profile.halfDuplex || !assistantActive);
   }
 
   function flushCapture() {
@@ -269,18 +327,8 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, INPUT_RATE);
-    const appendEvent = {
-      type: 'input_audio_buffer.append',
-      audio: int16ToBase64(pcm),
-      format: 'pcm16',
-      sample_rate_hz: INPUT_RATE,
-    };
-    // Omni duplex: ~1 fps camera frame rides the audio append (official
-    // MiniCPM-o-Demo contract: one base64 JPEG per ~1 s chunk).
-    if (cameraPendingFrame) {
-      appendEvent.video_frames = [cameraPendingFrame];
-      cameraPendingFrame = null;
-    }
+    const appendEvent = profile.append(int16ToBase64(pcm), cameraPendingFrame);
+    cameraPendingFrame = null;
     socket.send(JSON.stringify(appendEvent));
   }
 
@@ -288,13 +336,17 @@
     currentResponseId = responseId || currentResponseId;
     responseHasAudio = false;
     assistantActive = true;
-    setModel('Speaking');
+    responseComplete = false;
+    playbackComplete = true;
+    if (profile.halfDuplex) pendingCapture = [];
+    setModel(profile.halfDuplex ? 'Thinking' : 'Speaking');
   }
 
   function feedPlayback(decoded, responseId) {
     if (!decoded || !decoded.pcm || decoded.pcm.length === 0 || !playbackNode) return;
     const pcm = resampleInt16(decoded.pcm, decoded.sourceRate, playbackRate);
     responseHasAudio = true;
+    playbackComplete = false;
     assistantActive = true;
     setPlayback('Buffering');
     playbackNode.port.postMessage({
@@ -306,6 +358,7 @@
   }
 
   function requestPlaybackDrain(responseId) {
+    if (!responseHasAudio) { playbackComplete = true; finishResponseIfReady(); return; }
     if (!playbackNode) return;
     playbackNode.port.postMessage({ type: 'drain', responseId: responseId || currentResponseId });
   }
@@ -315,90 +368,91 @@
       if (!responseId && playedMs > 0) appendLog('playback ack skipped: missing response id', true);
       return;
     }
-    socket.send(JSON.stringify({
-      type: 'playback.ack',
-      response_id: responseId,
-      item_id: `item_${responseId}`,
-      played_ms: playedMs,
-      committed_ms: playedMs,
-    }));
+    const ack = profile.ack(responseId, playedMs);
+    if (ack) socket.send(JSON.stringify(ack));
   }
 
   function playbackDrained(message) {
     const responseId = message.responseId || currentResponseId;
-    sendPlaybackAck(responseId, Number(message.playedMs) || 0);
+    if (currentResponseId && responseId !== currentResponseId) return;
+    if (profile.playbackAck) sendPlaybackAck(responseId, Number(message.playedMs) || 0);
     setPlayback('Idle');
-    if (message.underrunMs > 0) {
-      appendLog(`playback underrun ${message.underrunMs} ms`);
-    }
-    window.setTimeout(() => {
-      assistantActive = false;
-      currentResponseId = null;
-      responseHasAudio = false;
-      if (running) setModel('Listening');
-    }, ECHO_GUARD_MS);
+    playbackComplete = true;
+    if (message.underrunMs > 0) appendLog(`playback underrun ${message.underrunMs} ms`);
+    if (!profile.halfDuplex) responseComplete = true;
+    finishResponseIfReady();
   }
 
-  function handleEvent(event) {
+  async function handleEvent(event) {
     appendEventLog(event);
-    const responseId = responseIdOf(event);
-    switch (event.type) {
-      case 'session.created':
-      case 'session.updated':
+    const action = profile.mapEvent(event);
+    const responseId = action.responseId;
+    switch (action.kind) {
+      case 'connected':
         setConnection('Connected', 'online');
-        setModel('Listening');
+        if (!assistantActive) setModel(profile.waiting);
         break;
-      case 'response.listen':
+      case 'listen':
         assistantActive = false;
-        setModel('Listening');
+        setModel(profile.waiting);
         break;
-      case 'response.created':
-      case 'response.speak':
+      case 'begin':
+        if (profile.halfDuplex) armTurnTimeout();
+        if (echoTimer !== null) { clearTimeout(echoTimer); echoTimer = null; }
         beginAssistant(responseId);
         break;
-      case 'response.output_audio.delta':
-        currentResponseId = responseId || currentResponseId;
-        assistantActive = true;
+      case 'audio': {
+        markBusy();
+        currentResponseId = responseId || currentResponseId || `turn-${turnCounter}`;
         setModel('Speaking');
-        decodeAudioDelta(event)
-          .then((decoded) => feedPlayback(decoded, responseId))
-          .catch((error) => appendLog(`audio decode failed: ${error.message || error}`, true));
+        const generation = sessionGeneration;
+        const decoded = await decodeAudioDelta(action.event);
+        if (generation === sessionGeneration) feedPlayback(decoded, currentResponseId);
         break;
-      case 'response.output_audio.done':
+      }
+      case 'drain':
         requestPlaybackDrain(responseId);
         break;
-      case 'response.output_audio_transcript.delta':
-        addTranscript('assistant', event.delta || '');
-        break;
-      case 'response.output_audio_transcript.done':
-        finishTranscript('assistant', event.transcript || '');
-        break;
-      case 'conversation.item.input_audio_transcription.delta':
-        addTranscript('user', event.delta || '');
-        break;
-      case 'conversation.item.input_audio_transcription.completed':
-        finishTranscript('user', event.transcript || '');
-        break;
-      case 'response.done':
-        finishTranscript('assistant');
-        if (!responseHasAudio) requestPlaybackDrain(responseId);
-        break;
-      case 'playback.acknowledged':
-        {
-          const acknowledgement = event.event || event;
-          runtimeDetail.textContent = `Playback committed ${acknowledgement.committed_ms || 0} ms`;
+      case 'text': case 'text-final':
+        if (action.role === 'assistant') {
+          // Qwen may emit both text and audio-transcript representations.
+          // Display one channel per response instead of duplicating the answer.
+          if (profile.halfDuplex && assistantTextChannel && action.channel !== assistantTextChannel) break;
+          if (action.text) assistantTextChannel = action.channel || assistantTextChannel;
         }
+        if (action.kind === 'text') addTranscript(action.role, action.text);
+        else if (profile.halfDuplex && action.role === 'assistant') {
+          if (action.text) {
+            const turn = ensureTurn('assistant');
+            turn.value = action.text;
+            turn.text.textContent = action.text;
+          }
+        } else finishTranscript(action.role, action.text);
         break;
-      case 'session.closed':
+      case 'done':
+        clearTimeout(turnTimeout);
+        responseComplete = true;
+        finishTranscript('assistant');
+        requestPlaybackDrain(responseId);
+        finishResponseIfReady();
+        break;
+      case 'backpressure':
+        armTurnTimeout();
+        markBusy();
+        setModel('Thinking / Speaking');
+        runtimeDetail.textContent = action.message;
+        break;
+      case 'ack':
+        runtimeDetail.textContent = `Playback committed ${action.committedMs} ms`;
+        break;
+      case 'closed':
         if (sessionCloseResolver) sessionCloseResolver();
         sessionCloseResolver = null;
         break;
       case 'error':
-        setConnection('Error', 'error');
-        runtimeDetail.textContent = String(event.error || event.code || 'Server error');
+        await failSession(action.message);
         break;
-      default:
-        break;
+      default: break;
     }
   }
 
@@ -452,49 +506,57 @@
   function openSocket() {
     return new Promise((resolve, reject) => {
       const url = realtimeUrl();
-      socket = new WebSocket(url);
+      const current = new WebSocket(url);
+      socket = current;
+      connectionReady = false;
+      turnCounter += 1;
       let settled = false;
-      socket.onopen = () => {
+      const timer = window.setTimeout(() => {
+        if (settled) return;
         settled = true;
-        const extraBody = {
-          auto_response: true,
-          native_duplex: true,
-        };
-        const session = {
-          modalities: ['audio', 'text'],
-          voice: 'default',
-          extra_body: extraBody,
-        };
-        // Reference voice for TTS cloning, provided by the server via
-        // --ref-audio (mirrors the official demo's default ref audio).
-        if (config.refAudio) session.ref_audio = config.refAudio;
-        const instructions = systemPromptInput ? systemPromptInput.value.trim() : '';
-        if (instructions) session.instructions = instructions;
-        socket.send(JSON.stringify({ type: 'session.update', session }));
-        runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;
+        current.onclose = null;
+        current.close();
+        reject(new Error(`Session handshake timed out. ${profile.connectionHint}`));
+      }, 15000);
+      const rejectOnce = (message) => {
+        clearTimeout(timer);
+        if (!settled) { settled = true; reject(new Error(message)); }
+      };
+      current.onopen = () => {
+        const instructions = systemPromptInput.value.trim();
+        for (const event of profile.initialMessages(config, instructions)) current.send(JSON.stringify(event));
         appendLog(`websocket open  ${url}`);
-        resolve();
       };
-      socket.onmessage = (message) => {
-        if (typeof message.data !== 'string') return;
-        try {
-          handleEvent(JSON.parse(message.data));
-        } catch (error) {
-          appendLog(`invalid server event: ${error.message || error}`, true);
+      current.onmessage = (message) => {
+        if (typeof message.data !== 'string' || socket !== current) return;
+        let event;
+        try { event = JSON.parse(message.data); }
+        catch (error) { rejectOnce(`Invalid server event: ${error.message}`); return; }
+        const action = profile.mapEvent(event);
+        if (action.kind === 'error' && !settled) {
+          rejectOnce(action.message);
+          return;
         }
-      };
-      socket.onerror = () => {
-        if (!settled) {
+        if (event.type === profile.readyEvent && !settled) {
+          clearTimeout(timer);
           settled = true;
-          reject(new Error(`WebSocket connection failed: ${url}`));
+          connectionReady = true;
+          runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;
+          resolve();
         }
+        // Serialize decoding with terminal events: a drain must never overtake
+        // an asynchronously decoded WAV chunk.
+        audioChain = audioChain.then(() => {
+          if (socket === current || action.kind === 'closed') return handleEvent(event);
+        }).catch((error) => failSession(`Server event failed: ${error.message}`));
       };
-      socket.onclose = (event) => {
+      current.onerror = () => rejectOnce(`WebSocket connection failed. ${profile.connectionHint}`);
+      current.onclose = (event) => {
+        clearTimeout(timer);
+        connectionReady = false;
         appendLog(`websocket closed  code=${event.code}`);
-        if (running) {
-          setConnection('Disconnected', 'error');
-          stopSession();
-        }
+        if (!settled) rejectOnce(`Connection closed before session ready. ${profile.connectionHint}`);
+        else if (running && socket === current) failSession(`Backend disconnected (${event.code}). ${profile.connectionHint}`);
       };
     });
   }
@@ -517,33 +579,36 @@
     setConnection('Connecting', 'connecting');
     runtimeDetail.textContent = 'Requesting microphone access';
     try {
+      sessionGeneration += 1;
+      audioChain = Promise.resolve();
       await openPlayback();
       await openCapture();
       await openSocket();
       running = true;
       muted = false;
       assistantActive = false;
-      sendTimer = window.setInterval(flushCapture, SEND_INTERVAL_MS);
+      sendTimer = window.setInterval(flushCapture, profile.sendIntervalMs || SEND_INTERVAL_MS);
       startClock();
       callButton.textContent = 'End session';
       callButton.classList.add('is-active');
       muteButton.disabled = false;
-      cameraButton.disabled = false;
+      cameraButton.disabled = !profile.camera;
+      sendTurnButton.disabled = !profile.clientCommit;
       setConnection('Connected', 'online');
-      setModel('Listening');
+      setModel(profile.waiting);
       appendLog('session started');
     } catch (error) {
       appendLog(`start failed: ${error.message || error}`, true);
+      await stopSession({ terminal: false });
       setConnection('Error', 'error');
       runtimeDetail.textContent = String(error.message || error);
-      await stopSession();
     } finally {
       callButton.disabled = false;
     }
   }
 
   async function startCamera() {
-    if (cameraStream) return;
+    if (!profile.camera || cameraStream) return;
     cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
     cameraPreview.srcObject = cameraStream;
     cameraPreview.style.display = '';
@@ -552,9 +617,11 @@
     // no client-side resize (the server normalizes at scale_resolution=448).
     cameraTimer = window.setInterval(() => {
       if (!cameraStream || cameraPreview.videoWidth === 0) return;
-      cameraCanvas.width = cameraPreview.videoWidth;
-      cameraCanvas.height = cameraPreview.videoHeight;
-      cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0);
+      const scale = profile.cameraMaxDimension
+        ? Math.min(1, profile.cameraMaxDimension / Math.max(cameraPreview.videoWidth, cameraPreview.videoHeight)) : 1;
+      cameraCanvas.width = Math.max(1, Math.round(cameraPreview.videoWidth * scale));
+      cameraCanvas.height = Math.max(1, Math.round(cameraPreview.videoHeight * scale));
+      cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0, cameraCanvas.width, cameraCanvas.height);
       cameraPendingFrame = cameraCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
     }, 1000);
     cameraButton.textContent = 'Camera off';
@@ -600,7 +667,23 @@
     });
   }
 
-  async function stopSession({ terminal = true } = {}) {
+  function stopSession(options = {}) {
+    if (stopping) return stopping;
+    stopping = cleanupSession(options).finally(() => { stopping = null; });
+    return stopping;
+  }
+
+  async function cleanupSession({ terminal = true } = {}) {
+    sessionGeneration += 1;
+    connectionReady = false;
+    clearTimeout(echoTimer);
+    clearTimeout(turnTimeout);
+    echoTimer = null;
+    responseComplete = false;
+    playbackComplete = true;
+    turnSubmitted = false;
+    assistantTextChannel = null;
+    sendTurnButton.disabled = true;
     running = false;
     assistantActive = false;
     pendingCapture = [];
@@ -612,7 +695,7 @@
       const closingSocket = socket;
       socket = null;
       closingSocket.onclose = null;
-      if (terminal && closingSocket.readyState === WebSocket.OPEN) {
+      if (terminal && profile.closeSession && closingSocket.readyState === WebSocket.OPEN) {
         const closed = waitForSessionClosed(closingSocket, SESSION_CLOSE_TIMEOUT_MS);
         closingSocket.send(JSON.stringify({ type: 'session.close' }));
         await closed;
@@ -634,6 +717,8 @@
     playbackNode = null;
     currentResponseId = null;
     responseHasAudio = false;
+    finishTranscript('user');
+    finishTranscript('assistant');
     meterFill.style.width = '0%';
     sessionTimer.textContent = '00:00';
     callButton.textContent = 'Start session';
@@ -660,6 +745,18 @@
   callButton.addEventListener('click', () => {
     if (running) stopSession();
     else startSession();
+  });
+  sendTurnButton.addEventListener('click', () => {
+    if (!running || !connectionReady || !profile.clientCommit || turnSubmitted) return;
+    flushCapture();
+    for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    turnSubmitted = true;
+    responseComplete = false;
+    markBusy();
+    armTurnTimeout();
+    sendTurnButton.disabled = true;
+    setModel('Thinking');
+    appendLog('turn submitted');
   });
   muteButton.addEventListener('click', toggleMute);
   clearLogButton.addEventListener('click', () => {

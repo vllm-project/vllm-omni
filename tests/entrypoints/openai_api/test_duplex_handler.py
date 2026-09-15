@@ -314,7 +314,7 @@ class FakeEngineClient:
 
 
 class FakeChatService:
-    duplex_serving_adapter_path = (
+    duplex_serving_adapter_path: str | None = (
         "vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
     )
 
@@ -467,7 +467,7 @@ class FakeServerVADBackend:
     def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
         del frame
         self.calls += 1
-        index = int(state)
+        index = state if isinstance(state, int) else 0
         probability = self.probabilities[index] if index < len(self.probabilities) else 0.0
         return probability, index + 1
 
@@ -495,7 +495,7 @@ class FailOnceServerVADBackend(FakeServerVADBackend):
         self._failed = False
 
     def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
-        if not self._failed and int(state) == 2:
+        if not self._failed and isinstance(state, int) and state == 2:
             self._failed = True
             raise RuntimeError("server VAD inference failed")
         return super().infer(frame, state)
@@ -1302,7 +1302,7 @@ async def test_realtime_invalid_server_vad_audio_is_correlated_and_unbuffered(
 ):
     ws = TimedWebSocket()
     ws.put(_server_vad_session_update(_server_vad_turn_detection(create_response=False)))
-    event = {"type": event_type, "event_id": "event-invalid-server-vad-audio"}
+    event: dict[str, Any] = {"type": event_type, "event_id": "event-invalid-server-vad-audio"}
     if event_type == "input_audio_buffer.append":
         event["audio"] = audio
     else:
@@ -1395,7 +1395,7 @@ async def test_realtime_server_vad_input_path_uses_runtime_capability(native: bo
     protocol.bind_native_input_append(native)
     protocol.commit_realtime_turn_detection_update()
 
-    source = np.arange(240, dtype="<i2")
+    source: np.ndarray = np.arange(240, dtype="<i2")
     append = await protocol._to_duplex_event(
         {
             "type": "input_audio_buffer.append",
@@ -1528,11 +1528,12 @@ async def test_realtime_rejects_unsupported_turn_based_server_vad_audio(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_video", [False, True])
 @pytest.mark.parametrize("sample_rate_hz", [16_000, 24_000])
 @pytest.mark.parametrize("create_response", [False, True], ids=["commit-only", "minimal-config"])
 @pytest.mark.parametrize("at_creation", [True, False], ids=["create", "update"])
 async def test_realtime_server_vad_commits_without_client_commit(
-    sample_rate_hz: int, create_response: bool, at_creation: bool
+    sample_rate_hz: int, create_response: bool, at_creation: bool, with_video: bool
 ):
     def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
         terminal_event = "response.done" if create_response else "input_audio_buffer.committed"
@@ -1549,7 +1550,11 @@ async def test_realtime_server_vad_commits_without_client_commit(
         )
     )
     # Cover the default 500 ms silence timeout, plus streaming FIR right context.
-    ws.put(_server_vad_audio_append(54, sample_rate_hz=sample_rate_hz))
+    audio_event = _server_vad_audio_append(54, sample_rate_hz=sample_rate_hz)
+    image = base64.b64encode(b"\xff\xd8\xfftest-frame").decode()
+    if with_video:
+        audio_event["video_frames"] = [image]
+    ws.put(audio_event)
     engine = FakeEngineClient()
     chat_service = TurnBasedFakeChatService(engine)
     handler = OmniDuplexSessionHandler(
@@ -1586,6 +1591,13 @@ async def test_realtime_server_vad_commits_without_client_commit(
     assert engine.opened == []
     assert engine.signals == []
     assert engine.closed == []
+
+    if create_response:
+        parts = chat_service.requests[0].messages[-1]["content"]
+        images = [part for part in parts if part["type"] == "image_url"]
+        assert len(images) == int(with_video)
+        if with_video:
+            assert images[0]["image_url"]["url"] == f"data:image/jpeg;base64,{image}"
 
 
 @pytest.mark.asyncio
@@ -1632,7 +1644,7 @@ async def test_realtime_server_vad_complete_audio_item_bypasses_vad(sample_rate_
 
     ws = TimedWebSocket(on_send=on_send)
     ws.put(_server_vad_session_update(_server_vad_turn_detection(), sample_rate_hz=sample_rate_hz))
-    samples = np.arange(sample_rate_hz // 10, dtype=np.float32)
+    samples: np.ndarray = np.arange(sample_rate_hz // 10, dtype=np.float32)
     pcm16 = np.rint(0.5 * np.sin(2 * np.pi * 1_000 * samples / sample_rate_hz) * 32_767).astype("<i2")
     public_audio = base64.b64encode(pcm16.tobytes()).decode()
     ws.put(
@@ -5277,7 +5289,8 @@ async def test_duplex_chat_missing_audio_metadata_reports_error():
 
     assert [event["type"] for event in sent] == ["response.created", "error"]
     assert sent[-1]["code"] == "response_error"
-    assert "AudioChunkMetadata" in sent[-1]["error"]
+    error = sent[-1]["error"]
+    assert isinstance(error, str) and "AudioChunkMetadata" in error
     assert session.playback.generated_ms == 0
     assert session.playback.sent_ms == 0
 
@@ -7299,7 +7312,9 @@ async def test_native_server_vad_update_rejection_does_not_stall(append_fails, e
         ws.put({"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(16_000), "format": "pcm_f32le"})
     update = _native_server_vad_update("rejected-vad-update")
     if not append_fails:
-        update["session"]["instructions"] = "You are now a pirate."
+        session_update = update["session"]
+        assert isinstance(session_update, dict)
+        session_update["instructions"] = "You are now a pirate."
     ws.put(update)
     ws.put({"type": "session.close"})
 

@@ -573,3 +573,50 @@ The gradio script supports the following arguments:
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
+
+## Browser voice call (shared realtime UI)
+
+Run these commands from the repository root with the vLLM-Omni environment activated.
+
+### Without VAD: manually submit each turn
+
+Start the backend:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+In another terminal, check backend readiness and start the UI:
+
+```bash
+curl --fail http://127.0.0.1:8091/health
+python -m examples.online_serving.qwen3_omni.realtime_web \
+    --backend ws://127.0.0.1:8091 --stt --port 7863
+```
+
+Open `http://localhost:7863`, start a session, speak, and press **Send turn**.
+`--stt` is the default. Each turn uses a separate connection without shared model
+history; the conversation shown in the browser is a local log.
+
+### With VAD: automatically submit after silence
+
+Start the backend with a Server VAD deployment overlay and a compatible Silero
+ONNX artifact, following the
+[complete VAD setup](../realtime_web/README.md#qwen3-with-server-vad-automatic-turns).
+After its health check succeeds, start the UI:
+
+```bash
+python -m examples.online_serving.qwen3_omni.realtime_web \
+    --backend ws://127.0.0.1:8091 --vad --port 7863
+```
+
+Speak and pause for 500 ms to submit automatically. `--vad` configures the client;
+it does not load a VAD model or change the backend deployment by itself.
+
+Both modes pause microphone upload while the reply is generated and played.
+In VAD mode, click **Camera** to upload sampled frames with your spoken question;
+see [camera setup and limits](../realtime_web/README.md#qwen-vad-camera-input).
+STT remains audio-only, and voice interruption is unavailable. To switch back to manual
+turns, restart the UI with `--stt`, refresh the page, and reconnect; the VAD-enabled
+backend can remain running. Stop the existing UI before reusing port 7863.
+See the [shared UI guide](../realtime_web/README.md) for HTTPS access and testing.

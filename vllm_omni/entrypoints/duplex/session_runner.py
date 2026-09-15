@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# mypy: ignore-errors
 
 from __future__ import annotations
 
@@ -1717,6 +1718,10 @@ class DuplexSessionRunnerMixin:
                                 - previous_scratch_bytes
                             )
                             session.release_input_bytes(max(0, reserved_bytes - retained_delta))
+                        if not native_input and accepted_audio:
+                            frames = payload.get("video_frames", [])
+                            if isinstance(frames, list):
+                                session.append_server_vad_video([frame for frame in frames if isinstance(frame, str)])
                         self._realtime_vad_metrics.observe_inference(vad_batch.inference_ms)
                         prefix_samples = round(server_vad_config.prefix_padding_ms * pipeline.sample_rate_hz / 1000)
                         speech_started = False

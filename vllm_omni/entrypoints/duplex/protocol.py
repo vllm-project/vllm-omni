@@ -319,16 +319,21 @@ class DuplexSessionConfig:
             raw_realtime_session = extra.get("realtime_session_payload")
             if not turn_detection_configured and isinstance(raw_realtime_session, dict):
                 turn_detection_configured, server_vad = parse_session_turn_detection(raw_realtime_session)
-            if isinstance(extra.get("overlap_policy"), str):
-                config.overlap_policy = cls._normalize_overlap_policy(extra["overlap_policy"])
-            if isinstance(extra.get("overlap_short_ack_ms"), int | float):
-                config.overlap_short_ack_ms = max(0, int(extra["overlap_short_ack_ms"]))
-            if isinstance(extra.get("overlap_barge_in_ms"), int | float):
-                config.overlap_barge_in_ms = max(0, int(extra["overlap_barge_in_ms"]))
-            if isinstance(extra.get("overlap_silence_rms"), int | float):
-                config.overlap_silence_rms = max(0.0, float(extra["overlap_silence_rms"]))
-            if isinstance(extra.get("playback_commit_policy"), str):
-                config.playback_commit_policy = cls._normalize_playback_commit_policy(extra["playback_commit_policy"])
+            overlap_policy = extra.get("overlap_policy")
+            if isinstance(overlap_policy, str):
+                config.overlap_policy = cls._normalize_overlap_policy(overlap_policy)
+            overlap_short_ack_ms = extra.get("overlap_short_ack_ms")
+            if isinstance(overlap_short_ack_ms, int | float):
+                config.overlap_short_ack_ms = max(0, int(overlap_short_ack_ms))
+            overlap_barge_in_ms = extra.get("overlap_barge_in_ms")
+            if isinstance(overlap_barge_in_ms, int | float):
+                config.overlap_barge_in_ms = max(0, int(overlap_barge_in_ms))
+            overlap_silence_rms = extra.get("overlap_silence_rms")
+            if isinstance(overlap_silence_rms, int | float):
+                config.overlap_silence_rms = max(0.0, float(overlap_silence_rms))
+            playback_commit_policy = extra.get("playback_commit_policy")
+            if isinstance(playback_commit_policy, str):
+                config.playback_commit_policy = cls._normalize_playback_commit_policy(playback_commit_policy)
         if turn_detection_configured:
             config.turn_detection_configured = True
             config.server_vad = server_vad
@@ -403,6 +408,7 @@ class InputBufferState:
     vad_prefix_audio: list[np.ndarray] = field(default_factory=list)
     vad_prefix_samples: int = 0
     vad_utterance_audio: list[np.ndarray] = field(default_factory=list)
+    vad_video_frames: list[str] = field(default_factory=list)
     vad_speech_active: bool = False
     active_server_vad_item_id: str | None = None
     pending_server_vad_turn: PendingServerVADTurn | None = None
@@ -768,6 +774,21 @@ class DuplexSession:
         self._input.pending_audio.append(DuplexAudioChunk(data=data, format=fmt, sample_rate_hz=sample_rate_hz))
         self.turn_state = DuplexTurnState.USER_SPEAKING
 
+    def append_server_vad_video(self, frames: list[str]) -> None:
+        """Keep a bounded visual window; idle input retains only the latest frame.
+
+        Frames arrive alongside an audio append, in capture order. They are
+        sampled visual context, not a separately synchronized video track.
+        """
+        if not frames:
+            return
+        limit = 8 if self._input.vad_speech_active else 1
+        self._input.vad_video_frames.extend(frames)
+        self._input.vad_video_frames = self._input.vad_video_frames[-limit:]
+        # Bound encoded image storage independently of the audio byte budget.
+        while sum(map(len, self._input.vad_video_frames)) > 4 * 1024 * 1024:
+            self._input.vad_video_frames.pop(0)
+
     def append_server_vad_frame(
         self,
         samples: np.ndarray,
@@ -824,6 +845,7 @@ class DuplexSession:
         return True
 
     def clear_server_vad_audio(self) -> None:
+        self._input.vad_video_frames.clear()
         self._input.vad_prefix_audio.clear()
         self._input.vad_prefix_samples = 0
         self._input.vad_utterance_audio.clear()
@@ -840,6 +862,7 @@ class DuplexSession:
 
     def discard_uncommitted_server_vad_utterance(self) -> int:
         released = self.server_vad_utterance_bytes
+        self._input.vad_video_frames.clear()
         self._input.vad_utterance_audio.clear()
         self._input.vad_speech_active = False
         self._input.active_server_vad_item_id = None
@@ -898,13 +921,17 @@ class DuplexSession:
                         },
                     }
                 )
+            for frame in self._input.vad_video_frames:
+                mime = "image/png" if frame.startswith("iVBOR") else "image/jpeg"
+                content_items.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{frame}"}})
+            self._input.vad_video_frames.clear()
             content = content_items
         else:
             content = text
 
         self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
-        message = {"role": "user", "content": content}
+        message: dict[str, object] = {"role": "user", "content": content}
         if append_history:
             self._conversation.messages.append(message)
         self._input.pending_text.clear()
@@ -966,7 +993,7 @@ class DuplexSession:
             input_audio_part["transcript"] = transcript
         self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
-        message = {"role": "user", "content": [input_audio_part]}
+        message: dict[str, object] = {"role": "user", "content": [input_audio_part]}
         if transcript:
             message["transcript"] = transcript
         self._conversation.messages.append(message)
@@ -1088,7 +1115,10 @@ class DuplexSession:
             for name in additive_fields:
                 value = raw_values.get(name)
                 if isinstance(value, int | float) and not isinstance(value, bool):
-                    current[name] = current.get(name, 0) + value
+                    current_total = current.get(name, 0)
+                    if not isinstance(current_total, int | float) or isinstance(current_total, bool):
+                        current_total = 0
+                    current[name] = current_total + value
             for name in first_positive_fields:
                 value = raw_values.get(name)
                 current_value = current.get(name)
@@ -1102,7 +1132,8 @@ class DuplexSession:
             for list_name, mean_name in interval_fields:
                 values = raw_values.get(list_name)
                 if isinstance(values, list):
-                    combined = list(current.get(list_name, []))
+                    existing = current.get(list_name, [])
+                    combined = list(existing) if isinstance(existing, list) else []
                     combined.extend(
                         value for value in values if isinstance(value, int | float) and not isinstance(value, bool)
                     )
@@ -1293,7 +1324,7 @@ class DuplexSession:
             self.input_commit_seq > response_input_commit_seq and not response_history_is_reserved
         )
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
-        message = None
+        message: dict[str, object] | None = None
         if assistant_text:
             self._conversation.last_assistant_full_message = {"role": "assistant", "content": assistant_text}
             self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
@@ -1453,8 +1484,8 @@ class DuplexSession:
             self._conversation.pending_truncations_ms.pop(item_id, None)
             return True
 
-        message = self._conversation.item_ids.get(item_id)
-        if message is None:
+        item_message = self._conversation.item_ids.get(item_id)
+        if item_message is None:
             pending = self._conversation.pending_item_ids.get(item_id)
             if pending is None:
                 self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
@@ -1488,6 +1519,7 @@ class DuplexSession:
             if item_id.startswith("item_"):
                 self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
             return True
+        message = item_message
         changed = self._truncate_message_to_audio_ms(
             message,
             audio_end_ms=audio_end_ms,
@@ -1714,20 +1746,24 @@ class DuplexSession:
             payload["tools"] = self.config.extra_body["realtime_tools"]
         if isinstance(self.config.extra_body.get("realtime_tool_choice"), str | dict):
             payload["tool_choice"] = self.config.extra_body["realtime_tool_choice"]
-        if isinstance(self.config.extra_body.get("realtime_metadata"), dict):
-            payload["metadata"] = dict(self.config.extra_body["realtime_metadata"])
-        if isinstance(self.config.extra_body.get("realtime_include"), list):
-            payload["include"] = list(self.config.extra_body["realtime_include"])
-        if isinstance(self.config.extra_body.get("realtime_prompt"), dict):
-            payload["prompt"] = dict(self.config.extra_body["realtime_prompt"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_transcription"), dict):
-            payload["input_audio_transcription"] = dict(self.config.extra_body["realtime_input_audio_transcription"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_noise_reduction"), dict):
-            payload["input_audio_noise_reduction"] = dict(
-                self.config.extra_body["realtime_input_audio_noise_reduction"]
-            )
-        if isinstance(self.config.extra_body.get("realtime_audio"), dict):
-            payload["audio"] = dict(self.config.extra_body["realtime_audio"])
+        realtime_metadata = self.config.extra_body.get("realtime_metadata")
+        if isinstance(realtime_metadata, dict):
+            payload["metadata"] = dict(realtime_metadata)
+        realtime_include = self.config.extra_body.get("realtime_include")
+        if isinstance(realtime_include, list):
+            payload["include"] = list(realtime_include)
+        realtime_prompt = self.config.extra_body.get("realtime_prompt")
+        if isinstance(realtime_prompt, dict):
+            payload["prompt"] = dict(realtime_prompt)
+        realtime_transcription = self.config.extra_body.get("realtime_input_audio_transcription")
+        if isinstance(realtime_transcription, dict):
+            payload["input_audio_transcription"] = dict(realtime_transcription)
+        realtime_noise_reduction = self.config.extra_body.get("realtime_input_audio_noise_reduction")
+        if isinstance(realtime_noise_reduction, dict):
+            payload["input_audio_noise_reduction"] = dict(realtime_noise_reduction)
+        realtime_audio = self.config.extra_body.get("realtime_audio")
+        if isinstance(realtime_audio, dict):
+            payload["audio"] = dict(realtime_audio)
         if isinstance(self.config.extra_body.get("realtime_tracing"), str | dict):
             payload["tracing"] = self.config.extra_body["realtime_tracing"]
         raw_realtime_session = self.config.extra_body.get("realtime_session_payload")
@@ -1757,7 +1793,8 @@ class DuplexTurnController:
         elif event_type == DuplexTurnEventType.ASSISTANT_DONE.value:
             session.transition_turn(DuplexTurnState.IDLE)
         elif event_type == DuplexTurnEventType.PLAYBACK_ACK.value:
-            played_ms = int(payload.get("played_ms", 0) or 0)
+            played_ms_raw = payload.get("played_ms", 0) or 0
+            played_ms = int(played_ms_raw) if isinstance(played_ms_raw, int | float) else 0
             committed_ms = payload.get("committed_ms")
             session.acknowledge_playback(
                 played_ms,

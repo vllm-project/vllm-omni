@@ -34,7 +34,7 @@ def test_realtime_state_owner_uses_explicit_bindings_not_dynamic_attribute_proxy
 
 class _ProtocolWebSocket:
     def __init__(self, *events: dict[str, object]) -> None:
-        self._events = asyncio.Queue()
+        self._events: asyncio.Queue[str] = asyncio.Queue()
         for event in events:
             self._events.put_nowait(json.dumps(event))
 
@@ -599,3 +599,55 @@ def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment
 def test_duplex_overlap_policy_defaults_and_invalid_values_to_listen_only():
     assert DuplexSessionConfig().overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
     assert DuplexSessionConfig._normalize_overlap_policy("not-a-policy") == DuplexOverlapPolicy.LISTEN_ONLY.value
+
+
+def test_server_vad_video_is_bounded_and_committed_with_audio():
+    import numpy as np
+
+    session = DuplexSession(session_id="video", config=DuplexSessionConfig())
+    session.append_server_vad_video(["old", "latest"])
+    session.append_server_vad_frame(np.zeros(512), speech_started=True, speech_stopped=False, prefix_samples=512)
+    for index in range(10):
+        session.append_server_vad_video([f"frame{index}"])
+    session.append_server_vad_frame(np.zeros(512), speech_started=False, speech_stopped=True, prefix_samples=512)
+    assert session.stage_server_vad_audio_for_commit()
+    committed = session.commit_user_input()
+    assert committed is not None
+    parts = committed.message["content"]
+    assert isinstance(parts, list)
+    assert parts[0]["type"] == "audio_url"
+    assert [part["image_url"]["url"].split(",")[1] for part in parts[1:]] == [f"frame{index}" for index in range(2, 10)]
+    session.append_audio("new-audio")
+    follow_up = session.commit_user_input()
+    assert follow_up is not None
+    assert len(follow_up.message["content"]) == 1
+
+
+@pytest.mark.parametrize(
+    "clear", ["clear_server_vad_audio", "discard_uncommitted_server_vad_utterance", "cancel_pending_input"]
+)
+def test_server_vad_video_clear_does_not_leak_to_next_turn(clear):
+    session = DuplexSession(session_id="video-clear", config=DuplexSessionConfig())
+    session.append_server_vad_video(["iVBORfake"])
+    getattr(session, clear)()
+    session.append_audio("audio")
+    committed = session.commit_user_input()
+    assert committed is not None
+    assert len(committed.message["content"]) == 1
+
+
+def test_server_vad_video_idle_window_and_byte_limit():
+    session = DuplexSession(session_id="video-idle", config=DuplexSessionConfig())
+    session.append_server_vad_video(["older"])
+    session.append_server_vad_video(["iVBORlatest"])
+    session.append_audio("audio")
+    committed = session.commit_user_input()
+    assert committed is not None
+    parts = committed.message["content"]
+    assert isinstance(parts, list)
+    assert parts[-1]["image_url"]["url"] == "data:image/png;base64,iVBORlatest"
+    session.append_server_vad_video(["x" * (4 * 1024 * 1024 + 1)])
+    session.append_audio("audio")
+    follow_up = session.commit_user_input()
+    assert follow_up is not None
+    assert len(follow_up.message["content"]) == 1

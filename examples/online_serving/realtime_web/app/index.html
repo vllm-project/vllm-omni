@@ -4,37 +4,35 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
-    <title>MiniCPM-o 4.5 Voice</title>
+    <title>Omni Realtime Voice</title>
     <link rel="stylesheet" href="static/styles.css">
   </head>
   <body>
     <header class="app-header">
       <div>
-        <p class="eyebrow">Experimental full-duplex runtime</p>
-        <h1>MiniCPM-o 4.5 Voice</h1>
+        <p id="pageEyebrow" class="eyebrow"></p>
+        <h1 id="pageTitle">Omni Realtime Voice</h1>
       </div>
       <span id="connectionState" class="status status-offline">Offline</span>
     </header>
 
     <main>
+      <p id="profileDescription" role="note"></p>
       <section class="call-bar" aria-label="Session controls">
         <div class="call-actions">
           <button id="callButton" class="primary" type="button">Start session</button>
+          <button id="sendTurnButton" class="secondary" type="button" hidden disabled>Send turn</button>
           <button id="muteButton" class="secondary" type="button" disabled>Mute</button>
           <button id="cameraButton" class="secondary" type="button" disabled>Camera</button>
           <video id="cameraPreview" muted playsinline style="display:none;width:96px;height:72px;border-radius:8px;object-fit:cover;background:#000"></video>
         </div>
-        <div style="display:flex;gap:8px;align-items:flex-start;margin-top:8px;width:100%">
+        <div id="promptControls" style="display:flex;gap:8px;align-items:flex-start;margin-top:8px;width:100%">
           <label style="display:inline-flex;flex-direction:column;gap:4px;font-size:13px;opacity:.85;white-space:nowrap">
             Prompt preset
             <select id="promptPreset" style="font-size:13px;padding:4px 6px;border-radius:6px">
-              <option value="omni" selected>Omni (official omni preset)</option>
-              <option value="chinese_call">中文通话 (official audio preset)</option>
-              <option value="english_call">English Call (official audio preset)</option>
-              <option value="custom">Custom</option>
             </select>
           </label>
-          <textarea id="systemPrompt" rows="2" placeholder="System prompt" style="flex:1;font-size:13px;padding:6px 8px;border-radius:6px;resize:vertical">Streaming Omni Conversation.</textarea>
+          <textarea id="systemPrompt" rows="2" placeholder="System prompt" style="flex:1;font-size:13px;padding:6px 8px;border-radius:6px;resize:vertical"></textarea>
         </div>
         <div class="meter" aria-label="Microphone level">
           <span>Mic</span>
@@ -53,7 +51,7 @@
             <p class="eyebrow">Live transcript</p>
             <h2 id="conversationTitle">Conversation</h2>
           </div>
-          <span class="policy-label">Model-controlled listen / speak</span>
+          <span id="policyLabel" class="policy-label"></span>
         </div>
         <div id="conversation" class="conversation" aria-live="polite">
           <p id="emptyConversation" class="empty-state">Start a session and speak naturally.</p>
@@ -73,7 +71,10 @@
       </details>
     </main>
 
-    <script>window.FULL_DUPLEX_CONFIG = __FULL_DUPLEX_CONFIG__;</script>
+    <script>window.OMNI_REALTIME_CONFIG = __FULL_DUPLEX_CONFIG__; window.FULL_DUPLEX_CONFIG = window.OMNI_REALTIME_CONFIG;</script>
+    <script src="static/profiles/common.js?v=__FULL_DUPLEX_APP_VERSION__"></script>
+    <script src="static/profiles/minicpm_native.js?v=__FULL_DUPLEX_APP_VERSION__"></script>
+    <script src="static/profiles/qwen3_turn.js?v=__FULL_DUPLEX_APP_VERSION__"></script>
     <script src="static/app.js?v=__FULL_DUPLEX_APP_VERSION__"></script>
   </body>
 </html>

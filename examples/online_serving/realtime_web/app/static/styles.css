@@ -125,3 +125,6 @@ button:disabled { opacity: .46; cursor: default; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* Profile-specific controls may have inline flex styles. */
+[hidden] { display: none !important; }
