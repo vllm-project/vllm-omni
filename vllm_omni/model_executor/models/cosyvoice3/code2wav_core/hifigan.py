@@ -489,6 +489,9 @@ class HiFTGenerator(nn.Module):
             block.remove_weight_norm()
 
     def _stft(self, x):
+        if x.device.type == "npu":
+            return self._stft_on_cpu(x)
+
         spec = torch.stft(
             x,
             self.istft_params["n_fft"],
@@ -500,18 +503,49 @@ class HiFTGenerator(nn.Module):
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
         return spec[..., 0], spec[..., 1]
 
+    def _stft_on_cpu(self, x):
+        target_device = x.device
+        target_dtype = x.dtype
+        spec = torch.stft(
+            x.float().cpu(),
+            self.istft_params["n_fft"],
+            self.istft_params["hop_len"],
+            self.istft_params["n_fft"],
+            window=self.stft_window.float().cpu(),
+            return_complex=True,
+        )
+        spec = torch.view_as_real(spec).to(device=target_device, dtype=target_dtype)
+        return spec[..., 0], spec[..., 1]
+
     def _istft(self, magnitude, phase):
+        if magnitude.device.type == "npu":
+            return self._istft_on_cpu(magnitude, phase)
+
         magnitude = torch.clip(magnitude, max=1e2)
         real = magnitude * torch.cos(phase)
-        img = magnitude * torch.sin(phase)
-        inverse_transform = torch.istft(
-            torch.complex(real, img),
+        imag = magnitude * torch.sin(phase)
+        return torch.istft(
+            torch.complex(real, imag),
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
             window=self._get_stft_window(magnitude),
         )
-        return inverse_transform
+
+    def _istft_on_cpu(self, magnitude, phase):
+        target_device = magnitude.device
+        target_dtype = magnitude.dtype
+        magnitude = torch.clip(magnitude, max=1e2)
+        real = magnitude * torch.cos(phase)
+        imag = magnitude * torch.sin(phase)
+        waveform = torch.istft(
+            torch.complex(real.float().cpu(), imag.float().cpu()),
+            self.istft_params["n_fft"],
+            self.istft_params["hop_len"],
+            self.istft_params["n_fft"],
+            window=self.stft_window.float().cpu(),
+        )
+        return waveform.to(device=target_device, dtype=target_dtype)
 
     def _get_stft_window(self, tensor: torch.Tensor) -> torch.Tensor:
         if self.stft_window.device != tensor.device:
