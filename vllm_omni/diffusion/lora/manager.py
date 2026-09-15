@@ -810,6 +810,11 @@ class DiffusionLoRAManager:
             # Tear it down instead of leaving it in the stacked buffers.
             self._reset_lora_layers()
 
+        # Model-specific loaders may own tensors outside the generic cache.
+        remove_model_adapter = getattr(self.pipeline, "_remove_diffusion_lora_adapter", None)
+        if callable(remove_model_adapter):
+            remove_model_adapter(adapter_id)
+
         del self._registered_adapters[adapter_id]
         self._adapter_scales.pop(adapter_id, None)
         self._adapter_access_order.pop(adapter_id, None)

@@ -486,3 +486,87 @@ def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
     assert rank2_info.value.status_code == 422
     assert rank2_info.value.error_type == "UnprocessableEntityError"
     assert "invalid reference-video file" in str(rank2_info.value)
+
+
+@pytest.mark.parametrize("execution", ["request", "step"])
+def test_pdd_base_pdd_switch_at_execution_boundary(execution):
+    """A base request after PDD must restore projections without manual disarm."""
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.pdd import PDDAdapter, PDDConfig
+
+    class HeadModel(_SegmentMeanModel):
+        def __init__(self):
+            self.final_layer = torch.nn.Module()
+            self.final_layer.video_out = torch.nn.Linear(96, 96)
+            self.final_layer.audio_out = torch.nn.Linear(32, 32)
+
+        def __call__(self, **kwargs):
+            video, audio = super().__call__(**kwargs)
+            return self.final_layer.video_out(video)[0], self.final_layer.audio_out(audio)[0]
+
+    torch.manual_seed(42)
+    model = HeadModel()
+    cfg = PDDConfig()
+    vp, ap = cfg.plans()
+    adapter = PDDAdapter(config=cfg, lora_id=1, video_plans=vp, audio_plans=ap)
+    adapter.install_heads(model)
+    with torch.no_grad():
+        for head in (model.final_layer.video_out, model.final_layer.audio_out):
+            head.weight.add_(0.01)
+            head.bias.add_(0.1)
+    branch, video, audio = _make_branch(text_len=3, latent_t=1, latent_h=2, latent_w=2, audio_t=2, seed=5)
+    sv, sa = _sigmas(9, 12.0), _sigmas(9, 3.0)
+    pipeline = _step_pipeline(model)
+    pipeline._resident_dit_layers_on_device = lambda **kwargs: nullcontext()
+    pipeline.progress_bar = lambda **kwargs: nullcontext(SimpleNamespace(update=lambda: None))
+    pipeline._unpack_denoised_rows = lambda branch, v, a, **kwargs: (v, a)
+    pipeline._build_denoise_inputs = lambda **kwargs: {
+        "branch": branch,
+        "video_rows": video.clone(),
+        "audio_rows": audio.clone(),
+        "cond_anchor": None,
+        "audio_anchor": None,
+        "sigmas_video": sv,
+        "sigmas_audio": sa,
+    }
+
+    def run(active):
+        if execution == "request":
+            return pipeline.diffuse(
+                task="t2va",
+                text_embeddings=torch.empty(0),
+                text_tags=torch.empty(0),
+                seed=5,
+                latent_t=1,
+                latent_h=2,
+                latent_w=2,
+                audio_t=2,
+                num_frames=5,
+                num_steps=9,
+                video_shift=12.0,
+                audio_shift=3.0,
+                base_schedule=None,
+                visual_condition=None,
+                visual_condition_shape=None,
+                audio_condition=None,
+                ref_audio_t=None,
+                pdd_adapter=active,
+            )
+        state = _make_state("switch", model, branch, video, audio, sv, sa)
+        state.extra[mod._STEP_PDD_ADAPTER] = active
+        while not state.denoise_completed:
+            pred = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
+            pipeline.step_scheduler(state, pred)
+        return state.latents, state.extra[mod._STEP_AUDIO_ROWS]
+
+    base_before = run(None)
+    pdd_before = run(adapter)
+    base_after = run(None)
+    pdd_after = run(adapter)
+    for expected, restored in zip(base_before, base_after):
+        torch.testing.assert_close(expected, restored)
+    for expected, restored in zip(pdd_before, pdd_after):
+        torch.testing.assert_close(expected, restored)
+    assert not torch.allclose(base_before[0], pdd_before[0])
