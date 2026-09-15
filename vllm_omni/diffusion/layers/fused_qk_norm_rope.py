@@ -1127,6 +1127,28 @@ def fused_qk_norm_rope_min_tokens(default: int) -> int:
     return value
 
 
+def pack_qk_norm_rope_table(
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    batch_size: int,
+    *,
+    dtype: torch.dtype,
+    min_tokens: int,
+) -> torch.Tensor | None:
+    """Pack theta-width ``cos``/``sin`` ``[S, D/2]`` (shared by the batch) into
+    the ``[B*S, D] = [cos | sin]`` table the fused ops index by flattened
+    token, in ``dtype``; ``None`` when ``B*S`` is below the consumer's token
+    gate (``fused_qk_norm_rope_min_tokens(min_tokens)``), which keeps every
+    attention site on its eager chain for that forward."""
+    tokens = batch_size * cos.shape[0]
+    if tokens < fused_qk_norm_rope_min_tokens(min_tokens):
+        return None
+    table = torch.cat((cos, sin), dim=-1).to(dtype)
+    if batch_size > 1:
+        table = table.unsqueeze(0).expand(batch_size, -1, -1).reshape(tokens, -1)
+    return table
+
+
 def fused_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1205,4 +1227,9 @@ def fused_qk_norm_rope(
     )
 
 
-__all__ = ["fused_joint_qkv_norm_rope", "fused_qk_norm_rope", "fused_qk_norm_rope_min_tokens"]
+__all__ = [
+    "fused_joint_qkv_norm_rope",
+    "fused_qk_norm_rope",
+    "fused_qk_norm_rope_min_tokens",
+    "pack_qk_norm_rope_table",
+]

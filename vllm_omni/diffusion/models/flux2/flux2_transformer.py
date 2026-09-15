@@ -38,7 +38,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
-    fused_qk_norm_rope_min_tokens,
+    pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
@@ -68,21 +68,13 @@ def _packed_qk_norm_rope_table(
 
     Flux.2's ``cos``/``sin`` are ``[S, D/2]`` (theta width, one row per joint
     token, text first), which is exactly the ``[cos(theta) | sin(theta)]``
-    half of the fused op's table; the table is repeated per batch element
-    because the op indexes it by flattened ``B*S`` token. It is stored in the
-    activation dtype — the eager chain casts ``cos``/``sin`` to that dtype
-    before ``apply_rotary_emb`` — so both paths rotate with identical
-    coefficients. Returns ``None`` below the token gate, keeping every block
-    on the eager chain.
+    half of the fused op's table. It is stored in the activation dtype — the
+    eager chain casts ``cos``/``sin`` to that dtype before ``apply_rotary_emb``
+    — so both paths rotate with identical coefficients. Returns ``None``
+    below the token gate, keeping every block on the eager chain.
     """
     cos, sin = rotary_emb
-    tokens = batch_size * cos.shape[0]
-    if tokens < fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS):
-        return None
-    table = torch.cat((cos, sin), dim=-1).to(dtype)
-    if batch_size > 1:
-        table = table.unsqueeze(0).expand(batch_size, -1, -1).reshape(tokens, -1)
-    return table
+    return pack_qk_norm_rope_table(cos, sin, batch_size, dtype=dtype, min_tokens=_FUSED_MIN_TOKENS)
 
 
 def _join_prefix(prefix: str, name: str) -> str:
