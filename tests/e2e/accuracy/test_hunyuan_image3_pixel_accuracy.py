@@ -73,7 +73,7 @@ def _baseline_path() -> Path:
     return path
 
 
-_OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+_OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "text_to_image" / "text_to_image.py"
 
 # DiT-only deploy config with trust_remote_code (based on hunyuan_image3_dit.yaml).
 _DEPLOY_CONFIG: dict[str, Any] = {
@@ -228,20 +228,17 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
     import subprocess
     import sys
 
-    output_dir = str(output_path.parent)
     subprocess.run(
         [
             sys.executable,
             str(_OFFLINE_SCRIPT),
-            "--modality",
-            "text2img",
             "--deploy-config",
             deploy_config,
-            "--prompts",
+            "--prompt",
             PROMPT,
             "--output",
-            output_dir,
-            "--steps",
+            str(output_path),
+            "--num-inference-steps",
             str(NUM_INFERENCE_STEPS),
             "--guidance-scale",
             str(GUIDANCE_SCALE),
@@ -251,21 +248,20 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
             str(HEIGHT),
             "--width",
             str(WIDTH),
-            "--bot-task",
-            "none",
-            "--sys-type",
+            "--use-system-prompt",
             "en_unified",
+            "--extra-body",
+            '{"bot_task": null}',
+            "--trust-remote-code",
             "--model",
             model,
             "--enforce-eager",
         ],
         check=True,
     )
-    images = sorted(Path(output_dir).glob("output_*.png"))
-    assert images, f"No output image found in {output_dir}"
-    image = Image.open(images[0]).convert("RGB")
+    assert output_path.exists(), f"No output image at {output_path}"
+    image = Image.open(output_path).convert("RGB")
     image.load()
-    image.save(output_path)
     return image
 
 
