@@ -1209,7 +1209,9 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
                 "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
                 "ttfp": "input_audio_buffer.commit client send to first audio packet",
                 "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                "tpot": "Stage-0 engine mean time per output token",
             },
+            "tpot_ms": None,
         },
         {
             "session_id": "seed-tts-session",
@@ -1225,15 +1227,17 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
                 "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
                 "ttfp": "input_audio_buffer.commit client send to first audio packet",
                 "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                "tpot": "Stage-0 engine mean time per output token",
             },
+            "tpot_ms": None,
         },
     ]
     assert session_metrics == {
         "session_id": "seed-tts-session",
         "audio_turn_count": 2,
-        "mean_ttft_ms": 150.0,
-        "mean_ttfp_ms": 250.0,
-        "mean_rtf": 3.125,
+        "ttft_ms": {"count": 2, "mean": 150.0, "p50": 150.0, "p99": 150.0},
+        "ttfp_ms": {"count": 2, "mean": 250.0, "p50": 200.0, "p99": 300.0},
+        "rtf": {"count": 2, "mean": 3.125, "p50": 2.5, "p99": 3.75},
     }
 
 

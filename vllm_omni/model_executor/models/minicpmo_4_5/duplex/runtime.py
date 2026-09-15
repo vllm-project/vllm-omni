@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from typing import Any, cast
@@ -23,17 +24,73 @@ _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
 # matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
 _DUPLEX_VISION_TOKENS_PER_FRAME = 66
 # Official stacked pair uses max_slice_nums=[2, 1]: the current frame is HD
-# sliced (1 source + 2 patches on 960x540) and the composite is not.
+# sliced (1 source + up to 2 patches, e.g. on 960x540) and the composite is
+# not. The patch count depends on the frame size (see
+# ``_duplex_hd_slice_count``); the constant is the fallback when the frame
+# header cannot be read.
 _DUPLEX_HD_SLICES_PER_BASE_FRAME = 3
+_DUPLEX_HD_MAX_SLICE_NUMS = 2
+_DUPLEX_SCALE_RESOLUTION = 448
+
+
+def _duplex_frames(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    frames = payload.get("video_frames")
+    if not isinstance(frames, list):
+        return []
+    return [frame for frame in frames if isinstance(frame, str) and frame]
 
 
 def _duplex_frame_count(payload: object) -> int:
-    if not isinstance(payload, dict):
+    return len(_duplex_frames(payload))
+
+
+def _duplex_frame_size(frame_b64: str) -> tuple[int, int] | None:
+    """Pixel size of a base64 JPEG/PNG frame from its header, or ``None``."""
+    from io import BytesIO
+
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(b64decode(frame_b64, validate=True))) as image:
+            width, height = image.size
+    except Exception:  # noqa: BLE001 - Stage0 rejects bad frames with a reason
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return int(width), int(height)
+
+
+def _duplex_hd_slice_count(image_size: tuple[int, int], max_slice_nums: int) -> int:
+    """Number of HD patches ``MiniCPMVImageProcessor.get_sliced_grid`` adds.
+
+    Port of the official grid selection (``scale_resolution=448``): an image
+    whose area fits in one 448x448 tile is not sliced at all, otherwise the
+    grid closest to the image aspect ratio among ``multiple-1 .. multiple+1``
+    splits is used. Stage0 runs the same processor, so the scheduler budget
+    and the worker-built embeddings agree.
+    """
+    width, height = image_size
+    ratio = width * height / (_DUPLEX_SCALE_RESOLUTION * _DUPLEX_SCALE_RESOLUTION)
+    multiple = min(math.ceil(ratio), max_slice_nums)
+    if multiple <= 1:
         return 0
-    frames = payload.get("video_frames")
-    if not isinstance(frames, list):
-        return 0
-    return sum(1 for frame in frames if isinstance(frame, str) and frame)
+    log_ratio = math.log(width / height)
+    best_grid = (1, 1)
+    min_error = float("inf")
+    for split_grids_nums in (multiple - 1, multiple, multiple + 1):
+        if split_grids_nums == 1 or split_grids_nums > max_slice_nums:
+            continue
+        for m in range(1, split_grids_nums + 1):
+            if split_grids_nums % m:
+                continue
+            grid = (m, split_grids_nums // m)
+            error = abs(log_ratio - math.log(grid[0] / grid[1]))
+            if error < min_error:
+                best_grid = grid
+                min_error = error
+    return best_grid[0] * best_grid[1]
 
 
 def _duplex_vision_tokens(payload: object) -> int:
@@ -41,15 +98,25 @@ def _duplex_vision_tokens(payload: object) -> int:
 
     Audio is never stacked: a unit still carries one second of soundtrack.
     ``stack_frames`` only adds a second *image*. Official HD on that pair is
-    ``[2, 1]``, so the base frame reserves three 66-token blocks and every
-    extra frame reserves one.
+    ``max_slice_nums=[2, 1]``: the base frame keeps its source block plus the
+    HD patches the processor cuts for its size (two for a 960x540 camera
+    frame, none for anything that fits in one 448x448 tile) and every extra
+    frame is one block. A single frame is never sliced. The count must match
+    the embeddings Stage0 builds exactly: surplus slots become pad
+    embeddings inside the KV.
     """
-    count = _duplex_frame_count(payload)
+    frames = _duplex_frames(payload)
+    count = len(frames)
     if count <= 0:
         return 0
-    if count >= 2:
-        return (_DUPLEX_HD_SLICES_PER_BASE_FRAME + (count - 1)) * _DUPLEX_VISION_TOKENS_PER_FRAME
-    return count * _DUPLEX_VISION_TOKENS_PER_FRAME
+    if count == 1:
+        return _DUPLEX_VISION_TOKENS_PER_FRAME
+    base_size = _duplex_frame_size(frames[0])
+    if base_size is None:
+        base_blocks = _DUPLEX_HD_SLICES_PER_BASE_FRAME
+    else:
+        base_blocks = 1 + _duplex_hd_slice_count(base_size, _DUPLEX_HD_MAX_SLICE_NUMS)
+    return (base_blocks + (count - 1)) * _DUPLEX_VISION_TOKENS_PER_FRAME
 
 
 def _duplex_pcm_sample_count(payload: object) -> int | None:

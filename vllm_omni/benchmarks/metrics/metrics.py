@@ -916,11 +916,9 @@ def calculate_metrics(
             all_tpots.append(tpot)
             itls += outputs[i].itl
             session_metrics = getattr(outputs[i], "duplex_session_metrics", None)
-            ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_ttft_ms") is not None
-            audio_ttfp_measured = (
-                not isinstance(session_metrics, dict) or session_metrics.get("mean_ttfp_ms") is not None
-            )
-            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_rtf") is not None
+            ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttft_ms") is not None
+            audio_ttfp_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttfp_ms") is not None
+            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("rtf") is not None
             if ttft_measured:
                 ttfts.append(outputs[i].ttft)
             if audio_ttfp_measured:

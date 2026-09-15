@@ -30,7 +30,7 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import 
     run_multi_session,
 )
 from tests.helpers.mark import hardware_test
-from vllm_omni.clients.duplex import build_realtime_url
+from vllm_omni.clients.duplex import build_realtime_url, metric_mean
 from vllm_omni.experimental.fullduplex.video_stacking import concat_frames_b64
 
 pytestmark = pytest.mark.omni
@@ -59,9 +59,12 @@ def _assert_session_metrics(metrics: object, *, expected_count: int) -> None:
     assert isinstance(metrics, dict)
     assert isinstance(metrics["session_id"], str)
     assert metrics["audio_turn_count"] == expected_count
-    assert metrics["mean_ttft_ms"] is not None and metrics["mean_ttft_ms"] >= 0
-    assert metrics["mean_ttfp_ms"] is not None and metrics["mean_ttfp_ms"] >= 0
-    assert metrics["mean_rtf"] is not None and metrics["mean_rtf"] >= 0
+    ttft_ms = metric_mean(metrics["ttft_ms"])
+    ttfp_ms = metric_mean(metrics["ttfp_ms"])
+    rtf = metric_mean(metrics["rtf"])
+    assert ttft_ms is not None and ttft_ms >= 0
+    assert ttfp_ms is not None and ttfp_ms >= 0
+    assert rtf is not None and rtf >= 0
 
 
 async def _receive_protocol_events(ws, required_types: set[str], *, timeout_s: float) -> list[dict[str, object]]:
