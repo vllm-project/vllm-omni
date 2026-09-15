@@ -17,7 +17,7 @@ from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServin
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
-from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.utils import is_image_generation_stage
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
@@ -57,7 +57,8 @@ def _get_engine_and_model(raw_request: Request):
             detail="Multi-stage engine not initialized. Start server with a multi-stage omni model.",
         )
 
-    # Check if there's a diffusion stage.
+    # Check if there's an image generation stage (classical diffusion or
+    # LLM-typed DiT such as MammothModa2).
     # Prefer app state (compat layer populated at startup), then fall back to
     # the engine client's stage configs for refactored AsyncOmni paths.
     stage_configs = getattr(raw_request.app.state, "stage_configs", None)
@@ -70,12 +71,12 @@ def _get_engine_and_model(raw_request: Request):
         )
 
     normalized_stage_configs = list(stage_configs)
-    has_diffusion_stage = any(get_stage_type(stage_cfg) == "diffusion" for stage_cfg in normalized_stage_configs)
+    has_image_stage = any(is_image_generation_stage(stage_cfg) for stage_cfg in normalized_stage_configs)
 
-    if not has_diffusion_stage:
+    if not has_image_stage:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            detail="No diffusion stage found in multi-stage pipeline.",
+            detail="No image generation stage found in multi-stage pipeline.",
         )
 
     # Get server's loaded model name
