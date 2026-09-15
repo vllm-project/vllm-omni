@@ -60,7 +60,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 # Blocking-wait interval for the event-driven final-output drain
-# (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): a message wakes the drain immediately via
+# (selected by VLLM_OMNI_EVENT_DRIVEN_ORCH or the engine pipeline default): a
+# message wakes the drain immediately via
 # the janus queue's condition variable; this timeout only bounds how often the
 # orchestrator liveness check runs while the pipeline is idle.
 _FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
@@ -937,7 +938,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
         engine = self.engine
 
-        # Event-driven drain (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): block on the
+        # Event-driven drain (explicit env value or the engine pipeline default): block on the
         # queue's condition variable in a dedicated thread instead of the
         # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
         # event-driven loop (vllm_omni/engine/orchestrator.py).

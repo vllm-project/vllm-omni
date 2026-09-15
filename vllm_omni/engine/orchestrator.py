@@ -1246,7 +1246,8 @@ class Orchestrator:
     async def _orchestration_loop_event_driven(self) -> None:
         """Event-driven variant of ``_orchestration_loop``.
 
-        Selected by ``VLLM_OMNI_EVENT_DRIVEN_ORCH=1``. One reader task per
+        Selected by the explicit ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` value or the
+        pipeline default computed at engine initialization. One reader task per
         available LLM stage replica awaits ``client.get_output_async()``
         directly — the same pattern vLLM's own ``AsyncLLM`` output handler uses
         — and feeds a single dispatch queue. This coroutine consumes that queue
@@ -1417,6 +1418,9 @@ class Orchestrator:
                     continue
                 kind, stage_id, replica_id, payload = pending_get.result()
                 pending_get = None
+                # Record the queue after dequeue so the gauge reflects work
+                # still waiting for dispatch rather than producer-side depth.
+                self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
 
                 if kind == "error":
                     # replica_id < 0 means the failure was raised by a poller
