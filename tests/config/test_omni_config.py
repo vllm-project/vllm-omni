@@ -94,6 +94,20 @@ def _from_pipeline_key(
     )
 
 
+def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
+    config = _from_pipeline_key(
+        "mammoth_moda2",
+        cli_overrides={"model": "/models/MammothModa2-Preview"},
+    )
+    stage = config.stage_by_id(1)
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.model_class_name == "MammothModa2DiTPipeline"
+    assert stage.diffusion_config.model == "/models/MammothModa2-Preview"
+    assert stage.diffusion_config.step_execution is False
+    assert stage.scheduler_config.max_num_seqs == 1
+    assert stage.connector_config.omni_kv_config == {"need_recv_cache": False}
+
+
 def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
     config = _from_pipeline_key(
         "minimax_h3_disaggregated",
