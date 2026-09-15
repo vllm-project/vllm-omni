@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -45,6 +45,16 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.gated_residual_adaln import (
+    try_fused_gated_residual,
+    try_fused_gated_residual_adaln,
+    try_fused_native_adaln,
+)
+from vllm_omni.diffusion.layers.paired_adaln import (
+    try_paired_gated_residual,
+    try_paired_gated_residual_adaln,
+    try_paired_native_adaln,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
@@ -868,11 +878,31 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process image stream - norm1 + modulation
         img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
-        img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
+        ordinary_t2i = modulate_index is None and not self.zero_cond_t
+        paired_norm1 = None
+        if ordinary_t2i:
+            paired_norm1 = try_paired_native_adaln(
+                hidden_states,
+                encoder_hidden_states,
+                img_scale1,
+                img_shift1,
+                txt_scale1,
+                txt_shift1,
+                self.img_norm1.eps,
+                self.txt_norm1.eps,
+            )
+        img_modulated, txt_modulated = (None, None) if paired_norm1 is None else paired_norm1
+        if img_modulated is None and ordinary_t2i:
+            img_modulated = try_fused_native_adaln(hidden_states, img_scale1, img_shift1, self.img_norm1.eps)
+        if img_modulated is None:
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
-        txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
-        txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
+        if txt_modulated is None and ordinary_t2i:
+            txt_modulated = try_fused_native_adaln(encoder_hidden_states, txt_scale1, txt_shift1, self.txt_norm1.eps)
+        if txt_modulated is None:
+            txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -892,23 +922,68 @@ class QwenImageTransformerBlock(nn.Module):
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
 
-        # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
-
-        # Process image stream - norm2 + MLP
+        # Ordinary T2I fuses residual/cast and norm2 modulation around native
+        # LayerNorm. Indexed Edit and other unsupported inputs keep the layers.
         img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
-        img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
+        paired_norm2 = None
+        if ordinary_t2i:
+            paired_norm2 = try_paired_gated_residual_adaln(
+                (hidden_states, img_attn_output, img_gate1, img_scale2, img_shift2),
+                (encoder_hidden_states, txt_attn_output, txt_gate1, txt_scale2, txt_shift2),
+                self.img_norm2.eps,
+                self.txt_norm2.eps,
+            )
+        if paired_norm2 is not None:
+            hidden_states, img_modulated2, encoder_hidden_states, txt_modulated2 = paired_norm2
+            # The two MLPs retain their original order, including TP collectives.
+            img_mlp_output = self.img_mlp(img_modulated2)
+            txt_mlp_output = self.txt_mlp(txt_modulated2)
+            paired_final = try_paired_gated_residual(
+                hidden_states,
+                img_mlp_output,
+                img_gate2,
+                encoder_hidden_states,
+                txt_mlp_output,
+                txt_gate2,
+            )
+            if paired_final is None:
+                hidden_states = hidden_states + img_gate2 * img_mlp_output
+                encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+            else:
+                hidden_states, encoder_hidden_states = paired_final
+            # The pair contract accepts only BF16/FP32; FP16 clipping is below.
+            return encoder_hidden_states, hidden_states
+        img_fused = None
+        if ordinary_t2i:
+            img_fused = try_fused_gated_residual_adaln(
+                hidden_states, img_attn_output, img_gate1, img_scale2, img_shift2, self.img_norm2.eps
+            )
+        if img_fused is None:
+            hidden_states = hidden_states + img_gate1 * img_attn_output
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        else:
+            hidden_states, img_modulated2 = img_fused
 
         img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        img_final = try_fused_gated_residual(hidden_states, img_mlp_output, img_gate2) if ordinary_t2i else None
+        hidden_states = hidden_states + img_gate2 * img_mlp_output if img_final is None else img_final
 
         # Process text stream - norm2 + MLP
-        txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
-        txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
+        txt_fused = None
+        if ordinary_t2i:
+            txt_fused = try_fused_gated_residual_adaln(
+                encoder_hidden_states, txt_attn_output, txt_gate1, txt_scale2, txt_shift2, self.txt_norm2.eps
+            )
+        if txt_fused is None:
+            encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+            txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
+        else:
+            encoder_hidden_states, txt_modulated2 = txt_fused
 
         txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        txt_final = try_fused_gated_residual(encoder_hidden_states, txt_mlp_output, txt_gate2) if ordinary_t2i else None
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output if txt_final is None else txt_final
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
