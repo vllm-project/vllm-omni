@@ -930,7 +930,7 @@ def test_producer_payload_feeds_rho_logging_end_to_end():
     chunk_dict = to_dict(chunk_payload)
     assert chunk_dict["meta"]["segment_text_tokens"] == 12
     model.forward(
-        input_ids=torch.tensor(chunk_dict["codes"]["audio"], dtype=torch.long),  # 4 codec frames
+        input_ids=torch.as_tensor(chunk_dict["codes"]["audio"], dtype=torch.long),  # 4 codec frames
         runtime_additional_information=[chunk_dict],
     )
     assert model._rho_stats._stats[rid]["seg_frames"] == 4
@@ -939,7 +939,7 @@ def test_producer_payload_feeds_rho_logging_end_to_end():
     finished_dict = to_dict(finished_payload)
     with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
         model.forward(
-            input_ids=torch.tensor(finished_dict["codes"]["audio"], dtype=torch.long),
+            input_ids=torch.as_tensor(finished_dict["codes"]["audio"], dtype=torch.long),
             runtime_additional_information=[finished_dict],
         )
     # 4 + 4 frames / 12 text tokens = 0.667, then the entry is dropped.

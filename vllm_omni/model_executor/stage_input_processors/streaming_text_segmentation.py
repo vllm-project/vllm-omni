@@ -66,22 +66,28 @@ _PUNCTUATION_LEVELS = (_LEVEL1, _LEVEL2, _LEVEL3)
 
 
 def _exclusive_terminals(tier: tuple[str, ...], *lower_tiers: tuple[str, ...]) -> tuple[str, ...]:
-    """Return the terminals unique to ``tier``, longest first.
+    """Return the terminals unique to ``tier``, longest first then lexicographic.
 
     Levels are exclusive so a token classifies once: ``"……"`` belongs to L3
-    only, even though the raw L3 list also contains ``"…"``.
+    only, even though the raw L3 list also contains ``"…"``.  Sorting by length
+    keeps a multi-character terminal ahead of its own prefix, and the
+    lexicographic tiebreak keeps the order stable across runs.
     """
     lower = set().union(*lower_tiers) if lower_tiers else set()
     unique = {punct for punct in tier if punct not in lower}
-    return tuple(sorted(unique, key=len, reverse=True))
+    return tuple(sorted(unique, key=lambda punct: (-len(punct), punct)))
 
 
 def _build_terminals_by_level() -> tuple[tuple[int, tuple[str, ...]], ...]:
-    level3 = _exclusive_terminals(_LEVEL3_PUNCTUATION, _LEVEL2_PUNCTUATION)
-    level2 = _exclusive_terminals(_LEVEL2_PUNCTUATION, _LEVEL1_PUNCTUATION)
+    """Pair each level with its own terminals, strongest level first.
+
+    The tiers are disjoint, so a suffix matches at most one level and the order
+    below only documents intent.
+    """
     level1 = _exclusive_terminals(_LEVEL1_PUNCTUATION)
-    # Weakest first, so a multi-character boundary is not shadowed by a prefix.
-    return ((_LEVEL3, level3), (_LEVEL2, level2), (_LEVEL1, level1))
+    level2 = _exclusive_terminals(_LEVEL2_PUNCTUATION, _LEVEL1_PUNCTUATION)
+    level3 = _exclusive_terminals(_LEVEL3_PUNCTUATION, _LEVEL2_PUNCTUATION)
+    return ((_LEVEL1, level1), (_LEVEL2, level2), (_LEVEL3, level3))
 
 
 _TERMINALS_BY_LEVEL = _build_terminals_by_level()
@@ -157,7 +163,16 @@ class SplitThresholds:
 
 @dataclass(frozen=True)
 class SegmentCut:
-    """One committed segment."""
+    """One committed segment.
+
+    ``text_tokens`` counts the segment's tokens including the boundary token.
+    ``punct_level`` is the boundary level the cut landed on, or 0 when the cut
+    landed mid-word.  ``is_forced`` is True when the ceiling or :meth:`finish`
+    committed the cut; a forced cut with ``punct_level == 0`` is a true hard
+    cut, while a forced cut with a level means the ceiling coincided with a
+    boundary.  :meth:`finish` always reports level 0, since flushing the tail is
+    not boundary-triggered.
+    """
 
     text_tokens: int
     punct_level: int
@@ -211,7 +226,9 @@ def compute_thresholds(
     Each level's threshold is ``ceil(capacity * ratio)``, so stronger boundaries
     cut earlier and weaker ones require more accumulated text.  The ratios must
     satisfy ``0 < level1 <= level2 <= level3 <= 1`` and the ceiling is exactly
-    the capacity, so tier spacing can never enlarge the budget.
+    the capacity, so tier spacing can never enlarge the budget.  For a small
+    capacity two levels can round to the same threshold; that is intentional,
+    the ceiling still being the enforceable hard limit.
     """
     if text_token_capacity < 1:
         raise ValueError(f"text_token_capacity must be positive, got {text_token_capacity}")
@@ -359,7 +376,10 @@ class CapacityAdaptiveSegmenter:
         return cuts
 
     def finish(self) -> SegmentCut | None:
-        """Force the final split of the tail, or ``None`` when it is empty."""
+        """Force the final split of the tail, or ``None`` when it is empty.
+
+        Reports level 0 because flushing the tail is not boundary-triggered.
+        """
         if self._token_count <= 0:
             return None
         return self._commit(punct_level=_NO_PUNCTUATION, is_forced=True)

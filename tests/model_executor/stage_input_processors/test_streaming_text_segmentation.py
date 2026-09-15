@@ -278,6 +278,19 @@ def test_measured_ratio_shapes_the_next_segment_capacity():
     assert segmenter.start_segment(remaining_capacity=100).force_split_at == 10
 
 
+def test_seam_contract_from_code2wav_measurement_to_next_budget():
+    """Seam the live wiring will connect (#6496 mechanism 2).
+
+    Code2Wav reports a finished segment as (realized acoustic frames, text
+    tokens); the segmenter turns that into the next segment's text capacity.
+    ``observe_segment`` is where rho arrives and ``start_segment`` is where the
+    next budget is applied, so this pins both ends of the unwired loop.
+    """
+    segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
+    segmenter.observe_segment(acoustic_steps=240, text_tokens=120)  # rho = 2.0
+    assert segmenter.start_segment(remaining_capacity=100).force_split_at == 50
+
+
 def test_segment_never_plans_more_acoustic_steps_than_remaining():
     """#5889 capacity property: capacity * expansion_ratio <= remaining budget."""
     segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
@@ -285,6 +298,25 @@ def test_segment_never_plans_more_acoustic_steps_than_remaining():
     for remaining in (30, 61, 149, 150, 1000):
         capacity = segmenter.start_segment(remaining_capacity=remaining).force_split_at
         assert capacity * segmenter.expansion_ratio <= remaining
+
+
+def test_a_committed_cut_reopens_the_next_segment_with_the_same_thresholds():
+    """A batch spanning two boundaries yields two online cuts, not one.
+
+    After a cut the next segment starts empty and reuses the frozen thresholds
+    until the caller refreshes them with ``start_segment()``.
+    """
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=10)  # level-1 threshold is 7
+    tokens = ["w"] * 6 + ["end."] + ["w"] * 6 + ["end."]
+    cuts = segmenter.append_tokens(tokens)
+    assert [cut.text_tokens for cut in cuts] == [7, 7]
+
+
+def test_threshold_lookup_rejects_an_unknown_level():
+    thresholds = compute_thresholds(text_token_capacity=10)
+    with pytest.raises(ValueError, match="punctuation level"):
+        thresholds.min_tokens_for_level(0)
 
 
 def test_constructor_rejects_invalid_parameters():

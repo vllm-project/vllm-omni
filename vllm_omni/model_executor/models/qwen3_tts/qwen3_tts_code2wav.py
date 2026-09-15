@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import torch
@@ -74,7 +74,11 @@ class _SegmentRhoTracker:
         if text_tokens > 0:
             stats["seg_text_tokens"] = max(stats["seg_text_tokens"], text_tokens)
 
-    def flush_empty_payload(self, runtime_infos: Any, request_ids: Any = None) -> None:
+    def flush_empty_payload(
+        self,
+        runtime_infos: list[dict[str, Any]] | None,
+        request_ids: Sequence[str] | None = None,
+    ) -> None:
         """Flush finish flags carried by payloads with no frames.
 
         The talker adapter ends a request with an empty-finished payload, so
@@ -107,7 +111,7 @@ class _SegmentRhoTracker:
                 self.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
 
     @staticmethod
-    def _canonical_request_id(request_ids: Any, index: int) -> str | None:
+    def _canonical_request_id(request_ids: Sequence[str] | None, index: int) -> str | None:
         """Scheduler-side request ID for batch ``index``, when available."""
         if request_ids is None or index >= len(request_ids):
             return None
