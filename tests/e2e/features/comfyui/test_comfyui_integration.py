@@ -26,6 +26,7 @@ from comfy_api.input import AudioInput, VideoInput
 from comfyui_vllm_omni.nodes import (
     VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
+    VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
@@ -60,6 +61,7 @@ class ServerCase(NamedTuple):
     stage_list: list
     stage_configs: list[Any]
     outputs: list[OmniRequestOutput]
+    tokenizer: Any = None
 
 
 class SamplingCase(NamedTuple):
@@ -77,6 +79,7 @@ class SamplingKind(str, Enum):
     UNDERSTANDING_AR_LIST = "understanding_ar_list"
     TTS_NONE = "tts_none"
     TTS_DIFFUSION_SINGLE = "tts_diffusion_single"
+    MUSIC_NONE = "music_none"
     VIDEO_NONE = "video_none"
     VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
     VIDEO_FASTH3 = "video_fasth3"
@@ -370,6 +373,11 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             assert len(received_sampling_params_list) == 3
             for i, expected in enumerate(AR_LIST_SAMPLING_PARAMS):
                 _assert_sampling_param_values(received_sampling_params_list[i], expected)
+        elif sampling_case.kind is SamplingKind.MUSIC_NONE:
+            assert len(received_sampling_params_list) == 2
+            assert prompt["prompt_token_ids"] == [101, 102, 103]
+            assert prompt["additional_information"]["max_audio_frames"] == [1512]
+            assert received_sampling_params_list[0].seed == 7
         elif sampling_case.kind in {SamplingKind.TTS_NONE, SamplingKind.TTS_DIFFUSION_SINGLE}:
             assert len(received_sampling_params_list) == 1
         elif sampling_case.kind is SamplingKind.VIDEO_NONE:
@@ -508,6 +516,9 @@ def mock_async_omni(
         _mock_preprocess_chat,
     )
 
+    if server_case.tokenizer is not None:
+        mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=server_case.tokenizer)
+
     mock_instance = mocker.AsyncMock(spec=RealAsyncOmni)
     mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
 
@@ -535,7 +546,7 @@ def mock_async_omni(
     mock_instance.shutdown = mocker.MagicMock()
     mock_instance.get_vllm_config = mocker.AsyncMock(return_value=None)
     mock_instance.get_supported_tasks = mocker.AsyncMock(return_value=["generate"])
-    mock_instance.get_tokenizer = mocker.AsyncMock(return_value=None)
+    mock_instance.get_tokenizer = mocker.AsyncMock(return_value=server_case.tokenizer)
 
     mock_async_omni_cls.return_value = mock_instance
     yield mock_async_omni_cls
@@ -1036,3 +1047,66 @@ async def test_video_generation_node_minimax_h3_ref2va(
     assert isinstance(result, tuple)
     assert len(result) == 1
     assert isinstance(result[0], VideoInput)
+
+
+def _build_music_tokenizer():
+    # Checkpoint token IDs required by the API adapter's tokenizer validation.
+    special_token_ids = {
+        "<|im_start|>": 151644,
+        "<|im_end|>": 151645,
+        "<|audio_cfg|>": 151654,
+        "<|audio_start|>": 151669,
+        "<|audio_end|>": 151670,
+        "<|caption_start|>": 151671,
+        "<|caption_end|>": 151672,
+        "<|lyrics_start|>": 151673,
+        "<|lyrics_end|>": 151674,
+    }
+
+    def encode(prompt):
+        assert prompt == (
+            "<|im_start|><|caption_start|>Warm acoustic pop at 92 BPM"
+            "<|caption_end|><|lyrics_start|>[start]\n[verse]\nThe morning light"
+            "<|lyrics_end|><|im_end|><|audio_start|>"
+        )
+        return [101, 102, 103]
+
+    return SimpleNamespace(encode=encode, convert_tokens_to_ids=special_token_ids.get)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        ServerCase(
+            served_model="MiniMaxAI/MiniMax-Music3",
+            stage_list=["llm", "llm"],
+            stage_configs=[
+                _make_stage_config("llm", model_stage="minimax_music3_ar"),
+                _make_stage_config("llm", model_stage="minimax_music3_acoustic"),
+            ],
+            outputs=[_build_audio_speech_output()],
+            tokenizer=_build_music_tokenizer(),
+        )
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [SamplingCase(kind=SamplingKind.MUSIC_NONE, sampling_params=None)],
+    indirect=True,
+)
+async def test_music_generation_node_minimax_music3(api_server: str, sampling_case: SamplingCase):
+    result = await VLLMOmniGenerateMusic().generate(
+        url=api_server,
+        model="MiniMaxAI/MiniMax-Music3",
+        lyrics="[Verse]\nThe morning light",
+        instructions="Warm acoustic pop at 92 BPM",
+        max_duration_seconds=60.5,
+        seed=7,
+        response_format="wav",
+    )
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert result[0]["sample_rate"] == 24000
+    assert result[0]["waveform"].shape == (1, 1, 24000)

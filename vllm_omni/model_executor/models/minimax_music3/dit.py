@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Condition encoder and flow-matching transformer for MiniMax Music 3.
 
 Stage 1 turns the AR stage's conditioning frames into a DAC latent in two
@@ -21,8 +21,8 @@ model picks up the same backend selection, sequence-parallel plumbing and
 KV-quant policy as every other transformer in the tree. That layer resolves
 its backend from the diffusion config, which an ``LLM_GENERATION`` stage such
 as this one does not set; it tolerates that and falls through to the platform
-default. If it cannot be built at all the block runs plain SDPA instead, a
-choice made once when the blocks are built and never inside ``forward``.
+default. FP32 inputs bypass that backend and use PyTorch SDPA, because
+FlashAttention does not accept FP32. SDPA also handles construction failures.
 """
 
 from __future__ import annotations
@@ -183,7 +183,10 @@ class Attention(nn.Module):
         self.backend_name = self.backend.attn_backend.get_name() if self.backend is not None else "TORCH_SDPA"
 
     def _attend(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        if self.backend is not None:
+        # The acoustic stage produces FP32 Q/K/V. FlashAttention rejects these:
+        # "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type".
+        # Keep FP32 inputs on SDPA without changing the model precision.
+        if self.backend is not None and q.dtype != torch.float32:
             return self.backend(q, k, v)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False, scale=self.softmax_scale)
