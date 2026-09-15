@@ -51,6 +51,61 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
 
 
 @dataclass
+class _PagedMetaCache:
+    """Device-side metadata of one non-committing forward, keyed by everything
+    that can change it. Stored on the request adapter."""
+
+    key: tuple
+    current_video_block_ids: list[int]
+    current_video_slot_mapping: torch.Tensor
+    action_scratch_block_ids: list[int]
+    action_slot_mapping: torch.Tensor
+    action_len: int
+    block_table: torch.Tensor
+    query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    query_len: int
+    kv_len: int
+    max_query_len: int
+    max_seq_len: int
+
+    @classmethod
+    def capture(cls, key: tuple, ctx: ARDiffusionPagedForwardContext) -> _PagedMetaCache:
+        assert ctx.current_video_slot_mapping is not None
+        assert ctx.action_slot_mapping is not None
+        assert ctx.block_table is not None and ctx.query_start_loc is not None and ctx.seq_lens is not None
+        return cls(
+            key=key,
+            current_video_block_ids=list(ctx.current_video_block_ids),
+            current_video_slot_mapping=ctx.current_video_slot_mapping,
+            action_scratch_block_ids=list(ctx.action_scratch_block_ids),
+            action_slot_mapping=ctx.action_slot_mapping,
+            action_len=ctx._action_len,
+            block_table=ctx.block_table,
+            query_start_loc=ctx.query_start_loc,
+            seq_lens=ctx.seq_lens,
+            query_len=ctx.query_len,
+            kv_len=ctx.kv_len,
+            max_query_len=ctx.max_query_len,
+            max_seq_len=ctx.max_seq_len,
+        )
+
+    def apply(self, ctx: ARDiffusionPagedForwardContext) -> None:
+        ctx.current_video_block_ids = list(self.current_video_block_ids)
+        ctx.current_video_slot_mapping = self.current_video_slot_mapping
+        ctx.action_scratch_block_ids = list(self.action_scratch_block_ids)
+        ctx.action_slot_mapping = self.action_slot_mapping
+        ctx._action_len = self.action_len
+        ctx.block_table = self.block_table
+        ctx.query_start_loc = self.query_start_loc
+        ctx.seq_lens = self.seq_lens
+        ctx.query_len = self.query_len
+        ctx.kv_len = self.kv_len
+        ctx.max_query_len = self.max_query_len
+        ctx.max_seq_len = self.max_seq_len
+
+
+@dataclass
 class ARDiffusionPagedForwardContext:
     """Mutable KV-branch state shared by all layer contexts in one forward."""
 
@@ -208,6 +263,29 @@ class ARDiffusionPagedForwardContext:
         """
         if getattr(self, "_prepared", False):
             return
+        # Non-committing forwards (the T-1 denoise probes of a chunk) write the
+        # current chunk into fixed scratch blocks and read an unchanged history,
+        # so every tensor built below is identical across those steps. Rebuilding
+        # them costs five pageable H2D copies per step, each a stream sync, which
+        # reintroduces the per-step device barrier the runner deliberately avoids
+        # (see ARDiffusionModelRunner.execute_stepwise). Cache them on the
+        # adapter; anything that changes the block table invalidates the cache.
+        cache_key = None
+        if not self.commit_current:
+            cache_key = (
+                int(self.adapter.completed_chunks),
+                tuple(self.history_block_ids),
+                int(self.seq_len),
+                int(action_len),
+                int(query_len),
+                str(device),
+            )
+            cached = self.adapter.paged_meta_cache
+            if cached is not None and cached.key == cache_key:
+                cached.apply(self)
+                self._allocated_video = True
+                self._prepared = True
+                return
         self.ensure_video_slots(device)
         (
             self.block_table,
@@ -219,6 +297,8 @@ class ARDiffusionPagedForwardContext:
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
         self._prepared = True
+        if cache_key is not None:
+            self.adapter.paged_meta_cache = _PagedMetaCache.capture(cache_key, self)
 
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
         if not getattr(self, "_prepared", False):
