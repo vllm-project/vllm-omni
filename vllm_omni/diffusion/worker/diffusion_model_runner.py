@@ -96,9 +96,9 @@ def _dit_any_rank_failed(local_failed: bool) -> bool:
     if not torch.distributed.is_initialized():
         return local_failed
     try:
-        from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+        from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
 
-        group = get_world_group().device_group
+        group = get_dit_group()
     except (AssertionError, ImportError):
         group = None
     if group is None:
