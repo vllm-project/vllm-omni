@@ -249,6 +249,19 @@ class Attention(nn.Module):
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
 
+        self._usp_executor = None
+        if (
+            config is not None
+            and not self._has_custom_attention
+            and not skip_sequence_parallel
+            and getattr(config.parallel_config, "enable_usp", False)
+            and getattr(config.parallel_config, "sequence_parallel_size", 1) > 1
+        ):
+            self._usp_executor = current_omni_platform.build_diffusion_usp_executor(
+                config.parallel_config,
+                get_sp_group(),
+            )
+
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
         self._kv_cache_dtype: str | None = None
@@ -414,6 +427,25 @@ class Attention(nn.Module):
                 raise NotImplementedError("paged Scheduler KV is not supported with AllGather-KV sequence parallelism")
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
+
+        # A platform USP executor owns the complete Ulysses + ring-group KV
+        # gather + FA hot path. Invoke it before Omni performs communication so
+        # one and only one implementation owns the collectives for this forward.
+        if self._usp_executor is not None and strategy is not self._no_parallel_strategy and not use_paged_attention:
+            usp_metadata = self._with_kv_cache_dtype(attn_metadata)
+            usp_output = self._usp_executor.try_forward(
+                query,
+                key,
+                value,
+                attn_metadata=usp_metadata,
+                backend_name=self.attn_backend.get_name(),
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+                scatter_dim=self.scatter_idx,
+                gather_dim=self.gather_idx,
+            )
+            if usp_output is not None:
+                return usp_output
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
