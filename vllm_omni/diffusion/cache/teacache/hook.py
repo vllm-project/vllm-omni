@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Hook-based TeaCache implementation for vLLM-Omni.
@@ -12,6 +12,7 @@ to support new models.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
 
 
@@ -37,7 +39,7 @@ class TeaCacheHook(ModelHook):
 
     Key features:
     - Zero changes to model code
-    - CFG-aware with separate states for positive/negative branches
+    - CFG-aware with separate state per branch (N-branch via ForwardContext)
     - CFG-parallel compatible: properly detects branch identity across ranks
     - Model-specific polynomial rescaling
     - Auto-detection of model types
@@ -62,7 +64,7 @@ class TeaCacheHook(ModelHook):
         self.config = config
         self.rescale_func = np.poly1d(config.coefficients)
         self.state_manager = StateManager(TeaCacheState)
-        self.extractor_fn = None
+        self.extractor_fn: Callable[..., Any] | None = None
         self._forward_cnt = 0
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
@@ -112,23 +114,29 @@ class TeaCacheHook(ModelHook):
         """
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
+        if self.extractor_fn is None:
+            raise RuntimeError("TeaCacheHook.initialize_hook must be called before forward")
         ctx = self.extractor_fn(module, *args, **kwargs)
 
         # ============================================================================
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
-        # Set context based on CFG branch for separate state tracking
-        # With CFG-parallel, each rank processes only one branch:
-        #   - cfg_rank 0: positive branch
-        #   - cfg_rank > 0: negative branch
-        # Without CFG-parallel, branches alternate within a single rank
-        if getattr(module, "do_true_cfg", False):
+        # Prefer an explicit CFG branch id from ForwardContext (set by
+        # sequential CFG mixin dispatch / denoise loops). This supports
+        # N-branch CFG without assuming module layout. Untagged models fall
+        # back to the legacy heuristic.
+        branch_id = None
+        if is_forward_context_available():
+            branch_id = get_forward_context().cfg_branch_id
+
+        if branch_id is not None:
+            cache_branch = f"branch_{branch_id}"
+        elif getattr(module, "do_true_cfg", False):
             cfg_parallel_size = get_classifier_free_guidance_world_size()
             if cfg_parallel_size > 1:
                 cfg_rank = get_classifier_free_guidance_rank()
-                cache_branch = "negative" if cfg_rank > 0 else "positive"
+                cache_branch = f"branch_rank_{cfg_rank}"
             else:
-                # No CFG-parallel: use forward counter to alternate branches
                 cache_branch = "negative" if self._forward_cnt % 2 == 1 else "positive"
         else:
             cache_branch = "positive"
