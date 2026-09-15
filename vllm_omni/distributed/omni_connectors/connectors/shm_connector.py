@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
 import os
@@ -142,7 +142,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
         return result
 
-    def cleanup(self, request_id: str) -> None:
+    def cleanup(self, request_id: str) -> int:
         """Best-effort cleanup of unconsumed SHM segments for *request_id*.
 
         Matches pending keys where *request_id* appears as the full key,
@@ -150,6 +150,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         If ``get()`` was never called, we unlink it here so /dev/shm
         doesn't leak.
         """
+        reclaimed = 0
         stale = [
             k
             for k in self._pending_keys
@@ -157,11 +158,13 @@ class SharedMemoryConnector(OmniConnectorBase):
         ]
         for key in stale:
             self._pending_keys.discard(key)
+            unlinked = False
             try:
                 seg = shm_pkg.SharedMemory(name=key)
                 seg.close()
                 seg.unlink()
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+                unlinked = True
             except FileNotFoundError:
                 pass
             except Exception as e:
@@ -172,6 +175,9 @@ class SharedMemoryConnector(OmniConnectorBase):
                     os.remove(lock_file)
                 except OSError:
                     pass
+            if unlinked:
+                reclaimed += 1
+        return reclaimed
 
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""

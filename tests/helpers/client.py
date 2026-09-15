@@ -97,6 +97,7 @@ def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[
 class OmniResponse:
     """Decoded multimodal / chat output from the OpenAI SDK or offline runner (not raw ``requests``)."""
 
+    request_id: str | None = None
     text_content: str | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
@@ -420,6 +421,8 @@ class OnlineOmniClient:
             text_content = ""
             audio_data = []
             for chunk in chat_completion:
+                if result.request_id is None:
+                    result.request_id = getattr(chunk, "id", None)
                 for choice in chunk.choices:
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     modality = getattr(chunk, "modality", None)
@@ -452,6 +455,7 @@ class OnlineOmniClient:
         """Wall clock from *before* ``chat.completions.create`` through response parse + local decode."""
         result = OmniResponse()
         try:
+            result.request_id = getattr(chat_completion, "id", None)
             audio_data = None
             text_content = None
             for choice in chat_completion.choices:

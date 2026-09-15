@@ -22,6 +22,7 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARS
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
 
@@ -102,6 +103,10 @@ def _make_talker_update(
     return update
 
 
+def _bind_omits_kv_transfer(sched) -> None:
+    bind_omits_transfer_helpers(sched)
+
+
 def _run_resumable_segment_stop(
     session: Request,
     *,
@@ -138,6 +143,7 @@ def _run_resumable_segment_stop(
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    _bind_omits_kv_transfer(sched)
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
@@ -275,6 +281,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    _bind_omits_kv_transfer(sched)
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
@@ -363,6 +370,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    _bind_omits_kv_transfer(sched)
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
