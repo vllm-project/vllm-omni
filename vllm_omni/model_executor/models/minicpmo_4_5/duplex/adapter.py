@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 from copy import deepcopy
 from typing import Any
 
@@ -262,18 +263,23 @@ class MiniCPMO45NativeDuplexServingAdapter:
             return None
 
     @staticmethod
-    def _load_native_tokenizer(model_config: Any) -> Any | None:
+    @functools.lru_cache(maxsize=4)
+    def _cached_load_native_tokenizer(model_path: str) -> Any:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+
+    @classmethod
+    def _load_native_tokenizer(cls, model_config: Any) -> Any | None:
         model_path = getattr(model_config, "model", None)
         if not isinstance(model_path, str) or not model_path:
             return None
         try:
-            from transformers import AutoTokenizer
-
-            return AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                local_files_only=True,
-            )
+            return cls._cached_load_native_tokenizer(model_path)
         except Exception:
             return None
 
