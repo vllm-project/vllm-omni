@@ -6,6 +6,10 @@ ratio restriction, comprehension blocking)."""
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
+    _get_ratio_other_slices,
+)
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Fake token IDs for testing (avoid importing the real model).
@@ -21,6 +25,35 @@ RATIO_END = 210
 RATIO_OTHER_START = 220
 RATIO_OTHER_END = 223
 TIMESTEP = 224
+
+
+class FakeTokenizer:
+    def __init__(self, token_ids: dict[str, int]):
+        self.token_ids = token_ids
+
+    def convert_tokens_to_ids(self, token: str) -> int | None:
+        return self.token_ids.get(token)
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "expected"),
+    [
+        ({}, []),
+        (
+            {
+                "<img_ratio_33>": 130103,
+                "<img_ratio_36>": 130106,
+            },
+            [(130103, 130107)],
+        ),
+    ],
+    ids=["base", "instruct"],
+)
+def test_get_ratio_other_slices(
+    token_ids: dict[str, int],
+    expected: list[tuple[int, int]],
+):
+    assert _get_ratio_other_slices(FakeTokenizer(token_ids)) == expected
 
 
 class FakeSamplerModel:
