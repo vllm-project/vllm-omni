@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 AsyncOmni - Refactored async orchestrator using AsyncOmniEngine.
 
@@ -27,8 +30,17 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.messages import (
+    DuplexFence,
+    DuplexSessionLifecycleMessage,
+)
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.duplex_request_client import (
+    DuplexRequestClient,
+    DuplexRequestOutputPort,
+)
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
@@ -39,16 +51,10 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
-    from vllm.inputs.preprocess import InputPreprocessor
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
+    from vllm.v1.engine.input_processor import InputProcessor
 
-    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
-    from vllm_omni.experimental.fullduplex.engine.messages import (
-        DuplexFence,
-        DuplexSessionLifecycleMessage,
-    )
-    from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
@@ -410,11 +416,6 @@ class AsyncOmni(EngineClient, OmniBase):
         )
 
     def _get_duplex_request_client(self) -> DuplexRequestClient:
-        from vllm_omni.experimental.fullduplex.request_client import (
-            DuplexRequestClient,
-            DuplexRequestOutputPort,
-        )
-
         client = getattr(self, "_duplex_request_client", None)
         if client is None:
             engine = getattr(self, "engine", None)
@@ -433,8 +434,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @staticmethod
     def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
-        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
-
         return DuplexRequestClient.request_info(result)
 
     async def _collect_duplex_data_plane_outputs(
@@ -454,14 +453,10 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @classmethod
     def _is_direct_duplex_data_plane_response(cls, output: object) -> bool:
-        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
-
         return DuplexRequestClient.is_direct_response(output)
 
     @classmethod
     def _duplex_multimodal_output(cls, output: object) -> dict[str, object]:
-        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
-
         return DuplexRequestClient.multimodal_output(output)
 
     # ==================== Generate Method ====================
@@ -1421,19 +1416,9 @@ class AsyncOmni(EngineClient, OmniBase):
         ``EngineCore.sleep(level>=1)`` already clears the P1 receiver cache.
         Clearing P0 avoids hash-only follow-up requests after that reset.
         """
-        processor = getattr(self, "input_processor", None)
-        if processor is None:
-            processor = getattr(self.engine, "input_processor", None)
-        cache = getattr(processor, "mm_processor_cache", None)
-        if cache is None:
-            logger.debug("[AsyncOmni] reset_mm_cache: no frontend mm_processor_cache")
-            return
-        for name in ("clear", "reset", "clear_cache"):
-            fn = getattr(cache, name, None)
-            if callable(fn):
-                fn()
-                return
-        logger.debug("[AsyncOmni] reset_mm_cache: cache has no clear/reset method")
+        renderer = self.renderer
+        if renderer is not None:
+            await renderer.clear_mm_cache_async()
 
     async def reset_encoder_cache(self) -> None:
         """Reset the encoder cache for all stages.
@@ -1729,7 +1714,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== EngineClient Interface ====================
 
-    async def get_input_preprocessor(self) -> InputPreprocessor:
+    async def get_input_preprocessor(self) -> InputProcessor:
         """Get input preprocessor."""
         return self.input_processor
 
@@ -1770,10 +1755,12 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         logger.debug("Weight update start requested (no-op in omni)")
 
-    async def finish_weight_update(self) -> None:
+    async def finish_weight_update(self, weight_version: str | None = None) -> None:
         """Finish the current weight update.
 
         Omni does not currently support weight transfer, so this is a no-op.
+        ``weight_version`` is accepted for upstream ``EngineClient`` protocol
+        compatibility (RLHF weight-transfer routers pass it positionally).
         """
         logger.debug("Weight update finish requested (no-op in omni)")
 

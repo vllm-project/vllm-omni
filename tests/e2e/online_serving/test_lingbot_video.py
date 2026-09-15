@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Online serving smoke coverage for the dense LingBot-Video checkpoint."""
 
@@ -20,7 +20,7 @@ PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 DEFAULT_SAMPLING_PARAMS = '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}'
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
 
 
 def _get_diffusion_feature_cases(model: str):
@@ -41,7 +41,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.slow
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
@@ -63,7 +63,7 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
     )
 
 
-@pytest.mark.slow
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_video_generation_modes_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:

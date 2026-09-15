@@ -538,3 +538,84 @@ def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(servi
     assert sampling_params_list[0].stop_token_ids == [], (
         "Without bot_task, AR stage stop_token_ids must be the default empty list"
     )
+
+
+def test_build_multistage_generation_inputs_omitted_bot_task_matches_prompt_default(serving_chat):
+    """Regression: an omitted bot_task must resolve identically for the AR
+    prompt and for its stop_token_ids.
+
+    ``build_prompt_tokens``/``build_prompt`` default an omitted bot_task
+    per-task via the ``_DEFAULT_BOT_TASK`` sentinel (``"think"`` for the base
+    ``it2i`` task, which isn't itself a key in ``_TASK_PRESETS``).
+    ``resolve_stop_token_ids`` must normalize from that same omitted-or-not
+    starting point. Passing the raw -- still ``None`` -- outer ``bot_task``
+    variable instead of mirroring ``build_kwargs``'s own omitted-or-not
+    ``"bot_task"`` entry made it normalize ``bot_task=None`` (plain mode), so
+    it fell through to the full ``<img_ratio_*>`` range instead of the
+    think/recaption terminator pair.
+
+    An explicit (non-"auto") size is required to observe this: with
+    ``need_ratio=True`` the ratio range is returned regardless of bot_task, so
+    the two paths only visibly disagree once a concrete size selects the
+    narrower stop set.
+    """
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeTokenizer:
+        SPECIAL = {
+            "<|startoftext|>": 1,
+            "<img>": 2,
+            "<recaption>": 4,
+        }
+
+        def convert_tokens_to_ids(self, tok: str) -> int:
+            return self.SPECIAL.get(tok, 0)
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            return list(range(100, 100 + len(text)))
+
+    def _build(extra_body):
+        engine = SimpleNamespace(
+            stage_configs=[
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ],
+            default_sampling_params_list=[
+                SamplingParams(temperature=0.0),
+                OmniDiffusionSamplingParams(),
+            ],
+        )
+        _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+            serving_chat,
+            engine=engine,
+            prompt="draw a cat",
+            extra_body=extra_body,
+            reference_images=[Image.new("RGB", (32, 32), color="red")],
+            gen_params=OmniDiffusionSamplingParams(height=768, width=1024),
+            tokenizer=FakeTokenizer(),
+        )
+        return sampling_params_list[0].stop_token_ids
+
+    # bot_task omitted entirely; use_system_prompt is what carries the request
+    # into the AR-prompt path.
+    omitted = _build({"use_system_prompt": "en_recaption"})
+    # Same request with the default spelled out explicitly.
+    explicit = _build({"bot_task": "think", "use_system_prompt": "en_recaption"})
+
+    expected = [
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+    ]
+    assert omitted == expected, (
+        f"omitted bot_task with an explicit size must resolve stop_token_ids for the "
+        f"default 'think' bot_task ({expected}); got {omitted}. A long list here is the "
+        f"full <img_ratio_*> range, meaning resolve_stop_token_ids normalized bot_task=None "
+        f"(plain mode) instead of agreeing with build_prompt_tokens's default."
+    )
+    assert omitted == explicit, (
+        "omitting bot_task must resolve the same stop_token_ids as passing the default "
+        f"explicitly; omitted={omitted} explicit={explicit}"
+    )

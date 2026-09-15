@@ -22,6 +22,13 @@ CATEGORIES = {
         "name": "Entry Points",
         "description": "Main entry points for vLLM-Omni inference and serving.",
     },
+    "clients": {
+        "name": "Clients",
+        "description": (
+            "Client libraries that talk to a running vLLM-Omni server "
+            "(the full-duplex Realtime client and its per-model session presets)."
+        ),
+    },
     "inputs": {
         "name": "Inputs",
         "description": "Input data structures for multi-modal inputs.",

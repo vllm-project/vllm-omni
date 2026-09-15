@@ -122,8 +122,10 @@ class TestStage1DiTLoRA:
             lambda root, name, sub: fake_replace_submodule(root, name, sub, replace_calls),
         )
 
-        # Build pipeline with bagel component
+        # Build pipeline with bagel component declared via _lora_components,
+        # matching how BagelPipeline opts in.
         pipeline = torch.nn.Module()
+        pipeline._lora_components = ["bagel"]
         pipeline.bagel = torch.nn.Module()
         lm = torch.nn.Module()
         lm.stacked_params_mapping = [
@@ -194,8 +196,11 @@ class TestBagelLoRARoundTrip:
 
         monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", DummyBaseLayerWithLoRA)
 
-        # Build pipeline with bagel.language_model.foo (simple non-packed layer)
+        # Build pipeline with bagel.language_model.foo (simple non-packed layer);
+        # the bagel component is declared via _lora_components, matching how
+        # BagelPipeline opts in.
         pipeline = torch.nn.Module()
+        pipeline._lora_components = ["bagel"]
         pipeline.bagel = torch.nn.Module()
         lm = torch.nn.Module()
         lm.foo = _FakeLinearBase()

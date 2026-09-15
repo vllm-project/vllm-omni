@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TensorRT engine for the CosyVoice3 flow-decoder (CFM) DiT estimator.
 
 The estimator is the per-step network the conditional flow-matching ODE solver
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import queue
+import uuid
 
 import torch
 from vllm.logger import init_logger
@@ -50,6 +51,26 @@ def _is_fp16_onnx(onnx_path: str) -> bool:
     and named ``*autocast_fp16*`` / ``*fp16*`` (vs ``*fp32*``)."""
     name = os.path.basename(onnx_path).lower()
     return "fp16" in name or "autocast" in name
+
+
+def _write_plan_atomically(engine_bytes, plan_path: str) -> None:
+    tmp = f"{plan_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    tmp_created = False
+    try:
+        with open(tmp, "xb") as f:
+            tmp_created = True
+            f.write(engine_bytes)
+        os.replace(tmp, plan_path)
+        tmp_created = False
+    except BaseException:
+        if tmp_created:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Failed to remove temporary TensorRT plan %s", tmp, exc_info=True)
+        raise
 
 
 def _convert_onnx_to_trt(onnx_path: str, plan_path: str, strongly_typed: bool) -> None:
@@ -96,10 +117,7 @@ def _convert_onnx_to_trt(onnx_path: str, plan_path: str, strongly_typed: bool) -
     engine_bytes = builder.build_serialized_network(network, config)
     if engine_bytes is None:
         raise RuntimeError(f"TensorRT failed to build flow-estimator engine from {onnx_path}")
-    tmp = plan_path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(engine_bytes)
-    os.replace(tmp, plan_path)
+    _write_plan_atomically(engine_bytes, plan_path)
     logger.info("Wrote flow-estimator TensorRT engine to %s", plan_path)
 
 

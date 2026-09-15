@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for diffusion attention backend selection."""
 
 from types import SimpleNamespace
@@ -100,9 +100,12 @@ def test_platform_default_used_without_resolved_spec(monkeypatch, attention_conf
 def test_backend_class_resolution_is_cached(monkeypatch):
     platform_calls = []
     load_calls = []
-    fake_platform = SimpleNamespace(
-        get_diffusion_attn_backend_cls=lambda **kwargs: (platform_calls.append(kwargs) or "fake.module.Backend")
-    )
+
+    def fake_get_cls(**kwargs):
+        platform_calls.append(kwargs)
+        return "fake.module.Backend"
+
+    fake_platform = SimpleNamespace(get_diffusion_attn_backend_cls=fake_get_cls)
 
     monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", fake_platform)
 
@@ -124,6 +127,39 @@ def test_backend_class_resolution_is_cached(monkeypatch):
         }
     ]
     assert load_calls == ["fake.module.Backend"]
+
+
+def test_capability_query_loads_explicit_cudnn_without_platform(monkeypatch):
+    platform_calls = []
+
+    def fake_get_cls(**kwargs):
+        platform_calls.append(kwargs)
+        return "fake.module.MustNotBeCalled"
+
+    fake_platform = SimpleNamespace(get_diffusion_attn_backend_cls=fake_get_cls)
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", fake_platform)
+
+    config = AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN"))
+    backend = selector.get_attn_backend_for_capability(role="self", attention_config=config)
+
+    assert backend.get_name() == "CUDNN_ATTN"
+    assert backend.supports_attention_mask()
+    assert platform_calls == []
+
+
+def test_capability_query_uses_unknown_head_size_for_platform_default(monkeypatch):
+    calls = []
+
+    def fake_get_backend(backend_name, head_size, allow_trtllm_default=True):
+        calls.append((backend_name, head_size, allow_trtllm_default))
+        return _PlatformBackend
+
+    monkeypatch.setattr(selector, "_cached_get_backend_cls", fake_get_backend)
+
+    backend = selector.get_attn_backend_for_capability(role="self", attention_config=AttentionConfig())
+
+    assert backend is _PlatformBackend
+    assert calls == [(None, selector.HEAD_SIZE_UNKNOWN, True)]
 
 
 def test_load_backend_cls_reports_missing_module():

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -80,7 +83,7 @@ def _ensure_remote_s2u_vendor_root(
             return str(existing_path)
 
     try:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except Exception as e:
         logger.warning("huggingface_hub unavailable; cannot fetch s2u_vendor from %s: %s", repo_id, e)
         return None
@@ -91,7 +94,7 @@ def _ensure_remote_s2u_vendor_root(
 
     for revision in revisions:
         try:
-            snapshot_dir = snapshot_download(
+            snapshot_dir = hf_api().snapshot_download(
                 repo_id=repo_id,
                 revision=revision,
                 allow_patterns=["s2u_vendor/**"],
@@ -99,7 +102,7 @@ def _ensure_remote_s2u_vendor_root(
             )
         except TypeError:
             try:
-                snapshot_dir = snapshot_download(
+                snapshot_dir = hf_api().snapshot_download(
                     repo_id=repo_id,
                     revision=revision,
                     allow_patterns=["s2u_vendor/**"],

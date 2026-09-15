@@ -1,10 +1,10 @@
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_TAG=v0.28.0
-FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
+ARG VLLM_ASCEND_VERSION=v0.29.0
+ARG VLLM_ASCEND_DEVICE_SUFFIX=
+FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
 WORKDIR ${APP_DIR}
-COPY . .
 
 RUN sed -i "s@^\(deb.*\)https\?://[a-z0-9.-]*\.ubuntu\.com@\1http://cache-service.nginx-pypi-cache.svc.cluster.local:8081@g" /etc/apt/sources.list
 
@@ -22,11 +22,9 @@ RUN apt-get update && \
     rm -rf /var/cache/apt/* && \
     rm -rf /var/lib/apt/lists/*
 
-RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
-    python3 -m pip install -U pip && \
+RUN python3 -m pip install -U pip && \
     python3 -m pip install -v \
+      "mindiesd==3.1.0" \
       "pytest>=7.0.0" \
       "pytest-asyncio>=0.21.0" \
       "pytest-cov>=4.0.0" \
@@ -48,7 +46,13 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "datasets>=3.0.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
-      --default-timeout=60 && \
+      --default-timeout=60
+
+COPY . .
+
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
     python3 -m pip install -v -e /vllm-workspace/vllm-omni/ --no-build-isolation \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \

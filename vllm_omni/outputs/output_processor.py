@@ -59,12 +59,27 @@ def _modality_to_type_string(modality: OutputModality) -> str:
     return "text"
 
 
+_TPOT_ELAPSED_MS = "_tpot_elapsed_ms"
+_TPOT_INTERVALS = "_tpot_intervals"
+
+
 def _mean_time_per_output_token_ms(stats: RequestStateStats) -> float:
     output_intervals = stats.num_generation_tokens - 1
     if output_intervals <= 0:
         return 0.0
     decode_time_s = max(stats.last_token_ts - stats.first_token_ts, 0.0)
     return decode_time_s * 1000.0 / float(output_intervals)
+
+
+def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, new_tokens: int) -> None:
+    """Weight one decode step by its token count. ITL stays one sample per step."""
+    if new_tokens <= 0:
+        return
+    total_elapsed_ms = float(record.get(_TPOT_ELAPSED_MS) or 0.0) + elapsed_ms
+    total_intervals = int(record.get(_TPOT_INTERVALS) or 0) + new_tokens
+    record[_TPOT_ELAPSED_MS] = total_elapsed_ms
+    record[_TPOT_INTERVALS] = total_intervals
+    record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
 
 
 class OmniRequestState(RequestState):
@@ -430,7 +445,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         )
 
     def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
-        return self._native_text_metrics_by_request.pop(request_id, {})
+        record = self._native_text_metrics_by_request.pop(request_id, {})
+        record.pop(_TPOT_ELAPSED_MS, None)
+        record.pop(_TPOT_INTERVALS, None)
+        return record
 
     def abort_requests(self, request_ids, internal: bool) -> list[str]:
         aborted_ids, _outputs = self.abort_requests_collecting_outputs(request_ids, internal=internal)
@@ -770,6 +788,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         was_prefilling = req_state.is_prefilling
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0
+        previous_num_generation_tokens = int(native_stats.num_generation_tokens) if native_stats is not None else 0
 
         # NOTE: We pass ``None`` for  *iteration_stats* to the parent so that
         # the upstream's ``_update_stats_from_output`` logs stats via its own
@@ -808,7 +827,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             itls_ms = record.setdefault("vllm_itls_ms", [])
             itls_ms.append(itl_ms)
             record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
-        record["vllm_tpot_ms"] = _mean_time_per_output_token_ms(native_stats)
+            _accumulate_segment_tpot(
+                record,
+                elapsed_ms=itl_ms,
+                new_tokens=max(int(native_stats.num_generation_tokens) - previous_num_generation_tokens, 0),
+            )
+        elif not record["vllm_itls_ms"]:
+            record["vllm_tpot_ms"] = _mean_time_per_output_token_ms(native_stats)
 
     def _update_stats_from_finished(
         self,
@@ -836,6 +861,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         finished_request = iteration_stats.finished_requests[-1]
         if finished_request.request_id != req_state.external_req_id:
             return
-        self._native_text_metric_record(req_state.external_req_id)["vllm_tpot_ms"] = (
-            float(finished_request.mean_time_per_output_token) * 1000.0
-        )
+        finished_tpot_ms = float(finished_request.mean_time_per_output_token) * 1000.0
+        record = self._native_text_metric_record(req_state.external_req_id)
+        if finished_tpot_ms > 0 and not record.get("vllm_itls_ms"):
+            record["vllm_tpot_ms"] = finished_tpot_ms

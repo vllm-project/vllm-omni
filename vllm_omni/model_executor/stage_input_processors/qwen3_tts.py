@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
 import time
@@ -24,6 +27,7 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     parse_chunk_ramp,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_full_utterance_decode_from_request,
     extract_language_from_prompt,
     extract_language_from_request,
     extract_speaker_from_prompt,
@@ -180,6 +184,15 @@ def talker2code2wav_async_chunk(
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
 
+    # Full-utterance Code2Wav is gated by ``full_utterance_decode`` (explicit
+    # opt-in via additional_information). Do not reuse ``non_streaming_mode``:
+    # that flag is prompt construction only and VoiceDesign defaults it to True
+    # even for streaming responses (#4198, #6898 review). When True, defer
+    # connector chunks until the talker finishes so Code2Wav decodes once.
+    full_utterance_decode = extract_full_utterance_decode_from_request(request)
+    if full_utterance_decode is True and not finished:
+        return None
+
     if length <= 0:
         if finished:
             return OmniPayloadStruct(
@@ -192,7 +205,10 @@ def talker2code2wav_async_chunk(
             )
         return None
 
-    if adaptive_enabled:
+    if full_utterance_decode is True:
+        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        context_length = length
+    elif adaptive_enabled:
         _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
         if _adaptive_states is None:
             _adaptive_states = {}

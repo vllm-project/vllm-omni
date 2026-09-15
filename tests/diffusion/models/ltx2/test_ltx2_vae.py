@@ -3,6 +3,8 @@
 
 """Unit tests for LTX video VAE tiling and distributed decode behavior."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,6 +12,45 @@ import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("initial_deterministic", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_ltx_vocoder_deterministic_context(monkeypatch, initial_deterministic, fail):
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _deterministic_ltx_vocoder
+
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", initial_deterministic)
+    if torch.backends.cudnn.is_available():
+        monkeypatch.setattr(torch.backends.cudnn, "benchmark_limit", 17)
+    settings = {
+        name: getattr(torch.backends.cudnn, name) for name in ("enabled", "benchmark", "benchmark_limit", "allow_tf32")
+    }
+    try:
+        with _deterministic_ltx_vocoder():
+            assert torch.backends.cudnn.deterministic
+            assert {name: getattr(torch.backends.cudnn, name) for name in settings} == settings
+            if fail:
+                raise RuntimeError("injected failure")
+    except RuntimeError as exc:
+        assert fail and str(exc) == "injected failure"
+    assert torch.backends.cudnn.deterministic == initial_deterministic
+    assert {name: getattr(torch.backends.cudnn, name) for name in settings} == settings
+
+
+@dataclass(frozen=True)
+class _OperatorSetProbe:
+    fna: Callable[..., torch.Tensor] | None
+
+
+@dataclass
+class _AttentionProbe:
+    kernel_size: tuple[int, int, int]
+    head_dim: int
+    to_out: tuple[torch.nn.Module, ...]
+    projected: torch.Tensor
+
+    def project_qkv(self, _hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.projected, self.projected, self.projected
 
 
 def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
@@ -38,9 +79,164 @@ def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
 
 
 class TestLTXDiffusionDecoder:
+    def test_diffusion_decoder_reuses_diffusers_with_scoped_overrides(self, monkeypatch):
+        from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
+            LTX2VideoDiffusionDecoderModel as DiffusersModel,
+        )
+
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
+            LTX2VideoDiffusionDecoderModel,
+            LTX2VideoVaeDiffusionNABlock,
+            LTX2VideoVaeNeighborhoodAttention,
+            LTX2VideoVaeSwiGLU,
+        )
+
+        original_init = DiffusersModel.__init__
+        original_parameters = {}
+
+        def capture_parameters(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            original_parameters.update(self.named_parameters())
+
+        with torch.device("meta"):
+            reference = DiffusersModel()
+            monkeypatch.setattr(DiffusersModel, "__init__", capture_parameters)
+            model = LTX2VideoDiffusionDecoderModel()
+        assert isinstance(model, DiffusersModel)
+        assert all(parameter is original_parameters[name] for name, parameter in model.named_parameters())
+        assert {name: tensor.shape for name, tensor in model.state_dict().items()} == {
+            name: tensor.shape for name, tensor in reference.state_dict().items()
+        }
+
+        modules = tuple(model.decoder.modules())
+        expected_blocks = sum(model.config.decoder_stage_depths)
+        assert sum(isinstance(module, LTX2VideoVaeNeighborhoodAttention) for module in modules) == expected_blocks
+        assert sum(isinstance(module, LTX2VideoVaeSwiGLU) for module in modules) == expected_blocks
+        assert (
+            sum(isinstance(module, LTX2VideoVaeDiffusionNABlock) for module in modules)
+            == model.config.decoder_stage_depths[-1]
+        )
+
+        assert type(model.decoder).__module__.startswith("vllm_omni.")
+        assert model.tiled_decode.__func__ is DiffusersModel.tiled_decode
+        assert type(reference.decoder) is type(model.decoder).__bases__[0]
+
+    def test_natten_processor_routes_stage5_through_tilelang_fna(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.vae import decoder as diffvae_modules
+
+        processor = object.__new__(diffvae_modules.LTX2VideoVaeNeighborhoodNattenProcessor)
+        processor.backend = None
+        fallback_calls = []
+        processor._na3d = lambda *args, **kwargs: fallback_calls.append((args, kwargs))
+
+        hidden_states = torch.randn(1, 11, 11, 11, 256, dtype=torch.bfloat16)
+        projected = hidden_states.view(1, 11, 11, 11, 4, 64)
+
+        class FakeAttention:
+            kernel_size = (11, 11, 11)
+            head_dim = 64
+            to_out = (torch.nn.Identity(),)
+
+            @staticmethod
+            def project_qkv(_hidden_states):
+                return projected, projected, projected
+
+        def token_permute(value, _tile, *, flip_tiled_dims):
+            assert flip_tiled_dims
+            return value, value.shape, None
+
+        def token_unpermute(value, *, token_layout_shape, tile_shape, flip_tiled_dims):
+            assert token_layout_shape == projected.shape
+            assert tile_shape == (4, 4, 4)
+            assert flip_tiled_dims
+            return value
+
+        fast_path_calls = []
+
+        def fast_path(query, key, value, *, shape, window):
+            fast_path_calls.append((query, key, value, shape, window))
+            return query
+
+        monkeypatch.setattr(diffvae_modules, "is_ltx2_fna_eligible", lambda _tensor: True)
+        monkeypatch.setattr(
+            diffvae_modules, "resolve_ltx2_vae_operators", lambda _device: _OperatorSetProbe(fna=fast_path)
+        )
+        monkeypatch.setattr(
+            diffvae_modules,
+            "_load_natten_token_permutation",
+            lambda: (token_permute, token_unpermute),
+        )
+
+        output = processor(FakeAttention(), hidden_states)
+
+        assert torch.equal(output, hidden_states)
+        assert len(fast_path_calls) == 1
+        assert fast_path_calls[0][3:] == ((11, 11, 11), (11, 11, 11))
+        assert not fallback_calls
+
+    @pytest.mark.parametrize("reason", ["device", "head_dim", "channels", "dtype", "tilelang_missing", "kernel"])
+    def test_natten_processor_keeps_natten_when_fast_path_does_not_apply(self, monkeypatch, reason):
+        from vllm_omni.diffusion.models.ltx2.vae import decoder as ops
+
+        processor = object.__new__(ops.LTX2VideoVaeNeighborhoodNattenProcessor)
+        processor.backend = None
+        channels = 128 if reason == "channels" else 256
+        head_dim = 32 if reason == "head_dim" else 64
+        x = torch.zeros(1, 11, 11, 11, channels, dtype=torch.float32 if reason == "dtype" else torch.bfloat16)
+        projected = x.view(1, 11, 11, 11, channels // head_dim, head_dim)
+        attn = _AttentionProbe(
+            kernel_size=(3, 5, 5) if reason == "kernel" else (11, 11, 11),
+            head_dim=head_dim,
+            to_out=(torch.nn.Identity(),),
+            projected=projected,
+        )
+        calls = []
+
+        def natten(q, k, v, **kwargs):
+            calls.append(kwargs)
+            return q
+
+        def unexpected_native_load(*_args, **_kwargs):
+            raise AssertionError("Native FNA must not be loaded for an unsupported configuration")
+
+        processor._na3d = natten
+        monkeypatch.setattr(ops, "is_ltx2_fna_eligible", lambda _tensor: reason != "device")
+        monkeypatch.setattr(
+            ops,
+            "resolve_ltx2_vae_operators",
+            lambda _device: _OperatorSetProbe(fna=None if reason == "tilelang_missing" else unexpected_native_load),
+        )
+        assert torch.equal(processor(attn, x), x)
+        assert calls == [{"kernel_size": attn.kernel_size, "scale": 1.0, "backend": None}]
+
+    def test_diffusion_decoder_noneligible_block_uses_diffusers_forward(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.vae import decoder as diffvae_modules
+
+        block = object.__new__(diffvae_modules.LTX2VideoVaeDiffusionNABlock)
+        torch.nn.Module.__init__(block)
+        expected = torch.randn(1, 1, 1, 1, 1)
+        calls = []
+
+        def upstream_forward(_self, hidden_states, latent_context, modulation, block_mask):
+            assert block_mask is None
+            calls.append((hidden_states, latent_context, modulation))
+            return expected
+
+        monkeypatch.setattr(
+            diffvae_modules.diffusers_decoder.LTX2VideoVaeDiffusionNABlock,
+            "forward",
+            upstream_forward,
+        )
+        hidden_states = torch.randn(1, 1, 1, 1, 1)
+        latent_context = torch.randn_like(hidden_states)
+        modulation = (torch.randn_like(hidden_states),)
+
+        assert block.forward(hidden_states, latent_context, modulation) is expected
+        assert calls == [(hidden_states, latent_context, modulation)]
+
     @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
     def test_distributed_diffusion_decoder_rejects_non_tile_parallel_modes(self, mode):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 
@@ -52,7 +248,7 @@ class TestLTXDiffusionDecoder:
             model.set_parallel_size(2, mode=mode)
 
     def test_distributed_diffusion_decoder_accepts_tile_parallel_mode(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 
@@ -68,7 +264,7 @@ class TestLTXDiffusionDecoder:
         assert calls == [(4, "tile")]
 
     def test_short_clip_keeps_stage5_temporal_context_then_crops_output(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
             LTX2VideoDiffusionDecoder3d,
             LTX2VideoDiffusionDecoderModel,
         )
@@ -143,7 +339,7 @@ class TestLTXDiffusionDecoder:
             _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_conv_vae": "true"}), "2.5")
 
     def test_native_diffusion_decoder_conversion_splits_qkv_and_folds_gates(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
             convert_ltx25_native_diffusion_decoder_state_dict,
         )
 
@@ -190,7 +386,7 @@ class TestLTXDiffusionDecoder:
         assert not any("type_emb" in key or "coarse" in key or "gate_msa" in key for key in converted)
 
     def test_native_diffusion_decoder_conversion_rejects_invalid_fused_qkv(self):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
             convert_ltx25_native_diffusion_decoder_state_dict,
         )
 
@@ -388,8 +584,8 @@ class TestLTXDiffusionDecoder:
         assert output.output[1].numel() == 0
 
     def test_diffusion_decoder_patch_parallel_size_one_uses_native_tiling(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import LTX2VideoDiffusionDecoderModel
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import LTX2VideoDiffusionDecoderModel
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 
@@ -424,7 +620,7 @@ class TestLTXDiffusionDecoder:
     def test_distributed_diffusion_tiles_preserve_serial_noise_order(self, monkeypatch):
         from diffusers.utils.torch_utils import randn_tensor
 
-        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
 

@@ -103,7 +103,7 @@ def test_prepare_audio_latents_samples_directly_in_packed_token_space():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_prepare_audio_latents_pads_generated_dummy_length_for_sp():
+def test_prepare_audio_latents_pads_short_audio_for_sp():
     pipeline = _make_pipeline(LTX2Pipeline, sequence_parallel_size=2)
 
     latents, original_num_frames, padded_num_frames = pipeline.prepare_audio_latents(

@@ -266,8 +266,6 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     inputs = MagicMock()
     inputs.mm_data_items = mm_data_items
     inputs.hf_processor_mm_kwargs = {"use_audio_in_video": True}
-    inputs.tokenization_kwargs = {}
-    inputs.prompt = [1, 2, 3]
     inputs.get_mm_hashes = MagicMock(return_value={"video": ["v0"], "audio": ["a0"]})
 
     timing_ctx = MagicMock()
@@ -307,7 +305,7 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     )
     fake_self._paired_cache_keys = Qwen2_5OmniThinkerMultiModalProcessor._paired_cache_keys
     fake_self.info.parse_mm_data = MagicMock(return_value=SimpleNamespace(name="missing"))
-    fake_self._apply_hf_processor_main = MagicMock(return_value=([9], {"video_grid_thw": object()}, False))
+    fake_self._apply_hf_processor_main = MagicMock(return_value={"video_grid_thw": object()})
     fake_self._get_mm_fields_config = MagicMock(return_value={})
     fake_self._get_mm_prompt_updates = MagicMock(return_value={"video": [[object()]], "audio": [[object()]]})
     fake_self._merge_mm_kwargs = capture_merge
@@ -316,13 +314,12 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
         "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.MultiModalKwargsItems.from_hf_inputs",
         return_value={"video": [object()], "audio": [object()]},
     ):
-        prompt_ids, mm_info, _ = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+        mm_info = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
             fake_self,
             inputs,
             timing_ctx,
         )
 
-    assert prompt_ids == [9]
     # Both modalities were reprocessed as one unit after pair-miss expansion.
     assert fake_self.info.parse_mm_data.call_args.args[0] == {
         "video": ["video-0"],
@@ -623,10 +620,17 @@ def test_derive_audio_from_video_placeholders_only_pairs_true_videos():
 
 
 def test_qwen3_processor_inherits_vllm_omni_per_video_helpers():
+    from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeThinkerMultiModalProcessor as UpstreamQwen3Processor,
+    )
+
     assert issubclass(
         Qwen3OmniMoeThinkerMultiModalProcessor,
         Qwen2_5OmniThinkerMultiModalProcessor,
     )
+    assert Qwen3OmniMoeThinkerMultiModalProcessor._get_hf_mm_data is UpstreamQwen3Processor._get_hf_mm_data
+    mro = Qwen3OmniMoeThinkerMultiModalProcessor.__mro__
+    assert mro.index(Qwen2_5OmniThinkerMultiModalProcessor) < mro.index(UpstreamQwen3Processor)
 
 
 def test_qwen3_prompt_updates_prefer_hf_second_per_grid_ts_from_outputs():

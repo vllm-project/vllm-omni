@@ -8,15 +8,35 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import pybase64 as base64
 
-from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, build_realtime_url, wait_for
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
+from vllm_omni.experimental.fullduplex.client import (
+    RealtimeDuplexClient,
+    RealtimeEventCollector,
+    build_realtime_url,
+    wait_for,
+)
+
+if TYPE_CHECKING:
+    from vllm_omni.clients.duplex import EventCollector
 
 from .omni_duplex_eval_clock import extract_timed_sentences
 from .omni_duplex_eval_media import iter_av_units, iter_jpegs, materialize_media, read_audio_pcm16, video_duration
+
+
+@dataclass(frozen=True)
+class GenerateSampleResult:
+    """Timed-sentence path plus duplex metrics for one generate sample."""
+
+    output: Path
+    request_metrics: list[dict[str, object]] = field(default_factory=list)
+    session_metrics: dict[str, object] = field(default_factory=dict)
 
 
 def _ref_audio(path: str | Path) -> str:
@@ -24,8 +44,22 @@ def _ref_audio(path: str | Path) -> str:
     return "data:audio/wav;base64," + base64.b64encode(value).decode("ascii")
 
 
+def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventCollector:
+    """Replay experimental collector events onto the public EventCollector."""
+    from vllm_omni.clients.duplex import EventCollector
+
+    collector = EventCollector()
+    for event, received_at_s in zip(source.events, source.event_received_at_s, strict=True):
+        collector.add(event, received_at_s=received_at_s)
+    return collector
+
+
+def _with_sample_identity(payload: dict[str, object], sample: DuplexSample) -> dict[str, object]:
+    return {"sample_id": sample.id, "split": sample.split, **payload}
+
+
 async def generate_sample(
-    sample: Any,
+    sample: DuplexSample,
     *,
     url: str,
     model: str,
@@ -37,11 +71,17 @@ async def generate_sample(
     clock: str = "media",
     overwrite: bool = False,
     unit_ms: int = 1000,
-) -> Path:
+) -> GenerateSampleResult:
+    """Generate one sample's timed sentences and collect duplex session metrics.
+
+    Timed sentences and ``*.meta.json`` stay the quality-eval artifacts. Duplex
+    request/session metrics are returned for the CLI to write
+    ``duplex_metrics.json``; they are not written into meta.
+    """
     output = Path(output_root) / sample.split / f"{sample.id}.json"
     meta_path = output.with_name(output.stem + ".meta.json")
     if output.exists() and not overwrite:
-        return output
+        return GenerateSampleResult(output=output)
     if mix != "question":
         raise NotImplementedError("v1 supports mix=question; soundtrack mixing is reserved for P1")
     media_dir = output.parent / ".media"
@@ -57,10 +97,12 @@ async def generate_sample(
     response_done = False
     drain_timeout = None
     close_timeout = None
+    stream_start: float | None = None
     async with client:
         await client.configure(model, ref_audio=_ref_audio(ref_audio), instructions="Streaming Omni Conversation.")
         ack_task = asyncio.create_task(_ack_playback(client))
         try:
+            stream_start = time.monotonic()
             await client.stream_av_units(iter_av_units(pcm, frames, unit_ms=unit_ms), realtime=realtime)
             await client.commit()
             try:
@@ -84,6 +126,7 @@ async def generate_sample(
         except TimeoutError as exc:
             close_timeout = str(exc)
         events = list(client.events.events)
+        collector = _event_collector_from_realtime(client.events)
     timed = [sentence.as_dict() for sentence in extract_timed_sentences(events, clock=clock)]
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(timed, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -102,7 +145,18 @@ async def generate_sample(
         "ref_audio_sha256": hashlib.sha256(Path(ref_audio).read_bytes()).hexdigest(),
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return output
+    from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
+
+    bundle = collect_duplex_session_metrics(
+        collector,
+        stream_start=stream_start if stream_start is not None else 0.0,
+        session_id=sample.id,
+    )
+    return GenerateSampleResult(
+        output=output,
+        request_metrics=[_with_sample_identity(metric, sample) for metric in bundle.request_metrics],
+        session_metrics=_with_sample_identity(bundle.session_metrics, sample),
+    )
 
 
 async def _ack_playback(client: RealtimeDuplexClient) -> None:

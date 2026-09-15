@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 An high-level API client adapter that forwards ComfyUI inputs to vLLM-Omni's REST API,
 and transforms the API responses back to ComfyUI formats.
@@ -271,8 +274,15 @@ class VLLMOmniClient:
         sampling_params: dict | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
+        spec_model: str | None = None,
         **extra_params,
     ) -> VideoInput:
+        """Post a video job and return the decoded result.
+
+        ``spec_model`` names the model whose payload spec builds the request, for
+        deployments that serve a known model under a different ``model`` alias. It
+        never reaches the wire; defaults to ``model``.
+        """
         if frame is not None and references is not None:
             raise ValueError("Provide only one of frame or references, not both.")
 
@@ -358,12 +368,14 @@ class VLLMOmniClient:
             model_params = dict(model_params)
             model_params.pop("type", None)
 
-        spec, _ = lookup_model_spec(model)
+        spec, _ = lookup_model_spec(spec_model or model)
         params_builder = spec.get("params_builder") if spec else None
         if params_builder is not None:
             form_fields = params_builder(
                 model_params or {},
                 extra_params={**extra_params, "task": video_task},
+                width=width,
+                height=height,
             )
             for k, v in form_fields.items():
                 form.add_field(k, v if isinstance(v, str) else str(v))

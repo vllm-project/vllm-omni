@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
 import time
 from typing import Any
 
+import numpy as np
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -27,6 +29,63 @@ class VoxCPM2Adapter(ARTTSAdapter):
     # stage key, so a VoxCPM2 talker deployed under a stage key another model
     # claims still resolves to VoxCPM2.
     detect_priority = 10
+
+    def __init__(self, ctx) -> None:
+        super().__init__(ctx)
+        self._tokenizer = None
+        self._split_map: dict[int, list[int]] = {}
+
+    def _encode(self, text: str) -> list[int]:
+        from transformers import AutoTokenizer
+
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            build_cjk_split_map,
+            split_multichar_chinese,
+        )
+
+        if self._tokenizer is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.ctx.engine_client.model_config.model, trust_remote_code=True
+            )
+            self._split_map = build_cjk_split_map(self._tokenizer)
+            logger.info("VoxCPM2 serving: built multichar split map (%d entries)", len(self._split_map))
+        ids = self._tokenizer.encode(text, add_special_tokens=True)
+        return split_multichar_chinese(ids, self._split_map)
+
+    async def _build_prompt(
+        self,
+        request: "OpenAICreateSpeechRequest",
+        uploaded_ref: tuple[np.ndarray, int] | None = None,
+    ) -> dict[str, Any]:
+        """Build the full-length VoxCPM2 prefill prompt.
+
+        ``uploaded_ref`` supplies an uploaded voice waveform when the request
+        has no explicit ``ref_audio`` so prefill-length accounting includes it.
+        """
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import build_voxcpm2_prompt
+
+        server = self.ctx.server
+        self._encode("")
+        ref_audio = None
+        ref_sr = None
+        voice_profile = None
+        if request.ref_audio is not None:
+            ref_audio, ref_sr, _ = await server._resolve_ref_audio(request.ref_audio)
+        elif uploaded_ref is not None:
+            wav_np, ref_sr = uploaded_ref
+            ref_audio = wav_np.tolist()
+        elif request.voice is not None:
+            voice_profile = self.capabilities.precomputed_speakers.get(request.voice.lower())
+        return build_voxcpm2_prompt(
+            hf_config=self.ctx.engine_client.model_config.hf_config,
+            tokenizer=self._tokenizer,
+            split_map=self._split_map,
+            text=request.input,
+            ref_audio=ref_audio,
+            ref_sr=ref_sr,
+            ref_text=request.ref_text,
+            voice_profile=voice_profile,
+        )
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate VoxCPM2 request parameters. Returns error message or None."""
@@ -66,7 +125,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
                     )
                 if request.ref_audio is None:
                     uploaded_ref = server._load_uploaded_audio(voice_lower)
-        prompt = await server._build_voxcpm2_prompt(request, uploaded_ref=uploaded_ref)
+        prompt = await self._build_prompt(request, uploaded_ref=uploaded_ref)
         tts_params = {}
         if request.voice:
             voice_lower = request.voice.lower()

@@ -15,12 +15,12 @@ from vllm_omni.experimental.fullduplex.client import (
     read_pcm16_wav,
     write_pcm16_wav,
 )
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-    MiniCPMO45DuplexPolicy,
-)
 from vllm_omni.experimental.fullduplex.video_stacking import (
     concat_frames,
     unit_subframe_offsets,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    MiniCPMO45DuplexPolicy,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_realtime_client_builds_explicit_native_duplex_url():
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&minicpmo45_native_duplex=0&session_id=stale",
+        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&native_duplex=0&session_id=stale",
         "openbmb/MiniCPM-o-4_5",
         session_id="session-a",
     )
@@ -38,7 +38,7 @@ def test_realtime_client_builds_explicit_native_duplex_url():
         "custom": ["1"],
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
-        "minicpmo45_native_duplex": ["1"],
+        "native_duplex": ["1"],
         "session_id": ["session-a"],
     }
 
@@ -65,7 +65,7 @@ def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
 
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
-    assert query["minicpmo45_native_duplex"] == ["1"]
+    assert query["native_duplex"] == ["1"]
 
 
 @pytest.mark.asyncio
@@ -232,7 +232,7 @@ async def test_realtime_client_configure_explicit_tts_opts_out_of_native_duplex(
     session_extra_body = client.sent[0]["session"]["extra_body"]
     assert session_extra_body == {
         "ref_audio": "data:audio/wav;base64,AAAA",
-        "minicpmo45_native_duplex": False,
+        "native_duplex": False,
     }
 
 
@@ -241,7 +241,7 @@ def test_realtime_event_collector_partitions_audio_by_response():
     collector.add({"type": "response.created", "response": {"id": "resp-a"}})
     collector.add(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(b"audio-a").decode("ascii"),
             "sample_rate_hz": 16_000,
@@ -252,7 +252,7 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.audio_bytes("resp-a") == b"audio-a"
     assert collector.output_sample_rate_hz == 16_000
     assert collector.first_received_at("response.created") is not None
-    assert collector.last_received_at("response.audio.delta") is not None
+    assert collector.last_received_at("response.output_audio.delta") is not None
 
 
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
@@ -273,7 +273,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
         collector.add(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": "resp-a",
                 "delta": base64.b64encode(b"audio").decode("ascii"),
                 "sample_rate_hz": 16_000,
@@ -286,7 +286,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         )
     collector.add(
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": "resp-a",
             "delta": "",
         },
@@ -294,7 +294,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     )
     collector.add(
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": "resp-a",
             "delta": "hello",
         },
@@ -369,7 +369,7 @@ def test_response_timing_ignores_unowned_session_level_metrics():
     )
     collector.add(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(b"audio").decode("ascii"),
             "metadata": {

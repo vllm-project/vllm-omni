@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import gc
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 import torch
@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from tests.helpers.mark import hardware_marks
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.benchmark,
 ]
@@ -30,7 +30,23 @@ HEIGHT = 192
 WIDTH = 320
 NUM_FRAMES = 9
 
-VARIANTS = {
+
+class _VariantConfig(TypedDict):
+    model: str
+    revision: str
+    model_env: str
+    max_abs: float
+    relative_l2: float
+    cosine: float
+    cfg_max_abs: float
+    cfg_relative_l2: float
+    cfg_cosine: float
+    step_max_abs: float
+    step_relative_l2: float
+    step_cosine: float
+
+
+VARIANTS: dict[str, _VariantConfig] = {
     "480p": {
         "model": "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
         "revision": "fed3bce411c58a0f688a31afe8f52e61acc2b15f",

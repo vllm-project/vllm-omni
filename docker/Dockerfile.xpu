@@ -1,4 +1,4 @@
-# Target vLLM version: v0.28.0. Keep VLLM_VERSION aligned with the target vLLM
+# Target vLLM version: v0.29.0. Keep VLLM_VERSION aligned with the target vLLM
 # release on every rebase.
 #
 # This file layers vLLM-Omni on top of the published upstream XPU image, which
@@ -18,7 +18,7 @@
 #
 # .buildkite/intel/scripts/run-xpu-test.sh automates that pull-then-build fallback.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai-xpu
-ARG VLLM_VERSION=v0.28.0
+ARG VLLM_VERSION=v0.29.0
 ARG VLLM_BASE=${VLLM_BASE_IMAGE}:${VLLM_VERSION}
 
 FROM ${VLLM_BASE} AS vllm-omni

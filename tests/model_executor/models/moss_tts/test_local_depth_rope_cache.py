@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU parity tests for MOSS-TTS Local Depth RoPE caching."""
 
 import pytest
@@ -42,3 +42,16 @@ def test_rope_cache_matches_reference_and_reuses_storage() -> None:
     # Smaller slices retain the fixed allocation used by CUDA Graph.
     attn.prepare_rope_cache(6, device, torch.float32)
     assert attn._rope_cos_cache.data_ptr() == cache_ptr
+
+
+def test_frame_local_kv_matches_full_prefix_and_reuses_slots() -> None:
+    model = MossTTSLocalDepthTransformer(_test_config()).eval()
+    model.h[0].attn.prepare_rope_cache(12, torch.device("cpu"), torch.float32)
+    cache = (torch.empty(2, 4, 12, 8), torch.empty(2, 4, 12, 8))
+    with torch.inference_mode():
+        for _ in range(2):
+            inputs = torch.randn(2, 12, 32)
+            for position in range(12):
+                expected = model._forward_prefix(inputs[:, : position + 1])[:, -1:]
+                actual = model._forward_prefix(inputs[:, position : position + 1], cache, position)
+                torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)

@@ -14,6 +14,9 @@ list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
+| AuK | `tencent/AuK`, `tencent/AuK-Flash` (assembled with `tools/prepare_auk_checkpoint.py`) | 2 (thinker encoder + DiT) | ✓ | — | instruction-driven editing, enhancement, separation; no example script (use `vllm_omni.model_extras.auk`) | 24 kHz |
+| Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
+| Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | — (serving WIP) | zero-shot | 22.05 kHz |
@@ -24,7 +27,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
-| dots.tts | `rednote-hilab/dots.tts-soar` | single (native AR) | — (not wired yet) | — | — | 48 kHz |
+| dots.tts | `dots-studio/dots.tts-soar` | single (native AR) | — (text-only) | ✓ (online) | no-reference synthesis | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
@@ -41,6 +44,57 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
 ```
 
 `--ref-audio` and `--ref-text` are optional (text-only synthesis works without them) and must be provided together for voice cloning. The exotic scripts — Qwen3-TTS, Voxtral TTS, CosyVoice3 — accept additional model-specific flags documented in their per-model section below. Qwen3-TTS in particular uses its own argparse surface (`--query-type`, `--audio-path`, etc.) and does not follow the common shape; see its section.
+
+---
+
+## Audio8 TTS Preview
+
+0.6B DualAR text-to-speech model (Audio8) with its own 44.1 kHz neural audio
+codec: a slow AR transformer predicts one semantic token per codec frame, and a
+4-layer fast AR predicts that frame's remaining 9 codebooks.
+
+### Prerequisites
+No extra packages: the codec architecture ships in tree and its weights
+(`codec.pth`) come with the checkpoint.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS, a compact multilingual text to speech model."
+```
+
+### Voice cloning
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text  "The exact transcript of the reference recording."
+```
+The reference transcript must match what is actually spoken in the clip;
+a mismatch degrades both stability and speaker similarity.
+
+### Streaming
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS." --streaming
+```
+
+### Notes
+- Output: 44.1 kHz mono WAV; the codec emits ~21.5 frames/s (2048 samples per frame).
+- Context is 2048 packed text+audio positions, so `max_model_len` is 2048.
+- Greedy decoding (`temperature: 0`) is degenerate for this checkpoint — it
+  ends the utterance almost immediately. Keep the deploy defaults
+  (`temperature 0.7`, `top_k 50`, `top_p 0.9`), which also match
+  `generation_config.json`.
+- Repetition-Aware Sampling is applied to the semantic token: a repeat inside
+  the last 10 frames is re-drawn from a flatter distribution instead of being
+  masked out.
+- `--num-prompts 4` smoke-tests concurrency (stage 0 runs `max_num_seqs: 4`).
+
+### Measured behaviour (1x H20, shared GPU)
+`--streaming` on a 58-character English sentence: TTFA ~0.74 s (4-frame first
+chunk), 7 chunks, 1.55 s wall for 3.16 s of audio (RTF ~0.49). Treat these as
+smoke-test magnitudes, not a benchmark.
 
 ---
 
@@ -130,11 +184,7 @@ Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24
 ## Fish Speech S2 Pro
 
 4B dual-AR text-to-speech model from FishAudio with the DAC codec at 44.1 kHz.
-
-### Prerequisites
-```bash
-pip install fish-speech
-```
+No extra packages are required; the DAC codec is vendored in vLLM-Omni.
 
 ### Quick start
 ```bash
@@ -490,20 +540,20 @@ Single-stage native AR TTS at 48 kHz (rednote-hilab). Pipeline: `Qwen2.5-1.5B ba
 ### Quick start
 ```bash
 python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
-    --model rednote-hilab/dots.tts-soar \
+    --model dots-studio/dots.tts-soar \
     --text "Hello, this is a test of dots TTS running on vLLM Omni."
 ```
 
 ### Voice cloning
-Not wired in this release — generation is zero-shot only. The CAM++ x-vector speaker encoder weights load, but `end2end.py` has no `--ref-audio`/`--ref-text` flags yet.
+Not wired in this release. Generation is text-only and does not consume reference audio, a named voice, or a precomputed speaker embedding. The CAM++ x-vector speaker encoder weights load, but `end2end.py` has no `--ref-audio`/`--ref-text` flags yet.
 
 ### Streaming
-The AudioVAE decoder has an internal streaming path (`init_stream_state` / `stream_step` / `stream_flush`) used to avoid boundary artifacts between 160 ms patches, but it is not yet exposed through an online serving endpoint or example.
+The AudioVAE decoder emits incremental audio through its internal streaming path (`init_stream_state` / `stream_step` / `stream_flush`). Online streaming is exposed through the OpenAI-compatible `/v1/audio/speech` endpoint with `stream=true`; see the [online serving guide](../../online_serving/text_to_speech/README.md#dotstts). The offline `end2end.py` script returns the consolidated waveform.
 
 ### Notes
 - Output: 48 kHz mono WAV.
 - Deploy config: `vllm_omni/deploy/dots_tts.yaml` (auto-loaded by HF `model_type`).
-- Checkpoints: `rednote-hilab/dots.tts-soar` is the validated default. `dots.tts-base` shares the same architecture but is unvalidated in this repo. `dots.tts-mf` (MeanFlow, 2-4 step) is not supported yet.
+- Checkpoints: `dots-studio/dots.tts-soar` is the validated default. `dots.tts-base` shares the same architecture but is unvalidated in this repo. `dots.tts-mf` (MeanFlow, 2-4 step) is not supported yet.
 - Known limitation: no CUDA graph capture and no batched side-path computation yet, so concurrent requests do not currently scale (each request's DiT Euler steps run serially). See `recipes/rednote-hilab/dots.tts.md` for details and the roadmap.
 
 ---
@@ -613,6 +663,37 @@ python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
 Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 
 ### Notes
+
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+---
+
+## Breeze-TTS-2
+
+Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder → bundled Qwen3-TTS codec) at 24 kHz mono. The prompt builder picks one of four templates automatically: plain, voice design (`--instruction`), clone (`--ref-audio` + `--ref-text`), or voice direction (reference + `--instruction`).
+
+### Quick start
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --model BreezeBlue/Breeze-TTS-2 \
+    --text "Hello, this is Breeze TTS 2 running on vLLM Omni."
+```
+
+### Voice direction
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --text "We need to discuss what happened last night." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "The exact transcript of the reference audio." \
+    --instruction "Speak slowly with a restrained, serious tone."
+```
+
+### Notes
+
+- Output: 24 kHz mono WAV; `--max-new-tokens` caps generated frames (80 ms each).
+- Speaker tags `--voice S0`..`S9` (default `S0`) select the timbre in non-reference modes; with `--ref-audio` the timbre comes from the reference clip.
+- Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.

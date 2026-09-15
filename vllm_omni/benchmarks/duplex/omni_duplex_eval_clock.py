@@ -49,7 +49,11 @@ def extract_timed_sentences(events: Iterable[dict[str, Any]], *, clock: str = "m
     last: float | None = None
     for event in events:
         event_type = event.get("type")
-        if event_type not in {"response.output_text.delta", "response.audio_transcript.delta", "response.text.delta"}:
+        if event_type not in {
+            "response.output_text.delta",
+            "response.output_audio_transcript.delta",
+            "response.text.delta",
+        }:
             continue
         delta = event.get("delta")
         if not isinstance(delta, str) or not delta.strip():

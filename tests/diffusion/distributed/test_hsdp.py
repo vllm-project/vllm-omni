@@ -12,6 +12,7 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 
 from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.distributed import hsdp as hsdp_module
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
     _unshardable_parameters,
@@ -71,6 +72,52 @@ def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
     assert model.block.input_global_scale is input_global_scale
     assert not isinstance(model.block.packed_weight, DTensor)
     assert not isinstance(model.block.input_global_scale, DTensor)
+
+
+def test_hsdp_resolves_nested_ignored_module_and_preserves_mixed_dtypes(
+    cpu_process_group,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Group:
+        world_size = 1
+        rank_in_group = 0
+        device_group = dist.group.WORLD
+
+    class MixedDtypeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.Module()
+            self.layers.sharded = nn.Linear(2, 2, dtype=torch.bfloat16)
+            self.layers.ignored = nn.Linear(2, 2, dtype=torch.float32)
+            self._hsdp_shard_conditions = [lambda name, _module: name == "layers.sharded"]
+            self._hsdp_ignored_modules = ["layers.ignored"]
+            self._hsdp_preserve_parameter_dtypes = True
+
+    group = Group()
+    monkeypatch.setattr(hsdp_module, "get_world_group", lambda: group)
+    monkeypatch.setattr(
+        hsdp_module,
+        "_create_hsdp_mesh",
+        lambda **_kwargs: DeviceMesh("cpu", [0]),
+    )
+
+    model = MixedDtypeModel()
+    ignored_weight = model.layers.ignored.weight
+    hsdp_module.apply_hsdp_to_model(
+        model,
+        HSDPInferenceConfig(
+            enabled=True,
+            hsdp_shard_size=1,
+            param_dtype=torch.float16,
+        ),
+        target_device=torch.device("cpu"),
+    )
+
+    assert model.layers.ignored.weight is ignored_weight
+    assert not isinstance(model.layers.ignored.weight, DTensor)
+    assert model.layers.ignored.weight.dtype == torch.float32
+    assert isinstance(model.layers.sharded.weight, DTensor)
+    assert model.layers.sharded.weight.dtype == torch.bfloat16
 
 
 class TestHSDPInferenceConfig:

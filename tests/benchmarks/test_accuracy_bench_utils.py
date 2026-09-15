@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E402, I001
 import argparse
 import math
 import os
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -106,11 +108,9 @@ def test_resolve_seed_tts_root_downloads_only_requested_locale(monkeypatch, tmp_
         captured["allow_patterns"] = allow_patterns
         return str(downloaded_root)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "huggingface_hub",
-        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
-    )
+    from vllm_omni.transformers_utils import repo_utils
+
+    monkeypatch.setattr(repo_utils.hf_api(), "snapshot_download", fake_snapshot_download)
 
     resolved = resolve_seed_tts_root(
         "zhaochenyang20/seed-tts-eval",

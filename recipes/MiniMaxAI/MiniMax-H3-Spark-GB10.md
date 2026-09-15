@@ -7,13 +7,14 @@ recipes it uses **no offload of any kind** — see the capacity note below.
 Validated on:
 
 - Host: DGX Spark (GB10), aarch64
-- GPUs: 1 (unified memory)
-- Driver: <FILL_DRIVER_VERSION>
+- GPUs: 1, or 2 hosts with one unified-memory GPU each
+- Driver: 580.173.02 for the two-host qualification
 - vLLM: 0.26.0
 - vLLM-Omni: `main` at `e1aa6eae75c460cd1893bc320546e81e66973831`
-- Workloads: T2VA and Ref2VA, 960x576, `duration=8.0`, 50 steps, `flow_shift=12`,
-  `seed=1101`
-
+- One-host workloads: T2VA and Ref2VA, 960x576, `duration=8.0`, 50 steps
+- Two-host workload: T2VA, 1344x768, `duration=5.0` and `duration=10.0`,
+  50 steps, text-encoder TP2, and DiT USP2
+- Common sampling settings: `flow_shift=12`, `seed=1101`
 
 ## Capacity requirements
 
@@ -24,6 +25,7 @@ Validated on:
 | Checkpoint storage | 135 GiB per partition |
 | Measured peak allocator high-water, T2VA (FP8) | 97.7 GiB |
 | Measured peak allocator high-water, Ref2VA (FP8) | 102.8 GiB |
+| Measured peak per rank, two-host T2VA 5 s / 10 s (FP8) | 75.45 / 87.17 GiB |
 
 `FL2VA` and `Ref2VA` are separate 135 GiB checkpoint partitions. Start one server
 at a time.
@@ -164,6 +166,41 @@ curl --fail-with-body -sS -X POST http://127.0.0.1:8000/v1/videos/sync \
 The response is `200 OK` with an MP4 body: H.264 at the requested geometry plus a
 32 kHz stereo AAC track. `ffprobe` reports 8.032 s for `duration=8.0`.
 
+## Two GB10 hosts: T2VA at 1344x768
+
+The two-host qualification uses one GB10 GPU per DGX Spark, connected through a
+single ConnectX-7 RoCE interface. The FL2VA checkpoint and software revision are
+identical on both hosts. The distributed configuration is:
+
+- world size 2;
+- text-encoder tensor parallel size 2;
+- DiT Ulysses sequence parallel size 2 and ring degree 1;
+- VAE patch parallel size 1;
+- online FP8, eager execution, cuDNN attention, and tiled VAE decode.
+
+The current diffusion multiprocess executor starts all ranks on one host and sets
+`MASTER_ADDR=localhost`. These measurements therefore used an external `env://`
+launcher with one rank on each host and a benchmark-only adaptation that maps
+both hosts' local worker to `cuda:0`. This qualifies the two-rank MiniMax-H3
+pipeline and its output, but it is not yet a supported cross-host `vllm serve`
+command. Do not infer that the single-host launch command above works unchanged
+across two machines.
+
+One 5-second, 2-step request warmed both workers before the measured runs. The
+reported pipeline elapsed time covers distributed model execution through GPU
+completion; MP4 encoding happened afterward and is not included.
+
+| Duration | Steps | Text encode | Denoise | Per step | VAE decode | Pipeline elapsed | Max peak per rank |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5 s | 50 | 0.21 s | 1570.19 s | 31.40 s | 79.45 s | 1649.87 s (27 min 30 s) | 75.45 GiB |
+| 10 s | 50 | 0.15 s | 4448.12 s | 88.96 s | 160.71 s | 4609.00 s (76 min 49 s) | 87.17 GiB |
+
+Both ranks reported stage times and allocator peaks within measurement noise.
+The generated outputs were H.264 at 1344x768 and 24 FPS with 32 kHz stereo AAC:
+124 frames (5.167 s) and 243 frames (10.125 s). Both files decoded successfully,
+and neither run encountered an OOM or NCCL error. These are single qualification
+runs (`n=1`), not throughput guarantees.
+
 ## Measured latency
 
 Single GB10, FP8, eager, cuDNN attention, tiled VAE, one request at a time:
@@ -238,9 +275,11 @@ shorter than a 50-step Ref2VA run.
 
 ## Known limitations
 
-- One GPU means no Ulysses, ring, TP, or VAE patch parallelism. Pass
+- With one GPU there is no Ulysses, ring, TP, or VAE patch parallelism. Pass
   `--usp 1 --ring 1 --vae-patch-parallel-size 1` explicitly if a profile or
   script would otherwise supply higher degrees.
+- The two-host results require the external launch adaptation described above;
+  cross-host diffusion worker launch is not exposed by the documented server CLI.
 - `--enforce-eager` is used because regional compile adds startup time without a
   parallelism win on a single rank.
 - `t2va` rejects requests without an explicit `aspect_ratio`. When `width` and
@@ -255,8 +294,7 @@ shorter than a 50-step Ref2VA run.
   adding references or raising the output shape.
 - Ref2VA requires a vLLM-Omni build newer than `v0.26.0`. See the version note
   under **Validated on**: FP8 weight loading and image-only Ref2VA are both
-  broken on `release/v0.26.0`.suggestion is  `v0.26.1`.
+  broken on `release/v0.26.0`. The suggested version is `v0.26.1`.
 - Online FP8 is incompatible with layerwise offload — the offload path produces a
   weight stride the Cutlass FP8 kernel rejects. This is not a practical
   restriction here since offload is unusable on GB10 anyway.
-```
