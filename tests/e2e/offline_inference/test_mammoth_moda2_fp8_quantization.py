@@ -151,12 +151,24 @@ def test_bf16_vs_fp8_generation_consistency():
     assert bf16_ids, "BF16 baseline produced no tokens"
     assert fp8_ids, "FP8 run produced no tokens"
 
-    common = min(len(bf16_ids), len(fp8_ids))
-    token_agree = sum(a == b for a, b in zip(bf16_ids[:common], fp8_ids[:common])) / common
+    assert len(bf16_ids) == len(fp8_ids), (
+        f"BF16/FP8 generated different sequence lengths: bf16={len(bf16_ids)} "
+        f"fp8={len(fp8_ids)} (bf16={bf16_ids} fp8={fp8_ids})"
+    )
+    token_agree = sum(a == b for a, b in zip(bf16_ids, fp8_ids)) / len(bf16_ids)
+
+    # The logprob gate must actually run: assert both sides reported a top-1
+    # logprob for every generated token instead of silently skipping on NaN.
+    assert len(bf16_lp) == len(bf16_ids), (
+        f"BF16 top-1 logprobs missing: got {len(bf16_lp)} for {len(bf16_ids)} tokens"
+    )
+    assert len(fp8_lp) == len(fp8_ids), (
+        f"FP8 top-1 logprobs missing: got {len(fp8_lp)} for {len(fp8_ids)} tokens"
+    )
 
     lp_common = min(len(bf16_lp), len(fp8_lp))
-    logprob_cos = _cosine_sim(bf16_lp[:lp_common], fp8_lp[:lp_common]) if lp_common > 0 else float("nan")
-    logprob_mae = _mean_abs_diff(bf16_lp[:lp_common], fp8_lp[:lp_common]) if lp_common > 0 else float("nan")
+        logprob_cos = _cosine_sim(bf16_lp[:lp_common], fp8_lp[:lp_common])
+    logprob_mae = _mean_abs_diff(bf16_lp[:lp_common], fp8_lp[:lp_common])
 
     print(f"[FP8 A/B] token_agreement={token_agree:.4f} logprob_cosine={logprob_cos:.4f} logprob_mae={logprob_mae:.4f}")
 
