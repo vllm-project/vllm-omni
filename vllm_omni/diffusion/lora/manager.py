@@ -394,17 +394,20 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Default denoising components, declared DiT components, and any a
-        # pipeline opts into via ``_lora_components``.
+        # Components scanned for LoRA-capable layers: framework defaults,
+        # declared DiT components, and any a pipeline opts into via
+        # ``_lora_components``. The defaults only cover the generic diffusers
+        # naming convention: ``transformer`` (plus ``transformer_2`` for
+        # dual-DiT pipelines such as Wan2.2) and ``unet`` for SDXL-style
+        # pipelines. Model-specific attribute names must be declared by the
+        # pipeline itself via ``_dit_modules`` or ``_lora_components``.
         #
-        # NOTE: SDXL-style pipelines expose the denoiser as ``unet``.
-        # Without scanning this component, adapters can load/activate while
-        # effectively applying to zero layers, producing base-identical output.
+        # NOTE: if the denoiser component is not scanned here, adapters can
+        # load/activate while effectively applying to zero layers, producing
+        # base-identical output.
         default_components = (
             "transformer",
             "transformer_2",
-            "dit",
-            "bagel",
             "unet",
         )
         declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
@@ -556,9 +559,9 @@ class DiffusionLoRAManager:
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
-        lora_names_by_id = (
-            {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
-        )
+        # Track bindings unconditionally. The zero-binding guard below needs this
+        # bookkeeping on every pipeline, not only the ones that supply a validator.
+        lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
 
         def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
@@ -675,6 +678,13 @@ class DiffusionLoRAManager:
                 lora_weights.lora_a.shape,
                 lora_weights.lora_b.shape,
                 scale,
+            )
+
+        if not bound_lora_names:
+            raise ValueError(
+                f"LoRA adapter {lora_model.id} applies to no layer: expected target modules in "
+                f"{sorted(self._expected_lora_modules)} but received {sorted(lora_model.loras)}. "
+                "Activating it would leave the base model unchanged."
             )
 
         if callable(binding_validator):

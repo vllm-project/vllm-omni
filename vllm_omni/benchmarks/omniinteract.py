@@ -233,7 +233,7 @@ class _Playback:
                 if response_id:
                     self.completed.add(response_id)
                 continue
-            if event.get("type") != "response.audio.delta":
+            if event.get("type") != "response.output_audio.delta":
                 continue
             encoded = event.get("delta") or event.get("audio")
             if not response_id:
@@ -241,13 +241,13 @@ class _Playback:
             if not isinstance(encoded, str):
                 raise ValueError("response audio payload is missing")
             if event.get("format") is None:
-                self._warn_once("response.audio.delta omitted format; assumed pcm16")
+                self._warn_once("response.output_audio.delta omitted format; assumed pcm16")
             elif event.get("format") != "pcm16":
                 raise ValueError("OmniInteract output must be pcm16")
             rate = event.get("sample_rate_hz")
             if rate is None:
                 rate = events.output_sample_rate_hz or OUTPUT_SAMPLE_RATE
-                self._warn_once(f"response.audio.delta omitted sample_rate_hz; assumed {rate}")
+                self._warn_once(f"response.output_audio.delta omitted sample_rate_hz; assumed {rate}")
             if rate != OUTPUT_SAMPLE_RATE:
                 raise ValueError(f"OmniInteract output must use {OUTPUT_SAMPLE_RATE} Hz audio")
             try:
@@ -683,7 +683,7 @@ def _collect_output(
         timing = response_times.setdefault(response_id, [start_s, end_s])
         timing[0], timing[1] = min(timing[0], start_s), max(timing[1], end_s)
 
-    text_event_types = {"response.audio_transcript.delta", "response.output_text.delta", "response.text.delta"}
+    text_event_types = {"response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta"}
     text_ids = {collector.response_id(event) for event in collector.events if event.get("type") in text_event_types}
     if None in text_ids or not text_ids <= created:
         raise ValueError("response transcript has no matching response.created")
@@ -726,7 +726,7 @@ def _collect_output(
                 **{key: value for key, value in event.items() if key not in {"delta", "audio"}},
                 "audio_bytes": audio_sizes[index],
             }
-            if event.get("type") == "response.audio.delta"
+            if event.get("type") == "response.output_audio.delta"
             else dict(event)
             for index, event in enumerate(collector.events)
         ]
@@ -946,13 +946,9 @@ class _RealtimeSession:
 
 def _audio_rtf_from_raw_metric(raw_metric: dict[str, object]) -> float | None:
     """Derive the audio RTF from a client-reported raw request metric."""
-    from vllm_omni.metrics.definitions import compute_audio_rtf
+    from vllm_omni.benchmarks.duplex_session_metrics import audio_rtf_from_raw_metric
 
-    generation_ms = raw_metric.get("audio_generation_ms")
-    duration_ms = raw_metric.get("audio_duration_ms")
-    if not isinstance(generation_ms, int | float) or not isinstance(duration_ms, int | float) or duration_ms <= 0:
-        return None
-    return round(compute_audio_rtf(float(generation_ms) / 1000.0, float(duration_ms) / 1000.0), 6)
+    return audio_rtf_from_raw_metric(raw_metric)
 
 
 def _populate_response_metrics(
@@ -961,45 +957,16 @@ def _populate_response_metrics(
     *,
     stream_start: float,
 ) -> None:
-    measurement_origin = {
-        "ttft": "response.created client receive to first non-empty text delta",
-        "ttfp": "response.created client receive to first audio packet",
-        "rtf": "response.created client receive to last audio packet divided by emitted audio duration",
-    }
-    request_metrics: list[dict[str, object]] = []
-    output_tokens = 0
-    for request_index, response_id in enumerate(collector.response_ids):
-        timing = collector.timing_summary(
-            after_s=stream_start,
-            input_committed_at_s=None,
-            response_id=response_id,
-            measurement_origin=measurement_origin,
-        )
-        raw_metric = timing.get("request_metrics")
-        stage0 = timing.get("stage0_tokens")
-        metric = {
-            "session_id": result.session_id,
-            "request_index": request_index,
-            "response_id": response_id,
-            **(raw_metric if isinstance(raw_metric, dict) else {}),
-        }
-        if isinstance(raw_metric, dict):
-            # The client reports raw data only; the RTF is derived here with
-            # the canonical server-side metric definition.
-            metric["rtf"] = _audio_rtf_from_raw_metric(raw_metric)
-        if isinstance(stage0, dict):
-            metric["stage0_tokens"] = dict(stage0)
-            output_tokens += int(stage0.get("output_token_count") or 0)
-        if isinstance(raw_metric, dict) or isinstance(stage0, dict):
-            request_metrics.append(metric)
-    result.output_tokens = output_tokens
-    result.duplex_request_metrics = request_metrics
-    from vllm_omni.clients.duplex import summarize_session_request_metrics
+    from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
 
-    result.duplex_session_metrics = summarize_session_request_metrics(
-        request_metrics,
+    bundle = collect_duplex_session_metrics(
+        collector,
+        stream_start=stream_start,
         session_id=result.session_id,
     )
+    result.output_tokens = bundle.output_tokens
+    result.duplex_request_metrics = bundle.request_metrics
+    result.duplex_session_metrics = bundle.session_metrics
 
 
 async def run_omniinteract_case(

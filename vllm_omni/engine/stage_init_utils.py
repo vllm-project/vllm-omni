@@ -50,11 +50,14 @@ from vllm_omni.config.omni_config import (
 )
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    TRANSFER_ENGINE_CONNECTOR_NAMES,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
-from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+from vllm_omni.inputs.preprocess import build_omni_renderer, omni_renderer_cls
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
@@ -1549,25 +1552,24 @@ class _TokenOnlyRenderer(BaseRenderer):
 
 
 def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
-    return _TokenOnlyRenderer(stage_vllm_config, tokenizer=None)
+    return omni_renderer_cls(_TokenOnlyRenderer)(stage_vllm_config, tokenizer=None)
 
 
 def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
-    """Build the shared stage-0 input processor."""
+    """Build the shared stage-0 input processor.
+
+    The renderer is the Omni subclass of the upstream renderer class that
+    ``renderer_from_config`` would have picked (or of the token-only renderer
+    when the stage skips tokenizer initialization), so upstream's
+    ``InputProcessor`` runs unmodified on top of it.
+    """
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
     if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
-        input_processor = InputProcessor(
-            vllm_config=stage_vllm_config,
-            renderer=_build_token_only_renderer(stage_vllm_config),
-        )
+        renderer = _build_token_only_renderer(stage_vllm_config)
     else:
-        input_processor = InputProcessor(vllm_config=stage_vllm_config)
-    input_processor.input_preprocessor = OmniInputPreprocessor(
-        vllm_config=stage_vllm_config,
-        renderer=input_processor.renderer,
-    )
-    return input_processor
+        renderer = build_omni_renderer(stage_vllm_config)
+    return InputProcessor(vllm_config=stage_vllm_config, renderer=renderer)
 
 
 def device_init_lock_path(device_id: int, lock_dir: str = "/tmp") -> str:
@@ -1883,17 +1885,37 @@ def get_stage_connector_spec(
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
+        connector_spec = dict(cfg.get("spec", {}))
+        if connector_spec.get("name") == "NixlConnector":
+            # A middle worker uses one connector for both directions. Preserve
+            # the incoming edge and carry the outgoing bind config separately.
+            for (source, target), outgoing in getattr(omni_transfer_config, "connectors", {}).items():
+                if source == str(stage_id):
+                    if outgoing.name != "NixlConnector":
+                        raise ValueError("A NIXL middle stage requires NIXL on its outgoing edge")
+                    extra = dict(connector_spec.get("extra", {}))
+                    extra["outgoing"] = {**(outgoing.extra or {}), "from_stage": int(source), "to_stage": int(target)}
+                    connector_spec["extra"] = extra
+                    break
+        if connector_spec.get("name") not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            extra = dict(connector_spec.get("extra", {}))
+            extra.pop("from_stage", None)
+            extra.pop("to_stage", None)
+            connector_spec["extra"] = extra
+        return connector_spec
 
     # A producer does not consume connector data itself. Keep its connector
     # for both async-chunk and terminal full-payload sends, but mark it
     # sender-only so the scheduler does not park orchestrator-provided inputs
     # waiting for an upstream payload.
     target_stage = str(stage_id)
-    for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
+    for (from_stage, to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
         if from_stage == target_stage:
             extra = dict(spec.extra or {})
             extra.setdefault("role", "sender")
+            if spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+                extra["from_stage"] = int(from_stage)
+                extra["to_stage"] = int(to_stage)
             return {"name": spec.name, "extra": extra}
     return {}
 

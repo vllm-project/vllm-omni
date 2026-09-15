@@ -275,12 +275,18 @@ class DuplexSessionAttachmentRegistry:
         payload: Mapping[str, object],
         *,
         journal: bool = True,
+        on_accepted: Callable[[], None] | None = None,
     ) -> JournalEntry | None:
         """Sequence and dispatch one event to the current attachment.
 
         The per-session lock keeps wire order equal to journal order without
         serializing unrelated sessions. A detached session still records
         replayable events, but has no transport side effect.
+
+        ``on_accepted`` runs synchronously once the event is journaled, or
+        after a successful transport send when journaling is disabled. A later
+        send failure cannot undo acceptance into the journal. Detached,
+        non-journaled events do not invoke it. The callback must not raise.
         """
         async with self._lock:
             state = self._require(session_id)
@@ -291,8 +297,12 @@ class DuplexSessionAttachmentRegistry:
                 entry = state.journal.record(payload) if journal else None
                 attachment = state.attachment
                 wire_payload = dict(entry.payload) if entry is not None else dict(payload)
+            if entry is not None and on_accepted is not None:
+                on_accepted()
             if attachment is not None:
                 await attachment.send(wire_payload)
+                if entry is None and on_accepted is not None:
+                    on_accepted()
             return entry
 
     async def acknowledge(self, session_id: str, sequence: int) -> int:

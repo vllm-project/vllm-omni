@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from math import isqrt
 from typing import Any
 
@@ -20,7 +21,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.bagel import BagelForConditionalGeneration
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -221,6 +222,20 @@ class OmniBagelDataParser(MultiModalDataParser):
 class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingInfo]):
     IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
 
+    def apply(self, inputs, timing_ctx):
+        num_img2img = inputs.mm_data_items.get_all_counts().get("img2img", 0)
+        if num_img2img:
+            token_id = self.info.get_tokenizer().get_vocab().get(self.IMG2IMG_PLACEHOLDER)
+            if token_id is not None:
+                prompt_ids = list(inputs.prompt)
+                missing = num_img2img - prompt_ids.count(token_id)
+                if missing > 0:
+                    inputs = replace(
+                        inputs,
+                        prompt=[token_id] * missing + prompt_ids,
+                    )
+        return super().apply(inputs, timing_ctx)
+
     @staticmethod
     def _mm_kwargs_for_bagel_img2img_hf(mm_kwargs: Mapping[str, object]) -> dict[str, object]:
         # OpenAI / GLM-style serving may pass target_h/target_w for output grid sizing.
@@ -241,69 +256,51 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             "pixel_values_img2img": MultiModalFieldConfig.batched("img2img"),
         }
 
-    def _call_hf_processor(
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ) -> "BatchFeature":
-        has_image = "images" in mm_data
-        has_img2img = "pixel_values_img2img" in mm_data
-
-        if has_img2img and self.IMG2IMG_PLACEHOLDER not in prompt:
-            prompt = f"{self.IMG2IMG_PLACEHOLDER}{prompt}"
-
-        if has_image and has_img2img:
-            outputs = BatchFeature()
-
-            img_data = dict(mm_data)
-            if "pixel_values_img2img" in img_data:
-                del img_data["pixel_values_img2img"]
-            kwargs_img = dict(mm_kwargs)
-            kwargs_img["is_img2img"] = False
-            out_img = super()._call_hf_processor(prompt, img_data, kwargs_img, tok_kwargs)
-            if "pixel_values" in out_img:
-                outputs["pixel_values"] = out_img["pixel_values"]
-            for k, v in out_img.items():
-                if k != "pixel_values":
-                    outputs[k] = v
-
-            img2img_data = dict(mm_data)
-            if "images" in img2img_data:
-                del img2img_data["images"]
-            img2img_data["images"] = img2img_data.pop("pixel_values_img2img")
-            kwargs_img2img = self._mm_kwargs_for_bagel_img2img_hf(mm_kwargs)
-            kwargs_img2img["is_img2img"] = True
-            out_img2img = super()._call_hf_processor(prompt, img2img_data, kwargs_img2img, tok_kwargs)
-            if "pixel_values" in out_img2img:
-                outputs["pixel_values_img2img"] = out_img2img["pixel_values"]
-            for k, v in out_img2img.items():
-                if k not in outputs:
-                    outputs[k] = v
-
-            return outputs
-
-        elif has_img2img:
-            mm_data = dict(mm_data)
-            mm_data["images"] = mm_data.pop("pixel_values_img2img")
-            mm_kwargs = self._mm_kwargs_for_bagel_img2img_hf(mm_kwargs)
-            mm_kwargs["is_img2img"] = True
-            outputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
-            if "pixel_values" in outputs:
-                outputs["pixel_values_img2img"] = outputs.pop("pixel_values")
-            return outputs
-
-        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
+    ) -> BatchFeature:
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+
+        has_image = "images" in mm_data
+        has_img2img = "pixel_values_img2img" in mm_data
+        processed_data = BatchFeature()
+
+        if has_image:
+            image_kwargs = {**hf_processor_mm_kwargs, "is_img2img": False}
+            image_outputs = self.info.ctx.call_hf_processor(
+                processor,
+                {"text": prompt_text, "images": mm_data["images"]},
+                image_kwargs,
+            )
+            processed_data.update(image_outputs)
+
+        if has_img2img:
+            img2img_kwargs = self._mm_kwargs_for_bagel_img2img_hf(hf_processor_mm_kwargs)
+            img2img_kwargs["is_img2img"] = True
+            img2img_outputs = self.info.ctx.call_hf_processor(
+                processor,
+                {
+                    "text": prompt_text,
+                    "images": mm_data["pixel_values_img2img"],
+                },
+                img2img_kwargs,
+            )
+            pixel_values = img2img_outputs.pop("pixel_values", None)
+            if pixel_values is not None:
+                processed_data["pixel_values_img2img"] = pixel_values
+            for key, value in img2img_outputs.items():
+                processed_data.setdefault(key, value)
+
+        if not has_image and not has_img2img:
+            processed_data = BatchFeature(dict(passthrough_data))
+        else:
+            processed_data.update(passthrough_data)
+        return processed_data
 
     def _get_prompt_updates(
         self,
@@ -372,7 +369,8 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
                 embed_mask = [True] * num_vae_total + [False] + [True] * num_vit_total
                 return PromptUpdateDetails(
                     full=tokens,
-                    is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
+                    # vLLM 0.29 calls is_embed with just the full token list.
+                    is_embed=lambda _full, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
                 )
 
             replacements.append(
@@ -1102,11 +1100,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             filtered_weights.append((mapped_name, tensor))
 
         loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["vit_pos_embed.pos_embed"],
-            ignore_unexpected_prefixes=["vae.", "latent_pos_embed.", "time_embedder.", "vae2llm."],
+            self, ignore_unexpected_prefixes=["vae.", "latent_pos_embed.", "time_embedder.", "vae2llm."]
         )
-        loaded = loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(
+            filtered_weights,
+            mapper=(self.hf_to_vllm_mapper) | WeightsMapper(orig_to_new_prefix={"vit_pos_embed.pos_embed": None}),
+        )
 
         loaded |= self._load_moe_gen_weights(moe_gen_weights)
 
