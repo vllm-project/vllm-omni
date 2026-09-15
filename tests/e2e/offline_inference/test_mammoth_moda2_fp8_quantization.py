@@ -30,7 +30,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 # Local Dev checkpoint; override via env for CI / hub ids.
-MODEL_PATH = os.environ.get("MAMMOTH_MODA2_MODEL", "/root/autodl-fs/MammothModa2-Dev")
+MODEL_PATH = os.environ.get("MAMMOTH_MODA2_MODEL", "bytedance-research/MammothModa2-Dev")
 
 # Quantization cases for the A/B gate. ``None`` is the BF16 baseline (the
 # ``quantization`` stage key is removed). FP8 is vLLM's runtime W8A8
