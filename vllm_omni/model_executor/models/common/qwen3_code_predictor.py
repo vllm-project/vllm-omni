@@ -1121,7 +1121,9 @@ class CodePredictorWrapper(nn.Module):
                     sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
                     cumulative_probs = sorted_probs.cumsum(dim=-1)
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
-                    sorted_logits[remove_mask] = float("-inf")
+                    # Keep the mask operation shape-preserving: boolean indexed
+                    # assignment takes a synchronizing index_put path on NPU.
+                    sorted_logits.masked_fill_(remove_mask, float("-inf"))
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
                 code = self._sample_codes_gumbel(logits, generator=sample_generator)
             else:
