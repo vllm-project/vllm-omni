@@ -1,5 +1,7 @@
 # MiniMax-H3 on a single NPU 950PR
 
+[Model guide](MiniMax-H3.md) · [Deployment choices](MiniMax-H3.md#choose-a-deployment) · [HTTP API](MiniMax-H3.md#http-api-examples)
+
 This recipe runs MiniMax-H3 with online INT8 quantization on one NPU 950PR
 NPU (128 GB HiBL 1.0 HBM). It covers the single-card T2VA configuration at
 1024x576. For the eight-card Atlas 800I A3 BF16 route at 768P, see
@@ -26,12 +28,11 @@ limited to 32 GiB of RAM. Passing `--enable-layerwise-offload` on this card is
 actively harmful: it stages weights in non-reclaimable host memory and the
 container's OOM killer terminates the server with exit code -9.
 
-
 ## Environment
 
 - Host architecture: x86_64
--  driver: 25.7.rc1.6 (hal 7.35.23)
--  firmware: 9.0.0.105.229
+- driver: 25.7.rc1.6 (hal 7.35.23)
+- firmware: 9.0.0.105.229
 - CANN toolkit: 9.1.0 (`/usr/local//cann-9.1.0`)
 - npu-smi: 25.7.rc1.6
 - Python: 3.12.13
@@ -51,15 +52,8 @@ uv pip install -e .
 ## Start a server
 
 ```bash
-export MODEL=/path/to/MiniMax-H3/FL2VA
-export PORT=8000
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400
-
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/FL2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 1 \
   --tensor-parallel-size 1 \
@@ -80,6 +74,22 @@ unset: it resolves to `TORCH_SDPA`, or to `FLASH_ATTN` when MindIE-SD is
 installed (see [MiniMax-H3-NPU.md § Environment](MiniMax-H3-NPU.md#environment)).
 
 H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
+
+## T2VA request example
+
+```bash
+curl -sS --max-time 1800 -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
+  -F 'width=1024' \
+  -F 'height=576' \
+  -F 'aspect_ratio=16:9' \
+  -F 'fps=24' \
+  -F 'num_inference_steps=60' \
+  -F 'flow_shift=12' \
+  -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":5,"audio_flow_shift":3.0}' \
+  -o t2va.mp4
+```
 
 ## Validated evidence
 
@@ -145,24 +155,6 @@ shared GlusterFS network mount. This is why the server command sets
 1800 s timeouts both abort mid-load with `TimeoutError` and exit code 143.
 Reduce both timeouts when the partition is staged on local disk.
 
-## T2VA request example
-
-```bash
-export API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
-
-curl -sS --max-time 1800 -X POST "${API_URL}" \
-  -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
-  -F 'width=1024' \
-  -F 'height=576' \
-  -F 'aspect_ratio=16:9' \
-  -F 'fps=24' \
-  -F 'num_inference_steps=60' \
-  -F 'flow_shift=12' \
-  -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":5,"audio_flow_shift":3.0}' \
-  -o t2va.mp4
-```
-
 ## Known limitations
 
 - INT8 online quantization is validated for T2VA on this card. Use BF16 for
@@ -173,8 +165,7 @@ curl -sS --max-time 1800 -X POST "${API_URL}" \
   throughput relative to a cold card. Warm the server with at least one full
   request before measuring, and treat steady state as the reportable number.
 - Requests can fail during result handoff on hosts where the IPC spill path is
-  slow. See [§ Result handoff and shared
-  memory](#result-handoff-and-shared-memory).
+  slow. See [validated evidence](#validated-evidence).
 - Loading the checkpoint from a network mount takes over 30 minutes and forces
   very large init timeouts. Stage the partition on local disk when possible.
 - The configuration measured here is 1024x576 at 60 steps, which differs from
@@ -188,7 +179,7 @@ curl -sS --max-time 1800 -X POST "${API_URL}" \
 
 ## Additional resources
 
-- [MiniMax-H3.md](MiniMax-H3.md) — full GPU guide
+- [MiniMax-H3.md](MiniMax-H3.md) — model and API guide
 - [MiniMax-H3-NPU.md](MiniMax-H3-NPU.md) — eight-card Atlas 800I A3 BF16 guide
 - [Int8 quantization](../../docs/user_guide/quantization/int8.md)
 - [Supported models](../../docs/models/supported_models.md)

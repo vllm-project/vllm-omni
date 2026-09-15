@@ -1,5 +1,7 @@
 # MiniMax-H3 on DGX Spark (GB10)
 
+[Model guide](MiniMax-H3.md) · [Deployment choices](MiniMax-H3.md#choose-a-deployment) · [HTTP API](MiniMax-H3.md#http-api-examples)
+
 This recipe uses online FP8 weight quantization, tiled VAE decode, and a single
 resident partition. GB10 is a unified-memory platform, so unlike the discrete-GPU
 recipes it uses **no offload of any kind** — see the capacity note below.
@@ -59,15 +61,13 @@ Treat this platform as strictly single-tenant for Ref2VA. There is no room for a
 second process, and adding reference images, reference videos, or a larger output
 shape will run into the OOM killer.
 
-## One GB10: 960x576, 8 seconds
+## Single-host deployment
+
+### One GB10: 960x576, 8 seconds
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-FLASHINFER_DISABLE_VERSION_CHECK=1 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200 \
 vllm serve /path/to/MiniMax-H3/FL2VA \
-  --omni --trust-remote-code --host 0.0.0.0 --port 8000 \
+  --omni --trust-remote-code \
   --init-timeout 3600 \
   --num-gpus 1 --tensor-parallel-size 1 --text-encoder-tp-size 1 \
   --usp 1 --ring 1 --vae-patch-parallel-size 1 \
@@ -120,18 +120,14 @@ ffprobe -v error -show_entries \
 Both requests return `200 OK` with an MP4 body: H.264 video at the requested
 geometry plus a 32 kHz stereo AAC track.
 
-## One GB10: Ref2VA, 960x576, 8 seconds
+### One GB10: Ref2VA, 960x576, 8 seconds
 
 `FL2VA` and `Ref2VA` are separate 135 GiB partitions and only one fits at a time.
 Stop the FL2VA server before starting this one.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-FLASHINFER_DISABLE_VERSION_CHECK=1 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
 vllm serve /path/to/MiniMax-H3/Ref2VA \
-  --omni --trust-remote-code --host 0.0.0.0 --port 8000 \
+  --omni --trust-remote-code \
   --init-timeout 3600 \
   --num-gpus 1 --tensor-parallel-size 1 --text-encoder-tp-size 1 \
   --usp 1 --ring 1 --vae-patch-parallel-size 1 \
@@ -139,9 +135,6 @@ vllm serve /path/to/MiniMax-H3/Ref2VA \
   --quantization fp8 --enforce-eager \
   --diffusion-attention-backend CUDNN_ATTN
 ```
-
-The 7200 s timeout used for T2VA is too short here: a 50-step Ref2VA request
-takes over an hour on this platform. Use 14400 s.
 
 Unlike `t2va`, `ref2va` defaults to a 16:9 output ratio, so `aspect_ratio` can be
 omitted when `width` and `height` are supplied.
@@ -269,10 +262,6 @@ Ref2VA text encode converged downward across the four runs (10.94 s, 9.66 s,
 8.52 s, 8.43 s) as first-touch costs fell away; treat ~8.5 s as steady state.
 VAE decode was stable at 67.9-69.8 s throughout.
 
-Set `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` well above the expected request time — the
-default 1800 s is shorter than a 50-step run on this platform, and 7200 s is
-shorter than a 50-step Ref2VA run.
-
 ## Known limitations
 
 - With one GPU there is no Ulysses, ring, TP, or VAE patch parallelism. Pass
@@ -295,6 +284,5 @@ shorter than a 50-step Ref2VA run.
 - Ref2VA requires a vLLM-Omni build newer than `v0.26.0`. See the version note
   under **Validated on**: FP8 weight loading and image-only Ref2VA are both
   broken on `release/v0.26.0`. The suggested version is `v0.26.1`.
-- Online FP8 is incompatible with layerwise offload — the offload path produces a
-  weight stride the Cutlass FP8 kernel rejects. This is not a practical
-  restriction here since offload is unusable on GB10 anyway.
+- Keep offload disabled on this unified-memory deployment. General FP8
+  compatibility is documented in the [model guide](MiniMax-H3.md#online-fp8-quantization).

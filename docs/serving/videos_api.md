@@ -115,6 +115,13 @@ job status becomes `completed`.
 bytes. It is useful for benchmarks and simple scripts that do not need job
 storage or polling.
 
+`X-Inference-Time-S` measures server elapsed time around generation and result
+preparation. It excludes client upload and response download; measure client
+end-to-end latency separately. `X-Stage-Durations` contains the reported
+model-stage timings, which need not sum to the server elapsed time.
+`X-Peak-Memory-MB` carries the pipeline-reported memory metric; its sampling
+and rank coverage depend on the pipeline and must be stated with benchmark results.
+
 ## Examples
 
 ### Image-to-Video

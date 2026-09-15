@@ -1,5 +1,7 @@
 # MiniMax-H3 on RTX PRO 5000 Blackwell GPUs
 
+[Model guide](MiniMax-H3.md) · [Deployment choices](MiniMax-H3.md#choose-a-deployment) · [HTTP API](MiniMax-H3.md#http-api-examples)
+
 This recipe runs MiniMax-H3 in BF16 on 72 GiB RTX PRO 5000 Blackwell GPUs. It
 contains the validated two-GPU DLO configuration and the recommended resident
 configurations: TP1 x Ulysses2 with 20 resident layers on two GPUs, TP2 x
@@ -39,6 +41,10 @@ reproduce the same PCIe and NUMA relationships on the target host.
 
 ## Recommended serving configurations
 
+The commands below use the default device order and host-memory policy. The
+reported measurements additionally used the GPU ordering above, NUMA node 0
+binding for two/four GPUs, and memory interleaving for eight GPUs.
+
 ### Two GPUs
 
 Two 72 GiB cards require distributed layerwise offload. The validated route
@@ -47,18 +53,8 @@ rank-local weights without AllGather. Eager execution avoids regional-compile
 instability on this offload path.
 
 ```bash
-export MODEL_ROOT=/path/to/MiniMax-H3
-export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8091
-
-CUDA_VISIBLE_DEVICES=0,1 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-numactl --cpunodebind=0 --membind=0 \
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/FL2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 2 \
   --tensor-parallel-size 1 \
@@ -82,18 +78,8 @@ parallelism 4, and explicit cuDNN BF16 attention. Selecting the backend
 explicitly keeps the recipe independent of platform-default backend changes.
 
 ```bash
-export MODEL_ROOT=/path/to/MiniMax-H3
-export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8091
-
-CUDA_VISIBLE_DEVICES=0,2,1,3 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-numactl --cpunodebind=0 --membind=0 \
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/FL2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 4 \
   --tensor-parallel-size 2 \
@@ -109,21 +95,12 @@ vllm serve "${MODEL}" \
 ### Eight GPUs
 
 The recommended eight-GPU route uses TP4 x Ulysses2, text-encoder TP8, VAE
-patch parallelism 8, and host-memory interleaving across both NUMA nodes.
+patch parallelism 8. The measurements used host-memory interleaving across both
+NUMA nodes.
 
 ```bash
-export MODEL_ROOT=/path/to/MiniMax-H3
-export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8091
-
-CUDA_VISIBLE_DEVICES=0,4,1,5,2,6,3,7 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-numactl --interleave=0,1 \
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/FL2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 8 \
   --tensor-parallel-size 4 \
@@ -141,7 +118,23 @@ Warm the server once before measuring so regional compilation is outside the
 measured request. The two-GPU DLO route intentionally remains eager.
 
 For Ref2VA, stop the FL2VA server and restart the same command with
-`MODEL="${MODEL_ROOT}/Ref2VA"`.
+`/path/to/MiniMax-H3/Ref2VA`.
+
+## T2VA request example
+
+```bash
+curl -sS --max-time 1800 -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
+  -F 'width=1344' \
+  -F 'height=768' \
+  -F 'aspect_ratio=16:9' \
+  -F 'fps=24' \
+  -F 'num_inference_steps=50' \
+  -F 'flow_shift=12' \
+  -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
+  -o t2va.mp4
+```
 
 ## Target-hardware validation
 
@@ -164,7 +157,7 @@ The recommended routes produced the following 50-step results. MiniMax-H3
 requested 50 denoise steps and executed 49 denoise updates, so per-step latency
 is `denoise / 49`.
 
-| GPUs | Workload | Parallelism | E2E (s) | Text encode (s) | Denoise (s) | VAE decode (s) | Per step (ms) | Peak memory (GiB) |
+| GPUs | Workload | Parallelism | E2E (s) | Text encode (s) | Denoise (s) | VAE decode (s) | Per denoiser update (ms) | Peak memory (GiB) |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 2 | T2VA | TP1 x Ulysses2, DLO resident 20 | 515.57 | 1.19 | 504.69 | 8.79 | 10,300 | 36.38 |
 | 2 | FL2VA first-frame I2VA | TP1 x Ulysses2, DLO resident 20 | 553.45 | 1.27 | 541.90 | 8.76 | 11,059 | 36.38 |
@@ -178,21 +171,3 @@ Peak memory is the maximum per-GPU value sampled externally with
 73,415 MiB device capacity, the four-GPU route leaves about 4.1 GiB, and the
 eight-GPU route leaves about 25.9 GiB. Re-measure memory for longer reference
 inputs, concurrency greater than one, or a different output shape.
-
-## T2VA request example
-
-```bash
-export API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
-
-curl -sS --max-time 1800 -X POST "${API_URL}" \
-  -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
-  -F 'width=1344' \
-  -F 'height=768' \
-  -F 'aspect_ratio=16:9' \
-  -F 'fps=24' \
-  -F 'num_inference_steps=50' \
-  -F 'flow_shift=12' \
-  -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
-  -o t2va.mp4
-```

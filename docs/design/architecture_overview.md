@@ -159,7 +159,7 @@ produce synchronized audio and video-like outputs.
 | Logical component | Batching | Attention and execution | Parallelism | Quantization |
 | --- | --- | --- | --- | --- |
 | **Text Encoder** | The current co-located pipeline follows the diffusion request scheduler; independent prompt/reference batching would require a separate multi-stage topology | Qwen3-VL attention and multimodal preprocessing | `--text-encoder-tp-size N` shards the encoder across the first `N` DiT ranks; independent placement is not part of the current topology | BF16/FP32 baseline; the H3 DiT FP8 path does not quantize the text encoder |
-| **DiT** | The current H3 implementation executes one generation request per diffusion batch; use concurrency for service-level throughput | cuDNN attention for the validated two-GPU consumer profile; TRTLLM attention or FlashAttention-4 on supported Blackwell profiles | TP2 plus text-encoder TP and Ulysses/VAE parallel groups on multi-GPU profiles; DLO/CPU offload trade memory for transfer time | Online FP8 applies to eligible DiT linears and is incompatible with layerwise offload |
+| **DiT** | The current H3 implementation executes one generation request per diffusion batch; use concurrency for service-level throughput | Backend selection follows the hardware deployment recipe | Tensor, sequence, and VAE parallel groups reduce per-device memory or distribute computation; CPU offload trades memory for transfer time | Eligible DiT linears support online FP8; see the model recipe for component and offload compatibility |
 | **VAE Decoder** | Decode follows each generation request; tile/patch work can be distributed even when denoising is not batched | VAE decode kernels rather than DiT attention | VAE patch parallelism and native tiled decode within the diffusion stage | BF16/FP32 baseline; the documented H3 FP8 path leaves both VAEs unchanged |
 
 The primary target is video/audio E2EL and media throughput, with the logical
@@ -169,7 +169,7 @@ independently. TTFT and TPOT do not describe the main H3 generation path
 because the user-visible output is diffusion media rather than a token stream.
 The
 [MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md)
-contains the hardware-specific profiles and warmup requirements.
+links to hardware-specific profiles and their warmup requirements.
 
 ### Cosmos3: unified MoT reasoner and generator
 
