@@ -67,11 +67,16 @@ logger = init_logger(__name__)
 
 
 DEFAULT_AUDIO_SAMPLE_RATE = 24_000
+_BORROWED_VIDEO_FRAMES_ENV = "VLLM_OMNI_VIDEO_BORROWED_FRAMES"
 
 
 VideoInput: TypeAlias = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
 AudioSample = int | float
 AudioInput: TypeAlias = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
+
+
+def _borrowed_video_frames_enabled() -> bool:
+    return os.getenv(_BORROWED_VIDEO_FRAMES_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class VideoFrames(list[Image.Image]):
@@ -749,6 +754,14 @@ def _iter_planar_video_frames(
         converter.shutdown()
 
 
+def _iter_borrowed_rgb_video_frames(frames: list[np.ndarray]) -> Generator[av.VideoFrame, None, None]:
+    """Wrap contiguous RGB arrays in AVFrames without copying their storage."""
+    import av
+
+    for frame in frames:
+        yield av.VideoFrame.from_numpy_buffer(frame, format="rgb24")
+
+
 def _log_video_encoding_path(
     *,
     selected_path: str,
@@ -843,6 +856,33 @@ def _encode_video_bytes(
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
+    if (
+        _borrowed_video_frames_enabled()
+        and common_dtype == np.dtype(np.uint8)
+        and len(frame_shape) == 3
+        and frame_shape[-1] == 3
+        and all(frame.strides[1:] == (3, 1) for frame in frames)
+    ):
+        _log_video_encoding_path(
+            selected_path="borrowed_rgb",
+            frames=frames,
+            frame_shape=frame_shape,
+            common_dtype=common_dtype,
+            fps=fps,
+            audio=audio,
+            audio_sample_rate=effective_audio_sample_rate,
+            effective_frame_conversion_workers=0,
+        )
+        audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+        return mux_av_video_audio_bytes(
+            _iter_borrowed_rgb_video_frames(frames),
+            width=frame_shape[1],
+            height=frame_shape[0],
+            audio_waveform=audio_np,
+            fps=float(fps),
+            audio_sample_rate=effective_audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
     fallback_reason = _direct_planar_fallback_reason(
         frames,
         frame_shape,
