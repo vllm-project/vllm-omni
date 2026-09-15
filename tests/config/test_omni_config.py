@@ -1713,14 +1713,29 @@ def test_stage_async_chunk_opt_out_matches_legacy_config(pipeline_async, stage_a
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     deploy = DeployConfig(
         async_chunk=pipeline_async,
-        stages=[StageDeployConfig(stage_id=1, async_chunk=stage_async)],
+        stages=[StageDeployConfig(stage_id=i, async_chunk=stage_async) for i in (0, 1)],
     )
     config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
     legacy = merge_pipeline_deploy(pipeline, deploy)
     expected = pipeline_async and stage_async is not False
-    assert config.stage_by_id(0).connector_config.async_chunk is pipeline_async
+    assert config.stage_by_id(0).connector_config.async_chunk is expected
     assert config.stage_by_id(1).connector_config.async_chunk is expected
     assert legacy[1].yaml_engine_args["async_chunk"] is expected
     assert config.stage_by_id(1).custom_process_input_func == legacy[1].custom_process_input_func
     if not expected:
         assert config.stage_by_id(1).custom_process_input_func.endswith("talker2code2wav_token_only")
+
+
+@pytest.mark.parametrize("disabled_stage", [0, 1])
+@pytest.mark.parametrize("builder", [merge_pipeline_deploy, VllmOmniConfig.from_pipeline_config])
+def test_async_chunk_rejects_mismatched_connector_edge(disabled_stage, builder):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        async_chunk=True,
+        stages=[StageDeployConfig(stage_id=disabled_stage, async_chunk=False)],
+    )
+    with pytest.raises(ValueError, match="incompatible async_chunk settings on connector edge 0 -> 1"):
+        if builder is merge_pipeline_deploy:
+            builder(pipeline, deploy)
+        else:
+            builder(pipeline, user_deploy_config=deploy)
