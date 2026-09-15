@@ -35,7 +35,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     normalize_lingbot_request,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler, build_pipeline_scheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -374,10 +374,15 @@ class LingBotVideoPipeline(
             torch_dtype=vae_dtype,
             local_files_only=local_files_only,
         ).to(self.device)
-        self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
-            model,
-            subfolder=scheduler_subfolder,
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowUniPCMultistepScheduler.from_pretrained(
+                model,
+                subfolder=scheduler_subfolder,
+                local_files_only=local_files_only,
+            ),
             local_files_only=local_files_only,
+            subfolder=scheduler_subfolder,
         )
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT

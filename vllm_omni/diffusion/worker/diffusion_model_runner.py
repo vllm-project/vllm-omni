@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_interaction_apply,
     supports_step_execution,
 )
+from vllm_omni.diffusion.models.schedulers import ensure_scheduler_consumed
 from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
@@ -335,6 +336,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+                ensure_scheduler_consumed(self.od_config, self.pipeline)
         time_after_load = time.perf_counter()
 
         logger.info(
