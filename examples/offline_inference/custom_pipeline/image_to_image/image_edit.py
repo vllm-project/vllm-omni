@@ -53,7 +53,6 @@ from typing import Any
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -139,12 +138,6 @@ async def main():
 
     # ---- Torch setup ----
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-    )
 
     # ---- Cache Config ----
     if args.cache_backend == "cache_dit":
@@ -171,7 +164,10 @@ async def main():
         vae_use_tiling=args.vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
-        parallel_config=parallel_config,
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
         diffusion_load_format="dummy",

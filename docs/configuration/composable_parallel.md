@@ -1,6 +1,6 @@
 # Composable parallel strategies
 
-In vLLM-Omni, the `composable_parallel` system layers a declarative *parallel strategy* on top of the existing stage configs. A strategy YAML maps each pipeline stage (by its `model_stage` name) to a stack of axis declarations — one per parallelism dimension — that the engine translates into per-stage parallel sizing (`tensor_parallel_size`, `data_parallel_size`, `pipeline_parallel_size`, expert-parallel toggle, replica count) and, when relevant, an orchestrator-wide load-balancer policy.
+In vLLM-Omni, the `composable_parallel` system layers a declarative *parallel strategy* on top of the registered pipeline and deploy config. A strategy YAML maps each pipeline stage (by its `model_stage` name) to a stack of axis declarations — one per parallelism dimension — that the engine translates into per-stage parallel sizing (`tensor_parallel_size`, `data_parallel_size`, `pipeline_parallel_size`, expert-parallel toggle, replica count) and, when relevant, an orchestrator-wide load-balancer policy.
 
 Strategies are intentionally narrow: each one only writes the axes it declares, leaving every other engine arg untouched. This makes a strategy file a small, reusable overlay you can swap independently of the deploy YAML (see `configuration/stage_configs.md`).
 
@@ -195,7 +195,7 @@ Because `omni_lb_policy` is read once at `AsyncOmniEngine` construction — not 
 
 Default: no default — required for every entry under `strategies:`.
 
-Strategy keys MUST be `model_stage` *names* (strings), the same labels stage configs use for `engine_args.model_stage` (see [`model_stage` in `stage_configs.md`](stage_configs.md#engine_argsmodel_stage)). Integer `stage_id` values are not accepted; the resolver matches on `model_stage` exactly (`_resolve_stage` in `vllm_omni/config/composable_parallel/apply.py`).
+Strategy keys MUST be `model_stage` *names* (strings), the same labels defined by [`StagePipelineConfig.model_stage`](stage_configs.md#pipeline-configuration). Integer `stage_id` values are not accepted; the resolver matches on `model_stage` exactly (`_resolve_stage` in `vllm_omni/config/composable_parallel/apply.py`).
 
 ## Common pitfalls
 

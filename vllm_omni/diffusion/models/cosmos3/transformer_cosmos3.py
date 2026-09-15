@@ -40,6 +40,12 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.platforms import current_omni_platform
 
+from .mixed_precision import (
+    Cosmos3MixedPrecisionConfig,
+    Cosmos3MixedPrecisionRuntime,
+    resolve_mixed_precision_config,
+)
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 
@@ -134,6 +140,26 @@ def _od_config_get(od_config: Any, key: str, default: Any = None) -> Any:
             return found
     value = _tf_config_get(tf_model_config, key, None)
     return default if value is None else value
+
+
+def _validate_mixed_precision_runtime(
+    config: Cosmos3MixedPrecisionConfig | None,
+    od_config: OmniDiffusionConfig,
+) -> None:
+    if config is None:
+        return
+    if get_tensor_model_parallel_world_size() != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
+    if int(getattr(od_config, "max_num_seqs", 1)) != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
+    if bool(getattr(od_config, "enable_distributed_layerwise_offload", False)):
+        raise ValueError(
+            "Cosmos3 mixed precision does not support distributed layer-wise offload "
+            "because its direct loader bypasses ModelOpt post-load transformations"
+        )
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if bool(getattr(parallel_config, "use_hsdp", False)):
+        raise ValueError("Cosmos3 mixed precision has not validated live backend weights under HSDP")
 
 
 def _as_bool(value: Any) -> bool:
@@ -651,6 +677,19 @@ class Cosmos3CrossAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
         )
+        # Multi-control attention operates on one full [control_i, target]
+        # sequence at a time. Keep those sequences replicated when Ulysses is
+        # active; sharding the concatenated [control_1, ..., control_N, target]
+        # layout would split the per-control ranges across ranks.
+        self.multi_control_attn = FrameworkAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            num_kv_heads=self.num_kv_heads,
+            prefix=f"{prefix}.multi_control_attn",
+            skip_sequence_parallel=True,
+        )
 
     # TODO(follow-up): collapse _forward_local and _forward_sp into a single
     # joint-based path when NoParallelAttention can process joint_key/value.
@@ -692,7 +731,21 @@ class Cosmos3CrossAttention(nn.Module):
         # standard reverse-all-to-all path (no joint-output splitting).
         joint_q = q.new_empty(B, 0, self.num_heads_local, self.head_dim)
 
+        gen_mask = None
+        joint_mask = None
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                gen_mask = torch.ones(B, padded_seq_len, dtype=torch.bool, device=q.device)
+                gen_mask[:, ctx.sp_original_seq_len :] = False
+                # UND K/V are trimmed to the common real text length before GEN
+                # attention, so every remaining joint key is valid.
+                joint_mask = torch.ones(B, k_und.shape[1], dtype=torch.bool, device=q.device)
+
         attn_metadata = AttentionMetadata(
+            attn_mask=gen_mask,
+            joint_attn_mask=joint_mask,
             joint_query=joint_q,
             joint_key=k_und,
             joint_value=v_und,
@@ -700,6 +753,61 @@ class Cosmos3CrossAttention(nn.Module):
         )
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
+
+    def _forward_multi_control(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        control_token_sizes: tuple[int, ...],
+        control_weights: tuple[float, ...],
+    ) -> torch.Tensor:
+        """Run independent attention per control and weight target outputs.
+
+        For control ``i``, both its queries and the target queries attend to
+        ``[text, control_i, target]``. Each control keeps the output from its
+        own pass, while target outputs are combined using normalized weights.
+        """
+        if len(control_token_sizes) != len(control_weights):
+            raise ValueError(
+                "Cosmos3 control token sizes and weights must have the same length: "
+                f"sizes={len(control_token_sizes)}, weights={len(control_weights)}."
+            )
+        control_tokens = sum(control_token_sizes)
+        if control_tokens <= 0 or control_tokens >= q.shape[1]:
+            raise ValueError(
+                "Cosmos3 multi-control attention requires non-empty control and target token ranges, "
+                f"got control_tokens={control_tokens}, total_tokens={q.shape[1]}."
+            )
+
+        q_target = q[:, control_tokens:]
+        k_target = k[:, control_tokens:]
+        v_target = v[:, control_tokens:]
+        control_outputs: list[torch.Tensor] = []
+        target_output: torch.Tensor | None = None
+        start = 0
+        for size, weight in zip(control_token_sizes, control_weights, strict=True):
+            if size <= 0:
+                raise ValueError(f"Cosmos3 control token sizes must be positive, got {control_token_sizes}.")
+            end = start + size
+            q_control = q[:, start:end]
+            k_control = k[:, start:end]
+            v_control = v[:, start:end]
+            q_pair = torch.cat([q_control, q_target], dim=1)
+            k_pair = torch.cat([k_und, k_control, k_target], dim=1)
+            v_pair = torch.cat([v_und, v_control, v_target], dim=1)
+            pair_output = self.multi_control_attn(q_pair, k_pair, v_pair)
+            control_outputs.append(pair_output[:, :size])
+            weighted_target = pair_output[:, size:] * weight
+            target_output = weighted_target if target_output is None else target_output + weighted_target
+            start = end
+
+        if start != control_tokens or target_output is None:
+            raise RuntimeError("Cosmos3 multi-control attention failed to cover all control token ranges.")
+        output = torch.cat([*control_outputs, target_output], dim=1)
+        return output.reshape(q.shape[0], q.shape[1], -1)
 
     # -- Public forward: routes to the appropriate path ----------------------
 
@@ -710,6 +818,8 @@ class Cosmos3CrossAttention(nn.Module):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        control_token_sizes: tuple[int, ...] | None = None,
+        control_weights: tuple[float, ...] | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -733,7 +843,19 @@ class Cosmos3CrossAttention(nn.Module):
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if _is_sp_active():
+        if control_token_sizes is not None or control_weights is not None:
+            if control_token_sizes is None or control_weights is None:
+                raise ValueError("Cosmos3 multi-control attention requires both control token sizes and weights.")
+            out = self._forward_multi_control(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                control_token_sizes,
+                control_weights,
+            )
+        elif _is_sp_active():
             out = self._forward_sp(q, k, v, k_und, v_und)
         else:
             out = self._forward_local(q, k, v, k_und, v_und)
@@ -847,6 +969,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_sin: torch.Tensor | None = None,
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        control_token_sizes: tuple[int, ...] | None = None,
+        control_weights: tuple[float, ...] | None = None,
     ) -> torch.Tensor:
         if cached_kv is not None:
             if self.layer_idx is None:
@@ -861,7 +985,13 @@ class Cosmos3GenDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.cross_attention(
-            hidden_states, k_und=k_und, v_und=v_und, freqs_cos=freqs_cos, freqs_sin=freqs_sin
+            hidden_states,
+            k_und=k_und,
+            v_und=v_und,
+            freqs_cos=freqs_cos,
+            freqs_sin=freqs_sin,
+            control_token_sizes=control_token_sizes,
+            control_weights=control_weights,
         )
         hidden_states = residual + hidden_states
 
@@ -965,6 +1095,13 @@ class Cosmos3GenSPPrepare(nn.Module):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # A transfer denoising step may run a full-control branch followed by a
+        # shorter no-control branch in one ForwardContext. Auto-padding metadata
+        # belongs to one branch only and must not truncate a later gather.
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            ctx.sp_padding_size = 0
+            ctx.sp_original_seq_len = None
         return hidden_gen, freqs_cos, freqs_sin
 
 
@@ -1022,9 +1159,9 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _sp_plan = {
         "gen_sp_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
-            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
         },
         "gen_sp_gather": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -1130,6 +1267,19 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        mixed_precision_config, mixed_precision_source = resolve_mixed_precision_config(od_config)
+        if mixed_precision_config is None:
+            if mixed_precision_source == "additional_config_disabled":
+                logger.info("Cosmos3 checkpoint mixed-precision policy disabled by additional_config")
+        else:
+            logger.info(
+                "Cosmos3 mixed precision active (source=%s): first_steps=%d last_steps=%d reasoner=%s",
+                mixed_precision_source,
+                mixed_precision_config.first_steps,
+                mixed_precision_config.last_steps,
+                mixed_precision_config.reasoner,
+            )
+        _validate_mixed_precision_runtime(mixed_precision_config, od_config)
 
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
@@ -1188,6 +1338,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 for i in range(self.num_hidden_layers)
             ]
         )
+
+        self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
+        if mixed_precision_config is not None:
+            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
+            self.mixed_precision_runtime.install(self)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
@@ -1496,47 +1651,6 @@ class Cosmos3VFMTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
-    @staticmethod
-    def _validate_gen_sequence_parallel(
-        *,
-        s_gen: int,
-        s_video: int,
-        s_control: int,
-        s_action: int,
-        s_sound: int,
-        has_action: bool,
-        has_sound: bool,
-        has_control: bool,
-        ulysses_size: int,
-    ) -> None:
-        if ulysses_size <= 1 or s_gen % ulysses_size == 0:
-            return
-
-        detail_parts = []
-        if has_control:
-            detail_parts.append(f"control tokens {s_control}")
-        detail_parts.append(f"video tokens {s_video}")
-        if has_action:
-            detail_parts.append(f"action tokens {s_action}")
-        if has_sound:
-            detail_parts.append(f"sound tokens {s_sound}")
-        detail = " = " + " + ".join(detail_parts) if len(detail_parts) > 1 else ""
-        adjust_detail = (
-            "Adjust the spatial resolution, frame count, action chunk size, "
-            "sound duration, or sound latent FPS so the combined media sequence is a "
-            "multiple of ulysses_degree."
-            if has_control or has_action or has_sound
-            else (
-                "Adjust the spatial resolution so that "
-                "t * ceil(h/patch) * ceil(w/patch) is a multiple "
-                "of ulysses_degree."
-            )
-        )
-        raise ValueError(
-            f"GEN sequence length ({s_gen}{detail}) must be divisible by "
-            f"ulysses_degree ({ulysses_size}). {adjust_detail}"
-        )
-
     def sound_latent_frames_for_sequence_parallel(
         self,
         *,
@@ -1579,6 +1693,7 @@ class Cosmos3VFMTransformer(nn.Module):
         sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -1601,6 +1716,8 @@ class Cosmos3VFMTransformer(nn.Module):
                 frames are noisy, as in T2I/T2V.
             control_latents: Optional transfer-control latents. Controls are
                 clean vision context and are packed before the noisy target.
+            control_weights: Optional non-negative relative weights for
+                transfer controls. Values are normalized to sum to one.
 
         Returns:
             [B, C, t, h, w] velocity prediction, or
@@ -1629,6 +1746,31 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             control_latent_list = list(control_latents)
         has_control = len(control_latent_list) > 0
+        if control_weights is None:
+            normalized_control_weights = (
+                [1.0 / len(control_latent_list)] * len(control_latent_list) if has_control else []
+            )
+        else:
+            if isinstance(control_weights, torch.Tensor):
+                raw_control_weights = control_weights.detach().cpu().flatten().tolist()
+            else:
+                raw_control_weights = list(control_weights)
+            if len(raw_control_weights) != len(control_latent_list):
+                raise ValueError(
+                    "Cosmos3 transfer control_weights length must match control_latents: "
+                    f"weights={len(raw_control_weights)}, controls={len(control_latent_list)}."
+                )
+            normalized_control_weights = [float(weight) for weight in raw_control_weights]
+            if any(not math.isfinite(weight) or weight < 0.0 for weight in normalized_control_weights):
+                raise ValueError(
+                    "Cosmos3 transfer control_weights must be finite and non-negative, "
+                    f"got {normalized_control_weights}."
+                )
+            control_weight_sum = sum(normalized_control_weights)
+            if control_weight_sum <= 0.0:
+                raise ValueError("Cosmos3 transfer control_weights must have a positive sum.")
+            normalized_control_weights = [weight / control_weight_sum for weight in normalized_control_weights]
+        use_multi_control_attention = len(control_latent_list) > 1
         if has_control and (has_action or has_sound):
             raise ValueError("Cosmos3 transfer control latents cannot be combined with action or sound latents.")
         if has_action and not self.action_gen:
@@ -1646,6 +1788,13 @@ class Cosmos3VFMTransformer(nn.Module):
 
         # Query Ulysses state at runtime
         ulysses_size, _, _ = _get_ulysses_state()
+        if use_multi_control_attention and ulysses_size > 1:
+            logger.warning_once(
+                "Cosmos3 multi-control attention requires full [control_i | target] "
+                "sequences, so the GEN pathway runs replicated on every Ulysses rank. "
+                "Sequence parallelism will not reduce per-rank memory or latency for "
+                "multi-control transfer requests."
+            )
 
         # Pack action/sound tokens (no learned weights) up front so the UND
         # cache sizing knows their token lengths.  The modality projections are
@@ -1722,6 +1871,9 @@ class Cosmos3VFMTransformer(nn.Module):
                 )
                 hidden_controls.append(hidden_control)
                 s_control += hidden_control.shape[1]
+            control_token_sizes = tuple(control.shape[1] for control in hidden_controls)
+            multi_control_weights = tuple(normalized_control_weights) if use_multi_control_attention else None
+            multi_control_token_sizes = control_token_sizes if use_multi_control_attention else None
             hidden_action = None
             hidden_sound = None
             if action_tokens is not None:
@@ -1779,19 +1931,9 @@ class Cosmos3VFMTransformer(nn.Module):
             # framework Attention handles the Ulysses head-slicing internally.
             if self.cached_kv is None or self.cached_freqs_gen is None:
                 raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-            self._validate_gen_sequence_parallel(
-                s_gen=hidden_gen.shape[1],
-                s_video=s_video,
-                s_control=s_control,
-                s_action=s_action,
-                s_sound=s_sound,
-                has_action=has_action,
-                has_sound=has_sound,
-                has_control=has_control,
-                ulysses_size=ulysses_size,
-            )
             freqs_cos, freqs_sin = self.cached_freqs_gen
-            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+            if not use_multi_control_attention:
+                hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
             freqs_gen = (freqs_cos, freqs_sin)
 
             if len(self.gen_layers) == len(self.cached_kv):
@@ -1802,6 +1944,8 @@ class Cosmos3VFMTransformer(nn.Module):
                         v_und=v_und,
                         freqs_cos=freqs_cos,
                         freqs_sin=freqs_sin,
+                        control_token_sizes=multi_control_token_sizes,
+                        control_weights=multi_control_weights,
                     )
                     # Cache-dit's block wrapper may return a tuple; unwrap it.
                     if isinstance(hidden_gen, tuple):
@@ -1813,11 +1957,14 @@ class Cosmos3VFMTransformer(nn.Module):
                         hidden_gen,
                         cached_kv=self.cached_kv,
                         freqs_gen=freqs_gen,
+                        control_token_sizes=multi_control_token_sizes,
+                        control_weights=multi_control_weights,
                     )
                     if isinstance(hidden_gen, tuple):
                         hidden_gen = hidden_gen[0]
 
-            hidden_gen = self.gen_sp_gather(hidden_gen)
+            if not use_multi_control_attention:
+                hidden_gen = self.gen_sp_gather(hidden_gen)
 
             # Final norm and project back to latent space
             hidden_gen = self.norm_moe_gen(hidden_gen)
@@ -1855,3 +2002,11 @@ class Cosmos3VFMTransformer(nn.Module):
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
         self.time_embedder.to(torch.float32)
+
+    def set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.set_step(step_index, num_steps)
+
+    def reset_mixed_precision(self) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.reset()

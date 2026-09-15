@@ -20,7 +20,6 @@ import torch
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
-    uses_full_payload_input_coordinator,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -59,6 +58,7 @@ def _make_request(req_id: str, status: str = "waiting") -> SimpleNamespace:
         num_computed_tokens=0,
         _all_token_ids=[],
         _output_token_ids=[],
+        payload_sender_info=None,
     )
 
 
@@ -94,109 +94,6 @@ class MockQueue:
 # ------------------------------------------------------------------ #
 #  Tests
 # ------------------------------------------------------------------ #
-
-
-class TestFullPayloadCoordinatorSelection(unittest.TestCase):
-    """Tests for the (model_arch, model_stage) whitelist gate.
-
-    The init_omni_connectors arch allowlist is keyed by ``model_arch`` and
-    is a superset of the stages registered here -- consumer-wait stages
-    must be registered explicitly in ``_FULL_PAYLOAD_INPUT_STAGES``, while
-    the init allowlist covers both producer- and consumer-side runners.
-    These tests pin which ``(arch, stage)`` pairs the gate fires for today.
-    """
-
-    # Expected whitelist (model_arch, model_stage).  Hardcoded to avoid the
-    # tautology of importing _FULL_PAYLOAD_INPUT_STAGES and asserting it
-    # against itself; any drift between this matrix and the whitelist will
-    # fail loudly here.
-    EXPECTED_FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
-        {
-            ("Qwen3OmniMoeForConditionalGeneration", "talker"),
-            ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
-            ("Qwen2_5OmniForConditionalGeneration", "talker"),
-            ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
-            ("CovoAudioForConditionalGeneration", "code2wav"),
-            ("MiMoAudioModel", "code2wav"),
-            ("Qwen3TTSCode2Wav", "code2wav"),
-            ("MiniCPMO45Code2Wav", "code2wav"),
-            # nemotron_voicechat: sync-path RVQ-VAE decode waits for the
-            # talker's full [frames, 31] code-stack payload.
-            ("NemotronVoiceChatCode2Wav", "code2wav"),
-            ("CosyVoice3Model", "cosyvoice3_code2wav"),
-            # audex: sync-path TTS decoder (async_chunk: false deploys) and
-            # the TTA XCodec1 stage (always sync full-payload).
-            ("AudexCode2Wav", "audex_code2wav"),
-            ("AudexXCodec1", "audex_xcodec"),
-            ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
-            ("IndexTTS25S2MelDecoder", "indextts2_5_s2mel_decoder"),
-            ("DyninOmniForConditionalGeneration", "token2image"),
-            ("DyninOmniForConditionalGeneration", "token2audio"),
-        }
-    )
-
-    def test_whitelist_matches_expected_matrix(self):
-        """_FULL_PAYLOAD_INPUT_STAGES must equal the hardcoded expected matrix.
-
-        Catches both accidental additions (which would silently enable the
-        consumer-wait gate for a new arch) and accidental removals (which
-        would silently disable an enabled arch).
-        """
-        from vllm_omni.core.sched.omni_scheduling_coordinator import _FULL_PAYLOAD_INPUT_STAGES
-
-        self.assertEqual(
-            frozenset(_FULL_PAYLOAD_INPUT_STAGES),
-            self.EXPECTED_FULL_PAYLOAD_INPUT_STAGES,
-            msg="_FULL_PAYLOAD_INPUT_STAGES drifted from the expected matrix; "
-            "update EXPECTED_FULL_PAYLOAD_INPUT_STAGES if intentional.",
-        )
-
-    def test_all_whitelisted_arch_stage_pairs_fire_gate(self):
-        """Every (arch, stage) pair in the expected matrix must fire
-        the gate when stage_id > 0 and async_chunk=False.
-        """
-        for arch, stage in self.EXPECTED_FULL_PAYLOAD_INPUT_STAGES:
-            model_config = SimpleNamespace(
-                stage_id=1,
-                async_chunk=False,
-                model_arch=arch,
-                model_stage=stage,
-            )
-            self.assertTrue(
-                uses_full_payload_input_coordinator(model_config),
-                msg=f"expected gate to fire for {arch}/{stage}",
-            )
-
-    def test_other_arch_or_stage_or_mode_does_not_fire(self):
-        cases = [
-            SimpleNamespace(
-                stage_id=1, async_chunk=True, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage="talker"
-            ),
-            SimpleNamespace(
-                stage_id=0, async_chunk=False, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage="thinker"
-            ),
-            SimpleNamespace(
-                stage_id=1,
-                async_chunk=False,
-                model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage="some_future_stage",
-            ),
-            SimpleNamespace(
-                stage_id=1, async_chunk=False, model_arch="Qwen3TTSForConditionalGeneration", model_stage="code2wav"
-            ),
-            SimpleNamespace(
-                stage_id=1, async_chunk=False, model_arch="MingFlashOmniForConditionalGeneration", model_stage="talker"
-            ),
-            SimpleNamespace(stage_id=1, async_chunk=False, model_arch=None, model_stage="talker"),
-            SimpleNamespace(
-                stage_id=1, async_chunk=False, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage=None
-            ),
-        ]
-        for model_config in cases:
-            self.assertFalse(
-                uses_full_payload_input_coordinator(model_config),
-                msg=f"expected gate OFF for {model_config}",
-            )
 
 
 class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
@@ -373,6 +270,19 @@ class TestWaitingForInputTransition(unittest.TestCase):
 
         self.assertEqual(len(coord.pending_input_registrations), 1)
         self.assertEqual(coord.pending_input_registrations[0].request_id, "r1")
+
+    def test_pending_input_registration_carries_payload_sender_info(self):
+        coord = OmniSchedulingCoordinator(stage_id=1)
+        req = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
+        req.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+        waiting = MockQueue([req])
+
+        coord.process_pending_full_payload_inputs(waiting, set())
+
+        self.assertEqual(
+            coord.pending_input_registrations[0].payload_sender_info,
+            {"host": "10.0.0.1", "zmq_port": 50051},
+        )
 
     def test_idle_cycles_retain_received_marker_before_request_appears(self):
         coord = OmniSchedulingCoordinator(stage_id=1)

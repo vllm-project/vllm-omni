@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E offline tests for Qwen3-TTS CustomVoice model with text input and audio output.
 
@@ -64,7 +64,7 @@ def get_prompt():
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
+def test_text_to_audio_001(omni_runner, offline_client) -> None:
     """
     Test text input processing and audio output via offline Omni runner.
     Deploy Setting: qwen3_tts_no_async_chunk.yaml + enforce_eager=true
@@ -74,4 +74,4 @@ def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
     Datasets: few requests
     """
     request_config = {"input": get_prompt(), "voice": "vivian"}
-    omni_runner_handler.send_audio_speech_request(request_config)
+    offline_client.send_audio_speech_request(request_config)

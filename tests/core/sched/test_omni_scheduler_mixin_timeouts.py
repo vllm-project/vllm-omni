@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit coverage for the two stage-input timeout hooks.
 
 ``_process_pending_input_timeouts`` covers the full-payload transport;
@@ -251,6 +251,38 @@ def test_log_failed_chunk_sends_still_reports_a_departed_request(caplog):
 def test_log_failed_chunk_sends_noop_without_adapter():
     scheduler = _FakeSendFailureScheduler({}, None)
     scheduler._log_failed_chunk_sends()
+
+
+class _FakeReceiveFailureAdapter:
+    def __init__(self, failures):
+        self._failures = dict(failures)
+
+    def collect_failed_receive_request_ids(self):
+        failures, self._failures = self._failures, {}
+        return failures
+
+
+class _FakeReceiveFailureScheduler(OmniSchedulerMixin):
+    def __init__(self, requests, adapter):
+        self.requests = requests
+        self.chunk_transfer_adapter = adapter
+        self.finish_calls = []
+
+    def finish_requests(self, req_ids, status):
+        self.finish_calls.append((set(req_ids), status))
+
+
+def test_process_chunk_receive_failures_delegates_to_finish_requests():
+    request_id = "invalid-chunk"
+    adapter = _FakeReceiveFailureAdapter({request_id: "prompt exceeds limit"})
+    scheduler = _FakeReceiveFailureScheduler({request_id: SimpleNamespace(request_id=request_id)}, adapter)
+
+    scheduler._process_chunk_receive_failures()
+
+    assert len(scheduler.finish_calls) == 1
+    finished_ids, status = scheduler.finish_calls[0]
+    assert finished_ids == {request_id}
+    assert getattr(status, "name", str(status)).endswith("FINISHED_ERROR")
 
 
 # --- R1.4: VLLM_OMNI_INPUT_WAIT_TIMEOUT_S is parsed at import time, so each of

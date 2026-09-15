@@ -83,23 +83,23 @@ Online serving:
 vllm serve <your-model> --omni --diffusion-kv-cache-dtype fp8
 ```
 
-Stage config:
+Deploy config:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
-    stage_type: diffusion
-    engine_args:
-      model_stage: dit
-      diffusion_kv_cache_dtype: "fp8"
-      diffusion_kv_cache_skip_steps: "0,1"
-      diffusion_kv_cache_skip_layers: "0-2"
+    diffusion_kv_cache_dtype: "fp8"
+    diffusion_kv_cache_skip_steps: "0,1"
+    diffusion_kv_cache_skip_layers: "0-2"
 ```
 
-Legacy YAML keys `kv_cache_dtype`, `kv_cache_skip_steps`, and
-`kv_cache_skip_layers` are still accepted when constructing
-`OmniDiffusionConfig` (for example via `from_kwargs`); prefer the `diffusion_*`
-names for new configs.
+The `model_stage` and diffusion execution type belong to the registered
+`PipelineConfig`; the deploy YAML only carries runtime overrides.
+
+The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
+`kv_cache_skip_layers` remain accepted when constructing
+`OmniDiffusionConfig` directly. They are not deploy YAML fields; prefer the
+`diffusion_*` names for new code.
 
 ## Parameters
 

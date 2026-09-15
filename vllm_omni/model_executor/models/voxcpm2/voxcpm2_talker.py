@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VoxCPM2 AR talker — PagedAttention pipeline with per-request state.
 
 Architecture:
@@ -42,9 +42,11 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_voxcpm2_profile,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
+from .lora import merge_voxcpm2_lora
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .runtime_config import _VoxCPM2RuntimeConfig
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -157,7 +159,7 @@ def build_voxcpm2_prompt(
     """Build a VoxCPM2 prefill prompt whose ``prompt_token_ids`` length matches
     the talker-side prefill length.
 
-    Used by both online serving (``serving_speech._build_voxcpm2_prompt``) and
+    Used by both online serving (``VoxCPM2Adapter._build_prompt``) and
     the offline example, so the talker-side length assertion never fires.
     """
     ids = split_multichar_chinese(tokenizer.encode(text, add_special_tokens=True), split_map)
@@ -833,6 +835,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
         self._runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(vllm_config)
+        self._startup_lora_applied = False
+        if self._runtime_config.startup_lora_path and vllm_config.load_config.load_format == "dummy":
+            raise ValueError("VoxCPM2 startup LoRA requires real base weights; load_format=dummy is unsupported")
         global _ENABLE_NVTX_PROFILE
         _ENABLE_NVTX_PROFILE = self._runtime_config.enable_nvtx_profile
 
@@ -963,7 +968,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         loaded = 0
         for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="voxcpm2"):
-            tensors = load_validated_profile_tensors(profile, expected_model_type="voxcpm2")
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type="voxcpm2",
+                validate_profile=validate_voxcpm2_profile,
+            )
             if tensors is None:
                 continue
 
@@ -2203,7 +2212,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         assert scaffold_len == tts_len, (
             f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
             "caller must pad prompt_token_ids to the full prefill length "
-            "(see serving_speech._build_voxcpm2_prompt or the offline example)."
+            "(see VoxCPM2Adapter._build_prompt or the offline example)."
         )
         enc_out = base_lm_out.unsqueeze(0)
 
@@ -3013,9 +3022,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     merged_cpu = merged.detach().cpu().float()
                     mm["model_outputs"] = list(merged_cpu.split(sizes))
                     mm["sr"] = [sr for _ in ready_req_ids]
+                    # Dense mode still yields a strict SUBSET of the batch when
+                    # some requests emit no audio this step (e.g. prefill
+                    # phase). Without the marker the runner indexes these
+                    # per-request lists by batch position and misroutes audio
+                    # across requests; the marker declares meta.req_id
+                    # alignment.
+                    mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 else:
                     mm["model_outputs"] = list(audio_by_req.values())
                     mm["sr"] = [sr for _ in audio_by_req]
+                    # Same subset hazard as the coalesce branch above.
+                    mm["meta"] = {"req_id": list(audio_by_req), "sparse_audio": ["1"]}
             elif self._uses_sparse_audio_outputs():
                 mm["model_outputs"] = []
                 mm["sr"] = []
@@ -3270,6 +3288,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"base_lm.": "model."})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._startup_lora_applied:
+            raise ValueError("Reloading VoxCPM2 weights with a startup LoRA is unsupported; restart the server")
+
         def _base_lm_only(ws):
             for name, tensor in ws:
                 if name.startswith("base_lm."):
@@ -3283,6 +3304,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # params as loaded so AutoWeightsLoader's strict check doesn't flag
         # them as missing from the checkpoint.
         loaded |= {name for name, _ in self.named_parameters() if name.startswith(("_tts.", "residual_model."))}
+
+        if adapter_path := self._runtime_config.startup_lora_path:
+            merged = merge_voxcpm2_lora(
+                adapter_path, base_lm=self.model, residual_lm=self.residual_model, tts=self._tts
+            )
+            self._startup_lora_applied = True
+            logger.info("Merged VoxCPM2 startup LoRA from %s into %d linear layers", adapter_path, merged)
 
         logger.info(
             "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype

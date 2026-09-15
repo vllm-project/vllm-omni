@@ -1,34 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Tests of common diffusion feature combinations in online serving mode
 for HunyuanVideo-1.5-T2V (480p).
 
 Coverage (H100, since model cannot fit L4):
-- CacheDiT + Layerwise CPU offloading (1 GPU)
-- CacheDiT + TP=2 + VAE patch parallel=2 (2 GPUs)
+- CPU offloading (1 GPU) — ``core_model`` + ``advanced_model``
+- CacheDiT + Layerwise CPU offloading (1 GPU) — ``full_model``
+- CacheDiT + TP=2 + VAE patch parallel=2 (2 GPUs) — ``full_model``
+
+HunyuanVideo-1.5 is a high-priority model, so only the most basic single-card deployment
+row runs on every PR (L2) and on merge (L3). The heavyweight feature combinations stay
+nightly-only (L4), together with the video similarity suites in
+``tests/e2e/accuracy/hunyuanvideo15_{t2v,i2v}/``.
+
+From ``tests/``::
+
+    pytest -s -v e2e/online_serving/test_hunyuan_video_15_expansion.py -m "core_model and diffusion" --run-level=core_model
+    pytest -s -v e2e/online_serving/test_hunyuan_video_15_expansion.py -m "advanced_model and diffusion" --run-level=advanced_model
+    pytest -s -v e2e/online_serving/test_hunyuan_video_15_expansion.py -m "full_model and diffusion" --run-level=full_model
 """
 
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
+pytestmark = [pytest.mark.diffusion]
 
 PROMPT = "A cat walking across a sunlit garden, cinematic lighting, slow motion."
 NEGATIVE_PROMPT = "low quality, blurry, distorted"
 
 MODEL = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v"
 
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
-
 
 def _get_diffusion_feature_cases(model: str):
-    """Return L4 diffusion feature cases for HunyuanVideo-1.5.
+    """Return diffusion feature cases for HunyuanVideo-1.5.
 
     Designed for 2x H100 environment per issue #1832.
+    Only the CPU-offload row is cheap enough for PR (L2) / merge (L3);
+    CacheDiT / parallel combinations run nightly (L4).
     """
     return [
         # (1 GPU) CPU offload
@@ -40,7 +51,11 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="single_card_cpu_offload",
-            marks=SINGLE_CARD_MARKS,
+            marks=[
+                *hardware_marks(res={"cuda": "H100"}),
+                pytest.mark.core_model,
+                pytest.mark.advanced_model,
+            ],
         ),
         # (1 GPU) CacheDiT + Layerwise CPU offloading
         pytest.param(
@@ -53,7 +68,10 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="single_card_cachedit_layerwise",
-            marks=SINGLE_CARD_MARKS,
+            marks=[
+                *hardware_marks(res={"cuda": ["H100", "B200"]}),
+                pytest.mark.full_model,
+            ],
         ),
         # (2 GPUs) CacheDiT + TP=2 + VAE patch parallel=2
         pytest.param(
@@ -70,7 +88,10 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_cachedit_tp2_vae2",
-            marks=PARALLEL_MARKS,
+            marks=[
+                *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
+                pytest.mark.full_model,
+            ],
         ),
     ]
 
@@ -82,9 +103,9 @@ def _get_diffusion_feature_cases(model: str):
 )
 def test_hunyuan_video_15_t2v(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
-    """L4 diffusion feature coverage for HunyuanVideo-1.5-T2V on H100."""
+    """Diffusion feature coverage for HunyuanVideo-1.5-T2V on H100."""
     form_data = {
         "prompt": PROMPT,
         "negative_prompt": NEGATIVE_PROMPT,
@@ -101,4 +122,4 @@ def test_hunyuan_video_15_t2v(
         "form_data": form_data,
     }
 
-    openai_client.send_video_diffusion_request(request_config)
+    online_client.send_video_diffusion_request(request_config)

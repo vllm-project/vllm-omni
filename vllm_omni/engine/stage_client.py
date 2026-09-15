@@ -35,6 +35,7 @@ class StageClient(Protocol):
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     default_sampling_params: OmniSamplingParams
+    prompt_transform_func: Any | None
     prompt_expand_func: Any | None
     requires_multimodal_data: bool
     custom_process_input_func: Any | None
@@ -93,6 +94,8 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         kv_transfer_port_offset: int = ...,
     ) -> dict[str, Any] | None: ...
 
+    def get_payload_sender_info(self) -> dict[str, Any] | None: ...
+
 
 class StagePoolDiffusionClient(StagePoolClient, Protocol):
     """Pool-facing API for diffusion stages."""
@@ -103,6 +106,7 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None: ...
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...

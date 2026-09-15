@@ -1,10 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import json
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.openai.protocol import (
-    DuplexCapabilities,
+from vllm_omni.entrypoints.duplex.protocol import (
     DuplexOverlapPolicy,
     DuplexSession,
     DuplexSessionConfig,
@@ -14,10 +16,13 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexTurnState,
     ResponseCreateOptions,
 )
-from vllm_omni.experimental.fullduplex.openai.realtime_session import (
+from vllm_omni.entrypoints.duplex.realtime_session import (
     NativeRealtimeSessionProtocol,
 )
-from vllm_omni.experimental.fullduplex.openai.realtime_state import RealtimeStateOwner
+from vllm_omni.entrypoints.duplex.realtime_state import RealtimeStateOwner
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
+    minicpmo45_native_capabilities,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -116,6 +121,7 @@ def test_realtime_model_name_does_not_implicitly_enable_native_duplex():
 
     event = protocol._session_create_from_realtime({"model": "openbmb/MiniCPM-o-4_5"})
 
+    assert "native_duplex" not in event["session"]["extra_body"]
     assert "minicpmo45_native_duplex" not in event["session"]["extra_body"]
 
 
@@ -125,14 +131,44 @@ def test_realtime_explicit_native_duplex_flag_is_preserved():
     event = protocol._session_create_from_realtime(
         {
             "model": "openbmb/MiniCPM-o-4_5",
+            "extra_body": {"native_duplex": True},
+        }
+    )
+
+    assert event["session"]["extra_body"]["native_duplex"] is True
+
+
+def test_realtime_legacy_native_duplex_alias_is_normalized():
+    # The deprecated model-prefixed spelling still opts in, but everything
+    # downstream (and every session echo) sees only the canonical key.
+    protocol = NativeRealtimeSessionProtocol({})
+
+    event = protocol._session_create_from_realtime(
+        {
+            "model": "openbmb/MiniCPM-o-4_5",
             "extra_body": {"minicpmo45_native_duplex": True},
         }
     )
 
-    assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
+    assert event["session"]["extra_body"]["native_duplex"] is True
+    assert "minicpmo45_native_duplex" not in event["session"]["extra_body"]
 
 
 def test_realtime_explicit_query_native_duplex_flag_is_available_before_autostart():
+    protocol = NativeRealtimeSessionProtocol(
+        {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "native_duplex": "1",
+        }
+    )
+
+    event = json.loads(asyncio.run(protocol.receive_internal_event_text(None)))
+
+    assert event["type"] == "session.create"
+    assert event["session"]["extra_body"]["native_duplex"] is True
+
+
+def test_realtime_legacy_query_native_duplex_alias_seeds_canonical_key():
     protocol = NativeRealtimeSessionProtocol(
         {
             "model": "openbmb/MiniCPM-o-4_5",
@@ -143,7 +179,8 @@ def test_realtime_explicit_query_native_duplex_flag_is_available_before_autostar
     event = json.loads(asyncio.run(protocol.receive_internal_event_text(None)))
 
     assert event["type"] == "session.create"
-    assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
+    assert event["session"]["extra_body"]["native_duplex"] is True
+    assert "minicpmo45_native_duplex" not in event["session"]["extra_body"]
 
 
 @pytest.mark.asyncio
@@ -151,7 +188,7 @@ async def test_realtime_resume_heartbeat_and_event_ack_translate_without_session
     protocol = NativeRealtimeSessionProtocol(
         {
             "model": "openbmb/MiniCPM-o-4_5",
-            "minicpmo45_native_duplex": "1",
+            "native_duplex": "1",
         }
     )
 
@@ -217,7 +254,7 @@ async def test_realtime_resume_query_suppresses_model_autostart_on_same_url():
     protocol = NativeRealtimeSessionProtocol(
         {
             "model": "openbmb/MiniCPM-o-4_5",
-            "minicpmo45_native_duplex": "1",
+            "native_duplex": "1",
             "resume": "1",
         }
     )
@@ -291,6 +328,39 @@ def test_realtime_projects_resume_lifecycle_events_without_duplex_prefix():
         "reason": "journal_gap",
         "event_id": resync["event_id"],
     }
+
+
+def test_realtime_projects_listen_response_identity():
+    protocol = NativeRealtimeSessionProtocol({})
+    protocol.encode_outbound_event({"type": "session.created", "session": {"id": "sid-listen"}})
+
+    bound = protocol.encode_outbound_event(
+        {
+            "type": "response.listen",
+            "session_id": "sid-listen",
+            "epoch": 0,
+            "reason": "model_listen",
+            "model_listen": True,
+            "response_id": "resp_1",
+        }
+    )[0]
+    # A listen that terminates a precreated response keeps the response
+    # identity on the Realtime dialect; clients demultiplex on response_id.
+    assert bound["type"] == "response.listen"
+    assert bound["response_id"] == "resp_1"
+    assert bound["response"]["id"] == "resp_1"
+    assert bound["response"]["status"] == "listening"
+
+    anonymous = protocol.encode_outbound_event(
+        {
+            "type": "response.listen",
+            "session_id": "sid-listen",
+            "epoch": 0,
+            "reason": "silence_or_noise",
+        }
+    )[0]
+    assert "response_id" not in anonymous
+    assert "id" not in anonymous["response"]
 
 
 def test_duplex_session_registry_advances_incarnation_when_id_is_reused():
@@ -392,6 +462,54 @@ def test_duplex_playback_ack_tracks_committed_cursor_separately():
     assert session.playback.committed_ms == 2_000
 
 
+@pytest.mark.parametrize("sample_rate_hz,frame_count", [(22_050, 23), (24_000, 24)])
+def test_duplex_generated_audio_rounds_only_cumulative_frames(sample_rate_hz: int, frame_count: int):
+    session = DuplexSessionRegistry().create()
+    response_id = session.begin_response()
+
+    durations = [
+        session.record_generated_audio(response_id, frame_count=1, sample_rate_hz=sample_rate_hz)
+        for _ in range(frame_count)
+    ]
+
+    assert durations[:-1] == [0] * (frame_count - 1)
+    assert durations[-1] == 1
+    assert session.playback.generated_ms == 1
+    assert session.playback.sent_ms == 0
+    assert session.playback.played_ms == 0
+
+
+def test_duplex_generated_audio_rejects_rate_change_without_advancing():
+    session = DuplexSessionRegistry().create()
+    response_id = session.begin_response()
+    session.record_generated_audio(response_id, frame_count=2205, sample_rate_hz=22_050)
+
+    with pytest.raises(ValueError, match="sample rate changed"):
+        session.record_generated_audio(response_id, frame_count=2400, sample_rate_hz=24_000)
+
+    assert session.playback.generated_ms == 100
+    assert session.playback.sent_ms == 0
+
+
+def test_duplex_late_audio_accounting_cannot_change_new_response():
+    session = DuplexSessionRegistry().create()
+    old_response = session.begin_response()
+    session.record_generated_audio(old_response, frame_count=2205, sample_rate_hz=22_050)
+    session.barge_in()
+    new_response = session.begin_response()
+    session.record_generated_audio(new_response, frame_count=2400, sample_rate_hz=48_000)
+    current_state = session.turn_state
+
+    assert session.record_generated_audio(old_response, frame_count=2205, sample_rate_hz=22_050) is None
+    session.mark_audio_sent(100, response_id=old_response, text_chars=99)
+
+    assert session.playback_for_response(old_response).sent_ms == 100
+    assert session.playback.generated_ms == 50
+    assert session.playback.sent_ms == 0
+    assert session.assistant_audio_text_marks == ()
+    assert session.turn_state == current_state
+
+
 def test_duplex_history_commit_uses_audio_text_alignment_marks():
     registry = DuplexSessionRegistry()
     session = registry.create()
@@ -436,7 +554,7 @@ def test_duplex_capabilities_do_not_claim_core_kv_or_input_append():
 
 
 def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
-    caps = DuplexCapabilities.minicpmo45_native(max_sessions=2).as_dict()
+    caps = minicpmo45_native_capabilities(max_sessions=2).as_dict()
 
     assert caps["implementation_level"] == "model_native_duplex"
     assert caps["supports_input_append"] is True
@@ -452,7 +570,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_core_resumable_request"] is True
     assert caps["supports_stage_connector_handoff"] is True
     assert caps["supports_audio_truncate"] is True
-    assert caps["supports_barge_in"] is False
+    assert caps["supports_barge_in"] is True
     assert caps["target_barge_in_latency_ms"] is None
     assert caps["supports_multi_session"] is True
     assert caps["supports_multi_session_same_replica"] is True
@@ -462,8 +580,17 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["stage_handoff_transport"] == "scheduler_data_plane"
 
 
+def test_duplex_overlap_policy_auto_falls_back_to_listen_only():
+    from vllm_omni.entrypoints.duplex.protocol import (
+        DuplexOverlapPolicy,
+        DuplexSessionConfig,
+    )
+
+    assert DuplexSessionConfig._normalize_overlap_policy("auto") == DuplexOverlapPolicy.LISTEN_ONLY.value
+
+
 def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment():
-    caps = DuplexCapabilities.minicpmo45_native(max_sessions=1).as_dict()
+    caps = minicpmo45_native_capabilities(max_sessions=1).as_dict()
 
     assert caps["supports_multi_session"] is False
     assert caps["supports_multi_session_same_replica"] is False

@@ -1,4 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Shared OpenAI serving utilities.
+
+PUT HERE:
+  - Cross-cutting stage-config / LoRA / pipeline helpers reused by multiple
+    OpenAI serving paths (not owned by a single endpoint family).
+
+DO NOT PUT HERE:
+  - Modality endpoint request/job helpers — those go in package ``helpers.py``
+    (e.g. ``images.helpers``, ``video.generation.helpers``).
+  - Pure image/video/audio media encode/decode — those stay in the matching
+    root ``*_utils*`` / mixin until family PRs absorb them.
+
+LONGEVITY:
+  - TODO(#5227, Phase 1): revisit and tidy this file during later OpenAI
+    entrypoint refactor stages; prefer growing endpoint-family helpers over this
+    root grab-bag when ownership is clear.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +36,27 @@ def get_stage_type(stage_cfg: Any) -> str:
         except Exception:
             pass
     return getattr(stage_cfg, "stage_type", "llm")
+
+
+def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
+    """Return whether a pipeline declares a final video output stage."""
+    for stage in stage_configs or ():
+        if isinstance(stage, dict):
+            final_output = stage.get("final_output", False)
+            final_output_type = stage.get("final_output_type")
+        elif hasattr(stage, "get"):
+            try:
+                final_output = stage.get("final_output", False)
+                final_output_type = stage.get("final_output_type")
+            except Exception:
+                final_output = getattr(stage, "final_output", False)
+                final_output_type = getattr(stage, "final_output_type", None)
+        else:
+            final_output = getattr(stage, "final_output", False)
+            final_output_type = getattr(stage, "final_output_type", None)
+        if final_output and final_output_type in {"video", "videos"}:
+            return True
+    return False
 
 
 def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None]:

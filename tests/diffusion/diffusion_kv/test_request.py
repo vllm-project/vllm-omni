@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -10,10 +10,10 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheTensor,
 )
 from vllm.v1.request import RequestStatus
 
+from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVContext, DiffusionKVRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -107,11 +107,8 @@ def test_request_rejects_non_context_values() -> None:
 def _manager(*, enable_caching: bool) -> KVCacheManager:
     # vLLM 0.26 lazily registers its built-in KV specs. Another test may have
     # already registered an out-of-tree spec, making the registry non-empty
-    # before FullAttentionSpec is registered. Initialize the native mappings
-    # explicitly; vLLM 0.25 has no registration hook and needs no setup.
-    register_all = getattr(native_kv_managers, "register_all_kvcache_specs", None)
-    if register_all is not None:
-        register_all(None)
+    # before FullAttentionSpec is registered. Initialize the native mappings.
+    native_kv_managers.register_all_kvcache_specs(None)
 
     spec = FullAttentionSpec(
         block_size=BLOCK_SIZE,
@@ -122,7 +119,7 @@ def _manager(*, enable_caching: bool) -> KVCacheManager:
     group = KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)
     config = KVCacheConfig(
         num_blocks=8,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 8, shared_by=["layer0"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, 8, ["layer0"])],
         kv_cache_groups=[group],
     )
     return KVCacheManager(

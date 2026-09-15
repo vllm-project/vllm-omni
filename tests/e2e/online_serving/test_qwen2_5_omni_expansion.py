@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E Online tests for Qwen2.5-Omni model with video input and audio output.
 """
@@ -59,7 +62,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+def test_mix_to_text_audio_001(omni_server, online_client) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -90,13 +93,13 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     }
 
     # Test single completion
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
+def test_text_to_text_001(omni_server, online_client) -> None:
     """
     Test text input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -114,4 +117,4 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())

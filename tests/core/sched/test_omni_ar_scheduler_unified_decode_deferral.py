@@ -76,6 +76,9 @@ def _make_scheduler(
         else:
             hf_config.voxcpm2_runtime_config = runtime_config
     sched.vllm_config = SimpleNamespace(model_config=model_config)
+    # Upstream ``Scheduler.__init__`` always creates ``skipped_waiting``; the
+    # abort sweep at the top of ``schedule()`` reads it.
+    sched.skipped_waiting = _MockQueue()
     return sched
 
 

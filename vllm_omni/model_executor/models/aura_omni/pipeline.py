@@ -80,6 +80,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
+            requires_full_payload_input=True,
         ),
     ),
 )

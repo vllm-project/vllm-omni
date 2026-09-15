@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Integration tests for the process-wide speaker cache across serving + models."""
 
 import pytest
@@ -26,7 +29,7 @@ class TestSpeakerCacheIntegration:
         assert cache.get(fish_key) is None
         assert cache.get(bob_key) is not None
 
-    def test_singleton_shared_across_call_sites(self, fresh_speaker_cache):
+    def test_singleton_shared_across_call_sites(self, clean_speaker_cache):
         cache_a = get_speaker_cache()
         cache_b = get_speaker_cache()
         assert cache_a is cache_b

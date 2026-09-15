@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Generate a LingBot-World v2 video from an image and camera trajectory.
 
 The official checkpoint is licensed separately under CC BY-NC-SA and is
@@ -30,7 +30,6 @@ from typing import Any
 import numpy as np
 
 _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
-_NUM_INFERENCE_STEPS = 4
 _MAX_SEQUENCE_LENGTH = 512
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_RAW_FRAMES = 117
@@ -100,6 +99,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for tensor parallelism inside the DiT.",
     )
+    parser.add_argument("--ulysses-degree", type=int, default=1, help="Pure Ulysses sequence parallel degree.")
     parser.add_argument("--flow-shift", type=float, default=5.0, help="Positive FlowUniPC scheduler shift.")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second in the exported MP4.")
     parser.add_argument("--output", default="lingbot_world_v2.mp4", help="Output MP4 path.")
@@ -154,20 +154,21 @@ def _positive_finite(value: float, flag: str) -> float:
 def build_omni_kwargs(
     args: argparse.Namespace,
     paths: LingBotPaths,
-    *,
-    parallel_config: Any,
 ) -> dict[str, Any]:
     """Build Omni configuration without overriding checkpoint class discovery."""
 
     if args.tensor_parallel_size <= 0:
         raise ValueError("--tensor-parallel-size must be a positive integer.")
+    if args.ulysses_degree <= 0:
+        raise ValueError("--ulysses-degree must be a positive integer.")
     flow_shift = _positive_finite(args.flow_shift, "--flow-shift")
     model_path = Path(args.model).expanduser()
     model = str(model_path.resolve()) if model_path.exists() else args.model
     return {
         "model": model,
         "flow_shift": flow_shift,
-        "parallel_config": parallel_config,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "ulysses_degree": args.ulysses_degree,
         "enforce_eager": args.enforce_eager,
         "model_config": {"lingbot_action_root": str(paths.action_root)},
     }
@@ -211,7 +212,6 @@ def build_request(
         "height": args.height,
         "width": args.width,
         "num_frames": args.num_frames,
-        "num_inference_steps": _NUM_INFERENCE_STEPS,
         "max_sequence_length": _MAX_SEQUENCE_LENGTH,
         "seed": args.seed,
         "fps": args.fps,
@@ -262,12 +262,10 @@ def main(argv: Sequence[str] | None = None) -> Path:
     # helper tests work on machines without the native vLLM runtime.
     from diffusers.utils import export_to_video
 
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    parallel_config = DiffusionParallelConfig(tensor_parallel_size=args.tensor_parallel_size)
-    omni_kwargs = build_omni_kwargs(args, paths, parallel_config=parallel_config)
+    omni_kwargs = build_omni_kwargs(args, paths)
     omni = Omni(**omni_kwargs)
     try:
         outputs = omni.generate(

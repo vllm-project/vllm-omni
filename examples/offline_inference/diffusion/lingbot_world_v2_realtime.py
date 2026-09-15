@@ -125,7 +125,6 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     # require a CUDA-enabled vLLM installation.
     import torch
 
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.diffusion.models.lingbot_world.actions import LingBotCameraControlReducer
     from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
@@ -141,7 +140,7 @@ async def run(argv: Sequence[str] | None = None) -> Path:
         model=args.model,
         engine_backend="vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
         enforce_eager=args.enforce_eager,
-        parallel_config=DiffusionParallelConfig(tensor_parallel_size=args.tensor_parallel_size),
+        tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=1,
         model_config={
             "ar_diffusion_height": args.height,
@@ -156,7 +155,6 @@ async def run(argv: Sequence[str] | None = None) -> Path:
         height=args.height,
         width=args.width,
         num_frames=9,
-        num_inference_steps=4,
         max_sequence_length=512,
         seed=args.seed,
         output_type="latent",

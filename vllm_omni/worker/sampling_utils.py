@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Sampling-state guards shared by the GPU and NPU AR model runners."""
 
 import torch
@@ -8,7 +8,21 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsPro
 
 logger = init_logger(__name__)
 
-__all__ = ["sanitize_min_tokens_stop_ids"]
+__all__ = ["clamp_prompt_ids_to_penalty_padding", "sanitize_min_tokens_stop_ids"]
+
+
+def clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:
+    """Clamp batch-level pad ids down to ``logits_vocab`` — upstream's
+    designed penalty padding value.
+
+    ``max=logits_vocab`` (NOT ``logits_vocab - 1``) is deliberate: upstream
+    penalty computation allocates ``vocab_size + 1`` bins and drops the last
+    column, so ``vocab_size`` is the padding value that never affects
+    penalties (vllm/model_executor/layers/utils.py::
+    get_token_bin_counts_and_mask). Clamping one lower would count padding
+    as real occurrences of the last vocab token.
+    """
+    return prompt_token_ids.clamp(max=logits_vocab)
 
 
 def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: int) -> None:
@@ -34,7 +48,7 @@ def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: in
         if not min_toks:
             continue
         needs_rebuild = False
-        for _, _, stop_tok_ids in min_toks.values():
+        for _, _, stop_tok_ids, _ in min_toks.values():
             oob = [tok for tok in stop_tok_ids if tok >= logits_vocab]
             if not oob:
                 continue
@@ -49,10 +63,19 @@ def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: in
         if needs_rebuild:
             reqs: list[int] = []
             tok_ids: list[int] = []
-            for index, (_, _, stop_tok_ids) in min_toks.items():
+            restore_reqs: list[int] = []
+            restore_tok_ids: list[int] = []
+            for index, (_, _, stop_tok_ids, uses_structured_output) in min_toks.items():
                 reqs.extend([index] * len(stop_tok_ids))
                 tok_ids.extend(stop_tok_ids)
+                if uses_structured_output:
+                    restore_reqs.extend([index] * len(stop_tok_ids))
+                    restore_tok_ids.extend(stop_tok_ids)
             proc.logits_slice = (
                 proc._device_tensor(reqs, torch.int32),
                 proc._device_tensor(tok_ids, torch.int32),
+            )
+            proc.restore_logits_slice = (
+                proc._device_tensor(restore_reqs, torch.int32),
+                proc._device_tensor(restore_tok_ids, torch.int32),
             )

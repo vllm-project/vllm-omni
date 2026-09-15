@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -119,6 +119,9 @@ def _model_name(model_env_var: str = MODEL_ENV_VAR, component: str = "FL2VA") ->
 def _server_args() -> list[str]:
     return [
         "--trust-remote-code",
+        # Both official-reference requests use fixed shapes. Keep regional
+        # compilation static so cold Inductor codegen is stable across CI nodes.
+        "--no-diffusion-compile-dynamic",
         "--num-gpus",
         "4",
         "--usp",
@@ -135,8 +138,6 @@ def _server_args() -> list[str]:
         "--vae-parallel-mode",
         "tile",
         "--vae-use-tiling",
-        "--diffusion-attention-backend",
-        "FLASH_ATTN",
         "--stage-init-timeout",
         "1800",
         "--init-timeout",
@@ -225,7 +226,7 @@ def _assert_official_video(
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 def test_minimax_h3_i2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:
@@ -301,7 +302,7 @@ def test_minimax_h3_i2va_matches_official_reference(
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 def test_minimax_h3_ref2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:

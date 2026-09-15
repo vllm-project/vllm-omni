@@ -1,6 +1,8 @@
-# Deploy config for Qwen3-Omni-MoE thinker-only checkpoints.
+# Deploy config for Qwen3-Omni-MoE thinker-only (text output, no talker/code2wav).
+# Works for Captioner/Thinking checkpoints and for Instruct weights when this
+# YAML is passed via --deploy-config (pipeline key forces the single-stage topology).
 # Verified on 2x H100-80G GPUs.
-pipeline: qwen3_omni_moe
+pipeline: qwen3_omni_moe_thinker_only
 distributed_executor_backend: mp
 enable_prefix_caching: true
 

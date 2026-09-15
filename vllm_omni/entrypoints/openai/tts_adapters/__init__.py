@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Registry of TTS serving adapters, and the model detection built on it.
 
 Adapters register themselves by their ``name`` (the model-type discriminator)
@@ -19,6 +20,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     OutputPolicy,
     PreparedRequest,
     SpeechServingContext,
+    TTSGenerationError,
     TTSModelAdapter,
 )
 
@@ -102,8 +104,11 @@ def tts_entry_stage_archs() -> frozenset[str]:
 from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     audex,
     audex_tta,
+    audio8_tts,
+    breeze_tts_2,
     cosyvoice3,
     covo_audio,
+    dots_tts,
     fish_speech,
     glm_tts,
     higgs_audio_v2,
@@ -111,6 +116,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     indextts2,
     ming_flash_omni_tts,
     ming_tts,
+    minimax_music3,
     moss_tts,
     omnivoice,
     qwen3_tts,
@@ -125,6 +131,7 @@ __all__ = [
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",
+    "TTSGenerationError",
     "TTSModelAdapter",
     "TTS_ADAPTER_REGISTRY",
     "all_tts_model_types",

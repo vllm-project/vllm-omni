@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for TeaCache extractor functions.
@@ -18,6 +18,7 @@ Currently implemented:
 - TestMiniMaxH3Extractor: MiniMaxH3DiTModel extractor
 """
 
+import math
 from abc import ABC, abstractmethod
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -650,6 +651,29 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         torch.testing.assert_close(actual_video, expected_video)
         torch.testing.assert_close(actual_audio, expected_audio)
 
+    def test_extractor_uses_prepared_rope_table(
+        self,
+        minimax_h3_module,
+        sample_inputs,
+        monkeypatch,
+    ):
+        """TeaCache must consume the denoise-loop RoPE table without rebuilding it."""
+        rope_table = minimax_h3_module.prepare_rope_table(
+            sample_inputs["img_position_ids"],
+            seq_len=sample_inputs["x"].shape[1],
+        )
+
+        def unexpected_rope_build(*args, **kwargs):
+            raise AssertionError("TeaCache extractor rebuilt the prepared RoPE table")
+
+        monkeypatch.setattr(minimax_h3_module, "prepare_rope_table", unexpected_rope_build)
+        monkeypatch.setattr(minimax_h3_module.rope, "forward", unexpected_rope_build)
+        context = extract_minimax_h3_context(
+            minimax_h3_module,
+            **{**sample_inputs, "rope_table": rope_table},
+        )
+        context.run_transformer_blocks()
+
     def test_run_transformer_blocks_forwards_packed_layout(
         self,
         minimax_h3_module,
@@ -704,6 +728,222 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         assert block_calls == 1
         assert video_logits.shape[0] == sample_inputs["img_pos_info"]["position_ids"].shape[0]
         assert audio_logits.shape[0] == sample_inputs["audio_pos_info"]["position_ids"].shape[0]
+
+    @pytest.mark.sp
+    def test_teacache_strict_sp_keeps_cache_state_rank_local(
+        self,
+        minimax_h3_module,
+        sample_inputs,
+        monkeypatch,
+    ):
+        """Strict SP must not mix local TeaCache state with gathered block rows."""
+        from vllm_omni.diffusion.attention.ops import minimax_h3_modulation
+        from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+        from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+        from vllm_omni.diffusion.distributed import parallel_state
+
+        seq_len = sample_inputs["x"].shape[1]
+        local_len = seq_len // 2
+        hidden_size = minimax_h3_module.hidden_size
+        video_width = minimax_h3_module.arch.latents_dim * math.prod(minimax_h3_module.arch.patch_size)
+        audio_width = minimax_h3_module.arch.audio_latents_dim
+        captured_modulation_indices: list[torch.Tensor] = []
+
+        class _StrictSPPrepare(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.global_indices: list[torch.Tensor] = []
+
+            def forward(self, hidden, rope_table, combined_indices):
+                assert hidden.shape[0] == local_len
+                assert rope_table.shape[0] == local_len
+                self.global_indices.append(combined_indices.clone())
+                return hidden, rope_table, combined_indices.narrow(0, 0, local_len)
+
+        class _StrictSPGather(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inputs: list[torch.Tensor] = []
+                self.outputs: list[torch.Tensor] = []
+
+            def forward(self, tensor):
+                self.inputs.append(tensor.clone())
+                if tensor.shape[-1] == hidden_size:
+                    raise AssertionError("TeaCache must not gather hidden states in strict SP")
+                assert tensor.shape == (local_len, video_width + audio_width)
+                # Model the all-gather of compact logits from every SP rank.
+                # postprocess() indexes the resulting global layout with
+                # infer_out_pos/audio_pos, including rows owned by another rank.
+                gathered = tensor.repeat(seq_len // local_len, 1)
+                assert gathered.shape == (seq_len, video_width + audio_width)
+                self.outputs.append(gathered)
+                return gathered
+
+        class _StrictSPGroup:
+            def __init__(self):
+                super().__init__()
+                self.local_decisions: list[int] = []
+                self.ops = []
+
+            def all_reduce(self, decision, op):
+                self.local_decisions.append(int(decision.item()))
+                self.ops.append(op)
+                # Simulate another rank requiring the second step to execute
+                # the collective block path even though this rank would cache.
+                if len(self.local_decisions) == 2:
+                    decision.fill_(1)
+                return decision
+
+        class _StrictSPBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block_indices: list[torch.Tensor] = []
+
+            def adaln_proj(self, t_emb):
+                del t_emb
+                zeros = torch.zeros(3, hidden_size, dtype=torch.float32)
+                return zeros, zeros
+
+            def norm1(self, hidden):
+                return hidden.clone()
+
+            def forward(self, hidden, *, combined_indices, rope_table, **kwargs):
+                del kwargs
+                assert hidden.shape[0] == local_len
+                assert rope_table.shape[0] == local_len
+                self.block_indices.append(combined_indices.clone())
+                return hidden + 1
+
+        class _StrictSPFinalLayer(nn.Module):
+            def forward(self, hidden, *, t_emb, inverse_indices):
+                del t_emb, inverse_indices
+                assert hidden.shape == (local_len, hidden_size)
+                return hidden[:, :video_width].float(), hidden[:, :audio_width].float()
+
+        local_prepare = _StrictSPPrepare()
+        gather = _StrictSPGather()
+        sp_group = _StrictSPGroup()
+        block = _StrictSPBlock()
+        minimax_h3_module.local_sp_prepare = local_prepare
+        minimax_h3_module.sp_gather = gather
+        minimax_h3_module.blocks = nn.ModuleList([block])
+        minimax_h3_module.final_layer = _StrictSPFinalLayer()
+        monkeypatch.setattr(minimax_h3_module, "_rope_local_span", lambda _seq_len: (0, local_len))
+        monkeypatch.setattr(
+            minimax_h3_module,
+            "_embed",
+            lambda **kwargs: (
+                torch.arange(local_len * hidden_size, dtype=torch.float32).reshape(local_len, hidden_size),
+                torch.zeros(3, hidden_size, dtype=torch.float32),
+            ),
+        )
+        monkeypatch.setattr(
+            minimax_h3_module,
+            "prepare_rope_table",
+            lambda *args, **kwargs: torch.zeros(local_len, 6, dtype=torch.float32),
+        )
+        monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
+
+        original_indexed_scale_shift = minimax_h3_modulation.indexed_scale_shift_
+
+        def capture_indexed_scale_shift(hidden, shift, scale, indices):
+            captured_modulation_indices.append(indices.clone())
+            return original_indexed_scale_shift(hidden, shift, scale, indices)
+
+        monkeypatch.setattr(minimax_h3_modulation, "indexed_scale_shift_", capture_indexed_scale_shift)
+
+        local_img_pos = torch.tensor([0, 1])
+        local_audio_pos = torch.tensor([2, 3])
+        token_tags = torch.full((seq_len,), -1, dtype=torch.long)
+        token_tags[local_img_pos] = 0
+        token_tags[local_audio_pos] = 2
+        inverse_indices = torch.zeros(seq_len, dtype=torch.long)
+        inputs = {
+            **sample_inputs,
+            "inverse_indices": inverse_indices,
+            "token_tags": token_tags,
+            "update_mask": torch.ones(local_img_pos.numel(), dtype=torch.bool),
+            "prompt_embeds": torch.empty(0, 6),
+            "img_pos_info": {"position_ids": local_img_pos},
+            "audio_pos_info": {"position_ids": local_audio_pos},
+            "text_pos_info": {"position_ids": torch.empty(0, dtype=torch.long)},
+            "img_pos_for_infer_output_info": {"position_ids": local_img_pos},
+            "refiner_packed_seq_params": {
+                "cu_seqlens_q": torch.tensor([0, 0], dtype=torch.int32),
+                "max_seqlen_q": 0,
+            },
+        }
+        expected_local_indices = (inverse_indices * 3 + token_tags.clamp(min=0))[:local_len]
+
+        hook = TeaCacheHook(
+            TeaCacheConfig(
+                transformer_type="MiniMaxH3DiTModel",
+                rel_l1_thresh=0.3,
+            )
+        )
+        hook.initialize_hook(minimax_h3_module)
+
+        hook.new_forward(minimax_h3_module, **inputs)
+        hook.new_forward(minimax_h3_module, **inputs)
+        video_logits, audio_logits = hook.new_forward(minimax_h3_module, **inputs)
+        state = hook.state_manager.get_state()
+
+        assert state.previous_residual is not None
+        assert state.previous_residual.shape == (local_len, hidden_size)
+        assert len(captured_modulation_indices) == 3
+        assert all(torch.equal(indices, expected_local_indices) for indices in captured_modulation_indices)
+        assert sp_group.local_decisions == [1, 0, 0]
+        assert len(sp_group.ops) == 3
+        assert all(op == torch.distributed.ReduceOp.MAX for op in sp_group.ops)
+        assert len(local_prepare.global_indices) == 2
+        assert all(indices.shape == (seq_len,) for indices in local_prepare.global_indices)
+        assert len(block.block_indices) == 2
+        assert all(torch.equal(indices, expected_local_indices) for indices in block.block_indices)
+        assert len(gather.inputs) == 3
+        assert video_logits.shape == (local_img_pos.numel(), video_width)
+        assert audio_logits.shape == (local_audio_pos.numel(), audio_width)
+
+    @pytest.mark.cpu
+    def test_teacache_non_strict_sp_gathers_hidden_once(
+        self,
+        minimax_h3_module,
+        sample_inputs,
+        monkeypatch,
+    ):
+        """The non-strict SP cache path must not gather global hidden rows twice."""
+        from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+        from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+
+        class _Prepare(nn.Module):
+            def forward(self, hidden, rope_table, combined_indices):
+                return hidden, rope_table, combined_indices
+
+        class _Gather(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inputs: list[torch.Tensor] = []
+
+            def forward(self, tensor):
+                self.inputs.append(tensor.clone())
+                return tensor
+
+        seq_len = sample_inputs["x"].shape[1]
+        gather = _Gather()
+        minimax_h3_module.sp_prepare = _Prepare()
+        minimax_h3_module.sp_gather = gather
+        monkeypatch.setattr(minimax_h3_module, "_rope_local_span", lambda _seq_len: (0, seq_len))
+
+        hook = TeaCacheHook(
+            TeaCacheConfig(
+                transformer_type="MiniMaxH3DiTModel",
+                rel_l1_thresh=0.3,
+            )
+        )
+        hook.initialize_hook(minimax_h3_module)
+        hook.new_forward(minimax_h3_module, **sample_inputs)
+
+        assert len(gather.inputs) == 1
+        assert gather.inputs[0].shape == (seq_len, minimax_h3_module.hidden_size)
 
     def test_invalid_module_raises_error(self):
         """Test that invalid module without blocks raises ValueError."""

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base contract for per-model TTS serving adapters.
 
 This package factors the per-model ``if self._tts_model_type == ...`` dispatch
@@ -10,31 +11,79 @@ instead of editing the shared serving module in ~10 scattered places.
 See the RFC for the full design (issue #4327).
 """
 
+import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
+
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
+DEFAULT_TTS_LANGUAGES = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    }
+)
 
-_conditioning_cache_salt_fn: "Callable[..., str] | None" = None
 
+def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict | None = None) -> str:
+    """Stable hash of the real Stage 0 conditioning for the prefix cache.
 
-def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict) -> str:
-    """Return the conditioning cache salt for ``request`` + ``tts_params``.
+    The talker's vLLM prompt is placeholder token ids; the real inputs are
+    rebuilt from text / ref_audio / ref_text into inputs_embeds. vLLM hashes
+    token ids (folded with cache_salt) for prefix caching, so without a salt
+    every request collides and a hit could reuse KV from a semantically
+    different input.
 
-    Lazily imports and caches ``serving_speech._conditioning_cache_salt`` on first
-    use: the import is deferred to break the adapters<->serving_speech import
-    cycle, and cached so it resolves once instead of on every ``build()`` call.
+    Raw request fields alone are not enough for uploaded voices: resolved
+    conditioning such as ``voice_created_at`` and content-aware ref-audio
+    cache keys must also be folded in. This distinguishes delete/re-upload of
+    the same voice and same-path local audio rewrites without hashing decoded
+    waveform arrays.
     """
-    global _conditioning_cache_salt_fn
-    if _conditioning_cache_salt_fn is None:
-        from vllm_omni.entrypoints.openai.serving_speech import _conditioning_cache_salt
-
-        _conditioning_cache_salt_fn = _conditioning_cache_salt
-    return _conditioning_cache_salt_fn(request, tts_params)
+    h = hashlib.sha256()
+    for part in (
+        request.input,
+        request.task_type,
+        request.language,
+        request.voice,
+        request.ref_text,
+        request.ref_audio,
+        request.instructions,
+        request.x_vector_only_mode,
+        request.speaker_embedding,
+    ):
+        h.update(b"\x00")
+        if part is not None:
+            h.update(repr(part).encode("utf-8"))
+    # Fold conditioning derived by adapters and absent from the raw request.
+    for key in (
+        "voice_created_at",
+        "task_type",
+        "speaker",
+        "ref_text",
+        "x_vector_only_mode",
+        "ref_audio_cache_key",
+        "ref_audio_2_cache_key",
+    ):
+        h.update(b"\x00")
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(repr(value).encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 def apply_max_new_tokens(
@@ -50,6 +99,14 @@ def apply_max_new_tokens(
     sampling_params_list = copy.deepcopy(sampling_params_list)
     sampling_params_list[0].max_tokens = request.max_new_tokens
     return sampling_params_list
+
+
+class TTSGenerationError(RuntimeError):
+    """A completed TTS generation that must not be returned as valid audio."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass
@@ -101,6 +158,14 @@ class SpeechServingContext:
     diffusion_engine: Any | None = None
 
 
+@dataclass(frozen=True)
+class TTSCapabilities:
+    precomputed_speakers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    supported_speakers: frozenset[str] = frozenset()
+    supported_languages: frozenset[str] = DEFAULT_TTS_LANGUAGES
+    codec_frame_rate: float | None = None
+
+
 class TTSModelAdapter(ABC):
     """Mandatory base class for a TTS model served via ``/v1/audio/speech``.
 
@@ -128,8 +193,13 @@ class TTSModelAdapter(ABC):
     detect_priority: ClassVar[int] = 100
     #: Serving backend: ``"ar"`` (engine_client) or ``"diffusion"``.
     backend: ClassVar[str] = "ar"
+    #: Whether streaming entrypoints must retain terminal metrics for validation.
+    validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Target sample rates validated for this adapter's output path. An empty
+    #: set means that the adapter does not expose per-request resampling.
+    supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
 
     max_new_tokens_min = 1
 
@@ -137,6 +207,7 @@ class TTSModelAdapter(ABC):
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         self.ctx = ctx
+        self.capabilities = TTSCapabilities()
 
     @classmethod
     def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
@@ -207,6 +278,49 @@ class TTSModelAdapter(ABC):
         """
         return sampling_params_list
 
+    def validate_generation(
+        self,
+        tts_params: Mapping[str, object],
+        *,
+        stage0_finish_reason: str | None,
+        output_tokens: int,
+    ) -> None:
+        """Reject a completed generation that is invalid for this model.
+
+        Adapters that override this hook must also set
+        :attr:`validates_generation` so streaming entrypoints retain the
+        terminal metrics needed by the validation without charging that cost
+        to unrelated TTS models.
+        """
+
+    async def warmup(self) -> None:
+        return
+
+    def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
+        return None
+
+    def load_capabilities(self) -> TTSCapabilities:
+        self.capabilities = TTSCapabilities(
+            precomputed_speakers=self._load_precomputed_speakers(),
+            supported_speakers=frozenset(self._load_supported_speakers()),
+            supported_languages=self._load_supported_languages(),
+            codec_frame_rate=self._load_codec_frame_rate(),
+        )
+        return self.capabilities
+
+    def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def _load_supported_speakers(self) -> set[str]:
+        # Preserve the legacy default path, which reads talker_config.
+        return load_supported_speakers(self.ctx.engine_client)
+
+    def _load_supported_languages(self) -> frozenset[str]:
+        return DEFAULT_TTS_LANGUAGES
+
+    def _load_codec_frame_rate(self) -> float | None:
+        return load_codec_frame_rate(self.ctx.engine_client)
+
 
 class ARTTSAdapter(TTSModelAdapter):
     """Adapter for models served through the AR ``engine_client`` path.
@@ -250,5 +364,6 @@ __all__ = [
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",
+    "TTSGenerationError",
     "TTSModelAdapter",
 ]

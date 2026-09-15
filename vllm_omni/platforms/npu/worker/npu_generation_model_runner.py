@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import gc
 import logging
 import time
 from collections.abc import Mapping
-from copy import copy, deepcopy
+from copy import copy
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -33,12 +34,15 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
-from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import partition_payload_list
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.mixins import maybe_unpad_input_ids
+from vllm_omni.worker.omni_connector_model_runner_mixin import (
+    OmniConnectorModelRunnerMixin,
+    needs_omni_connector,
+)
 
 
 class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -47,31 +51,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
-        #  -------------------------------------- Omni-new -------------------------------------------------
-        # Mirrors the init allowlist in gpu_generation_model_runner.py. The
-        # connector-role fallback keeps consumer stages whose arch is not on the
-        # allowlist (e.g. MiniCPM-o 4.5 stage 2) from starving on input.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "AudexCode2Wav",
-            "AudexXCodec1",
-            "CosyVoice3Model",
-            "DyninOmniForConditionalGeneration",
-            "IndexTTS2S2MelDecoder",
-        }
-        if (
-            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
-            or get_stage_connector_role(self.model_config) is not None
-        ):
+        if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )
-        #  -------------------------------------- Omni-new -------------------------------------------------
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
@@ -110,25 +93,24 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
-        if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing:
+        profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
+        if profiling_chunk_config.enabled and profiling_chunk_config.need_timing:
             if getattr(scheduler_output, "disable_profiling_timing", False):
-                self.ascend_config.scheduler_config.profiling_chunk_config.need_timing = False
+                profiling_chunk_config.need_timing = False
             else:
                 self._sync_device()
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-        # self._draft_token_ids is None when `input_fits_in_drafter=False`
-        # and there is no draft tokens scheduled. so it need to update the
-        # spec_decoding info in scheduler_output with async_scheduling.
-        # use deepcopy to avoid the modification has influence on the
-        # scheduler_output in engine core process.
-        # TODO(Ronald1995): deepcopy is expensive when there is a large
-        # number of requests, optimize it later.
-        if (
-            self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
-        ):
-            scheduler_output = deepcopy(scheduler_output)
+
+        if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
+            num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
+            spec_decode_tokens_copy = scheduler_output.scheduled_spec_decode_tokens.copy()
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=num_scheduled_tokens_copy,
+                scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+            )
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -161,7 +143,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 #  -------------------------------------- Omni-new -------------------------------------------------
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
-                    self._start_dump_data()
+                    self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
@@ -184,7 +166,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        self._dummy_run(1, skip_gdn_state_update=True)
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
@@ -198,7 +180,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                         "it when the requests need prompt logprobs"
                     )
 
-                self._start_dump_data()
+                self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -355,6 +337,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             )
 
             #  -------------------------------------- Omni-new -------------------------------------------------
+            # [Omni] Exact-shape models need input_ids at its real token count (#6712).
+            input_ids = maybe_unpad_input_ids(self.model, input_ids, scheduler_output.total_num_scheduled_tokens)
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
             if getattr(self.model, "requires_request_ids", False):
@@ -368,13 +352,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
 
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        if self.calculate_kv_scales:  # type: ignore[has-type]
-            cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False  # type: ignore[has-type]
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
@@ -450,6 +427,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -565,8 +543,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         if self.speculative_config is not None:
             self.finalize_kv_connector()
 
-        if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing and hasattr(
-            self, "_execution_start_time"
+        if (
+            profiling_chunk_config.enabled
+            and profiling_chunk_config.need_timing
+            and hasattr(self, "_execution_start_time")
         ):
             self._sync_device()
             output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
@@ -656,6 +636,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         randomize_inputs: bool = False,
+        skip_gdn_state_update: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.is_valid_runtime_mode()
@@ -788,7 +769,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
-                    self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                    if skip_gdn_state_update:
+                        self.gdn_query_start_loc.np.fill(0)
+                    else:
+                        self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -806,6 +790,12 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 # rows as well so device-side metadata does not see stale block ids.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+                # Invalidate slots before backends copy metadata for dummy execution.
+                if not is_graph_capturing:
+                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                        blk_table = self.input_batch.block_table[kv_cache_gid]
+                        blk_table.slot_mapping.gpu.fill_(-1)
+
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -816,11 +806,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                     for_cudagraph_capture=is_graph_capturing,
                     num_scheduled_tokens_np=num_scheduled_tokens,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    skip_gdn_state_update=skip_gdn_state_update,
                 )
-                if not is_graph_capturing:
-                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                        blk_table = self.input_batch.block_table[kv_cache_gid]
-                        blk_table.slot_mapping.gpu.fill_(-1)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -875,9 +864,9 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
-                # When PP and flashcomm1 are enabled, during dummy_run the estimated space should divide num_tokens by
-                # tp_size; otherwise, on non-first PP ranks it would effectively perform an extra all-gather, leading
-                # to incorrect memory estimation and potentially causing OOM.
+                # When PP and sequence parallelism are enabled, during dummy_run the estimated space should divide
+                # num_tokens by tp_size; otherwise, on non-first PP ranks it would effectively perform an extra
+                # all-gather, leading to incorrect memory estimation and potentially causing OOM.
                 intermediate_tokens = num_tokens_padded
                 if enable_sp():
                     tp_size = get_tensor_model_parallel_world_size()

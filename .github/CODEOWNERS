@@ -79,8 +79,6 @@
 /vllm_omni/model_executor/models/ @tzhouam @gcanlin @Sy0307 @amy-why-3459 @linyueqian
 /vllm_omni/model_extras/ @tzhouam @gcanlin @princepride
 /vllm_omni/plugins/ @gcanlin @tjtanaa @xuechendi
-# Config override within model_executor — docs/design/module/vllm_omni_config.md
-/vllm_omni/model_executor/stage_configs/ @lishunyang12 @alex-jw-brooks
 
 # Execution platforms (hardware backends) — docs/design/module/execution_platforms.md
 /vllm_omni/platforms/ @gcanlin @tjtanaa @xuechendi
