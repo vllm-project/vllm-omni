@@ -428,7 +428,34 @@ def _daily_omni_repo_from_args(args) -> str | None:
     return None
 
 
+_DIFFUSION_ENDPOINTS = frozenset({
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/videos",
+})
+
+_DIFFUSION_BACKENDS = frozenset({
+    "openai-image-gen-omni",
+    "openai-image-edits-omni",
+    "openai-video-omni",
+})
+
+
+def _is_diffusion_get_samples(args) -> bool:
+    endpoint = getattr(args, "endpoint", None) or ""
+    backend = getattr(args, "backend", None) or ""
+    return endpoint in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_BACKENDS
+
+
 def get_samples(args, tokenizer):
+    # Diffusion models have no tokenizer — handle them before anything else.
+    if _is_diffusion_get_samples(args):
+        from vllm_omni.benchmarks.data_modules.diffusion_dataset import (
+            load_diffusion_samples,
+        )
+
+        return load_diffusion_samples(args)
+
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
