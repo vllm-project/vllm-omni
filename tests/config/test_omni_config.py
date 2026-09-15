@@ -1480,7 +1480,7 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
-    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
     assert od_config.kv_transfer_config.engine_id == "dit-engine-1"
 
@@ -1705,3 +1705,31 @@ def test_compact_offload_config_is_validated_during_projection():
                 "components": ["dit"],
             }
         )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_diffusion_quantization_origin_survives_projection_and_transport(monkeypatch, explicit):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.quantization import build_quant_config
+
+    checkpoint = TransformerConfig.from_dict(
+        {
+            "quantization_config": {
+                "quant_method": "mxfp4",
+                "is_checkpoint_mxfp4_serialized": True,
+                "w4a8_fallback_steps": [37],
+            }
+        }
+    )
+    requested = build_quant_config("mxfp4", w4a8_fallback_steps=[]) if explicit else None
+    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        tf_model_config=checkpoint,
+        quantization_config=requested,
+    )
+    assert cfg.quantization_config_is_auto_detected is not explicit
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+    monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda self: self.set_tf_model_config(checkpoint))
+    cfg.enrich_config()
+    restored = ForkingPickler.loads(ForkingPickler.dumps(cfg))
+    assert restored.quantization_config_is_auto_detected is not explicit
+    assert restored.quantization_config.w4a8_fallback_steps == ([] if explicit else [37])

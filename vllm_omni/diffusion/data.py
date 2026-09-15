@@ -1012,6 +1012,8 @@ class OmniDiffusionConfig:
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
     quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    # Internal provenance, retained across config projection and worker transport.
+    quantization_config_is_auto_detected: bool = False
     # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
@@ -1349,6 +1351,8 @@ class OmniDiffusionConfig:
             or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
         )
         if should_use_checkpoint_config:
+            if self.quantization_config is None:
+                self.quantization_config_is_auto_detected = True
             self.quantization_config = tf_config.quant_config
             logger.info(
                 "Auto-detected quantization '%s' from model config",

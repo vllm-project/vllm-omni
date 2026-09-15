@@ -814,6 +814,8 @@ class _DiffusionConfigProjection:
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
+    # Internal provenance, retained across config projection and worker transport.
+    quantization_config_is_auto_detected: bool = False
     extras: dict[str, Any] = field(default_factory=dict)
 
     @field_validator("kv_transfer_config", mode="before")
@@ -961,6 +963,8 @@ class _DiffusionConfigProjection:
             or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
         )
         if should_use_checkpoint_config:
+            if self.quantization_config is None:
+                self.quantization_config_is_auto_detected = True
             self.quantization_config = quant_config
             if quant_method is not None:
                 self.additional_config.setdefault("auto_detected_quant_method", quant_method)
