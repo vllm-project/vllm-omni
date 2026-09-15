@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -40,9 +40,23 @@ from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNormZero,
     AdaLayerNormZeroSingle,
 )
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_joint_qkv_norm_rope,
+    fused_qk_norm_rope,
+    pack_qk_norm_rope_table,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
+
+# Joint-sequence token count (B * (txt + img)) below which the attention
+# blocks keep their eager RMSNorm -> cat -> RoPE chain; the fused path won at
+# every size measured on H200 for this chain (see Flux.2), so fuse by default
+# and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
+_FUSED_MIN_TOKENS = 0
+# joint_attention_kwargs key carrying the per-forward packed RoPE table.
+_QK_NORM_ROPE_TABLE_KEY = "qk_norm_rope_table"
 
 
 class ColumnParallelApproxGELU(nn.Module):
@@ -225,8 +239,16 @@ class FluxAttention(torch.nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
+        # forward supplied the packed table and the CUDA kernel accepts the
+        # geometry; otherwise the original eager chain.
+        qk_norm_rope_table = kwargs.get(_QK_NORM_ROPE_TABLE_KEY)
+        use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
+            query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
+        )
+        if not use_fused_qk_norm_rope:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
             encoder_hidden_states = encoder_hidden_states.contiguous()
@@ -241,14 +263,46 @@ class FluxAttention(torch.nn.Module):
             encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
 
-            encoder_query = self.norm_added_q(encoder_query)
-            encoder_key = self.norm_added_k(encoder_key)
+            if use_fused_qk_norm_rope:
+                # One launch writes joint Q/K/V in attention's input layout.
+                query, key, value = fused_joint_qkv_norm_rope(
+                    encoder_query,
+                    encoder_key,
+                    encoder_value,
+                    query,
+                    key,
+                    value,
+                    self.norm_added_q.weight,
+                    self.norm_added_k.weight,
+                    self.norm_q.weight,
+                    self.norm_k.weight,
+                    qk_norm_rope_table,
+                    self.norm_q.variance_epsilon,
+                )
+            else:
+                encoder_query = self.norm_added_q(encoder_query)
+                encoder_key = self.norm_added_k(encoder_key)
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-
-        query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+                query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
+        elif use_fused_qk_norm_rope:
+            batch_size, seq_len, num_heads, head_dim = query.shape
+            num_kv_heads = key.shape[2]
+            query, key = fused_qk_norm_rope(
+                query.reshape(batch_size * seq_len, num_heads, head_dim),
+                key.reshape(batch_size * seq_len, num_kv_heads, head_dim),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                qk_norm_rope_table,
+                self.norm_q.variance_epsilon,
+                interleaved=True,
+            )
+            query = query.view(batch_size, seq_len, num_heads, head_dim)
+            key = key.view(batch_size, seq_len, num_kv_heads, head_dim)
+        else:
+            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
 
         attn_metadata = None
         if attention_mask is not None:
@@ -478,6 +532,24 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
+def _with_qk_norm_rope_table(
+    joint_attention_kwargs: dict[str, Any] | None,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> dict[str, Any] | None:
+    """Return the block kwargs with one packed ``[cos | sin]`` table for the
+    fused QK RMSNorm + RoPE of every block (double blocks: joint text/image
+    op; single blocks: joint sequence). Stored in the activation dtype — the
+    eager chain rotates with ``cos``/``sin`` cast to that dtype too."""
+    cos, sin = image_rotary_emb
+    table = pack_qk_norm_rope_table(
+        cos, sin, hidden_states.shape[0], dtype=hidden_states.dtype, min_tokens=_FUSED_MIN_TOKENS
+    )
+    if table is None:
+        return joint_attention_kwargs
+    return {**(joint_attention_kwargs or {}), _QK_NORM_ROPE_TABLE_KEY: table}
+
+
 class FluxTransformer2DModel(nn.Module):
     """
     The Transformer model introduced in Flux.
@@ -685,6 +757,7 @@ class FluxTransformer2DModel(nn.Module):
             image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
         else:
             image_rotary_emb = self.pos_embed(ids)
+        joint_attention_kwargs = _with_qk_norm_rope_table(joint_attention_kwargs, image_rotary_emb, hidden_states)
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -829,6 +902,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
         image_rotary_emb = self.pos_embed(ids)
+        joint_attention_kwargs = _with_qk_norm_rope_table(joint_attention_kwargs, image_rotary_emb, hidden_states)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
