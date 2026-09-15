@@ -1,7 +1,8 @@
 // JIT build of pytorch/pytorch#178230 all_to_all_permute (Ulysses-style fused
 // permute-free all-to-all over NCCL symmetric memory).
 //
-// Kernel is verbatim from the PR; the host entry point is adapted to the
+// Kernel is ported from the PR, including the flattened-copy throughput fix
+// from pytorch/pytorch#187778. The host entry point is adapted to the
 // NCCLDevCommManager API shipped in torch 2.11 (we obtain the host ncclComm_t
 // via the manager and create our own ncclDevComm with enough LSA barriers,
 // cached per group — the PR's keyed-devcomm manager API is not in 2.11).
@@ -61,36 +62,16 @@ void copy_rows(const at::Tensor& input, at::Tensor& out) {
       stream));
 }
 
-// ---- kernel (verbatim from PR) ----------------------------------------------
-__device__ inline void copy_bytes_vec16_aligned(
-    const char* src, char* dst, size_t nbytes, size_t tid, size_t stride) {
-  const size_t n_vec = nbytes / 16;
-  constexpr int kUnroll = 4;
-  size_t vec_idx = tid;
-  for (; vec_idx + static_cast<size_t>(kUnroll - 1) * stride < n_vec;
-       vec_idx += static_cast<size_t>(kUnroll) * stride) {
-    at::native::memory::Vec<16> chunk[kUnroll];
-#pragma unroll 4
-    for (int u = 0; u < kUnroll; ++u) {
-      const size_t i = vec_idx + static_cast<size_t>(u) * stride;
-      chunk[u] = at::native::memory::ld_vec<16>(src + i * 16);
-    }
-#pragma unroll 4
-    for (int u = 0; u < kUnroll; ++u) {
-      const size_t i = vec_idx + static_cast<size_t>(u) * stride;
-      at::native::memory::st_vec<16>(dst + i * 16, chunk[u]);
-    }
-  }
-  for (; vec_idx < n_vec; vec_idx += stride) {
-    auto v = at::native::memory::ld_vec<16>(src + vec_idx * 16);
-    at::native::memory::st_vec<16>(dst + vec_idx * 16, v);
-  }
-}
-
+// ---- kernel ------------------------------------------------------------------
 constexpr int A2A_MAX_SLOTS = 64;
-constexpr int A2A_MAX_CTAS_PER_SLOT = 128;
-constexpr int A2A_THREADS_PER_CTA = 128;
+// 16 CTAs/peer underfills large GPUs at TP=4 (only 64 CTAs total). 64 gives
+// enough independent remote loads to cover LSA latency without the extra waves
+// and barrier state of the previous 128-CTA limit.
+constexpr int A2A_MAX_CTAS_PER_SLOT = 64;
+constexpr int A2A_THREADS_PER_CTA = 256;
 constexpr int A2A_MAX_CTA_COUNT = A2A_MAX_SLOTS * A2A_MAX_CTAS_PER_SLOT;
+// Target 16-byte vectors per thread before adding another CTA to a peer slot.
+constexpr int64_t A2A_VECS_PER_THREAD = 4;
 
 __global__ void all_to_all_lsa_kernel(
     ncclWindow_t window,
@@ -103,7 +84,6 @@ __global__ void all_to_all_lsa_kernel(
     size_t dst_row_stride_bytes,
     ncclDevComm devComm) {
   const int peer_idx = blockIdx.x;
-  const int local_block = blockIdx.y;
   const ncclCoopCta coop{};
 
   ncclLsaBarrierSession<ncclCoopCta> bar{
@@ -111,21 +91,56 @@ __global__ void all_to_all_lsa_kernel(
       blockIdx.x * gridDim.y + blockIdx.y};
   bar.sync(coop, cuda::memory_order_acquire);
 
-  unsigned char* dst_peer_base =
-      out + static_cast<size_t>(peer_idx) * peer_stride_bytes;
-  CUDA_KERNEL_ASSERT((base_src_byte_offset & 15) == 0);
+  // Resolve the peer's LSA base once per CTA. The pointer is offsettable within
+  // the symmetric window, so rows can be addressed with ordinary arithmetic.
+  const char* src_peer_base = reinterpret_cast<const char*>(
+      ncclGetLsaPointer(window, base_src_byte_offset, peer_idx));
+  char* dst_peer_base = reinterpret_cast<char*>(out) +
+      static_cast<size_t>(peer_idx) * peer_stride_bytes;
+  CUDA_KERNEL_ASSERT((reinterpret_cast<uintptr_t>(src_peer_base) & 15) == 0);
   CUDA_KERNEL_ASSERT((reinterpret_cast<uintptr_t>(dst_peer_base) & 15) == 0);
 
-  for (int i = local_block; i < num_rows; i += gridDim.y) {
-    const size_t row_byte_offset =
-        base_src_byte_offset + static_cast<size_t>(i) * src_row_stride_bytes;
-    const void* src_row = ncclGetLsaPointer(window, row_byte_offset, peer_idx);
-    unsigned char* dst_row =
-        dst_peer_base + static_cast<size_t>(i) * dst_row_stride_bytes;
-    copy_bytes_vec16_aligned(
-        reinterpret_cast<const char*>(src_row),
-        reinterpret_cast<char*>(dst_row),
-        copy_row_bytes, coop.thread_rank(), coop.size());
+  // Flatten (row, column-vector) into one vector index. This lets threads carry
+  // work across row boundaries and issue four independent remote loads before
+  // the corresponding local stores, hiding LSA read latency even for rows that
+  // are too narrow to trigger a four-way unroll on their own.
+  constexpr int kUnroll = 4;
+  const int64_t vecs_per_row = static_cast<int64_t>(copy_row_bytes >> 4);
+  const int64_t total_vecs = static_cast<int64_t>(num_rows) * vecs_per_row;
+  const int64_t stride = static_cast<int64_t>(gridDim.y) * blockDim.x;
+  int64_t gv = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+  for (; gv + (kUnroll - 1) * stride < total_vecs;
+       gv += kUnroll * stride) {
+    at::native::memory::Vec<16> chunk[kUnroll];
+    size_t dst_offsets[kUnroll];
+#pragma unroll 4
+    for (int k = 0; k < kUnroll; ++k) {
+      const int64_t g = gv + static_cast<int64_t>(k) * stride;
+      const int64_t row = g / vecs_per_row;
+      const int64_t vec = g - row * vecs_per_row;
+      const size_t vec_byte_offset = static_cast<size_t>(vec) << 4;
+      const size_t src_offset =
+          static_cast<size_t>(row) * src_row_stride_bytes + vec_byte_offset;
+      dst_offsets[k] =
+          static_cast<size_t>(row) * dst_row_stride_bytes + vec_byte_offset;
+      chunk[k] = at::native::memory::ld_vec<16>(src_peer_base + src_offset);
+    }
+#pragma unroll 4
+    for (int k = 0; k < kUnroll; ++k) {
+      at::native::memory::st_vec<16>(dst_peer_base + dst_offsets[k], chunk[k]);
+    }
+  }
+  for (; gv < total_vecs; gv += stride) {
+    const int64_t row = gv / vecs_per_row;
+    const int64_t vec = gv - row * vecs_per_row;
+    const size_t vec_byte_offset = static_cast<size_t>(vec) << 4;
+    const size_t src_offset =
+        static_cast<size_t>(row) * src_row_stride_bytes + vec_byte_offset;
+    const size_t dst_offset =
+        static_cast<size_t>(row) * dst_row_stride_bytes + vec_byte_offset;
+    at::native::memory::st_vec<16>(
+        dst_peer_base + dst_offset,
+        at::native::memory::ld_vec<16>(src_peer_base + src_offset));
   }
   bar.sync(coop, cuda::memory_order_release);
 }
@@ -194,8 +209,8 @@ void all_to_all_permute(
   TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0, "a2a_permute: input ptr must be 16B aligned");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "a2a_permute: out ptr must be 16B aligned");
 
-  const int unroll = 4 * 16 / static_cast<int>(esize);
-  const int elems_per_cta = A2A_THREADS_PER_CTA * unroll;
+  constexpr int64_t vecs_per_cta =
+      A2A_THREADS_PER_CTA * A2A_VECS_PER_THREAD;
   int ctas_per_slot = 1;
 
   if (col_scatter) {
@@ -219,7 +234,13 @@ void all_to_all_permute(
     TORCH_CHECK(ok3 || ok2, "a2a_permute: bad out shape for (1,0)");
     const size_t row_bytes = (size_t)local_cols * (size_t)esize;
     TORCH_CHECK(row_bytes % 16 == 0, "a2a_permute: local_cols*esize must be 16B-divisible");
-    ctas_per_slot = std::max(1, std::min((rows * local_cols + elems_per_cta - 1) / elems_per_cta, A2A_MAX_CTAS_PER_SLOT));
+    const int64_t total_vecs =
+        static_cast<int64_t>(rows) * static_cast<int64_t>(row_bytes >> 4);
+    ctas_per_slot = static_cast<int>(std::max<int64_t>(
+        1,
+        std::min<int64_t>(
+            (total_vecs + vecs_per_cta - 1) / vecs_per_cta,
+            A2A_MAX_CTAS_PER_SLOT)));
     const size_t esz = (size_t)esize;
     const size_t base_src = tensor_leading_offset + (size_t)my_rank * (size_t)local_cols * esz;
     all_to_all_lsa_kernel<<<dim3(p, ctas_per_slot), A2A_THREADS_PER_CTA, 0, stream>>>(
@@ -246,7 +267,13 @@ void all_to_all_permute(
     TORCH_CHECK(ok3 || ok2, "a2a_permute: bad out shape for (0,1)");
     const size_t row_bytes = (size_t)cols * (size_t)esize;
     TORCH_CHECK(row_bytes % 16 == 0, "a2a_permute: cols*esize must be 16B-divisible");
-    ctas_per_slot = std::max(1, std::min((local_rows * cols + elems_per_cta - 1) / elems_per_cta, A2A_MAX_CTAS_PER_SLOT));
+    const int64_t total_vecs =
+        static_cast<int64_t>(local_rows) * static_cast<int64_t>(row_bytes >> 4);
+    ctas_per_slot = static_cast<int>(std::max<int64_t>(
+        1,
+        std::min<int64_t>(
+            (total_vecs + vecs_per_cta - 1) / vecs_per_cta,
+            A2A_MAX_CTAS_PER_SLOT)));
     const size_t esz = (size_t)esize; const size_t cu = (size_t)cols;
     const size_t base_src = tensor_leading_offset + (size_t)(my_rank * local_rows) * cu * esz;
     all_to_all_lsa_kernel<<<dim3(p, ctas_per_slot), A2A_THREADS_PER_CTA, 0, stream>>>(
