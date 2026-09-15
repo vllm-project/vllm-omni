@@ -59,6 +59,7 @@ from torch.nn import Module
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
+    LinearMethodBase,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -863,3 +864,108 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
                 "DiffusionMXFP4DualScaleMixedConfig is currently only supported on NPU (Ascend) platforms."
             )
         return NPUMxfp4DualScaleOnlineLinearMethod(self)
+
+
+# ---------------------------------------------------------------------------
+# XPU method — built directly on XPUMxFp4LinearKernel
+#
+# Same split as MXFP8: the kernel owns the packed-weight / e8m0-scale relayout
+# and the fp4_gemm call, so vLLM's INC method layer is not depended on.
+# ---------------------------------------------------------------------------
+
+try:
+    from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
+    from vllm.model_executor.kernels.linear.mxfp4.xpu import XPUMxFp4LinearKernel
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
+    from vllm.model_executor.parameter import GroupQuantScaleParameter
+except ImportError as e:
+    raise ImportError(
+        "vLLM MXFP4 support is not available. "
+        "MXFP4 quantization requires vLLM with XPUMxFp4LinearKernel support. "
+        "Please upgrade vLLM or use a compatible build."
+    ) from e
+
+MXFP4_PACK_FACTOR = 2  # two E2M1 values per uint8
+
+
+class VllmMxfp4OfflineLinearMethod(LinearMethodBase):
+    """Offline MXFP4 linear method for AutoRound checkpoints (data_type="mx_fp").
+
+    Weights arrive packed two E2M1 values per byte, with one uint8 e8m0 scale per
+    ``group_size`` input elements. Layout normalization and the GEMM are the
+    kernel's; activations are flattened to ``(M, K)`` for diffusion.
+    """
+
+    def __init__(self, group_size: int = 32) -> None:
+        self.group_size = group_size
+        self.kernel = XPUMxFp4LinearKernel(MxFp4LinearLayerConfig(activation_quant_key=kMxfp4Dynamic))
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        if input_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                f"MXFP4 requires input_size_per_partition ({input_size_per_partition}) "
+                f"to be divisible by {self.group_size}."
+            )
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        # Checkpoint key is weight_packed; renamed to weight before the kernel
+        # relayout, which views it as float4_e2m1fn_x2.
+        layer.register_parameter(
+            "weight_packed",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // MXFP4_PACK_FACTOR,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale",
+            GroupQuantScaleParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // self.group_size,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        layer.weight = torch.nn.Parameter(layer.weight_packed.data, requires_grad=False)
+        del layer.weight_packed
+        self.kernel.process_weights_after_loading(layer)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.dim() <= 2:
+            return self.kernel.apply_weights(layer, x, bias)
+        ori_shape = x.shape
+        output = self.kernel.apply_weights(layer, x.reshape(-1, ori_shape[-1]), bias)
+        return output.reshape(*ori_shape[:-1], -1)
