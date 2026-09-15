@@ -11,9 +11,6 @@ prompt-embeds builder runs on CPU and the result is moved back to NPU
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from enum import Enum
-
 import torch
 import torch.nn as nn
 import torch_npu
@@ -30,21 +27,6 @@ _A5_PATCHED = False
 _original_init = None
 _original_load_weights = None
 _ACL_FORMAT_FRACTAL_Z = 4
-
-
-class Code2WavDtype(str, Enum):
-    """Supported NPU Code2Wav decoder compute dtypes."""
-
-    FP32 = "fp32"
-    BF16 = "bf16"
-    FP16 = "fp16"
-
-
-_CODE2WAV_TORCH_DTYPES = {
-    Code2WavDtype.FP32: torch.float32,
-    Code2WavDtype.BF16: torch.bfloat16,
-    Code2WavDtype.FP16: torch.float16,
-}
 
 
 def _prepare_npu_code2wav_runtime() -> None:
@@ -82,40 +64,20 @@ def _prepare_npu_decoder_weights(decoder: nn.Module) -> None:
     logger.info("Prepared NPU Code2Wav weights: linear=%d conv=%d", linear_count, conv_count)
 
 
-def resolve_npu_code2wav_runtime_dtype(vllm_config: VllmConfig) -> torch.dtype:
-    """Resolve an explicit decoder dtype, preserving FP32 when unset."""
-    additional_config = getattr(vllm_config, "additional_config", None)
-    configured_dtype = (
-        additional_config.get("code2wav_dtype", Code2WavDtype.FP32)
-        if isinstance(additional_config, Mapping)
-        else Code2WavDtype.FP32
-    )
-    if configured_dtype is None:
-        configured_dtype = Code2WavDtype.FP32
-    try:
-        dtype = Code2WavDtype(configured_dtype)
-    except (TypeError, ValueError) as exc:
-        supported = ", ".join(item.value for item in Code2WavDtype)
-        raise ValueError(f"Unsupported Code2Wav dtype {configured_dtype!r}; expected one of: {supported}") from exc
-    return _CODE2WAV_TORCH_DTYPES[dtype]
-
-
 def _patched_load_weights(self, weights):
     assert _original_load_weights is not None
     loaded = _original_load_weights(self, weights)
     device = self.vllm_config.device_config.device
     platform_dtype_override = getattr(self, "_npu_decoder_runtime_dtype", None)
     if platform_dtype_override is not None:
-        # 310P requires FP16 and deliberately overrides the general NPU YAML.
+        # 310P requires FP16 and deliberately overrides the stage dtype.
         runtime_dtype = platform_dtype_override(device)
-    else:
-        runtime_dtype = resolve_npu_code2wav_runtime_dtype(self.vllm_config)
-    self.decoder.to(device=device, dtype=runtime_dtype)
+        self.decoder.to(device=device, dtype=runtime_dtype)
+        if hasattr(self.decoder, "precompute_snake_caches"):
+            self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
     actual_dtype = next(self.decoder.parameters()).dtype
     logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
-    if runtime_dtype != torch.float32 and hasattr(self.decoder, "precompute_snake_caches"):
-        self.decoder.precompute_snake_caches()
     return loaded
 
 
