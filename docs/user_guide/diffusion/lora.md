@@ -155,6 +155,52 @@ checkpoint second to `--lora-path`.
 !!! note "Server-side Path Requirement"
     The LoRA adapter path (`local_path`) must be readable on the **server** machine. If your client and server are on different machines, ensure the LoRA adapter is accessible via a shared mount or copied to the server.
 
+## Merge-on-Load
+
+`lora_merge_on_load=True` folds the active adapter into the base weights at
+activation time instead of computing the LoRA delta on every forward pass.
+This removes all per-forward LoRA cost — the delta matmuls in eager pipelines,
+and the torch.compile graph fragmentation that installed LoRA wrappers cause
+in compiled pipelines. When compatible resident adapters are switched, shared
+targets are overwritten directly from the pristine base plus the new delta;
+only targets used by the old adapter but not the new one need a separate
+restore. Deactivating or removing the active adapter restores the original
+weights exactly.
+
+```python
+omni = Omni(
+    model="stabilityai/stable-diffusion-3.5-medium",
+    lora_path=lora_path,
+    lora_merge_on_load=True,
+)
+```
+
+Best suited to workloads that keep one adapter active for many generations
+(a static style adapter, or RL rollout where the adapter is re-synced per
+training step). Constraints:
+
+- Target layers must be unquantized; otherwise standard LoRA wrappers are
+  installed instead (with a warning).
+- Incompatible with `enable_layerwise_offload` and
+  `enable_distributed_layerwise_offload` (falls back to wrappers). Plain
+  `enable_cpu_offload` is safe.
+- A pristine copy of every targeted weight is kept for the lifetime of the
+  process (roughly the size of the adapter's target layers), so switching
+  adapters is exact.
+- Adapter IDs are immutable versions: changing the files behind an active ID
+  is not an update. Register the new revision with a new `lora_int_id`, keep
+  cache capacity for both revisions, and switch directly before removing the
+  old ID. Removing the active ID first necessarily pays the restore cost.
+- Shared/overlapping weight storage is rejected by the direct path. Parameter
+  objects, storage addresses, shapes, strides, and dtypes are preserved for
+  supported weights.
+
+Treat the direct overwrite path as single-rank eager-only unless the target
+configuration is separately validated. Preserving parameter identity alone
+does not establish CUDA Graph,
+`torch.compile`, tensor-parallel, or concurrent-update safety; validate those
+modes for the target workload before enabling them in production.
+
 ## Wan2.2 LightX2V Offline Assembly
 
 This workflow is LoRA-adjacent: it uses external LightX2V conversion plus
