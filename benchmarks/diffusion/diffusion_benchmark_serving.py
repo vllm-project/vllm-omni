@@ -1087,6 +1087,12 @@ async def _run_warmups(
 
     warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    failed_count = sum(not output.success for output in warmup_outputs)
+    if failed_count:
+        raise RuntimeError(
+            f"{failed_count}/{len(warmup_outputs)} warmup requests failed; "
+            "check server logs before running the benchmark."
+        )
     return list(zip(warmup_requests, warmup_outputs))
 
 
