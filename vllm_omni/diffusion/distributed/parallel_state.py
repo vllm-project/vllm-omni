@@ -1063,6 +1063,14 @@ def destroy_distributed_environment():
     _WORLD = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+    # The all-gather landing buffers a platform may keep are process-level
+    # state shared by every coordinator, so they are dropped here -- the one
+    # teardown point reached after the world group is gone -- rather than in
+    # `GroupCoordinator.destroy` (which runs per group, and would free memory
+    # still in use by the groups that outlive it) or in
+    # `destroy_model_parallel` (which is also called on the init error path
+    # while `_WORLD` stays alive).
+    current_omni_platform.reset_all_gather_buffers()
 
 
 def destroy_distributed_env():
