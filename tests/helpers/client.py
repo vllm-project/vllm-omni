@@ -102,6 +102,7 @@ class OmniResponse:
     audio_content: str | None = None
     audio_format: str | None = None
     audio_bytes: bytes | None = None
+    word_timestamps: list[dict[str, str | int]] | None = None
     #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before the
     #: OpenAI client call through response parsing and local post-process (e.g. audio decode).
     e2e_latency: float | None = None
@@ -1419,6 +1420,9 @@ class OnlineOmniClient:
             result.success = True
             result.audio_format = getattr(response, "response", None)
             if result.audio_format is not None:
+                timestamps = result.audio_format.headers.get("X-Word-Timestamps")
+                if timestamps is not None:
+                    result.word_timestamps = json.loads(timestamps)
                 result.audio_format = result.audio_format.headers.get("content-type", "")
 
         except Exception as e:
@@ -1472,6 +1476,7 @@ class OnlineOmniClient:
             "extra_params",
             "stream_format",
             "x_vector_only_mode",
+            "word_timestamps",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]

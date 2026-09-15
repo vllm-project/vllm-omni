@@ -914,6 +914,17 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     """
     assert response.success, "The request failed."
 
+    if request_config.get("word_timestamps"):
+        timestamps = response.word_timestamps
+        assert isinstance(timestamps, list) and timestamps, "Expected nonempty X-Word-Timestamps"
+        previous_start = 0
+        for timestamp in timestamps:
+            assert isinstance(timestamp["word"], str) and timestamp["word"]
+            start, end = timestamp["start_ms"], timestamp["end_ms"]
+            assert isinstance(start, int) and isinstance(end, int)
+            assert previous_start <= start <= end
+            previous_start = start
+
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
     min_audio = request_config.get("min_audio_bytes")
     if min_audio is not None:
