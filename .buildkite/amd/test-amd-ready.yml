@@ -58,6 +58,14 @@ steps:
   commands:
     - pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
 
+- label: "Scheduler Injection Test"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - pytest -s -v tests/e2e/features/scheduler_injection/ -m "core_model"
+
 
 - label: "Voxtral TTS CUDA Unit Test"
   agent_pool: mi300_1
