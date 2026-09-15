@@ -38,7 +38,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.pushes = []
@@ -95,7 +95,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -690,6 +690,7 @@ def test_combined_weight_loader_routes_each_contiguous_partition():
     pipeline.text_encoder = torch.nn.Identity()
     pipeline.video_vae = torch.nn.Identity()
     pipeline.audio_vae = torch.nn.Identity()
+    pipeline.latent_upscaler = None
     loaded = pipeline.load_weights(
         iter(
             [
