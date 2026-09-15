@@ -56,6 +56,8 @@ class OrchestratorMonitorBase(Protocol):
 
     def note_loop(self, *, idle: bool) -> None: ...
 
+    def set_dispatch_queue_size(self, size: int) -> None: ...
+
     def flush(self) -> None: ...
 
 
@@ -64,6 +66,9 @@ class _NullOrchestratorMonitor:
         return
 
     def note_loop(self, *, idle: bool) -> None:
+        return
+
+    def set_dispatch_queue_size(self, size: int) -> None:
         return
 
     def flush(self) -> None:
@@ -94,6 +99,10 @@ class OrchestratorMonitor:
         self._duration_s: list[float] = []
         self._loop_idle_buf: list[int] = []
         self._loop_active_buf: list[int] = []
+        self._dispatch_queue_size = 0
+        self._dispatch_queue_size_buf: list[int] = []
+        self._dispatch_queue_high_water = 0
+        self._dispatch_queue_high_water_buf: list[int] = []
         self._replicas: dict[str, _ReplicaSeries] = {}
 
     def register_replica(self, stage_id: int, replica_id: int) -> None:
@@ -107,6 +116,11 @@ class OrchestratorMonitor:
         else:
             self._loop_active += 1
 
+    def set_dispatch_queue_size(self, size: int) -> None:
+        size = max(int(size), 0)
+        self._dispatch_queue_size = size
+        self._dispatch_queue_high_water = max(self._dispatch_queue_high_water, size)
+
     def flush(self) -> None:
         if self._flushed:
             return
@@ -118,6 +132,8 @@ class OrchestratorMonitor:
                 "duration_s": self._duration_s,
                 "loop_idle": self._loop_idle_buf,
                 "loop_active": self._loop_active_buf,
+                "dispatch_queue_size": self._dispatch_queue_size_buf,
+                "dispatch_queue_high_water": self._dispatch_queue_high_water_buf,
             },
             "replicas": dict(sorted(self._replicas.items())),
         }
@@ -154,6 +170,8 @@ class OrchestratorMonitor:
         self._duration_s.append(max(now_mono - self._window_start_mono, 1e-9))
         self._loop_idle_buf.append(self._loop_idle)
         self._loop_active_buf.append(self._loop_active)
+        self._dispatch_queue_size_buf.append(self._dispatch_queue_size)
+        self._dispatch_queue_high_water_buf.append(self._dispatch_queue_high_water)
         for key, series in self._replicas.items():
             outputs_qsize, inflight = sampled.get(key, (0, 0))
             series["outputs_queue_size"].append(outputs_qsize)
@@ -161,6 +179,8 @@ class OrchestratorMonitor:
 
         self._loop_idle = 0
         self._loop_active = 0
+        self._dispatch_queue_size = 0
+        self._dispatch_queue_high_water = 0
         self._window_start_mono = now_mono
 
     def _log_summary(self, output_path: str) -> None:
