@@ -133,6 +133,7 @@ _PIPELINE_STAGES = [
     "audex_thinker",
     "audex_tta_thinker",
     "audex_xcodec",
+    "audio8_tts_01b_slow_ar",
     "audio8_tts_codec_decoder",
     "audio8_tts_slow_ar",
     "audio_generation",
