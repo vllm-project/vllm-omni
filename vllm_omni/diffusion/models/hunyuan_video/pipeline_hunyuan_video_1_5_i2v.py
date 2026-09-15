@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
 from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import (
+    _get_encoder_hidden_states_indices,
     extract_glyph_texts,
     format_text_input,
     get_hunyuan_video_15_post_process_func,
@@ -550,9 +551,16 @@ class HunyuanVideo15I2VPipeline(
 
         batch_size = prompt_embeds.shape[0]
 
-        # Get image embeddings from SigLIP (no explicit mask — the transformer
-        # detects I2V via non-zero image_embeds, matching diffusers behaviour)
         image_embeds = self._get_image_embeds(image, device).to(dtype=dtype)
+        image_embeds_mask = torch.ones(image_embeds.shape[:2], dtype=torch.bool, device=device)
+        encoder_hidden_states_indices = _get_encoder_hidden_states_indices(
+            image_embeds_mask, prompt_embeds_mask_2, prompt_embeds_mask
+        )
+        negative_encoder_hidden_states_indices = None
+        if negative_prompt_embeds_mask is not None and negative_prompt_embeds_mask_2 is not None:
+            negative_encoder_hidden_states_indices = _get_encoder_hidden_states_indices(
+                image_embeds_mask, negative_prompt_embeds_mask_2, negative_prompt_embeds_mask
+            )
 
         latents = self.prepare_latents(
             batch_size=batch_size,
@@ -597,6 +605,8 @@ class HunyuanVideo15I2VPipeline(
                     "encoder_hidden_states_2": prompt_embeds_2,
                     "encoder_attention_mask_2": prompt_embeds_mask_2,
                     "image_embeds": image_embeds,
+                    "image_embeds_mask": image_embeds_mask,
+                    "encoder_hidden_states_indices": encoder_hidden_states_indices,
                     "return_dict": False,
                 }
 
@@ -612,6 +622,8 @@ class HunyuanVideo15I2VPipeline(
                         "encoder_hidden_states_2": negative_prompt_embeds_2,
                         "encoder_attention_mask_2": negative_prompt_embeds_mask_2,
                         "image_embeds": image_embeds,
+                        "image_embeds_mask": image_embeds_mask,
+                        "encoder_hidden_states_indices": negative_encoder_hidden_states_indices,
                         "return_dict": False,
                     }
 
