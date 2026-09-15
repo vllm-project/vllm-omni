@@ -17,7 +17,7 @@ from vllm_omni.entrypoints.duplex.runtime_adapter import (
     ServingRuntimeConfigError,
     reject_changed_runtime_value,
 )
-from vllm_omni.model_executor.models.personaplex.duplex.config import DEFAULT_PERSONA
+from vllm_omni.model_executor.models.personaplex.duplex.config import DEFAULT_PERSONA, SAMPLE_RATE
 from vllm_omni.model_executor.models.personaplex.duplex.data_plane import (
     PersonaPlexDataPlaneContext,
     PersonaPlexDataPlaneSession,
@@ -120,6 +120,7 @@ class PersonaPlexServingRuntimeAdapter:
             supports_barge_in=False,
             supports_playback_ack=True,
             supports_input_append=True,
+            input_sample_rate_hz=SAMPLE_RATE,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
             supports_rollback_to_checkpoint=False,

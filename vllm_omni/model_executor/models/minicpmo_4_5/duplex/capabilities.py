@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from vllm_omni.entrypoints.duplex.protocol import DuplexCapabilities
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 
 
 def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
@@ -13,6 +14,7 @@ def minicpmo45_native_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
         supports_model_native_turn_policy=True,
         supports_barge_in=True,
         supports_input_append=True,
+        input_sample_rate_hz=MiniCPMO45DuplexPolicy.SAMPLE_RATE_HZ,
         supports_replace_latest_chunk=False,
         supports_reencode_context=False,
         supports_turn_commit_only=False,

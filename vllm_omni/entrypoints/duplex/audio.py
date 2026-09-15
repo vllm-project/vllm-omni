@@ -62,6 +62,33 @@ def resample_pcm16_mono(raw: bytes, *, source_rate_hz: int, target_rate_hz: int)
     return np.clip(np.rint(resampled * 32768.0), -32768, 32767).astype("<i2").tobytes()
 
 
+def resample_pcm_f32_mono(raw: bytes, *, source_rate_hz: int, target_rate_hz: int) -> bytes:
+    """Resample little-endian mono float32 PCM without changing its format."""
+    if source_rate_hz <= 0 or target_rate_hz <= 0 or source_rate_hz == target_rate_hz:
+        return raw
+
+    samples = np.frombuffer(raw, dtype="<f4")
+    # Import lazily so the generic Duplex audio module does not pull in the
+    # OpenAI API server while the Duplex stack itself is being imported.
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
+
+    rate_gcd = math.gcd(source_rate_hz, target_rate_hz)
+    reduced_factor = max(source_rate_hz // rate_gcd, target_rate_hz // rate_gcd)
+    if reduced_factor > StreamingAudioResampler._max_polyphase_factor:
+        # Keep unusual client rates bounded while common audio rates use the
+        # high-quality polyphase path.
+        if samples.size <= 1:
+            return raw
+        target_size = max(1, int(round(samples.size * target_rate_hz / source_rate_hz)))
+        source_x = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
+        target_x = np.linspace(0.0, 1.0, num=target_size, endpoint=True)
+        resampled = np.interp(target_x, source_x, samples)
+    else:
+        resampler = StreamingAudioResampler(source_rate_hz, target_rate_hz)
+        resampled = resampler.process(samples, final=True)
+    return np.ascontiguousarray(resampled, dtype="<f4").tobytes()
+
+
 def decode_g711_ulaw(raw: bytes) -> bytes:
     if ulaw2lin is not None:
         return ulaw2lin(raw, 2)
@@ -156,15 +183,18 @@ def convert_input_audio_with_rate(
     fmt: object,
     *,
     sample_rate_hz: int | float | None = None,
-    target_sample_rate_hz: int = 16_000,
+    target_sample_rate_hz: int | None = 16_000,
 ) -> tuple[object, object, int | float | None]:
+    """Normalize supported input to float32 PCM and optionally resample it."""
     if not isinstance(audio, str) or not isinstance(fmt, str):
         return audio, fmt, sample_rate_hz
     normalized = fmt.lower()
-    if normalized not in {"pcm16", "pcm_s16le", "s16le", "g711_ulaw", "g711_alaw"}:
+    if normalized not in {"pcm16", "pcm_s16le", "s16le", "pcm_f32le", "g711_ulaw", "g711_alaw"}:
         return audio, fmt, sample_rate_hz
     if isinstance(sample_rate_hz, int | float):
         sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
+    if target_sample_rate_hz is not None:
+        target_sample_rate_hz = validate_input_sample_rate_hz(target_sample_rate_hz)
     try:
         raw = base64.b64decode(audio.strip(), validate=False)
     except (binascii.Error, ValueError):
@@ -175,16 +205,28 @@ def convert_input_audio_with_rate(
     elif normalized == "g711_alaw":
         raw = decode_g711_alaw(raw)
         sample_rate_hz = sample_rate_hz if isinstance(sample_rate_hz, int | float) else 8_000
+    elif normalized == "pcm_f32le":
+        if len(raw) % np.dtype("<f4").itemsize:
+            return audio, fmt, sample_rate_hz
     elif len(raw) % 2:
         return audio, fmt, sample_rate_hz
-    if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) != target_sample_rate_hz:
-        raw = resample_pcm16_mono(
+    if (
+        isinstance(sample_rate_hz, int | float)
+        and target_sample_rate_hz is not None
+        and int(sample_rate_hz) != target_sample_rate_hz
+    ):
+        resample = resample_pcm_f32_mono if normalized == "pcm_f32le" else resample_pcm16_mono
+        raw = resample(
             raw,
             source_rate_hz=int(sample_rate_hz),
             target_rate_hz=target_sample_rate_hz,
         )
         sample_rate_hz = target_sample_rate_hz
-    pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    pcm = (
+        np.frombuffer(raw, dtype="<f4")
+        if normalized == "pcm_f32le"
+        else np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    )
     encoded = base64.b64encode(np.ascontiguousarray(pcm, dtype="<f4").tobytes()).decode("ascii")
     return encoded, "pcm_f32le", sample_rate_hz
 

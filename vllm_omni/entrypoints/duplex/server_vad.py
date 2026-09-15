@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import numpy as np
 from vllm.transformers_utils.repo_utils import try_get_local_file
 
+from vllm_omni.entrypoints.duplex.audio import validate_input_sample_rate_hz
+
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
 
@@ -340,9 +342,21 @@ class ServerVADPipeline:
             raise ValueError("server_vad PCM16 input contains an incomplete sample")
         pcm16 = np.frombuffer(samples, dtype="<i2")
 
+        normalized = np.ascontiguousarray(pcm16, dtype=np.float32) * np.float32(1.0 / 32768.0)
+        return await self.push_float32(normalized, source_sample_rate_hz=source_sample_rate_hz)
+
+    async def push_float32(
+        self,
+        samples: np.ndarray,
+        *,
+        source_sample_rate_hz: int,
+    ) -> ServerVADBatch:
+        """Normalize chunked mono float32 input and run endpoint detection."""
+        source_sample_rate_hz = validate_input_sample_rate_hz(source_sample_rate_hz)
         if self._source_sample_rate_hz is not None and source_sample_rate_hz != self._source_sample_rate_hz:
             raise ValueError("server_vad input sample rate cannot change within a continuous audio stream")
-        if pcm16.size and self._source_sample_rate_hz is None:
+        normalized = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1)
+        if normalized.size and self._source_sample_rate_hz is None:
             from vllm_omni.entrypoints.openai.audio_utils_mixin import StreamingAudioResampler
 
             self._input_resampler = (
@@ -352,7 +366,6 @@ class ServerVADPipeline:
             )
             self._source_sample_rate_hz = source_sample_rate_hz
 
-        normalized = np.ascontiguousarray(pcm16, dtype=np.float32) * np.float32(1.0 / 32768.0)
         if self._input_resampler is not None:
             normalized = self._input_resampler.process(normalized)
         return await self.push(normalized)
