@@ -37,6 +37,15 @@ _MODEL_COEFFICIENTS = {
     # Bagel transformer coefficients
     # Using Qwen's coefficients as reasonable default given shared architecture
     "Bagel": [1.33313129e06, -1.68644226e05, 7.95050740e03, -1.63747873e02, 1.26352397e00],
+    # HiDream-O1 coefficients fitted on 6,860 branch-separated samples from
+    # 70 PartiPrompts trajectories (50 steps, true CFG, full computation).
+    "HiDreamO1TextModel": [
+        5.08867311e03,
+        -1.82837657e03,
+        2.31252757e02,
+        -1.14587590e01,
+        2.10901097e-01,
+    ],
     # SenseNova-U1 transformer coefficients
     "SenseNovaU1ForCausalLM": [
         9.07281930e04,
@@ -95,6 +104,7 @@ _MODEL_COEFFICIENTS = {
 
 _DEFAULT_REL_L1_THRESH = 0.2
 _MODEL_DEFAULT_REL_L1_THRESH = {
+    "HiDreamO1TextModel": 0.1,
     "MiniMaxH3DiTModel": 0.17,
 }
 
