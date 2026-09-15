@@ -21,13 +21,12 @@ below.
 
 - **Realtime stepwise** — see [Streaming video serving](#streaming-video-serving).
   The suggested path: one `WS /v1/realtime/video` session produces the whole
-  rollout, one video chunk per AR block. It cannot take realtime camera
-  interaction yet; that is being added, and this path is the one that will
-  remain.
+  rollout, one video chunk per AR block. Mid-session camera control uses
+  structural SE3 `session.interaction` payloads; optional
+  `camera_action_script` remains for request-scoped WASD scripts.
 - **Realtime tick** *(deprecated)* — see
   [Realtime in-process generation](#realtime-in-process-generation-deprecated).
-  The only path that takes realtime camera interaction today, so it stays until
-  the stepwise path can, but it takes no new work and will be removed.
+  Older one-block-per-`generate()` control plane with JSONL WASD frames; will be removed in the future.
 - **Offline** — see [Offline generation](#offline-generation). Replays a fixed
   pose/intrinsics trajectory in one request and writes an MP4. Use it when the
   camera path is known up front and streaming is not needed.
@@ -54,10 +53,10 @@ the runtime consumes only the prefix needed by the request.
 
 ## Realtime in-process generation (deprecated)
 
-Use [Streaming video serving](#streaming-video-serving) instead unless you need
-mid-session camera interaction, which only this path has. It still works and
-emits no runtime warning; removal is tracked as B4 of the LingBot World 2.0
-roadmap ([#6672](https://github.com/vllm-project/vllm-omni/issues/6672)).
+Prefer [Streaming video serving](#streaming-video-serving) for mid-session
+camera control. This tick example still works and emits no runtime warning;
+removal is tracked as B4 of the LingBot World 2.0 roadmap
+([#6672](https://github.com/vllm-project/vllm-omni/issues/6672)).
 
 The realtime example keeps AR-Diffusion KV and model-owned state across
 requests. Each JSONL line describes the prompt and/or three latent-frame camera
@@ -94,8 +93,8 @@ The stepwise path keeps AR-Diffusion paged KV but issues **one** request for
 the whole rollout: `prepare_encode` runs once, then every AR block is four DMD
 steps followed by one streamed chunk. Identity metadata uses
 `session_id = request_id` with contiguous `chunk_index` values from zero.
-Camera motion for this landing is request-scoped: one three-frame action list
-per chunk, fixed when the rollout starts.
+Camera motion can be request-scoped (`camera_action_script` / `action_path`) or
+updated mid-session via `session.interaction`.
 
 Serve it with the AR-Diffusion deploy config, which selects the AR-Diffusion
 engine and enables streamed step execution:
@@ -113,11 +112,11 @@ keep their request-mode topology when no deploy config is given, and the
 stepwise serving topology is only ever an explicit choice.
 
 Clients then use the generic WebSocket protocol documented in
-[`docs/serving/video_stream_api.md`](../../docs/serving/video_stream_api.md):
+[`docs/serving/streaming_video_output_api.md`](../../docs/serving/streaming_video_output_api.md):
 `session.start` begins one rollout and each AR block arrives as a binary video
-chunk. The model is image-conditioned, so the first frame is required and rides
-on `image_reference` as an `http(s)` or `data:` URL; per-chunk camera actions
-ride on `extra_params`:
+chunk. The model is image-conditioned, so the first frame is required
+at `image_reference` as an `http(s)` or `data:` URL; an optional request-scoped
+pre-scripted list of WASD actions can be provided in `extra_params`:
 
 ```json
 {"type": "session.start", "model": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
@@ -132,7 +131,26 @@ ride on `extra_params`:
 chunk, and a request generates `((num_frames - 1) // 4 + 1) // 3` chunks:
 three for `num_frames: 33`, seven for `num_frames: 81`.
 
-The bundled client speaks this protocol:
+Mid-session camera control uses structural SE3 on `session.interaction`
+(Unity frame: `+X` right, `+Y` up, `+Z` forward). WASD key tokens belong in
+clients and are required to be converted before submitting to the service:
+
+```json
+{"type": "session.interaction",
+ "interaction": {
+   "event_id": "forward-1",
+   "event": {
+     "multi_modal_data": {
+       "camera": {
+         "mode": "velocity",
+         "data": {"translation": [0.0, 0.0, 0.05], "rotation": [0.0, 0.0, 0.0, 1.0]}
+       }
+     }
+   }
+ }}
+```
+
+The bundled client helps translate the protocol, converting `--camera-updates` keystrokes to corresponding SE3 matrices:
 
 ```bash
 python examples/online_serving/streaming_video_generation/streaming_video_client.py \
@@ -140,22 +158,20 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
   --prompt "The camera moves slowly forward through the scene." \
   --image-reference /path/to/first_frame.png \
   --width 832 --height 480 --num-frames 33 --fps 16 --seed 42 \
-  --extra-params '{"camera_action_script":[[["w"],["w"],["w"]],[["a"],[],[]],[[],[],[]]]}' \
+  --camera-updates '[{"at": 1.0, "actions": ["w"]}, {"at": 3.0, "actions": ["a"]}]' \
   --output lingbot_world_v2_stream.mp4
 ```
 
 A served request may instead point at a pose/intrinsics trajectory with
 `extra_params.action_path`, which is resolved inside the trusted root set by
 `model_config.lingbot_action_root` or `VLLM_OMNI_LINGBOT_ACTION_ROOT`; a server
-started without that root configured accepts only `camera_action_script`.
+started without that root configured accepts only `camera_action_script` or
+mid-session camera interaction.
 
 Requested `width`/`height` must match `ar_diffusion_width`/`ar_diffusion_height`
 in the deploy config, because the AR cache geometry is fixed at load time.
 Blocks are decoded independently, so seams between chunks are possible; a
 session-owned streaming decoder is tracked separately.
-
-Mid-session `session.interaction` for camera control is not wired yet, so a
-served rollout follows the script it started with.
 
 The deprecated tick example remains available for the older
 one-block-per-`generate()` control plane.
@@ -197,8 +213,8 @@ tested commit.
 
 - Only the 14B causal-fast checkpoint is supported.
 - The tick control plane is internal; the public transport is the stepwise
-  `WS /v1/realtime/video` path, which cannot take mid-session camera
-  interaction yet.
+  `WS /v1/realtime/video` path with structural SE3 mid-session camera
+  interaction (WASD remains a client-side or `camera_action_script` convenience).
 - Stepwise serving requires an explicit
   `--deploy-config vllm_omni/deploy/lingbot_world_v2_stepwise.yaml`; there is
   no default deploy config for this model.

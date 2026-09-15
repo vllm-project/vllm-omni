@@ -24,16 +24,21 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
+from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery, SupportsStepExecution
 from vllm_omni.diffusion.models.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
+    LINGBOT_CONTROLLER_TRANSLATION_UNIT,
     LingBotCameraActionFrames,
     LingBotCameraActionScript,
     as_camera_action_frames,
     as_camera_action_script,
+    camera_trajectory_from_absolute_pose,
     integrate_lingbot_camera_actions,
     parse_lingbot_camera_action_frames,
     parse_lingbot_camera_action_script,
@@ -379,25 +384,36 @@ def get_lingbot_world_pre_process_func(
             camera_actions = None
         else:
             action_path = extra_args.get("action_path")
-            if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
-                raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
-            if not configured_action_root:
-                raise ValueError(
-                    "sampling_params.extra_args.action_path requires a trusted action root configured by "
-                    f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+            if action_path is None or action_path == "":
+                # Stepwise / streaming sessions may omit a request-scoped camera
+                # script and instead drive motion via mid-generation camera
+                # interaction (idle hold until the first camera event).
+                if getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False):
+                    trajectory = None
+                    camera_actions = None
+                    camera_action_script = None
+                else:
+                    raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+            else:
+                if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
+                    raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+                if not configured_action_root:
+                    raise ValueError(
+                        "sampling_params.extra_args.action_path requires a trusted action root configured by "
+                        f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+                    )
+                action_directory = resolve_trusted_action_directory(
+                    action_path,
+                    configured_action_root,
                 )
-            action_directory = resolve_trusted_action_directory(
-                action_path,
-                configured_action_root,
-            )
-            try:
-                trajectory = load_camera_trajectory(action_directory)
-            except OSError:
-                raise ValueError(
-                    "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
-                ) from None
-            camera_actions = None
-            camera_action_script = None
+                try:
+                    trajectory = load_camera_trajectory(action_directory)
+                except OSError:
+                    raise ValueError(
+                        "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
+                    ) from None
+                camera_actions = None
+                camera_action_script = None
 
         updated_prompt = dict(prompt)
         updated_multi_modal_data = dict(multi_modal_data)
@@ -454,6 +470,7 @@ class LingBotWorldCausalDMDPipeline(
     SupportImageInput,
     SupportsComponentDiscovery,
     SupportsStepExecution,
+    InteractionMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
 ):
@@ -740,8 +757,10 @@ class LingBotWorldCausalDMDPipeline(
         camera_sources = (
             int(camera_trajectory is not None) + int(camera_actions is not None) + int(camera_action_script is not None)
         )
-        if camera_sources != 1:
-            raise ValueError("LingBot pre-processing must materialize exactly one camera input.")
+        if camera_sources > 1:
+            raise ValueError("LingBot pre-processing must materialize at most one camera input.")
+        # Zero camera sources are allowed for stepwise camera-interaction sessions;
+        # request-mode ``forward`` still requires an explicit trajectory or actions.
 
         request_flow_shift = (
             extra_args["flow_shift"] if "flow_shift" in extra_args else getattr(self.scheduler.config, "shift", 5.0)
@@ -974,10 +993,10 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             )
             drop_anchor = True
-        elif inputs.camera_actions is not None:
-            # The action integrator returns post-action poses. Keep the first
-            # action visible to framewise-delta conditioning by prepending its
-            # known pre-action state (identity for a new realtime session).
+        elif inputs.camera_actions is not None or latent_aligned:
+            # Action/interaction integrators return post-action poses. Prepend the
+            # known pre-action state (identity for a new session) so the first
+            # pose still contributes a framewise delta.
             identity = torch.eye(
                 4,
                 device=trajectory.poses.device,
@@ -991,6 +1010,9 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             )
             drop_anchor = True
+        # Realtime interaction cannot see future steps; use the controller translation unit
+        # so speed is not renormalized per chunk. Full action_path keeps max-norm.
+        is_realtime_interaction_control = inputs.camera_actions is not None or latent_aligned
         camera_embedding = build_plucker_embedding(
             embedding_trajectory,
             height=inputs.height,
@@ -999,6 +1021,7 @@ class LingBotWorldCausalDMDPipeline(
             target_width=inputs.width,
             device=self.device,
             dtype=dtype,
+            translation_scale=LINGBOT_CONTROLLER_TRANSLATION_UNIT if is_realtime_interaction_control else None,
         )
         if drop_anchor:
             camera_embedding = camera_embedding[1:]
@@ -1144,6 +1167,11 @@ class LingBotWorldCausalDMDPipeline(
                 "camera_action_script is read only by LingBot step execution; "
                 "request mode takes one three-frame camera_actions control per "
                 "block, or a camera_trajectory for the request."
+            )
+        if inputs.camera_trajectory is None and inputs.camera_actions is None:
+            raise ValueError(
+                "LingBot request mode requires camera_trajectory or camera_actions; "
+                "omit them only for stepwise camera-interaction sessions."
             )
         tick = ARDiffusionTickRequest.from_extra_args(req.sampling_params.extra_args)
         if tick is not None and self._ar_diffusion_kv_state is None:
@@ -1557,7 +1585,6 @@ class LingBotWorldCausalDMDPipeline(
             "camera_embedding_cache": camera_embedding_cache,
         }
         self._ar_text_caches(prompt_embeds, invalidate=False)
-        self._prepare_next_chunk(state)
         return state
 
     def _prepare_next_chunk(self, state: StepRequestState) -> None:
@@ -1571,6 +1598,7 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
         condition = image_condition[:, :, start_frame:stop_frame]
         previous = extra.get("camera_tail")
+
         if extra.get("camera_action_script") is not None:
             chunk_actions = extra["camera_action_script"][state.chunk_index]
             action_trajectory, camera_pitch = integrate_lingbot_camera_actions(
@@ -1594,13 +1622,49 @@ class LingBotWorldCausalDMDPipeline(
                 previous=previous,
             )
         elif extra.get("camera_embedding_cache") is not None:
-            # Same slice request mode takes from its one full-trajectory
-            # embedding, so both paths condition a block identically.
+            # Prefer the full-trajectory cache (action_path / request-mode replay)
+            # over live interaction so stepwise serving does not silently drop
+            # a precomputed path when the camera modality is registered.
             trajectory = extra["camera_trajectory_cache"]
             camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
             camera_tail = CameraTrajectory(
                 poses=trajectory.poses[stop_frame - 1 : stop_frame].clone(),
                 intrinsics=trajectory.intrinsics[stop_frame - 1 : stop_frame].clone(),
+            )
+        elif self._interaction_coordinator is not None and self._interaction_coordinator.has_modality("camera"):
+            # Poses come from the latest boundary apply: ``prepare_encode`` for
+            # chunk 0, the diffusion runner for later chunks. This method only
+            # digests them — it does not apply interactions itself.
+            camera_session = state.interaction_sessions.get("camera")
+            if not isinstance(camera_session, CameraSession) or camera_session.last_absolute_poses is None:
+                raise RuntimeError(
+                    "LingBot camera interaction requires apply_interaction_at_chunk_boundary before prepare_next_chunk."
+                )
+            absolute_poses = camera_session.last_absolute_poses
+            media_frames = (block_frames - 1) * self.vae_scale_factor_temporal + 1
+            if int(absolute_poses.shape[0]) != media_frames:
+                raise ValueError(
+                    "camera interaction must produce exactly one pose per media frame; "
+                    f"got {int(absolute_poses.shape[0])}, expected {media_frames}."
+                )
+            # Model-native digest: absolute C2W on the media timeline, resample to
+            # latent frames, then the existing plucker path (which relativizes).
+            media_trajectory = camera_trajectory_from_absolute_pose(
+                absolute_poses, width=inputs.width, height=inputs.height
+            )
+            action_trajectory = interpolate_camera_trajectory(media_trajectory, block_frames)
+            chunk_inputs = replace(
+                inputs,
+                camera_trajectory=action_trajectory,
+                camera_actions=None,
+                num_frames=media_frames,
+                num_latent_frames=block_frames,
+            )
+            camera, camera_tail = self._prepare_camera(
+                chunk_inputs,
+                dtype=extra["dtype"],
+                previous=previous,
+                latent_aligned=True,
             )
         else:
             raise RuntimeError("LingBot step execution is missing a camera trajectory or action script.")
@@ -1738,16 +1802,35 @@ class LingBotWorldCausalDMDPipeline(
             },
         }
         state.chunk_index += 1
-        finished = state.request_denoise_completed
-        if not finished:
+        # When the runner has wired an InteractionCoordinator, it owns next-chunk
+        # prep via ``prepare_next_chunk`` after ``apply_interaction_at_chunk_boundary``.
+        # Direct stepwise callers (unit tests) still prepare here.
+        if not state.request_denoise_completed and self._interaction_coordinator is None:
             self._prepare_next_chunk(state)
         return DiffusionOutput(
             output=output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             chunk_index=completed_chunk_index,
             total_chunks=state.total_chunks,
-            finished=finished,
+            finished=state.request_denoise_completed,
         )
+
+    def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
+        """Expose this chunk's decoded media extent for camera interaction timelines."""
+        block_frames = int(state.extra.get("block_frames") or self.transformer.config.num_frames_per_block)
+        media_frames = (block_frames - 1) * self.vae_scale_factor_temporal + 1
+        fps = state.sampling.fps
+        if fps is None or float(fps) <= 0:
+            # Media-frame camera controls are not wall-clock paced; a unit fps keeps
+            # resolve_event_frame_offset well-defined when the client omits sampling.fps.
+            fps = float(media_frames)
+        return ChunkMediaSpec(num_frames=int(media_frames), fps=float(fps))
+
+    def prepare_next_chunk(self, state: StepRequestState) -> None:
+        """Prepare the next AR block after chunk-boundary interaction apply."""
+        if state.request_denoise_completed:
+            return
+        self._prepare_next_chunk(state)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
