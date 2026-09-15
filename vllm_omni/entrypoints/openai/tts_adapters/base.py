@@ -159,6 +159,24 @@ class SpeechServingContext:
 
 
 @dataclass(frozen=True)
+class TextCommitmentCapabilities:
+    """Adapter contract for raw-text commitment through the WebSocket path.
+
+    These describe supported behavior, not a promise that the current server
+    deployment enables optional features such as the forced aligner. A future
+    stateful adapter must use a handler that implements its lifecycle contract.
+    """
+
+    profile: str
+    languages: frozenset[str]
+    independent_segments: bool
+    preserves_cross_segment_context: bool
+    streaming_audio: bool
+    word_timestamps: bool
+    retry_failed_segments: bool
+
+
+@dataclass(frozen=True)
 class TTSCapabilities:
     precomputed_speakers: dict[str, dict[str, Any]] = field(default_factory=dict)
     supported_speakers: frozenset[str] = frozenset()
@@ -197,6 +215,9 @@ class TTSModelAdapter(ABC):
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: None disables commitment. Opt-in adapters describe their complete
+    #: commitment contract so the handler can validate every requested feature.
+    text_commitment: ClassVar[TextCommitmentCapabilities | None] = None
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()

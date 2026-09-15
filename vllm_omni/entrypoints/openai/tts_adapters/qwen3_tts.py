@@ -17,6 +17,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     DEFAULT_TTS_LANGUAGES,
     ARTTSAdapter,
     PreparedRequest,
+    TextCommitmentCapabilities,
     TTSGenerationError,
     conditioning_cache_salt,
 )
@@ -48,6 +49,15 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     validates_generation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
+    text_commitment = TextCommitmentCapabilities(
+        profile="zh_en_special_v1",
+        languages=frozenset({"Chinese", "English"}),
+        independent_segments=True,
+        preserves_cross_segment_context=False,
+        streaming_audio=True,
+        word_timestamps=True,
+        retry_failed_segments=False,
+    )
     supported_output_sample_rates = frozenset({8000, 24000})
 
     def __init__(self, ctx) -> None:
@@ -390,16 +400,20 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             )
 
             server = self.ctx.server
+            engine_client = self.ctx.engine_client
+            if engine_client is None or engine_client.model_config is None:
+                raise RuntimeError("Qwen3-TTS model configuration is unavailable")
+            model_config = engine_client.model_config
             if server._tts_tokenizer is None:
                 from transformers import AutoTokenizer
 
-                model_name = self.ctx.engine_client.model_config.model
+                model_name = model_config.model
                 server._tts_tokenizer = AutoTokenizer.from_pretrained(
                     model_name,
                     trust_remote_code=True,
                     padding_side="left",
                 )
-            hf_config = self.ctx.engine_client.model_config.hf_config
+            hf_config = model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
             return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
