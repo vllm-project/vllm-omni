@@ -398,6 +398,14 @@ model. Neither replaces a real-model run: generate against H3, save with
 `ffprobe -v error -count_frames -show_streams -show_format -of json "$OUTPUT"`
 and `ffmpeg -v error -i "$OUTPUT" -f null -`, and watch and listen to it.
 
+### MiniMax-H3 Fun ControlNet Union (WF-06)
+
+The [ControlNet workflow](example_workflows/vLLM-Omni%20MiniMax-H3%20Fun%20ControlNet%20Union.json)
+shares one remote generation chain across **Canny, Depth, HED, MLSD, Pose, and Inpaint**.
+It includes a default Canny path, an SDPose extraction subgraph, prepared-hint inputs,
+and static/dynamic mask inputs. See the [setup and mode-switching guide](docs/minimax-h3-controlnet.md)
+for models, source preparation, parameters and validation.
+
 ### TTS (e.g., Qwen TTS series)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni TTS**)

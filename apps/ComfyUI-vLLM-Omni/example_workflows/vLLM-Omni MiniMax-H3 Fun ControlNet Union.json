@@ -1,0 +1,2297 @@
+{
+  "id": "4f322bea-a926-4b63-80b8-1c4c6ec73806",
+  "revision": 0,
+  "last_node_id": 33,
+  "last_link_id": 10,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        20,
+        350
+      ],
+      "size": [
+        330,
+        670
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            1,
+            9
+          ]
+        }
+      ],
+      "title": "1. Aligned source — 24 FPS / 124 frames",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "wf06-source.mp4",
+        "image"
+      ],
+      "widgets_values_named": {
+        "file": "wf06-source.mp4",
+        "upload": "image"
+      }
+    },
+    {
+      "id": 2,
+      "type": "GetVideoComponents",
+      "pos": [
+        410,
+        350
+      ],
+      "size": [
+        330,
+        120
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": []
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": []
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "links": []
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "title": "2. Source frames"
+    },
+    {
+      "id": 3,
+      "type": "Canny",
+      "title": "3. Canny — default control",
+      "pos": [
+        410,
+        540
+      ],
+      "size": [
+        330,
+        160
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "name": "low_threshold",
+          "type": "FLOAT",
+          "link": null,
+          "widget": {
+            "name": "low_threshold"
+          }
+        },
+        {
+          "name": "high_threshold",
+          "type": "FLOAT",
+          "link": null,
+          "widget": {
+            "name": "high_threshold"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Canny"
+      },
+      "widgets_values": [
+        0.1,
+        0.2
+      ]
+    },
+    {
+      "id": 4,
+      "type": "CreateVideo",
+      "pos": [
+        800,
+        350
+      ],
+      "size": [
+        330,
+        140
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 3
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "codec",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "codec"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "widgets_values": [
+        24,
+        "auto",
+        "sRGB",
+        "none"
+      ],
+      "widgets_values_named": {
+        "fps": 24,
+        "bit_depth": "auto",
+        "color_space": "sRGB",
+        "codec": "none"
+      },
+      "title": "4. Canny frames → control VIDEO"
+    },
+    {
+      "id": 5,
+      "type": "VLLMOmniMiniMaxH3Control",
+      "title": "5. Shared Control — choose mode",
+      "pos": [
+        1230,
+        350
+      ],
+      "size": [
+        330,
+        240
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "control_video",
+          "type": "VIDEO",
+          "link": 4
+        },
+        {
+          "name": "source_video",
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "link": null
+        },
+        {
+          "name": "mask_video",
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "name": "control_type",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "control_type"
+          }
+        },
+        {
+          "name": "strength",
+          "type": "FLOAT",
+          "link": null,
+          "widget": {
+            "name": "strength"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "control",
+          "type": "MINIMAX_H3_CONTROL",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Control"
+      },
+      "widgets_values": [
+        "canny",
+        1.0
+      ]
+    },
+    {
+      "id": 6,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [
+        1230,
+        680
+      ],
+      "size": [
+        330,
+        226
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "n",
+          "name": "n",
+          "type": "INT",
+          "widget": {
+            "name": "n"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "num_inference_steps",
+          "name": "num_inference_steps",
+          "type": "INT",
+          "widget": {
+            "name": "num_inference_steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "guidance_scale",
+          "name": "guidance_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "guidance_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "true_cfg_scale",
+          "name": "true_cfg_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "true_cfg_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_slicing",
+          "name": "vae_use_slicing",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_slicing"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_tiling",
+          "name": "vae_use_tiling",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_tiling"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "seed",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "diffusion sampling params",
+          "name": "diffusion sampling params",
+          "type": "SAMPLING_PARAMS",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniDiffusionSampling"
+      },
+      "widgets_values": [
+        1,
+        40,
+        1.0,
+        1.0,
+        false,
+        true,
+        43,
+        "fixed"
+      ],
+      "title": "Base sampling — 40 steps / seed 43"
+    },
+    {
+      "id": 7,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        1230,
+        1080
+      ],
+      "size": [
+        330,
+        82
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio_flow_shift",
+          "name": "audio_flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_flow_shift"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "flow_shift",
+          "name": "flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "flow_shift"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MiniMax-H3 video params",
+          "name": "MiniMax-H3 video params",
+          "type": "VIDEO_PARAMS",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3.0,
+        12.0
+      ],
+      "title": "MiniMax-H3 parameters",
+      "widgets_values_named": {
+        "audio_flow_shift": 3.0,
+        "flow_shift": 12.0
+      }
+    },
+    {
+      "id": 8,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        1680,
+        350
+      ],
+      "size": [
+        510,
+        620
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "frame",
+          "name": "frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "references",
+          "name": "references",
+          "shape": 7,
+          "type": "VIDEO_REFERENCES",
+          "link": null
+        },
+        {
+          "name": "control",
+          "type": "MINIMAX_H3_CONTROL",
+          "link": 5
+        },
+        {
+          "localized_name": "sampling_params",
+          "name": "sampling_params",
+          "shape": 7,
+          "type": "SAMPLING_PARAMS",
+          "link": 6
+        },
+        {
+          "localized_name": "lora",
+          "name": "lora",
+          "shape": 7,
+          "type": "REMOTE_LORA",
+          "link": null
+        },
+        {
+          "localized_name": "model_params",
+          "name": "model_params",
+          "shape": 7,
+          "type": "VIDEO_PARAMS",
+          "link": 7
+        },
+        {
+          "localized_name": "fast_h3",
+          "name": "fast_h3",
+          "shape": 7,
+          "type": "FASTH3_DEPLOYMENT",
+          "link": null
+        },
+        {
+          "localized_name": "url",
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "negative_prompt",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "INT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://127.0.0.1:8092/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "A dancer moves across an open field, following the movement in the control video. A steady medium-wide shot in daylight. Natural footsteps and a gentle breeze are audible. No music.",
+        "",
+        1344,
+        768,
+        24,
+        5.167
+      ],
+      "title": "6. Remote H3 + Union generation"
+    },
+    {
+      "id": 9,
+      "type": "SaveVideo",
+      "pos": [
+        2280,
+        350
+      ],
+      "size": [
+        420,
+        126
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "video/WF06-H3-ControlNet",
+        "auto",
+        "auto",
+        "auto"
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "video/WF06-H3-ControlNet",
+        "format": "auto",
+        "format.codec": "auto",
+        "codec": "auto"
+      },
+      "title": "7. Save generated video and audio"
+    },
+    {
+      "id": 20,
+      "type": "622cceeb-7ba3-4dd9-b0e8-00066c5222a4",
+      "pos": [
+        20,
+        1480
+      ],
+      "size": [
+        530,
+        530
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "resize_target_longer_size",
+          "name": "resize_type.longer_size",
+          "type": "INT",
+          "widget": {
+            "name": "resize_type.longer_size"
+          },
+          "link": null
+        },
+        {
+          "label": "detect_threshold",
+          "name": "threshold",
+          "type": "FLOAT",
+          "widget": {
+            "name": "threshold"
+          },
+          "link": null
+        },
+        {
+          "label": "detect_class",
+          "name": "class_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "class_name"
+          },
+          "link": null
+        },
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            10
+          ]
+        },
+        {
+          "name": "keypoints",
+          "type": "POSE_KEYPOINT",
+          "links": []
+        },
+        {
+          "name": "bboxes",
+          "type": "BOUNDING_BOX",
+          "links": []
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": []
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.15.1",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "previewExposures": []
+      },
+      "widgets_values": [
+        1344,
+        "lanczos",
+        true,
+        true,
+        true,
+        true,
+        4,
+        2,
+        0.51,
+        0.5,
+        "person",
+        2,
+        "sdpose_wholebody_fp16.safetensors",
+        "rt_detr_v4-x-hgnet_fp16.safetensors"
+      ],
+      "widgets_values_named": {
+        "resize_type.longer_size": 1344,
+        "scale_method": "lanczos",
+        "draw_body": true,
+        "draw_hands": true,
+        "draw_face": true,
+        "draw_feet": true,
+        "stick_width": 4,
+        "face_point_size": 2,
+        "score_threshold": 0.51,
+        "threshold": 0.5,
+        "class_name": "person",
+        "max_detections": 2,
+        "ckpt_name": "sdpose_wholebody_fp16.safetensors",
+        "unet_name": "rt_detr_v4-x-hgnet_fp16.safetensors"
+      },
+      "title": "Pose extractor — official SDPose subgraph"
+    },
+    {
+      "id": 21,
+      "type": "CreateVideo",
+      "pos": [
+        660,
+        1480
+      ],
+      "size": [
+        330,
+        140
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 10
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "codec",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "codec"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "widgets_values": [
+        24,
+        "auto",
+        "sRGB",
+        "none"
+      ],
+      "widgets_values_named": {
+        "fps": 24,
+        "bit_depth": "auto",
+        "color_space": "sRGB",
+        "codec": "none"
+      },
+      "title": "Pose frames → control VIDEO"
+    },
+    {
+      "id": 22,
+      "type": "LoadVideo",
+      "pos": [
+        20,
+        2240
+      ],
+      "size": [
+        480,
+        670
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "title": "Prepared hint — Depth / HED / MLSD / Pose / Canny",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "wf06-control.mp4",
+        "image"
+      ],
+      "widgets_values_named": {
+        "file": "wf06-control.mp4",
+        "upload": "image"
+      }
+    },
+    {
+      "id": 23,
+      "type": "LoadImageMask",
+      "title": "Static mask — white regenerates (red channel)",
+      "pos": [
+        1230,
+        1480
+      ],
+      "size": [
+        400,
+        290
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "image"
+          }
+        },
+        {
+          "name": "channel",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "channel"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImageMask"
+      },
+      "widgets_values": [
+        "wf06-mask.png",
+        "red",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "wf06-mask.png",
+        "channel": "red",
+        "upload": "image"
+      }
+    },
+    {
+      "id": 24,
+      "type": "LoadVideo",
+      "pos": [
+        1230,
+        1910
+      ],
+      "size": [
+        400,
+        670
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "title": "Dynamic mask — aligned binary video",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "wf06-mask.mp4",
+        "image"
+      ],
+      "widgets_values_named": {
+        "file": "wf06-mask.mp4",
+        "upload": "image"
+      }
+    },
+    {
+      "id": 30,
+      "type": "MarkdownNote",
+      "title": "Start here",
+      "pos": [
+        20,
+        10
+      ],
+      "size": [
+        1060,
+        260
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "MarkdownNote"
+      },
+      "widgets_values": [
+        "# WF-06 · H3 Fun ControlNet Union\nDefault: **Canny**. Prepare `wf06-source.mp4` at **1344×768, 24 FPS, 124 frames** using the guide, then set the remote server URL and Queue. The server loads H3 FL2VA and the original Union weights.\n\nAll six modes share Control → Generate Video → Save Video. Unconnected alternative branches stay idle.\n\nGuide: `apps/ComfyUI-vLLM-Omni/docs/minimax-h3-controlnet.md`"
+      ]
+    },
+    {
+      "id": 31,
+      "type": "MarkdownNote",
+      "title": "Mode switching",
+      "pos": [
+        1230,
+        10
+      ],
+      "size": [
+        1470,
+        260
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "MarkdownNote"
+      },
+      "widgets_values": [
+        "## Choose one control input\n- **canny**: default Canny VIDEO → Control.control_video.\n- **pose**: Pose VIDEO → Control.control_video; set control_type=pose. Install the two SDPose preprocessor weights.\n- **depth / hed / mlsd**: load the corresponding prepared hint in Prepared hint → Control.control_video, then select the matching mode. See the guide for preprocessing.\n- **inpaint**: disconnect control_video; connect Aligned source → source_video and Static mask → mask (or Dynamic mask → mask_video). Set control_type=inpaint and describe the edit in the prompt.\n\nUse one mask input at a time. Structural modes can also use source + mask. Update the prompt when switching scenes."
+      ]
+    },
+    {
+      "id": 32,
+      "type": "MarkdownNote",
+      "title": "Pose models and timing",
+      "pos": [
+        20,
+        1090
+      ],
+      "size": [
+        1060,
+        280
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "MarkdownNote"
+      },
+      "widgets_values": [
+        "The included subgraph adapts the official ComfyUI SDPose video extractor. It detects people and draws body, hands, face and feet. MODEL and VAE are both required.\n\nComfyUI/models/checkpoints: `sdpose_wholebody_fp16.safetensors`\n\nComfyUI/models/diffusion_models: `rt_detr_v4-x-hgnet_fp16.safetensors`\n\nPrepare timing and crop before extraction. Setting Create Video to 24 FPS only changes playback rate; use the guide to resample source footage. The input audio stays unconnected; Save Video preserves generated audio."
+      ]
+    },
+    {
+      "id": 33,
+      "type": "MarkdownNote",
+      "title": "Prepared hints and masks",
+      "pos": [
+        1780,
+        1480
+      ],
+      "size": [
+        700,
+        320
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "MarkdownNote"
+      },
+      "widgets_values": [
+        "Prepared hint and both mask loaders are idle until connected to the shared Control node.\n\nMatch all video inputs to the same 1344×768 canvas, crop, 24 FPS timeline and 124 frames. For a static black/white PNG select the **red** channel: white=regenerate, black=source conditioning. Dynamic masks use white/black RGB frames.\n\nCommunity HED/MLSD preprocessors run outside this graph; their optional packages are not required to import it."
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "VIDEO"
+    ],
+    [
+      5,
+      5,
+      0,
+      8,
+      2,
+      "MINIMAX_H3_CONTROL"
+    ],
+    [
+      6,
+      6,
+      0,
+      8,
+      3,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      7,
+      7,
+      0,
+      8,
+      5,
+      "VIDEO_PARAMS"
+    ],
+    [
+      8,
+      8,
+      0,
+      9,
+      0,
+      "VIDEO"
+    ],
+    [
+      9,
+      1,
+      0,
+      20,
+      3,
+      "VIDEO"
+    ],
+    [
+      10,
+      20,
+      0,
+      21,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Default Canny path · shared generation",
+      "bounding": [
+        -10,
+        -30,
+        2750,
+        1070
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "Pose · connect its VIDEO output to shared Control",
+      "bounding": [
+        -10,
+        1050,
+        1100,
+        1100
+      ],
+      "color": "#7b5d97",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "Prepared hint · Depth / HED / MLSD",
+      "bounding": [
+        -10,
+        2170,
+        1100,
+        550
+      ],
+      "color": "#6f8253",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "Mask inputs · Inpaint or masked structural control",
+      "bounding": [
+        1190,
+        1350,
+        1550,
+        1080
+      ],
+      "color": "#a07850",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "definitions": {
+    "subgraphs": [
+      {
+        "id": "622cceeb-7ba3-4dd9-b0e8-00066c5222a4",
+        "version": 1,
+        "state": {
+          "lastGroupId": 9,
+          "lastNodeId": 717,
+          "lastLinkId": 1772,
+          "lastRerouteId": 0
+        },
+        "revision": 0,
+        "config": {},
+        "name": "SDPose Video Pose Extractor [Multi‑Person]",
+        "description": "Extracts multi-person pose keypoints and skeleton frame sequences from video using SDPose with built-in person detection.",
+        "inputNode": {
+          "id": -10,
+          "bounding": [
+            -3570,
+            3300,
+            182.8984375,
+            340
+          ]
+        },
+        "outputNode": {
+          "id": -20,
+          "bounding": [
+            -1890,
+            3730,
+            120,
+            140
+          ]
+        },
+        "inputs": [
+          {
+            "id": "088eefc1-cd8a-4573-993f-9e4da008a12d",
+            "name": "resize_type.longer_size",
+            "type": "INT",
+            "linkIds": [
+              1704
+            ],
+            "label": "resize_target_longer_size",
+            "pos": [
+              -3407.1015625,
+              3320
+            ]
+          },
+          {
+            "id": "b6449bd3-73d4-41c8-b81f-cf8d33f76a2e",
+            "name": "scale_method",
+            "type": "COMBO",
+            "linkIds": [
+              1705
+            ],
+            "pos": [
+              -3407.1015625,
+              3340
+            ]
+          },
+          {
+            "id": "4cff52ad-ed07-4c97-8803-fcbd89554fd0",
+            "name": "draw_body",
+            "type": "BOOLEAN",
+            "linkIds": [
+              1706
+            ],
+            "pos": [
+              -3407.1015625,
+              3360
+            ]
+          },
+          {
+            "id": "7af63dce-f7df-4d7e-8215-d7c7f60bf81c",
+            "name": "draw_hands",
+            "type": "BOOLEAN",
+            "linkIds": [
+              1707
+            ],
+            "pos": [
+              -3407.1015625,
+              3380
+            ]
+          },
+          {
+            "id": "af3a9bce-61f9-4aca-b530-9f65e028b35e",
+            "name": "draw_face",
+            "type": "BOOLEAN",
+            "linkIds": [
+              1708
+            ],
+            "pos": [
+              -3407.1015625,
+              3400
+            ]
+          },
+          {
+            "id": "4620f6a3-2c85-4b79-ad8f-35d0326b568f",
+            "name": "draw_feet",
+            "type": "BOOLEAN",
+            "linkIds": [
+              1709
+            ],
+            "pos": [
+              -3407.1015625,
+              3420
+            ]
+          },
+          {
+            "id": "fee5d0c9-8d4b-4934-81d8-ba2206dc56cb",
+            "name": "stick_width",
+            "type": "INT",
+            "linkIds": [
+              1710
+            ],
+            "pos": [
+              -3407.1015625,
+              3440
+            ]
+          },
+          {
+            "id": "aafdd060-ba81-4324-a9cc-b656e1ebc133",
+            "name": "face_point_size",
+            "type": "INT",
+            "linkIds": [
+              1711
+            ],
+            "pos": [
+              -3407.1015625,
+              3460
+            ]
+          },
+          {
+            "id": "514c5503-f9e6-4d23-b1ae-1d3291acb2a3",
+            "name": "score_threshold",
+            "type": "FLOAT",
+            "linkIds": [
+              1712
+            ],
+            "pos": [
+              -3407.1015625,
+              3480
+            ]
+          },
+          {
+            "id": "4eb3e4ea-7a36-4511-8483-0d12aadd32f7",
+            "name": "threshold",
+            "type": "FLOAT",
+            "linkIds": [
+              1718
+            ],
+            "label": "detect_threshold",
+            "pos": [
+              -3407.1015625,
+              3500
+            ]
+          },
+          {
+            "id": "c76a7a05-81e6-4b17-a9e0-85f47a5844f2",
+            "name": "class_name",
+            "type": "COMBO",
+            "linkIds": [
+              1719
+            ],
+            "label": "detect_class",
+            "pos": [
+              -3407.1015625,
+              3520
+            ]
+          },
+          {
+            "id": "4417e988-6e80-4236-be31-4c179037f5a2",
+            "name": "max_detections",
+            "type": "INT",
+            "linkIds": [
+              1720
+            ],
+            "pos": [
+              -3407.1015625,
+              3540
+            ]
+          },
+          {
+            "id": "7d7c4a0b-0d1b-4c98-942b-f90548d2a492",
+            "name": "ckpt_name",
+            "type": "COMBO",
+            "linkIds": [
+              1721
+            ],
+            "pos": [
+              -3407.1015625,
+              3560
+            ]
+          },
+          {
+            "id": "4d75122c-2c14-452a-98fe-d1545d3e012a",
+            "name": "unet_name",
+            "type": "COMBO",
+            "linkIds": [
+              1722
+            ],
+            "pos": [
+              -3407.1015625,
+              3580
+            ]
+          },
+          {
+            "id": "6c46c988-4dd1-41a2-957e-03caf60d7657",
+            "name": "video",
+            "type": "VIDEO",
+            "linkIds": [
+              1741
+            ],
+            "pos": [
+              -3407.1015625,
+              3600
+            ]
+          }
+        ],
+        "outputs": [
+          {
+            "id": "f05ed8cc-9403-4f14-8085-4364b06f8a48",
+            "name": "IMAGE",
+            "type": "IMAGE",
+            "linkIds": [
+              1701
+            ],
+            "localized_name": "IMAGE",
+            "pos": [
+              -1870,
+              3750
+            ]
+          },
+          {
+            "id": "4b64118e-3cef-4eeb-9dad-4cd09cfd63a2",
+            "name": "keypoints",
+            "type": "POSE_KEYPOINT",
+            "linkIds": [
+              1725
+            ],
+            "pos": [
+              -1870,
+              3770
+            ]
+          },
+          {
+            "id": "a27f7e34-dcbc-4fb0-a4e1-2c5fc423ca5f",
+            "name": "bboxes",
+            "type": "BOUNDING_BOX",
+            "linkIds": [
+              1726
+            ],
+            "pos": [
+              -1870,
+              3790
+            ]
+          },
+          {
+            "id": "b7fe351d-2b38-41ea-9f4d-3be1a0aad275",
+            "name": "audio",
+            "type": "AUDIO",
+            "linkIds": [
+              1743
+            ],
+            "pos": [
+              -1870,
+              3810
+            ]
+          },
+          {
+            "id": "ae187b6f-c9ca-4487-b5c1-3ad775fe945e",
+            "name": "fps",
+            "type": "FLOAT",
+            "linkIds": [
+              1744
+            ],
+            "pos": [
+              -1870,
+              3830
+            ]
+          }
+        ],
+        "widgets": [],
+        "nodes": [
+          {
+            "id": 671,
+            "type": "SDPoseKeypointExtractor",
+            "pos": [
+              -2550,
+              3080
+            ],
+            "size": [
+              270,
+              180
+            ],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "model",
+                "name": "model",
+                "type": "MODEL",
+                "link": 1696
+              },
+              {
+                "localized_name": "vae",
+                "name": "vae",
+                "type": "VAE",
+                "link": 1697
+              },
+              {
+                "localized_name": "image",
+                "name": "image",
+                "type": "IMAGE",
+                "link": 1698
+              },
+              {
+                "localized_name": "bboxes",
+                "name": "bboxes",
+                "shape": 7,
+                "type": "BOUNDING_BOX",
+                "link": 1717
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "keypoints",
+                "name": "keypoints",
+                "type": "POSE_KEYPOINT",
+                "links": [
+                  1699,
+                  1725
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "SDPoseKeypointExtractor",
+              "cnr_id": "comfy-core",
+              "ver": "0.15.0",
+              "enableTabs": false,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "hasSecondTab": false,
+              "secondTabText": "Send Back",
+              "secondTabOffset": 80,
+              "secondTabWidth": 65
+            },
+            "widgets_values": [
+              16
+            ],
+            "widgets_values_named": {
+              "batch_size": 16
+            }
+          },
+          {
+            "id": 674,
+            "type": "ResizeImageMaskNode",
+            "pos": [
+              -3010,
+              3880
+            ],
+            "size": [
+              270,
+              110
+            ],
+            "flags": {},
+            "order": 3,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "input",
+                "name": "input",
+                "type": "IMAGE,MASK",
+                "link": 1742
+              },
+              {
+                "localized_name": "longer_size",
+                "name": "resize_type.longer_size",
+                "type": "INT",
+                "widget": {
+                  "name": "resize_type.longer_size"
+                },
+                "link": 1704
+              },
+              {
+                "localized_name": "scale_method",
+                "name": "scale_method",
+                "type": "COMBO",
+                "widget": {
+                  "name": "scale_method"
+                },
+                "link": 1705
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "resized",
+                "name": "resized",
+                "type": "IMAGE",
+                "links": [
+                  1698,
+                  1716
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "ResizeImageMaskNode",
+              "cnr_id": "comfy-core",
+              "ver": "0.15.0",
+              "enableTabs": false,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "hasSecondTab": false,
+              "secondTabText": "Send Back",
+              "secondTabOffset": 80,
+              "secondTabWidth": 65
+            },
+            "widgets_values": [
+              "scale longer dimension",
+              1024,
+              "lanczos"
+            ],
+            "widgets_values_named": {
+              "resize_type": "scale longer dimension",
+              "resize_type.longer_size": 1024,
+              "scale_method": "lanczos"
+            }
+          },
+          {
+            "id": 672,
+            "type": "SDPoseDrawKeypoints",
+            "pos": [
+              -2540,
+              3590
+            ],
+            "size": [
+              270,
+              280
+            ],
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "keypoints",
+                "name": "keypoints",
+                "type": "POSE_KEYPOINT",
+                "link": 1699
+              },
+              {
+                "localized_name": "draw_body",
+                "name": "draw_body",
+                "type": "BOOLEAN",
+                "widget": {
+                  "name": "draw_body"
+                },
+                "link": 1706
+              },
+              {
+                "localized_name": "draw_hands",
+                "name": "draw_hands",
+                "type": "BOOLEAN",
+                "widget": {
+                  "name": "draw_hands"
+                },
+                "link": 1707
+              },
+              {
+                "localized_name": "draw_face",
+                "name": "draw_face",
+                "type": "BOOLEAN",
+                "widget": {
+                  "name": "draw_face"
+                },
+                "link": 1708
+              },
+              {
+                "localized_name": "draw_feet",
+                "name": "draw_feet",
+                "type": "BOOLEAN",
+                "widget": {
+                  "name": "draw_feet"
+                },
+                "link": 1709
+              },
+              {
+                "localized_name": "stick_width",
+                "name": "stick_width",
+                "type": "INT",
+                "widget": {
+                  "name": "stick_width"
+                },
+                "link": 1710
+              },
+              {
+                "localized_name": "face_point_size",
+                "name": "face_point_size",
+                "type": "INT",
+                "widget": {
+                  "name": "face_point_size"
+                },
+                "link": 1711
+              },
+              {
+                "localized_name": "score_threshold",
+                "name": "score_threshold",
+                "type": "FLOAT",
+                "widget": {
+                  "name": "score_threshold"
+                },
+                "link": 1712
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "IMAGE",
+                "name": "IMAGE",
+                "type": "IMAGE",
+                "links": [
+                  1701
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "SDPoseDrawKeypoints",
+              "cnr_id": "comfy-core",
+              "ver": "0.15.0",
+              "enableTabs": false,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "hasSecondTab": false,
+              "secondTabText": "Send Back",
+              "secondTabOffset": 80,
+              "secondTabWidth": 65
+            },
+            "widgets_values": [
+              true,
+              true,
+              true,
+              true,
+              4,
+              2,
+              0.5,
+              true
+            ],
+            "widgets_values_named": {
+              "draw_body": true,
+              "draw_hands": true,
+              "draw_face": true,
+              "draw_feet": true,
+              "stick_width": 4,
+              "face_point_size": 2,
+              "score_threshold": 0.5,
+              "draw_head": true
+            }
+          },
+          {
+            "id": 673,
+            "type": "CheckpointLoaderSimple",
+            "pos": [
+              -3040,
+              3080
+            ],
+            "size": [
+              390,
+              160
+            ],
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "ckpt_name",
+                "name": "ckpt_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "ckpt_name"
+                },
+                "link": 1721
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "MODEL",
+                "name": "MODEL",
+                "type": "MODEL",
+                "links": [
+                  1696
+                ]
+              },
+              {
+                "localized_name": "CLIP",
+                "name": "CLIP",
+                "type": "CLIP",
+                "links": []
+              },
+              {
+                "localized_name": "VAE",
+                "name": "VAE",
+                "type": "VAE",
+                "links": [
+                  1697
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "CheckpointLoaderSimple",
+              "cnr_id": "comfy-core",
+              "ver": "0.15.0",
+              "models": [
+                {
+                  "name": "sdpose_wholebody_fp16.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/SDPose/resolve/main/checkpoints/sdpose_wholebody_fp16.safetensors",
+                  "directory": "checkpoints"
+                }
+              ],
+              "enableTabs": false,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "hasSecondTab": false,
+              "secondTabText": "Send Back",
+              "secondTabOffset": 80,
+              "secondTabWidth": 65
+            },
+            "widgets_values": [
+              "sdpose_wholebody_fp16.safetensors"
+            ],
+            "widgets_values_named": {
+              "ckpt_name": "sdpose_wholebody_fp16.safetensors"
+            }
+          },
+          {
+            "id": 677,
+            "type": "UNETLoader",
+            "pos": [
+              -3030,
+              3300
+            ],
+            "size": [
+              370,
+              110
+            ],
+            "flags": {},
+            "order": 4,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "unet_name",
+                "name": "unet_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "unet_name"
+                },
+                "link": 1722
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "MODEL",
+                "name": "MODEL",
+                "type": "MODEL",
+                "links": [
+                  1715
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "UNETLoader",
+              "cnr_id": "comfy-core",
+              "ver": "0.14.1",
+              "models": [
+                {
+                  "name": "rt_detr_v4-x-hgnet_fp16.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/SDPose/resolve/main/diffusion_models/rt_detr_v4-x-hgnet_fp16.safetensors",
+                  "directory": "diffusion_models"
+                }
+              ],
+              "enableTabs": false,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "hasSecondTab": false,
+              "secondTabText": "Send Back",
+              "secondTabOffset": 80,
+              "secondTabWidth": 65
+            },
+            "widgets_values": [
+              "rt_detr_v4-x-hgnet_fp16.safetensors",
+              "default"
+            ],
+            "widgets_values_named": {
+              "unet_name": "rt_detr_v4-x-hgnet_fp16.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          {
+            "id": 678,
+            "type": "RTDETR_detect",
+            "pos": [
+              -2540,
+              3320
+            ],
+            "size": [
+              280,
+              200
+            ],
+            "flags": {},
+            "order": 5,
+            "mode": 0,
+            "inputs": [
+              {
+                "label": "model",
+                "localized_name": "model",
+                "name": "model",
+                "type": "MODEL",
+                "link": 1715
+              },
+              {
+                "label": "image",
+                "localized_name": "image",
+                "name": "image",
+                "type": "IMAGE",
+                "link": 1716
+              },
+              {
+                "localized_name": "threshold",
+                "name": "threshold",
+                "type": "FLOAT",
+                "widget": {
+                  "name": "threshold"
+                },
+                "link": 1718
+              },
+              {
+                "localized_name": "class_name",
+                "name": "class_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "class_name"
+                },
+                "link": 1719
+              },
+              {
+                "localized_name": "max_detections",
+                "name": "max_detections",
+                "type": "INT",
+                "widget": {
+                  "name": "max_detections"
+                },
+                "link": 1720
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "bboxes",
+                "name": "bboxes",
+                "type": "BOUNDING_BOX",
+                "links": [
+                  1717,
+                  1726
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "RTDETR_detect",
+              "cnr_id": "comfy-core",
+              "ver": "0.15.1",
+              "enableTabs": false,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "hasSecondTab": false,
+              "secondTabText": "Send Back",
+              "secondTabOffset": 80,
+              "secondTabWidth": 65
+            },
+            "widgets_values": [
+              0.5,
+              "person",
+              2
+            ],
+            "widgets_values_named": {
+              "threshold": 0.5,
+              "class_name": "person",
+              "max_detections": 2
+            }
+          },
+          {
+            "id": 692,
+            "type": "GetVideoComponents",
+            "pos": [
+              -3010,
+              4100
+            ],
+            "size": [
+              230,
+              120
+            ],
+            "flags": {},
+            "order": 6,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "video",
+                "name": "video",
+                "type": "VIDEO",
+                "link": 1741
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "images",
+                "name": "images",
+                "type": "IMAGE",
+                "links": [
+                  1742
+                ]
+              },
+              {
+                "localized_name": "audio",
+                "name": "audio",
+                "type": "AUDIO",
+                "links": [
+                  1743
+                ]
+              },
+              {
+                "localized_name": "fps",
+                "name": "fps",
+                "type": "FLOAT",
+                "links": [
+                  1744
+                ]
+              },
+              {
+                "localized_name": "bit_depth",
+                "name": "bit_depth",
+                "type": "COMBO",
+                "links": null
+              },
+              {
+                "localized_name": "color_space",
+                "name": "color_space",
+                "type": "COMBO",
+                "links": null
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "GetVideoComponents",
+              "cnr_id": "comfy-core",
+              "ver": "0.18.1",
+              "enableTabs": false,
+              "tabWidth": 65,
+              "tabXOffset": 10,
+              "hasSecondTab": false,
+              "secondTabText": "Send Back",
+              "secondTabOffset": 80,
+              "secondTabWidth": 65
+            }
+          }
+        ],
+        "groups": [],
+        "links": [
+          {
+            "id": 1696,
+            "origin_id": 673,
+            "origin_slot": 0,
+            "target_id": 671,
+            "target_slot": 0,
+            "type": "MODEL"
+          },
+          {
+            "id": 1697,
+            "origin_id": 673,
+            "origin_slot": 2,
+            "target_id": 671,
+            "target_slot": 1,
+            "type": "VAE"
+          },
+          {
+            "id": 1698,
+            "origin_id": 674,
+            "origin_slot": 0,
+            "target_id": 671,
+            "target_slot": 2,
+            "type": "IMAGE"
+          },
+          {
+            "id": 1699,
+            "origin_id": 671,
+            "origin_slot": 0,
+            "target_id": 672,
+            "target_slot": 0,
+            "type": "POSE_KEYPOINT"
+          },
+          {
+            "id": 1701,
+            "origin_id": 672,
+            "origin_slot": 0,
+            "target_id": -20,
+            "target_slot": 0,
+            "type": "IMAGE"
+          },
+          {
+            "id": 1704,
+            "origin_id": -10,
+            "origin_slot": 0,
+            "target_id": 674,
+            "target_slot": 1,
+            "type": "INT"
+          },
+          {
+            "id": 1705,
+            "origin_id": -10,
+            "origin_slot": 1,
+            "target_id": 674,
+            "target_slot": 2,
+            "type": "COMBO"
+          },
+          {
+            "id": 1706,
+            "origin_id": -10,
+            "origin_slot": 2,
+            "target_id": 672,
+            "target_slot": 1,
+            "type": "BOOLEAN"
+          },
+          {
+            "id": 1707,
+            "origin_id": -10,
+            "origin_slot": 3,
+            "target_id": 672,
+            "target_slot": 2,
+            "type": "BOOLEAN"
+          },
+          {
+            "id": 1708,
+            "origin_id": -10,
+            "origin_slot": 4,
+            "target_id": 672,
+            "target_slot": 3,
+            "type": "BOOLEAN"
+          },
+          {
+            "id": 1709,
+            "origin_id": -10,
+            "origin_slot": 5,
+            "target_id": 672,
+            "target_slot": 4,
+            "type": "BOOLEAN"
+          },
+          {
+            "id": 1710,
+            "origin_id": -10,
+            "origin_slot": 6,
+            "target_id": 672,
+            "target_slot": 5,
+            "type": "INT"
+          },
+          {
+            "id": 1711,
+            "origin_id": -10,
+            "origin_slot": 7,
+            "target_id": 672,
+            "target_slot": 6,
+            "type": "INT"
+          },
+          {
+            "id": 1712,
+            "origin_id": -10,
+            "origin_slot": 8,
+            "target_id": 672,
+            "target_slot": 7,
+            "type": "FLOAT"
+          },
+          {
+            "id": 1715,
+            "origin_id": 677,
+            "origin_slot": 0,
+            "target_id": 678,
+            "target_slot": 0,
+            "type": "MODEL"
+          },
+          {
+            "id": 1716,
+            "origin_id": 674,
+            "origin_slot": 0,
+            "target_id": 678,
+            "target_slot": 1,
+            "type": "IMAGE"
+          },
+          {
+            "id": 1717,
+            "origin_id": 678,
+            "origin_slot": 0,
+            "target_id": 671,
+            "target_slot": 3,
+            "type": "BOUNDING_BOX"
+          },
+          {
+            "id": 1718,
+            "origin_id": -10,
+            "origin_slot": 9,
+            "target_id": 678,
+            "target_slot": 2,
+            "type": "FLOAT"
+          },
+          {
+            "id": 1719,
+            "origin_id": -10,
+            "origin_slot": 10,
+            "target_id": 678,
+            "target_slot": 3,
+            "type": "COMBO"
+          },
+          {
+            "id": 1720,
+            "origin_id": -10,
+            "origin_slot": 11,
+            "target_id": 678,
+            "target_slot": 4,
+            "type": "INT"
+          },
+          {
+            "id": 1721,
+            "origin_id": -10,
+            "origin_slot": 12,
+            "target_id": 673,
+            "target_slot": 0,
+            "type": "COMBO"
+          },
+          {
+            "id": 1722,
+            "origin_id": -10,
+            "origin_slot": 13,
+            "target_id": 677,
+            "target_slot": 0,
+            "type": "COMBO"
+          },
+          {
+            "id": 1725,
+            "origin_id": 671,
+            "origin_slot": 0,
+            "target_id": -20,
+            "target_slot": 1,
+            "type": "POSE_KEYPOINT"
+          },
+          {
+            "id": 1726,
+            "origin_id": 678,
+            "origin_slot": 0,
+            "target_id": -20,
+            "target_slot": 2,
+            "type": "BOUNDING_BOX"
+          },
+          {
+            "id": 1741,
+            "origin_id": -10,
+            "origin_slot": 14,
+            "target_id": 692,
+            "target_slot": 0,
+            "type": "VIDEO"
+          },
+          {
+            "id": 1742,
+            "origin_id": 692,
+            "origin_slot": 0,
+            "target_id": 674,
+            "target_slot": 0,
+            "type": "IMAGE"
+          },
+          {
+            "id": 1743,
+            "origin_id": 692,
+            "origin_slot": 1,
+            "target_id": -20,
+            "target_slot": 3,
+            "type": "AUDIO"
+          },
+          {
+            "id": 1744,
+            "origin_id": 692,
+            "origin_slot": 2,
+            "target_id": -20,
+            "target_slot": 4,
+            "type": "FLOAT"
+          }
+        ],
+        "extra": {
+          "workflowRendererVersion": "LG"
+        }
+      }
+    ]
+  },
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        80,
+        100
+      ]
+    }
+  },
+  "version": 0.4
+}
