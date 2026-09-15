@@ -11,7 +11,7 @@ import json
 from collections.abc import Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from fastapi import WebSocket
@@ -32,6 +32,7 @@ from vllm_omni.entrypoints.duplex.protocol import (
     DuplexCommittedInput,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
+    DuplexResponseEndHook,
     DuplexSession,
     DuplexSessionConfig,
     DuplexSessionRegistry,
@@ -77,6 +78,7 @@ from vllm_omni.entrypoints.duplex.websocket import (
     DuplexSessionTasks,
     DuplexWebSocketActor,
 )
+from vllm_omni.metrics.duplex_turn import finished_reason_for_cancel
 from vllm_omni.metrics.realtime import RealtimeVADMetrics
 
 if TYPE_CHECKING:
@@ -257,7 +259,7 @@ class OmniDuplexSessionHandler(
             with suppress(asyncio.CancelledError):
                 await data_plane_task
         if session.active_response_id is not None:
-            session.end_response(commit_text=False)
+            session.end_response(commit_text=False, finished_reason="close")
         self._cleanup_duplex_session_state(session)
         self._registry.close(session.session_id)
         self._realtime_protocols.pop(session.session_id, None)
@@ -1006,6 +1008,7 @@ class OmniDuplexSessionHandler(
         session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
         session = self._registry.create(config=config, session_id=session_id)
         if runtime_adapter is not None:
+            self._attach_duplex_turn_metrics(session)
             session.replace_capabilities(
                 runtime_adapter.capabilities(max_sessions=self._duplex_session_config.max_sessions)
             )
@@ -1394,6 +1397,43 @@ class OmniDuplexSessionHandler(
             ),
             "stage0",
         )
+
+    def _attach_duplex_turn_metrics(self, session: DuplexSession) -> None:
+        engine_client = getattr(self._chat_service, "engine_client", None)
+        begin = getattr(engine_client, "begin_duplex_turn_metrics", None)
+        finalize = getattr(engine_client, "finalize_duplex_turn_metrics", None)
+        if not callable(begin) or not callable(finalize):
+            return
+
+        def on_begin(sess: DuplexSession) -> None:
+            rid = sess.active_request_id or self._native_stage0_request_id(sess, sess.epoch)
+            response_id = sess.active_response_id
+            if not rid or not response_id:
+                return
+            turn_id = sess.active_response_turn_id
+            mark_arrival = getattr(engine_client, "mark_duplex_turn_arrival", None)
+            arrival_ts = mark_arrival(rid) if callable(mark_arrival) else None
+            begin(
+                rid,
+                response_id=response_id,
+                turn_id=turn_id if turn_id is not None else sess.turn_id,
+                arrival_ts=arrival_ts,
+            )
+
+        def on_end(
+            sess: DuplexSession,
+            *,
+            request_id: str | None,
+            response_id: str,
+            reason: str,
+        ) -> None:
+            rid = request_id or self._native_stage0_request_id(sess, sess.epoch)
+            if not rid:
+                return
+            finalize(rid, reason=reason)
+
+        session.on_response_begin = on_begin
+        session.on_response_end = cast(DuplexResponseEndHook, on_end)
 
     @staticmethod
     def _session_auto_responds(session: DuplexSession) -> bool:
@@ -2054,6 +2094,7 @@ class OmniDuplexSessionHandler(
         committed_message = session.end_response(
             commit_text=self._should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
+            finished_reason=finished_reason_for_cancel(reason),
         )
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"
