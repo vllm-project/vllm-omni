@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/ernie_image/pipeline_ernie_image.py
 
 import json
@@ -16,6 +16,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -80,7 +81,6 @@ class ErnieImagePipeline(
     ):
         super().__init__()
         self.od_config = od_config
-        self.is_distilled = is_distilled
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -96,6 +96,13 @@ class ErnieImagePipeline(
         logger.info("Model path for initialization: %s", model)
         local_files_only = os.path.exists(model)
         logger.info("Local files only: %s", local_files_only)
+
+        self.is_distilled = is_distilled or self._detect_distilled(model)
+        if self.is_distilled:
+            logger.info(
+                "Distilled ERNIE-Image checkpoint detected (%s); classifier-free guidance is disabled.",
+                model,
+            )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model,
@@ -259,6 +266,25 @@ class ErnieImagePipeline(
             return False
         extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
         return bool(extra_args.get("apply_pe", True))
+
+    @staticmethod
+    def _read_model_index(model: str) -> dict:
+        try:
+            return get_hf_file_to_dict("model_index.json", model) or {}
+        except Exception as e:
+            logger.debug("Failed to read model_index.json for %s: %s", model, e)
+            return {}
+
+    @staticmethod
+    def _detect_distilled(model: str, model_index: dict | None = None) -> bool:
+        if model_index is None:
+            model_index = ErnieImagePipeline._read_model_index(model)
+        marker = model_index.get("is_distilled")
+        if marker is not None:
+            return bool(marker)
+        # Current upstream ERNIE-Image repos ship no is_distilled marker in
+        # model_index.json, so fall back to the checkpoint name until they do.
+        return "turbo" in os.path.basename(model.rstrip("/")).lower()
 
     def encode_prompt(
         self,
@@ -441,6 +467,12 @@ class ErnieImagePipeline(
         self._guidance_scale = guidance_scale
         self._current_timestep = None
         self._interrupt = False
+
+        if self.is_distilled and guidance_scale > 1:
+            logger.info(
+                "guidance_scale=%s is ignored: distilled ERNIE-Image runs without classifier-free guidance.",
+                guidance_scale,
+            )
 
         self.check_inputs(prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds)
         height, width = self._resize_dimensions(height, width)
