@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import builtins
 
@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.indextts2.text_processing_v2_5 import (
     apply_pronunciation_annotations,
     clean_indextts25_text,
     prepare_indextts25_text,
+    split_indextts25_text,
 )
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_SPECIAL_TOKENS,
@@ -21,6 +22,67 @@ from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("text", "budget", "expected"),
+    [
+        ("甲乙丙", 3, ["甲乙丙"]),
+        ("甲，乙。丙！", 4, ["甲，乙。", "丙！"]),
+        ("甲乙丙丁戊", 2, ["甲乙", "丙丁", "戊"]),
+        ("甲，乙丙丁戊", 3, ["甲，乙", "丙丁戊"]),
+        ("甲\n乙 丙", 3, ["甲\n", "乙 丙"]),
+    ],
+)
+def test_split_text_preserves_content_and_respects_budget(text, budget, expected):
+    segments = split_indextts25_text(text, token_length=len, lang_prefix="", capacity=100, max_tokens=budget)
+    assert segments == expected
+    assert "".join(segments) == text
+    assert all(len(segment) <= budget for segment in segments)
+
+
+def test_split_text_reserves_language_prefix_and_start_stop_positions():
+    segments = split_indextts25_text("甲乙丙丁戊", token_length=len, lang_prefix="zh ", capacity=8, max_tokens=120)
+    assert segments == ["甲乙丙", "丁戊"]
+    assert all(len("zh " + segment) + 2 <= 8 for segment in segments)
+
+
+def test_split_text_counts_prefix_and_body_together():
+    # A boundary-sensitive tokenizer: concatenation is costlier than separately
+    # encoding the prefix and body. Adding those separate counts would overflow.
+    def token_length(value):
+        return len(value) + (2 if value.startswith("P:") and len(value) > 2 else 0)
+
+    segments = split_indextts25_text("abc", token_length=token_length, lang_prefix="P:", capacity=100, max_tokens=6)
+    assert segments == ["ab", "c"]
+    assert all(token_length("P:" + segment) <= 6 for segment in segments)
+
+
+@pytest.mark.parametrize("marker", ["SPECIAL_TOKEN_1", "SPECIAL_TOKEN_2"])
+def test_split_text_keeps_pronunciation_annotation_atomic(marker):
+    annotation = f"<|{marker}|>A.B<|{marker}|>"
+    text = "前" + annotation + "后"
+    segments = split_indextts25_text(text, token_length=len, lang_prefix="", capacity=1000, max_tokens=len(annotation))
+    assert segments == ["前", annotation, "后"]
+    assert "".join(segments) == text
+
+
+@pytest.mark.parametrize("text", ["<|SPECIAL_TOKEN_2|>XING2<|SPECIAL_TOKEN_2|>", "<|EMO_HAPPY|>", "甲"])
+def test_split_text_rejects_oversized_indivisible_units(text):
+    with pytest.raises(ValueError, match="indivisible"):
+        split_indextts25_text(text, token_length=len, lang_prefix="zh", capacity=100, max_tokens=2)
+
+
+@pytest.mark.parametrize("text", ["", " \n"])
+def test_split_text_rejects_empty_input(text):
+    with pytest.raises(ValueError, match="empty"):
+        split_indextts25_text(text, token_length=len, lang_prefix="", capacity=100)
+
+
+@pytest.mark.parametrize(("capacity", "max_tokens"), [(2, 120), (100, 0), (100, -1)])
+def test_split_text_rejects_invalid_limits(capacity, max_tokens):
+    with pytest.raises(ValueError, match="positive token budget"):
+        split_indextts25_text(text="abc", token_length=len, lang_prefix="", capacity=capacity, max_tokens=max_tokens)
 
 
 def test_special_token_layout_matches_official_checkpoint_vocab():

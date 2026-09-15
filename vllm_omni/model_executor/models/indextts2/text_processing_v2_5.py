@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Text preparation shared by IndexTTS 2.5 prompt sizing and model prefill."""
 
 from __future__ import annotations
@@ -295,6 +295,80 @@ def normalize_indextts25_text(
     )
 
 
+def split_indextts25_text(
+    text: str,
+    *,
+    token_length: Callable[[str], int],
+    lang_prefix: str,
+    capacity: int,
+    max_tokens: int = 120,
+) -> list[str]:
+    """Split normalized text without changing its contents.
+
+    ``token_length`` must use the same tokenizer as model prefill, including
+    special-token handling. ``max_tokens`` includes the language prefix but
+    excludes the start/stop text tokens; ``capacity`` includes both wrappers.
+    Count prefix + text together because token counts need not be additive.
+
+    Prefer punctuation boundaries, falling back to Unicode characters for
+    oversized plain-text spans. Keep normalized pronunciation annotations and
+    individual special tokens intact. Reject an indivisible unit that cannot
+    fit, rather than silently exceeding the budget or truncating its contents.
+    This helper does not normalize text or schedule generation.
+    """
+    if not text or not text.strip():
+        raise ValueError("IndexTTS 2.5 text cannot be empty")
+    if max_tokens < 1 or capacity < 3:
+        raise ValueError("IndexTTS 2.5 requires a positive token budget and capacity of at least 3")
+    limit = min(max_tokens, capacity - 2)
+
+    def fits(value: str) -> bool:
+        return token_length(lang_prefix + value) <= limit
+
+    if fits(text):
+        return [text]
+
+    # Paired pronunciation markers must be matched before standalone markers.
+    protected = re.compile(r"(<\|SPECIAL_TOKEN_\d+\|>).*?\1|<\|[^|]+\|>", re.DOTALL)
+    pieces: list[tuple[str, bool]] = []
+    pos = 0
+    for match in protected.finditer(text):
+        if match.start() > pos:
+            pieces.append((text[pos : match.start()], False))
+        pieces.append((match.group(), True))
+        pos = match.end()
+    if pos < len(text):
+        pieces.append((text[pos:], False))
+
+    segments: list[str] = []
+    current = ""
+
+    def append_unit(unit: str) -> None:
+        nonlocal current
+        if current and not fits(current + unit):
+            segments.append(current)
+            current = ""
+        if not fits(current + unit):
+            raise ValueError("IndexTTS 2.5 token budget cannot fit an indivisible text unit with its language prefix")
+        current += unit
+
+    for piece, atomic in pieces:
+        if atomic:
+            append_unit(piece)
+            continue
+        for part in re.split(r"(?<=[，。！？、；：,.!?;:\n])", piece):
+            if not part:
+                continue
+            if fits(part):
+                append_unit(part)
+            else:
+                for char in part:
+                    append_unit(char)
+    if current:
+        segments.append(current)
+    return segments
+
+
 def prepare_indextts25_text(
     text: str,
     *,
@@ -303,18 +377,28 @@ def prepare_indextts25_text(
     tokenizer_file: str = INDEXTTS25_TOKENIZER_FILE,
     text_normalization: bool = True,
     normalizer: Callable[[str, str], str] | None = None,
+    text_preprocessed: bool = False,
 ) -> tuple[list[int], int]:
+    """Encode text, optionally accepting an internally preprocessed segment.
+
+    ``text_preprocessed`` skips all text transformations, including annotation
+    and casing transforms which still run with ``text_normalization=False``.
+    """
     if not text or not text.strip():
         raise ValueError("IndexTTS 2.5 text cannot be empty")
     lang_code = normalize_language_code(lang)
     # When no heavyweight TN callback is installed, punctuation/casing and
     # annotations are still deterministic. The Talker installs the official
     # language-specific normalizer before enabling text_normalization.
-    normalized = normalize_indextts25_text(
-        text,
-        lang=lang_code,
-        text_normalization=text_normalization,
-        normalizer=normalizer,
+    normalized = (
+        text
+        if text_preprocessed
+        else normalize_indextts25_text(
+            text,
+            lang=lang_code,
+            text_normalization=text_normalization,
+            normalizer=normalizer,
+        )
     )
     # ``zhen`` is not a registered special token. Keep its official literal
     # prefix so tiktoken encodes it through existing mergeable ranks; remapping

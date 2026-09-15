@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
 
@@ -7,6 +7,7 @@ from transformers import PretrainedConfig
 
 INDEXTTS25_MIN_DURATION_FACTOR = 0.5
 INDEXTTS25_MAX_DURATION_FACTOR = 2.0
+INDEXTTS25_TEXT_PREPROCESSED_KEY = "_indextts25_text_preprocessed"
 
 
 class IndexTTS2Config(PretrainedConfig):
