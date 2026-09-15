@@ -170,10 +170,82 @@ class _RecordingTransformer(nn.Module):
         return {name for name, _ in self.loaded_weights}
 
 
+class _StubCausalDecoder:
+    """Stand-in for the Wan causal decoder's cache protocol.
+
+    Reproduces only what streaming depends on: each call walks ``feat_idx``
+    across one cache slot per causal convolution, and the session's opening
+    frame (``first_chunk``) expands to a single raw frame while every later
+    frame expands by the temporal factor.
+    """
+
+    NUM_CONVS = 3
+
+    def __init__(self) -> None:
+        self.first_chunk_flags: list[bool] = []
+        # Identity of the cache each call wrote through, so an interleaved run
+        # can assert that a session never advanced another session's context.
+        self.cache_ids: list[int] = []
+
+    def __call__(self, x: torch.Tensor, *, feat_cache, feat_idx, first_chunk: bool = False):
+        self.first_chunk_flags.append(bool(first_chunk))
+        self.cache_ids.append(id(feat_cache))
+        for _ in range(self.NUM_CONVS):
+            index = feat_idx[0]
+            feat_cache[index] = x.detach().clone()
+            feat_idx[0] = index + 1
+        num_frames = 1 if first_chunk else 4
+        return x.new_zeros(x.shape[0], 3, num_frames, x.shape[-2] * 8, x.shape[-1] * 8)
+
+
+class _StubCausalEncoder(nn.Module):
+    """Minimal Wan cache layout; the real tiny VAE below checks numerical parity."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv_in = nn.Conv3d(3, 16, 1)
+        self.down_blocks = nn.ModuleList([lingbot_pipeline.WanResample(16, mode="downsample2d") for _ in range(3)])
+        self.mid_block = SimpleNamespace(resnets=[])
+        self.conv_out = nn.Conv3d(16, 32, 1)
+        self.inputs: list[torch.Tensor] = []
+
+    def forward(self, video, *, feat_cache, feat_idx):
+        self.inputs.append(video.detach().clone())
+        first = feat_cache[0] is None
+        tail = video[:, :, -2:].clone()
+        if tail.shape[2] == 1 and feat_cache[0] is not None:
+            tail = torch.cat((feat_cache[0][:, :, -1:], tail), dim=2)
+        feat_cache[0] = tail
+        height, width = video.shape[-2] // 8, video.shape[-1] // 8
+        previous_frames = 0 if feat_cache[1] is None else feat_cache[1].shape[2]
+        feat_cache[1] = video.new_zeros(1, 16, min(2, previous_frames + 1), height, width)
+        feat_idx[0] += 2
+        moments = video.new_zeros(1, 32, 1, height, width)
+        if first:
+            moments[:, :16] = 2.0
+        return moments
+
+
 class _StubVAE(_FakePretrained):
     dtype = torch.float32
 
-    def __init__(self):
+    def __init__(self, *, streaming: bool = True):
+        self.encoder = _StubCausalEncoder()
+        self.quant_conv = nn.Identity()
+        self._cached_conv_counts = {"encoder": 2}
+        self._enc_feat_map = ["module-owned"]
+        self._enc_conv_idx = [71]
+        if streaming:
+            self.decoder = _StubCausalDecoder()
+            # Recorded, not discarded: on the streaming branch this is the only
+            # place the tensor handed to the decoder can be observed, and it is
+            # what carries the checkpoint's latent rescale.
+            self.post_quant_inputs: list[torch.Tensor] = []
+            self.post_quant_conv = self._record_post_quant
+            self._cached_conv_counts["decoder"] = _StubCausalDecoder.NUM_CONVS
+            # Module-owned cache the shared VAE keeps for whole-clip decode;
+            # streaming must never write through it.
+            self._feat_map = ["module-owned"]
         self.config = SimpleNamespace(
             z_dim=16,
             scale_factor_temporal=4,
@@ -184,6 +256,10 @@ class _StubVAE(_FakePretrained):
         self.encode_inputs: list[torch.Tensor] = []
         self.decode_inputs: list[torch.Tensor] = []
         self.on_decode = None
+
+    def _record_post_quant(self, latent: torch.Tensor) -> torch.Tensor:
+        self.post_quant_inputs.append(latent.detach().clone())
+        return latent
 
     def encode(self, video: torch.Tensor):
         self.encode_inputs.append(video.detach().clone())
@@ -455,7 +531,39 @@ def test_ar_diffusion_capability_uses_transformer_local_head_geometry() -> None:
     assert spec.sink_frames == 3
     assert [(branch.name, branch.local_index) for branch in spec.kv_branches] == [("main", 0)]
     assert spec.cross_attention_lengths == {"text": 512}
-    assert spec.model_owned_state_bytes_per_session == 9_600
+    # One condition block, committed + pending encoder caches, and decoder state.
+    # The stub encoder retains 2 RGB frames at 16x16 and 2 feature frames at 2x2.
+    encoder_bytes = (2 * 3 * 16 * 16 + 2 * 16 * 2 * 2) * 4
+    assert spec.model_owned_state_bytes_per_session == 960 + 2 * encoder_bytes + 2_421_248
+
+
+def test_session_admission_accounts_for_the_streaming_decoder_cache() -> None:
+    """Admission includes encoder state even when the decoder cannot stream."""
+    module = _load_pipeline_module()
+
+    def spec_pipeline():
+        pipeline = _pipeline(module)
+        # The spec reads the constructed attention's head count; the head count
+        # plays no part in model-owned bytes, so any value will do here.
+        pipeline.transformer.blocks[0].self_attn = SimpleNamespace(num_sp_heads=1)
+        return pipeline
+
+    small = spec_pipeline().ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+
+    wide = spec_pipeline()
+    wide._ar_width = wide._ar_width * 2
+    widened = wide.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    # Twice the area: the decoder cache doubles, so the total grows by far more
+    # than the image condition alone could account for.
+    assert widened - small > 2_000_000
+
+    # Removing decoder support leaves the condition and both encoder histories.
+    bare = spec_pipeline()
+    for attribute in ("decoder", "post_quant_conv"):
+        if hasattr(bare.vae, attribute):
+            delattr(bare.vae, attribute)
+    bare.vae._cached_conv_counts.pop("decoder")
+    assert bare.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session == 960 + 2 * 6_656
 
 
 def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_path: Path) -> None:
@@ -1123,20 +1231,19 @@ def test_request_validation_rejects_unsupported_contracts(request_batch, message
         _pipeline(module)._parse_request(request_batch)
 
 
-def test_resource_limits_accept_exact_documented_boundaries() -> None:
+def test_request_validation_accepts_frames_beyond_previous_limit() -> None:
     module = _load_pipeline_module()
-    sampling = _SamplingParams(height=480, width=832, num_frames=117, max_sequence_length=512)
+    sampling = _SamplingParams(height=480, width=832, num_frames=129, max_sequence_length=512)
 
     parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
 
-    assert (parsed.height, parsed.width, parsed.num_frames, parsed.max_sequence_length) == (480, 832, 117, 512)
+    assert (parsed.height, parsed.width, parsed.num_frames, parsed.max_sequence_length) == (480, 832, 129, 512)
 
 
 @pytest.mark.parametrize(
     ("sampling", "message"),
     [
         (_SamplingParams(height=480, width=848), "pixel area|480.*832"),
-        (_SamplingParams(num_frames=129), "num_frames.*117"),
         (_SamplingParams(max_sequence_length=511), "max_sequence_length.*512"),
         (_SamplingParams(max_sequence_length=513), "max_sequence_length.*512"),
         (_SamplingParams(max_sequence_length=512.0), "max_sequence_length.*512"),
@@ -1473,9 +1580,9 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     assert cache_ref() is None
 
 
-def _tick_extra_args(*, chunk_index: int, prompt: str = "move through the room"):
+def _tick_extra_args(*, chunk_index: int, prompt: str = "move through the room", session_id: str = "world-1"):
     return ARDiffusionTickRequest(
-        session_id="world-1",
+        session_id=session_id,
         request_id="legacy-lingbot-request",
         chunk_index=chunk_index,
         applied_event_ids=(chunk_index,),
@@ -1488,6 +1595,16 @@ def _tick_extra_args(*, chunk_index: int, prompt: str = "move through the room")
             ),
         ),
     ).to_extra_args()
+
+
+def test_realtime_rejects_pixel_output_before_condition_encoding() -> None:
+    pipeline = _pipeline(_load_pipeline_module())
+    pipeline._ar_diffusion_kv_state = object()
+    sampling = _SamplingParams(output_type="np", extra_args=_tick_extra_args(chunk_index=0))
+    with pytest.raises(ValueError, match="require output_type='latent'"):
+        pipeline(_request(sampling=sampling))
+    assert pipeline._ar_sessions == {}
+    assert pipeline.vae.encoder.inputs == []
 
 
 def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
@@ -1692,7 +1809,7 @@ def test_typed_tick_rejects_non_contiguous_chunk_index(
         pipeline(_request(sampling=sampling))
 
 
-def test_typed_tick_rejects_chunk_beyond_realtime_condition_horizon(
+def test_typed_ticks_keep_bounded_encoder_state_beyond_ten_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_pipeline_module()
@@ -1700,21 +1817,228 @@ def test_typed_tick_rejects_chunk_beyond_realtime_condition_horizon(
     pipeline._ar_height = 16
     pipeline._ar_width = 16
     pipeline._ar_diffusion_kv_state = object()
-    pipeline._ar_sessions["world-1"] = module._LingBotARSessionState(
-        next_chunk_index=10,
-    )
+    generated = []
     monkeypatch.setattr(
         pipeline,
-        "encode_prompt",
-        lambda *args, **kwargs: pytest.fail("the realtime horizon must be validated before prompt encoding"),
+        "_ar_text_caches",
+        lambda *args, **kwargs: [SimpleNamespace()],
     )
 
-    sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=10))
-    with pytest.raises(
-        ValueError,
-        match=r"at most 10 ticks.*chunk_index 0 through 9.*117 pixel frames",
-    ):
+    def generate_block(**kwargs):
+        generated.append(
+            {
+                "condition": kwargs["condition"].clone(),
+                "start_frame": kwargs["start_frame"],
+            }
+        )
+        return torch.zeros_like(kwargs["condition"][:, :16])
+
+    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+
+    for chunk_index in range(11):
+        sampling = _SamplingParams(
+            extra_args=_tick_extra_args(chunk_index=chunk_index),
+        )
         pipeline(_request(sampling=sampling))
+
+    assert pipeline.vae.encode_inputs == []
+    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == [1] + [4] * 32
+    assert all(torch.count_nonzero(video) == 0 for video in pipeline.vae.encoder.inputs[1:])
+    encoder_cache = pipeline._ar_sessions["world-1"].encoder_cache
+    assert sum(t.numel() * t.element_size() for t in encoder_cache) == pipeline._condition_encoder_cache_bytes()
+    assert pipeline.vae._enc_feat_map == ["module-owned"]
+    assert pipeline.vae._enc_conv_idx == [71]
+    assert pipeline._ar_sessions["world-1"].next_chunk_index == 11
+    assert [item["start_frame"] for item in generated] == list(range(0, 33, 3))
+    assert torch.count_nonzero(generated[0]["condition"][:, :4]) > 0
+    torch.testing.assert_close(
+        generated[1]["condition"][:, :4],
+        torch.zeros_like(generated[1]["condition"][:, :4]),
+    )
+    for item in generated[2:]:
+        torch.testing.assert_close(item["condition"], generated[1]["condition"])
+
+
+def _tiny_condition_pipeline(monkeypatch: pytest.MonkeyPatch):
+    from diffusers import AutoencoderKLWan
+
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
+
+    pipeline = _pipeline(_load_pipeline_module())
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(7)
+        pipeline.vae = AutoencoderKLWan(
+            base_dim=4,
+            z_dim=16,
+            dim_mult=[1, 1, 1, 1],
+            num_res_blocks=1,
+            temperal_downsample=[False, True, True],
+        ).eval()
+    monkeypatch.setattr(lingbot_pipeline, "retrieve_latents", retrieve_latents)
+    monkeypatch.setattr(pipeline, "_ar_text_caches", lambda *args, **kwargs: [SimpleNamespace()])
+    return pipeline
+
+
+@pytest.mark.parametrize("mode", ["realtime", "stepwise"])
+def test_condition_continues_real_causal_vae_beyond_initial_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    pipeline = _tiny_condition_pipeline(monkeypatch)
+    blocks = 12
+    inputs = pipeline._parse_request(_request(sampling=_SamplingParams(num_frames=(blocks * 3 - 1) * 4 + 1)))
+    with torch.inference_mode():
+        expected = pipeline._prepare_condition(inputs, dtype=torch.float32)
+    module_cache = pipeline.vae._enc_feat_map
+    seen = []
+
+    def check(condition):
+        index = len(seen)
+        torch.testing.assert_close(condition, expected[:, :, index * 3 : (index + 1) * 3], rtol=1e-6, atol=1e-6)
+        seen.append(condition.clone())
+
+    if mode == "realtime":
+        pipeline._ar_diffusion_kv_state = object()
+
+        def generate_block(**kwargs):
+            check(kwargs["condition"])
+            return torch.zeros_like(kwargs["condition"][:, :16])
+
+        monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+        session_id = "world-1"
+        outputs = (
+            pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=index))))
+            for index in range(blocks)
+        )
+    else:
+
+        def probe_step(**kwargs):
+            if kwargs["step_index"] == 0:
+                check(kwargs["condition"])
+            return torch.ones_like(kwargs["current_latents"])
+
+        monkeypatch.setattr(pipeline._dmd_blocks, "probe_step", probe_step)
+        monkeypatch.setattr(pipeline._dmd_blocks, "commit_block_kv", lambda **kwargs: None)
+        state = _stepwise_state(num_frames=(blocks * 3 - 1) * 4 + 1)
+        session_id = state.request_id
+        outputs = _stepwise_chunks(pipeline, state, _FakeARState(session_id))
+
+    cache_sizes = []
+    for _ in outputs:
+        state = pipeline._ar_sessions.get(session_id)
+        if state is not None:
+            for cache in (state.encoder_cache, state.pending_encoder_cache):
+                if cache is not None:
+                    size = sum(t.numel() * t.element_size() for t in cache if t is not None)
+                    assert size == pipeline._condition_encoder_cache_bytes()
+                    assert all(t.grad_fn is None for t in cache if t is not None)
+                    cache_sizes.append(size)
+    assert len(seen) == blocks and len(set(cache_sizes)) == 1
+    assert pipeline.vae._enc_feat_map is module_cache and all(t is None for t in module_cache)
+    pipeline.close_ar_diffusion_session(session_id)
+    assert pipeline._ar_sessions == {}
+
+
+def test_condition_encoder_interleaving_retry_and_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _tiny_condition_pipeline(monkeypatch)
+    pipeline._ar_diffusion_kv_state = object()
+    prompts = {
+        "a": _prompt(images=Image.new("RGB", (16, 16), (255, 0, 0))),
+        "b": _prompt(images=Image.new("RGB", (16, 16), (0, 255, 0))),
+    }
+    expected = {}
+    with torch.inference_mode():
+        for name, prompt in prompts.items():
+            inputs = pipeline._parse_request(_request(prompt=prompt, sampling=_SamplingParams(num_frames=45)))
+            expected[name] = pipeline._prepare_condition(inputs, dtype=torch.float32)
+    assert not torch.equal(expected["a"], expected["b"])
+    active = None
+    failure = None
+    original_encoder = pipeline.vae.encoder.forward
+
+    def encoder(*args, **kwargs):
+        output = original_encoder(*args, **kwargs)
+        if failure == "encoder":
+            raise RuntimeError("injected encoder failure")
+        return output
+
+    def generate_block(**kwargs):
+        index = kwargs["start_frame"]
+        torch.testing.assert_close(kwargs["condition"], expected[active][:, :, index : index + 3], rtol=1e-6, atol=1e-6)
+        if failure == "dit":
+            raise RuntimeError("injected DiT failure")
+        return torch.zeros_like(kwargs["condition"][:, :16])
+
+    monkeypatch.setattr(pipeline.vae.encoder, "forward", encoder)
+    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+
+    def run(name, index):
+        nonlocal active
+        active = name
+        sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=index, session_id=name))
+        return pipeline(_request(prompt=prompts[name], sampling=sampling))
+
+    run("a", 0)
+    for index, kind in [(1, "encoder"), (2, "dit")]:
+        state = pipeline._ar_sessions["a"]
+        committed = state.encoder_cache
+        saved = [t.clone() if t is not None else None for t in committed]
+        failure = kind
+        with pytest.raises(RuntimeError, match="injected"):
+            run("a", index)
+        assert state.next_chunk_index == index and state.encoder_cache is committed
+        assert state.pending_encoder_cache is None
+        for before, after in zip(saved, committed, strict=True):
+            if before is not None:
+                torch.testing.assert_close(before, after, rtol=0, atol=0)
+        failure = None
+        run("b", index - 1)
+        run("a", index)
+
+    old_a = pipeline._ar_sessions["a"]
+    pipeline.reset_ar_diffusion_session("a")
+    assert old_a.encoder_cache is None and old_a.pending_encoder_cache is None
+    assert "a" not in pipeline._ar_sessions and "b" in pipeline._ar_sessions
+    run("a", 0)
+    old_b = pipeline._ar_sessions["b"]
+    pipeline.close_ar_diffusion_session("b")
+    assert old_b.encoder_cache is None and old_b.pending_encoder_cache is None
+    assert "a" in pipeline._ar_sessions and "b" not in pipeline._ar_sessions
+    pipeline.close_ar_diffusion_session("a")
+    assert pipeline._ar_sessions == {}
+
+
+def test_stepwise_failed_chunk_releases_pending_encoder_on_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _pipeline(_load_pipeline_module())
+    state = _stepwise_state()
+    transformer = pipeline.transformer
+    transformer.raise_on_call = 1
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        pipeline.prepare_encode(state)
+        session = pipeline._ar_sessions[state.request_id]
+        assert session.encoder_cache is None and session.pending_encoder_cache is not None
+        with pytest.raises(RuntimeError, match="forced transformer failure"):
+            pipeline.denoise_step(None, states=[state])
+        assert session.next_chunk_index == 0 and session.encoder_cache is None
+    pipeline.close_ar_diffusion_session(state.request_id)
+    assert session.encoder_cache is None and session.pending_encoder_cache is None
+    assert state.request_id not in pipeline._ar_sessions
+
+
+@pytest.mark.parametrize("mode", ["realtime", "stepwise"])
+def test_stateful_condition_rejects_tiled_encoder(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    pipeline = _pipeline(_load_pipeline_module())
+    _enable_vae_tiling(pipeline, tile_sample_min=8)
+    with pytest.raises(ValueError, match="does not support tiled VAE encoding"):
+        if mode == "realtime":
+            pipeline._ar_diffusion_kv_state = object()
+            pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+        else:
+            state = _stepwise_state()
+            with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+                pipeline.prepare_encode(state)
+    assert pipeline.vae.encoder.inputs == []
+    assert all(s.encoder_cache is None and s.pending_encoder_cache is None for s in pipeline._ar_sessions.values())
 
 
 def test_request_cache_is_released_before_vae_decode() -> None:
@@ -1743,25 +2067,25 @@ def test_request_cache_is_released_before_vae_decode() -> None:
     assert result.output.shape[2] == 21
 
 
-def test_117_frame_request_generates_ten_complete_latent_blocks() -> None:
+def test_129_frame_request_generates_eleven_complete_latent_blocks() -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
     trajectory = _CameraTrajectory(
-        poses=torch.eye(4).repeat(117, 1, 1),
-        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(117, 1),
+        poses=torch.eye(4).repeat(129, 1, 1),
+        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(129, 1),
     )
     sampling = _SamplingParams(
-        num_frames=117,
+        num_frames=129,
         output_type="latent",
         extra_args={"_lingbot_camera_trajectory": trajectory},
     )
 
     result = pipeline(_request(sampling=sampling))
 
-    assert result.output.shape == (1, 16, 30, 2, 2)
-    assert len(transformer.calls) == 50
-    assert [call["start_frame"] for call in transformer.calls[::5]] == list(range(0, 30, 3))
+    assert result.output.shape == (1, 16, 33, 2, 2)
+    assert len(transformer.calls) == 55
+    assert [call["start_frame"] for call in transformer.calls[::5]] == list(range(0, 33, 3))
 
 
 def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
@@ -1852,6 +2176,27 @@ def _run_stepwise(pipeline, state):
     return outputs
 
 
+def _stepwise_chunks(pipeline, state, ar_state):
+    """Yield one chunk at a time, binding AR state around each invocation.
+
+    The runner binds runner-owned KV for the duration of one stepwise
+    invocation and releases it again, so a generator that suspends at each
+    chunk boundary is what lets two requests be driven the way the scheduler
+    drives them at session_capacity > 1: A-chunk0, B-chunk0, A-chunk1, ...
+    """
+    with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
+        pipeline.prepare_encode(state)
+    while not state.request_denoise_completed:
+        output = None
+        with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
+            noise = pipeline.denoise_step(None, states=[state])
+            pipeline.step_scheduler(state, noise)
+            if state.chunk_denoise_completed:
+                output = pipeline.post_decode(state)
+        if output is not None:
+            yield output
+
+
 def test_pipeline_declares_step_execution_support() -> None:
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
@@ -1932,13 +2277,14 @@ def test_stepwise_progress_metadata_and_commit_trace() -> None:
         assert output.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
 
 
-def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
+@pytest.mark.parametrize("num_chunks", [2, 12])
+def test_stepwise_matches_tick_transformer_trace_and_latents(num_chunks) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
     pipeline._ar_height = 16
     pipeline._ar_width = 16
-    script = ((("w",), ("w",), ("w",)), (("d",), ("d",), ("d",)))
+    script = ((("w",), ("w",), ("w",)), (("d",), ("d",), ("d",))) * (num_chunks // 2)
     fake = _FakeARState("world-1")
 
     with pipeline.bind_ar_diffusion_state("world-1", fake):
@@ -1965,7 +2311,7 @@ def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
     transformer.calls.clear()
     pipeline.close_ar_diffusion_session("world-1")
 
-    stepwise_state = _stepwise_state(request_id="req-1", num_frames=21, script=script, seed=17)
+    stepwise_state = _stepwise_state(request_id="req-1", num_frames=12 * num_chunks - 3, script=script, seed=17)
     stepwise_fake = _FakeARState(stepwise_state.request_id)
     with pipeline.bind_ar_diffusion_state(stepwise_state.request_id, stepwise_fake):
         stepwise_outputs = _run_stepwise(pipeline, stepwise_state)
@@ -1974,6 +2320,15 @@ def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
     assert [call["start_frame"] for call in transformer.calls] == [call["start_frame"] for call in tick_calls]
     for tick_latent, output in zip(tick_latents, stepwise_outputs, strict=True):
         torch.testing.assert_close(output.output["payload"]["latents"], tick_latent)
+    for step_call, tick_call in zip(transformer.calls, tick_calls, strict=True):
+        torch.testing.assert_close(step_call["hidden_states"], tick_call["hidden_states"])
+        torch.testing.assert_close(step_call["camera_hidden_states"], tick_call["camera_hidden_states"])
+    assert stepwise_state.extra["condition"].shape[2] == 3
+    assert pipeline.vae.encode_inputs == []
+    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == ([1] + [4] * (num_chunks * 3 - 1)) * 2
+    assert stepwise_fake.commits == ["main"] * num_chunks
+    assert len(stepwise_outputs) == num_chunks and stepwise_outputs[-1].finished
+    assert pipeline.vae.decode_inputs == []
 
 
 def test_stepwise_trajectory_camera_matches_request_mode_under_non_uniform_speed(monkeypatch) -> None:
@@ -2039,12 +2394,11 @@ def test_stepwise_emits_latents_without_touching_the_vae() -> None:
     assert pipeline.vae.decode_inputs == []
 
 
-def test_stepwise_decodes_each_chunk_for_streaming_consumers(monkeypatch) -> None:
-    """A non-latent request must stream pixels under the primary "video" key."""
+def _capture_video_processor(monkeypatch) -> list[tuple[tuple[int, ...], str]]:
+    """Record what reaches postprocess_video, and name each chunk's output."""
     import diffusers.video_processor as video_processor_module
 
-    module = _load_pipeline_module()
-    processed = []
+    processed: list[tuple[tuple[int, ...], str]] = []
 
     class VideoProcessor:
         def __init__(self, *, vae_scale_factor):
@@ -2055,9 +2409,21 @@ def test_stepwise_decodes_each_chunk_for_streaming_consumers(monkeypatch) -> Non
             return f"frames-{len(processed)}"
 
     monkeypatch.setattr(video_processor_module, "VideoProcessor", VideoProcessor)
+    return processed
+
+
+def _streaming_pipeline(module):
     pipeline = _pipeline(module, transformer=_RecordingTransformer())
     pipeline._ar_height = 16
     pipeline._ar_width = 16
+    return pipeline
+
+
+def test_stepwise_decodes_each_chunk_for_streaming_consumers(monkeypatch) -> None:
+    """A non-latent request must stream pixels under the primary "video" key."""
+    module = _load_pipeline_module()
+    processed = _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
     state = _stepwise_state(num_frames=21)
     state.sampling.output_type = "np"
     fake = _FakeARState(state.request_id)
@@ -2065,12 +2431,266 @@ def test_stepwise_decodes_each_chunk_for_streaming_consumers(monkeypatch) -> Non
     with pipeline.bind_ar_diffusion_state(state.request_id, fake):
         outputs = _run_stepwise(pipeline, state)
 
-    # One decode per AR block, each seeing only that block's three latent frames.
-    assert [tuple(latents.shape) for latents in pipeline.vae.decode_inputs] == [(1, 16, 3, 2, 2)] * 2
     assert [output_type for _, output_type in processed] == ["np", "np"]
     assert [output.output["payload"] for output in outputs] == [{"video": "frames-1"}, {"video": "frames-2"}]
     # Identity metadata survives the switch to pixel output.
     assert [output.output["metadata"]["ar_diffusion"]["chunk_index"] for output in outputs] == [0, 1]
+
+
+def test_stepwise_chunks_continue_one_sessions_temporal_decode(monkeypatch) -> None:
+    """Chunk N + 1 must continue chunk N instead of restarting the decoder.
+
+    Only the session's opening latent frame collapses to a single raw frame,
+    so the streamed timeline carries the same frame count an offline decode of
+    the same latents would: 9 frames, then 12.
+    """
+    module = _load_pipeline_module()
+    processed = _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+    fake = _FakeARState(state.request_id)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        _run_stepwise(pipeline, state)
+
+    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
+    # One opening frame for the session, not one per chunk.
+    assert pipeline.vae.decoder.first_chunk_flags == [True] + [False] * 5
+    # The whole-clip decode path is not involved, and the module-owned cache
+    # the shared VAE keeps for it is untouched.
+    assert pipeline.vae.decode_inputs == []
+    assert pipeline.vae._feat_map == ["module-owned"]
+
+
+def test_streaming_decode_state_is_owned_by_the_session(monkeypatch) -> None:
+    """Decoder state is keyed by request id and released with the AR session."""
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(request_id="req-stream", num_frames=21)
+    state.sampling.output_type = "np"
+    fake = _FakeARState(state.request_id)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        _run_stepwise(pipeline, state)
+
+    decode_state = pipeline._streaming_decode_states["req-stream"]
+    assert decode_state.session_id == "req-stream"
+    assert decode_state.frames_decoded == 6
+    assert decode_state.nbytes() > 0
+
+    pipeline.close_ar_diffusion_session("req-stream")
+    assert "req-stream" not in pipeline._streaming_decode_states
+    # Release drops the cache itself, not just the pipeline's reference to it.
+    assert decode_state.nbytes() == 0
+    assert decode_state.frames_decoded == 0
+
+
+def test_streaming_decode_state_is_dropped_on_session_reset(monkeypatch) -> None:
+    """A reset session must not resume the temporal context it just abandoned."""
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(request_id="req-reset", num_frames=21)
+    state.sampling.output_type = "np"
+    fake = _FakeARState(state.request_id)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        _run_stepwise(pipeline, state)
+
+    pipeline.reset_ar_diffusion_session("req-reset")
+    assert pipeline._streaming_decode_states == {}
+    # Releasing a session that never decoded is a no-op, not an error.
+    pipeline.reset_ar_diffusion_session("req-reset")
+
+
+def test_streaming_decode_keeps_interleaved_sessions_isolated(monkeypatch) -> None:
+    """Two sessions ticking alternately must not share one temporal cache.
+
+    Running one rollout to completion before the other starts would only show
+    that the dict is keyed by request id. The failure worth catching is chunk N
+    of one session advancing the other's cache mid-rollout, which needs the
+    interleaving the scheduler actually produces.
+    """
+    module = _load_pipeline_module()
+    processed = _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    states = []
+    for request_id in ("req-a", "req-b"):
+        state = _stepwise_state(request_id=request_id, num_frames=21)
+        state.sampling.output_type = "np"
+        states.append(state)
+    runs = [_stepwise_chunks(pipeline, state, _FakeARState(state.request_id)) for state in states]
+
+    chunks: list[tuple[str, int]] = []
+    while runs:
+        for run in list(runs):
+            try:
+                output = next(run)
+            except StopIteration:
+                runs.remove(run)
+                continue
+            metadata = output.output["metadata"]["ar_diffusion"]
+            chunks.append((metadata["session_id"], metadata["chunk_index"]))
+
+    # A-chunk0, B-chunk0, A-chunk1, B-chunk1: the sessions really are interleaved.
+    assert chunks == [("req-a", 0), ("req-b", 0), ("req-a", 1), ("req-b", 1)]
+
+    caches = pipeline._streaming_decode_states
+    assert set(caches) == {"req-a", "req-b"}
+    assert caches["req-a"].feat_map is not caches["req-b"].feat_map
+    # Every frame of a session was decoded through that session's own cache,
+    # three frames per chunk, and each session opened exactly one rollout.
+    cache_a, cache_b = (id(caches["req-a"].feat_map), id(caches["req-b"].feat_map))
+    assert pipeline.vae.decoder.cache_ids == [cache_a] * 3 + [cache_b] * 3 + [cache_a] * 3 + [cache_b] * 3
+    assert pipeline.vae.decoder.first_chunk_flags == (
+        [True, False, False] + [True, False, False] + [False] * 3 + [False] * 3
+    )
+    assert [shape for shape, _ in processed] == [
+        (1, 3, 9, 16, 16),
+        (1, 3, 9, 16, 16),
+        (1, 3, 12, 16, 16),
+        (1, 3, 12, 16, 16),
+    ]
+
+
+def test_streaming_decode_failure_drops_the_half_advanced_cache(monkeypatch) -> None:
+    """A failed chunk must not leave a cache a later chunk would continue from."""
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(request_id="req-boom", num_frames=21)
+    state.sampling.output_type = "np"
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("decoder blew up")
+
+    pipeline.vae.decoder = explode
+
+    with pytest.raises(RuntimeError, match="decoder blew up"):
+        with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+            _run_stepwise(pipeline, state)
+
+    assert pipeline._streaming_decode_states == {}
+
+
+def _enable_vae_tiling(pipeline, *, tile_sample_min: int) -> None:
+    """Configure the stub VAE the way registry.py configures the real one."""
+    pipeline.vae.use_tiling = True
+    pipeline.vae.spatial_compression_ratio = 8
+    pipeline.vae.tile_sample_min_height = tile_sample_min
+    pipeline.vae.tile_sample_min_width = tile_sample_min
+
+
+def test_streaming_decode_receives_rescaled_latents(monkeypatch) -> None:
+    """The streaming branch must invert the checkpoint's latent statistics.
+
+    Nothing downstream can catch a miss here: the pixels stay finite and
+    correctly shaped, only wrongly scaled. Request mode and the fallback path
+    observe the rescale through ``vae.decode``'s recorded input, which streaming
+    never reaches, so this asserts on what ``post_quant_conv`` received.
+    """
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        pipeline.prepare_encode(state)
+        while not state.chunk_denoise_completed:
+            pipeline.step_scheduler(state, pipeline.denoise_step(None, states=[state]))
+        model_space = state.latents.clone()
+        pipeline.post_decode(state)
+
+    shape = (1, -1, 1, 1, 1)
+    latent_mean = torch.as_tensor(pipeline.vae.config.latents_mean, dtype=model_space.dtype).view(*shape)
+    latent_std = torch.as_tensor(pipeline.vae.config.latents_std, dtype=model_space.dtype).view(*shape)
+    expected = (model_space * latent_std + latent_mean).to(dtype=pipeline.vae.dtype)
+
+    recorded = torch.cat(pipeline.vae.post_quant_inputs, dim=2)
+    assert recorded.shape == expected.shape, "one recorded frame per latent frame in the chunk"
+    torch.testing.assert_close(recorded, expected, rtol=0, atol=0)
+    # And the rescale is not a no-op on this fixture, so the assertion bites.
+    assert not torch.equal(expected, model_space.to(dtype=pipeline.vae.dtype))
+
+
+def test_streaming_decode_is_reported_to_the_profiler(monkeypatch) -> None:
+    """A streamed rollout must report decode time, not zero.
+
+    The profiler wraps ``vae.decode``, which streaming never calls, so without
+    its own stage the one stage this path changes would be invisible -- and a
+    perf regression in the streaming decoder would be too.
+    """
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _pipeline(
+        module,
+        transformer=_RecordingTransformer(),
+        od_config=_od_config(
+            enable_diffusion_pipeline_profiler=True,
+        ),
+    )
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        outputs = _run_stepwise(pipeline, state)
+
+    stage = f"{type(pipeline).__name__}._streaming_decode_chunk"
+    durations = pipeline.stage_durations
+    assert stage in durations, f"streamed decode is unprofiled; stages seen: {sorted(durations)}"
+    assert durations[stage] > 0.0
+    assert durations[f"{type(pipeline).__name__}._prepare_condition_chunk"] > 0.0
+    # The stage reaches the consumer on every streamed chunk, not just at the end.
+    assert all(stage in (output.stage_durations or {}) for output in outputs)
+
+
+def test_streaming_decode_falls_back_when_the_vae_would_tile(monkeypatch) -> None:
+    """Tiled decode drives its own cache, so a tiling shape keeps per-chunk decode."""
+    module = _load_pipeline_module()
+    processed = _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    # A latent of 2x2 exceeds a one-latent-cell tile, so vae.decode would tile.
+    _enable_vae_tiling(pipeline, tile_sample_min=8)
+    outputs = [
+        pipeline._decode_chunk_to_pixels(torch.zeros(1, 16, 3, 2, 2), output_type="np", session_id="tiled")
+        for _ in range(2)
+    ]
+
+    # One whole-clip decode per AR block, each seeing only that block's frames.
+    assert [tuple(latents.shape) for latents in pipeline.vae.decode_inputs] == [(1, 16, 3, 2, 2)] * 2
+    assert pipeline.vae.decoder.first_chunk_flags == []
+    assert pipeline._streaming_decode_states == {}
+    # Nine frames per chunk instead of 9 then 12: the frame loss being removed.
+    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 9, 16, 16)]
+    assert outputs == ["frames-1", "frames-2"]
+
+
+def test_streaming_decode_survives_tiling_enabled_below_the_tile_threshold(monkeypatch) -> None:
+    """``use_tiling`` alone does not tile, so such a shape must still stream.
+
+    ``AutoencoderKLWan._decode`` tiles only when the latent exceeds a tile. A
+    gate on the flag alone would give up streaming -- and a frame per block --
+    on a configuration that would never have tiled.
+    """
+    module = _load_pipeline_module()
+    processed = _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    # A 2x2 latent is within a tile this size, so vae.decode would not tile.
+    _enable_vae_tiling(pipeline, tile_sample_min=256)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        _run_stepwise(pipeline, state)
+
+    assert pipeline.vae.decode_inputs == []
+    assert pipeline.vae.decoder.first_chunk_flags == [True] + [False] * 5
+    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
 
 
 def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> None:

@@ -148,6 +148,72 @@ def _successful_output(
     return case, collector, result
 
 
+def test_response_metrics_include_engine_tpot_and_stream_window():
+    first_audio = _audio("r1")
+    first_audio["metadata"] = {
+        "audio_duration_ms": 100,
+        "vllm_omni": {
+            "stage_metrics": {
+                "0": {
+                    "num_tokens_out": 3,
+                    "vllm_tpot_ms": 10.0,
+                    "vllm_itls_ms": [10.0, 10.0],
+                }
+            }
+        },
+    }
+    second_audio = _audio("r2")
+    second_audio["metadata"] = {
+        "audio_duration_ms": 200,
+        "vllm_omni": {
+            "stage_metrics": {
+                "0": {
+                    "num_tokens_out": 2,
+                    "vllm_tpot_ms": 20.0,
+                    "vllm_itls_ms": [20.0],
+                }
+            }
+        },
+    }
+    collector = _collector(
+        (_created("r1"), 10.1),
+        (_text("r1", "first"), 10.2),
+        (first_audio, 10.3),
+        (_done("r1"), 10.4),
+        (_created("r2"), 12.1),
+        (_text("r2", "second"), 12.2),
+        (second_audio, 12.5),
+        (_done("r2"), 12.6),
+    )
+    result = oi.OmniInteractCaseResult("1q1a", "video.mp4", "", session_id="session")
+
+    oi._populate_response_metrics(result, collector, stream_start=10.0)
+
+    assert result.output_tokens == 5
+    assert [metric["tpot_ms"] for metric in result.duplex_request_metrics] == [10.0, 20.0]
+    assert result.duplex_session_metrics == {
+        "session_id": "session",
+        "audio_turn_count": 2,
+        "ttft_ms": {"count": 2, "mean": 100.0, "p50": 100.0, "p99": 100.0},
+        "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
+        "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
+        "rtf": {"count": 2, "mean": 2.0, "p50": 2.0, "p99": 2.0},
+        "stream_ttft_ms": 200.0,
+        "stream_ttfp_ms": 300.0,
+        "stream_rtf": 8.333333,
+        "stream_audio_generation_ms": 2500.0,
+        "stream_audio_duration_ms": 300.0,
+        "stream_measurement_origin": {
+            "ttft": "input stream start to first non-empty text delta",
+            "ttfp": "input stream start to first audio packet",
+            "rtf": (
+                "input stream start-to-last-audio receive time divided by total emitted audio duration; "
+                "includes concurrent realtime input"
+            ),
+        },
+    }
+
+
 def _write_success(
     root: Path,
     case: data.OmniInteractCase,
@@ -645,7 +711,7 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
             transcript="timing metadata missing",
             output_tokens=0,
             duplex_request_metrics=[{"request_metrics": {"ttft_ms": 1.0}}],
-            duplex_session_metrics={"mean_ttft_ms": 10.0},
+            duplex_session_metrics={"ttft_ms": 10.0},
         )
 
     monkeypatch.setattr(benchmark_patch, "run_omniinteract_case", run)
@@ -713,7 +779,7 @@ async def test_adapter_reports_exact_or_weighted_token_timing(
             success=True,
             output_tokens=5,
             duplex_request_metrics=request_metrics,
-            duplex_session_metrics={"mean_ttft_ms": 100.0},
+            duplex_session_metrics={"ttft_ms": 100.0},
         )
 
     monkeypatch.setattr(benchmark_patch, "run_omniinteract_case", run)
