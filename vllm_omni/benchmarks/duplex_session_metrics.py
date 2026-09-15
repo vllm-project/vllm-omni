@@ -82,6 +82,7 @@ def collect_duplex_session_metrics(
         )
         raw_metric = timing.get("request_metrics")
         stage0 = timing.get("stage0_tokens")
+        stage_metrics = timing.get("stage_metrics")
         metric: dict[str, object] = {
             "session_id": session_id,
             "request_index": request_index,
@@ -93,7 +94,9 @@ def collect_duplex_session_metrics(
         if isinstance(stage0, dict):
             metric["stage0_tokens"] = dict(stage0)
             output_tokens += int(stage0.get("output_token_count") or 0)
-        if isinstance(raw_metric, dict) or isinstance(stage0, dict):
+        if isinstance(stage_metrics, dict):
+            metric["stage_metrics"] = stage_metrics
+        if isinstance(raw_metric, dict) or isinstance(stage0, dict) or isinstance(stage_metrics, dict):
             request_metrics.append(metric)
     session_metrics = summarize_session_request_metrics(
         request_metrics,

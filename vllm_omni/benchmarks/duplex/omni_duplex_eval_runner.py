@@ -37,6 +37,7 @@ class GenerateSampleResult:
     output: Path
     request_metrics: list[dict[str, object]] = field(default_factory=list)
     session_metrics: dict[str, object] = field(default_factory=dict)
+    generated: bool = True
 
 
 def _ref_audio(path: str | Path) -> str:
@@ -71,6 +72,7 @@ async def generate_sample(
     clock: str = "media",
     overwrite: bool = False,
     unit_ms: int = 1000,
+    collect_stage_metrics: bool = False,
 ) -> GenerateSampleResult:
     """Generate one sample's timed sentences and collect duplex session metrics.
 
@@ -81,7 +83,7 @@ async def generate_sample(
     output = Path(output_root) / sample.split / f"{sample.id}.json"
     meta_path = output.with_name(output.stem + ".meta.json")
     if output.exists() and not overwrite:
-        return GenerateSampleResult(output=output)
+        return GenerateSampleResult(output=output, generated=False)
     if mix != "question":
         raise NotImplementedError("v1 supports mix=question; soundtrack mixing is reserved for P1")
     media_dir = output.parent / ".media"
@@ -99,7 +101,12 @@ async def generate_sample(
     close_timeout = None
     stream_start: float | None = None
     async with client:
-        await client.configure(model, ref_audio=_ref_audio(ref_audio), instructions="Streaming Omni Conversation.")
+        await client.configure(
+            model,
+            ref_audio=_ref_audio(ref_audio),
+            instructions="Streaming Omni Conversation.",
+            extra_body={"return_stage_metrics": True} if collect_stage_metrics else None,
+        )
         ack_task = asyncio.create_task(_ack_playback(client))
         try:
             stream_start = time.monotonic()
