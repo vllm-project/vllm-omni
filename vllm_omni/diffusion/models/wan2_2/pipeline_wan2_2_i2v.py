@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_z
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
+    Wan22DenoiseScheduleMixin,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
@@ -173,6 +174,7 @@ def get_wan22_i2v_pre_process_func(
 
 class Wan22I2VPipeline(
     nn.Module,
+    Wan22DenoiseScheduleMixin,
     SupportImageInput,
     PipelineParallelMixin,
     CFGParallelMixin,
@@ -516,7 +518,7 @@ class Wan22I2VPipeline(
         height = common.height or 480
         width = common.width or 832
         num_frames = common.num_frames or 81
-        num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+        num_steps = self.resolve_num_inference_steps(common.num_inference_steps)
 
         output_type = common.output_type or "np"
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1

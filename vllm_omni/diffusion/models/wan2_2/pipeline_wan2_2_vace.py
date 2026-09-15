@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import copy
+from typing import ClassVar
 
 import PIL.Image
 import torch
@@ -189,6 +190,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     Extends Wan22Pipeline with VACE-specific context creation and weight loading.
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
+
+    # VACE's own forward defaults to 50 steps, not the base pipeline's 40.
+    default_num_inference_steps: ClassVar[int] = 50
 
     def __init__(
         self,

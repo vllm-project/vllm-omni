@@ -199,7 +199,7 @@ class TeaCacheBackend(CacheBackend):
         # Mark as enabled
         self.enabled = True
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int | None, verbose: bool = True) -> None:
         """
         Refresh TeaCache state for new generation.
 

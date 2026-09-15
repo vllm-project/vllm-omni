@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
+RefreshCacheContextFunc: TypeAlias = Callable[[Any, int | None, bool], None]
 
 
 @dataclass(frozen=True)
@@ -108,9 +108,24 @@ def _build_cache_context_refresh(
     projected_config = CacheDiTConfig.from_diffusion_config(cache_config)
 
     def refresh_cache_context(
-        pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True
+        pipeline: SupportsComponentDiscovery, num_inference_steps: int | None, verbose: bool = True
     ) -> None:
         transformer = get_pipeline_transformer(pipeline)
+
+        if num_inference_steps is None:
+            # The step count is unknown, but the context must still be rebuilt or
+            # the next request would resume this request's step counters and
+            # residual buffers. Refreshing with an empty override keeps the
+            # installed configuration and only drops the per-request state.
+            cache_dit.refresh_context(
+                transformer,
+                cache_config=DBCacheConfig().reset(
+                    force_refresh_step_hint=projected_config.force_refresh_step_hint,
+                    force_refresh_step_policy=projected_config.force_refresh_step_policy,
+                ),
+                verbose=verbose,
+            )
+            return
 
         # Cache-DiT has no predefined SCM mask for these small step counts.
         scm_supported_steps = num_inference_steps >= 8 or num_inference_steps in (4, 6)
@@ -329,7 +344,9 @@ class CacheDiTBackend(CacheBackend):
                 del pipeline._cache_dit_targets
             self.enabled = False
 
-    def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(
+        self, pipeline: SupportsComponentDiscovery, num_inference_steps: int | None, verbose: bool = True
+    ) -> None:
         if not self.enabled or not self._refresh_funcs:
             logger.warning("Cache-dit is not enabled. Cannot refresh cache context.")
             return

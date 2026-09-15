@@ -9,6 +9,7 @@ This section describes how to add cache-dit acceleration to a new diffusion pipe
 - [Overview](#overview)
 - [Standard Models: Automatic Support](#standard-models-automatic-support)
 - [Custom Architectures: Writing Custom Implementation](#custom-architectures-writing-custom-implementation)
+- [Request-Boundary Refresh](#request-boundary-refresh)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 - [Reference Implementations](#reference-implementations)
@@ -154,6 +155,12 @@ def refresh_cache_context(pipeline, num_inference_steps, verbose=True):
     cache_dit.refresh_context(pipeline.transformer_2, num_inference_steps=low_steps, ...)
 ```
 
+Splitting the step count needs the boundary and the effective step count the
+denoise loop will use, which only the pipeline knows. Wan2.2 exposes
+`resolve_cache_dit_step_split()` for this (see
+[Request-Boundary Refresh](#request-boundary-refresh)); the enabler prefers it
+over inspecting the pipeline directly.
+
 ### Example 2: Multi-Block-List Model (LongCatImage)
 
 LongCatImage has a single transformer with two block lists: `transformer_blocks` and `single_transformer_blocks`.
@@ -192,6 +199,44 @@ CUSTOM_DIT_ENABLERS = {
     "YourCustomPipeline": enable_cache_for_your_model,  # Add here
 }
 ```
+
+---
+
+## Request-Boundary Refresh
+
+Cache-DiT keeps its per-request state — step counters, residual buffers, and
+calibrator history — on a persistent context that lives as long as the installed
+hooks. In online serving that context is shared by every request, so the runner
+rebuilds it before each batch:
+
+`DiffusionModelRunner._refresh_cache_for_requests()` calls
+`CacheDiTBackend.refresh()` on **every** batch. Skipping it would let a request
+resume the previous request's cache: the new request starts past its warmup
+window and reuses stale residuals, which produces a visibly corrupted output
+from the second generation onward.
+
+The step count comes from the request when it pins one. When it does not, the
+runner asks the pipeline via `resolve_num_inference_steps()` (falling back to a
+`num_inference_steps` attribute), because a pipeline that defaults the step count
+internally is the only thing that knows the real value:
+
+```python
+# vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py
+class Wan22DenoiseScheduleMixin:
+    default_num_inference_steps: ClassVar[int] = 40
+
+    def resolve_num_inference_steps(self, num_inference_steps): ...
+    def resolve_cache_dit_step_split(self, num_inference_steps): ...
+```
+
+If the step count still cannot be resolved, the refresh runs anyway with no
+override: Cache-DiT recreates the context from its installed configuration and
+drops the per-request state. Resetting on an unknown step count is always
+correct; skipping the reset never is.
+
+When adding a pipeline that defaults `num_inference_steps` itself, implement
+`resolve_num_inference_steps()` so the cache context is sized to the schedule the
+denoise loop will actually run.
 
 ---
 

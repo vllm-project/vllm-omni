@@ -170,6 +170,13 @@ def enable_cache_for_dual_transformer(pipeline, cache_config):
 
 Key difference: `refresh_context` must be called on **each transformer separately** with its own step count.
 
+`_split_inference_steps` needs the boundary and the effective step count that the
+denoise loop will use, so let the pipeline compute it (Wan2.2 exposes
+`resolve_cache_dit_step_split()`) rather than probing the live scheduler — probing
+it would clobber the state `forward` is about to set up. Pass `None` instead of
+`0` for a stage that never runs: Cache-DiT reads `num_inference_steps=0` as "this
+inference is already over" and re-refreshes on every call.
+
 ### Choosing the ForwardPattern
 
 | Pattern | Block forward signature | Example models |
@@ -194,6 +201,18 @@ CUSTOM_DIT_ENABLERS = {
 ```
 
 The key must match `pipeline.__class__.__name__`.
+
+## Request-Boundary Refresh
+
+`DiffusionModelRunner._refresh_cache_for_requests()` refreshes the cache context
+before **every** batch. Cache-DiT's context is persistent and shared across
+requests, so a skipped refresh makes the next request resume the previous one's
+step counters and residual buffers — the second generation comes out corrupted.
+
+If the request omits `num_inference_steps`, the runner asks the pipeline through
+`resolve_num_inference_steps()` (or a `num_inference_steps` attribute). Implement
+that hook on any pipeline whose `forward` applies its own step-count default,
+otherwise the cache context is sized for a schedule that never runs.
 
 ## Configuration Parameters
 

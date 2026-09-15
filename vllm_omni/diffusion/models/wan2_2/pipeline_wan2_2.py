@@ -324,8 +324,59 @@ _WAN_TEXT_ENCODER_OFFLOAD_PLAN = OffloadPlan(
 )
 
 
+class Wan22DenoiseScheduleMixin:
+    """Expose the denoise schedule ``forward`` is about to run.
+
+    Cache backends prepare their per-request state before ``forward`` starts, so
+    they cannot read the resolved step count or the MoE boundary off the pipeline
+    yet. These helpers recompute both from the same defaults ``forward`` applies,
+    which keeps a Cache-DiT context refresh aligned with the denoise loop it is
+    meant to accelerate.
+    """
+
+    default_num_inference_steps: ClassVar[int] = 40
+
+    def resolve_num_inference_steps(self, num_inference_steps: int | None) -> int:
+        """Return the step count ``forward`` will denoise with."""
+        if getattr(self, "is_dmd", False):
+            # The distilled checkpoint ignores request-level step counts.
+            return len(FASTWAN_DMD_TIMESTEPS)
+        if num_inference_steps is None or num_inference_steps <= 0:
+            return self.default_num_inference_steps
+        return num_inference_steps
+
+    def resolve_denoise_timesteps(self, num_inference_steps: int | None) -> torch.Tensor:
+        """Return the timesteps ``forward`` will iterate over."""
+        if getattr(self, "is_dmd", False):
+            return torch.tensor(FASTWAN_DMD_TIMESTEPS, dtype=torch.float32)
+        # Probe a throwaway scheduler: ``forward`` rebuilds and re-arms the live
+        # one from the request, so advancing it here would be observable.
+        scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        scheduler.set_timesteps(
+            self.resolve_num_inference_steps(num_inference_steps),
+            device=torch.device("cpu"),
+        )
+        return scheduler.timesteps
+
+    def resolve_cache_dit_step_split(self, num_inference_steps: int | None) -> tuple[int, int]:
+        """Split the denoise steps across the high-noise and low-noise experts.
+
+        Returns ``(num_high_noise_steps, num_low_noise_steps)``, matching how
+        ``diffuse`` picks ``transformer`` versus ``transformer_2``.
+
+        Split algorithm from https://github.com/vipshop/cache-dit/pull/542.
+        """
+        # Mirrors the fallback ``forward`` applies when boundary_ratio is unset.
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else 0.875
+        boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        timesteps = self.resolve_denoise_timesteps(num_inference_steps)
+        num_high_noise_steps = int((timesteps >= boundary_timestep).sum())
+        return num_high_noise_steps, len(timesteps) - num_high_noise_steps
+
+
 class Wan22Pipeline(
     nn.Module,
+    Wan22DenoiseScheduleMixin,
     PipelineParallelMixin,
     CFGParallelMixin,
     ProgressBarMixin,
@@ -670,12 +721,10 @@ class Wan22Pipeline(
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        if self.is_dmd:
-            # The checkpoint was distilled for these three transitions. Ignore
-            # request-level step counts, including the engine's 1-step warmup.
-            num_steps = len(FASTWAN_DMD_TIMESTEPS)
-        else:
-            num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+        # The DMD checkpoint was distilled for three fixed transitions, so
+        # request-level step counts (including the engine's 1-step warmup) are
+        # ignored; ``resolve_num_inference_steps`` encodes that.
+        num_steps = self.resolve_num_inference_steps(common.num_inference_steps)
 
         output_type = common.output_type or "np"
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1

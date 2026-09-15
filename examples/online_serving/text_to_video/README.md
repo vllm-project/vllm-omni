@@ -37,11 +37,39 @@ bash run_server.sh
 
 The script allows overriding:
 - `MODEL` (default: `Wan-AI/Wan2.2-T2V-A14B-Diffusers`)
-- `PORT` (default: `8091`)
+- `PORT` (default: `8098`)
 - `BOUNDARY_RATIO` (default: `0.875`)
 - `FLOW_SHIFT` (default: `5.0`)
 - `CACHE_BACKEND` (default: `none`)
+- `CACHE_CONFIG` (default: unset; JSON passed to `--cache-config`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
+
+#### Start with Cache-DiT Acceleration
+
+Wan2.2 T2V/I2V are MoE checkpoints, so Cache-DiT caches the high-noise and
+low-noise experts under separate contexts split at `--boundary-ratio`:
+
+```bash
+CACHE_BACKEND=cache_dit ENABLE_CACHE_DIT_SUMMARY=1 bash run_server.sh
+```
+
+Or directly:
+
+```bash
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8098 \
+    --boundary-ratio 0.875 --flow-shift 5.0 \
+    --cache-backend cache_dit \
+    --cache-config '{"Fn_compute_blocks": 1, "Bn_compute_blocks": 0, "max_warmup_steps": 4}'
+```
+
+Pass `--boundary-ratio` at startup. It decides how the denoise steps split
+between the two experts, and Cache-DiT sizes each expert's cache context from
+that split; a server-wide value keeps the split stable across requests.
+
+Requests do not need to send `num_inference_steps` — the pipeline default (40)
+is used for both denoising and cache sizing. Set
+`ENABLE_CACHE_DIT_SUMMARY=1` to log per-request hit/miss statistics, which is the
+quickest way to confirm the cache is being exercised and reset per request.
 
 ## Async Job Behavior
 

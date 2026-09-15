@@ -112,14 +112,14 @@ class StepCacheBackend(CacheBackend):
 
         self.enabled = True
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int | None, verbose: bool = True) -> None:
         """Refresh stepcache state for a new generation."""
         state = get_stepcache_state(pipeline)
         if state is not None:
             state.reset()
             if verbose:
                 logger.debug(
-                    "stepcache state refreshed (num_inference_steps=%d)",
+                    "stepcache state refreshed (num_inference_steps=%s)",
                     num_inference_steps,
                 )
         elif verbose and is_stepcache_active(pipeline):
