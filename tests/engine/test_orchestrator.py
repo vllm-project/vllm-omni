@@ -533,6 +533,7 @@ async def _enqueue_add_request(
     original_prompt,
     sampling_params_list,
     final_stage_id: int,
+    request_artifact_dirs: list[str] | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -546,6 +547,7 @@ async def _enqueue_add_request(
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
+            request_artifact_dirs=request_artifact_dirs,
         )
     )
 
