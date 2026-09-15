@@ -25,6 +25,7 @@ from vllm_omni.entrypoints.duplex.runtime_adapter import (
     coerce_int,
     payload_turn_id,
 )
+from vllm_omni.metrics.duplex_frame_timing import log_audio_emit_event
 
 logger = init_logger(__name__)
 
@@ -747,6 +748,13 @@ class NativeRuntimeBridgeMixin:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context(session)
         for native_result in self._serving_runtime_adapter.data_plane.project(result, context=context):
+            log_audio_emit_event(
+                session.session_id,
+                session.epoch,
+                request_id,
+                native_result,
+                session.capabilities.chunk_period_ms,
+            )
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                 send_json,
                 native_result,

@@ -53,6 +53,7 @@ from vllm_omni.entrypoints.duplex.websocket import (
     is_input_event,
     normalize_duplex_input_event,
 )
+from vllm_omni.metrics.duplex_frame_timing import log_append_event
 
 logger = init_logger(__name__)
 
@@ -1973,6 +1974,12 @@ class DuplexSessionRunnerMixin:
                         if pcm_reservation.byte_count == 0:
                             session.release_input_bytes(raw_audio_bytes)
                         payload = pcm_reservation.payload
+                        log_append_event(
+                            session.session_id,
+                            session.epoch,
+                            pcm_reservation.byte_count,
+                            session.capabilities.chunk_period_ms,
+                        )
                     else:
                         session.append_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
                     if native_input:

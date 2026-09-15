@@ -16,6 +16,11 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.metrics.duplex_frame_timing import (
+    frame_timing_clock,
+    log_connector_get_event,
+    log_connector_put_event,
+)
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -500,6 +505,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
+        get_t0 = frame_timing_clock()
         try:
             result = self.connector.get(
                 str(target_stage_id),
@@ -519,6 +525,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
+
+        log_connector_get_event(
+            connector_get_key,
+            stage_id,
+            int(result[1]) if isinstance(result, tuple) else 0,
+            get_t0,
+        )
 
         with self._receiver_state_lock:
             # cleanup_receiver() can run while connector.get() is in flight.
@@ -811,12 +824,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
             return
 
+        put_t0 = frame_timing_clock()
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+        log_connector_put_event(connector_put_key, stage_id, success, size, put_t0)
 
         with self._sender_state_lock:
             if sender_token is not None:
