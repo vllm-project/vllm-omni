@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 VFM Transformer for vllm-omni.
 
 Implements the Mixture-of-Transformers architecture with two pathways:
@@ -38,6 +38,10 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.platforms import current_omni_platform
 
 from .mixed_precision import (
@@ -152,7 +156,7 @@ def _validate_mixed_precision_runtime(
         raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
     if int(getattr(od_config, "max_num_seqs", 1)) != 1:
         raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
-    if bool(getattr(od_config, "enable_distributed_layerwise_offload", False)):
+    if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
         raise ValueError(
             "Cosmos3 mixed precision does not support distributed layer-wise offload "
             "because its direct loader bypasses ModelOpt post-load transformations"
