@@ -225,7 +225,7 @@ def test_code2wav_patch_reads_stage_additional_config(
         assert model.backend not in code2wav_patch._backend_graph_runners
 
 
-@pytest.mark.parametrize("value", [True, "true", "false", "0", "off"])
+@pytest.mark.parametrize("value", [True, 1, "true", "1", "yes", "on"])
 def test_code2wav_patch_rejects_bfloat16_attention_cache(monkeypatch, value):
     built = False
 
@@ -246,7 +246,7 @@ def test_code2wav_patch_rejects_bfloat16_attention_cache(monkeypatch, value):
     assert not built
 
 
-@pytest.mark.parametrize("value", [False, None, 0, ""])
+@pytest.mark.parametrize("value", [False, None, 0, "", "false", "0", "off", "no"])
 def test_code2wav_patch_allows_disabled_bfloat16_attention_cache(monkeypatch, value):
     built = False
 
@@ -362,6 +362,15 @@ def test_code2wav_platform_wraps_flow_execution_context(monkeypatch):
             flush_encoder,
         ),
     )
+    monkeypatch.setattr(
+        code2wav_patch,
+        "_original_decode_ragged_batch",
+        lambda instance, tokens, features, states, *, last_chunks: (
+            "ragged",
+            last_chunks,
+        ),
+        raising=False,
+    )
     features = SimpleNamespace(speech_tokens=torch.zeros(1))
 
     assert code2wav_patch._patched_setup_batch(backend, features, 3) == ("setup", 3)
@@ -372,4 +381,71 @@ def test_code2wav_platform_wraps_flow_execution_context(monkeypatch):
         [],
         last_chunk=True,
     ) == ("decode", True, False)
-    assert entered == [(torch.device("cpu"), True), (torch.device("cpu"), True)]
+    assert code2wav_patch._patched_decode_ragged_batch(
+        backend,
+        [torch.zeros(1), torch.zeros(2)],
+        features,
+        [],
+        last_chunks=[False, True],
+    ) == ("ragged", [False, True])
+    assert entered == [
+        (torch.device("cpu"), True),
+        (torch.device("cpu"), True),
+        (torch.device("cpu"), True),
+    ]
+
+
+def test_code2wav_patch_installs_ragged_flow_context(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+        BatchedToken2Wav,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+        MiniCPMO45Code2Wav,
+    )
+
+    entered = []
+
+    @contextmanager
+    def flow_context(device, *, require_math):
+        entered.append((device, require_math))
+        yield
+
+    def original_ragged(instance, tokens, features, states, *, last_chunks):
+        return ("installed-ragged", last_chunks)
+
+    for target, name in (
+        (MiniCPMO45Code2Wav, "_build_backend"),
+        (BatchedToken2Wav, "_estimator_step"),
+        (BatchedToken2Wav, "setup_batch"),
+        (BatchedToken2Wav, "decode_batch"),
+        (BatchedToken2Wav, "decode_ragged_batch"),
+    ):
+        monkeypatch.setattr(target, name, getattr(target, name))
+
+    for name in (
+        "_PATCHED",
+        "_original_build_backend",
+        "_original_estimator_step",
+        "_original_setup_batch",
+        "_original_decode_batch",
+        "_original_decode_ragged_batch",
+    ):
+        monkeypatch.setattr(code2wav_patch, name, getattr(code2wav_patch, name))
+
+    monkeypatch.setattr(BatchedToken2Wav, "decode_ragged_batch", original_ragged)
+    monkeypatch.setattr(code2wav_patch, "_flow_execution_context", flow_context)
+    monkeypatch.setattr(code2wav_patch, "_PATCHED", False)
+    code2wav_patch.apply_minicpmo_4_5_code2wav_patch()
+
+    backend = object.__new__(BatchedToken2Wav)
+    features = SimpleNamespace(speech_tokens=torch.zeros(1))
+    result = backend.decode_ragged_batch(
+        [torch.zeros(1), torch.zeros(2)],
+        features,
+        [],
+        last_chunks=[False, True],
+    )
+
+    assert result == ("installed-ragged", [False, True])
+    assert BatchedToken2Wav.decode_ragged_batch is code2wav_patch._patched_decode_ragged_batch
+    assert entered == [(torch.device("cpu"), False)]
