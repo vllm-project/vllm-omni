@@ -736,13 +736,14 @@ def test_unsupported_sp_config_fails_before_component_loading(overrides):
     assert module._loader_state.prefetch_calls == []
 
 
-def test_unsupported_quantization_fails_before_component_loading() -> None:
+def test_quantization_reaches_transformer_factory() -> None:
     module = _load_pipeline_module()
+    quant_config = object()
 
-    with pytest.raises(NotImplementedError, match="quantization"):
-        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=object()))
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=quant_config))
 
-    assert module._loader_state.prefetch_calls == []
+    assert pipeline.transformer is not None
+    assert _FakeTransformerFactory.last_call[1:] == (quant_config, "transformer")
 
 
 def test_official_scheduler_config_matches_fixed_dmd_contract() -> None:

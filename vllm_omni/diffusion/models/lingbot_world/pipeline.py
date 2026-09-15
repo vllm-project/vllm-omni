@@ -211,8 +211,6 @@ def _validate_scheduler_config(config: dict[str, Any]) -> None:
 
 
 def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
-    if getattr(od_config, "quantization_config", None) is not None:
-        raise NotImplementedError("LingBot World v1 does not support quantization.")
     parallel_config = getattr(od_config, "parallel_config", None)
     if parallel_config is None:
         return
