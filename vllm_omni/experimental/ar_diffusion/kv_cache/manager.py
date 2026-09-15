@@ -244,7 +244,12 @@ class ARDiffusionKVCache:
         # forward needs one block per current frame plus space for any
         # model-declared action/state tokens that coexist with video KV.
         declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
-        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
+        # frames_per_block counts *frames*; convert to blocks rather than
+        # assuming one block per frame. A frame spans ceil(chunk_size /
+        # block_size) blocks once the two sizes are allowed to differ.
+        blocks_per_frame = -(-config.chunk_size // block_size)
+        self.blocks_per_frame = blocks_per_frame
+        minimum_scratch_blocks = self.frames_per_block * blocks_per_frame + declared_scratch_blocks
         override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
         override_blocks = int(override) if override is not None else 0
         if override_blocks < 0:
@@ -274,8 +279,23 @@ class ARDiffusionKVCache:
         )
 
         def _required_managed_blocks(capacity: int) -> int:
-            resident_per_session = config.sink_chunks + config.window_chunks
-            return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
+            """Managed blocks needed to hold ``capacity`` resident sessions.
+
+            Every term here counts *frames*, so each is converted to blocks.
+            Before block size and frame size were allowed to differ this
+            conversion was the identity and the frame counts could be used
+            directly; they cannot once a frame spans several blocks.
+
+            Converting rather than rewriting keeps the budget the same number
+            of *tokens* it always was, so a finer block size does not inflate
+            the requirement -- it only stops the final block of each term from
+            rounding up a whole frame's worth of memory.
+            """
+            resident_frames = config.sink_chunks + config.window_chunks
+            per_session_blocks = resident_frames * self.blocks_per_frame
+            in_flight_blocks = self.frames_per_block * self.blocks_per_frame
+            headroom_blocks = 2 * self.blocks_per_frame
+            return self.num_local_kv_branches * (capacity * per_session_blocks + in_flight_blocks) + headroom_blocks
 
         def _required_bytes(capacity: int) -> int:
             return (
@@ -568,6 +588,16 @@ class ARDiffusionKVCache:
 
     def block_table(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         return list(self.manager.get_block_ids(adapter.request_id)[0])
+
+    def block_ids_at(self, adapter: ARDiffusionRequestAdapter, indices: Sequence[int]) -> list[int]:
+        """Block ids at ``indices`` of the request's block table, without copying it.
+
+        The table keeps a null entry for every evicted position, so it grows with
+        the session. :meth:`block_table` reads every entry; this reads only the
+        ones asked for, straight from the manager's own block list.
+        """
+        blocks = self.manager.get_blocks(adapter.request_id).blocks[0]
+        return [blocks[index].block_id for index in indices]
 
     def chunk_write_slots(self, adapter: ARDiffusionRequestAdapter) -> torch.Tensor:
         """Slot mapping for the in-flight chunk — the K/V write target."""
