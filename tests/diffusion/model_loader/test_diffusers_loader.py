@@ -22,7 +22,10 @@ import vllm_omni.diffusion.model_loader.diffusers_loader as loader_module
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.lora.manager import LoRABackend
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.diffusers_loader import (
+    DiffusersPipelineLoader,
+    is_offline_checkpoint_quant_config,
+)
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     HostWeightPlanResult,
@@ -1052,6 +1055,75 @@ def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
     assert loader.load_model(load_device="cpu") is model
     assert calls == ["load", "process"]
     assert loader.take_host_weight_plan() is None
+
+
+def test_is_offline_checkpoint_quant_config_autoround_w4a16():
+    assert is_offline_checkpoint_quant_config(None) is False
+    assert is_offline_checkpoint_quant_config(SimpleNamespace(data_type="int")) is False
+    assert is_offline_checkpoint_quant_config(SimpleNamespace(is_checkpoint_quantized=True)) is True
+    assert is_offline_checkpoint_quant_config(SimpleNamespace(data_type="mx_fp")) is True
+    assert (
+        is_offline_checkpoint_quant_config(
+            SimpleNamespace(data_type="int", packing_format="auto_round:auto_gptq"),
+        )
+        is True
+    )
+
+
+def _cpu_offload_init_device(monkeypatch, quant_config) -> torch.device:
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=False,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            sequence_parallel_size=1,
+        ),
+        quantization_config=quant_config,
+        enable_cpu_offload=True,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=False,
+        model="unused",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    seen: list[torch.device] = []
+
+    def _init(_load_format, target_device, *_args, **_kwargs):
+        seen.append(target_device)
+        return model
+
+    loader._init_from_load_format = _init  # type: ignore[method-assign]
+    loader.load_weights = lambda _model, **_kwargs: None  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: None  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(None, "skip mmap"),
+    )
+    loader.load_model(load_device="cpu", device=torch.device("cuda"))
+    assert seen, "expected _init_from_load_format to run"
+    return seen[0]
+
+
+def test_cpu_offload_keeps_autoround_w4a16_construction_on_cpu(monkeypatch):
+    device = _cpu_offload_init_device(
+        monkeypatch,
+        SimpleNamespace(data_type="int", packing_format="auto_round:auto_gptq", is_checkpoint_quantized=False),
+    )
+    assert device.type == "cpu"
+
+
+def test_cpu_offload_online_quant_still_constructs_on_accelerator(monkeypatch):
+    device = _cpu_offload_init_device(
+        monkeypatch,
+        SimpleNamespace(data_type="fp8", is_checkpoint_quantized=False),
+    )
+    assert device.type == "cuda"
 
 
 def test_dlo_mmap_plan_with_distilled_lora_falls_back_to_ordinary_loader(monkeypatch):

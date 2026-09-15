@@ -91,6 +91,26 @@ def download_gguf(
 logger = init_logger(__name__)
 
 
+def is_offline_checkpoint_quant_config(quant_cfg: object | None) -> bool:
+    """True when packed weights already live in the checkpoint.
+
+    CPU offload otherwise treats any ``quant_config`` as online quantization and
+    rebuilds modules on CUDA. AutoRound INT W4A16 (``packing_format``
+    ``auto_round:auto_gptq``) is packed on disk but is not ``data_type=mx_fp``
+    and often lacks ``is_checkpoint_quantized``, which OOMs Qwen-Image on 22 GiB
+    L4 (#7555).
+    """
+    if quant_cfg is None:
+        return False
+    if bool(getattr(quant_cfg, "is_checkpoint_quantized", False)):
+        return True
+    data_type = getattr(quant_cfg, "data_type", None)
+    if data_type == "mx_fp":
+        return True
+    packing = getattr(quant_cfg, "packing_format", None)
+    return isinstance(packing, str) and packing.startswith("auto_round:")
+
+
 def _natural_sort_key(filepath: str) -> list:
     """Natural sort key for filenames with numeric components, e.g.
     model-00001-of-00005.safetensors -> ['model-', 1, '-of-', 5, '.safetensors']."""
@@ -655,10 +675,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # then move back to CPU afterward.
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
-            quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
-            )
+            is_offline = is_offline_checkpoint_quant_config(self.quant_config)
             if not is_offline:
                 load_device = device.type
                 offload_after_quant = True
@@ -1208,7 +1225,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             rank = torch.distributed.get_rank()
 
         has_online_quant = self._has_online_quant(model) or (
-            self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
+            self.quant_config is not None and not is_offline_checkpoint_quant_config(self.quant_config)
         )
         enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
 
