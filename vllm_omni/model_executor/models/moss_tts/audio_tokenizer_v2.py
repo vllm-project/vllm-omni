@@ -302,6 +302,7 @@ def apply_rope(
     offset: torch.Tensor,
     max_period: float = 10_000,
     time_before_heads: bool = False,
+    freqs_cache: torch.Tensor | None = None,
 ):
     """Apply rotary position embedding (GPT-J interleaved convention).
 
@@ -322,8 +323,11 @@ def apply_rope(
     if D <= 0 or (D % 2) != 0:
         raise ValueError(f"RoPE requires an even last dimension, got D={D}")
 
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    if freqs_cache is not None:
+        freqs = freqs_cache
+    else:
+        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
+        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
     ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
 
     if time_before_heads:
@@ -342,15 +346,15 @@ def apply_rope(
         sin = torch.cat([sin_d2, sin_d2], dim=-1)
         dims = q.shape[:-1]
         # interleaved -> neox: [r0 i0 r1 i1 ...] -> [r0 r1 ... i0 i1 ...]
-        q_neox = q.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
-        k_neox = k.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        q_neox = q.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D)
+        k_neox = k.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D)
         # npu_rotary_mul: q_out = q * cos + rotate_half(q) * sin (neox rotation
         # = GPT-J rotation after the layout conversion -- verified bf16-identical).
         qo = torch_npu.npu_rotary_mul(q_neox, cos, sin)
         ko = torch_npu.npu_rotary_mul(k_neox, cos, sin)
-        # neox -> interleaved (back)
-        qo = qo.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
-        ko = ko.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        # Skip neox->interleaved back-conversion: attention QK^T is layout-
+        # independent (dot product sums over D regardless of element order),
+        # and Q/K are both in neox format. Verified bit-identical.
         return qo, ko
 
     # Eager fallback (non-NPU): original 14-op GPT-J rotation in fp32.
@@ -382,6 +386,18 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
     def __init__(self, max_period: float = 10000.0):
         super().__init__()
         self.max_period = max_period
+        self._freqs_cache: torch.Tensor | None = None
+
+    def _get_freqs(self, dim: int, device: torch.device) -> torch.Tensor:
+        if (
+            self._freqs_cache is not None
+            and self._freqs_cache.shape[0] == dim // 2
+            and self._freqs_cache.device == device
+        ):
+            return self._freqs_cache
+        ds = torch.arange(dim // 2, device=device, dtype=torch.float32)
+        self._freqs_cache = torch.exp(ds * (-math.log(self.max_period) * 2 / dim))
+        return self._freqs_cache
 
     def forward(
         self,
@@ -390,7 +406,9 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
         offset: torch.Tensor,
         time_before_heads: bool = False,
     ):
-        return apply_rope(q, k, offset, self.max_period, time_before_heads)
+        D = q.shape[-1]
+        freqs = self._get_freqs(D, q.device)  # noqa: N806
+        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs)
 
 
 # =============================================================================
@@ -510,6 +528,15 @@ class RingKVCache:
             self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
         else:
             self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
+        self._arange_capacity = torch.arange(capacity, device=device, dtype=torch.long)
+        self._cached_T: int = -1
+        self._arange_T: torch.Tensor | None = None
+
+    def _get_arange_t(self, t_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self._cached_T != t_len or self._arange_T is None or self._arange_T.device != device:
+            self._arange_T = torch.arange(t_len, device=device, dtype=dtype)
+            self._cached_T = t_len
+        return self._arange_T
 
     def reset(self, reset_mask: torch.Tensor) -> None:
         self.end_offset[:] = torch.where(reset_mask, torch.zeros_like(self.end_offset), self.end_offset)
@@ -539,7 +566,7 @@ class RingKVCache:
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
-            indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+            indexes = self._get_arange_t(T, end_offset.device, end_offset.dtype)  # noqa: N806
             indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
             scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
             row_cache[0].scatter_(2, scatter_indexes, k)
@@ -549,7 +576,7 @@ class RingKVCache:
             # request even though dense graph operators still execute it.
             self.cache.index_copy_(1, slots, row_cache)
 
-            cache_indexes = torch.arange(self.capacity, device=end_offset.device, dtype=torch.long)
+            cache_indexes = self._arange_capacity
             last_offset = end_offset.view(-1, 1) + T - 1
             end_index = last_offset % self.capacity
             delta = cache_indexes - end_index
@@ -561,10 +588,10 @@ class RingKVCache:
             next_offset = torch.where(valid_rows, end_offset + T, end_offset)
             self.end_offset.index_copy_(0, slots, next_offset)
             invalid = cache_indexes >= next_offset.view(-1, 1)
-            positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+            positions = positions.masked_fill_(invalid, -1)
             return KVCacheResult(row_cache[0], row_cache[1], positions)
 
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype)
+        indexes = self._get_arange_t(T, self.end_offset.device, self.end_offset.dtype)  # noqa: N806
         indexes = indexes + self.end_offset.view(-1, 1)
         indexes = indexes % self.capacity
 
@@ -579,7 +606,7 @@ class RingKVCache:
         keys = self.cache[0]
         values = self.cache[1]
 
-        indexes = torch.arange(self.capacity, device=self.end_offset.device, dtype=torch.long)
+        indexes = self._arange_capacity
         last_offset = self.end_offset.view(-1, 1) + T - 1
         end_index = last_offset % self.capacity
         delta = indexes - end_index
@@ -598,7 +625,7 @@ class RingKVCache:
             self.end_offset.add_(T)
 
         invalid = indexes >= self.end_offset.view(-1, 1)
-        positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+        positions = positions.masked_fill_(invalid, -1)
 
         return KVCacheResult(keys, values, positions)
 
@@ -812,6 +839,39 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             and q.shape[-1] == 64
         ):
             x = streaming_attention(q, k, v, attn_bias)
+        elif q.device.type == "npu" and attn_bias is not None:
+            import torch_npu
+
+            atten_mask = ~attn_bias
+            x, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
+                q,
+                k,
+                v,
+                head_num=self.num_heads,
+                input_layout="BNSD",
+                atten_mask=atten_mask,
+                scale=1.0 / (self.embed_dim // self.num_heads) ** 0.5,
+                keep_prob=1.0,
+                pre_tockens=attn_bias.shape[-1],
+                next_tockens=0,
+                sparse_mode=0,
+            )
+        elif q.device.type == "npu" and attn_bias is None:
+            import torch_npu
+
+            x, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
+                q,
+                k,
+                v,
+                head_num=self.num_heads,
+                input_layout="BNSD",
+                atten_mask=None,
+                scale=1.0 / (self.embed_dim // self.num_heads) ** 0.5,
+                keep_prob=1.0,
+                pre_tockens=T,
+                next_tockens=T,
+                sparse_mode=0,
+            )
         else:
             x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
@@ -943,7 +1003,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
-        return x_orig.to(update) + self.layer_scale_2(update)
+        return x_orig + self.layer_scale_2(update)
 
     def _sa_block(
         self,
@@ -953,7 +1013,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         x_orig = x
         x = self.norm1(x)
         update = self.self_attn(x, x, x, execution_context=execution_context)
-        return x_orig.to(update) + self.layer_scale_1(update)
+        return x_orig + self.layer_scale_1(update)
 
     def forward(
         self,
@@ -2044,12 +2104,11 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         if codes_lengths is None:
             codes_lengths = torch.full((B,), T, device=device, dtype=torch.long)
 
-        # Keep eager execution and CUDA/NPU Graph capture on the same BF16 path.
-        # Autocast is required on NPU because #5235's decode-LUT uses .float()
-        # for precision, producing float32 embeddings.  Without autocast, these
-        # float32 tensors flow into bf16 LayerNorm weights and NPU's aclnnLayerNorm
-        # rejects the mixed dtype (CUDA auto-casts; NPU does not).
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type != "cpu"):
+        # With bf16 LUT (lut_dtype=bfloat16 on NPU), the LUT output is already bf16,
+        # matching the bf16 decoder weights. Autocast is no longer needed on NPU
+        # (it was only required because NPU's float32 LUT mismatched bf16 weights).
+        # CUDA keeps its original autocast behavior; CPU keeps autocast disabled.
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
             zq = quantizer.decode_codes(codes)
 
