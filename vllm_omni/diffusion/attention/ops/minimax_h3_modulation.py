@@ -112,13 +112,14 @@ def _rms_norm_indexed_scale_shift_kernel(
     x = tl.load(x_ptr + row * stride_x_row + columns, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(x * x, axis=0) / hidden_size
-    normalized = x * tl.rsqrt(variance + eps) * weight
+    # Match the BF16 normalized value produced by unfused RMSNorm before AdaLN affine.
+    normalized = (x * tl.rsqrt(variance + eps) * weight).to(tl.bfloat16)
 
-    shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+    shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0)
+    scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0)
     tl.store(
         output_ptr + row * hidden_size + columns,
-        normalized * (1.0 + scale) + shift,
+        normalized * (scale + 1.0) + shift,
         mask=mask,
     )
 
@@ -150,21 +151,23 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
 
-    residual = tl.load(residual_ptr + row * stride_residual_row + columns, mask=mask, other=0.0).to(tl.float32)
-    gate = tl.load(gate_ptr + index * stride_gate_row + columns, mask=mask, other=0.0).to(tl.float32)
-    branch = tl.load(branch_ptr + row * stride_branch_row + columns, mask=mask, other=0.0).to(tl.float32)
+    residual = tl.load(residual_ptr + row * stride_residual_row + columns, mask=mask, other=0.0)
+    gate = tl.load(gate_ptr + index * stride_gate_row + columns, mask=mask, other=0.0)
+    branch = tl.load(branch_ptr + row * stride_branch_row + columns, mask=mask, other=0.0)
     # Match the BF16 residual value consumed by the unfused RMSNorm path.
-    updated = (residual + gate * branch).to(tl.bfloat16).to(tl.float32)
+    updated = residual + (gate * branch)
     tl.store(residual_out_ptr + row * hidden_size + columns, updated, mask=mask)
 
     weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
-    variance = tl.sum(updated * updated, axis=0) / hidden_size
-    normalized = updated * tl.rsqrt(variance + eps) * weight
-    shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+    up_f32 = updated.to(tl.float32)
+    variance = tl.sum(up_f32 * up_f32, axis=0) / hidden_size
+    # Match the BF16 normalized value produced by unfused RMSNorm before AdaLN affine.
+    normalized = (up_f32 * tl.rsqrt(variance + eps) * weight).to(tl.bfloat16)
+    shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0)
+    scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0)
     tl.store(
         modulated_out_ptr + row * hidden_size + columns,
-        normalized * (1.0 + scale) + shift,
+        normalized * (scale + 1.0) + shift,
         mask=mask,
     )
 
