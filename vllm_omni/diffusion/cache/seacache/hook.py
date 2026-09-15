@@ -258,9 +258,9 @@ class SeaCacheRootHook(ModelHook):
             if not isinstance(vision_items, list):
                 raise ValueError("extractor did not provide SeaCache vision inputs")
             noisy_frame_mask = extra_states.get("sea_cache_noisy_frame_mask")
-            if isinstance(noisy_frame_mask, torch.Tensor) and not bool(torch.any(noisy_frame_mask != 0).item()):
-                self._warn_once("SeaCache requires noisy vision; conditioning-only calls run in full.")
-                return self._run_uncached(ctx)
+            conditioning_only = isinstance(noisy_frame_mask, torch.Tensor) and not bool(
+                torch.any(noisy_frame_mask != 0).item()
+            )
 
             step = self.current_step_callback()
             sigma = self.current_sigma_callback()
@@ -286,6 +286,10 @@ class SeaCacheRootHook(ModelHook):
                 raise ValueError("expected a valid step index and exact sigma in [0, 1]")
         except (IndexError, TypeError, ValueError, RuntimeError) as error:
             self._warn_once(f"SeaCache metadata is invalid; running full: {error}")
+            return self._run_uncached(ctx)
+
+        if conditioning_only:
+            self._warn_once("SeaCache requires noisy vision; conditioning-only calls run in full.")
             return self._run_uncached(ctx)
 
         state: SeaCacheState = self.state_manager.get_state()

@@ -513,6 +513,27 @@ def test_hook_fails_open_without_noisy_vision() -> None:
     assert hook.skip_count == 0
 
 
+def test_conditioning_only_model_failure_runs_forward_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+    forward_calls = 0
+
+    def fail_forward(hidden_gen: torch.Tensor) -> torch.Tensor:
+        nonlocal forward_calls
+        forward_calls += 1
+        raise RuntimeError("model forward failed")
+
+    monkeypatch.setattr(transformer, "_run_gen_layers", fail_forward)
+    all_clean = torch.zeros(1, 1, 2, 1, 1)
+
+    with pytest.raises(RuntimeError, match="model forward failed"):
+        _run_step(transformer, 1000, 1.0, hook=hook, noisy_frame_mask=all_clean)
+
+    assert forward_calls == 1
+
+
 def test_hook_fails_open_without_explicit_context() -> None:
     transformer = TinyCosmos3Transformer()
     metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=2)

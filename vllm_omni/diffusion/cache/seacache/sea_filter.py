@@ -35,9 +35,7 @@ def apply_sea_filter(hidden_states: torch.Tensor, sigma: float, power_exp: float
         gain = reshaped_gain if gain is None else gain * reshaped_gain
 
     assert gain is not None
-    mean_gain = gain.mean()
-    if torch.isfinite(mean_gain) and mean_gain > 0:
-        gain = gain / mean_gain
+    gain = gain / gain.mean()
     return torch.fft.ifftn(spectrum * gain, dim=dimensions).real.to(original_dtype)
 
 
