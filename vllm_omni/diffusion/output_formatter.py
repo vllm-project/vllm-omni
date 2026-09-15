@@ -12,6 +12,7 @@ from vllm_omni.diffusion.io_support import get_diffusion_output_type, supports_a
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.model_executor.stage_input_processors import _common
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadata,
@@ -200,9 +201,17 @@ def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) ->
 
 
 def _ensure_list(outputs: DiffusionPayloadValue) -> list[DiffusionPayloadValue]:
-    if isinstance(outputs, list):
-        return outputs
-    return [outputs] if outputs is not None else []
+    """Wrap a non-list primary payload as ``[x]`` (diffusion formatter semantics).
+
+    ``output_formatter`` is **not** a stage-input helper: the legacy behaviour
+    was wrap-only — a ``list`` passes through unchanged, a non-list scalar /
+    tensor / PIL ``Image`` is wrapped verbatim as ``[x]``, and ``None`` becomes
+    ``[]``.  The canonical ``_common.ensure_list`` would flatten tensors,
+    iterate dict keys, and walk a PIL ``Image`` row by row, so it must not be
+    reused here; ``_common.ensure_list_wrap_only`` reproduces the exact legacy
+    semantics.
+    """
+    return _common.ensure_list_wrap_only(outputs)
 
 
 def _primary_payload(postprocess_output: DiffusionPostprocessOutput) -> DiffusionPayloadValue | None:
