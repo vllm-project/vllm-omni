@@ -113,6 +113,8 @@ checkpoint. `instructions` is the persona string.
 `PersonaPlexDuplexRuntimeExtension` is pure model policy. It:
 
 - configures greedy Stage 0 sampling and bounded segment lengths;
+- clones Stage 1 sampling defaults and selects `RequestOutputKind.DELTA` for
+  the native duplex path, leaving turn-based defaults unchanged;
 - maps each accepted PCM append to a scheduler prompt;
 - places immutable session identity, append sequence, PCM payload, voice, and
   persona under `model_intermediate_buffer["duplex"]`;
@@ -179,8 +181,8 @@ that fails during CUDA graph capture is not an acceptable deployment profile.
 
 ### Data-plane projector
 
-`PersonaPlexDataPlaneSession` converts cumulative or delta Stage 1 output into
-model-neutral native results:
+`PersonaPlexDataPlaneSession` consumes Stage 1 PCM deltas and cumulative text
+to produce model-neutral native results:
 
 ```python
 {
@@ -195,8 +197,21 @@ model-neutral native results:
 }
 ```
 
-It owns per-request audio and text cursors so a cumulative output cannot replay
-old audio. The generic projector turns each native result into the Realtime
+The Stage 1 output processor drains audio payloads at each emission instead of
+retaining the complete call history. The data-plane projector forwards each
+nonempty PCM delta, including equal-size or identical consecutive chunks;
+it does not slice those deltas with a cumulative sample offset. Deferred chunks
+are coalesced only within one emission. Empty PCM does not invoke the encoder
+or emit a header-only WAV, but any new transcript is still delivered.
+
+The per-request text cursor advances only after any nonempty audio has been
+successfully encoded; text-only output does not need audio encoding.
+Failure to encode nonempty PCM raises rather than silently consuming output.
+Projection is not server-send completion or client playback acknowledgement.
+The shared output accumulator retains sample-rate metadata as latest-value
+snapshots; ordinary cumulative output remains available to other callers.
+
+The generic projector turns each native result into the Realtime
 `response.output_audio.delta` / `response.output_audio_transcript.delta` pair (and
 `response.output_text.delta` for text) under one `response_id`; the full
 mapping is the name map in the
