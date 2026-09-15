@@ -57,3 +57,31 @@ cross-stage routing.
 
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
+
+### Hardware-specific block qualification
+
+When a model selects native and vendor implementations of the same block,
+qualify the extension seam before changing selection policy:
+
+1. Load the same nontrivial state dict strictly into both implementations.
+2. Exercise identity and channel-changing skip paths plus production mode
+   branches.
+3. Compare shape, dtype, and values with declared per-dtype tolerances.
+4. Assert that the normal platform entry selects the intended class and that
+   accelerated operations actually execute.
+5. Restore process-global backend state after successful and failing calls.
+6. Report block timings separately from model and request timings.
+7. Record both the benchmark checkout revision and the imported package source
+   path; an editable installation can otherwise execute a different checkout.
+8. List the tested hardware and execution modes explicitly. Unrun
+   `torch.compile` and CUDA Graph cells remain pending, not implicitly covered
+   by eager-mode results.
+
+Block qualification does not replace checkpoint loading, generated-output
+quality, or request-level validation through the normal model entry.
+
+For HunyuanImage3 ResBlocks, the initial evidence at `fa3d24d6` covers eager
+execution on A100 80GB PCIe; an independent H200 eager reproduction was reported
+by the reviewer on PR #7421. Neither establishes `torch.compile` or CUDA Graph
+qualification. The added production-sized BF16 fixtures also require fresh GPU
+qualification; the original smaller-fixture results do not cover them.
