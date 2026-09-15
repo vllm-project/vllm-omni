@@ -49,3 +49,8 @@ def test_internal_blacklist_keys_derived_from_orchestrator():
     """
     blacklist = internal_blacklist_keys()
     assert blacklist == orchestrator_field_names() - SHARED_FIELDS
+
+
+def test_diffusion_cache_bundle_is_not_a_shared_field():
+    assert "cache_backend" not in SHARED_FIELDS
+    assert "cache_config" not in SHARED_FIELDS
