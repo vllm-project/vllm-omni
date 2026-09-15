@@ -281,7 +281,9 @@ class AttnProcessor:
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        attn_mask_has_padding: bool | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -321,7 +323,11 @@ class AttnProcessor:
         if attention_mask is not None:
             attention_mask = attention_mask.to(torch.bool)
 
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = (
+            AttentionMetadata(attn_mask=attention_mask, attn_mask_has_padding=attn_mask_has_padding)
+            if attention_mask is not None
+            else None
+        )
         hidden_states = attn.omni_attn(query, key, value, attn_metadata)
 
         if attention_mask is not None:
@@ -403,8 +409,10 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        image_rotary_emb: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         temb: torch.Tensor | None = None,
+        *,
+        attn_mask_has_padding: bool | None = None,
     ) -> torch.Tensor:
         if self.modulation:
             if temb is None:
@@ -416,6 +424,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                attn_mask_has_padding=attn_mask_has_padding,
             )
             hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
@@ -427,6 +436,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                attn_mask_has_padding=attn_mask_has_padding,
             )
             hidden_states = hidden_states + self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states))
@@ -694,9 +704,19 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         return text_hidden_states, img_tokens
 
-    def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+    def _apply_transformer_layers(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        temb: torch.Tensor,
+        *,
+        attn_mask_has_padding: bool | None = None,
+    ) -> torch.Tensor:
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+            hidden_states = layer(
+                hidden_states, attention_mask, rotary_emb, temb, attn_mask_has_padding=attn_mask_has_padding
+            )
         return hidden_states
 
     def forward(
@@ -758,7 +778,14 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
             joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
 
-        hidden_states = self._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        # The lengths already live on the host. Reuse this fact across joint
+        # blocks instead of inspecting the same device mask in every FA call.
+        attn_mask_has_padding = (
+            None if torch.compiler.is_compiling() else any(seq_len != max_seq_len for seq_len in seq_lengths)
+        )
+        hidden_states = self._apply_transformer_layers(
+            joint_hidden_states, attention_mask, rotary_emb, temb, attn_mask_has_padding=attn_mask_has_padding
+        )
 
         hidden_states = self.norm_out(hidden_states, temb)
 

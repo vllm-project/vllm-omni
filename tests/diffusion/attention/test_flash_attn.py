@@ -390,7 +390,8 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
     print("✓ Case 3 PASSED: FA and SDPA cross-attention outputs are very close!")
 
 
-def test_varlen_masked_routing_by_role(monkeypatch):
+@pytest.mark.parametrize("padding_hint", [None, True])
+def test_varlen_masked_routing_by_role(monkeypatch, padding_hint):
     """The unpad route is picked by role, not Q/K length equality; runs without a GPU."""
     calls = []
 
@@ -399,11 +400,15 @@ def test_varlen_masked_routing_by_role(monkeypatch):
         return q
 
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
 
     batch_size, seq_len, num_heads, head_dim = 2, 4, 2, 8
     query = torch.randn(batch_size, seq_len, num_heads, head_dim)
-    metadata = AttentionMetadata(attn_mask=torch.tensor([[True, True, False, False], [True, True, True, False]]))
+    metadata = AttentionMetadata(
+        attn_mask=torch.tensor([[True, True, False, False], [True, True, True, False]]),
+        attn_mask_has_padding=padding_hint,
+    )
 
     cross_impl = FlashAttentionImpl(
         num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False, role="cross"
@@ -424,7 +429,48 @@ def test_varlen_masked_routing_by_role(monkeypatch):
     assert cu_seqlens_k.tolist() == [0, 2, 5]
 
 
-def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
+@pytest.mark.parametrize("padding_hint", [False, None, True])
+@pytest.mark.parametrize("dense_available", [False, True])
+def test_full_mask_padding_hint_preserves_dense_routing(monkeypatch, mocker, padding_hint, dense_available):
+    """Exercise real CUDA dispatch/unpadding helpers on CPU with kernel stubs."""
+    calls = []
+
+    def fake_flash_func(q, k, v, **kwargs):
+        calls.append((q.shape, kwargs))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_func", fake_flash_func if dense_available else None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_flash_func)
+    reduction = mocker.spy(torch, "any")
+    query = torch.randn(2, 4, 2, 8)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    metadata = AttentionMetadata(attn_mask=mask, attn_mask_has_padding=padding_hint)
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+
+    output = impl.forward_cuda(query, query, query, metadata)
+
+    assert torch.equal(output, query)
+    assert len(calls) == 1
+    shape, kwargs = calls[0]
+    assert shape == (query.shape if dense_available else torch.Size([8, 2, 8]))
+    assert kwargs["causal"] is False
+    assert kwargs["softmax_scale"] == 0.5
+    if not dense_available:
+        assert kwargs["cu_seqlens_q"].tolist() == [0, 4, 8]
+        assert kwargs["cu_seqlens_k"].tolist() == [0, 4, 8]
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
+    if padding_hint is False:
+        reduction.assert_not_called()
+    else:
+        reduction.assert_called_once()
+        assert torch.equal(reduction.call_args.args[0], ~mask)
+    assert metadata.attn_mask is mask
+    assert metadata.attn_mask_has_padding is padding_hint
+
+
+@pytest.mark.parametrize("padding_hint", [False, None, True])
+def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch, mocker, padding_hint):
     calls = []
 
     def fake_varlen_func(q, k, v, **kwargs):
@@ -437,12 +483,19 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     monkeypatch.setattr(fa, "flash_attn_func", None)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    reduction = mocker.spy(torch, "any")
 
     impl = FlashAttentionImpl(num_heads=4, num_kv_heads=2, head_size=4, softmax_scale=0.5, causal=False)
     query = torch.randn(1, 3, 4, 4)
     key = torch.randn(1, 3, 2, 4)
     value = torch.randn(1, 3, 2, 4)
-    metadata = AttentionMetadata(full_attn_spans=[[(0, 3)]])
+    metadata = AttentionMetadata(
+        full_attn_spans=[[(0, 3)]],
+        attn_mask=torch.ones(1, 3, dtype=torch.bool),
+        attn_mask_has_padding=padding_hint,
+        # Piecewise spans take priority even over incomplete packed metadata.
+        extra={"cu_seqlens_q": torch.tensor([0, 3], dtype=torch.int32)},
+    )
 
     output = impl.forward_cuda(query, key, value, metadata)
 
@@ -452,9 +505,11 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     assert calls[0]["max_seqlen_k"] == 3
     assert calls[0]["causal"] is False
     assert calls[0]["softmax_scale"] == 0.5
+    reduction.assert_not_called()
 
 
-def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
+@pytest.mark.parametrize("padding_hint", [False, None, True])
+def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch, mocker, padding_hint):
     calls = []
 
     def fake_varlen_func(q, k, v, **kwargs):
@@ -463,12 +518,14 @@ def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
 
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+    reduction = mocker.spy(torch, "any")
 
     impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
     query = torch.randn(1, 8, 2, 4)
     cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32)
     metadata = AttentionMetadata(
         attn_mask=torch.tensor([[True] * 6 + [False] * 2]),
+        attn_mask_has_padding=padding_hint,
         extra={
             "cu_seqlens_q": cu_seqlens,
             "cu_seqlens_k": cu_seqlens,
@@ -484,6 +541,7 @@ def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
     assert calls[0][0] == torch.Size([8, 2, 4])
     assert calls[0][3]["cu_seqlens_q"] is cu_seqlens
     assert calls[0][3]["max_seqlen_q"] == 6
+    reduction.assert_not_called()
 
 
 def test_packed_varlen_metadata_must_be_complete(monkeypatch):

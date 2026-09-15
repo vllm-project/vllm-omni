@@ -356,14 +356,18 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if torch.compiler.is_compiling() and is_forward_context_available():
-            od_config = get_forward_context().omni_diffusion_config
-            parallel_config = getattr(od_config, "parallel_config", None)
-            if getattr(parallel_config, "use_hsdp", False):
-                # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
-                # attention graph; otherwise scheduler dependency analysis can
-                # fail on the fused attention region.
-                return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
+        if torch.compiler.is_compiling():
+            if attn_metadata is not None and attn_metadata.attn_mask_has_padding is not None:
+                # Clear before HSDP can leave the compiled region below.
+                attn_metadata = replace(attn_metadata, attn_mask_has_padding=None)
+            if is_forward_context_available():
+                od_config = get_forward_context().omni_diffusion_config
+                parallel_config = getattr(od_config, "parallel_config", None)
+                if getattr(parallel_config, "use_hsdp", False):
+                    # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
+                    # attention graph; otherwise scheduler dependency analysis can
+                    # fail on the fused attention region.
+                    return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
 
@@ -419,6 +423,14 @@ class Attention(nn.Module):
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask_has_padding is not None
+            and not isinstance(strategy, NoParallelAttention)
+        ):
+            # Resharding can change the mask described by the producer.
+            attn_metadata = replace(attn_metadata, attn_mask_has_padding=None)
 
         # Scheduler rows describe the logical sequence, while strict Ulysses
         # may append synthetic tokens solely to make the image shard divisible.
