@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """W4A4 MXFP4 (Microscaling FP4) online/offline quantization for diffusion transformers.
 
 Architecture mirrors mxfp8_config.py:
@@ -61,7 +61,10 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -91,6 +94,7 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+@register_quantization_config("mxfp4")
 class DiffusionMXFP4Config(QuantizationConfig):
     """W4A4 MXFP4 quantization config for diffusion transformers.
 
@@ -746,6 +750,7 @@ def _parse_block_idx(prefix: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+@register_quantization_config("mxfp4_dualscale")
 class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
     """W4A4 MXFP4 DualScale with per-layer BF16 fallback for diffusion transformers.
 

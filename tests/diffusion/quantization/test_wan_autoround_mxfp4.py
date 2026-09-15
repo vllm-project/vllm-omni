@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Wan AutoRound-format MXFP4 configuration and layer-mapping tests."""
 
 from unittest.mock import patch
@@ -12,7 +12,7 @@ from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanTransformer3DModel,
 )
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -38,7 +38,7 @@ def _autoround_mxfp4_config() -> dict:
 
 
 def test_build_wan_autoround_mxfp4_config():
-    config = build_quant_config(_autoround_mxfp4_config())
+    config = build_quantization_config(_autoround_mxfp4_config())
 
     assert isinstance(config, OmniINCConfig)
     assert config.get_name() == "inc"
@@ -50,7 +50,7 @@ def test_build_wan_autoround_mxfp4_config():
 
 
 def test_wan_autoround_config_uses_runtime_layer_names():
-    config = build_quant_config(_autoround_mxfp4_config())
+    config = build_quantization_config(_autoround_mxfp4_config())
     configure_quant_config(config, WanTransformer3DModel)
 
     assert config.packed_modules_mapping is WanTransformer3DModel.packed_modules_mapping
@@ -69,7 +69,7 @@ def test_wan_autoround_config_uses_runtime_layer_names():
 
 
 def test_wan_autoround_scope_dispatches_only_blocks_to_mxfp4():
-    config = build_quant_config(_autoround_mxfp4_config())
+    config = build_quantization_config(_autoround_mxfp4_config())
     configure_quant_config(config, WanTransformer3DModel)
 
     layer = object.__new__(LinearBase)

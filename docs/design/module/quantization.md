@@ -19,7 +19,7 @@ validation_paths:
   - tests/diffusion/quantization/**
 upstream_refs:
   - vllm.model_executor.layers.quantization
-last_reviewed: 2026-07-16
+last_reviewed: 2026-09-06
 ---
 
 # Quantization
@@ -43,6 +43,13 @@ method when a requested combination is unsupported.
 
 **Rule:** A new method or layer mapping MUST include correctness comparison
 against a defined reference result.
+
+### QUANT-INV-004: Runtime configs are concrete objects
+
+**Rule:** Raw CLI and checkpoint quantization specs MUST be resolved into a
+`QuantizationConfig` before a replica initialization plan is constructed.
+Initialization plans and their vLLM or Omni diffusion configs MUST carry the
+resolved object; raw method strings and mappings remain input-stage data only.
 
 ## Safe-change guide
 
