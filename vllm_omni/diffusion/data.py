@@ -863,6 +863,9 @@ class OmniDiffusionConfig:
     lora_scale: float | list[float] = 1.0
     lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
     max_cpu_loras: int | None = None
+    # Fold the active adapter into base weights at activation, removing all
+    # per-forward LoRA cost. See DiffusionLoRAManager for constraints.
+    lora_merge_on_load: bool = False
 
     output_type: str = "pil"
 

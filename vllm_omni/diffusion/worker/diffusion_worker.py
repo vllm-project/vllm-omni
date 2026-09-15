@@ -560,6 +560,15 @@ class DiffusionWorker:
 
         lora_backend = self.od_config.lora_backend
         if lora_backend == LoRABackend.PEFT:
+            merge_on_load = self.od_config.lora_merge_on_load
+            layerwise_offload = self.od_config.enable_layerwise_offload or getattr(
+                self.od_config, "enable_distributed_layerwise_offload", False
+            )
+            if merge_on_load and layerwise_offload:
+                logger.warning(
+                    "lora_merge_on_load is incompatible with layerwise offload; falling back to standard LoRA wrappers."
+                )
+                merge_on_load = False
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=self.model_runner.pipeline,
                 device=self.device,
@@ -567,6 +576,7 @@ class DiffusionWorker:
                 max_cached_adapters=self.od_config.max_cpu_loras,
                 lora_path=lora_path,
                 lora_scale=self.od_config.lora_scale,
+                merge_on_load=merge_on_load,
             )
         elif lora_backend == LoRABackend.DISTILL:
             pipeline = self.model_runner.pipeline
