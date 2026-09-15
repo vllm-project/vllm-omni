@@ -283,24 +283,21 @@ def load_minimax_h3_turbo_lora(
 
         if partition == "ref2va" and spec.task_family == "fl2v":
             raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
-        # ``combined`` serves ref2va from ``transformers_ref``, but the LoRA
-        # target pattern only injects into ``transformer``: the adapter would
-        # bind to the stack that never runs.
-        if spec.task_family == "ref2v" and partition != "ref2va":
-            raise ValueError(
-                f"{spec.filename} is a Ref2VA Turbo artifact; start the server with --task-type ref2va "
-                f"(task_type={partition!r} serves ref2va from a DiT the adapter cannot bind to)"
-            )
+        if spec.task_family == "ref2v" and partition not in {"ref2va", "combined"}:
+            raise ValueError(f"{spec.filename} requires a Ref2VA-capable server")
+        dit_component = "transformers_ref" if partition == "combined" and spec.task_family == "ref2v" else "transformer"
         if unsupported_offload_mode is not None:
             raise ValueError(f"MiniMax-H3 Turbo dynamic LoRA does not support {unsupported_offload_mode}")
 
         tensors = _validate_and_convert_tensors(checkpoint)
 
+    # In combined mode qualify both families. Relative FL names would also
+    # match Ref layers after they have been wrapped by an earlier adapter.
     peft_helper = PEFTHelper.from_dict(
         {
             "r": spec.rank,
             "lora_alpha": spec.alpha,
-            "target_modules": _TURBO_TARGET_PATTERN,
+            "target_modules": _TURBO_TARGET_PATTERN.replace("^transformer", "^" + dit_component),
         }
     )
     lora_model = LoRAModel.from_lora_tensors(
@@ -309,7 +306,15 @@ def load_minimax_h3_turbo_lora(
         peft_helper=peft_helper,
         device="cpu",
         dtype=dtype,
-        weights_mapper=_TURBO_WEIGHTS_MAPPER,
+        weights_mapper=WeightsMapper(
+            orig_to_new_substr=dict(_TURBO_WEIGHTS_MAPPER.orig_to_new_substr),
+            orig_to_new_prefix={
+                "blocks.": f"{dit_component}.blocks.",
+                "token_refiner.": f"{dit_component}.token_refiner.",
+            },
+        )
+        if partition == "combined"
+        else _TURBO_WEIGHTS_MAPPER,
     )
     _pack_h3_turbo_fc1(lora_model)
     logger.info(

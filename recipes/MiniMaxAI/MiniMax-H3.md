@@ -908,10 +908,10 @@ Diffusers file. The filename is the contract, so do not rename an artifact
 either -- a renamed file is rejected rather than served on a guess.
 
 FL2VA artifacts serve `t2va` and `fl2va` on any FL2VA or combined server.
-Ref2VA artifacts require
-`--task-type ref2va`: a combined server serves `ref2va` from a second DiT that
-the adapter cannot bind to, so loading one there is refused rather than silently
-running an undistilled model on the few-step schedule.
+Ref2VA artifacts support `--task-type ref2va` and combined servers. In combined
+mode, Ref2VA adapters bind to `transformers_ref` and FL2VA adapters bind to
+`transformer`; switching adapter families keeps their weights isolated. An
+FL2VA-only server still rejects Ref2VA artifacts.
 
 Download the artifact you want:
 
