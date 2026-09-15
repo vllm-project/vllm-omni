@@ -20,8 +20,8 @@ dynamically quantized before the attention operator. It does not quantize model
 weights and is separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or
 pre-quantized checkpoint formats.
 
-If `diffusion_kv_cache_dtype` is not set, behavior is unchanged and attention
-runs in the native dtype.
+If neither `diffusion_kv_cache_dtype` nor per-role `quant.method` is set,
+attention runs in the native dtype.
 
 ## Hardware Support
 
@@ -36,7 +36,7 @@ Legend: `✅` supported, `❌` unsupported.
 
 FP8 FA is currently implemented only for the NPU Flash Attention backend. Other
 backends do not support `diffusion_kv_cache_dtype="fp8"` for diffusion attention
-and fall back to native dtype execution.
+and reject an incompatible explicit configuration.
 
 ## Model Type Support
 
@@ -123,3 +123,21 @@ layers skip FP8 FA; all other eligible full-attention forwards use the FP8 path.
 4. Report both latency and quality results when enabling this option for a new
    model. For image or video models, include visual comparison and quantitative
    metrics when available, such as PSNR or SSIM.
+
+## Wan2.2 T2V quantized attention on Ascend
+
+For Wan2.2 T2V A14B, `FLASH_ATTN` accepts per-role `quant.method` values
+`fp8`, `mxfp8`, `mxfp4`, or `float`. This requires a compatible MindIE-SD
+`quant_attention` API and native operators for the selected precision.
+Keep cross-attention at `float`; model weights are unaffected.
+
+`quant.fallback` is an ordered list, for example `[mxfp8, float]` for MXFP4.
+It applies to unsupported inputs or an unavailable public API, before execution.
+An empty list makes these conditions errors; native execution errors always propagate.
+The list cannot repeat methods and `float`, if present, must be last.
+`quant.rotation_seed` overrides the Dense FP8/MXFP8 rotation seed (default `425500`).
+Conflicting per-role and global quantization settings are rejected.
+
+Minimal T2V deploy configurations are provided in
+`examples/offline_inference/text_to_video/wan22_quant_attention/fa_mxfp8.yaml`
+and `fa_mxfp4.yaml`.

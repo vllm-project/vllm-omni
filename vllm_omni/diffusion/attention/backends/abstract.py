@@ -211,6 +211,10 @@ class AttentionMetadata:
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
     #     decide whether/how to apply.
+    #   "quant_fallback": ordered alternative Q/K/V methods; no operator-error retries.
+    #   "disable_attention_quant": bool — per-forward skip/model opt-out,
+    #     independent of sparse-vs-dense selection.
+    #   "rotation_seed": int — explicit seed for Runtime paths supporting rotation.
     #   "cu_seqlens_q" / "cu_seqlens_k": int32 CUDA tensors describing packed
     #     variable-length query/key sequences for FlashAttention.
     #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with

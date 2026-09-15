@@ -1,0 +1,17 @@
+# Wan2.2 T2V-A14B: strict quantized self-attention, float cross-attention.
+# Empty fallback makes unsupported hardware fail visibly during qualification.
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    diffusion_attention_config:
+      per_role:
+        self:
+          backend: FLASH_ATTN
+          quant:
+            method: mxfp8
+            fallback: []
+        cross:
+          backend: FLASH_ATTN
+          quant:
+            method: float

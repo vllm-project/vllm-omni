@@ -1,61 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FP8 quantization utilities for diffusion attention tensors.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Compatibility entrypoints for MindIE-SD Q/K/V quantization.
 
-Provides per-tensor dynamic quantization of Q/K/V tensors to
-float8_e4m3fn format. Designed for diffusion models where Q/K/V are
-computed fresh each forward pass (no persistent KV cache).
+Omni supplies its seeded rotations; MindIE-SD owns quantization and execution.
 """
 
 from __future__ import annotations
 
+import functools
 import math
-import threading
-from functools import lru_cache
 
 import torch
 
-# Hadamard rotation matrix for QuaRot-style preprocessing
-# keyed by (device, dtype, head_dim) to avoid matmul dtype mismatch.
-_ROT_MATRIXS: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
-_ROT_MATRIX_LOCK = threading.Lock()
-
-_FP8_KV_LABELS = frozenset({"fp8"})
-
 
 def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
-    """True if config requests FP8-style KV / QKV quantization for the NPU FA path."""
-    return kv_cache_dtype in _FP8_KV_LABELS
+    return kv_cache_dtype in {"fp8", "mxfp8", "mxfp4"}
 
 
-@lru_cache(maxsize=1)
-def _load_quant_ops():
-    try:
-        import torch_npu
-        from mindiesd.layers.quant.block_quant import fa_block_quant_preprocess
-        from msmodelslim.processor.quarot.common.quarot_utils import QuaRotMode, create_rot
-    except ImportError as e:
-        raise ImportError(
-            "fp8_rotate_quant_fa requires torch_npu, MindIE-SD (mindiesd), and MSModelSlim. "
-            "See https://gitcode.com/Ascend/MindIE-SD and https://gitcode.com/Ascend/msmodelslim"
-        ) from e
-    return torch_npu, fa_block_quant_preprocess, QuaRotMode, create_rot
-
-
-def _get_rot_matrix(
-    device: torch.device,
-    dtype: torch.dtype,
-    head_dim: int,
-    qua_rot_mode,
-    create_rot,
+@functools.lru_cache(maxsize=128)
+def get_quant_attention_rotation(
+    device: torch.device, dtype: torch.dtype, head_dim: int, seed: int = 425500
 ) -> torch.Tensor:
-    key = (device, dtype, head_dim)
-    with _ROT_MATRIX_LOCK:
-        rot = _ROT_MATRIXS.get(key)
-        if rot is None:
-            rot = create_rot(qua_rot_mode.HADAMARD, head_dim, seed=425500).to(device=device, dtype=dtype)
-            _ROT_MATRIXS[key] = rot
-    return rot
+    """Preserve Omni's seeded Walsh-Hadamard rotation without changing global RNG."""
+    if head_dim <= 0 or head_dim & (head_dim - 1):
+        raise ValueError("Generated attention rotations require a power-of-two head dimension.")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("rotation_seed must be an integer.")
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    signs = torch.randint(0, 2, (head_dim,), generator=generator, dtype=torch.int64)
+    signs = signs.to(dtype=torch.float32).mul_(2).sub_(1)
+    hadamard = torch.ones(1, 1)
+    while hadamard.shape[0] < head_dim:
+        hadamard = torch.cat((torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0)
+    rotation = signs[:, None] * hadamard / math.sqrt(head_dim)
+    return rotation.to(device=device, dtype=dtype).contiguous()
 
 
 def fp8_rotate_quant_fa(
@@ -66,62 +44,19 @@ def fp8_rotate_quant_fa(
     layout: str = "BNSD",
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Run NPU fused attention with dynamic FP8 Q/K/V and optional QuaRot preprocess.
-
-    Args:
-        query: Query tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
-        key: Key tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
-        value: Value tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
-        layout: ``BNSD`` or ``BSND`` for ``npu_fused_infer_attention_score_v2``.
-        softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
-
-    Returns:
-        Attention output in the same layout as inputs.
-    """
-    torch_npu, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
-
-    out_dtype = query.dtype
-    device = query.device
-
-    if layout == "BNSD":
-        _, n, s, d = query.shape
-    elif layout == "BSND":
-        _, s, n, d = query.shape
-    else:
-        raise ValueError(f"fp8_rotate_quant_fa: unsupported layout {layout!r}, expected BNSD or BSND")
-
-    rot = _get_rot_matrix(device, query.dtype, d, qua_rot_mode, create_rot)
-    q_f = torch.matmul(query, rot)
-    k_f = torch.matmul(key, rot)
-
-    q, q_scale = fa_block_quant_preprocess(q_f, block_size=128, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-    k, k_scale = fa_block_quant_preprocess(k_f, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-    v, v_scale = fa_block_quant_preprocess(value, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-
-    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
-
-    out = torch_npu.npu_fused_infer_attention_score_v2(
-        q,
-        k,
-        v,
-        input_layout=layout,
-        num_query_heads=n,
-        softmax_scale=scale,
-        pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
-        next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
-        query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
-        key_quant_mode=7,  # Same quant mode as query branch.
-        value_quant_mode=7,  # Same quant mode as key/query branches.
-        dequant_scale_query=q_scale,
-        dequant_scale_key=k_scale,
-        dequant_scale_value=v_scale,
-        out_dtype=out_dtype,
-    )[0]
-
-    if out.shape[2] != s:
-        if layout == "BNSD":
-            out = out[:, :, :s, :]
-        elif layout == "BSND":
-            out = out[:, :s, :, :]
-
-    return out
+    """Preserve the legacy layout/scale API and Omni rotation seed."""
+    try:
+        from mindiesd import quant_attention
+    except ImportError as exc:
+        raise ImportError("NPU FP8 attention requires MindIE-SD quant_attention.") from exc
+    rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])
+    return quant_attention(
+        query,
+        key,
+        value,
+        precision="fp8",
+        layout=layout,
+        scale=softmax_scale,
+        q_rot=rotation,
+        k_rot=rotation,
+    )

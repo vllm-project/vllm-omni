@@ -416,6 +416,7 @@ class WanSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="self",
+            qkv_layout="BSND",
             prefix=prefix,
         )
 
