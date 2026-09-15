@@ -17,9 +17,11 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
     SupportsComponentDiscovery,
@@ -37,6 +39,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 
@@ -310,9 +313,9 @@ class LingBotVideoPipeline(
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
 
     The in-tree transformer supports both dense MLP blocks and routed MoE blocks.
-    Fused expert kernels and the optional ``refiner/`` transformer are not loaded
-    or executed. ``t_thresh`` only selects a low-noise sigma schedule for the
-    primary transformer; it does not enable automatic refiner orchestration.
+    Routed blocks use vLLM's common FusedMoE runner. The optional
+    ``refiner/`` transformer is not loaded or executed; ``t_thresh`` only
+    selects a low-noise sigma schedule for the primary transformer.
     """
 
     supports_step_execution: ClassVar[bool] = False
@@ -348,12 +351,24 @@ class LingBotVideoPipeline(
         vae_subfolder = str(model_config.get("vae_subfolder", "vae"))
         scheduler_subfolder = str(model_config.get("scheduler_subfolder", "scheduler"))
 
-        self.transformer = LingBotVideoTransformer3DModel.from_pretrained(
-            model,
-            subfolder=transformer_subfolder,
-            torch_dtype=transformer_dtype,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder=transformer_subfolder,
+                revision=getattr(od_config, "revision", None),
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
+        transformer_kwargs = get_transformer_config_kwargs(
+            od_config.tf_model_config,
+            LingBotVideoTransformer3DModel,
+        )
+        self.transformer = LingBotVideoTransformer3DModel(
+            **transformer_kwargs,
+            prefix="transformer",
+        )
+        self.transformer.to(dtype=transformer_dtype)
         text_encoder_kwargs: dict[str, Any] = {
             "dtype": text_encoder_dtype,
             "local_files_only": local_files_only,
@@ -396,13 +411,7 @@ class LingBotVideoPipeline(
         return self
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        consumed = list(weights)
-        if consumed:
-            raise RuntimeError(
-                f"{self.__class__.__name__}.load_weights received {len(consumed)} weight tensors; "
-                "LingBot components are loaded directly from subfolders during __init__."
-            )
-        return {name for name, _ in self.named_parameters()}
+        return AutoWeightsLoader(self).load_weights(weights)
 
     @staticmethod
     def check_inputs(height: int, width: int, num_frames: int) -> None:
