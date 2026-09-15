@@ -116,7 +116,7 @@ class ARDiffusionPagedForwardContext:
         self._allocated_video = True
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
-        """Reserve scratch slots for action/state K/V, if present."""
+        """Reserve scratch slots for auxiliary K/V, if present."""
         if action_len <= 0:
             self.action_scratch_block_ids = []
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
@@ -200,7 +200,7 @@ class ARDiffusionPagedForwardContext:
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:
         """Host-side, once-per-KV-branch setup (called OUTSIDE torch.compile).
 
-        Allocates the current video/action slots (still lazy: only the KV branch a
+        Allocates the current video/auxiliary slots (still lazy: only the KV branch a
         CFG-parallel rank actually runs reaches its ``_forward_blocks``), builds
         the padded block-table metadata ONCE for all layers, and publishes the
         pool registry for the fused custom op. The compiled per-layer code then
