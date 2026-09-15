@@ -132,6 +132,14 @@ def test_judge_score_parser(raw: str, expected: int | None) -> None:
     assert parse_judge_score(raw) == expected
 
 
+@pytest.mark.parametrize("path", ["", "/", "/v1", "/v1/", "/v1/chat/completions", "/v1/chat/completions/"])
+@pytest.mark.parametrize("suffix", ["", "?api-version=2026&token=a%2Fb&route=/"])
+def test_chat_completions_url_preserves_query(path: str, suffix: str) -> None:
+    assert protocol.chat_completions_url(f"https://example.com/gateway{path}{suffix}") == (
+        f"https://example.com/gateway/v1/chat/completions{suffix}"
+    )
+
+
 def test_judge_config_has_only_fixed_public_fields(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("SECRET_VALUE", "must-not-appear")
     path = tmp_path / "judges.json"

@@ -61,10 +61,11 @@ def public_endpoint(url: str) -> str:
 
 
 def chat_completions_url(base_url: str) -> str:
-    base = base_url.rstrip("/")
-    if base.endswith("/chat/completions"):
-        return base
-    return f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+    endpoint = urlsplit(base_url)
+    path = endpoint.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path += "/chat/completions" if path.endswith("/v1") else "/v1/chat/completions"
+    return endpoint._replace(path=path).geturl()
 
 
 def load_judge_config(path: str | Path) -> list[JudgeSpec]:
