@@ -135,6 +135,10 @@ class RainFusionPlan:
 class RainFusionAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supported_platforms: tuple[str, ...] = ("npu",)
+    # The impl trims [real, pad] packed tensors to the valid prefix with
+    # [:, :used] itself (and never reads attn_mask), so models may run the
+    # padded layout without materializing a padding mask.
+    supports_prefix_kv_slicing: bool = True
 
     @classmethod
     def validate_available(cls) -> None:
@@ -473,7 +477,12 @@ class RainFusionAttentionImpl(AttentionImpl):
             )
 
         used = plan.used_len
-        q, k, v = (tensor[:, :used] for tensor in (query, key, value))
+        # Split query once: the valid prefix drives the kernel, the padding
+        # tail is reused verbatim as the output padding below. All views,
+        # zero-copy. split_with_sizes always yields both parts, including an
+        # empty tail when the sequence needs no padding.
+        q, q_pad = torch.split(query, [used, query.shape[1] - used], dim=1)
+        k, v = key[:, :used], value[:, :used]
         # Ulysses has already gathered the full sequence onto this rank and split
         # the heads, so read the head count off the tensor rather than num_heads.
         common_kwargs: dict[str, object] = {
@@ -505,6 +514,9 @@ class RainFusionAttentionImpl(AttentionImpl):
             out = sparse_attention(q, k, v, **common_kwargs)
         if used == query.shape[1]:
             return out
-        padded = torch.zeros_like(query)
-        padded[:, :used] = out
-        return padded
+        # Only the first ``used`` rows are read back downstream, so the padding
+        # payload is free. Reuse the query tail split off above instead of
+        # zeroing a fresh buffer: a single cat write, no extra allocation, and
+        # always finite values (uninitialized memory could hold NaN bit
+        # patterns).
+        return torch.cat([out, q_pad], dim=1)
