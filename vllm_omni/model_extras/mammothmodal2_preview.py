@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -37,9 +37,16 @@ def build_text_to_image_prompt(
     MammothModa2 t2i uses classifier-free guidance via ``text_guidance_scale``
     and has no explicit negative-prompt path, so ``negative_prompt`` is accepted
     for signature compatibility but not injected.
+
+    Image dimensions must be positive multiples of 16. Omitted dimensions
+    default to 1024.
     """
-    h = height or 1024
-    w = width or 1024
+    h = 1024 if height is None else height
+    w = 1024 if width is None else width
+    for name, size in (("height", h), ("width", w)):
+        if size <= 0 or size % _PATCH_SIZE != 0:
+            raise ValueError(f"MammothModa2 {name} must be a positive multiple of {_PATCH_SIZE}, got {size}")
+
     ar_height = h // _PATCH_SIZE
     ar_width = w // _PATCH_SIZE
 
@@ -97,5 +104,5 @@ def build_x_to_text_prompt(
     )
 
 
-MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS = frozenset()
+MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
 MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES = True
