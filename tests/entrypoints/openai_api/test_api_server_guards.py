@@ -97,6 +97,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/videos/{video_id}/content"),
     ("POST", "/v1/omni/sleep"),
     ("POST", "/v1/omni/wakeup"),
+    ("POST", "/v1/stage/run"),
 }
 _EXPECTED_PROFILER_ROUTES = {
     ("POST", "/start_profile"),

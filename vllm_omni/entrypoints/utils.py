@@ -10,6 +10,7 @@ from typing import Any, get_args, get_origin
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.yaml_util import create_config
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 
@@ -77,6 +78,54 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             )
 
     return parsed
+
+
+def extract_standalone_stage_config(
+    stage_configs: list,
+    stage_id: int,
+) -> list:
+    """Extract a single stage from a multi-stage config list for standalone operation.
+
+    Adjusts the stage for independent execution: renumbers to stage_id 0,
+    marks as final output, clears input_sources, and strips next-stage
+    transform references. Connector and sampling config are preserved.
+    """
+    from omegaconf import OmegaConf
+
+    target = None
+    for cfg in stage_configs:
+        if int(cfg.stage_id) == stage_id:
+            target = OmegaConf.to_container(cfg, resolve=True)
+            break
+    if target is None:
+        available = [int(c.stage_id) for c in stage_configs]
+        raise ValueError(f"stage_id {stage_id} not found (available: {available})")
+
+    target["stage_id"] = 0
+    target["final_output"] = True
+    if not target.get("final_output_type"):
+        engine_args = target.get("engine_args", {})
+        eot = engine_args.get("engine_output_type", "")
+        if eot == "audio":
+            target["final_output_type"] = "audio"
+        elif eot == "latent":
+            target["final_output_type"] = "latent"
+        elif eot:
+            raise ValueError(f"Unsupported engine_output_type {eot!r} for standalone stage. Supported: audio, latent.")
+    target.pop("input_sources", None)
+    target.pop("input_connectors", None)
+    target.pop("output_connectors", None)
+
+    engine_args = target.get("engine_args", {})
+    engine_args["async_chunk"] = False
+    for key in (
+        "custom_process_next_stage_input_func",
+        "async_chunk_process_next_stage_input_func",
+    ):
+        engine_args.pop(key, None)
+    target["engine_args"] = engine_args
+
+    return [create_config(target)]
 
 
 def get_final_stage_id_for_e2e(
