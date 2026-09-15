@@ -1896,6 +1896,7 @@ def test_image_edit_parameter_default_single_stage(test_client):
 
     assert captured_sampling_params.width == 24
     assert captured_sampling_params.height == 16
+    assert (captured_sampling_params.height_not_provided, captured_sampling_params.width_not_provided) == (True, True)
     assert captured_sampling_params.num_outputs_per_prompt == 1
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
@@ -1911,6 +1912,19 @@ def test_image_edit_parameter_default_single_stage(test_client):
         },
     )
     assert response.status_code == 400
+
+
+def test_image_edit_explicit_size_marks_canvas_provided_single_stage(test_client):
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((24, 16)))],
+        data={"prompt": "hello world.", "size": "16x24"},
+    )
+
+    assert response.status_code == 200
+    sampling = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert (sampling.height, sampling.width) == (24, 16)
+    assert (sampling.height_not_provided, sampling.width_not_provided) == (False, False)
 
 
 def test_image_edit_compression_jpeg(test_client):

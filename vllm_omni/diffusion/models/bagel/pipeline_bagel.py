@@ -184,6 +184,12 @@ def _bagel_effective_image_size(
     return min(resized_height, max_image_size), min(resized_width, max_image_size)
 
 
+def _bagel_canvas_requested(sampling: OmniDiffusionSamplingParams) -> bool:
+    return (sampling.height is not None and not sampling.height_not_provided) or (
+        sampling.width is not None and not sampling.width_not_provided
+    )
+
+
 def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
     """Resolve BAGEL execution mode and step-batch compatibility."""
 
@@ -198,7 +204,9 @@ def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
         image_shape = kv_metadata.get("image_shape")
         if image_shape is not None:
             sampling.height, sampling.width = (int(value) for value in image_shape)
-        elif isinstance(request.prompt, dict):
+            sampling.height_not_provided = False
+            sampling.width_not_provided = False
+        elif isinstance(request.prompt, dict) and not _bagel_canvas_requested(sampling):
             modalities = request.prompt.get("modalities") or []
             multi_modal_data = request.prompt.get("multi_modal_data") or {}
             image_input = multi_modal_data.get("img2img")
@@ -220,6 +228,8 @@ def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
                     latent_downsample=latent_downsample,
                     max_latent_size=max_latent_size,
                 )
+                sampling.height_not_provided = True
+                sampling.width_not_provided = True
 
         extra_args = request.sampling_params.extra_args or {}
         cfg_interval = tuple(extra_args.get("cfg_interval", (0.4, 1.0)))
@@ -528,6 +538,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 f"latent_downsample={self.bagel.latent_downsample})."
             )
         image_shape = (height, width)
+        image_shape_requested = _bagel_canvas_requested(sampling)
 
         extra_args = getattr(sampling, "extra_args", {}) or {}
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
@@ -569,6 +580,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
             if sampling.kv_metadata and "image_shape" in sampling.kv_metadata:
                 image_shape = tuple(sampling.kv_metadata["image_shape"])
+                image_shape_requested = True
 
             branch_kvs = getattr(sampling, "cfg_branch_past_key_values", None) or {}
             branch_metadata = getattr(sampling, "cfg_branch_kv_metadata", None) or {}
@@ -673,8 +685,15 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     image_input = [_resize_to_stride(img) for img in image_input]
 
                     resized_w, resized_h = image_input[0].size
-                    image_shape = (resized_h, resized_w)
-                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
+                    if not image_shape_requested:
+                        image_shape = (resized_h, resized_w)
+                    logger.info(
+                        "img2img: resized source to %dx%d, generating at %dx%d",
+                        resized_w,
+                        resized_h,
+                        image_shape[1],
+                        image_shape[0],
+                    )
 
                     def vae_transforms(img):
                         if img.mode != "RGB":
