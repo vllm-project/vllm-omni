@@ -74,30 +74,54 @@ class _SegmentRhoTracker:
         if text_tokens > 0:
             stats["seg_text_tokens"] = max(stats["seg_text_tokens"], text_tokens)
 
-    def flush_empty_payload(self, runtime_infos: Any) -> None:
+    def flush_empty_payload(self, runtime_infos: Any, request_ids: Any = None) -> None:
         """Flush finish flags carried by payloads with no frames.
 
         The talker adapter ends a request with an empty-finished payload, so
         forward() returns before the boundary-cleanup loop; the flags must be
         honored here or the trailing segment is never logged.
+
+        ``request_ids`` are the canonical scheduler-side IDs that key
+        :meth:`observe_chunk` (``requires_request_ids``).  The payload meta
+        carries the *external* request ID, which may differ, so the payload ID
+        is only a fallback for direct/dummy calls without runner IDs; keying
+        this flush on it would leave the observed segment unflushed and merge
+        two segments into one ratio.
         """
         if not self.enabled:
             return
-        for info in runtime_infos or []:
+        for index, info in enumerate(runtime_infos or []):
             if not isinstance(info, dict):
                 continue
             meta = info.get("meta", {})
             if not isinstance(meta, dict):
                 continue
-            req_id = meta.get("request_id")
-            if isinstance(req_id, list):
-                req_id = req_id[0] if req_id else None
+            req_id = self._canonical_request_id(request_ids, index)
+            if req_id is None:
+                req_id = self._payload_request_id(meta)
             if req_id is None:
                 continue
             finished = bool(meta.get("finished", False))
             segment_finished = bool(meta.get("is_segment_finished", False))
             if finished or segment_finished:
-                self.on_boundary(str(req_id), finished=finished, segment_finished=segment_finished)
+                self.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
+
+    @staticmethod
+    def _canonical_request_id(request_ids: Any, index: int) -> str | None:
+        """Scheduler-side request ID for batch ``index``, when available."""
+        if request_ids is None or index >= len(request_ids):
+            return None
+        return str(request_ids[index])
+
+    @staticmethod
+    def _payload_request_id(meta: dict[str, Any]) -> str | None:
+        """Request ID carried by the payload meta (external ID; fallback only)."""
+        req_id = meta.get("request_id")
+        if isinstance(req_id, list):
+            req_id = req_id[0] if req_id else None
+        if req_id is None:
+            return None
+        return str(req_id)
 
     def on_boundary(self, req_id: str, *, finished: bool, segment_finished: bool) -> None:
         """Log and clear stats at a segment or request boundary.
@@ -374,7 +398,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
 
         if input_ids is None or input_ids.numel() == 0:
-            self._rho_stats.flush_empty_payload(runtime_additional_information)
+            self._rho_stats.flush_empty_payload(runtime_additional_information, kwargs.get("request_ids"))
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},

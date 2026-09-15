@@ -1,5 +1,6 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import math
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -36,29 +37,50 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 logger = init_logger(__name__)
 
 
-def _request_tts_text_tokens(request: Any) -> int | None:
-    """Return the request's normalized text token count (n_k), or None.
+def _precomputed_assistant_text_tokens(request: Any) -> int | None:
+    """Return the request's assistant text-token count (n_k), or ``None``.
 
-    Reads the precomputed text ids carried in ``additional_information``
-    (``PRECOMPUTED_TEXT_IDS_KEY``). Returns None when only the raw string is
-    available, in which case Code2Wav logs rho without n_k.
+    Scope: this instrumentation produces n_k only for requests that already
+    carry precomputed assistant text ids (``PRECOMPUTED_TEXT_IDS_KEY``) in
+    ``additional_information``.  A request carrying only the raw text string
+    returns ``None`` and Code2Wav then logs rho without n_k; deriving the count
+    from raw text needs the model tokenizer and is a follow-up.
+
+    Definition: the value is the number of assistant text ids for the request —
+    the tokenizer output of the assistant chat-template framing plus the text,
+    i.e. the same ids the prompt builder consumes — so template/control tokens
+    are included, not excluded.  It is request-scoped, which equals
+    segment-scoped on the whole-request async-chunk path where one segment
+    covers the whole utterance: exactly the n_k that ``rho = A_k / n_k`` needs.
     """
     additional_information = getattr(request, "additional_information", None)
-    if additional_information is None or not hasattr(additional_information, "entries"):
+    if additional_information is None:
         return None
-    entries = additional_information.entries
+    entries = getattr(additional_information, "entries", None)
     if not isinstance(entries, dict):
         return None
     entry = entries.get(PRECOMPUTED_TEXT_IDS_KEY)
     if entry is None:
         return None
-    ids = getattr(entry, "list_data", None)
-    if not isinstance(ids, (list, tuple)) or not ids:
-        return None
-    # ``list_data`` is ``[assistant_token_ids_for_len]`` (a single list of ids).
-    text_ids = ids[0] if len(ids) == 1 and isinstance(ids[0], (list, tuple)) else ids
-    count = len(text_ids) if isinstance(text_ids, (list, tuple)) else 0
-    return count or None
+    return _serialized_entry_token_count(entry)
+
+
+def _serialized_entry_token_count(entry: Any) -> int | None:
+    """Count the ids in a serialized ``AdditionalInformationEntry``.
+
+    ``additional_information`` crosses process boundaries, so the precomputed
+    ids arrive either as a nested list or as a tensor encoded as raw bytes plus
+    its shape.
+    """
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, (list, tuple)) and list_data:
+        # ``list_data`` is ``[assistant_token_ids_for_len]`` (one list of ids).
+        text_ids = list_data[0] if len(list_data) == 1 and isinstance(list_data[0], (list, tuple)) else list_data
+        return len(text_ids) or None
+    tensor_shape = getattr(entry, "tensor_shape", None)
+    if getattr(entry, "tensor_data", None) is not None and isinstance(tensor_shape, list) and tensor_shape:
+        return math.prod(tensor_shape) or None
+    return None
 
 
 def _qwen3_tts_degenerate_finished_payload():
@@ -386,7 +408,7 @@ def talker2code2wav_async_chunk(
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
-    segment_text_tokens = _request_tts_text_tokens(request)
+    segment_text_tokens = _precomputed_assistant_text_tokens(request)
     if segment_text_tokens is not None:
         meta.segment_text_tokens = segment_text_tokens
 
@@ -615,7 +637,7 @@ def talker2code2wav_full_payload(
     # async-chunk path, which already ships left_context_size in-band.
     if ref_code is not None and ref_frames > 0:
         meta["left_context_size"] = ref_frames
-    segment_text_tokens = _request_tts_text_tokens(request)
+    segment_text_tokens = _precomputed_assistant_text_tokens(request)
     if segment_text_tokens is not None:
         meta["segment_text_tokens"] = segment_text_tokens
     return {

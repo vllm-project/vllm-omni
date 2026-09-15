@@ -3,9 +3,13 @@
 """n_k producer contract for Qwen3-TTS rho instrumentation (#6496).
 
 Code2Wav computes rho = A_k / n_k from ``segment_text_tokens`` in the payload
-meta. These tests pin the producer side: the request's precomputed text ids
-(``PRECOMPUTED_TEXT_IDS_KEY``) yield the text-token count, and the count
-rides the payload meta.
+meta. These tests pin the producer side: the request's precomputed assistant
+text ids (``PRECOMPUTED_TEXT_IDS_KEY``) yield the text-token count, and the
+count rides the payload meta.
+
+Scope: the producer only reports n_k for requests that already carry precomputed
+ids; a request carrying only the raw text string reports None and rho is logged
+without n_k.
 """
 
 from collections import defaultdict
@@ -16,7 +20,7 @@ import torch
 
 from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
-    _request_tts_text_tokens,
+    _precomputed_assistant_text_tokens,
     talker2code2wav_async_chunk,
 )
 
@@ -33,13 +37,27 @@ def test_text_tokens_from_precomputed_ids():
     payload = AdditionalInformationPayload(
         entries={"_qwen3_tts_text_ids": AdditionalInformationEntry(list_data=[[1, 2, 3, 4, 5]])}
     )
-    assert _request_tts_text_tokens(_Req(payload)) == 5
+    assert _precomputed_assistant_text_tokens(_Req(payload)) == 5
 
 
 def test_text_tokens_none_when_only_raw_text():
     """Without precomputed ids (raw text string), the producer reports None."""
     payload = AdditionalInformationPayload(entries={"text": AdditionalInformationEntry(list_data=["hello world"])})
-    assert _request_tts_text_tokens(_Req(payload)) is None
+    assert _precomputed_assistant_text_tokens(_Req(payload)) is None
+
+
+def test_text_tokens_from_tensor_serialized_ids():
+    """The ids may cross the process boundary as raw tensor bytes plus shape."""
+    payload = AdditionalInformationPayload(
+        entries={
+            "_qwen3_tts_text_ids": AdditionalInformationEntry(
+                tensor_data=b"\x00" * 40,
+                tensor_shape=[5],
+                tensor_dtype="int64",
+            )
+        }
+    )
+    assert _precomputed_assistant_text_tokens(_Req(payload)) == 5
 
 
 def _tm_with_frames(rid, n_frames, max_num_seqs=8):

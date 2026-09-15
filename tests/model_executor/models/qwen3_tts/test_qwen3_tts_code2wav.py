@@ -829,6 +829,36 @@ def test_rho_stats_flush_on_empty_finished_input():
     assert any("segment rho" in text and "rho=0.500" in text for text in logged)
 
 
+def test_rho_stats_empty_payload_flush_uses_the_canonical_request_id():
+    """Frame observations key on the scheduler-side ID, not the external one.
+
+    The payload meta carries the external request ID, which may differ from the
+    scheduler-side ID that keys ``observe_chunk``.  Keying the empty-payload
+    flush on the payload ID would leave the observed segment unflushed and
+    merge two segments into one ratio.
+    """
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_id="external-rid", segment_text_tokens=8),
+        request_ids=["internal-rid"],
+    )
+    assert "internal-rid" in model._rho_stats._stats
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.tensor([], dtype=torch.long),  # empty-finished sentinel
+            runtime_additional_information=_rho_meta(
+                request_id="external-rid", finished=torch.tensor(True, dtype=torch.bool)
+            ),
+            request_ids=["internal-rid"],
+        )
+    assert "internal-rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.500" in text for text in logged)
+
+
 def test_rho_stats_flush_on_requests_finished():
     """The trailing segment is logged when the runner reports the request finished.
 
