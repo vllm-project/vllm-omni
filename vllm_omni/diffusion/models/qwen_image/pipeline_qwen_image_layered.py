@@ -6,7 +6,8 @@ import json
 import logging
 import math
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from typing import ClassVar, cast
 
 import numpy as np
@@ -36,6 +37,10 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.offloader.sequential_backend import (
+    SequentialOffloadHook,
+    sequential_offload_component,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -582,6 +587,24 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         return latents, image_latents
 
+    @contextmanager
+    def _text_encoder_on_compute_device(self) -> Iterator[None]:
+        """Keep the VL encoder on the compute device for ``generate()``.
+
+        Transformers 5.14+ ``prepare_inputs_for_generation`` moves every tensor
+        to ``model.device`` *before* ``forward``. Model-level CPU offload leaves
+        the encoder on CPU until the sequential hook's ``pre_forward``, so
+        ``generate()`` would copy ``input_ids`` onto CPU and then fail the
+        embedding lookup after the hook swaps weights back to GPU.
+        """
+        registry = getattr(self.text_encoder, "_hook_registry", None)
+        hook = None if registry is None else registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+        if isinstance(hook, SequentialOffloadHook):
+            with sequential_offload_component(self.text_encoder):
+                yield
+            return
+        yield
+
     def get_image_caption(self, prompt_image, use_en_prompt=True, device=None):
         if use_en_prompt:
             prompt = self.image_caption_prompt_en
@@ -593,7 +616,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             padding=True,
             return_tensors="pt",
         ).to(device)
-        generated_ids = self.text_encoder.generate(**model_inputs, max_new_tokens=512)
+        with self._text_encoder_on_compute_device():
+            generated_ids = self.text_encoder.generate(**model_inputs, max_new_tokens=512)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
         ]
