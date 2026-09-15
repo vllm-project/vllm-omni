@@ -1,0 +1,912 @@
+{
+  "id": "f039d2d4-c20e-4d5a-9501-ad895836ef04",
+  "revision": 0,
+  "last_node_id": 14,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -330
+      ],
+      "size": [
+        1300,
+        190
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "WF-04 DEVELOPMENT DRAFT — generation disabled",
+      "properties": {},
+      "widgets_values": [
+        "WF-04 is waiting for GUIDE-01, GUIDE-02 and NODE-02. The intended aspect ratio and audio output still require validation with the final guide implementation. Generate Video and Save Video remain muted: this graph has no timeline-guide path. The three guide notes are connection placeholders, not executable guide nodes. See ../minimax-h3-multiframe.md before integrating the remaining dependencies."
+      ],
+      "color": "#432",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        270,
+        314
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "h3_frame_ref_1.png",
+        "image"
+      ],
+      "title": "Anchor 1: identity reference"
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        390
+      ],
+      "size": [
+        270,
+        314
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "h3_frame_ref_2.png",
+        "image"
+      ],
+      "title": "Anchor 2: timeline frame 36"
+    },
+    {
+      "id": 4,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        780
+      ],
+      "size": [
+        270,
+        314
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "h3_frame_ref_3.png",
+        "image"
+      ],
+      "title": "Anchor 3: timeline frame 72"
+    },
+    {
+      "id": 5,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        1170
+      ],
+      "size": [
+        270,
+        314
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "h3_frame_ref_4.png",
+        "image"
+      ],
+      "title": "Anchor 4: timeline frame 120"
+    },
+    {
+      "id": 6,
+      "type": "VLLMOmniVideoReferences",
+      "pos": [
+        360,
+        0
+      ],
+      "size": [
+        156.9380859375,
+        126
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image_1",
+          "name": "image_1",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 1
+        },
+        {
+          "localized_name": "image_2",
+          "name": "image_2",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "audio_1",
+          "name": "audio_1",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "audio_2",
+          "name": "audio_2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "video_1",
+          "name": "video_1",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "localized_name": "video_2",
+          "name": "video_2",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "references",
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniVideoReferences"
+      },
+      "widgets_values": [],
+      "title": "Semantic references — Picture 1"
+    },
+    {
+      "id": 7,
+      "type": "MarkdownNote",
+      "pos": [
+        360,
+        390
+      ],
+      "size": [
+        330,
+        230
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "GUIDE-02 pending: anchor 2 at frame 36",
+      "properties": {},
+      "widgets_values": [
+        "Connect h3_frame_ref_2.png to the real GUIDE-02 image input at frame 36 (1.5s). Chain guide outputs in order, then connect the last guide to Generate Video. The node type and serialized API fields are unresolved; this note does not send any data. Do not replace a timeline guide with an ordinary semantic reference."
+      ],
+      "color": "#432",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 8,
+      "type": "MarkdownNote",
+      "pos": [
+        360,
+        780
+      ],
+      "size": [
+        330,
+        230
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "GUIDE-02 pending: anchor 3 at frame 72",
+      "properties": {},
+      "widgets_values": [
+        "Connect h3_frame_ref_3.png to the real GUIDE-02 image input at frame 72 (3s). Chain guide outputs in order, then connect the last guide to Generate Video. The node type and serialized API fields are unresolved; this note does not send any data. Do not replace a timeline guide with an ordinary semantic reference."
+      ],
+      "color": "#432",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 9,
+      "type": "MarkdownNote",
+      "pos": [
+        360,
+        1170
+      ],
+      "size": [
+        330,
+        230
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "GUIDE-02 pending: anchor 4 at frame 120",
+      "properties": {},
+      "widgets_values": [
+        "Connect h3_frame_ref_4.png to the real GUIDE-02 image input at frame 120 (5s). Chain guide outputs in order, then connect the last guide to Generate Video. The node type and serialized API fields are unresolved; this note does not send any data. Do not replace a timeline guide with an ordinary semantic reference."
+      ],
+      "color": "#432",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 10,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [
+        780,
+        620
+      ],
+      "size": [
+        284.205078125,
+        226
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "n",
+          "name": "n",
+          "type": "INT",
+          "widget": {
+            "name": "n"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "num_inference_steps",
+          "name": "num_inference_steps",
+          "type": "INT",
+          "widget": {
+            "name": "num_inference_steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "guidance_scale",
+          "name": "guidance_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "guidance_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "true_cfg_scale",
+          "name": "true_cfg_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "true_cfg_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_slicing",
+          "name": "vae_use_slicing",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_slicing"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_tiling",
+          "name": "vae_use_tiling",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_tiling"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "seed",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "diffusion sampling params",
+          "name": "diffusion sampling params",
+          "type": "SAMPLING_PARAMS",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniDiffusionSampling"
+      },
+      "widgets_values": [
+        1,
+        50,
+        1,
+        1,
+        false,
+        false,
+        738004,
+        "fixed"
+      ],
+      "title": "Base Ref2VA sampling"
+    },
+    {
+      "id": 11,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        1120,
+        620
+      ],
+      "size": [
+        276.56796875,
+        112
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio_flow_shift",
+          "name": "audio_flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_flow_shift"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "flow_shift",
+          "name": "flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "flow_shift"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MiniMax-H3 video params",
+          "name": "MiniMax-H3 video params",
+          "type": "VIDEO_PARAMS",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3,
+        12
+      ],
+      "title": "Base Ref2VA shifts"
+    },
+    {
+      "id": 12,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        780,
+        0
+      ],
+      "size": [
+        425.5948726785682,
+        551.767376721426
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 2,
+      "inputs": [
+        {
+          "localized_name": "frame",
+          "name": "frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "references",
+          "name": "references",
+          "shape": 7,
+          "type": "VIDEO_REFERENCES",
+          "link": 2
+        },
+        {
+          "localized_name": "sampling_params",
+          "name": "sampling_params",
+          "shape": 7,
+          "type": "SAMPLING_PARAMS",
+          "link": 3
+        },
+        {
+          "localized_name": "lora",
+          "name": "lora",
+          "shape": 7,
+          "type": "REMOTE_LORA",
+          "link": null
+        },
+        {
+          "localized_name": "model_params",
+          "name": "model_params",
+          "shape": 7,
+          "type": "VIDEO_PARAMS",
+          "link": 4
+        },
+        {
+          "name": "fast_h3",
+          "type": "FASTH3_DEPLOYMENT",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "localized_name": "url",
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "negative_prompt",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "INT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "Use <Picture 1> for the subject identity and the opening composition. Create a stylized fashion film. Cut to the second supplied timeline composition at 1.5 seconds, the third at 3 seconds, and the final composition at 5 seconds. Include a rhythmic electronic soundtrack and synchronized subtle scene sounds. Only <Picture 1> is a semantic reference in this default graph.",
+        "",
+        1344,
+        768,
+        24,
+        5.167
+      ],
+      "title": "DISABLED — waiting for timeline-guide API"
+    },
+    {
+      "id": 13,
+      "type": "SaveVideo",
+      "pos": [
+        1350,
+        0
+      ],
+      "size": [
+        374,
+        313.7692307692308
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 2,
+      "inputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 5
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "format",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "video/MiniMax_H3_Multiframe",
+        "mp4",
+        "auto"
+      ],
+      "title": "DISABLED — enable after guide integration"
+    },
+    {
+      "id": 14,
+      "type": "MarkdownNote",
+      "pos": [
+        780,
+        990
+      ],
+      "size": [
+        660,
+        210
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Optional Ref2VA Turbo — integrate after dependencies",
+      "properties": {},
+      "widgets_values": [
+        "Use server-format minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors, 5 sigma points (4 denoiser forwards), flow_shift=12, audio_flow_shift=3, scale=1. Connect a real Remote LoRA node using the server-local artifact path. The ComfyUI-repacked adapter and FastH3 are not interchangeable with this Ref2VA adapter. These are documented target settings, not a tested Turbo workflow."
+      ],
+      "color": "#432",
+      "bgcolor": "#000"
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      6,
+      0,
+      12,
+      1,
+      "VIDEO_REFERENCES"
+    ],
+    [
+      3,
+      10,
+      0,
+      12,
+      2,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      4,
+      11,
+      0,
+      12,
+      4,
+      "VIDEO_PARAMS"
+    ],
+    [
+      5,
+      12,
+      0,
+      13,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "wf04": {
+      "task": "WF-04",
+      "status": "BLOCKED_DEPENDENCIES",
+      "baseline_sha": "85da94339130337b49e610d08276aedcf84f6b96",
+      "source": {
+        "repository": "Comfy-Org/workflow_templates",
+        "revision": "aaac56dd5cc5497533d92cbe50edc35ea660e587",
+        "path": "templates/video_minimax_h3_multiframe_reference.json"
+      },
+      "output": {
+        "width": 1344,
+        "height": 768,
+        "aspect_ratio": "16:9",
+        "fps": 24,
+        "num_frames": 124,
+        "audio_required": true
+      },
+      "anchors": [
+        {
+          "image": "h3_frame_ref_1.png",
+          "role": "semantic_reference",
+          "reference_order": 1,
+          "frame_index": null
+        },
+        {
+          "image": "h3_frame_ref_2.png",
+          "role": "timeline_guide",
+          "frame_index": 36,
+          "guide_length": 1
+        },
+        {
+          "image": "h3_frame_ref_3.png",
+          "role": "timeline_guide",
+          "frame_index": 72,
+          "guide_length": 1
+        },
+        {
+          "image": "h3_frame_ref_4.png",
+          "role": "timeline_guide",
+          "frame_index": 120,
+          "guide_length": 1
+        }
+      ],
+      "dependencies": {
+        "GUIDE-01": null,
+        "GUIDE-02": null,
+        "NODE-02": null
+      },
+      "guide_node_type": null,
+      "guide_api_fields": null,
+      "validation": {
+        "real_comfyui_execution": "NOT_RUN",
+        "real_model": "NOT_RUN",
+        "saved_audio": "NOT_RUN"
+      }
+    }
+  },
+  "version": 0.4
+}
