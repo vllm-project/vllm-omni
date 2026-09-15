@@ -24,6 +24,15 @@ for ``level2_capacity_ratio`` and a weak pause for
 ``level3_capacity_ratio``.  Nothing cuts before its own level threshold.  The
 only other exits are ``force_split_at`` (the hard capacity ceiling) and the
 forced split performed by :meth:`CapacityAdaptiveSegmenter.finish`.
+
+Capacity is derived from a **monotonic** planning ratio, kept separate from the
+smoothed estimate: :attr:`~CapacityAdaptiveSegmenter.duration_ratio` is a
+two-sided EMA over accepted observations, while
+:attr:`~CapacityAdaptiveSegmenter.safety_ratio` only ever increases within a
+session and is what sizes segments.  A segment that happens to be fast
+therefore lowers the estimate without ever widening the hard budget, so an
+under-estimated ratio cannot plan a segment larger than the acoustic stage can
+finish.
 """
 
 from __future__ import annotations
@@ -53,8 +62,17 @@ DEFAULT_LEVEL3_CAPACITY_RATIO = 0.90
 # text-token capacity, so a segment never plans to consume the whole budget.
 DEFAULT_SAFETY_MARGIN = 8
 
-# EMA weight applied to a newly observed expansion ratio.
+# EMA weight applied to an accepted duration observation.
 DEFAULT_EMA_ALPHA = 0.3
+
+# A segment shorter than this is too noisy to estimate or plan from, so short
+# segments leave both ratios untouched (mirrors the CAPS reference).
+DEFAULT_MIN_DURATION_TOKENS = 8
+
+# Guard rail: a pathological observation (e.g. a hallucination loop) must not
+# tighten the monotonic planning ratio without bound, which would eventually
+# make every segment unplannable.
+DEFAULT_MAX_EXPANSION_RATIO = 64.0
 
 # Punctuation levels.  A segment may open at level 1, 2 or 3; 0 means "no
 # boundary punctuation", used for forced cuts and the final split.
@@ -255,6 +273,8 @@ class CapacityAdaptiveSegmenter:
         *,
         ema_alpha: float = DEFAULT_EMA_ALPHA,
         safety_margin: int = DEFAULT_SAFETY_MARGIN,
+        min_duration_tokens: int = DEFAULT_MIN_DURATION_TOKENS,
+        max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
         level1_capacity_ratio: float = DEFAULT_LEVEL1_CAPACITY_RATIO,
         level2_capacity_ratio: float = DEFAULT_LEVEL2_CAPACITY_RATIO,
         level3_capacity_ratio: float = DEFAULT_LEVEL3_CAPACITY_RATIO,
@@ -264,6 +284,10 @@ class CapacityAdaptiveSegmenter:
             raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
         if safety_margin < 0:
             raise ValueError(f"safety_margin must be nonnegative, got {safety_margin}")
+        if min_duration_tokens < 1:
+            raise ValueError(f"min_duration_tokens must be positive, got {min_duration_tokens}")
+        if not math.isfinite(max_expansion_ratio) or max_expansion_ratio < 1.0:
+            raise ValueError(f"max_expansion_ratio must be finite and >= 1.0, got {max_expansion_ratio}")
         if warmup_expansion_ratio is not None and (
             not math.isfinite(warmup_expansion_ratio) or warmup_expansion_ratio < 1.0
         ):
@@ -274,16 +298,36 @@ class CapacityAdaptiveSegmenter:
 
         self._ema_alpha = ema_alpha
         self._safety_margin = safety_margin
+        self._min_duration_tokens = min_duration_tokens
+        self._max_expansion_ratio = max_expansion_ratio
         self._capacity_ratios = ratios
-        self._expansion_ratio = warmup_expansion_ratio
-        self._has_observation = False
+        warmup = None if warmup_expansion_ratio is None else self._clamp_ratio(warmup_expansion_ratio)
+        self._duration_ratio = warmup
+        self._safety_ratio = warmup
         self._thresholds: SplitThresholds | None = None
         self._token_count = 0
 
+    def _clamp_ratio(self, ratio: float) -> float:
+        return min(max(ratio, 1.0), self._max_expansion_ratio)
+
     @property
-    def expansion_ratio(self) -> float | None:
-        """Estimated acoustic steps per text token, or None before warmup."""
-        return self._expansion_ratio
+    def duration_ratio(self) -> float | None:
+        """Smoothed acoustic steps per text token, or None before any estimate.
+
+        Diagnostics and duration estimates only: capacity is sized from
+        :attr:`safety_ratio`, never from this value.
+        """
+        return self._duration_ratio
+
+    @property
+    def safety_ratio(self) -> float | None:
+        """Planning ratio used to size segments, or None before any estimate.
+
+        Monotonically non-decreasing within a session, so a faster-than-planned
+        segment can lower :attr:`duration_ratio` without ever widening the hard
+        text budget.
+        """
+        return self._safety_ratio
 
     @property
     def thresholds(self) -> SplitThresholds | None:
@@ -296,39 +340,47 @@ class CapacityAdaptiveSegmenter:
         return self._token_count
 
     def observe_segment(self, *, acoustic_steps: int, text_tokens: int) -> None:
-        """Feed the realized ``rho`` of a finished segment into the estimate.
+        """Feed the realized ``rho`` of a finished segment into both ratios.
 
-        The estimate only affects segments opened afterwards; a frozen segment
-        keeps its thresholds.  Degenerate observations are ignored so a
-        truncated or empty segment cannot poison the estimate.
+        The smoothed :attr:`duration_ratio` moves towards ``rho``, while the
+        monotonic :attr:`safety_ratio` is only ever raised to it.  Neither
+        affects a segment already open; only segments opened afterwards.
+
+        Only degenerate and too-short segments are ignored, so a truncated or
+        noisy segment cannot distort the estimate that future budgets rest on.
         """
         if text_tokens <= 0 or acoustic_steps <= 0:
             return
-        observed_ratio = acoustic_steps / text_tokens
-        if not self._has_observation:
-            # The first real measurement seeds the estimate; a warmup value is
-            # only a pre-data fallback and is not blended into the EMA.
-            self._expansion_ratio = observed_ratio
-            self._has_observation = True
+        if text_tokens < self._min_duration_tokens:
             return
-        assert self._expansion_ratio is not None
-        self._expansion_ratio = self._ema_alpha * observed_ratio + (1.0 - self._ema_alpha) * self._expansion_ratio
+        observed_ratio = self._clamp_ratio(acoustic_steps / text_tokens)
+        if self._duration_ratio is None:
+            self._duration_ratio = observed_ratio
+        else:
+            self._duration_ratio = self._clamp_ratio(
+                (1.0 - self._ema_alpha) * self._duration_ratio + self._ema_alpha * observed_ratio
+            )
+        if self._safety_ratio is None:
+            self._safety_ratio = observed_ratio
+        else:
+            self._safety_ratio = max(self._safety_ratio, observed_ratio)
 
     def start_segment(self, *, remaining_capacity: int, max_text_tokens: int | None = None) -> SplitThresholds:
         """Open a segment and freeze its thresholds.
 
-        Needs an expansion-ratio estimate: either the constructor's warmup value
-        or at least one :meth:`observe_segment` call.  Raises ``ValueError`` when
-        the remaining capacity cannot fit a single predicted text token.
+        Capacity comes from the monotonic :attr:`safety_ratio`, so it needs a
+        warmup value or at least one :meth:`observe_segment` call.  Raises
+        ``ValueError`` when the remaining capacity cannot fit a single predicted
+        text token.
         """
-        if self._expansion_ratio is None:
+        if self._safety_ratio is None:
             raise RuntimeError(
                 "no expansion-ratio estimate available; pass warmup_expansion_ratio "
                 "or call observe_segment() before start_segment()"
             )
         capacity = derive_text_token_capacity(
             remaining_capacity=remaining_capacity,
-            expansion_ratio=self._expansion_ratio,
+            expansion_ratio=self._safety_ratio,
             safety_margin=self._safety_margin,
             max_text_tokens=max_text_tokens,
         )

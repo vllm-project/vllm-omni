@@ -244,24 +244,61 @@ def test_non_monotonic_capacity_ratios_are_rejected():
         compute_thresholds(text_token_capacity=10, level1_capacity_ratio=0.9, level2_capacity_ratio=0.8)
 
 
-def test_first_observation_seeds_the_expansion_ratio():
+def test_an_observation_moves_the_duration_estimate_and_raises_safety():
+    """Warmup 7.0 then rho 2.0: the EMA moves, safety keeps the higher value."""
     segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=7.0)
-    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)
-    assert segmenter.expansion_ratio == pytest.approx(2.0)
+    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)  # rho = 2.0
+    assert segmenter.duration_ratio == pytest.approx(0.7 * 7.0 + 0.3 * 2.0)
+    assert segmenter.safety_ratio == pytest.approx(7.0)
 
 
-def test_ema_smooths_subsequent_expansion_ratios():
+def test_ema_smooths_subsequent_duration_observations():
     segmenter = CapacityAdaptiveSegmenter(ema_alpha=0.5, warmup_expansion_ratio=2.0)
-    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)  # seeds 2.0
+    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)  # 2.0 -> EMA stays 2.0
     segmenter.observe_segment(acoustic_steps=200, text_tokens=50)  # 4.0 -> 0.5*4 + 0.5*2
-    assert segmenter.expansion_ratio == pytest.approx(3.0)
+    assert segmenter.duration_ratio == pytest.approx(3.0)
+
+
+def test_safety_ratio_never_decreases():
+    segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
+    segmenter.observe_segment(acoustic_steps=200, text_tokens=20)  # rho = 10.0
+    segmenter.observe_segment(acoustic_steps=20, text_tokens=20)  # rho = 1.0
+    assert segmenter.safety_ratio == pytest.approx(10.0)
+
+
+def test_capacity_uses_the_monotonic_safety_ratio_not_the_duration_ema():
+    """A later fast segment must not widen the hard budget.
+
+    The duration EMA falls towards the fast observation, but capacity keeps
+    being sized from the monotonic safety ratio, so the planned segment cannot
+    exceed what the acoustic stage was already shown to need.
+    """
+    segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
+    segmenter.observe_segment(acoustic_steps=200, text_tokens=20)  # rho = 10.0
+    segmenter.observe_segment(acoustic_steps=20, text_tokens=20)  # rho = 1.0
+    assert segmenter.duration_ratio < segmenter.safety_ratio
+    assert segmenter.start_segment(remaining_capacity=100).force_split_at == 10
+
+
+def test_short_segment_observations_are_ignored():
+    """A too-short segment is too noisy to estimate or plan from."""
+    segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=2.0, min_duration_tokens=8)
+    segmenter.observe_segment(acoustic_steps=100, text_tokens=4)
+    assert segmenter.safety_ratio == pytest.approx(2.0)
+
+
+def test_observed_ratio_is_bounded_by_the_guard_rail():
+    """A pathological observation cannot tighten the budget without bound."""
+    segmenter = CapacityAdaptiveSegmenter(max_expansion_ratio=16.0)
+    segmenter.observe_segment(acoustic_steps=100_000, text_tokens=10)
+    assert segmenter.safety_ratio == pytest.approx(16.0)
 
 
 def test_degenerate_observations_are_ignored():
     segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=2.0)
     segmenter.observe_segment(acoustic_steps=0, text_tokens=10)
     segmenter.observe_segment(acoustic_steps=10, text_tokens=0)
-    assert segmenter.expansion_ratio == pytest.approx(2.0)
+    assert segmenter.safety_ratio == pytest.approx(2.0)
 
 
 def test_frozen_thresholds_ignore_a_mid_segment_observation():
@@ -292,12 +329,12 @@ def test_seam_contract_from_code2wav_measurement_to_next_budget():
 
 
 def test_segment_never_plans_more_acoustic_steps_than_remaining():
-    """#5889 capacity property: capacity * expansion_ratio <= remaining budget."""
+    """#5889 capacity property: capacity * safety_ratio <= remaining budget."""
     segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
     segmenter.observe_segment(acoustic_steps=300, text_tokens=150)  # rho = 2.0
     for remaining in (30, 61, 149, 150, 1000):
         capacity = segmenter.start_segment(remaining_capacity=remaining).force_split_at
-        assert capacity * segmenter.expansion_ratio <= remaining
+        assert capacity * segmenter.safety_ratio <= remaining
 
 
 def test_a_committed_cut_reopens_the_next_segment_with_the_same_thresholds():
