@@ -19,4 +19,9 @@ RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'imp
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
+# Use writable runtime locations for arbitrary non-root UIDs.
+ENV HOME=/tmp \
+    VLLM_CACHE_ROOT=/tmp/vllm \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
+
 ENTRYPOINT []
