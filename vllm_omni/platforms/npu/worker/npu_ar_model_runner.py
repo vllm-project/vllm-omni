@@ -334,6 +334,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not isinstance(info, dict):
             return None
         val = info.get("omni_final_stage_id")
+        if val is None:
+            return None
         try:
             return int(val)
         except (TypeError, ValueError):
@@ -512,7 +514,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        self._dummy_run(1, skip_gdn_state_update=True)
 
                     kv_ids = self.kv_extracted_req_ids
                     self.kv_extracted_req_ids = None
@@ -1035,6 +1037,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
         (
+            num_nans_in_logits,
+            num_nans_device,
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
@@ -1278,6 +1282,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            num_nans_in_logits=num_nans_in_logits,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         model_runner_output.routed_experts = routed_experts_lists
@@ -1318,6 +1323,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
+            num_nans=num_nans_device,
         )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,

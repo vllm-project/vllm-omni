@@ -278,9 +278,9 @@ def maybe_coerce_to_message_type(params: SamplingParams, is_streaming: bool):
     if params.output_kind == target_type:
         return params
     elif is_streaming and params.output_kind == RequestOutputKind.FINAL_ONLY:
-        logger.warning("Request appears to be streaming, but got request type final only!")
+        logger.debug("Coercing FINAL_ONLY output to DELTA for streaming")
     elif not is_streaming and params.output_kind == RequestOutputKind.DELTA:
-        logger.warning("Request appears to not be streaming, but got request type delta!")
+        logger.debug("Coercing DELTA output to FINAL_ONLY for non-streaming")
 
     if not params.skip_clone:
         params = params.clone()

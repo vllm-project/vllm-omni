@@ -44,6 +44,80 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert not explicit["async_chunk"]
 
 
+def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
+    """Parse a ``serve`` argv through the real Omni parser, returning the
+    TrackingNamespace (with ``explicit_keys``) that ``validate`` receives."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    return parser.parse_args(argv)
+
+
+def test_omni_serve_requires_model_when_none_provided() -> None:
+    """Regression for https://github.com/vllm-project/vllm-omni/issues/4158:
+    ``vllm serve --omni`` with no model must fail fast instead of silently
+    falling back to vLLM's default model and crashing in the diffusion worker.
+    """
+    args = _parse_serve_args(["serve", "--omni"])
+    cmd = OmniServeCommand()
+    with pytest.raises(ValueError, match="requires an explicit model"):
+        cmd.validate(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # A deploy YAML supplied *without* an explicit model must still trip
+        # the guard. It carries per-stage engine args only -- the
+        # checkpoint is always threaded in from ``args.model`` -- so its mere
+        # presence does not establish that a model was provided. Without an
+        # explicit model ``args.model`` stays at vLLM's default and the launch
+        # reproduces the issue-4158 diffusion-registry crash.
+        ["serve", "--omni", "--deploy-config", "deploy.yaml"],
+        # An empty/whitespace model must not satisfy the guard either -- this is
+        # the ``--model "$MODEL"``-with-unset-var footgun. Otherwise the empty
+        # value flows downstream and crashes with the same confusing error.
+        ["serve", "", "--omni"],  # empty positional
+        ["serve", "--omni", "--model", ""],  # empty --model
+        ["serve", "--omni", "--model", "   "],  # whitespace-only --model
+    ],
+)
+def test_omni_serve_rejects_missing_or_empty_model(argv: list[str]) -> None:
+    """Regression for review feedback on PR #4167: a deploy YAML is not a
+    model source, so ``--deploy-config`` alone must not bypass the
+    require-a-model guard; neither may an empty/whitespace model value."""
+    args = _parse_serve_args(argv)
+    cmd = OmniServeCommand()
+    with pytest.raises(ValueError, match="requires an explicit model"):
+        cmd.validate(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["serve", "fake-model", "--omni"],  # positional model
+        ["serve", "--omni", "--model", "fake-model"],  # --model flag
+        # An explicit model with a deploy YAML is the legitimate multi-stage
+        # path and must pass the guard.
+        ["serve", "fake-model", "--omni", "--deploy-config", "deploy.yaml"],
+    ],
+)
+def test_omni_serve_accepts_explicit_model(argv: list[str], mocker: MockerFixture) -> None:
+    """A model supplied positionally or via ``--model`` -- with or without a
+    deploy YAML -- must NOT trip the require-a-model guard. Downstream
+    validation is mocked so only the new guard is exercised."""
+    mocker.patch(
+        "vllm_omni.diffusion.utils.hf_utils.is_diffusion_model",
+        return_value=False,
+    )
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    args = _parse_serve_args(argv)
+    cmd = OmniServeCommand()
+    # Must not raise the "requires a model" error for any of these.
+    cmd.validate(args)
+
+
 def test_serve_parser_accepts_strategy_config() -> None:
     """``--strategy-config`` must parse onto the ``strategy_config`` dest and be
     forwarded as an explicit kwarg so the engine can overlay the strategy."""
@@ -69,6 +143,30 @@ def test_serve_parser_accepts_deploy_config() -> None:
     assert args.get_explicit_kwargs_dict()["deploy_config"] == "/tmp/deploy.yaml"
 
 
+def test_serve_parser_accepts_video_output_transport() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--video-output-transport", '{"enable_device_postprocess": true}']
+    )
+
+    expected = {"enable_device_postprocess": True}
+    assert args.video_output_transport == expected
+    assert args.get_explicit_kwargs_dict()["video_output_transport"] == expected
+
+
+@pytest.mark.parametrize("value", ["{not json", "[]"])
+def test_serve_parser_rejects_invalid_video_output_transport(value: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--video-output-transport", value])
+
+
 def test_serve_parser_rejects_stage_configs_path() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
@@ -86,6 +184,26 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
 
     assert args.cfg_parallel_size == 4
+
+
+def test_serve_parser_accepts_robot_openpi_idle_timeout() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "0"])
+
+    assert args.robot_openpi_idle_timeout == 0
+    assert args.get_explicit_kwargs_dict()["robot_openpi_idle_timeout"] == 0
+
+
+def test_serve_parser_rejects_negative_robot_openpi_idle_timeout() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "-1"])
 
 
 def test_serve_parser_accepts_ulysses_a2a_permute() -> None:

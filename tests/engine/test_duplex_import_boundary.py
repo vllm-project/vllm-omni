@@ -122,8 +122,8 @@ from vllm_omni.clients.duplex import EventCollector
 collector = EventCollector()
 chunk = base64.b64encode(b"\\x00\\x00" * 2400).decode("ascii")
 collector.add({"type": "response.created", "response_id": "r1"}, received_at_s=1.0)
-collector.add({"type": "response.audio.delta", "response_id": "r1", "delta": chunk}, received_at_s=1.1)
-collector.add({"type": "response.audio.delta", "response_id": "r1", "delta": chunk}, received_at_s=1.2)
+collector.add({"type": "response.output_audio.delta", "response_id": "r1", "delta": chunk}, received_at_s=1.1)
+collector.add({"type": "response.output_audio.delta", "response_id": "r1", "delta": chunk}, received_at_s=1.2)
 summary = collector.timing_summary(after_s=0.0, response_id="r1")
 if "audio_output" not in summary or "request_metrics" not in summary:
     raise SystemExit("timing_summary produced no audio_output/request_metrics sections")

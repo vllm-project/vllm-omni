@@ -54,6 +54,9 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2 import (
+            BreezeTTS2Config,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -105,6 +108,7 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("breeze", BreezeTTS2Config),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -443,8 +447,8 @@ class OmniEngineArgs(EngineArgs):
 @dataclass
 class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
     @classmethod
-    def add_cli_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        parser = AsyncEngineArgs.add_cli_args(parser)
+    def add_cli_args(cls, parser: argparse.ArgumentParser, async_args_only: bool = False) -> argparse.ArgumentParser:
+        parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=async_args_only)
         parser = OmniEngineArgs._add_omni_specific_args(parser)
         return parser
 
@@ -566,11 +570,13 @@ class OrchestratorArgs:
     diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
+    video_output_transport: dict[str, object] | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
     diffusion_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage

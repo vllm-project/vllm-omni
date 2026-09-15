@@ -279,7 +279,7 @@ async def test_response_handle_flow():
         sock.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
         sock.feed(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": "resp-1",
                 "delta": _b64(chunk),
                 "sample_rate_hz": 24_000,
@@ -288,7 +288,7 @@ async def test_response_handle_flow():
         )
         sock.feed(
             {
-                "type": "response.audio_transcript.delta",
+                "type": "response.output_audio_transcript.delta",
                 "response_id": "resp-1",
                 "delta": "hi there",
                 "server_event_seq": 5,
@@ -370,7 +370,7 @@ async def test_terminal_listen_keeps_spoken_decision():
         sock.feed({"type": "response.speak", "response_id": "resp-1", "server_event_seq": 3})
         sock.feed(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": "resp-1",
                 "delta": _b64(chunk),
                 "sample_rate_hz": 24_000,
@@ -418,7 +418,7 @@ async def test_slow_audio_consumer_drops_oldest_instead_of_stalling():
     )
     for payload in (b"c1", b"c2", b"c3"):
         # _feed must never block the reader, even against a full queue.
-        handle._feed(AudioDelta({"type": "response.audio.delta", "delta": _b64(payload)}))
+        handle._feed(AudioDelta({"type": "response.output_audio.delta", "delta": _b64(payload)}))
     handle._finish(None)
     chunks = [chunk async for chunk in handle.audio()]
     assert chunks == [b"c3"]  # oldest chunks were dropped, the sentinel landed
@@ -561,7 +561,7 @@ def test_event_collector_accumulates_audio():
     collector = EventCollector()
     collector.add({"type": "response.created", "response": {"id": "r1"}}, received_at_s=1.0)
     collector.add(
-        {"type": "response.audio.delta", "response_id": "r1", "delta": _b64(b"ab"), "sample_rate_hz": 16_000},
+        {"type": "response.output_audio.delta", "response_id": "r1", "delta": _b64(b"ab"), "sample_rate_hz": 16_000},
         received_at_s=1.1,
     )
     collector.add(
@@ -632,7 +632,7 @@ def test_event_collector_partitions_audio_by_response():
     collector.add({"type": "response.created", "response": {"id": "resp-a"}})
     collector.add(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(b"audio-a").decode("ascii"),
             "sample_rate_hz": 16_000,
@@ -643,7 +643,7 @@ def test_event_collector_partitions_audio_by_response():
     assert collector.audio_bytes("resp-a") == b"audio-a"
     assert collector.output_sample_rate_hz == 16_000
     assert collector.first_received_at("response.created") is not None
-    assert collector.last_received_at("response.audio.delta") is not None
+    assert collector.last_received_at("response.output_audio.delta") is not None
 
 
 def test_event_collector_reports_engine_token_and_audio_intervals():
@@ -664,7 +664,7 @@ def test_event_collector_reports_engine_token_and_audio_intervals():
     for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
         collector.add(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": "resp-a",
                 "delta": base64.b64encode(b"audio").decode("ascii"),
                 "sample_rate_hz": 16_000,
@@ -676,11 +676,11 @@ def test_event_collector_reports_engine_token_and_audio_intervals():
             received_at_s=received_at_s,
         )
     collector.add(
-        {"type": "response.audio_transcript.delta", "response_id": "resp-a", "delta": ""},
+        {"type": "response.output_audio_transcript.delta", "response_id": "resp-a", "delta": ""},
         received_at_s=10.1,
     )
     collector.add(
-        {"type": "response.audio_transcript.delta", "response_id": "resp-a", "delta": "hello"},
+        {"type": "response.output_audio_transcript.delta", "response_id": "resp-a", "delta": "hello"},
         received_at_s=10.15,
     )
     collector.add(
@@ -736,11 +736,162 @@ def test_event_collector_reports_engine_token_and_audio_intervals():
         "measurement_origin": {
             "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
             "ttfp": "input_audio_buffer.commit client send to first audio packet",
+            "tpot": "Stage-0 engine mean time per output token",
         },
         "ttft_ms": 250.0,
         "ttfp_ms": 300.0,
         "audio_generation_ms": 460.0,
         "audio_duration_ms": 240.0,
+        "tpot_ms": 15.0,
+    }
+
+
+def test_session_summary_omits_unmeasured_zero_tpot():
+    summary = summarize_session_request_metrics(
+        [
+            {"ttft_ms": 100.0, "tpot_ms": 0.0},
+            {"ttft_ms": 200.0, "tpot_ms": None},
+        ],
+        session_id="session",
+    )
+
+    assert summary["ttft_ms"] == {
+        "count": 2,
+        "mean": 150.0,
+        "p50": 100.0,
+        "p99": 200.0,
+    }
+    assert "tpot_ms" not in summary
+
+
+def test_event_collector_reports_global_metrics_across_responses():
+    collector = EventCollector()
+    for response_id, created_at_s, text_at_s, audio_times, durations in (
+        ("resp-a", 10.1, 10.2, (10.3, 10.4), (100, 200)),
+        ("resp-b", 12.1, 12.2, (12.3, 12.5), (150, 300)),
+    ):
+        collector.add(
+            {"type": "response.created", "response": {"id": response_id}},
+            received_at_s=created_at_s,
+        )
+        collector.add(
+            {
+                "type": "response.output_audio_transcript.delta",
+                "response_id": response_id,
+                "delta": response_id,
+            },
+            received_at_s=text_at_s,
+        )
+        for received_at_s, duration_ms in zip(audio_times, durations, strict=True):
+            collector.add(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": response_id,
+                    "delta": base64.b64encode(b"audio").decode("ascii"),
+                    "sample_rate_hz": 16_000,
+                    "metadata": {"audio_duration_ms": duration_ms},
+                },
+                received_at_s=received_at_s,
+            )
+
+    metrics = collector.global_timing_summary(
+        after_s=10.0,
+        window_started_at_s=10.0,
+        response_ids=["resp-a", "resp-b"],
+        measurement_origin={
+            "ttft": "input stream start to first non-empty text delta",
+            "ttfp": "input stream start to first audio packet",
+            "rtf": "input stream start-to-last-audio receive time divided by total emitted audio duration",
+        },
+    )
+
+    assert metrics == {
+        "source": "client_monotonic_receive",
+        "response_ids": ["resp-a", "resp-b"],
+        "measurement_origin": {
+            "ttft": "input stream start to first non-empty text delta",
+            "ttfp": "input stream start to first audio packet",
+            "rtf": "input stream start-to-last-audio receive time divided by total emitted audio duration",
+        },
+        "ttft_ms": 200.0,
+        "ttfp_ms": 300.0,
+        "audio_generation_ms": 2500.0,
+        "audio_duration_ms": 500.0,
+    }
+
+
+def test_event_collector_prefers_server_request_start_for_ttf():
+    collector = EventCollector()
+    collector.add(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp-a",
+                "metadata": {
+                    "duplex_event": {
+                        "response_request_metrics": {
+                            "source": "server_monotonic_request_start",
+                            "measurement_origin": {
+                                "ttft": "native request start to first text output",
+                                "ttfp": "native request start to first audio output",
+                            },
+                            "ttft_ms": 125.0,
+                            "ttfp_ms": 175.0,
+                        }
+                    }
+                },
+            },
+        },
+        received_at_s=10.0,
+    )
+    stage_metrics = {
+        "0": {
+            "num_tokens_out": 4,
+            "vllm_ttft_ms": 120.0,
+            "vllm_tpot_ms": 15.0,
+            "vllm_itl_ms": 14.0,
+            "vllm_itls_ms": [10.0, 14.0, 18.0],
+        }
+    }
+    for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
+        collector.add(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-a",
+                "delta": base64.b64encode(b"audio").decode("ascii"),
+                "sample_rate_hz": 16_000,
+                "metadata": {
+                    "audio_duration_ms": cumulative_audio_ms,
+                    "vllm_omni": {"stage_metrics": stage_metrics},
+                },
+            },
+            received_at_s=received_at_s,
+        )
+    collector.add(
+        {"type": "response.output_audio_transcript.delta", "response_id": "resp-a", "delta": "hello"},
+        received_at_s=10.15,
+    )
+
+    timing = collector.timing_summary(
+        after_s=10.0,
+        input_committed_at_s=9.9,
+        response_id="resp-a",
+    )
+
+    assert timing["request_metrics"] == {
+        "source": "server_request_start_and_client_receive",
+        "measurement_origin": {
+            "ttft": "native request start to first text output",
+            "ttfp": "native request start to first audio output",
+            "tpot": "Stage-0 engine mean time per output token",
+        },
+        "ttft_ms": 125.0,
+        "ttfp_ms": 175.0,
+        "audio_generation_ms": 460.0,
+        "audio_duration_ms": 240.0,
+        "response_created_to_first_text_ms": 150.0,
+        "response_created_to_first_audio_ms": 200.0,
+        "tpot_ms": 15.0,
     }
 
 
@@ -752,7 +903,7 @@ def test_response_timing_ignores_unowned_session_level_metrics():
     )
     collector.add(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(b"audio").decode("ascii"),
             "metadata": {
@@ -806,9 +957,9 @@ def test_summarize_session_request_metrics_averages_audio_turns():
     assert summary == {
         "session_id": "sess-1",
         "audio_turn_count": 2,
-        "mean_ttft_ms": 200.0,
-        "mean_ttfp_ms": 300.0,
-        "mean_rtf": 0.6,
+        "ttft_ms": {"count": 2, "mean": 200.0, "p50": 100.0, "p99": 300.0},
+        "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
+        "rtf": {"count": 2, "mean": 0.6, "p50": 0.5, "p99": 0.7},
     }
 
 
@@ -887,7 +1038,7 @@ def test_reference_audio_data_url(tmp_path):
 def test_event_collector_response_text_joins_deltas_per_response():
     collector = EventCollector()
     collector.add({"type": "response.created", "response_id": "r1"})
-    collector.add({"type": "response.audio_transcript.delta", "response_id": "r1", "delta": "he"})
+    collector.add({"type": "response.output_audio_transcript.delta", "response_id": "r1", "delta": "he"})
     collector.add({"type": "response.output_text.delta", "response_id": "r2", "delta": "other"})
     collector.add({"type": "response.text.delta", "response_id": "r1", "delta": "llo"})
     assert collector.response_text("r1") == "hello"

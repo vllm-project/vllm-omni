@@ -18,6 +18,7 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -231,7 +232,6 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
-        self._consumed_metric_messages: dict[str, set[int]] = {}
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
@@ -298,13 +298,6 @@ class OmniBase(PDDisaggregationMixin):
         """True when a non-empty stage pool has lost all of its replicas."""
         return len(pool.clients) > 0 and self._live_replica_count(pool) == 0
 
-    def _consumed_metric_message_ids(self, request_id: str) -> set[int]:
-        consumed_by_request = getattr(self, "_consumed_metric_messages", None)
-        if consumed_by_request is None:
-            consumed_by_request = {}
-            self._consumed_metric_messages = consumed_by_request
-        return consumed_by_request.setdefault(request_id, set())
-
     @property
     def is_running(self) -> bool:
         return self.engine.is_alive()
@@ -339,6 +332,7 @@ class OmniBase(PDDisaggregationMixin):
         allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
         """Resolve request parameters; pipeline sampling constraints override caller values."""
+        normalized: Sequence[Any]
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
             # Set the output kind to delta since no params were specified
@@ -354,7 +348,9 @@ class OmniBase(PDDisaggregationMixin):
         if len(normalized) != self.num_stages:
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
 
-        if sampling_params_list is not None:
+        # Streaming coercion may also change a constrained output kind in
+        # the defaults (for example, an internal TTS stage's FINAL_ONLY).
+        if sampling_params_list is not None or allow_delta_coercion:
             normalized = [
                 self._apply_sampling_constraints(params, constraints)
                 for params, constraints in zip(normalized, self.sampling_constraints_list, strict=True)
@@ -364,7 +360,7 @@ class OmniBase(PDDisaggregationMixin):
     @staticmethod
     def _get_sampling_constraints_list(stage_configs: Sequence[Any]) -> list[dict[str, Any]]:
         """Extract each stage's required sampling settings from runtime configs."""
-        constraints_list = []
+        constraints_list: list[dict[str, Any]] = []
         for stage_config in stage_configs:
             constraints = getattr(stage_config, "sampling_constraints", {})
             if not isinstance(constraints, Mapping):
@@ -377,12 +373,12 @@ class OmniBase(PDDisaggregationMixin):
 
     @staticmethod
     def _apply_sampling_constraints(params: Any, constraints: Mapping[str, Any]) -> Any:
-        """Rebuild params with pipeline-required settings without mutating caller input."""
+        """Apply pipeline requirements, merging required stops with caller stops."""
         if not constraints:
             return params
         if isinstance(params, Mapping):
-            return {**params, **constraints}
-        if is_dataclass(params):
+            values = dict(params)
+        elif is_dataclass(params):
             values = {field.name: getattr(params, field.name) for field in fields(params) if field.init}
         elif struct_fields := getattr(params, "__struct_fields__", None):
             values = {
@@ -392,13 +388,17 @@ class OmniBase(PDDisaggregationMixin):
             }
         else:
             raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
-        return type(params)(**{**values, **constraints})
+
+        resolved = merge_sampling_constraints(values, constraints)
+        if isinstance(params, Mapping):
+            return resolved
+        return type(params)(**resolved)
 
     def _record_request_failure_once(self, request_id: str, reason: str) -> None:
         req_state = self.request_states.get(request_id)
         prom = getattr(self, "prom_metrics", None)
         metrics = getattr(req_state, "metrics", None)
-        if metrics is None or prom is None:
+        if req_state is None or metrics is None or prom is None:
             return
         if str(request_id) in metrics.e2e_done or getattr(req_state, "failure_recorded", False):
             return
@@ -446,9 +446,6 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
-            consumed_by_request = getattr(self, "_consumed_metric_messages", None)
-            if consumed_by_request is not None:
-                consumed_by_request.pop(request_id, None)
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.
@@ -529,7 +526,7 @@ class OmniBase(PDDisaggregationMixin):
             stage_meta = self.engine.get_stage_metadata(stage_id)
             output_type = getattr(msg.engine_outputs, "final_output_type", stage_meta.final_output_type)
             msg_id = id(msg)
-            consumed = self._consumed_metric_message_ids(req_id)
+            consumed = req_state.consumed_metric_message_ids
             if msg_id not in consumed:
                 req_state.metrics.on_stage_metrics(stage_id, req_id, msg.metrics, output_type)
                 submit_ts = msg.stage_submit_ts
@@ -639,8 +636,9 @@ class OmniBase(PDDisaggregationMixin):
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
             msg_id = id(result)
-            consumed = self._consumed_metric_message_ids(req_id)
-            if msg_id not in consumed:
+            req_state = self.request_states.get(req_id)
+            consumed = req_state.consumed_metric_message_ids if req_state is not None else None
+            if consumed is not None and msg_id not in consumed:
                 metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)

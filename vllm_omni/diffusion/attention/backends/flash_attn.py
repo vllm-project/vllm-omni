@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
-from functools import partial
+from functools import cache, partial
 
 import torch
 from vllm.logger import init_logger
@@ -17,6 +17,15 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+@cache
+def _get_npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
+    """Return the shared block mask used by NPU right-down causal attention."""
+    return torch.triu(
+        torch.ones((2048, 2048), dtype=torch.bool, device=device),
+        diagonal=1,
+    ).contiguous()
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -549,6 +558,53 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        if self.causal:
+            import torch_npu
+
+            if attention_mask is None:
+                # The compressed upper-triangular mask with sparse_mode=3
+                # applies FlashAttention's bottom-right causal alignment when
+                # Sq != Skv without materializing the full attention matrix.
+                npu_attention_mask = _get_npu_compressed_causal_mask(query.device)
+                sparse_mode = 3
+                # Explicitly enable invalid-row handling for Sq > Skv. Equal
+                # and shorter query sequences have no fully causal-masked rows.
+                inner_precise = 2 if query.shape[1] > key.shape[1] else 0
+            else:
+                # A custom keep-mask cannot be combined with the compressed
+                # sparse_mode=3 mask. Materialize the composed block-mask and
+                # use allMask mode instead. The explicit mask follows the
+                # framework convention (True=keep), while npu_fusion_attention
+                # uses True=block.
+                explicit_keep_mask = _maybe_reshape_attn_mask(
+                    query,
+                    key,
+                    attention_mask,
+                    mask_mode="full_qk",
+                ).to(device=query.device, dtype=torch.bool)
+                query_positions = torch.arange(query.shape[1], device=query.device).unsqueeze(1)
+                key_positions = torch.arange(key.shape[1], device=query.device).unsqueeze(0)
+                causal_block_mask = key_positions > query_positions + (key.shape[1] - query.shape[1])
+                npu_attention_mask = (causal_block_mask | ~explicit_keep_mask).contiguous()
+                sparse_mode = 1
+                # An explicit mask can create fully masked rows regardless of
+                # the Sq/Skv relationship.
+                inner_precise = 2
+
+            return torch_npu.npu_fusion_attention(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                head_num=query.shape[2],
+                input_layout="BSND",
+                atten_mask=npu_attention_mask,
+                scale=float(self.softmax_scale),
+                keep_prob=1.0,
+                inner_precise=inner_precise,
+                sparse_mode=sparse_mode,
+            )[0]
+
         from mindiesd import attention_forward
 
         # Opt-in mask-free paths (mirror the CUDA cu_seqlens behavior): the
@@ -567,7 +623,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 out = self._forward_varlen_packed_npu(query, key, value, extra)
             if out is not None:
                 return out
-        attention_mask = attn_metadata.attn_mask if attn_metadata else None
         if attention_mask is None and extra.get("npu_attn_varlen", False):
             # Models skip mask construction when this opt-in is set
             # (FlashAttentionBackend.supports_packed_mask_free). The packed

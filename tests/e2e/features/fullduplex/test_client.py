@@ -241,7 +241,7 @@ def test_realtime_event_collector_partitions_audio_by_response():
     collector.add({"type": "response.created", "response": {"id": "resp-a"}})
     collector.add(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(b"audio-a").decode("ascii"),
             "sample_rate_hz": 16_000,
@@ -252,7 +252,7 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.audio_bytes("resp-a") == b"audio-a"
     assert collector.output_sample_rate_hz == 16_000
     assert collector.first_received_at("response.created") is not None
-    assert collector.last_received_at("response.audio.delta") is not None
+    assert collector.last_received_at("response.output_audio.delta") is not None
 
 
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
@@ -273,7 +273,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
         collector.add(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": "resp-a",
                 "delta": base64.b64encode(b"audio").decode("ascii"),
                 "sample_rate_hz": 16_000,
@@ -286,7 +286,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         )
     collector.add(
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": "resp-a",
             "delta": "",
         },
@@ -294,7 +294,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     )
     collector.add(
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": "resp-a",
             "delta": "hello",
         },
@@ -369,7 +369,7 @@ def test_response_timing_ignores_unowned_session_level_metrics():
     )
     collector.add(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(b"audio").decode("ascii"),
             "metadata": {
