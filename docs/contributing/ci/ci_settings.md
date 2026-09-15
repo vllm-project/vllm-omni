@@ -38,7 +38,7 @@ Canonical layout (prefer these paths for new changes):
 │   ├── test-amd-nightly.yml         # Nightly full-model jobs (experimental)
 │   ├── test-template-amd-omni.j2    # Renders final pipeline.yaml
 │   └── scripts/
-│       ├── bootstrap-amd-omni.sh    # Entry: skip-ci → Jinja → upload
+│       ├── bootstrap-amd-omni.sh    # Compatibility wrapper for shared uploader
 │       └── run-amd-test.sh          # Wraps pytest inside ROCm docker
 ├── intel/
 │   ├── pipeline-intel.yml           # Static Intel XPU pipeline
@@ -65,7 +65,7 @@ Canonical layout (prefer these paths for new changes):
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
 | **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
 | **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
-| **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
+| **AMD** | `amd/pipeline.yml` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml` | Shared uploader with `--amd` mode | `agent_pool` + `mirror_hardwares: [amdproduction]` (native template metadata) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
 
 ## Platform configuration style
@@ -170,7 +170,7 @@ Canonical layout (prefer these paths for new changes):
 
 === "AMD"
 
-    **Bootstrap:** [`amd/scripts/bootstrap-amd-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/scripts/bootstrap-amd-omni.sh)—skip-ci, diff filtering, Jinja render, then `buildkite-agent pipeline upload`.
+    **Bootstrap:** [`amd/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/pipeline.yml) invokes the shared uploader with `--amd`. It reuses `skip_ci.py`, selects suites, renders Jinja, and uploads native MI300 child jobs without CUDA preset expansion.
 
     **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and ordinary `main`), and experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or `main` with `NIGHTLY=1`). Multiple PR tier labels combine their suites behind one image build. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, and `nightly` as an explicit override. During nightly burn-in every AMD nightly leaf is non-blocking.
 
@@ -192,7 +192,7 @@ Canonical layout (prefer these paths for new changes):
 
     1. Edit `test-amd-ready.yml`, `test-amd-merge.yml`, or `test-amd-nightly.yml`.
     2. Copy a neighboring block: `label`, `agent_pool`, `mirror_hardwares`, `commands`, optional `grade`.
-    3. Regenerate via bootstrap / Jinja; update `skip_ci.py` if you add a new YAML path.
+    3. Regenerate via the shared uploader; update `skip_ci.py` if you add a new YAML path.
 
 === "Intel"
 
