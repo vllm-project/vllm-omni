@@ -427,6 +427,38 @@ class HunyuanImage3Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
         )
 
+    def _get_diffusion_lora_name_aliases(self, full_module_name: str) -> list[str]:
+        """Map LoRA wrapper names to the PEFT adapter namespace.
+
+        ``self.transformer`` aliases ``self.model``, so the generic diffusion
+        LoRA manager registers the DiT layers under ``transformer.layers.*``.
+        PEFT adapters store the same weights under the ``model.layers.*``
+        namespace (matching the HF checkpoint), so expose the alias to let both
+        names resolve to the same adapter tensors.
+        """
+        if full_module_name.startswith("transformer."):
+            return [f"model.{full_module_name[len('transformer.') :]}"]
+        return []
+
+    def _deinterleave_fused_qkv_lora_b(self, lora_b: torch.Tensor) -> torch.Tensor | None:
+        """Re-order a fused ``qkv_proj`` LoRA-B from the checkpoint's
+        GQA-interleaved layout (per-KV-head ``[Q-group, K, V]``) into the block
+        layout ``[all Q, all K, all V]`` expected by the QKV output slices.
+
+        Reuses the exact same split as the base-weight loader
+        (``HunyuanImage3Model._split_qkv_weight``) so the LoRA deltas land on
+        the same output rows as the checkpoint weights. Returns ``None`` if the
+        HI3 fused-QKV layout cannot be established, in which case the caller
+        must fail closed rather than apply the rows to the wrong slices.
+        """
+        split_qkv = getattr(self.transformer, "_split_qkv_weight", None)
+        if not callable(split_qkv):
+            return None
+        try:
+            return split_qkv(lora_b)
+        except (RuntimeError, ValueError):
+            return None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
         # List of unexpected keywords in weight names
