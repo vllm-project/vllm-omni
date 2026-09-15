@@ -252,8 +252,9 @@ throughput guarantee.
   supports the H3 native `tile` mode only.
 - RainFusion block-sparse attention and INT8 quantization are validated for
   T2VA only; use the BF16 dense configuration for FL2VA and Ref2VA.
-- Online quantization cannot be combined with distributed layerwise offload
-  while AllGather is enabled; pass `--dlo-no-use-allgather` in that case.
+- Online INT8 quantization can be combined with distributed layerwise offload
+  while AllGather is enabled. Keep AllGather enabled for SP>1; use
+  `--dlo-no-use-allgather` only when collective communication is unavailable.
 
 ## Additional resources
 

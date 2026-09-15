@@ -11,8 +11,9 @@ instead of editing the shared serving module in ~10 scattered places.
 See the RFC for the full design (issue #4327).
 """
 
+import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -37,22 +38,52 @@ DEFAULT_TTS_LANGUAGES = frozenset(
     }
 )
 
-_conditioning_cache_salt_fn: "Callable[..., str] | None" = None
 
+def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict | None = None) -> str:
+    """Stable hash of the real Stage 0 conditioning for the prefix cache.
 
-def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict) -> str:
-    """Return the conditioning cache salt for ``request`` + ``tts_params``.
+    The talker's vLLM prompt is placeholder token ids; the real inputs are
+    rebuilt from text / ref_audio / ref_text into inputs_embeds. vLLM hashes
+    token ids (folded with cache_salt) for prefix caching, so without a salt
+    every request collides and a hit could reuse KV from a semantically
+    different input.
 
-    Lazily imports and caches ``serving_speech._conditioning_cache_salt`` on first
-    use: the import is deferred to break the adapters<->serving_speech import
-    cycle, and cached so it resolves once instead of on every ``build()`` call.
+    Raw request fields alone are not enough for uploaded voices: resolved
+    conditioning such as ``voice_created_at`` and content-aware ref-audio
+    cache keys must also be folded in. This distinguishes delete/re-upload of
+    the same voice and same-path local audio rewrites without hashing decoded
+    waveform arrays.
     """
-    global _conditioning_cache_salt_fn
-    if _conditioning_cache_salt_fn is None:
-        from vllm_omni.entrypoints.openai.serving_speech import _conditioning_cache_salt
-
-        _conditioning_cache_salt_fn = _conditioning_cache_salt
-    return _conditioning_cache_salt_fn(request, tts_params)
+    h = hashlib.sha256()
+    for part in (
+        request.input,
+        request.task_type,
+        request.language,
+        request.voice,
+        request.ref_text,
+        request.ref_audio,
+        request.instructions,
+        request.x_vector_only_mode,
+        request.speaker_embedding,
+    ):
+        h.update(b"\x00")
+        if part is not None:
+            h.update(repr(part).encode("utf-8"))
+    # Fold conditioning derived by adapters and absent from the raw request.
+    for key in (
+        "voice_created_at",
+        "task_type",
+        "speaker",
+        "ref_text",
+        "x_vector_only_mode",
+        "ref_audio_cache_key",
+        "ref_audio_2_cache_key",
+    ):
+        h.update(b"\x00")
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(repr(value).encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 def apply_max_new_tokens(

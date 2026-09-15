@@ -46,6 +46,10 @@ from vllm_omni.diffusion.data import (
     OmniWakeTask,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.kv_connector import (
+    init_worker_kv_connector,
+    shutdown_kv_connector,
+)
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -60,7 +64,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
+from vllm_omni.diffusion.ipc import (
+    DIFFUSION_RPC_RESULT_ENVELOPE,
+    pack_diffusion_output_shm,
+    payload_carries_typed_media,
+)
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -522,6 +530,7 @@ class DiffusionWorker:
         self.vllm_config.model_config.max_model_len = resolved_max_model_len
         kv_cache_config = kv_cache_configs[self.rank]
         self.vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        init_worker_kv_connector(self.vllm_config, kv_cache_config)
         with self._maybe_get_memory_pool_context("kv_cache"):
             self.model_runner.set_kv_cache_config(kv_cache_config)
 
@@ -565,6 +574,7 @@ class DiffusionWorker:
                 if self.od_config.lora_scale > 1.0:
                     logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
                 pipeline.load_lora_weights(lora_path)
+                pipeline.lora_is_fused = True
             else:
                 logger.warning("Pipeline does not support loading distilled LoRA weights for now.")
         else:
@@ -977,13 +987,16 @@ class DiffusionWorker:
                         mgr.shutdown_prefetch()
         finally:
             try:
-                a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
-                if a2a_permute is not None:
-                    a2a_permute.clear_a2a_permute_workspaces()
-            except Exception:
-                logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                shutdown_kv_connector()
             finally:
-                destroy_distributed_env()
+                try:
+                    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+                    if a2a_permute is not None:
+                        a2a_permute.clear_a2a_permute_workspaces()
+                except Exception:
+                    logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                finally:
+                    destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:
@@ -1122,7 +1135,15 @@ class WorkerProc:
         # Sync path (original, or async fallback).
         try:
             pack_diffusion_output_shm(output)
+        except (TypeError, ValueError):
+            raise
         except Exception as e:
+            # Typed media that fails to pack is left unprepared/on device (the
+            # pack is failure-atomic and does not mutate it), so enqueueing it
+            # would ship a broken payload. Re-raise memory/packing failures here
+            # instead of swallowing them for typed media.
+            if payload_carries_typed_media(output):
+                raise
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
         self._enqueue_result(output)
@@ -1327,6 +1348,14 @@ class WorkerProc:
 
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
+        if not should_reply:
+            # A rank that will not reply must not hand the result back: the busy
+            # loop binds it to a local that stays alive until the next request
+            # overwrites it, so a device-resident output -- for diffusion, an
+            # entire decoded video -- would occupy accelerator memory for the
+            # whole idle period on every rank that did not produce the reply.
+            # The `collect_rank_status` branch above already returns None here.
+            return None, False
         return result, should_reply
 
     def recv_message(self) -> Any:

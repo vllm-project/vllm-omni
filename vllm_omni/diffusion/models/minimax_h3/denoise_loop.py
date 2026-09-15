@@ -136,7 +136,23 @@ class MiniMaxH3DenoiseBranch:
                 )
                 for span in raw_spans
             )
-            self.static_kwargs["video_token_layout"] = VideoTokenLayout(used_len=int(cu[1]), video_spans=spans)
+            target_start = next(span.start for span in reversed(spans) if span.role == "target")
+            prefix_tags = token_tags[:target_start]
+            prefix_segments: list[int] = []
+            if prefix_tags.numel():
+                # Run-lengths preserve modality/reference boundaries without
+                # carrying CUDA tensors into every attention layer.
+                boundaries = torch.nonzero(prefix_tags[1:] != prefix_tags[:-1]).flatten().tolist()
+                starts = [0, *(index + 1 for index in boundaries)]
+                stops = [*(index + 1 for index in boundaries), target_start]
+                prefix_segments = [stop - start for start, stop in zip(starts, stops, strict=True)]
+            self.static_kwargs["video_token_layout"] = VideoTokenLayout(
+                used_len=int(cu[1]),
+                video_spans=spans,
+            )
+            # FastH3-specific prefix geometry belongs to MiniMax-H3's packed
+            # attention contract, not the shared VideoTokenLayout interface.
+            self.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] = tuple(prefix_segments)
         else:
             grid = packed["latent_grid"].tolist()
             self.static_kwargs["video_token_layout"] = VideoTokenLayout(

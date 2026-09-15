@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from:
 # https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
 #
@@ -34,8 +34,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -85,7 +85,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Store configs
         self.config = config
         self.multimodal_config = multimodal_config
-        from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
             patch_minicpmo_remote_config,
         )
 
@@ -338,7 +338,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         session_key = (session_id, incarnation)
         state = helper.sessions.get(session_key)
         if state is None:
-            from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
                 _MiniCPMO45Stage0SessionState,
             )
 
@@ -456,7 +456,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         if helper is not None:
             return helper
-        from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import MiniCPMO45Stage0DuplexRuntime
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import MiniCPMO45Stage0DuplexRuntime
 
         model_path = getattr(getattr(self.vllm_config, "model_config", None), "model", None)
         device = str(self._module_device(self.thinker if self.thinker is not None else self))
@@ -547,13 +547,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
             if isinstance(thinker_output, tuple):
-                embeds, text_hidden_states = thinker_output
+                _, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
 
             # Prepare hidden states for downstream stages
-            # Ensure correct shape: (batch_size, seq_len, hidden_dim)
-            if added_batch_dim:
+            # Ensure correct shape: (seq_len, hidden_dim)
+            if text_hidden_states.ndim == 3 and text_hidden_states.shape[0] == 1:
                 text_hidden_states = text_hidden_states.squeeze(0)
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors

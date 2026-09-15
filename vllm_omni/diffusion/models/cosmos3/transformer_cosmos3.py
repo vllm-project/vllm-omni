@@ -40,6 +40,12 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.platforms import current_omni_platform
 
+from .mixed_precision import (
+    Cosmos3MixedPrecisionConfig,
+    Cosmos3MixedPrecisionRuntime,
+    resolve_mixed_precision_config,
+)
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 
@@ -134,6 +140,26 @@ def _od_config_get(od_config: Any, key: str, default: Any = None) -> Any:
             return found
     value = _tf_config_get(tf_model_config, key, None)
     return default if value is None else value
+
+
+def _validate_mixed_precision_runtime(
+    config: Cosmos3MixedPrecisionConfig | None,
+    od_config: OmniDiffusionConfig,
+) -> None:
+    if config is None:
+        return
+    if get_tensor_model_parallel_world_size() != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
+    if int(getattr(od_config, "max_num_seqs", 1)) != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
+    if bool(getattr(od_config, "enable_distributed_layerwise_offload", False)):
+        raise ValueError(
+            "Cosmos3 mixed precision does not support distributed layer-wise offload "
+            "because its direct loader bypasses ModelOpt post-load transformations"
+        )
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if bool(getattr(parallel_config, "use_hsdp", False)):
+        raise ValueError("Cosmos3 mixed precision has not validated live backend weights under HSDP")
 
 
 def _as_bool(value: Any) -> bool:
@@ -705,7 +731,21 @@ class Cosmos3CrossAttention(nn.Module):
         # standard reverse-all-to-all path (no joint-output splitting).
         joint_q = q.new_empty(B, 0, self.num_heads_local, self.head_dim)
 
+        gen_mask = None
+        joint_mask = None
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                gen_mask = torch.ones(B, padded_seq_len, dtype=torch.bool, device=q.device)
+                gen_mask[:, ctx.sp_original_seq_len :] = False
+                # UND K/V are trimmed to the common real text length before GEN
+                # attention, so every remaining joint key is valid.
+                joint_mask = torch.ones(B, k_und.shape[1], dtype=torch.bool, device=q.device)
+
         attn_metadata = AttentionMetadata(
+            attn_mask=gen_mask,
+            joint_attn_mask=joint_mask,
             joint_query=joint_q,
             joint_key=k_und,
             joint_value=v_und,
@@ -1055,6 +1095,13 @@ class Cosmos3GenSPPrepare(nn.Module):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # A transfer denoising step may run a full-control branch followed by a
+        # shorter no-control branch in one ForwardContext. Auto-padding metadata
+        # belongs to one branch only and must not truncate a later gather.
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            ctx.sp_padding_size = 0
+            ctx.sp_original_seq_len = None
         return hidden_gen, freqs_cos, freqs_sin
 
 
@@ -1112,9 +1159,9 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _sp_plan = {
         "gen_sp_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
-            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
         },
         "gen_sp_gather": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -1220,6 +1267,19 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        mixed_precision_config, mixed_precision_source = resolve_mixed_precision_config(od_config)
+        if mixed_precision_config is None:
+            if mixed_precision_source == "additional_config_disabled":
+                logger.info("Cosmos3 checkpoint mixed-precision policy disabled by additional_config")
+        else:
+            logger.info(
+                "Cosmos3 mixed precision active (source=%s): first_steps=%d last_steps=%d reasoner=%s",
+                mixed_precision_source,
+                mixed_precision_config.first_steps,
+                mixed_precision_config.last_steps,
+                mixed_precision_config.reasoner,
+            )
+        _validate_mixed_precision_runtime(mixed_precision_config, od_config)
 
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
@@ -1278,6 +1338,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 for i in range(self.num_hidden_layers)
             ]
         )
+
+        self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
+        if mixed_precision_config is not None:
+            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
+            self.mixed_precision_runtime.install(self)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
@@ -1586,47 +1651,6 @@ class Cosmos3VFMTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
-    @staticmethod
-    def _validate_gen_sequence_parallel(
-        *,
-        s_gen: int,
-        s_video: int,
-        s_control: int,
-        s_action: int,
-        s_sound: int,
-        has_action: bool,
-        has_sound: bool,
-        has_control: bool,
-        ulysses_size: int,
-    ) -> None:
-        if ulysses_size <= 1 or s_gen % ulysses_size == 0:
-            return
-
-        detail_parts = []
-        if has_control:
-            detail_parts.append(f"control tokens {s_control}")
-        detail_parts.append(f"video tokens {s_video}")
-        if has_action:
-            detail_parts.append(f"action tokens {s_action}")
-        if has_sound:
-            detail_parts.append(f"sound tokens {s_sound}")
-        detail = " = " + " + ".join(detail_parts) if len(detail_parts) > 1 else ""
-        adjust_detail = (
-            "Adjust the spatial resolution, frame count, action chunk size, "
-            "sound duration, or sound latent FPS so the combined media sequence is a "
-            "multiple of ulysses_degree."
-            if has_control or has_action or has_sound
-            else (
-                "Adjust the spatial resolution so that "
-                "t * ceil(h/patch) * ceil(w/patch) is a multiple "
-                "of ulysses_degree."
-            )
-        )
-        raise ValueError(
-            f"GEN sequence length ({s_gen}{detail}) must be divisible by "
-            f"ulysses_degree ({ulysses_size}). {adjust_detail}"
-        )
-
     def sound_latent_frames_for_sequence_parallel(
         self,
         *,
@@ -1907,17 +1931,6 @@ class Cosmos3VFMTransformer(nn.Module):
             # framework Attention handles the Ulysses head-slicing internally.
             if self.cached_kv is None or self.cached_freqs_gen is None:
                 raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-            self._validate_gen_sequence_parallel(
-                s_gen=hidden_gen.shape[1],
-                s_video=s_video,
-                s_control=s_control,
-                s_action=s_action,
-                s_sound=s_sound,
-                has_action=has_action,
-                has_sound=has_sound,
-                has_control=has_control,
-                ulysses_size=1 if use_multi_control_attention else ulysses_size,
-            )
             freqs_cos, freqs_sin = self.cached_freqs_gen
             if not use_multi_control_attention:
                 hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
@@ -1989,3 +2002,11 @@ class Cosmos3VFMTransformer(nn.Module):
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
         self.time_embedder.to(torch.float32)
+
+    def set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.set_step(step_index, num_steps)
+
+    def reset_mixed_precision(self) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.reset()

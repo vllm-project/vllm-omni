@@ -912,10 +912,18 @@ def test_native_duplex_rollover_matches_official_sliding_recompute(mocker) -> No
     assert build_condition.call_count == 3
 
 
-def test_native_duplex_condition_advance_requires_recompute_marker(mocker) -> None:
+def test_native_duplex_condition_advance_without_rollover_updates_window_state(mocker) -> None:
     talker = _make_talker()
-    condition = torch.ones(2, 2)
-    mocker.patch.object(talker, "_build_condition_embeddings", return_value=condition)
+    talker.emb_text = nn.Embedding(1, 2)
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+    first_condition = torch.ones(2, 2)
+    second_condition = torch.full((2, 2), 2.0)
+    third_condition = torch.full((2, 2), 3.0)
+    mocker.patch.object(
+        talker,
+        "_build_condition_embeddings",
+        side_effect=[first_condition, second_condition, second_condition, third_condition],
+    )
     common = {
         "_omni_is_prefill": True,
         "_omni_prompt_len": 2,
@@ -926,8 +934,102 @@ def test_native_duplex_condition_advance_requires_recompute_marker(mocker) -> No
     }
 
     talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 0}, **common)
+    initial_state = talker._request_condition_states["req-history"]
+    assert initial_state["condition_seq"] == 0
+    assert torch.equal(initial_state["condition"], first_condition)
+    talker._request_audio_states["req-history"]["recent_codes"] = [1, 2, 3]
+
+    _, embeds, _ = talker.preprocess(
+        torch.zeros(4, dtype=torch.long),
+        None,
+        _omni_prompt_len=4,
+        meta={"streaming_condition_seq": 1},
+        **{key: value for key, value in common.items() if key != "_omni_prompt_len"},
+    )
+
+    assert torch.equal(embeds[-2:], second_condition)
+    state = talker._request_condition_states["req-history"]
+    assert state["condition_seq"] == 1
+    assert torch.equal(state["condition"], second_condition)
+    assert state["base_recent_codes"] == (1, 2, 3)
+    assert talker._request_audio_states["req-history"]["recent_codes"] == [1, 2, 3]
+
+    # A chunked-prefill retry for the same condition is idempotent.
+    _, retry_embeds, _ = talker.preprocess(
+        torch.zeros(2, dtype=torch.long),
+        None,
+        _omni_num_computed_tokens=2,
+        _omni_prompt_len=4,
+        meta={"streaming_condition_seq": 1},
+        **{key: value for key, value in common.items() if key != "_omni_prompt_len"},
+    )
+    assert torch.equal(retry_embeds, second_condition)
+    assert talker._request_condition_states["req-history"]["base_recent_codes"] == (1, 2, 3)
+
+    previous_codes = [4, 5]
+    expected_rollover = torch.cat(
+        [
+            second_condition,
+            talker.emb_code[0](torch.tensor(previous_codes)),
+            third_condition,
+        ],
+        dim=0,
+    )
+    _, rollover_embeds, _ = talker.preprocess(
+        torch.zeros(expected_rollover.shape[0], dtype=torch.long),
+        None,
+        _omni_prompt_len=expected_rollover.shape[0],
+        ids={"streaming_prompt_previous_codes": previous_codes},
+        meta={
+            "streaming_condition_seq": 2,
+            "streaming_prompt_recompute": True,
+        },
+        **{key: value for key, value in common.items() if key != "_omni_prompt_len"},
+    )
+    assert torch.equal(rollover_embeds, expected_rollover)
+    rollover_state = talker._request_condition_states["req-history"]
+    assert rollover_state["base_recent_codes"] == (1, 2, 3, 4, 5)
+
+
+def test_native_duplex_sliding_condition_advance_requires_recompute_marker(mocker) -> None:
+    talker = _make_talker()
+    talker._tts_config.attention_type = "sliding_recompute"
+    condition = torch.ones(2, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=condition)
+    common = {
+        "_omni_is_prefill": True,
+        "_omni_prompt_len": 2,
+        "_omni_num_computed_tokens": 0,
+        "request_id": "req-sliding",
+        "native_duplex": True,
+        "tts_token_ids": torch.tensor([1]),
+        "tts_hidden_states": torch.ones(1, 2),
+    }
+
+    talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 0}, **common)
     with pytest.raises(ValueError, match="advanced without its streaming recompute marker"):
         talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 1}, **common)
+
+
+def test_native_duplex_disabled_recompute_policy_accepts_condition_advance(mocker) -> None:
+    talker = _make_talker()
+    talker._tts_config.attention_type = "other"
+    condition = torch.ones(2, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=condition)
+    common = {
+        "_omni_is_prefill": True,
+        "_omni_prompt_len": 2,
+        "_omni_num_computed_tokens": 0,
+        "request_id": "req-disabled-policy",
+        "native_duplex": True,
+        "tts_token_ids": torch.tensor([1]),
+        "tts_hidden_states": torch.ones(1, 2),
+    }
+
+    talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 0}, **common)
+    talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 1}, **common)
+
+    assert talker._request_condition_states["req-disabled-policy"]["condition_seq"] == 1
 
 
 @pytest.mark.parametrize(

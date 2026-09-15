@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Serving-layer regressions for the Audex zero-codec-token contract.
 
 A zero-codec-token (or phase-invalid TTA) request reaches the serving layer
@@ -171,7 +171,7 @@ class TestAudexCfgValidation:
 class TestAudexCfgInjection:
     def _serving_with_fake_tokenizer(self):
         serving = _serving()
-        serving._get_audex_tokenizer = lambda: _MarkerTokenizer()
+        serving._adapter._get_tokenizer = lambda: _MarkerTokenizer()
         return serving
 
     def _cond_prompt(self, text: str = "Hello world.") -> str:
@@ -333,8 +333,8 @@ class TestAdapterRouting:
 class TestAudexTTAInjection:
     def _serving(self):
         serving = _serving(model_type="audex_tta")
-        serving._get_audex_tokenizer = lambda: _TTAVocabTokenizer()
-        serving._audex_tta_rvq = None
+        serving._adapter._get_tokenizer = lambda: _TTAVocabTokenizer()
+        serving._adapter._tta_rvq = None
         return serving
 
     def _prompt(self):

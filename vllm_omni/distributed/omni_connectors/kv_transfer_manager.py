@@ -564,6 +564,13 @@ class OmniKVTransferManager:
                             # the wrong process. Explicit sender_* YAML values
                             # are still preserved for standalone connector use.
 
+                    if c_type == "NixlConnector" and c_extra.get("role") == "receiver":
+                        # This manager receives on the shared incoming edge;
+                        # its YAML zmq_port belongs to the producer. NIXL treats
+                        # an explicit zmq_port as a local listener, even for a
+                        # receiver. Keep only the request-scoped sender_* endpoint.
+                        c_extra.pop("zmq_port", None)
+
                     logger.info(
                         "Initializing OmniConnector type=%s role=%s",
                         c_type,
@@ -922,7 +929,9 @@ class OmniKVTransferManager:
         The base host/port are also stored so that the receive path can
         construct per-rank metadata for heterogeneous TP scenarios.
         """
-        if not self.config.need_recv_cache:
+        # A stage can sit on the receiving end of a payload-only edge, where the
+        # sender endpoint still has to be applied even though no KV is expected.
+        if not self.config.need_recv_cache and (self.config.connector_config or {}).get("role") != "receiver":
             return
 
         actual_info = self._resolve_sender_info(sender_info, sender_stage_id=sender_stage_id)

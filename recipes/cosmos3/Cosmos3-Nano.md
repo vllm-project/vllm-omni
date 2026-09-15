@@ -50,9 +50,10 @@ mode is selected per request:
   **`nvidia/Cosmos3-Nano-Policy-DROID`** is served the same way
   (`domain_name=droid_lerobot`).
 
-- **DROID OpenPI policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and
-  connect an OpenPI-compatible websocket client to `/v1/realtime/robot/openpi`.
-  This path returns action chunks directly instead of an mp4.
+- **DROID policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and connect
+  RoboLab or another OpenPI-compatible client to
+  `/v1/realtime/robot/openpi`. This endpoint returns action chunks directly
+  instead of an mp4.
 
   Action requests can use `input_reference` or `video_reference` for video input.
   `policy` and `forward_dynamics` can also use an image reference; `inverse_dynamics`
@@ -114,6 +115,38 @@ generation from ~50 GB to ~36 GB with BF16-level quality (T2V composition can
 shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
+
+For a serialized ModelOpt FP8 or NVFP4 checkpoint, an experimental
+mixed-precision schedule can use native W8A8/W4A4 in middle denoising steps
+and dense W8A16/W4A16 in the first and last steps:
+
+```bash
+vllm serve /path/to/Cosmos3-Nano-modelopt \
+  --omni \
+  --additional-config \
+  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+```
+
+The nested object's presence supplies an explicit runtime override; use an
+empty object for these defaults. A compatible checkpoint can instead declare
+the versioned `runtime.diffusion_step_policy` in its authoritative
+`transformer/config.json`. The checkpoint policy is used only when no runtime
+override is present. Use
+`--additional-config '{"cosmos3_mixed_precision":{"enabled":false}}'` to
+disable the checkpoint schedule without disabling checkpoint quantization.
+This path currently requires tensor parallel size 1 and does not support HSDP
+or block-scaled FP8. It keeps one live quantized weight representation:
+scheduled FP8 requires serialized tensorwise scales and a canonical backend,
+while scheduled NVFP4 requires a supported CUTLASS-compatible native or
+FlashInfer layout. Its dequantization is a correctness baseline; no speedup is
+implied. Quantized reasoner weights use A16 by default; set
+`"reasoner":"native"` in the nested object to keep W8A8/W4A4.
+The checkpoint's ModelOpt configuration selects FP8 or NVFP4; mixed FP8/NVFP4
+checkpoints are not supported by this schedule. BF16 linears are left unchanged.
+The schedule currently supports one active request per worker. Model-level and
+layer-wise offload are designed to work with this live-weight path but still
+require GPU validation. Distributed layer-wise offload and incompatible native
+weight layouts fail during loading.
 
 #### Verification
 
@@ -207,6 +240,18 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F 'extra_params={"depth":{"control_path":"/path/to/depth_control.mp4"},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
   -o cosmos3_transfer_depth.mp4
 
+# The same transfer control can be uploaded by a remote client instead of
+# being placed on the server filesystem. Uploads are limited to 512 MiB.
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Generate a realistic scene following the provided world-state control." \
+  -F "input_reference=@/path/to/input.mp4;type=video/mp4" \
+  -F "control_reference=@/path/to/wsm.mp4;type=video/mp4" \
+  -F "control_type=wsm" \
+  -F 'extra_params={"wsm":{"control_weight":1.0},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
+  -o cosmos3_transfer_wsm.mp4
+
 # Text-to-video-with-sound
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
@@ -270,39 +315,70 @@ VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
 curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
 curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
 
-# DROID OpenPI policy server (websocket action serving).
-# Requires cosmos_framework on PYTHONPATH because the pipeline reuses the
-# reference RoboLab action transforms. If your checkpoint config already
-# includes policy_server_config, omit the stage_overrides file and flag.
-cat > cosmos3_droid_openpi_stage_overrides.json <<'JSON'
-{
-  "0": {
-    "model_config": {
-      "policy_server_config": {
-        "image_resolution": [540, 640],
-        "n_external_cameras": 2,
-        "needs_wrist_camera": true,
-        "needs_stereo_camera": false,
-        "needs_session_id": true,
-        "action_space": "joint_position"
-      }
-    }
-  }
-}
-JSON
+# DROID websocket policy server. Use the tested cosmos-framework revision
+# directly from source; installing the package can introduce dependency conflicts.
+export COSMOS_FRAMEWORK_ROOT=/path/to/cosmos-framework
+git -C "$COSMOS_FRAMEWORK_ROOT" checkout c14617c2bc93dacbf69674fb964eec93182933d9
+export PYTHONPATH="$COSMOS_FRAMEWORK_ROOT"
 
+# Validate every cosmos-framework symbol used by the action-policy pipeline
+# before allocating the model.
+python - <<'PY'
+from vllm_omni.diffusion.models.cosmos3.utils import (
+    get_robolab_domain_id,
+    preflight_cosmos3_action_framework_imports,
+)
+
+preflight_cosmos3_action_framework_imports()
+print("cosmos-framework action imports OK; DROID domain:", get_robolab_domain_id("droid_lerobot"))
+PY
+
+# The bundled deploy config (vllm_omni/deploy/cosmos3_policy_droid.yaml)
+# selects the registered cosmos3_policy pipeline and carries the DROID
+# checkpoint's serving defaults: JSON prompt formatting (a property of this
+# checkpoint's training recipe, not a generic server default), the
+# model-specific OpenPI binary handshake metadata (policy_server_config), and
+# guardrails off (policy serving emits robot actions; the guardrail stack is
+# not part of it, so --no-guardrails is implied).
+# Policy checkpoints cannot be auto-detected — they share their HF metadata
+# with the T2I/video Cosmos3 checkpoints — so --deploy-config is required.
+# Per-checkpoint model_config tweaks can be layered on top with
+# --stage-overrides; dict overrides deep-merge with the deploy yaml.
+export VLLM_OMNI_ROOT=/absolute/path/to/vllm-omni
 vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   --omni \
   --host 0.0.0.0 --port 8000 \
-  --model-class-name Cosmos3OmniDiffusersPipeline \
-  --no-guardrails \
-  --stage-overrides "$(cat cosmos3_droid_openpi_stage_overrides.json)"
+  --deploy-config "$VLLM_OMNI_ROOT/vllm_omni/deploy/cosmos3_policy_droid.yaml" \
+  --robot-openpi-idle-timeout 0
 
-# Point an OpenPI websocket client at:
-#   ws://localhost:8000/v1/realtime/robot/openpi
-# The first server message is policy_server_config. Each infer request sends a
-# msgpack-numpy observation dict and receives a writable float32 action array.
+# From a RoboLab checkout:
+python policies/cosmos3/run.py \
+  --remote-uri ws://localhost:8000/v1/realtime/robot/openpi \
+  --task BananaInBowlTask
+
+# For a server started with "--api-key $POLICY_API_KEY", pass the same value as
+# a Bearer token. --remote-token takes precedence over COSMOS3_API_TOKEN.
+COSMOS3_API_TOKEN="$POLICY_API_KEY" python policies/cosmos3/run.py \
+  --remote-uri wss://policy.example/v1/realtime/robot/openpi \
+  --task BananaInBowlTask
 ```
+
+The endpoint sends `policy_server_config` as its initial binary MsgPack
+message and returns the action array directly. RoboLab accepts that direct
+array as well as proxy responses shaped as `{"action": ...}` or
+`{"actions": ...}`, and turns structured server errors into client exceptions.
+
+RoboLab supplies `session_id=robolab-episode-<episode>-env-<env_id>`, so
+parallel environments have independent policy state even though they share
+one WebSocket. The server tracks interleaved session IDs independently.
+The default receive-idle timeout is 30 seconds; set
+`--robot-openpi-idle-timeout 0` when simulator steps between replans can take
+longer, or set another non-negative timeout in seconds.
+
+If vLLM-Omni is started with `--api-key` or `VLLM_API_KEY`, the standard
+OpenPI route uses the normal API authentication middleware. RoboLab's
+`--remote-token` and `COSMOS3_API_TOKEN` send the required
+`Authorization: Bearer ...` header.
 
 #### Notes
 

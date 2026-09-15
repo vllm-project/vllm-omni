@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # The halo-exchange spatial-parallel decode here is adapted from SGLang's
 # spatial-parallel VAE decode
@@ -24,7 +24,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MethodType
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -33,6 +33,8 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 
 logger = init_logger(__name__)
 
@@ -644,7 +646,7 @@ def _replace_child(
         )
         return
     if isinstance(child, nn.ZeroPad2d):
-        padding = tuple(int(p) for p in child.padding)
+        padding = cast(tuple[int, int, int, int], tuple(int(p) for p in child.padding))
         module_padding = padding
         if parent.__class__.__name__ == "Sequential":
             # Let the following WanDistConv2d account for global after-edge
@@ -794,7 +796,8 @@ def spatial_shard_decode(
     group: dist.ProcessGroup,
     return_dict: bool = True,
     split_dim: str = "height",
-) -> DecoderOutput | tuple[torch.Tensor]:
+    on_chunk: DecodedChunkConsumer | None = None,
+) -> DecoderOutput | tuple[torch.Tensor] | None:
     install_wan_spatial_shard_decode(vae, group, split_dim=split_dim)
 
     if z.shape[2] == 0:
@@ -806,6 +809,7 @@ def spatial_shard_decode(
     produce_output = world_size <= 1 or rank == 0
 
     vae.clear_cache()
+    callback_error: BaseException | None = None
     try:
         context = vae._execution_context() if hasattr(vae, "_execution_context") else nullcontext()
         with context:
@@ -820,18 +824,33 @@ def spatial_shard_decode(
                     first_chunk=(i == 0),
                 )
                 if produce_output:
-                    decoded_chunks.append(chunk)
+                    if on_chunk is not None and callback_error is None:
+                        try:
+                            if vae.config.patch_size is not None:
+                                chunk = unpatchify(chunk, patch_size=vae.config.patch_size)
+                            on_chunk(torch.clamp(chunk, min=-1.0, max=1.0))
+                        except BaseException as exc:
+                            # Keep all ranks in the temporal collective loop;
+                            # surface the callback failure only after decode.
+                            callback_error = exc
+                    elif on_chunk is None:
+                        decoded_chunks.append(chunk)
+                del chunk
 
-            if produce_output:
+            if produce_output and on_chunk is None:
                 out = torch.cat(decoded_chunks, dim=2)
                 if vae.config.patch_size is not None:
                     out = unpatchify(out, patch_size=vae.config.patch_size)
                 out = torch.clamp(out, min=-1.0, max=1.0)
-            else:
-                out = z.new_zeros(0)
     finally:
         vae.clear_cache()
 
+    if callback_error is not None:
+        raise callback_error
+    if on_chunk is not None:
+        return None
+    if not produce_output:
+        out = z.new_zeros(0)
     if not return_dict:
         return (out,)
     return DecoderOutput(sample=out)

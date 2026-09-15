@@ -11,13 +11,15 @@ import asyncio
 import json
 import os
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v3 import HiggsAudioV3Adapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -892,6 +894,81 @@ class TestFeedbackMethods:
         assert r2 == {}  # Second row is all -1
 
 
+# ---- AC-3: Reference Audio Substitution Tests ----
+
+
+class TestReferenceAudioSubstitution:
+    def _make_talker(self, query_start_loc):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        class FakeTalker:
+            _last_step_query_start_loc = query_start_loc
+            _apply_ref_audio_substitution = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_ref_audio_substitution
+
+            @staticmethod
+            def multimodal_embedding(codes):
+                return codes.to(torch.float32)
+
+        return FakeTalker()
+
+    @staticmethod
+    def _reference_info():
+        return [
+            {
+                "audio_input_ids": torch.tensor([[5], [7]], dtype=torch.long),
+                "audio_input_ids_mask": torch.tensor([True, True]),
+                "audio_placeholder_positions": torch.tensor([1, 2]),
+            }
+        ]
+
+    def test_valid_placeholder_tokens_are_replaced_from_explicit_positions(self):
+        talker = self._make_talker(torch.tensor([0, 4]))
+        hidden_states = torch.zeros(4, 1)
+        input_ids = torch.tensor([1, 151702, 151702, 2])
+        positions = torch.arange(4)
+
+        result = talker._apply_ref_audio_substitution(
+            hidden_states,
+            input_ids,
+            positions,
+            self._reference_info(),
+        )
+
+        assert result[:, 0].tolist() == [0.0, 5.0, 7.0, 0.0]
+
+    def test_chunked_prefill_selects_code_by_absolute_prompt_position(self):
+        talker = self._make_talker(torch.tensor([0, 1]))
+        hidden_states = torch.zeros(1, 1)
+        input_ids = torch.tensor([151702])
+        positions = torch.tensor([2])
+
+        result = talker._apply_ref_audio_substitution(
+            hidden_states,
+            input_ids,
+            positions,
+            self._reference_info(),
+        )
+
+        assert result[:, 0].tolist() == [7.0]
+
+    def test_legacy_negative_placeholder_tokens_remain_supported(self):
+        talker = self._make_talker(torch.tensor([0, 4]))
+        hidden_states = torch.zeros(4, 1)
+        input_ids = torch.tensor([1, -100, -100, 2])
+        positions = torch.arange(4)
+        reference_info = self._reference_info()
+        reference_info[0].pop("audio_placeholder_positions")
+
+        result = talker._apply_ref_audio_substitution(
+            hidden_states,
+            input_ids,
+            positions,
+            reference_info,
+        )
+
+        assert result[:, 0].tolist() == [0.0, 5.0, 7.0, 0.0]
+
+
 # ---- AC-6: Audio Feedback Method Tests ----
 
 
@@ -1545,6 +1622,23 @@ class TestPromptBuilder:
         assert 151703 not in ids  # <|ref_audio|>
         assert 151704 not in ids  # <|ref_text|>
 
+    def test_voice_clone_prompt_is_vocab_valid_for_engine(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        adapter = HiggsAudioV3TokenizerAdapter(self._make_mock_tokenizer())
+        prompt_ids = adapter.build_prompt("Hello", num_ref_tokens=2)
+
+        engine_prompt_ids, placeholder_positions = adapter.prepare_prompt_for_engine(prompt_ids)
+
+        assert min(prompt_ids) < 0
+        assert min(engine_prompt_ids) >= 0
+        assert placeholder_positions.tolist() == [2, 3]
+        filler_ids = [engine_prompt_ids[index] for index in placeholder_positions.tolist()]
+        assert filler_ids == [adapter.tts_id] * 2
+        assert adapter.audio_id not in filler_ids
+
 
 class TestVoiceCloneReferenceCache:
     def test_audio_tokenizer_dir_env_accepts_parent_or_subdir(self, tmp_path, monkeypatch):
@@ -1591,31 +1685,21 @@ class TestVoiceCloneReferenceCache:
         assert tok._resolve_audio_tokenizer_dir() is None
 
     def test_higgs_v3_ref_code_cache_returns_clone(self):
-        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-
-        serving = object.__new__(OmniOpenAIServingSpeech)
-        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
-        serving._higgs_audio_v3_ref_code_cache_bytes = 0
-        serving._higgs_audio_v3_ref_code_inflight = {}
+        adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
 
         codes = torch.arange(16, dtype=torch.long).reshape(2, 8)
-        serving._put_higgs_audio_v3_ref_codes("ref-a", codes)
+        adapter._put_higgs_audio_v3_ref_codes("ref-a", codes)
 
-        cached = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        cached = adapter._get_higgs_audio_v3_ref_codes("ref-a")
         assert cached is not None
         cached.fill_(0)
 
-        cached_again = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        cached_again = adapter._get_higgs_audio_v3_ref_codes("ref-a")
         assert cached_again is not None
         assert torch.equal(cached_again, codes)
 
     def test_higgs_v3_ref_code_inflight_deduplicates_concurrent_encode(self):
-        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-
-        serving = object.__new__(OmniOpenAIServingSpeech)
-        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
-        serving._higgs_audio_v3_ref_code_cache_bytes = 0
-        serving._higgs_audio_v3_ref_code_inflight = {}
+        adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
         calls = 0
 
         def encode_reference_audio(_wav, _sr):
@@ -1630,7 +1714,7 @@ class TestVoiceCloneReferenceCache:
         async def run():
             return await asyncio.gather(
                 *[
-                    serving._resolve_higgs_audio_v3_ref_codes(
+                    adapter._resolve_higgs_audio_v3_ref_codes(
                         "ref-a",
                         object(),
                         24000,
@@ -1649,7 +1733,7 @@ class TestVoiceCloneReferenceCache:
             assert torch.equal(codes, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
 
         cached, cache_hit, inflight_wait = asyncio.run(
-            serving._resolve_higgs_audio_v3_ref_codes(
+            adapter._resolve_higgs_audio_v3_ref_codes(
                 "ref-a",
                 object(),
                 24000,

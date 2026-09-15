@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Streaming segment-boundary state must be keyed by stage.
 
 ``Orchestrator._orchestration_loop`` polls every stage into the same
@@ -15,13 +15,13 @@ from dataclasses import dataclass, field
 import pytest
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine.duplex.contracts import DuplexRequestIdentity
+from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     StreamingSegmentState,
 )
-from vllm_omni.experimental.fullduplex.engine.contracts import DuplexRequestIdentity
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

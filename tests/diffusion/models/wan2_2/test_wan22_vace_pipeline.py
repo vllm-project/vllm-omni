@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,46 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import WanVACETra
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_vace_default_flow_shift_preserves_compact_offload_runtime_state(monkeypatch) -> None:
+    @dataclass
+    class RuntimeConfig:
+        flow_shift: float | None = None
+        diffusion_offload_config: dict[str, object] = field(
+            default_factory=lambda: {
+                "mode": "layer",
+                "components": ["text_encoder"],
+            }
+        )
+        enable_layerwise_offload: bool = True
+        post_init_calls: int = 0
+
+        def __post_init__(self) -> None:
+            self.post_init_calls += 1
+
+    config = RuntimeConfig()
+    resolved_offload = object()
+    config._resolved_diffusion_offload = resolved_offload
+    config._diffusion_offload_flags_materialized = True
+    captured = {}
+
+    def capture_base_init(self, *, od_config, prefix="") -> None:
+        captured.update(od_config=od_config, prefix=prefix)
+
+    monkeypatch.setattr(Wan22VACEPipeline.__mro__[1], "__init__", capture_base_init)
+
+    Wan22VACEPipeline(od_config=config, prefix="stage")
+
+    forwarded = captured["od_config"]
+    assert forwarded is not config
+    assert config.flow_shift is None
+    assert forwarded.flow_shift == 3.0
+    assert forwarded.diffusion_offload_config is config.diffusion_offload_config
+    assert forwarded._resolved_diffusion_offload is resolved_offload
+    assert forwarded._diffusion_offload_flags_materialized is True
+    assert forwarded.post_init_calls == 1
+    assert captured["prefix"] == "stage"
 
 
 def _make_vace_pipeline() -> Wan22VACEPipeline:

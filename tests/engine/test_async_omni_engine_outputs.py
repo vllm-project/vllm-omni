@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for AsyncOmniEngine.try_get_output and try_get_output_async.
 
 Focuses on the critical behavior: when the orchestrator thread dies,
@@ -15,22 +18,22 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.engine.async_engine_utils import weak_shutdown_async_omni_engine
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.duplex.control_client import (
+    DuplexControlClient,
+    DuplexControlRequestError,
+)
+from vllm_omni.engine.duplex.messages import (
+    AppendDuplexInputMessage,
+    DuplexControlResultMessage,
+    DuplexFence,
+    SignalDuplexTurnMessage,
+)
 from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     ErrorMessage,
     OutputMessage,
 )
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
-from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
-    DuplexControlClient,
-    DuplexControlRequestError,
-)
-from vllm_omni.experimental.fullduplex.engine.messages import (
-    AppendDuplexInputMessage,
-    DuplexControlResultMessage,
-    DuplexFence,
-    SignalDuplexTurnMessage,
-)
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

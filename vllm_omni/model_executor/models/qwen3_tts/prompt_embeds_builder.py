@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stand-alone builder for Qwen3-TTS AR talker prompt embeddings.
 
 Factors the prompt-construction logic out of
@@ -640,6 +643,10 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     # -------------------- speaker encoder / codec encoder --------------------
 
+    # Some NPUs (310P, Ascend 950) do not support torch.stft; builders on
+    # such devices set this flag to compute the mel spectrogram on CPU.
+    _mel_spectrogram_on_cpu: bool = False
+
     def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
@@ -663,7 +670,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         # Follow official implementation: mel_spectrogram expects 24kHz. Move
         # the waveform first so STFT/mel computation stays on the model device
         # instead of materializing a CPU mel tensor and copying it per request.
-        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
+        # Devices without torch.stft set _mel_spectrogram_on_cpu instead.
+        mel_device = torch.device("cpu") if self._mel_spectrogram_on_cpu else dev
+        wav_tensor = torch.from_numpy(wav).to(device=mel_device, dtype=torch.float32).unsqueeze(0)
         mels = mel_spectrogram(
             wav_tensor,
             n_fft=1024,
@@ -674,7 +683,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(dtype=dtype))[0]
+        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
         return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(
@@ -1239,6 +1248,15 @@ class Qwen3TTSPromptEmbedsBuilder:
             else:
                 wav_np, sr = _get_ref_audio()
                 speaker_embed = self.extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            expected_speaker_dim = int(self._talker_config.hidden_size)
+            actual_speaker_dim = int(speaker_embed.shape[-1])
+            if actual_speaker_dim != expected_speaker_dim:
+                raise ValueError(
+                    "Qwen3-TTS speaker embedding dimension mismatch: "
+                    f"got {actual_speaker_dim}, but the talker requires {expected_speaker_dim}. "
+                    "Use a matching Base checkpoint or a compatible precomputed speaker embedding."
+                )
 
             # Cache miss: store extraction result in the speaker cache.
             if _speaker_cache_key is not None and speaker_embed is not None and self._speaker_cache is not None:

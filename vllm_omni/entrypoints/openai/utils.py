@@ -1,4 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Shared OpenAI serving utilities.
+
+PUT HERE:
+  - Cross-cutting stage-config / LoRA / pipeline helpers reused by multiple
+    OpenAI serving paths (not owned by a single endpoint family).
+
+DO NOT PUT HERE:
+  - Modality endpoint request/job helpers — those go in package ``helpers.py``
+    (e.g. ``images.helpers``, ``video.generation.helpers``).
+  - Pure image/video/audio media encode/decode — those stay in the matching
+    root ``*_utils*`` / mixin until family PRs absorb them.
+
+LONGEVITY:
+  - TODO(#5227, Phase 1): revisit and tidy this file during later OpenAI
+    entrypoint refactor stages; prefer growing endpoint-family helpers over this
+    root grab-bag when ownership is clear.
+"""
 
 from __future__ import annotations
 

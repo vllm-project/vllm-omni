@@ -155,7 +155,6 @@ async def run(argv: Sequence[str] | None = None) -> Path:
         height=args.height,
         width=args.width,
         num_frames=9,
-        num_inference_steps=4,
         max_sequence_length=512,
         seed=args.seed,
         output_type="latent",

@@ -36,7 +36,7 @@ immediately followed by one binary WebSocket frame containing fragmented MP4
 bytes.
 
 | Direction | Event or frame | Purpose |
-|-----------|----------------|---------|
+| ----------- | ---------------- | --------- |
 | Client to server | `session.start` | Starts generation with a prompt and video parameters |
 | Server to client | `video.start` | Confirms the request ID, format, and accepted configuration |
 | Server to client | `video.chunk_metadata` | Describes the next binary media frame |

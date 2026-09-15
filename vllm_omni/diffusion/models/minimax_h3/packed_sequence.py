@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 packed-sequence materialization for FL2VA and Ref2VA tasks.
 
 Layout: [text L | imgvid_cond C | audio A(=t*2ch) | video_target V | pad P].
@@ -17,6 +18,8 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 import torch
+
+from vllm_omni.errors import OmniClientError
 
 MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES: tuple[tuple[int, ...], ...] = (
     (0,),
@@ -38,11 +41,40 @@ _INTERP = 32
 _T_GROUP = 5
 _FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 _FRAME_RESCALE = 5.0 / 3.0
-_SEQ_ALIGN = 64
+MINIMAX_H3_SEQ_ALIGN = 64
+"""Row alignment of the packed sequence.
+
+An explicit ``seq_len`` must be a multiple of this, so that pinning a length
+lands on a bucket the default rounding could also produce.
+"""
+
+MINIMAX_H3_MAX_PAD_SEQ_LEN = 1 << 20
+"""Ceiling for a request-pinned packed length.
+
+Every packed row costs a fixed number of bytes across the structural tensors
+built below, so an unbounded request value would size those allocations. The
+largest shape this pipeline is documented against -- 672x384 at 209 frames --
+packs about 16k rows, so this ceiling leaves roughly two orders of magnitude of
+headroom while keeping the structural tensors in the tens of megabytes.
+"""
 # MiniMax H3 packs video latents with a fixed [1, 2, 2] (t, h, w) patch.
 _PATCH_T = 1
 _PATCH_H = 2
 _PATCH_W = 2
+
+
+def _resolve_padded_seq_len(used: int, seq_len: int | None) -> int:
+    """Resolve the padded row count for a packed sequence.
+
+    Without an explicit ``seq_len`` the used rows are rounded up to the next
+    :data:`MINIMAX_H3_SEQ_ALIGN` boundary. An explicit value is honored as-is
+    and must cover the used rows.
+    """
+    if seq_len is None:
+        return ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
+    if seq_len < used:
+        raise OmniClientError(f"seq_len {seq_len} < used rows {used}")
+    return seq_len
 
 
 def _keyframe_cond_frame_indices(
@@ -124,10 +156,15 @@ def minimax_h3_packed_sequence(
     include_keyframe_cond: bool,
     keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
     frame_count: int | None = None,
+    seq_len: int | None = None,
 ) -> dict[str, object]:
     """Build the packed-sequence structural fields for one CFG branch.
 
-    The used length is padded up to a multiple of 64.
+    The used length is padded up to a multiple of
+    :data:`MINIMAX_H3_SEQ_ALIGN`, or to an explicit ``seq_len`` that covers the
+    used rows -- the same contract
+    :func:`minimax_h3_packed_sequence_ref2va_blocks` already offers. Pinning
+    the length keeps requests of different prompt lengths on one packed shape.
     """
     ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
     frame_rows = ph * pw
@@ -143,7 +180,7 @@ def minimax_h3_packed_sequence(
     video_rows = latent_t * frame_rows
     audio_rows = audio_t * audio_channel
     used = text_len + cond_rows + audio_rows + video_rows
-    seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
+    seq_len = _resolve_padded_seq_len(used, seq_len)
 
     text_sl = slice(0, text_len)
     cond_sl = slice(text_len, text_len + cond_rows)
@@ -376,10 +413,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     audio_rows = audio_t * audio_channel
     ref_rows = ref_visual_rows + ref_audio_rows
     used = text_len + ref_rows + audio_rows + video_rows
-    if seq_len is None:
-        seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
-    if seq_len < used:
-        raise ValueError(f"seq_len {seq_len} < used rows {used}")
+    seq_len = _resolve_padded_seq_len(used, seq_len)
 
     text_sl = slice(0, text_len)
     cursor = text_len

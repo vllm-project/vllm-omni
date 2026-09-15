@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -157,7 +157,10 @@ def _load_weights_noop(model: Qwen3TTSCode2Wav) -> set[str]:
         def __init__(self, *_: object, **__: object):
             pass
 
-        def load_weights(self, _weights: object) -> set[str]:
+        def load_weights(self, _weights: object, *, mapper: object | None = None) -> set[str]:
+            # vLLM 0.29 dropped skip_prefixes from AutoWeightsLoader; the model
+            # now passes the stage exclusions as a WeightsMapper instead.
+            del mapper
             return {"decoder.fake_weight"}
 
     with (

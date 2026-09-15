@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -214,11 +214,20 @@ def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch):
     assert fish_kvcache_backend.get_fish_kvcache_attn_stats()["small_hit_count"] == 1
 
 
-def _vllm_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
+def _vllm_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16):
     # Source of truth for the paged KV cache layout the backend must unpack.
-    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+    # vLLM 0.29 removed AttentionBackend.get_kv_cache_shape; the per-layer shape
+    # now comes from the spec, with the content dim expressed in bytes.
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, compute_layer_kv_cache_shape_bytes
 
-    return FlashAttentionBackend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+    num_pages, num_heads, num_states, content_bytes = compute_layer_kv_cache_shape_bytes(spec, num_blocks)
+    return (num_pages, num_heads, num_states, content_bytes // dtype.itemsize)
 
 
 def test_fish_kvcache_backend_unbinds_kv_on_vllm_cache_layout(monkeypatch):

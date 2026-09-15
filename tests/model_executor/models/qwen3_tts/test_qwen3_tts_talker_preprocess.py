@@ -78,6 +78,7 @@ def _make_minimal_builder(
         codec_bos_id=8,
         num_code_groups=2,
         spk_is_dialect={},
+        hidden_size=4,
     )
     builder._model_path = ""
     builder._text_embedding = None
@@ -388,6 +389,34 @@ def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
     assert ref_audio_ids == [id(ref_audio), id(ref_audio)]
     assert ref_code_len == 2
     assert torch.equal(ref_code, torch.ones((2, 2), dtype=torch.long))
+
+
+def test_base_voice_clone_rejects_speaker_embedding_dimension_before_cat():
+    """Keep a worker-side guard for callers that bypass the Speech API."""
+    builder = _make_minimal_builder()
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
+
+    class FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
+
+    builder._text_tokenizer = FakeTokenizer()
+    builder.normalize_ref_audio = lambda _raw: (np.arange(1024, dtype=np.float32), 16000)
+    builder.extract_speaker_embedding = lambda _wav, _sr: torch.ones(3, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="got 3, but the talker requires 4"):
+        builder.build_prompt_embeds(
+            task_type="Base",
+            info_dict={
+                "text": ["hello"],
+                "ref_audio": ["ref.wav"],
+                "x_vector_only_mode": [True],
+                "non_streaming_mode": [False],
+            },
+        )
 
 
 def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():

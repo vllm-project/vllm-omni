@@ -92,6 +92,16 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
             "and tpop controls both text TPOP and internal stream TPOP."
         ),
     )
+    group.add_argument(
+        "--omni-request-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Total per-request timeout in seconds for benchmark HTTP requests. Timed-out requests are "
+            "recorded as failed instead of stalling the run on a hung server. Defaults to 900 when "
+            "omitted; set <= 0 to restore the legacy 6 h cap."
+        ),
+    )
 
 
 def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -103,8 +113,8 @@ def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="think",
         help=(
-            "Default bot_task form field for --backend openai-image-edits-omni "
-            "(/v1/images/edits). "
+            "Default bot_task form field for image edits "
+            "(--backend openai-image-edits-omni or --endpoint /v1/images/edits). "
             'Use --extra-body \'{"bot_task":"..."}\' to override per run.'
         ),
     )
@@ -352,6 +362,12 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             raise ValueError("OmniInteract requires --max-concurrency to be positive")
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
-    if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:
+    backend = getattr(args, "backend", None)
+    endpoint = getattr(args, "endpoint", None)
+    # serve.py remaps implicit backend to the endpoint path for image edits;
+    # inject bot_task for both the named backend and /v1/images/edits.
+    if bot_task is not None and (
+        backend in ("openai-image-edits-omni", "/v1/images/edits") or endpoint == "/v1/images/edits"
+    ):
         extra_body.setdefault("bot_task", bot_task)
     args.extra_body = extra_body

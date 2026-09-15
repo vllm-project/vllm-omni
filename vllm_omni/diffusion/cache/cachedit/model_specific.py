@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Model-specific Cache-DiT adapters and enablers."""
 
@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.cachedit.backend import (
     CUSTOM_DIT_ENABLERS,
+    CacheDiTEnableResult,
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
@@ -836,6 +837,36 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def _get_magi2_transformer_block(pipeline: Any) -> torch.nn.Module:
+    return pipeline.transformer.block
+
+
+def enable_cache_for_magi2(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache only MAGI-2's repeated native transformer-layer stack.
+
+    The pre/post adapters still execute on every denoising step. MAGI-2 either
+    packs both CFG branches into one transformer call or assigns one branch to
+    each CFG-parallel rank. In both layouts each rank invokes this stack once
+    per denoising step, so it remains a non-separate-CFG Pattern-3 stack.
+    """
+
+    transformer_block = _get_magi2_transformer_block(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer_block,
+        blocks=[transformer_block.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=False,
+        check_forward_pattern=True,
+    )
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter,
+        get_pipeline_transformer=_get_magi2_transformer_block,
+    )
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -853,6 +884,7 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "Magi2Pipeline": enable_cache_for_magi2,
         }
     )
 

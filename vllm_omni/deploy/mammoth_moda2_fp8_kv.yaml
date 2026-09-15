@@ -1,0 +1,7 @@
+# MammothModa2 AR→DiT text-to-image with opt-in FP8 KV cache for the AR stage.
+
+base_config: mammoth_moda2.yaml
+
+stages:
+  - stage_id: 0
+    kv_cache_dtype: fp8_e4m3

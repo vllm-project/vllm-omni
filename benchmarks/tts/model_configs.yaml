@@ -17,12 +17,23 @@ models:
         extra_params:
           lang: en
           text_normalization: true
+  # Audio8 TTS Preview: DualAR, 44.1 kHz. trust_remote_code stays false.
+  # Bench at 44.1 kHz: export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100, otherwise
+  # the streamed-PCM duration defaults to 24 kHz and RTF looks 1.84x too good.
+  Audio8/Audio8-TTS-Preview-0.6b:
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
 
   # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
   # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
   # at model runtime).  Use -Base for voice_clone.
   Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice:
-    supported_tasks: [default_voice, voice_design]
+    supported_tasks: [default_voice]
     backend: openai-audio-speech
     endpoint: /v1/audio/speech
     trust_remote_code: true
@@ -31,6 +42,13 @@ models:
         voice: Vivian
         language: English
         task_type: CustomVoice
+
+  Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign:
+    supported_tasks: [voice_design]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
       voice_design:
         task_type: VoiceDesign
         language: English
@@ -132,3 +150,14 @@ models:
     endpoint: /v1/audio/speech
     task_extra_body:
       voice_design: {}
+
+  # OmniVoice serves plain text-to-speech over /v1/audio/speech; voice cloning
+  # and voice design are offline-only for this model, so default_voice is the
+  # only task the server can answer.
+  k2-fsa/OmniVoice:
+    supported_tasks: [default_voice]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice: {}

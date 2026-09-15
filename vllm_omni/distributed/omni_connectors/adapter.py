@@ -227,16 +227,21 @@ def construct_next_stage_streaming_input_prompt(
     previous_condition_seq: int | None = None,
     condition_seq: int | None = None,
     recompute_previous_chunks: int = 0,
+    recompute_on_capacity: bool = False,
 ) -> bool:
-    """Update a downstream streaming request prompt from connector payload ids.
+    """Update a downstream streaming request prompt from connector payload.
 
     Async-chunk downstream stages are prewarmed before the real Talker prompt is
-    known. When a Thinker payload carries ``ids.prompt``, this helper:
+    known. When a Thinker payload carries ``ids.prompt`` or declares the
+    placeholder length in ``meta.next_stage_prompt_len``, this helper:
 
     * Preserves ``num_computed_tokens`` while extending a non-window prompt.
-      Explicit replacements and one-condition window recomputes reset it.
+      Explicit replacements and one-condition window recomputes reset it. A
+      full-attention Talker recomputes only when the next condition would
+      exceed its context limit.
     * Moves already-computed output tokens into ``prompt_token_ids``.
-    * Appends a new placeholder prompt slice sized from the upstream ids.
+    * Appends a placeholder slice using the declared downstream prompt length,
+      or derives its length from ``ids.prompt`` for legacy producers.
     * Refreshes block hashes so the scheduler allocates KV slots for the
       extended prompt without discarding prior computed state.
     """
@@ -285,12 +290,28 @@ def construct_next_stage_streaming_input_prompt(
     explicit_replacement = meta.get("replace_streaming_prompt") is True
     if isinstance(recompute_previous_chunks, bool) or recompute_previous_chunks not in (0, 1):
         raise ValueError("streaming prompt recompute supports exactly one previous chunk")
+    if not isinstance(recompute_on_capacity, bool):
+        raise ValueError("recompute_on_capacity must be a bool")
     has_window_contract = recompute_previous_chunks == 1
-    window_recompute = not explicit_replacement and has_window_contract and previous_condition_seq is not None
+    if recompute_on_capacity and not has_window_contract:
+        raise ValueError("capacity-triggered streaming prompt recompute requires window_size=1")
+    if (
+        recompute_on_capacity
+        and not explicit_replacement
+        and previous_condition_seq is not None
+        and generation_reserve == 0
+    ):
+        raise ValueError("capacity-triggered streaming prompt recompute requires a positive generation reserve")
     exceeds_accumulated_capacity = (
         managed_prompt_len is not None
         and capacity_limit is not None
         and request.num_computed_tokens + managed_prompt_len + generation_reserve > capacity_limit
+    )
+    window_recompute = (
+        not explicit_replacement
+        and has_window_contract
+        and previous_condition_seq is not None
+        and (exceeds_accumulated_capacity if recompute_on_capacity else True)
     )
     if not explicit_replacement and exceeds_accumulated_capacity and not window_recompute:
         raise ValueError("capacity-managed streaming prompt rollover requires window_size=1")
@@ -369,7 +390,12 @@ def construct_next_stage_streaming_input_prompt(
         request.update_block_hashes()
         return True
     prompt_token_ids = ids.get("prompt", None)
-    if not prompt_token_ids:
+    has_declared_prompt_len = (
+        isinstance(next_stage_prompt_len, int)
+        and not isinstance(next_stage_prompt_len, bool)
+        and next_stage_prompt_len > 0
+    )
+    if not has_declared_prompt_len and not prompt_token_ids:
         return False
     num_computed_tokens = request.num_computed_tokens
     kept_output_tokens = request._all_token_ids[request.num_prompt_tokens : num_computed_tokens]
@@ -378,7 +404,7 @@ def construct_next_stage_streaming_input_prompt(
     assert request.prompt_token_ids is not None
     # Extend prompt with kept output tokens.
     request.prompt_token_ids.extend(kept_output_tokens)
-    if isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
+    if has_declared_prompt_len:
         next_prompt_len = next_stage_prompt_len
     else:
         next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))

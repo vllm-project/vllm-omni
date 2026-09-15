@@ -9,7 +9,7 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -27,7 +27,10 @@ MODELS: dict[str, dict[str, int | None]] = {**AUDIO_MODEL, **IMAGE_MODELS}
 
 MODEL_MARKS = {
     "riverclouds/qwen_image_random": pytest.mark.core_model,
-    "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
+    "stabilityai/stable-audio-open-1.0": [
+        pytest.mark.full_model,
+        *hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}),
+    ],
 }
 
 _GATED_MODELS = {"stabilityai/stable-audio-open-1.0"}

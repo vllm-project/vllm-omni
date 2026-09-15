@@ -7,11 +7,18 @@ attention only against the selected top-k blocks.
 
 The supported checkpoint provides both text-to-video and image-to-video modes through `Wan22Pipeline`; the separate Wan I2V-14B, S2V, and VACE pipelines are outside this backend's supported scope.
 
+MiniMax-H3 served with a FastH3 VSA adapter uses a second, H3-specific route
+through the same backend. See the
+[MiniMax-H3 recipe](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) for its geometry,
+supported topologies, and commands.
+
 VSA is a CUDA-only, explicitly selected backend. It requires the
 `fastvideo-kernel` package and currently supports non-causal self-attention
 with equal query and key/value sequence lengths. Unsupported shapes, masks,
 dtypes, sequence-parallel execution, or kernel failures fall back to
-`TORCH_SDPA` and emit a warning with the reason.
+`TORCH_SDPA` and emit a warning with the reason. On the Wan route, an active
+sequence-parallel context is one of those fallbacks; the H3 route supports pure
+Ulysses and rejects ring or all-gather sequence parallelism at startup.
 
 ## Enable the backend
 
@@ -119,7 +126,8 @@ the backend guarantees sparse execution:
 - `route=SDPA` or `FASTVIDEO_VSA falling back to SDPA: ...` means dense SDPA
   executed; the warning includes the reason.
 
-The current kernel requires CUDA tensors in FP16 or BF16, 256-token blocks,
+The Wan route requires CUDA tensors in FP16 or BF16, 256-token blocks,
 standard `head_size**-0.5` scaling, equal Q/K/V head counts, no attention mask,
-and no active sequence-parallel context. NPU and XPU paths do not execute the
-FastVideo VSA CUDA kernel.
+and no active sequence-parallel context. The MiniMax-H3 route uses 64-token
+`(4, 4, 4)` blocks and supports pure Ulysses. NPU and XPU paths do not execute
+the FastVideo VSA CUDA kernel.

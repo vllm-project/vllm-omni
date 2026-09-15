@@ -136,7 +136,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + reduced_token_params, indirect=True)
 def test_text_to_text_audio_001(omni_server, online_client) -> None:
     """
@@ -156,7 +156,7 @@ def test_text_to_text_audio_001(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_video_to_text_001(omni_server, online_client) -> None:
     """
@@ -180,7 +180,7 @@ def test_text_video_to_text_001(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + reduced_token_params, indirect=True)
 def test_text_audio_to_text_audio_002(omni_server, online_client) -> None:
     """
@@ -205,7 +205,7 @@ def test_text_audio_to_text_audio_002(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_large_image_to_text_audio_001(omni_server, online_client) -> None:
     """
@@ -233,7 +233,7 @@ def test_large_image_to_text_audio_001(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_video_to_text_audio_001(omni_server, online_client) -> None:
     """
@@ -258,7 +258,7 @@ def test_text_video_to_text_audio_001(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_in_video_001(omni_server, online_client) -> None:
     """
@@ -284,7 +284,7 @@ def test_audio_in_video_001(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_in_video_002(omni_server, online_client) -> None:
     """
@@ -311,7 +311,7 @@ def test_audio_in_video_002(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_in_video_default_loader_sampling_regression(omni_server, online_client) -> None:
     """
@@ -349,7 +349,7 @@ def test_audio_in_video_default_loader_sampling_regression(omni_server, online_c
     online_client.send_omni_request(dict(base_config))
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_one_word_prompt_001(omni_server, online_client) -> None:
     """Catastrophic-regression gate on one-word pronunciation.
@@ -403,7 +403,7 @@ def test_one_word_prompt_001(omni_server, online_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_speaker_001(omni_server, online_client) -> None:
     """
@@ -428,7 +428,7 @@ def test_speaker_001(omni_server, online_client) -> None:
     online_client.send_omni_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_speaker_002(omni_server, online_client) -> None:
     """
@@ -463,7 +463,7 @@ def test_speaker_002(omni_server, online_client) -> None:
             print(f"Gender assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
     """
