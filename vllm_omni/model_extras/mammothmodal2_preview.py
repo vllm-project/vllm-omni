@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -71,6 +71,9 @@ MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS = frozenset(
         # than OmniDiffusionRequest, so the standard --num-inference-steps flag does
         # not reach it; it is routed through extra_body like the CFG knobs.
         "num_inference_steps",
+        # Per-request latent seed and generator device for reproducible batching.
+        "seed",
+        "generator_device",
     }
 )
 
@@ -97,5 +100,5 @@ def build_x_to_text_prompt(
     )
 
 
-MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS = frozenset()
+MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
 MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES = True
