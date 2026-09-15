@@ -774,6 +774,8 @@ class Orchestrator:
         )
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
+        for role, companion_id in (msg.cfg_companion_ids or {}).items():
+            self._cfg_tracker.register_companion(request_id, role, companion_id)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
