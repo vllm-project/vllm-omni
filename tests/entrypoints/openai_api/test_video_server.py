@@ -43,7 +43,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _read_upload_limited,
     _reference_video_decode_spec,
 )
-from vllm_omni.errors import GuardrailViolationError
+from vllm_omni.errors import GuardrailViolationError, OmniServerError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -2766,3 +2766,35 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+def test_async_cfg_timeout_preserves_504_on_retrieve(test_client, mocker: MockerFixture):
+    message = "CFG companion deadline exceeded: video__neg"
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=OmniServerError(message, status_code=504, error_type="GatewayTimeoutError"),
+    )
+    response = test_client.post("/v1/videos", data={"prompt": "timeout prompt"})
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+
+    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
+    assert failed["error"]["code"] == 504
+    assert failed["error"]["message"] == message
+
+    retrieve = test_client.get(f"/v1/videos/{video_id}")
+    assert retrieve.status_code == 504
+    assert retrieve.json()["error"]["code"] == 504
+
+
+def test_sync_cfg_timeout_preserves_504(test_client, mocker: MockerFixture):
+    message = "CFG companion deadline exceeded: video__neg"
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=OmniServerError(message, status_code=504, error_type="GatewayTimeoutError"),
+    )
+    response = test_client.post("/v1/videos/sync", data={"prompt": "timeout prompt"})
+    assert response.status_code == 504
+    assert response.json()["detail"] == message

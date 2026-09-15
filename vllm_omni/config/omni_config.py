@@ -1381,6 +1381,7 @@ class VllmOmniOrchestratorConfig:
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = Field(default=30.0, gt=0.0)
     batch_timeout: int = Field(default=10, ge=0)
+    cfg_companion_timeout: float = Field(default=600.0, gt=0.0, allow_inf_nan=False)
     # When True, stages sharing a physical GPU initialize concurrently, guarded
     # by pre-launch admission control + engine-core-held SH/EX device locks
     # (see stage_admission / stage_phase_lock). Default False keeps the legacy

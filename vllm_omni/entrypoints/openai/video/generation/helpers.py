@@ -69,7 +69,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_audio_url,
     decode_input_reference,
 )
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import OmniRequestError
 
 logger = init_logger(__name__)
 
@@ -257,7 +257,7 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
         message = str(exc.detail) if exc.detail else str(exc)
         return VideoError(code=exc.status_code, message=message)
 
-    if isinstance(exc, OmniClientError):
+    if isinstance(exc, OmniRequestError):
         return VideoError(code=exc.status_code, message=exc.message)
 
     if isinstance(exc, (EngineGenerateError, EngineDeadError)):

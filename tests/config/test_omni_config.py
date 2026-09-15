@@ -37,6 +37,7 @@ from vllm_omni.config.omni_config import (
     VllmOmniConfig,
     VllmOmniDiffusionStageConfig,
     VllmOmniGenerationStageConfig,
+    VllmOmniOrchestratorConfig,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
@@ -591,6 +592,7 @@ def test_from_pipeline_config_maps_orchestrator_cli_overrides():
             "omni_lb_policy": "round_robin",
             "omni_heartbeat_timeout": 9.5,
             "batch_timeout": 3,
+            "cfg_companion_timeout": 45.0,
         },
     )
 
@@ -605,6 +607,13 @@ def test_from_pipeline_config_maps_orchestrator_cli_overrides():
     assert orchestrator_config.omni_lb_policy == "round_robin"
     assert orchestrator_config.omni_heartbeat_timeout == 9.5
     assert orchestrator_config.batch_timeout == 3
+    assert orchestrator_config.cfg_companion_timeout == 45.0
+
+
+@pytest.mark.parametrize("timeout", [0.0, float("nan"), float("inf")])
+def test_orchestrator_config_rejects_invalid_cfg_companion_timeout(timeout: float):
+    with pytest.raises(ValidationError, match="cfg_companion_timeout"):
+        VllmOmniOrchestratorConfig(cfg_companion_timeout=timeout)
 
 
 def test_from_pipeline_config_records_loaded_deploy_path_on_orchestrator_config():
@@ -1480,7 +1489,8 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
-    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    # A local model path keeps this config-only test independent of the Hub.
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
     assert od_config.kv_transfer_config.engine_id == "dit-engine-1"
 

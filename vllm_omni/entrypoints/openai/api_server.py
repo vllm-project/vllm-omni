@@ -193,7 +193,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
     remove_route_from_app,
 )
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import OmniRequestError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
@@ -1928,8 +1928,8 @@ async def generate_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as e:
-        logger.info("Client error during image generation: %s", e)
+    except OmniRequestError as e:
+        logger.info("Request error during image generation: %s", e)
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
@@ -2298,8 +2298,8 @@ async def edit_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as e:
-        logger.info("Client error during image edit: %s", e)
+    except OmniRequestError as e:
+        logger.info("Request error during image edit: %s", e)
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
@@ -2426,8 +2426,8 @@ async def create_video_sync(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
-    except OmniClientError as exc:
-        logger.info("Client error during sync video generation: %s", exc)
+    except OmniRequestError as exc:
+        logger.info("Request error during sync video generation: %s", exc)
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except Exception as exc:
         logger.exception("Sync video generation failed for request_id=%s", request_id)

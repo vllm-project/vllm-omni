@@ -61,6 +61,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     tts_entry_stage_archs,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.errors import OmniRequestError
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
@@ -1774,9 +1775,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             error: dict[str, Any] = {
                 "message": str(e),
-                "type": "server_error",
+                "type": e.error_type if isinstance(e, OmniRequestError) else "server_error",
                 "param": None,
-                "code": HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                "code": e.status_code if isinstance(e, OmniRequestError) else HTTPStatus.INTERNAL_SERVER_ERROR.value,
             }
             if emitted_audio:
                 error.update(partial_audio=True, action="discard")
@@ -2331,6 +2332,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._diffusion_error_response("Client disconnected")
         except (EngineGenerateError, EngineDeadError):
             raise  # Propagate to the global Omni exception handler
+        except OmniRequestError as e:
+            return self._diffusion_error_response(str(e), status_code=e.status_code, err_type=e.error_type)
         except ValueError as e:
             return self._diffusion_error_response(str(e), status_code=400)
         except Exception as e:
@@ -2338,7 +2341,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._diffusion_error_response(f"Speech generation failed: {e}")
 
     @staticmethod
-    def _diffusion_error_response(message: str, status_code: int = 500) -> Response:
+    def _diffusion_error_response(message: str, status_code: int = 500, *, err_type: str | None = None) -> Response:
         """Create a JSON error response without depending on OpenAIServing.
 
         Args:
@@ -2346,8 +2349,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             status_code: HTTP status code; defaults to 500. Pass a 4xx code for
                 client-input validation failures so the response semantics match
                 the OpenAI-compatible behavior used by ``create_speech``.
+            err_type: Explicit request error type, or the default for the status.
         """
-        err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
+        if err_type is None:
+            err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
         error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
         return Response(content=error_body, media_type="application/json", status_code=status_code)
 
@@ -2572,6 +2577,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
             )
             raise  # Propagate to the global Omni exception handler
+        except OmniRequestError as e:
+            return self._diffusion_error_response(str(e), status_code=e.status_code, err_type=e.error_type)
         except ValueError as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.warning(
