@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import (
     build_attention_config,
     parse_attention_config,
 )
+from vllm_omni.diffusion.forward_context import ForwardContext
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -1059,6 +1060,103 @@ class TestOptInFloat32Fallback:
         impl = attention.sdpa_fallback if expected == "fallback" else attention.attention
         assert impl.kwargs["num_kv_heads"] == 2
         assert impl.kwargs["softmax_scale"] == 0.25
+
+    @pytest.mark.parametrize("padding_hint", [False, None, True])
+    @pytest.mark.parametrize(
+        "parallel,compiling",
+        [
+            pytest.param(False, False, id="no-sp-eager"),
+            pytest.param(True, False, id="sp-eager"),
+            pytest.param(False, True, id="no-sp-compiling"),
+            pytest.param(True, True, id="sp-compiling"),
+        ],
+    )
+    def test_padding_hint_invalidated_at_compile_or_parallel_boundary(
+        self, monkeypatch, padding_hint, parallel, compiling
+    ):
+        attention, events, state = self._make_attention(monkeypatch, allow=False)
+        if not parallel:
+            attention.parallel_strategy = layer_mod.NoParallelAttention()
+        # Exercise the compile guard without compiling fake kernels or SP collectives.
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
+        query = torch.ones(1, 2, 4, 8)
+        metadata = AttentionMetadata(
+            attn_mask=torch.ones(1, 2, dtype=torch.bool),
+            attn_mask_has_padding=padding_hint,
+            extra={"layer": 0},
+        )
+
+        output = attention(query, query, query, metadata)
+
+        forwarded = state["kernel_call"][3]
+        assert forwarded.attn_mask_has_padding is (None if parallel or compiling else padding_hint)
+        assert metadata.attn_mask_has_padding is padding_hint
+        if parallel:
+            prepared = state["prepared"][3]
+            # Compilation clears the hint at entry; eager SP clears only after pre_attention.
+            assert prepared.attn_mask_has_padding is (None if compiling else padding_hint)
+            assert (forwarded is prepared) is (compiling or padding_hint is None)
+        else:
+            assert (forwarded is metadata) is (not compiling or padding_hint is None)
+        assert forwarded.attn_mask is metadata.attn_mask
+        assert forwarded.extra is metadata.extra
+        assert events == (["pre", "selected", "post"] if parallel else ["selected"])
+        torch.testing.assert_close(output, query + (12 if parallel else 4))
+
+    @pytest.mark.parametrize("padding_hint", [False, True])
+    def test_compiled_padding_hint_cleared_before_hsdp_graph_break(self, monkeypatch, padding_hint):
+        attention, events, state = self._make_attention(monkeypatch, allow=False)
+        compiling = {"active": True}
+        config = OmniDiffusionConfig()
+        config.parallel_config.use_hsdp = True
+        context = ForwardContext(omni_diffusion_config=config)
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling["active"])
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(layer_mod, "get_forward_context", lambda: context)
+        seen = []
+
+        def boundary(query, key, value, metadata):
+            seen.append(metadata)
+            # Simulate @compiler.disable: the real _forward_impl now executes eagerly.
+            compiling["active"] = False
+            return attention._forward_impl(query, key, value, metadata)
+
+        monkeypatch.setattr(attention, "_forward_hsdp_compile_boundary", boundary)
+        query = torch.ones(1, 2, 4, 8)
+        metadata = AttentionMetadata(
+            attn_mask=torch.ones(1, 2, dtype=torch.bool),
+            attn_mask_has_padding=padding_hint,
+        )
+
+        output = attention(query, query, query, metadata)
+
+        assert len(seen) == 1
+        assert seen[0].attn_mask_has_padding is None
+        assert seen[0] is not metadata
+        assert seen[0].attn_mask is metadata.attn_mask
+        assert state["kernel_call"][3] is seen[0]
+        assert metadata.attn_mask_has_padding is padding_hint
+        assert events == ["selected"]
+        torch.testing.assert_close(output, query + 4)
+
+    @pytest.mark.parametrize("padding_hint", [False, None, True])
+    def test_padding_hint_preserves_automatic_fp32_fallback(self, monkeypatch, padding_hint):
+        attention, events, state = self._make_attention(monkeypatch)
+        attention.parallel_strategy = layer_mod.NoParallelAttention()
+        # Simulate only the CUDA dispatch predicate; tensors and kernels stay on CPU.
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        query = torch.ones(1, 2, 4, 8, dtype=torch.float32)
+        metadata = AttentionMetadata(
+            attn_mask=torch.ones(1, 2, dtype=torch.bool),
+            attn_mask_has_padding=padding_hint,
+        )
+
+        output = attention(query, query, query, metadata)
+
+        assert events == ["fallback"]
+        assert state["kernel_call"][3] is metadata
+        assert metadata.attn_mask_has_padding is padding_hint
+        torch.testing.assert_close(output, query + 4)
 
     def test_explicit_backend_failure_is_not_retried_with_sdpa(self, monkeypatch):
         attention, events, _ = self._make_attention(monkeypatch, backend="FLASH_ATTN")
