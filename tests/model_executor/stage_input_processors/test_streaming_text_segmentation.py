@@ -1,205 +1,320 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Contract tests for the online CAPS segmenter (RFC #6496 mechanism 2).
 
-import random
+The first four tests are the worked examples from the PR review: they pin the
+token-by-token call sequence, the cut position and the per-level thresholds, so
+the online state machine cannot silently drift back to an offline helper.
+"""
 
 import pytest
 
 from vllm_omni.model_executor.stage_input_processors.streaming_text_segmentation import (
     CapacityAdaptiveSegmenter,
+    classify_punctuation_level,
+    compute_thresholds,
+    derive_text_token_capacity,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# "No fear of words, no fear of years. Better later than never."
+_TOKENS_ONE_SEGMENT = [
+    "No",
+    " fear",
+    " of",
+    " words,",
+    " no",
+    " fear",
+    " of",
+    " years.",
+    " Better",
+    " later",
+    " than",
+    " never.",
+]
 
-def _zh_chars(text: str) -> list[str]:
-    """Char-tokenize zh text; punctuation stays its own single-char token."""
-    return list(text)
+# Same sentence plus a clause carrying " What's more," and " fresh,".
+_TOKENS_TWO_LEVELS = [
+    "No",
+    " fear",
+    " of",
+    " words,",
+    " no",
+    " fear",
+    " of",
+    " years.",
+    " Better",
+    " later",
+    " than",
+    " never.",
+    " What's",
+    " more,",
+    " tomorrow",
+    " is",
+    " always",
+    " fresh,",
+    " with",
+    " no",
+    " mistakes",
+    " in",
+    " it",
+    " yet.",
+]
 
-
-def test_budget_is_capacity_divided_by_measured_rho():
-    segmenter = CapacityAdaptiveSegmenter()
-    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)  # rho = 2.0
-
-    assert segmenter.open_segment(remaining_capacity=200) == 100
-    assert segmenter.open_segment(remaining_capacity=150) == 75
-
-
-def test_ema_smooths_rho_estimates():
-    segmenter = CapacityAdaptiveSegmenter(ema_alpha=0.5)
-    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)  # rho = 2.0
-    segmenter.observe_segment(acoustic_steps=200, text_tokens=50)  # rho = 4.0
-
-    assert segmenter.rho_hat == pytest.approx(3.0)  # 0.5 * 4 + 0.5 * 2
-
-
-def test_warmup_uses_caller_default_until_first_observation():
-    segmenter = CapacityAdaptiveSegmenter()
-
-    assert segmenter.open_segment(remaining_capacity=200, max_text_tokens=30) == 30
-    assert segmenter.open_segment(remaining_capacity=200) == 1
-
-    segmenter.observe_segment(acoustic_steps=50, text_tokens=50)  # rho = 1.0
-    assert segmenter.open_segment(remaining_capacity=200) == 200
-
-
-def test_max_text_tokens_caps_budget():
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-
-    assert segmenter.open_segment(remaining_capacity=200, max_text_tokens=50) == 50
-
-
-def test_frozen_budget_is_immune_to_mid_segment_observations():
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-    budget = segmenter.open_segment(remaining_capacity=100)
-    assert budget == 100
-
-    # A mid-segment observation must not shift the already-frozen budget.
-    segmenter.observe_segment(acoustic_steps=500, text_tokens=50)  # rho = 10
-    assert segmenter.active_budget == 100
-
-    # It does shape the *next* segment's budget.
-    assert segmenter.open_segment(remaining_capacity=100) == 10
-
-
-def test_segment_never_exceeds_acoustic_capacity():
-    """#5889 regression property: budget * rho_hat <= remaining_capacity."""
-    segmenter = CapacityAdaptiveSegmenter()
-    segmenter.observe_segment(acoustic_steps=60, text_tokens=30)  # rho = 2.0
-
-    for capacity in (30, 61, 149, 150, 1000):
-        budget = segmenter.open_segment(remaining_capacity=capacity)
-        assert budget * segmenter.rho_hat <= capacity
+# Token positions used by the two-level examples.
+_PERIOD_BEFORE_L1 = 12  # " never." -- below the level-1 threshold
+_COMMA_BEFORE_L2 = 14  # " more,"   -- below the level-2 threshold
+_COMMA_AT_L2 = 18  # " fresh,"  -- reaches the level-2 threshold
 
 
-def test_punctuation_rank_prefers_sentence_final_over_clause():
-    tokens = _zh_chars("一二三四五六七八。九十，然后继续")
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-    segmenter.open_segment(remaining_capacity=12)
-
-    cut = segmenter.select_cut(tokens)
-    # Window is [0.7*12, 12) = [8, 12): "。" at index 8 and a weaker "，" at
-    # index 11 both qualify; strength wins over rightmost-ness.
-    assert cut.cut_index == 9
-    assert cut.reason == "sentence_final"
-    assert cut.fill_fraction >= 0.7
+def _segmenter(**kwargs) -> CapacityAdaptiveSegmenter:
+    """Segmenter whose capacity equals the remaining budget it is given."""
+    return CapacityAdaptiveSegmenter(warmup_expansion_ratio=1.0, safety_margin=0, **kwargs)
 
 
-def test_weaker_punctuation_accepted_when_budget_drains():
-    # No sentence-final inside the window; clause "，" at index 10 qualifies.
-    tokens = _zh_chars("一二三四五六七八九十，然后继续说话内容很长")
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-    segmenter.open_segment(remaining_capacity=13)
-
-    cut = segmenter.select_cut(tokens)
-    assert cut.reason == "clause"
-    assert cut.cut_index == 11
-
-
-def test_punctuation_below_fill_window_is_rejected_and_hard_cuts():
-    # Sentence-final at index 5 fills only 5/12 < 0.7 * 12; text continues
-    # past the budget, so the segment hard-cuts at the ceiling.
-    tokens = _zh_chars("短句。然后后面还有很长很长的内容继续往下说")
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-    segmenter.open_segment(remaining_capacity=12)
-
-    cut = segmenter.select_cut(tokens)
-    assert cut.reason == "hard_cut"
-    assert cut.cut_index == 12
-    assert cut.fill_fraction == 1.0
+def _cuts(capacity: int, tokens: list[str]) -> list[tuple[int, int, bool]]:
+    """Drive one segment online and return ``(text_tokens, punct_level, forced)``."""
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=capacity)
+    cuts = segmenter.append_tokens(tokens)
+    final = segmenter.finish()
+    if final is not None:
+        cuts.append(final)
+    return [(cut.text_tokens, cut.punct_level, cut.is_forced) for cut in cuts]
 
 
-def test_text_ending_inside_window_cuts_at_end_of_text():
-    tokens = _zh_chars("今天的内容就到这里")
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-    segmenter.open_segment(remaining_capacity=20)
+def test_single_level_example_splits_at_the_sentence_final_boundary():
+    """Review example 1: capacity 10 with level-1 ratio 0.7 cuts at token 8.
 
-    cut = segmenter.select_cut(tokens)
-    assert cut.reason == "end_of_text"
-    assert cut.cut_index == len(tokens)
-
-
-def test_committed_abbreviation_token_is_never_a_sentence_cut():
-    tokens = ["this", "is", "e.g.", "中文"]
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-    segmenter.open_segment(remaining_capacity=4)
-
-    cut = segmenter.select_cut(tokens)
-    assert cut.reason != "sentence_final"
-    assert cut.cut_index == len(tokens)
-
-
-def test_multi_char_punctuation_run_is_classified_by_first_char():
-    tokens = _zh_chars("他说完了……然后继续")
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0)
-    segmenter.open_segment(remaining_capacity=8)
-
-    cut = segmenter.select_cut(tokens)
-    assert cut.reason == "sentence_final"
-
-
-@pytest.mark.parametrize("budget", (8, 12, 20))
-@pytest.mark.parametrize("seed", (0, 1, 2))
-def test_fragmentation_bound_holds_with_random_punctuation(budget: int, seed: int) -> None:
-    """Greedy fill-window segmentation never over-fragments.
-
-    Every non-final segment fills at least floor(alpha * budget) tokens, so
-    segment count is bounded by ceil(total / floor(alpha * budget)) + 1.
+    The comma at token 4 stays open because the clause level needs 8 tokens.
     """
-    rng = random.Random(seed)
-    alphabet = "abcdefghijklmnopqrstuvwxyz"
-    punct = "。，、"
-    tokens: list[str] = []
-    for _ in range(250):
-        if rng.random() < 0.06:
-            tokens.append(rng.choice(punct))
-        else:
-            tokens.append(rng.choice(alphabet))
-
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=1.0, min_fill_fraction=0.7)
-    consumed = 0
-    segments = 0
-    min_fill = 1.0
-    floor_fill = max(1, int(0.7 * budget)) / budget
-    while consumed < len(tokens):
-        segmenter.open_segment(remaining_capacity=budget)
-        cut = segmenter.select_cut(tokens[consumed:])
-        assert cut.cut_index >= max(1, int(0.7 * budget)) or consumed + cut.cut_index >= len(tokens)
-        # Only non-final segments must fill the window; the tail segment may
-        # legitimately be short (end_of_text).
-        if consumed + cut.cut_index < len(tokens):
-            min_fill = min(min_fill, cut.fill_fraction)
-        consumed += cut.cut_index
-        segments += 1
-
-    bound = -(-len(tokens) // max(1, int(0.7 * budget))) + 1
-    assert min_fill >= floor_fill
-    assert segments <= bound
+    assert _cuts(10, _TOKENS_ONE_SEGMENT) == [(8, 1, False), (4, 0, True)]
 
 
-def test_open_segment_requires_positive_capacity():
+def test_weaker_boundary_waits_for_its_own_stricter_threshold():
+    """Review example 2: capacity 20, L1=0.7, L2=0.8 cuts at token 18.
+
+    The period at token 12 and the comma at token 14 are both too early; only
+    the comma at token 18 clears the clause threshold.
+    """
+    assert _cuts(20, _TOKENS_TWO_LEVELS)[0] == (_COMMA_AT_L2, 2, False)
+
+
+def test_stronger_boundary_below_its_threshold_does_not_cut():
+    """The period at token 12 is under the level-1 threshold, so nothing cuts."""
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=20)
+    assert segmenter.append_tokens(_TOKENS_TWO_LEVELS[:_PERIOD_BEFORE_L1]) == []
+
+
+def test_weaker_boundary_below_its_threshold_does_not_cut():
+    """The comma at token 14 is under the level-2 threshold, so nothing cuts."""
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=20)
+    assert segmenter.append_tokens(_TOKENS_TWO_LEVELS[:_COMMA_BEFORE_L2]) == []
+
+
+def test_threshold_is_met_by_the_token_that_reaches_it():
+    """Off-by-one regression: capacity 10 * 0.7 = 7 splits at the 7th token."""
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=10)
+    cuts = segmenter.append_tokens(["a", "b", "c", "d", "e", "f", "done."])
+    assert len(cuts) == 1
+
+
+def test_token_by_token_matches_batched_append():
+    """The online decision must not depend on how tokens are batched."""
+    online = _segmenter()
+    online.start_segment(remaining_capacity=20)
+    token_by_token = [cut for token in _TOKENS_TWO_LEVELS if (cut := online.append_token(token)) is not None]
+
+    batched = _segmenter()
+    batched.start_segment(remaining_capacity=20)
+    assert token_by_token == batched.append_tokens(_TOKENS_TWO_LEVELS)
+
+
+def test_committed_boundary_is_not_moved_by_later_tokens():
+    """A cut commits on the boundary token; the next segment starts empty."""
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=20)
+    segmenter.append_tokens(_TOKENS_TWO_LEVELS[: _COMMA_AT_L2 - 1])
+    cut = segmenter.append_token(" fresh,")
+    assert cut is not None and cut.text_tokens == _COMMA_AT_L2
+    assert segmenter.token_count == 0
+
+
+def test_ceiling_forces_a_cut_without_punctuation():
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=10)
+    cuts = segmenter.append_tokens(["w"] * 10)
+    assert [(cut.text_tokens, cut.is_forced) for cut in cuts] == [(10, True)]
+
+
+def test_finish_forces_the_tail_split():
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=10)
+    segmenter.append_tokens(["hello", " world"])
+    final = segmenter.finish()
+    assert final is not None and (final.text_tokens, final.is_forced) == (2, True)
+
+
+def test_finish_returns_none_when_the_tail_is_empty():
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=10)
+    assert segmenter.finish() is None
+
+
+def test_short_prefix_is_not_reported_as_end_of_text():
+    """A prefix shorter than the capacity stays open until finish()."""
+    segmenter = _segmenter()
+    segmenter.start_segment(remaining_capacity=10)
+    assert segmenter.append_token("No") is None
+
+
+def test_append_token_requires_an_open_segment():
+    segmenter = _segmenter()
+    with pytest.raises(RuntimeError, match="start_segment"):
+        segmenter.append_token("token")
+
+
+def test_start_segment_requires_an_expansion_ratio_estimate():
     segmenter = CapacityAdaptiveSegmenter()
-    with pytest.raises(ValueError, match="remaining_capacity"):
-        segmenter.open_segment(remaining_capacity=0)
+    with pytest.raises(RuntimeError, match="expansion-ratio estimate"):
+        segmenter.start_segment(remaining_capacity=100)
 
 
-def test_select_cut_requires_open_segment():
-    segmenter = CapacityAdaptiveSegmenter()
-    with pytest.raises(RuntimeError, match="open_segment"):
-        segmenter.select_cut(["a"])
+@pytest.mark.parametrize(
+    "token,expected_level",
+    [
+        ("done.", 1),
+        ("好。", 1),
+        ("really?", 1),
+        ("now!", 1),
+        ("fresh,", 2),
+        ("words;", 2),
+        ('done."', 1),
+        ("word", 0),
+        ("", 0),
+        ("tail ", 0),
+        ("\n", 3),
+        ("gap—", 3),
+        ("wait…", 3),
+    ],
+)
+def test_classify_punctuation_level_reads_the_right_boundary(token, expected_level):
+    assert classify_punctuation_level(token) == expected_level
+
+
+@pytest.mark.parametrize(
+    "remaining,ratio,safety,max_tokens,expected",
+    [
+        (108, 2.0, 8, None, 50),
+        (108, 2.0, 8, 20, 20),
+        (108, 2.0, 8, 80, 50),
+    ],
+)
+def test_capacity_is_capped_but_never_bypassed(remaining, ratio, safety, max_tokens, expected):
+    """max_text_tokens only lowers the capacity derived from the remaining budget."""
+    capacity = derive_text_token_capacity(
+        remaining_capacity=remaining,
+        expansion_ratio=ratio,
+        safety_margin=safety,
+        max_text_tokens=max_tokens,
+    )
+    assert capacity == expected
+
+
+def test_capacity_below_one_token_is_rejected():
+    with pytest.raises(ValueError, match="cannot fit one predicted text token"):
+        derive_text_token_capacity(remaining_capacity=9, expansion_ratio=2.0, safety_margin=8)
+
+
+def test_thresholds_tighten_with_the_punctuation_level():
+    thresholds = compute_thresholds(text_token_capacity=100)
+    assert thresholds.min_tokens_level1 < thresholds.min_tokens_level2 < thresholds.min_tokens_level3
+
+
+def test_threshold_ceiling_equals_the_capacity():
+    assert compute_thresholds(text_token_capacity=37).force_split_at == 37
+
+
+def test_non_monotonic_capacity_ratios_are_rejected():
+    with pytest.raises(ValueError, match="level1 <= level2 <= level3"):
+        compute_thresholds(text_token_capacity=10, level1_capacity_ratio=0.9, level2_capacity_ratio=0.8)
+
+
+def test_first_observation_seeds_the_expansion_ratio():
+    segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=7.0)
+    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)
+    assert segmenter.expansion_ratio == pytest.approx(2.0)
+
+
+def test_ema_smooths_subsequent_expansion_ratios():
+    segmenter = CapacityAdaptiveSegmenter(ema_alpha=0.5, warmup_expansion_ratio=2.0)
+    segmenter.observe_segment(acoustic_steps=100, text_tokens=50)  # seeds 2.0
+    segmenter.observe_segment(acoustic_steps=200, text_tokens=50)  # 4.0 -> 0.5*4 + 0.5*2
+    assert segmenter.expansion_ratio == pytest.approx(3.0)
+
+
+def test_degenerate_observations_are_ignored():
+    segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=2.0)
+    segmenter.observe_segment(acoustic_steps=0, text_tokens=10)
+    segmenter.observe_segment(acoustic_steps=10, text_tokens=0)
+    assert segmenter.expansion_ratio == pytest.approx(2.0)
+
+
+def test_frozen_thresholds_ignore_a_mid_segment_observation():
+    segmenter = _segmenter()
+    frozen = segmenter.start_segment(remaining_capacity=100)
+    segmenter.observe_segment(acoustic_steps=500, text_tokens=50)
+    assert segmenter.thresholds == frozen
+
+
+def test_measured_ratio_shapes_the_next_segment_capacity():
+    """Closed loop: a realized rho of 10 shrinks the next segment's capacity."""
+    segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=1.0, safety_margin=0)
+    segmenter.observe_segment(acoustic_steps=500, text_tokens=50)  # rho = 10
+    assert segmenter.start_segment(remaining_capacity=100).force_split_at == 10
+
+
+def test_segment_never_plans_more_acoustic_steps_than_remaining():
+    """#5889 capacity property: capacity * expansion_ratio <= remaining budget."""
+    segmenter = CapacityAdaptiveSegmenter(safety_margin=0)
+    segmenter.observe_segment(acoustic_steps=300, text_tokens=150)  # rho = 2.0
+    for remaining in (30, 61, 149, 150, 1000):
+        capacity = segmenter.start_segment(remaining_capacity=remaining).force_split_at
+        assert capacity * segmenter.expansion_ratio <= remaining
 
 
 def test_constructor_rejects_invalid_parameters():
     with pytest.raises(ValueError, match="ema_alpha"):
         CapacityAdaptiveSegmenter(ema_alpha=0.0)
-    with pytest.raises(ValueError, match="min_fill_fraction"):
-        CapacityAdaptiveSegmenter(min_fill_fraction=1.5)
-    with pytest.raises(ValueError, match="warmup_rho"):
-        CapacityAdaptiveSegmenter(warmup_rho=-1.0)
+    with pytest.raises(ValueError, match="warmup_expansion_ratio"):
+        CapacityAdaptiveSegmenter(warmup_expansion_ratio=0.5)
+    with pytest.raises(ValueError, match="level1 <= level2 <= level3"):
+        CapacityAdaptiveSegmenter(level1_capacity_ratio=0.9, level2_capacity_ratio=0.8)
 
 
-def test_degenerate_observations_are_ignored():
-    segmenter = CapacityAdaptiveSegmenter(warmup_rho=2.0)
-    segmenter.observe_segment(acoustic_steps=0, text_tokens=10)
-    segmenter.observe_segment(acoustic_steps=10, text_tokens=0)
-    assert segmenter.rho_hat == 2.0
+def test_segments_fill_at_least_the_weakest_early_threshold():
+    """Deterministic fragmentation bound: a cut never passes the level-1 ceiling.
+
+    Level 1 has the lowest threshold, so no non-final segment can be shorter
+    than ``min_tokens_level1``; segment count is therefore bounded by
+    ``ceil(total / min_tokens_level1) + 1``.
+    """
+    capacity = 20
+    # Alternating words and sentence-final separators: every second token is an
+    # eligible level-1 boundary once the threshold is reached.
+    tokens = [token for index in range(60) for token in (f"w{index}", "end.")]
+
+    segmenter = _segmenter()
+    thresholds = segmenter.start_segment(remaining_capacity=capacity)
+    cuts = segmenter.append_tokens(tokens)
+    final = segmenter.finish()
+    if final is not None:
+        cuts.append(final)
+
+    committed = cuts[:-1]
+    assert committed and all(cut.text_tokens >= thresholds.min_tokens_level1 for cut in committed)
+    assert len(cuts) <= -(-len(tokens) // thresholds.min_tokens_level1) + 1

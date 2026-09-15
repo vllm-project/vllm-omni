@@ -1,199 +1,370 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Model-independent capacity-adaptive segmentation policy for streaming TTS text.
+"""Online capacity-adaptive segmentation for streaming TTS text (CAPS).
 
-Sizes each text segment from the realized expansion ratio rho = A_k / n_k
-(acoustic decode steps per text token) of the segment that just finished,
-instead of a static chunk ramp (RFC #6496):
+RFC #6496 mechanism 2.  Speech spends acoustic capacity slowly while text
+arrives densely, so each released text segment is sized from the *realized*
+expansion ratio ``rho = acoustic_steps / text_tokens`` of the segment that just
+finished, instead of a static chunk ramp.
 
-* ``observe_segment`` feeds rho of the finished segment into an EMA estimate.
-* ``open_segment`` freezes the next segment's text-token budget as
-  ``remaining_capacity / rho_hat``.
-* ``select_cut`` picks the strongest punctuation cut point inside the fill
-  window ``[min_fill_fraction * budget, budget]`` and hard-cuts at the
-  ceiling otherwise. Every non-final segment fills at least
-  ``floor(min_fill_fraction * budget)`` tokens, bounding the segment count.
+The mechanism is **online**: text arrives token by token from an upstream
+stage, so the cut decision is made as each token arrives and never depends on
+the complete text::
 
-The engine is model- and tokenizer-agnostic: it consumes a token sequence
-whose punctuation is tokenized as its own token, and a scalar remaining
-acoustic capacity supplied by the caller.
+    segmenter = CapacityAdaptiveSegmenter(warmup_expansion_ratio=warmup)
+    segmenter.start_segment(remaining_capacity=budget)
+    while token := next_token():
+        cut = segmenter.append_token(token)   # None while the segment stays open
+    final = segmenter.finish()                # forced split of the tail
+
+Thresholds are frozen when a segment opens and are **per punctuation level**,
+progressively tightening: a sentence-final boundary may cut once
+``level1_capacity_ratio`` of the capacity is filled, a clause boundary waits
+for ``level2_capacity_ratio`` and a weak pause for
+``level3_capacity_ratio``.  Nothing cuts before its own level threshold.  The
+only other exits are ``force_split_at`` (the hard capacity ceiling) and the
+forced split performed by :meth:`CapacityAdaptiveSegmenter.finish`.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
 
-# Punctuation strength ranks, strongest first.  Sentence-final punctuation is
-# the safest cut: nothing legal continues the sentence after it.  Clause
-# punctuation admits a continuation of the same sentence, and weak pauses
-# only mark reading rhythm.  The policy accepts weaker ranks as the budget
-# drains, and hard-cuts only at the ceiling.
-_SENTENCE_FINAL = frozenset("。！？!?…")
-_CLAUSE = frozenset("，；：,;:")
-_WEAK_PAUSE = frozenset("、—")
-_ALL_PUNCT = _SENTENCE_FINAL | _CLAUSE | _WEAK_PAUSE
+# ---------------------------------------------------------------------------
+# Punctuation tiers (exclusive; the strongest matching terminal wins).
+# Mirrors the CAPS reference tiers: L1 sentence-final, L2 clause, L3 weak pause.
+# ---------------------------------------------------------------------------
+_LEVEL1_PUNCTUATION: tuple[str, ...] = ("。", "！", "？", ".", "!", "?")
+_LEVEL2_PUNCTUATION: tuple[str, ...] = ("，", "、", "；", "：", ",", ";", ":")
+_LEVEL3_PUNCTUATION: tuple[str, ...] = ("\n", "\r", "\t", "\f", "\v", "…", "……", "—", "——")
+_LEVEL3_BREAK_WHITESPACE: frozenset[str] = frozenset(p for p in _LEVEL3_PUNCTUATION if p.isspace())
+# Closing quotes/brackets may follow a boundary punctuation; they are skipped
+# when locating a token's right boundary ("done." followed by '"').
+_TRAILING_CLOSERS: frozenset[str] = frozenset("\"')]}）】》」』”’")
 
-CutReason = Literal["sentence_final", "clause", "weak_pause", "hard_cut", "end_of_text"]
+# Default frozen-threshold ratios (progressively tightening).
+DEFAULT_LEVEL1_CAPACITY_RATIO = 0.70
+DEFAULT_LEVEL2_CAPACITY_RATIO = 0.80
+DEFAULT_LEVEL3_CAPACITY_RATIO = 0.90
 
-# Minimum fill fraction of the frozen budget (alpha in RFC #6496). Cuts below
-# it are rejected so short segments do not over-fragment the text.
-_DEFAULT_MIN_FILL_FRACTION = 0.7
+# Acoustic steps reserved before converting remaining capacity into a
+# text-token capacity, so a segment never plans to consume the whole budget.
+DEFAULT_SAFETY_MARGIN = 8
+
+# EMA weight applied to a newly observed expansion ratio.
+DEFAULT_EMA_ALPHA = 0.3
+
+# Punctuation levels.  A segment may open at level 1, 2 or 3; 0 means "no
+# boundary punctuation", used for forced cuts and the final split.
+_NO_PUNCTUATION = 0
+_LEVEL1 = 1
+_LEVEL2 = 2
+_LEVEL3 = 3
+_PUNCTUATION_LEVELS = (_LEVEL1, _LEVEL2, _LEVEL3)
+
+
+def _exclusive_terminals(tier: tuple[str, ...], *lower_tiers: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the terminals unique to ``tier``, longest first.
+
+    Levels are exclusive so a token classifies once: ``"……"`` belongs to L3
+    only, even though the raw L3 list also contains ``"…"``.
+    """
+    lower = set().union(*lower_tiers) if lower_tiers else set()
+    unique = {punct for punct in tier if punct not in lower}
+    return tuple(sorted(unique, key=len, reverse=True))
+
+
+def _build_terminals_by_level() -> tuple[tuple[int, tuple[str, ...]], ...]:
+    level3 = _exclusive_terminals(_LEVEL3_PUNCTUATION, _LEVEL2_PUNCTUATION)
+    level2 = _exclusive_terminals(_LEVEL2_PUNCTUATION, _LEVEL1_PUNCTUATION)
+    level1 = _exclusive_terminals(_LEVEL1_PUNCTUATION)
+    # Weakest first, so a multi-character boundary is not shadowed by a prefix.
+    return ((_LEVEL3, level3), (_LEVEL2, level2), (_LEVEL1, level1))
+
+
+_TERMINALS_BY_LEVEL = _build_terminals_by_level()
+
+
+def classify_punctuation_level(token: str) -> int:
+    """Return the punctuation level at ``token``'s right boundary.
+
+    Text arrives from the upstream tokenizer, so a boundary punctuation is
+    normally attached to the last word (``"years."``, ``"好好，"``).  Only the
+    token's trailing boundary is classified: trailing whitespace and closing
+    quotes/brackets are skipped, then the remaining suffix is matched against
+    the tiers.  Returns 0 when the token carries no boundary punctuation.
+    """
+    if not token:
+        return _NO_PUNCTUATION
+
+    index = len(token) - 1
+    saw_level3_break = False
+    while index >= 0:
+        char = token[index]
+        if char.isspace():
+            if char in _LEVEL3_BREAK_WHITESPACE:
+                saw_level3_break = True
+            index -= 1
+            continue
+        if char in _TRAILING_CLOSERS:
+            index -= 1
+            continue
+        break
+
+    if index < 0:
+        return _LEVEL3 if saw_level3_break else _NO_PUNCTUATION
+
+    boundary = token[: index + 1]
+    for level, terminals in _TERMINALS_BY_LEVEL:
+        if boundary.endswith(terminals):
+            return level
+    return _LEVEL3 if saw_level3_break else _NO_PUNCTUATION
+
+
+def _validate_capacity_ratios(ratios: tuple[float, float, float]) -> None:
+    if not all(math.isfinite(ratio) for ratio in ratios):
+        raise ValueError("level capacity ratios must be finite")
+    if not 0.0 < ratios[0] <= ratios[1] <= ratios[2] <= 1.0:
+        raise ValueError("level capacity ratios must satisfy 0 < level1 <= level2 <= level3 <= 1")
+
+
+@dataclass(frozen=True)
+class SplitThresholds:
+    """Frozen per-segment thresholds, all measured in text tokens.
+
+    ``min_tokens_level1`` <= ``min_tokens_level2`` <= ``min_tokens_level3`` <=
+    ``force_split_at``.  A boundary cuts only once the open segment has reached
+    its own level's threshold; ``force_split_at`` cuts regardless of boundary.
+    """
+
+    min_tokens_level1: int
+    min_tokens_level2: int
+    min_tokens_level3: int
+    force_split_at: int
+
+    def min_tokens_for_level(self, level: int) -> int:
+        """Threshold for a punctuation ``level`` (1, 2 or 3)."""
+        if level == _LEVEL1:
+            return self.min_tokens_level1
+        if level == _LEVEL2:
+            return self.min_tokens_level2
+        if level == _LEVEL3:
+            return self.min_tokens_level3
+        raise ValueError(f"punctuation level must be one of {_PUNCTUATION_LEVELS}, got {level}")
 
 
 @dataclass(frozen=True)
 class SegmentCut:
-    """Decision for one text segment.
+    """One committed segment."""
 
-    Attributes:
-        cut_index: Number of leading tokens consumed by this segment
-            (exclusive end index into the token sequence).
-        reason: Why this cut point was chosen.
-        budget: The frozen text-token budget this segment opened with.
-        fill_fraction: ``cut_index / budget``; >= ``min_fill_fraction`` for
-            punctuation cuts and 1.0 for hard cuts.
-        text_tokens: Number of text tokens in this segment (== cut_index).
-    """
-
-    cut_index: int
-    reason: CutReason
-    budget: int
-    fill_fraction: float
     text_tokens: int
+    punct_level: int
+    is_forced: bool
+
+
+def derive_text_token_capacity(
+    *,
+    remaining_capacity: int,
+    expansion_ratio: float,
+    safety_margin: int = DEFAULT_SAFETY_MARGIN,
+    max_text_tokens: int | None = None,
+) -> int:
+    """Convert remaining acoustic capacity into a text-token capacity.
+
+    ``capacity = floor((remaining_capacity - safety_margin) / expansion_ratio)``,
+    capped by ``max_text_tokens`` when given.  ``max_text_tokens`` only lowers
+    the capacity, never bypasses it, so a caller-supplied ceiling cannot plan a
+    segment whose predicted acoustic cost exceeds the remaining budget.
+    """
+    if remaining_capacity <= 0:
+        raise ValueError(f"remaining_capacity must be positive, got {remaining_capacity}")
+    if safety_margin < 0:
+        raise ValueError(f"safety_margin must be nonnegative, got {safety_margin}")
+    if not math.isfinite(expansion_ratio) or expansion_ratio < 1.0:
+        raise ValueError(f"expansion_ratio must be finite and >= 1.0, got {expansion_ratio}")
+    if max_text_tokens is not None and max_text_tokens <= 0:
+        raise ValueError(f"max_text_tokens must be positive, got {max_text_tokens}")
+
+    capacity = math.floor((remaining_capacity - safety_margin) / expansion_ratio)
+    if capacity < 1:
+        raise ValueError(
+            "remaining capacity cannot fit one predicted text token after the safety margin: "
+            f"remaining_capacity={remaining_capacity}, safety_margin={safety_margin}, "
+            f"expansion_ratio={expansion_ratio}"
+        )
+    if max_text_tokens is None:
+        return capacity
+    return min(capacity, max_text_tokens)
+
+
+def compute_thresholds(
+    *,
+    text_token_capacity: int,
+    level1_capacity_ratio: float = DEFAULT_LEVEL1_CAPACITY_RATIO,
+    level2_capacity_ratio: float = DEFAULT_LEVEL2_CAPACITY_RATIO,
+    level3_capacity_ratio: float = DEFAULT_LEVEL3_CAPACITY_RATIO,
+) -> SplitThresholds:
+    """Freeze one segment's thresholds from its text-token capacity.
+
+    Each level's threshold is ``ceil(capacity * ratio)``, so stronger boundaries
+    cut earlier and weaker ones require more accumulated text.  The ratios must
+    satisfy ``0 < level1 <= level2 <= level3 <= 1`` and the ceiling is exactly
+    the capacity, so tier spacing can never enlarge the budget.
+    """
+    if text_token_capacity < 1:
+        raise ValueError(f"text_token_capacity must be positive, got {text_token_capacity}")
+    ratios = (level1_capacity_ratio, level2_capacity_ratio, level3_capacity_ratio)
+    _validate_capacity_ratios(ratios)
+
+    return SplitThresholds(
+        min_tokens_level1=math.ceil(text_token_capacity * level1_capacity_ratio),
+        min_tokens_level2=math.ceil(text_token_capacity * level2_capacity_ratio),
+        min_tokens_level3=math.ceil(text_token_capacity * level3_capacity_ratio),
+        force_split_at=text_token_capacity,
+    )
 
 
 class CapacityAdaptiveSegmenter:
-    """Sizes streaming TTS text segments from measured acoustic expansion.
+    """Online CAPS state machine for a single streaming TTS request.
 
-    State is per-request: create one instance per streaming TTS request.
-    Thread-safety is not provided; the caller owns the instance.
+    One instance per request; the owning stage drives it from one task, so no
+    locking is provided.
     """
 
     def __init__(
         self,
         *,
-        ema_alpha: float = 0.3,
-        min_fill_fraction: float = _DEFAULT_MIN_FILL_FRACTION,
-        warmup_rho: float | None = None,
+        ema_alpha: float = DEFAULT_EMA_ALPHA,
+        safety_margin: int = DEFAULT_SAFETY_MARGIN,
+        level1_capacity_ratio: float = DEFAULT_LEVEL1_CAPACITY_RATIO,
+        level2_capacity_ratio: float = DEFAULT_LEVEL2_CAPACITY_RATIO,
+        level3_capacity_ratio: float = DEFAULT_LEVEL3_CAPACITY_RATIO,
+        warmup_expansion_ratio: float | None = None,
     ) -> None:
         if not 0.0 < ema_alpha <= 1.0:
             raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
-        if not 0.0 < min_fill_fraction <= 1.0:
-            raise ValueError(f"min_fill_fraction must be in (0, 1], got {min_fill_fraction}")
-        if warmup_rho is not None and warmup_rho <= 0:
-            raise ValueError(f"warmup_rho must be positive, got {warmup_rho}")
+        if safety_margin < 0:
+            raise ValueError(f"safety_margin must be nonnegative, got {safety_margin}")
+        if warmup_expansion_ratio is not None and (
+            not math.isfinite(warmup_expansion_ratio) or warmup_expansion_ratio < 1.0
+        ):
+            raise ValueError(f"warmup_expansion_ratio must be finite and >= 1.0, got {warmup_expansion_ratio}")
+
+        ratios = (level1_capacity_ratio, level2_capacity_ratio, level3_capacity_ratio)
+        _validate_capacity_ratios(ratios)
+
         self._ema_alpha = ema_alpha
-        self._min_fill_fraction = min_fill_fraction
-        self._warmup_rho = warmup_rho
-        self._rho_hat: float | None = warmup_rho
+        self._safety_margin = safety_margin
+        self._capacity_ratios = ratios
+        self._expansion_ratio = warmup_expansion_ratio
         self._has_observation = False
-        self._active_budget: int | None = None
+        self._thresholds: SplitThresholds | None = None
+        self._token_count = 0
 
     @property
-    def rho_hat(self) -> float | None:
-        """Current EMA estimate of acoustic decode steps per text token."""
-        return self._rho_hat
+    def expansion_ratio(self) -> float | None:
+        """Estimated acoustic steps per text token, or None before warmup."""
+        return self._expansion_ratio
 
     @property
-    def active_budget(self) -> int | None:
-        """Text-token budget frozen by the last ``open_segment`` call."""
-        return self._active_budget
+    def thresholds(self) -> SplitThresholds | None:
+        """Thresholds frozen by the most recent :meth:`start_segment`."""
+        return self._thresholds
+
+    @property
+    def token_count(self) -> int:
+        """Text tokens accumulated in the segment currently open."""
+        return self._token_count
 
     def observe_segment(self, *, acoustic_steps: int, text_tokens: int) -> None:
-        """Feed the realized rho = acoustic_steps / text_tokens of a finished segment.
+        """Feed the realized ``rho`` of a finished segment into the estimate.
 
-        Updates the EMA estimate used by the *next* ``open_segment`` call;
-        it never changes a budget already frozen by ``open_segment``.
-        Degenerate observations (no text or no acoustic steps) are ignored.
+        The estimate only affects segments opened afterwards; a frozen segment
+        keeps its thresholds.  Degenerate observations are ignored so a
+        truncated or empty segment cannot poison the estimate.
         """
         if text_tokens <= 0 or acoustic_steps <= 0:
             return
-        rho_k = acoustic_steps / text_tokens
+        observed_ratio = acoustic_steps / text_tokens
         if not self._has_observation:
-            # First real measurement seeds the estimate; the warmup value is
+            # The first real measurement seeds the estimate; a warmup value is
             # only a pre-data fallback and is not blended into the EMA.
-            self._rho_hat = rho_k
+            self._expansion_ratio = observed_ratio
             self._has_observation = True
-        else:
-            self._rho_hat = self._ema_alpha * rho_k + (1.0 - self._ema_alpha) * self._rho_hat
+            return
+        assert self._expansion_ratio is not None
+        self._expansion_ratio = self._ema_alpha * observed_ratio + (1.0 - self._ema_alpha) * self._expansion_ratio
 
-    def open_segment(
-        self,
-        *,
-        remaining_capacity: int,
-        max_text_tokens: int | None = None,
-    ) -> int:
-        """Freeze the text-token budget for the next segment.
+    def start_segment(self, *, remaining_capacity: int, max_text_tokens: int | None = None) -> SplitThresholds:
+        """Open a segment and freeze its thresholds.
 
-        Budget is ``max(1, int(remaining_capacity / rho_hat))``; until the
-        first observation it falls back to ``max_text_tokens`` (or 1) as a
-        warmup default, mirroring the static ramp.  ``max_text_tokens``
-        caps the budget (e.g. a stage-0 ``max_tokens`` ceiling).  The frozen
-        budget is returned and remains fixed until the next call.
+        Needs an expansion-ratio estimate: either the constructor's warmup value
+        or at least one :meth:`observe_segment` call.  Raises ``ValueError`` when
+        the remaining capacity cannot fit a single predicted text token.
         """
-        if remaining_capacity <= 0:
-            raise ValueError(f"remaining_capacity must be positive, got {remaining_capacity}")
-        if max_text_tokens is not None and max_text_tokens <= 0:
-            raise ValueError(f"max_text_tokens must be positive, got {max_text_tokens}")
-        if self._rho_hat is None:
-            budget = max_text_tokens if max_text_tokens is not None else 1
-        else:
-            budget = max(1, int(remaining_capacity / self._rho_hat))
-        if max_text_tokens is not None:
-            budget = min(budget, max_text_tokens)
-        self._active_budget = budget
-        return budget
-
-    def select_cut(self, tokens: Sequence[str]) -> SegmentCut:
-        """Choose the cut point for the next segment from ``tokens``.
-
-        The frozen budget delimits the acceptable window
-        ``[alpha * budget, budget]``; inside it the rightmost sentence-final
-        punctuation wins, then clause, then weak pause.  With no acceptable
-        punctuation the segment hard-cuts at the budget ceiling, and when
-        the text itself ends inside the window the cut lands at end of text.
-
-        Punctuation must be tokenized as its own token: a token is classified
-        only when *every* character of it is punctuation, so a committed
-        ``e.g.`` token can never be mistaken for a sentence-final cut.
-        """
-        if self._active_budget is None:
-            raise RuntimeError("open_segment() must be called before select_cut()")
-        budget = self._active_budget
-        window_start = max(0, int(self._min_fill_fraction * budget))
-        window_end = min(budget, len(tokens))
-
-        last_sentence_final = -1
-        last_clause = -1
-        last_weak = -1
-        for index in range(window_start, window_end):
-            token = tokens[index]
-            if not token or any(ch not in _ALL_PUNCT for ch in token):
-                continue
-            ch = token[0]
-            if ch in _SENTENCE_FINAL:
-                last_sentence_final = index
-            elif ch in _CLAUSE:
-                last_clause = index
-            elif ch in _WEAK_PAUSE:
-                last_weak = index
-
-        if last_sentence_final >= 0:
-            cut, reason = last_sentence_final + 1, "sentence_final"
-        elif last_clause >= 0:
-            cut, reason = last_clause + 1, "clause"
-        elif last_weak >= 0:
-            cut, reason = last_weak + 1, "weak_pause"
-        elif window_end == len(tokens) and window_end > 0:
-            cut, reason = window_end, "end_of_text"
-        else:
-            cut, reason = window_end, "hard_cut"
-
-        return SegmentCut(
-            cut_index=cut,
-            reason=reason,
-            budget=budget,
-            fill_fraction=cut / budget,
-            text_tokens=cut,
+        if self._expansion_ratio is None:
+            raise RuntimeError(
+                "no expansion-ratio estimate available; pass warmup_expansion_ratio "
+                "or call observe_segment() before start_segment()"
+            )
+        capacity = derive_text_token_capacity(
+            remaining_capacity=remaining_capacity,
+            expansion_ratio=self._expansion_ratio,
+            safety_margin=self._safety_margin,
+            max_text_tokens=max_text_tokens,
         )
+        level1_ratio, level2_ratio, level3_ratio = self._capacity_ratios
+        self._thresholds = compute_thresholds(
+            text_token_capacity=capacity,
+            level1_capacity_ratio=level1_ratio,
+            level2_capacity_ratio=level2_ratio,
+            level3_capacity_ratio=level3_ratio,
+        )
+        self._token_count = 0
+        return self._thresholds
+
+    def append_token(self, token: str) -> SegmentCut | None:
+        """Append one streaming token, returning a cut when it commits.
+
+        The decision uses the token count *including* the token just appended,
+        which is what the frozen thresholds are expressed in.  A boundary cuts
+        only once its own level threshold is reached; the ceiling cuts
+        regardless of boundary.  Returns ``None`` while the segment stays open.
+
+        A committed cut opens the next segment with the same frozen thresholds;
+        call :meth:`start_segment` again to refresh them from updated capacity
+        and expansion-ratio estimates.
+        """
+        thresholds = self._thresholds
+        if thresholds is None:
+            raise RuntimeError("start_segment() must be called before append_token()")
+
+        self._token_count += 1
+        punct_level = classify_punctuation_level(token)
+        if self._token_count >= thresholds.force_split_at:
+            return self._commit(punct_level=punct_level, is_forced=True)
+        if punct_level != _NO_PUNCTUATION and self._token_count >= thresholds.min_tokens_for_level(punct_level):
+            return self._commit(punct_level=punct_level, is_forced=False)
+        return None
+
+    def append_tokens(self, tokens: Sequence[str]) -> list[SegmentCut]:
+        """Append tokens in arrival order and collect the cuts they commit."""
+        cuts: list[SegmentCut] = []
+        for token in tokens:
+            cut = self.append_token(token)
+            if cut is not None:
+                cuts.append(cut)
+        return cuts
+
+    def finish(self) -> SegmentCut | None:
+        """Force the final split of the tail, or ``None`` when it is empty."""
+        if self._token_count <= 0:
+            return None
+        return self._commit(punct_level=_NO_PUNCTUATION, is_forced=True)
+
+    def _commit(self, *, punct_level: int, is_forced: bool) -> SegmentCut:
+        cut = SegmentCut(text_tokens=self._token_count, punct_level=punct_level, is_forced=is_forced)
+        self._token_count = 0
+        return cut
