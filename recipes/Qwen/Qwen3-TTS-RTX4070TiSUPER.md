@@ -7,7 +7,7 @@
 - Task: Text-to-speech
 - Mode: Online serving
 - Hardware: 1x NVIDIA GeForce RTX 4070 Ti SUPER, 16376 MiB
-- Maintainer: @Sheehan20
+- Maintainer: Community
 
 ## When to use this recipe
 
