@@ -1328,7 +1328,11 @@ class TestDeployConfigLoading:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.session_mode == "duplex"
-        assert deploy.active_stream_window == max_sessions
+        # ``0`` disables the limiter: the configured session/stage capacity is
+        # what bounds the pipeline. Any positive window serializes concurrent
+        # audio first-packet generation (measured: TTFP -23% at 0 vs 4 on
+        # L20X, 128 requests / concurrency 8).
+        assert deploy.active_stream_window == 0
         assert deploy.duplex_session.max_sessions == max_sessions
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
