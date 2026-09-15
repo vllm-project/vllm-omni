@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import base64
 import binascii
 from typing import Any
 
-from vllm.sampling_params import SamplingParams
+import pybase64 as base64
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.runtime import (
@@ -58,6 +58,12 @@ class PersonaPlexDuplexRuntimeExtension:
             stage0.top_k = 1
             stage0.max_tokens = 1
             configured[0] = stage0
+        if len(defaults) > 1 and isinstance(defaults[1], SamplingParams):
+            # Clone session defaults before changing the producer contract.
+            # Code2Wav emits fresh PCM; do not retain audio from earlier wakes.
+            stage1 = defaults[1].clone()
+            stage1.output_kind = RequestOutputKind.DELTA
+            configured[1] = stage1
         return tuple(configured)
 
     def plan_append(

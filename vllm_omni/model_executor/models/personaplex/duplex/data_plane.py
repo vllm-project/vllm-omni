@@ -29,13 +29,17 @@ class PersonaPlexDataPlaneContext:
 
 @dataclass(slots=True)
 class _RequestCursor:
-    audio_samples: int = 0
     text: str = ""
     terminal: bool = False
 
 
 class PersonaPlexDataPlaneSession:
-    """Project cumulative staged PersonaPlex output into Realtime deltas."""
+    """Project Stage 1 PCM deltas and cumulative text into Realtime events.
+
+    The runtime extension configures Stage 1 with output_kind=DELTA.
+    Equal-size or identical audio chunks are distinct stream contributions,
+    not cumulative snapshots to slice or deduplicate.
+    """
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
@@ -92,22 +96,28 @@ class PersonaPlexDataPlaneSession:
             request_id = None
         state = self._requests.setdefault(request_id, _RequestCursor()) if request_id is not None else _RequestCursor()
         multimodal = _multimodal_output(output, completion)
-        audio = _audio_value(multimodal)
-        audio_delta = _slice_audio(audio, state.audio_samples)
-        audio_samples = _num_samples(audio)
-        if audio_samples is not None:
-            state.audio_samples = audio_samples
+        audio_delta = _audio_value(multimodal)
 
         text = _text_value(multimodal, completion)
         text_delta = _text_delta(text, state.text)
-        if text:
-            state.text = text
 
         sample_rate_hz = _sample_rate(multimodal)
-        encoded = self._encode_audio(audio_delta, sample_rate_hz, context.response_format, context.speed)
+        delta_samples = _num_samples(audio_delta) or 0
+        # Empty PCM can encode as a nonempty WAV header. It is not an audio
+        # event; preserve any transcript without invoking the audio encoder.
+        encoded = (
+            self._encode_audio(audio_delta, sample_rate_hz, context.response_format, context.speed)
+            if delta_samples
+            else None
+        )
+        if delta_samples and not encoded:
+            raise RuntimeError("PersonaPlex could not encode a nonempty audio delta")
+        # Encoding failure must not consume the transcript cursor. Projection
+        # is not a server-send completion or a client playback acknowledgement.
+        if text:
+            state.text = text
         if not encoded and not text_delta:
             return None
-        delta_samples = _num_samples(audio_delta) or 0
         return {
             "supported": True,
             "stage_role": "tts",
@@ -150,8 +160,13 @@ def _audio_value(multimodal: dict[str, object]) -> object | None:
         (multimodal[key] for key in ("audio", "model_outputs", "latent") if key in multimodal),
         None,
     )
-    if isinstance(value, list) and len(value) == 1:
-        return value[0]
+    if isinstance(value, list):
+        if not value:
+            return None
+        if len(value) == 1:
+            return value[0]
+        # Coalesce only this emission's deferred CPU chunks, never history.
+        return np.concatenate([np.asarray(chunk, dtype=np.float32).reshape(-1) for chunk in value])
     return value
 
 
@@ -174,24 +189,6 @@ def _text_delta(text: str, previous: str) -> str:
     if previous and text.startswith(previous):
         return text[len(previous) :]
     return text
-
-
-def _slice_audio(audio: object | None, offset: int) -> object | None:
-    samples = _num_samples(audio)
-    if samples is None or samples <= 0:
-        return None
-    if offset <= 0 or samples < offset:
-        return audio
-    if samples == offset:
-        return None
-    try:
-        import torch
-
-        if isinstance(audio, torch.Tensor):
-            return audio.reshape(-1)[offset:].contiguous()
-    except Exception:
-        pass
-    return np.asarray(audio, dtype=np.float32).reshape(-1)[offset:]
 
 
 def _num_samples(audio: object | None) -> int | None:

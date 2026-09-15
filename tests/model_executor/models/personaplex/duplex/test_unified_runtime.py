@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
 from vllm_omni.config.stage_config import (
@@ -358,7 +358,9 @@ def test_runtime_extension_builds_one_frame_scheduler_append() -> None:
     assert configured[0].temperature == 0.0
     assert configured[0].top_k == 1
     assert configured[0].max_tokens == 1
-    assert configured[1] is defaults[1]
+    assert configured[1] is not defaults[1]
+    assert configured[1].output_kind == RequestOutputKind.DELTA
+    assert defaults[1].output_kind == RequestOutputKind.CUMULATIVE
 
     plan = extension.plan_append(
         request_id="req",
@@ -381,7 +383,7 @@ def test_runtime_extension_builds_one_frame_scheduler_append() -> None:
     assert duplex["data_plane"] is True
 
 
-def test_projector_emits_only_cumulative_audio_and_text_suffixes() -> None:
+def test_projector_emits_audio_deltas_and_cumulative_text_suffixes() -> None:
     encoded_sizes: list[int] = []
 
     def encode_audio(audio, _sample_rate, _response_format, _speed):
@@ -402,7 +404,7 @@ def test_projector_emits_only_cumulative_audio_and_text_suffixes() -> None:
     second = SimpleNamespace(
         request_id="req",
         outputs=[SimpleNamespace(text="hello", multimodal_output={})],
-        multimodal_output={"model_outputs": np.arange(6, dtype=np.float32), "sr": 24000},
+        multimodal_output={"model_outputs": np.arange(4, 6, dtype=np.float32), "sr": 24000},
         finished=False,
     )
 
