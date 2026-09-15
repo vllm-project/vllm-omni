@@ -11,8 +11,12 @@ from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalP
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _source_output(*, include_latent: bool = True) -> OmniRequestOutput:
-    multimodal_output = {"latent": torch.arange(32, dtype=torch.float32).reshape(4, 8)} if include_latent else {}
+def _source_output(
+    *,
+    include_latent: bool = True,
+    dtype: torch.dtype = torch.float32,
+) -> OmniRequestOutput:
+    multimodal_output = {"latent": torch.arange(32, dtype=dtype).reshape(4, 8)} if include_latent else {}
     completion = MultimodalCompletionOutput(
         index=0,
         text="",
@@ -48,6 +52,15 @@ def test_ar2diffusion_builds_one_prompt_with_raw_ar_conditions() -> None:
         torch.arange(32, dtype=torch.float32).reshape(4, 8),
     )
     assert info["full_hidden_states"].is_contiguous()
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_ar2diffusion_preserves_low_precision_hidden_states(dtype: torch.dtype) -> None:
+    result = ar2diffusion([_source_output(dtype=dtype)], {})
+
+    hidden_states = result["additional_information"]["full_hidden_states"]
+    assert hidden_states.dtype == dtype
+    assert hidden_states.is_contiguous()
 
 
 def test_ar2diffusion_uses_prompt_dimension_fallbacks() -> None:

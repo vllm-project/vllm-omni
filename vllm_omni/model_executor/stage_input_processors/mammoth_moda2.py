@@ -76,7 +76,7 @@ def ar2diffusion(
         "height": height,
         "width": width,
         "additional_information": {
-            "full_hidden_states": full_hidden_states.float().contiguous(),
+            "full_hidden_states": full_hidden_states.contiguous(),
             "full_token_ids": full_token_ids,
             "answer_start_index": len(prompt_token_ids),
         },

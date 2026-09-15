@@ -329,6 +329,7 @@ source_file_dependencies:
     - *qwen_image
     - tests/e2e/online_serving/test_qwen_image.py
     - tests/e2e/online_serving/test_qwen_image_expansion.py
+    - tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py
 
   diffusion_qwen_image_accuracy:
     - *qwen_image
@@ -416,6 +417,11 @@ source_file_dependencies:
     - *z_image
     - tests/e2e/online_serving/test_z_image.py
     - tests/e2e/online_serving/test_zimage_expansion.py
+
+  diffusion_sana_video_function:
+    - *sana_video
+    - tests/e2e/online_serving/test_sana_video_expansion.py
+    - tests/e2e/accuracy/sana_video/
 
   diffusion_stable_audio_function:
     - *stable_audio

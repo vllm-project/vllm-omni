@@ -44,6 +44,7 @@ L3_YAML_FILES: dict[str, str] = {
 L45_YAML_FILES: dict[str, str] = {
     ".buildkite/cuda/test-nightly.yml": "cuda",
     ".buildkite/cuda/test-weekly.yml": "cuda",
+    ".buildkite/amd/test-amd-nightly.yml": "amd",
     ".buildkite/npu/test-npu-nightly.yml": "npu",
 }
 
