@@ -900,6 +900,17 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         """List of size of each codebook"""
         return self.quantizer.codebook_sizes
 
+    @property
+    def dtype(self) -> torch.dtype:
+        """Actual dtype of the loaded model parameters.
+
+        Used instead of a hardcoded dtype so decode-time casts stay
+        consistent with whatever dtype the weights were loaded/cast to
+        (e.g. the float16 fallback on GPUs without bfloat16 support,
+        such as Tesla T4 / compute capability < 8.0). See #4838.
+        """
+        return next(self.parameters()).dtype
+
     def load_weight(self, weight: tuple[str, torch.Tensor]) -> str:
         params_dict = dict(self.named_parameters())
         name, loaded_weight = weight
@@ -1094,7 +1105,7 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         padded = pad_sequence(all_chunks, batch_first=True, padding_value=0.0)
 
         audio_codes = padded.to(device=current_omni_platform.device_type)  # [B, T, K]
-        audio_values = self.decode(audio_codes.transpose(1, 2), dtype=torch.bfloat16)  # [B, 1, T_out]
+        audio_values = self.decode(audio_codes.transpose(1, 2), dtype=self.dtype)  # [B, 1, T_out]
         audio_values = audio_values.detach().cpu().float().squeeze(1)  # [B, T_out]
         # Gate min/max reductions behind logger level.
         if logger.isEnabledFor(logging.WARNING):
