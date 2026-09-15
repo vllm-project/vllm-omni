@@ -513,6 +513,57 @@ def test_mot_o_proj(
             )
 
 
+@pytest.mark.parametrize(
+    ("bias_text", "bias_vae"),
+    [(True, False), (False, True)],
+    ids=["text-only", "vae-only"],
+)
+def test_mot_row_one_sided_bias(bias_text: bool, bias_vae: bool):
+    """The fused row projection must support a bias on only one expert."""
+    dcfg = _parse_dtype("w16a16_bf16")
+    K = 32
+    N = 64
+    M = 5
+
+    with set_current_vllm_config(VllmConfig()):
+        text_linear = RowParallelLinear(
+            K,
+            N,
+            bias=bias_text,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        vae_linear = RowParallelLinear(
+            K,
+            N,
+            bias=bias_vae,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        mot_linear = MoTRowParallelLinear(
+            K,
+            N,
+            bias=bias_text,
+            vae_bias=bias_vae,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+
+        _sync_weights(text_linear, vae_linear, mot_linear)
+        text_idx = torch.tensor([0, 2], dtype=torch.long, device="cuda")
+        vae_idx = torch.tensor([1, 3, 4], dtype=torch.long, device="cuda")
+        x = torch.randn(M, K, dtype=dcfg.torch_dtype, device="cuda")
+
+        with torch.no_grad():
+            ref = _reference_forward(x, text_idx, vae_idx, text_linear, vae_linear)
+            mot_out, _ = mot_linear(x, text_idx, vae_idx)
+
+        _check_and_report(ref, mot_out, f"Row one-sided bias text={bias_text} vae={bias_vae}")
+
+
 # =========================================================================
 #  Test: und-mode (text_indices=None) — falls back to standard forward
 # =========================================================================
