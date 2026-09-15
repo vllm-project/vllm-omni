@@ -273,3 +273,29 @@ def test_strict_loader_covers_all_keys_and_uses_ema_router_bias() -> None:
     torch.testing.assert_close(
         target_moe.router.expert_bias_ema, torch.full_like(target_moe.router.expert_bias_ema, 3.0)
     )
+
+
+def test_select_block_config_dispatch_by_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kernel block configs follow the device compute capability (no GPU needed)."""
+
+    from vllm_omni.diffusion.models.magi2 import mh_moe
+
+    class _Capability:
+        def __init__(self, major: int) -> None:
+            self.major = major
+
+    def set_major(major: int | None) -> None:
+        monkeypatch.setattr(
+            mh_moe.current_omni_platform,
+            "get_device_capability",
+            lambda: None if major is None else _Capability(major),
+        )
+
+    set_major(9)  # Hopper (H100 / H200): large 128-token tiles with 3 stages
+    assert mh_moe._select_block_config() == (128, 64, 32, 3, 8)
+    set_major(10)  # Blackwell: 128-token tiles at 2 stages
+    assert mh_moe._select_block_config() == (128, 64, 32, 2, 8)
+    set_major(8)  # Ada (L20X): no shared-memory budget for 128-token tiles
+    assert mh_moe._select_block_config() == (64, 64, 32, 2, 4)
+    set_major(None)
+    assert mh_moe._select_block_config() == (64, 64, 32, 2, 4)
