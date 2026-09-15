@@ -19,6 +19,3 @@ def register_omni_reasoning_parsers():
     """Register vllm-omni reasoning parsers with vLLM's ReasoningParserManager."""
     for name, (module_path, class_name) in _OMNI_REASONING_PARSERS.items():
         ReasoningParserManager.register_lazy_module(name, module_path, class_name)
-
-
-register_omni_reasoning_parsers()

@@ -33,7 +33,11 @@ from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization.factory import (
+    build_quantization_config,
+    get_quantization_method,
+    should_adopt_checkpoint_quant_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import KVTransferConfig, ProfilerConfig
@@ -44,57 +48,66 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize legacy diffusion kwargs before config construction."""
-    config_kwargs = dict(raw_kwargs)
+def normalize_omni_kwargs(kwargs: Mapping[str, Any], is_diffusion: bool) -> dict[str, Any]:
+    """Normalize legacy diffusion kwargs before config construction and return a handle to the
+    normalized kwargs.
 
-    dtype = config_kwargs.get("dtype")
+    NOTE: This should be the only place we handle kwarg fallbacks/aliases so that we can
+    easily deprecate them for removal in future releases if needed.
+    """
+    normalized = dict(kwargs)
+
+    # dtype normalization should apply regardless of engine type
+    dtype = normalized.get("dtype")
     if dtype is None:
-        config_kwargs["dtype"] = "auto"
+        normalized["dtype"] = "auto"
     elif isinstance(dtype, torch.dtype):
-        config_kwargs["dtype"] = str(dtype).removeprefix("torch.")
+        normalized["dtype"] = str(dtype).removeprefix("torch.")
     elif not isinstance(dtype, str):
         raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(dtype).__name__}")
 
+    # For quantization, map quantization -> quantization_config, regardless of type,
+    # so that we can build out of the same field later.
+    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
+        normalized["quantization_config"] = normalized.pop("quantization")
+    else:
+        normalized.pop("quantization", None)
+    if not is_diffusion:
+        return normalized
+
+    ### Diffusion specific
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
-    if "static_lora_scale" in config_kwargs:
-        if "lora_scale" not in config_kwargs:
-            config_kwargs["lora_scale"] = config_kwargs["static_lora_scale"]
-        config_kwargs.pop("static_lora_scale", None)
+    if "static_lora_scale" in normalized:
+        if "lora_scale" not in normalized:
+            normalized["lora_scale"] = normalized["static_lora_scale"]
+        normalized.pop("static_lora_scale", None)
 
-    diffusion_quantization = config_kwargs.pop("diffusion_quantization_config", None)
-    if config_kwargs.get("quantization_config") is None and diffusion_quantization is not None:
-        config_kwargs["quantization_config"] = diffusion_quantization
-
-    # Backwards-compatibility: map "quantization" to "quantization_config"
-    # so callers using the old field name still work.
-    if "quantization" in config_kwargs and config_kwargs.get("quantization_config", None) is None:
-        config_kwargs["quantization_config"] = config_kwargs.pop("quantization")
-    else:
-        config_kwargs.pop("quantization", None)
+    diffusion_quantization = normalized.pop("diffusion_quantization_config", None)
+    if normalized.get("quantization_config") is None and diffusion_quantization is not None:
+        normalized["quantization_config"] = diffusion_quantization
 
     # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-    if config_kwargs.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in config_kwargs:
-        config_kwargs["diffusion_kv_cache_dtype"] = config_kwargs.pop("kv_cache_dtype")
+    if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
+        normalized["diffusion_kv_cache_dtype"] = normalized.pop("kv_cache_dtype")
     else:
-        config_kwargs.pop("kv_cache_dtype", None)
-    if config_kwargs.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in config_kwargs:
-        config_kwargs["diffusion_kv_cache_skip_steps"] = config_kwargs.pop("kv_cache_skip_steps")
+        normalized.pop("kv_cache_dtype", None)
+    if normalized.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in normalized:
+        normalized["diffusion_kv_cache_skip_steps"] = normalized.pop("kv_cache_skip_steps")
     else:
-        config_kwargs.pop("kv_cache_skip_steps", None)
-    if config_kwargs.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in config_kwargs:
-        config_kwargs["diffusion_kv_cache_skip_layers"] = config_kwargs.pop("kv_cache_skip_layers")
+        normalized.pop("kv_cache_skip_steps", None)
+    if normalized.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in normalized:
+        normalized["diffusion_kv_cache_skip_layers"] = normalized.pop("kv_cache_skip_layers")
     else:
-        config_kwargs.pop("kv_cache_skip_layers", None)
+        normalized.pop("kv_cache_skip_layers", None)
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
-    diffusion_attn_backend = config_kwargs.pop("diffusion_attention_backend", None)
-    fastvideo_vsa_topk = config_kwargs.pop("fastvideo_vsa_topk", None)
+    diffusion_attn_backend = normalized.pop("diffusion_attention_backend", None)
+    fastvideo_vsa_topk = normalized.pop("fastvideo_vsa_topk", None)
     if diffusion_attn_backend is not None or fastvideo_vsa_topk is not None:
-        existing = config_kwargs.get("diffusion_attention_config")
-        config_kwargs["diffusion_attention_config"] = parse_attention_config(
+        existing = normalized.get("diffusion_attention_config")
+        normalized["diffusion_attention_config"] = parse_attention_config(
             existing,
             attention_backend=diffusion_attn_backend,
             fastvideo_vsa_topk=fastvideo_vsa_topk,
@@ -102,33 +115,33 @@ def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, 
 
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
-    if "cache_backend" not in config_kwargs:
+    if "cache_backend" not in normalized:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
-        config_kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
-    elif config_kwargs["cache_backend"] is None:
+        normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+    elif normalized["cache_backend"] is None:
         # Callers (e.g. example CLIs with `default=None`) pass an explicit
         # None for "no cache"; canonicalize it so every consumer sees the
         # declared `str` value instead of relying on per-model None handling.
-        config_kwargs["cache_backend"] = "none"
+        normalized["cache_backend"] = "none"
 
-    cache_config = config_kwargs.get("cache_config")
+    cache_config = normalized.get("cache_config")
     if isinstance(cache_config, str):
         try:
-            config_kwargs["cache_config"] = json.loads(cache_config)
+            normalized["cache_config"] = json.loads(cache_config)
         except json.JSONDecodeError:
             logger.warning("Invalid cache_config JSON, using backend defaults.")
-            config_kwargs.pop("cache_config", None)
+            normalized.pop("cache_config", None)
 
-    if config_kwargs.get("streaming_output") is None and config_kwargs.get("diffusion_streaming_output") is not None:
-        config_kwargs["streaming_output"] = config_kwargs["diffusion_streaming_output"]
-    config_kwargs.pop("diffusion_streaming_output", None)
+    if normalized.get("streaming_output") is None and normalized.get("diffusion_streaming_output") is not None:
+        normalized["streaming_output"] = normalized["diffusion_streaming_output"]
+    normalized.pop("diffusion_streaming_output", None)
 
     # Convert optional YAML null values to empty containers.
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
-        if key in config_kwargs and config_kwargs[key] is None:
-            config_kwargs[key] = {}
+        if key in normalized and normalized[key] is None:
+            normalized[key] = {}
 
-    return config_kwargs
+    return normalized
 
 
 def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
@@ -505,8 +518,8 @@ class TransformerConfig:
         quant_config: QuantizationConfig | None = None
         disk_qc = params.get("quantization_config")
         if isinstance(disk_qc, dict):
-            raw_quant_method = disk_qc.get("quant_method", disk_qc.get("method"))
-            quant_config = build_quant_config(disk_qc)
+            raw_quant_method = get_quantization_method(disk_qc)
+            quant_config = build_quantization_config(disk_qc)
             if quant_config is not None:
                 quant_method = raw_quant_method if raw_quant_method is not None else quant_config.get_name()
 
@@ -1008,10 +1021,7 @@ class OmniDiffusionConfig:
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
-    # Quantization: str method name, dict config, QuantizationConfig, or None.
-    # str is resolved to {"method": <str>} internally.
-    # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
-    quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    quantization_config: QuantizationConfig | None = None
     # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
@@ -1276,26 +1286,19 @@ class OmniDiffusionConfig:
             self.video_output_transport = VideoOutputTransportConfig(**dict(self.video_output_transport))
         elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
             raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+        if isinstance(self.quantization_config, (str, Mapping)):
+            logger.warning_once(
+                "Passing a string or mapping as OmniDiffusionConfig.quantization_config "
+                "is deprecated and will be removed in vLLM-Omni>0.30. Pass a "
+                "preconstructed QuantizationConfig object instead."
+            )
+        self.quantization_config = build_quantization_config(self.quantization_config)
 
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
         # time. For late (post-construction) assignment, callers should use
         # set_tf_model_config() which propagates quant_config automatically.
         self._propagate_quantization_from_tf_config(self.tf_model_config)
-
-        # Resolve quantization_config: str/dict -> QuantizationConfig via build_quant_config.
-        if self.quantization_config is not None:
-            if isinstance(self.quantization_config, QuantizationConfig):
-                pass  # Already built
-            elif isinstance(self.quantization_config, str):
-                self.quantization_config = build_quant_config(self.quantization_config)
-            elif isinstance(self.quantization_config, Mapping):
-                self.quantization_config = build_quant_config(dict(self.quantization_config))
-            else:
-                raise TypeError(
-                    f"quantization_config must be str, dict, QuantizationConfig, or None, "
-                    f"got {type(self.quantization_config)!r}"
-                )
 
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
@@ -1338,44 +1341,15 @@ class OmniDiffusionConfig:
                 )
 
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
-        if tf_config.quant_config is None:
+        checkpoint = tf_config.quant_config
+        if checkpoint is None:
             return
-
-        is_checkpoint_fp8 = bool(getattr(tf_config.quant_config, "is_checkpoint_fp8_serialized", False))
-        is_checkpoint_nvfp4 = bool(getattr(tf_config.quant_config, "is_checkpoint_nvfp4_serialized", False))
-        should_use_checkpoint_config = (
-            self.quantization_config is None
-            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
-            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
-        )
-        if should_use_checkpoint_config:
-            self.quantization_config = tf_config.quant_config
+        if should_adopt_checkpoint_quant_config(self.quantization_config, checkpoint):
+            self.quantization_config = checkpoint
             logger.info(
                 "Auto-detected quantization '%s' from model config",
                 tf_config.quant_method,
             )
-
-    @staticmethod
-    def _is_generic_fp8_quant_config(quant_config: object) -> bool:
-        if isinstance(quant_config, str):
-            return quant_config.lower() == "fp8"
-        if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() == "fp8"
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "fp8"
-        return False
-
-    @staticmethod
-    def _is_generic_nvfp4_quant_config(quant_config: object) -> bool:
-        if isinstance(quant_config, str):
-            return quant_config.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
-        if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "modelopt_fp4"
-        return False
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
         """Assign `tf_model_config` and propagate quantization if detected.
@@ -1615,14 +1589,16 @@ class OmniDiffusionConfig:
                     raise
 
     @classmethod
-    def normalize_init_kwargs(cls, raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
-        config_kwargs = normalize_omni_diffusion_kwargs(raw_kwargs)
+    def normalize_init_kwargs(cls, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        config_kwargs = normalize_omni_kwargs(kwargs, is_diffusion=True)
+
+        # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
-        # Remaining ``None`` values mean "unset" at the CLI/deploy boundary.
-        # Drop them so non-optional dataclass defaults are not overwritten.
-        # Fields where ``None`` has normalization semantics (for example dtype
-        # and nullable container inputs) are handled above before this filter.
-        return {key: value for key, value in config_kwargs.items() if key in valid_fields and value is not None}
+        filtered_kwargs = {
+            key: value for key, value in config_kwargs.items() if key in valid_fields and value is not None
+        }
+
+        return filtered_kwargs
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":

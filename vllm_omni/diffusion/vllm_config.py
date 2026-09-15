@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import torch
 from vllm.config import CompilationConfig, DeviceConfig, KVTransferConfig, VllmConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -70,7 +71,7 @@ class _DiffusionVllmModelConfig:
     original_max_model_len: int | None
     runner_type: str = "generate"
     quantization: str | None = None
-    quantization_config: Any | None = None
+    quantization_config: QuantizationConfig | None = None
     hf_config: Any | None = None
     hf_text_config: Any | None = None
     multimodal_config: Any | None = None
@@ -160,8 +161,8 @@ class _DiffusionVllmModelConfig:
 
 
 def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
-    quant_config = getattr(od_config, "quantization_config", None)
-    quantization = quant_config.get_name() if quant_config is not None and hasattr(quant_config, "get_name") else None
+    quant_config = od_config.quantization_config
+    quantization = quant_config.get_name() if quant_config is not None else None
     hf_config = getattr(od_config, "tf_model_config", None)
     hf_text_config = get_hf_text_config(hf_config) if hasattr(hf_config, "get_text_config") else hf_config
     configured_max_model_len = getattr(od_config, "max_model_len", None)
