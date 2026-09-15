@@ -27,7 +27,7 @@ documented separately and is not re-measured here.
 
 | Task | Required input | Qualified output | Entrypoint |
 | --- | --- | --- | --- |
-| Layer decomposition | Exactly one image; prompt may be empty | Exactly `layers` RGBA PNGs | [`image_edit.py`](../../examples/offline_inference/image_to_image/image_edit.py) |
+| Layer decomposition | Exactly one image; prompt may be empty | Exactly `layers` RGBA PNG files | [`image_edit.py`](../../examples/offline_inference/image_to_image/image_edit.py) |
 
 | Parameter | Supported values | Notes |
 | --- | --- | --- |
@@ -139,7 +139,7 @@ ls -lh layered_0.png layered_1.png layered_2.png layered_3.png
 
 Expected: four RGBA PNG files. For a 720×1280 input at `resolution=640`, each
 layer is 480×864. The 2026-09-16 qualification produced four 480×864 RGBA
-PNGs (`layered_0.png` … `layered_3.png`) from a 720×1280 input.
+PNG files (`layered_0.png` … `layered_3.png`) from a 720×1280 input.
 
 ```bash
 python - <<'PY'
