@@ -75,7 +75,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
-from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
+from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError, is_client_error_status
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -1524,6 +1524,18 @@ class Orchestrator:
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
             parent_id = output.request_id
+        req_state = self.request_states.get(parent_id)
+        # Preserve a terminal worker rejection's origin before abort cleanup.
+        # Non-streaming stages are sequential. A final-stage rejection without
+        # CFG companions has no other request branch that may still read inputs.
+        worker_finished = (
+            bool(getattr(output, "finished", False))
+            and is_client_error_status(getattr(output, "error_status_code", None))
+            and req_state is not None
+            and req_state.final_stage_id == stage_id
+            and not req_state.streaming.enabled
+            and not self._cfg_tracker.has_companions(parent_id)
+        )
         await self.output_async_queue.put(
             ErrorMessage(
                 request_id=parent_id,
@@ -1531,6 +1543,7 @@ class Orchestrator:
                 error=output.error,
                 status_code=getattr(output, "error_status_code", None),
                 error_type=getattr(output, "error_type", None),
+                worker_finished=worker_finished,
             )
         )
         await self._cleanup_request_ids(

@@ -142,6 +142,72 @@ def test_prepare_ref2va_keeps_original_text_and_exact_condition_order():
     ]
 
 
+@pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
+def test_timeline_guides_survive_split_stage_without_qwen_presentation(task):
+    from multiprocessing.reduction import ForkingPickler
+
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
+
+    descriptors = [
+        {"frame_index": 36, "image": "/trusted/guide.png"},
+        {"frame_index": -22, "video": "/trusted/guide.mp4", "audio": "/trusted/guide.flac"},
+        {"frame_index": 36, "image": "/trusted/guide.png"},
+    ]
+    sampling = OmniDiffusionSamplingParams(
+        height=256,
+        width=448,
+        extra_args={"task": task, GUIDES_EXTRA_KEY: descriptors},
+    )
+    sampling = ForkingPickler.loads(ForkingPickler.dumps(sampling))
+    prompt = {"prompt": "unchanged prompt"}
+    if task != "t2va":
+        prompt["multi_modal_data"] = {"image": Image.new("RGB", (256, 256))}
+    transformed = prepare_text_encoder_prompt(prompt, [sampling])
+    assert transformed["prompt"] == prompt["prompt"]
+    assert transformed["mm_processor_kwargs"][MINIMAX_H3_CONDITION_LABELS_KEY] == (
+        [] if task == "t2va" else [("image", 1)]
+    )
+    assert len((transformed["multi_modal_data"] or {}).get("image", [])) == (0 if task == "t2va" else 1)
+    assert "video" not in (transformed["multi_modal_data"] or {})
+    assert "audio" not in (transformed["multi_modal_data"] or {})
+    assert sampling.extra_args[GUIDES_EXTRA_KEY] == descriptors
+    assert GUIDES_EXTRA_KEY not in transformed["mm_processor_kwargs"]
+    result = text_encoder2diffusion([_source_output(_valid_text_conditioning_payload())], prompt)
+    assert result["prompt"] == prompt["prompt"]
+    assert result.get("multi_modal_data") == prompt.get("multi_modal_data")
+    assert "text_encoder_output" in result["additional_information"]
+    assert sampling.extra_args[GUIDES_EXTRA_KEY] == descriptors
+
+
+@pytest.mark.parametrize("string_prompt", [False, True])
+@pytest.mark.parametrize("profile", ["high", "lora"])
+def test_timeline_split_stage_rejects_explicit_acceleration_before_qwen(monkeypatch, string_prompt, profile):
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
+
+    sampling = OmniDiffusionSamplingParams(
+        quality="lossless",
+        extra_args={GUIDES_EXTRA_KEY: [{"frame_index": 36, "image": "/trusted/guide.png"}]},
+    )
+    if profile == "high":
+        sampling.quality = "high"
+    else:
+        sampling.lora_request = SimpleNamespace(lora_int_id=1)
+    images = Mock(side_effect=AssertionError("must reject before Qwen image preparation"))
+    monkeypatch.setattr("vllm_omni.model_executor.stage_input_processors.minimax_h3._prepare_qwen_images", images)
+    prompt = "test" if string_prompt else {"prompt": "test", "multi_modal_data": {"image": object()}}
+    with pytest.raises(OmniClientError, match="timeline guides"):
+        prepare_text_encoder_prompt(prompt, [sampling])
+    images.assert_not_called()
+
+
+def test_empty_timeline_guides_keep_split_stage_high_quality_supported():
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
+
+    sampling = OmniDiffusionSamplingParams(quality="high", extra_args={GUIDES_EXTRA_KEY: []})
+    assert prepare_text_encoder_prompt("plain prompt", [sampling]) == "plain prompt"
+
+
 def test_text_encoder_prompt_rejects_injected_prepared_video_descriptor():
     prompt = {
         "prompt": "hello",

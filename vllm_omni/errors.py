@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Request-scoped client error types shared across vLLM-Omni entrypoints."""
 
@@ -31,6 +31,9 @@ class OmniClientError(ValueError):
         self.message = message
         self.status_code = int(status_code)
         self.error_type = error_type
+        # Populated only from an origin-qualified terminal worker rejection.
+        # An exception class or a completed abort request is not this proof.
+        self.worker_finished = False
 
 
 class GuardrailViolationError(OmniClientError):

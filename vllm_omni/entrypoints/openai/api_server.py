@@ -171,9 +171,11 @@ from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_v
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GUIDED_JOBS
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_SYNC_TIMEOUT_S,
     _cleanup_video_references,
+    _delete_guided_video,
     _parse_video_form,
     _run_video_generation_job,
     _status_code_for_video_failure,
@@ -362,40 +364,43 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             # server socket is accepting.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
-        shutdown_task = await serve_http(
-            _TimestampMiddleware(app),
-            sock=sock,
-            enable_ssl_refresh=args.enable_ssl_refresh,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            # NOTE: When the 'disable_uvicorn_access_log' value is True,
-            # no access log will be output.
-            access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
-            ssl_ca_certs=args.ssl_ca_certs,
-            ssl_cert_reqs=args.ssl_cert_reqs,
-            ssl_ciphers=args.ssl_ciphers,
-            h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
-            h11_max_header_count=args.h11_max_header_count,
-            **uvicorn_kwargs,
-        )
-
         try:
+            shutdown_task = await serve_http(
+                _TimestampMiddleware(app),
+                sock=sock,
+                enable_ssl_refresh=args.enable_ssl_refresh,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                # NOTE: When the 'disable_uvicorn_access_log' value is True,
+                # no access log will be output.
+                access_log=not args.disable_uvicorn_access_log,
+                timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs,
+                ssl_ciphers=args.ssl_ciphers,
+                h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+                h11_max_header_count=args.h11_max_header_count,
+                **uvicorn_kwargs,
+            )
             await shutdown_task
         finally:
             if warmup_task is not None:
                 warmup_task.cancel()
             state = getattr(app, "state", None)
             serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
-            if serving_video is not None:
-                serving_video.shutdown()
-            serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
-            if serving_speech is not None:
-                serving_speech.shutdown()
-            sock.close()
+            try:
+                if serving_video is not None:
+                    await serving_video.drain_guided_requests()
+            finally:
+                if serving_video is not None:
+                    serving_video.shutdown()
+                serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
+                if serving_speech is not None:
+                    serving_speech.shutdown()
+                sock.close()
 
 
 @asynccontextmanager
@@ -2345,6 +2350,31 @@ async def create_video(
         control_path,
     ) = ctx
     ref = video_response_from_request(effective_model_name, request)
+    bundle = request._guide_bundle
+    if bundle is not None:
+        try:
+            await VIDEO_STORE.upsert(ref.id, ref)
+            bundle.job_id = ref.id
+            GUIDED_JOBS[ref.id] = bundle
+            bundle.submit(
+                _run_video_generation_job(
+                    handler,
+                    request,
+                    ref.id,
+                    reference_image,
+                    reference_video,
+                    reference_audio,
+                    control_path,
+                    app_state=raw_request.app.state,
+                )
+            )
+            return ref
+        except BaseException:
+            bundle.abandoned = True
+            if bundle.task is None:
+                bundle.close()
+            await VIDEO_STORE.pop(ref.id)
+            raise
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(
         _run_video_generation_job(
@@ -2404,24 +2434,37 @@ async def create_video_sync(
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
+    bundle = request._guide_bundle
     try:
+        generation = handler.generate_video_bytes(
+            request,
+            request_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
+            reference_audio=reference_audio,
+        )
+        if bundle is not None:
+            generation = asyncio.shield(bundle.submit(generation))
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
-                handler.generate_video_bytes(
-                    request,
-                    request_id,
-                    reference_image=reference_image,
-                    reference_video=reference_video,
-                    reference_audio=reference_audio,
-                ),
+                generation,
                 timeout=VIDEO_SYNC_TIMEOUT_S,
             ),
         )
     except asyncio.TimeoutError:
+        if bundle is not None:
+            bundle.abandoned = True
         raise HTTPException(
             status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
-            detail=f"Video generation timed out after {VIDEO_SYNC_TIMEOUT_S}s.",
+            detail=(
+                f"Video generation timed out after {VIDEO_SYNC_TIMEOUT_S}s."
+                + (" Submitted guided generation continues; inputs are released after completion." if bundle else "")
+            ),
         )
+    except asyncio.CancelledError:
+        if bundle is not None:
+            bundle.abandoned = True
+        raise
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
@@ -2436,7 +2479,10 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path)
+        if bundle is None:
+            _cleanup_video_references(reference_video, reference_audio, control_path)
+        elif bundle.task is None:
+            bundle.close()
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -2534,9 +2580,18 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
         HTTPException: If the video job does not exist, cancellation is still
         in progress, or output is not yet ready for a completed job.
     """
+    bundle = GUIDED_JOBS.get(video_id)
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    bundle = bundle or GUIDED_JOBS.get(video_id)
+    if bundle is not None:
+        # Do not cancel the generation task: abort acknowledgement does not
+        # establish that a worker has stopped reading file-backed inputs.
+        bundle.abandoned = True
+        await bundle.finish_storage(_delete_guided_video(video_id, bundle))
+        return VideoDeleteResponse(id=video_id, deleted=True)
 
     if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
         task = await VIDEO_TASKS.get(video_id)

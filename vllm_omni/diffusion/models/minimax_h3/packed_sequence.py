@@ -345,6 +345,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     ref_blocks: Sequence[Mapping[str, object]],
     audio_channel: int = 2,
     seq_len: int | None = None,
+    guide_blocks: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """General ref2va-family packed layout.
 
@@ -358,20 +359,55 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     rows; both share the same temporal origin and advance by the longer of the
     audio and video spans. Standalone audio advances the target origin by its
     own T, and image blocks advance it by one integer slot.
+
+    Optional ``guide_blocks`` use the same shapes plus a resolved nonnegative
+    integer ``frame_index`` (in pixel frames). They pack before references, in
+    insertion order, with visual rows before audio for AV guides. A ``video``
+    guide requires ``ref_audio_t=0``; use ``video_audio`` for explicit audio.
+    Guides start at the reference-adjusted target origin plus 5/3 * frame_index
+    and never advance that origin. Guide and reference rows together form the
+    fixed prefix of each modality's rows. Output length/row admission limits
+    must be checked by the caller before materializing this layout.
     """
+    dimensions = dict(
+        text_len=text_len,
+        latent_t=latent_t,
+        latent_h=latent_h,
+        latent_w=latent_w,
+        audio_t=audio_t,
+        audio_channel=audio_channel,
+    )
+    for key in dimensions:
+        _positive_int(dimensions, key, "target", allow_zero=key == "text_len")
+    if latent_h % _PATCH_H or latent_w % _PATCH_W:
+        raise ValueError("target latent_h and latent_w must be divisible by the spatial patch size (2)")
+    if seq_len is not None:
+        _positive_int({"seq_len": seq_len}, "seq_len", "target")
     if not isinstance(ref_blocks, Sequence) or isinstance(ref_blocks, (str, bytes)):
         raise ValueError("ref_blocks must be a sequence")
+    if guide_blocks is None:
+        guide_blocks = ()
+    if not isinstance(guide_blocks, Sequence) or isinstance(guide_blocks, (str, bytes)):
+        raise ValueError("guide_blocks must be a sequence")
 
     parsed: list[dict[str, object]] = []
     ref_visual_rows = 0
     ref_audio_rows = 0
-    for index, raw in enumerate(ref_blocks):
-        path = f"ref_blocks[{index}]"
+    for block_index, raw in enumerate((*guide_blocks, *ref_blocks)):
+        is_guide = block_index < len(guide_blocks)
+        index = block_index if is_guide else block_index - len(guide_blocks)
+        path = f"{'guide_blocks' if is_guide else 'ref_blocks'}[{index}]"
         if not isinstance(raw, Mapping):
             raise ValueError(f"{path} must be an object")
+        if is_guide:
+            frame_index = _positive_int(raw, "frame_index", path, allow_zero=True)
         kind = raw.get("kind", raw.get("type"))
         if not isinstance(kind, str) or not kind:
             raise ValueError(f"{path}.kind must be a non-empty string")
+        if kind in ("image", "video", "video_audio"):
+            for key, patch in (("latent_h", _PATCH_H), ("latent_w", _PATCH_W)):
+                if _positive_int(raw, key, path) % patch:
+                    raise ValueError(f"{path}.{key} must be divisible by the spatial patch size ({patch})")
         if kind == "image":
             rh = _positive_int(raw, "latent_h", path)
             rw = _positive_int(raw, "latent_w", path)
@@ -379,12 +415,14 @@ def minimax_h3_packed_sequence_ref2va_blocks(
             item = {"kind": kind, "latent_h": rh, "latent_w": rw, "rows": rows}
             ref_visual_rows += rows
         elif kind == "audio":
-            rt = _positive_int(raw, "ref_audio_t", path, allow_zero=True)
+            rt = _positive_int(raw, "ref_audio_t", path, allow_zero=not is_guide)
             rows = rt * audio_channel
             item = {"kind": kind, "ref_audio_t": rt, "audio_rows": rows}
             ref_audio_rows += rows
         elif kind in ("video", "video_audio"):
-            rt = _positive_int(raw, "ref_audio_t", path, allow_zero=True)
+            rt = _positive_int(raw, "ref_audio_t", path, allow_zero=not is_guide or kind == "video")
+            if is_guide and kind == "video" and rt:
+                raise ValueError(f"{path}.ref_audio_t must be zero for a video guide; use video_audio for AV")
             vt = _positive_int(raw, "latent_t", path)
             vh = _positive_int(raw, "latent_h", path)
             vw = _positive_int(raw, "latent_w", path)
@@ -405,7 +443,23 @@ def minimax_h3_packed_sequence_ref2va_blocks(
             ref_visual_rows += video_rows
         else:
             raise ValueError(f"{path}.kind unsupported for ref2va: {kind!r}")
+        if is_guide:
+            item["frame_index"] = frame_index
         parsed.append(item)
+
+    # Preserve reference accumulation order (including fp64 rounding), independent
+    # of physical row offsets and guide spans.
+    target_origin = float(text_len)
+    for item in parsed[len(guide_blocks) :]:
+        item["origin"] = target_origin
+        if item["kind"] == "image":
+            target_origin += 1.0
+        elif item["kind"] == "audio":
+            target_origin += float(item["ref_audio_t"])
+        else:
+            target_origin += max(float(item["ref_audio_t"]), _video_t_span(int(item["latent_t"])))
+    for item in parsed[: len(guide_blocks)]:
+        item["origin"] = target_origin + _FRAME_RESCALE * int(item["frame_index"])
 
     ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
     frame_rows = ph * pw
@@ -433,9 +487,14 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         else:
             a_rows = int(item["audio_rows"])
             v_rows = int(item["video_rows"])
-            audio_sl = slice(cursor, cursor + a_rows)
-            visual_sl = slice(audio_sl.stop, audio_sl.stop + v_rows)
-            cursor = visual_sl.stop
+            if "frame_index" in item:
+                visual_sl = slice(cursor, cursor + v_rows)
+                audio_sl = slice(visual_sl.stop, visual_sl.stop + a_rows)
+                cursor = audio_sl.stop
+            else:
+                audio_sl = slice(cursor, cursor + a_rows)
+                visual_sl = slice(audio_sl.stop, audio_sl.stop + v_rows)
+                cursor = visual_sl.stop
             block_slices.append({**item, "audio_sl": audio_sl, "visual_sl": visual_sl})
 
     audio_sl = slice(cursor, cursor + audio_rows)
@@ -485,8 +544,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     hh, ww = torch.meshgrid(h_grid, w_grid, indexing="ij")
     target_frame = torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1)
 
-    t_cursor = float(text_len)
     for item in block_slices:
+        t_cursor = float(item["origin"])
         kind = str(item["kind"])
         if kind == "image":
             visual_sl = item["visual_sl"]
@@ -505,7 +564,6 @@ def minimax_h3_packed_sequence_ref2va_blocks(
             g[visual_sl, 0] = t_cursor
             g[visual_sl, 1] = ref_hh.reshape(-1)
             g[visual_sl, 2] = ref_ww.reshape(-1)
-            t_cursor += 1.0
         elif kind == "audio":
             audio_ref_sl = item["audio_sl"]
             assert isinstance(audio_ref_sl, slice)
@@ -526,7 +584,6 @@ def minimax_h3_packed_sequence_ref2va_blocks(
                         ),
                     ]
                 )
-            t_cursor += float(ref_t)
         else:
             audio_ref_sl = item["audio_sl"]
             visual_sl = item["visual_sl"]
@@ -567,7 +624,6 @@ def minimax_h3_packed_sequence_ref2va_blocks(
             rv_g[:, :, 0] = _video_t_grid(vt, t_cursor)[:, None]
             rv_g[:, :, 1:] = rv_frame[None]
             g[visual_sl] = rv_g.reshape(-1, 3)
-            t_cursor += max(float(ref_t), _video_t_span(vt))
 
     input_ids[audio_sl] = MINIMAX_H3_AUDIO_ID
     input_ids[audio_sl.start] = MINIMAX_H3_AUDIO_FIRST_ID
@@ -577,7 +633,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     audio_mask[audio_sl] = True
     image_mask[video_sl] = True
 
-    audio_t_grid = t_cursor + torch.arange(audio_t, dtype=torch.float64)
+    audio_t_grid = target_origin + torch.arange(audio_t, dtype=torch.float64)
     g[audio_sl, 0] = audio_t_grid.repeat(audio_channel)
     g[audio_sl, 2] = torch.cat(
         [
@@ -587,7 +643,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     )
 
     video_g = torch.empty(latent_t, frame_rows, 3, dtype=torch.float64)
-    video_g[:, :, 0] = _video_t_grid(latent_t, t_cursor)[:, None]
+    video_g[:, :, 0] = _video_t_grid(latent_t, target_origin)[:, None]
     video_g[:, :, 1:] = target_frame[None]
     g[video_sl] = video_g.reshape(-1, 3)
 

@@ -86,13 +86,10 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     minimax_h3_text_only_ids,
 )
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    resolve_minimax_h3_aspect_ratio as _resolve_minimax_h3_aspect_ratio,
-)
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    resolve_minimax_h3_output_canvas as _resolve_output_canvas,
-)
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     resolve_minimax_h3_reference_image_shape as _reference_image_shape,
+)
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    resolve_minimax_h3_target_canvas as _resolve_target_canvas,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
@@ -104,6 +101,17 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
+)
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
+    GUIDES_EXTRA_KEY,
+    TimelineGuideBudget,
+    TimelineGuideLimits,
+    decode_guide_audio,
+    decode_guide_image,
+    decode_guide_video,
+    guide_audio_limit,
+    resolve_guide_start,
+    validate_guide_descriptors,
 )
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import (
@@ -290,6 +298,7 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "visual_condition_shapes",
     "audio_condition_lengths",
     "keyframe_frame_indices",
+    "guide_blocks",
     "pad_seq_len",
 )
 
@@ -640,6 +649,38 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
             error_type=error_type,
         )
     raise RuntimeError(message)
+
+
+def _synchronize_any_rank_exception(exc: Exception | None) -> None:
+    """Agree on any rank's failure after local work and residency cleanup."""
+    group, _, world_size = _dit_rank_world()
+    if world_size == 1:
+        if exc is not None:
+            raise exc
+        return
+    local_error = (
+        None
+        if exc is None
+        else {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "status_code": getattr(exc, "status_code", None),
+            "error_type": getattr(exc, "error_type", None),
+        }
+    )
+    errors: list[Any] = [None] * world_size
+    dist.all_gather_object(errors, local_error, group=group)
+    for rank, info in enumerate(errors):
+        if info is None:
+            continue
+        message = f"[rank {rank}] {info['type']}: {info['message']}"
+        if info["status_code"] is not None:
+            raise client_error_from_metadata(
+                message,
+                status_code=int(info["status_code"]),
+                error_type=info["error_type"],
+            )
+        raise RuntimeError(message)
 
 
 def _broadcast_tensor(
@@ -1300,32 +1341,15 @@ class MiniMaxH3Pipeline(
             )
         num_frames = minimax_h3_align_frame_count(requested_frames)
 
-        height = sampling.height
-        width = sampling.width
-        aspect_ratio = target.get("aspect_ratio", extra.get("aspect_ratio"))
-        raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
-        if isinstance(raw_short_edge, bool) or not isinstance(raw_short_edge, (int, np.integer)):
-            raise OmniClientError(
-                f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {raw_short_edge!r}"
-            )
-        short_edge = int(raw_short_edge)
-
-        aspect_ratio = _resolve_minimax_h3_aspect_ratio(
+        # One shared canvas resolver; the split-stage Qwen preparation calls the
+        # same function so reference/target shapes cannot drift between stages.
+        height, width = _resolve_target_canvas(
             task,
-            aspect_ratio,
-            image,
+            height=sampling.height,
+            width=sampling.width,
+            extra_args=extra,
+            image=image,
         )
-        if not 0.25 <= aspect_ratio <= 4.0:
-            raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be in [1:4, 4:1], got {aspect_ratio}")
-
-        if height is None or width is None:
-            height, width = _resolve_output_canvas(aspect_ratio, short_edge)
-        height = int(height) // 32 * 32
-        width = int(width) // 32 * 32
-        if min(height, width) <= 0:
-            raise OmniClientError(f"invalid MiniMax H3 canvas {width}x{height}")
-        if width > 4 * height or height > 4 * width:
-            raise OmniClientError("MiniMax H3 canvas aspect ratio must be in [1:4, 4:1]")
 
         latent_t = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(num_frames)
         audio_t = MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(num_frames / fps)
@@ -1701,6 +1725,205 @@ class MiniMaxH3Pipeline(
                             logger.exception("Failed to release retained allocator cache after offload failure")
                     raise
 
+    def _validate_timeline_guide_profile(self, sampling: Any, task: str, quality_plan: Any) -> None:
+        if quality_plan.cache_dit is not None:
+            raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
+        cache_backend = str(getattr(self.od_config, "cache_backend", "none") or "none").lower()
+        if cache_backend not in ("none", "cache_dit"):
+            raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
+        if (
+            self._fasth3 is not None
+            or self.lora_is_fused
+            or getattr(self, "_lora_is_fused", False)
+            # LoraLoaderMixin records this only after in-place weight addition;
+            # the dynamic manager's inactive registry is _registered_adapters.
+            or getattr(self, "_lora_loaded", None)
+        ):
+            raise OmniClientError("MiniMax H3 timeline guides require base H3 weights, not FastH3 or fused LoRA")
+        if sampling.lora_request is not None and not math.isclose(float(sampling.lora_scale), 0.0):
+            raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
+        if self._sigma_schedule_for_request(sampling, task) is not None:
+            raise OmniClientError("MiniMax H3 timeline guides do not support distilled schedules")
+        # Inspect resolved modules, including the token-refiner attention role,
+        # rather than the startup default (which role overrides can replace).
+        dense_backends = {
+            "FLASH_ATTN",
+            "SDPA",
+            "SAGE_ATTN",
+            "SAGE_ATTN_3",
+            "CUDNN_ATTN",
+            "FLASHINFER_ATTN",
+            "FLASH_ATTN_HUB",
+            "FLASH_ATTN_3_HUB",
+            "TRTLLM_ATTN",
+        }
+        for module in self._transformer_for_task(task).modules():
+            if any(getattr(module, "_diffusion_lora_active_slices", ())):
+                raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA adapters")
+            if isinstance(module, MiniMaxH3Attention):
+                backend = module.attention.attn_backend.get_name()
+                if backend not in dense_backends:
+                    raise OmniClientError(
+                        f"MiniMax H3 timeline guides require dense attention in every role; got {backend}"
+                    )
+                if backend == "TRTLLM_ATTN":
+                    from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig, SkipSoftmaxConfig
+
+                    attention = module.attention
+                    implementation = attention.attention
+                    spec = getattr(attention, "attn_spec", None)
+                    backend_kwargs = spec.backend_kwargs() if spec is not None else None
+                    if (
+                        implementation.quant.enabled
+                        or implementation.skip.configured
+                        or QuantConfig.from_backend_kwargs(backend_kwargs).enabled
+                        or SkipSoftmaxConfig.from_backend_kwargs(backend_kwargs).configured
+                    ):
+                        raise OmniClientError(
+                            "MiniMax H3 timeline guides require dense unquantized TRTLLM_ATTN in every role; "
+                            "disable quant and skip_softmax/target_sparsity options"
+                        )
+
+    @staticmethod
+    def _check_timeline_rows(limits: TimelineGuideLimits, guide_rows: int, other_rows: int) -> int:
+        packed_rows = ((guide_rows + other_rows + 63) // 64) * 64
+        if guide_rows > limits.max_guide_rows:
+            raise OmniClientError("MiniMax H3 timeline guides exceed the guide-row limit; trim guides")
+        if packed_rows > limits.max_packed_rows:
+            raise OmniClientError("MiniMax H3 timeline guides exceed the packed-request row limit; trim inputs")
+        return packed_rows
+
+    def _encode_timeline_guides(
+        self,
+        descriptors: list[dict[str, Any]],
+        *,
+        width: int,
+        height: int,
+        num_frames: int,
+        limits: TimelineGuideLimits,
+        other_rows: int,
+        keyframe_rows: int = 0,
+    ) -> tuple[list[dict[str, Any]], torch.Tensor | None, list[tuple[int, int, int]], torch.Tensor | None, list[int]]:
+        group, rank, world_size = _dit_rank_world()
+        decoded: list[dict[str, Any]] = []
+        blocks: list[dict[str, Any]] = []
+        prep_error = None
+        if rank == 0:
+            try:
+                budget = TimelineGuideBudget(limits)
+                guide_rows = keyframe_rows
+                other_rows -= keyframe_rows
+                for descriptor in descriptors:
+                    frames = None
+                    audio = None
+                    if "image" in descriptor:
+                        frames = [decode_guide_image(descriptor["image"], width, height, limits, budget=budget)]
+                    elif "video" in descriptor:
+                        frames = decode_guide_video(
+                            descriptor["video"], width, height, num_frames, limits, budget=budget
+                        )
+                    count = len(frames) if frames is not None else 1
+                    start = resolve_guide_start(descriptor["frame_index"], num_frames, count)
+                    block: dict[str, Any] = {"frame_index": start}
+                    if frames is not None:
+                        vt = 1 if count == 1 else MINIMAX_H3_SHAPE_PLANNER.video_latent_t(count)
+                        block.update(
+                            kind="image" if "image" in descriptor else "video",
+                            latent_t=vt,
+                            latent_h=height // 16,
+                            latent_w=width // 16,
+                            ref_audio_t=0,
+                        )
+                        guide_rows += vt * (height // 32) * (width // 32)
+                    if "audio" in descriptor:
+                        audio = decode_guide_audio(descriptor["audio"], limits, budget=budget)
+                        # Audio VAE preprocess may pad to its stride. Reserve the
+                        # whole output remainder, then verify the actual cropped T.
+                        limit_t = guide_audio_limit(num_frames, start)
+                        if limit_t < 1:
+                            raise OmniClientError("timeline guide leaves no audio latent positions")
+                        block.update(kind="video_audio" if frames is not None else "audio", ref_audio_t=limit_t)
+                        guide_rows += 2 * limit_t
+                    self._check_timeline_rows(limits, guide_rows, other_rows)
+                    blocks.append(block)
+                    decoded.append({"frames": frames, "audio": audio})
+            except Exception as exc:
+                prep_error = OmniClientError(str(exc)) if isinstance(exc, ValueError) else exc
+        _broadcast_rank0_exception(prep_error)
+        if world_size > 1:
+            payload = [blocks]
+            dist.broadcast_object_list(payload, src=0, group=group)
+            blocks = payload[0]
+
+        visual_parts, audio_parts = [], []
+        visual_shapes, audio_lengths = [], []
+        distributed_video = any("video" in item for item in descriptors) and self.video_vae.is_distributed_enabled()
+        for index, block in enumerate(blocks):
+            if block["kind"] != "audio":
+                frames = decoded[index]["frames"] if rank == 0 else None
+                is_clip = "video" in descriptors[index]
+                if distributed_video and is_clip:
+                    payload = [frames]
+                    dist.broadcast_object_list(payload, src=0, group=group)
+                    frames = payload[0]
+                rows = None
+                encode_error = None
+                shape = (block["latent_t"], block["latent_h"], block["latent_w"])
+                try:
+                    if rank == 0 or (distributed_video and is_clip):
+                        with self._component_on_device(self.video_vae):
+                            if is_clip:
+                                video_frames = np.stack([np.asarray(frame) for frame in frames])
+                                rows, actual_shape = self.video_vae.encode_video(video_frames)
+                                if tuple(actual_shape) != shape:
+                                    raise OmniClientError(
+                                        f"timeline guide video latent shape {actual_shape} != {shape}"
+                                    )
+                            else:
+                                rows = self.video_vae.encode_image(frames[0])
+                        expected = shape[0] * (shape[1] // 2) * (shape[2] // 2)
+                        if tuple(rows.shape) != (expected, 96):
+                            raise OmniClientError("timeline guide visual VAE returned an unexpected row shape")
+                except Exception as exc:
+                    encode_error = exc
+                if distributed_video and is_clip:
+                    _synchronize_any_rank_exception(encode_error)
+                else:
+                    _broadcast_rank0_exception(encode_error)
+                visual_parts.append(_broadcast_tensor(rows, dtype=torch.float32, device=self.device))
+                visual_shapes.append(shape)
+            if block["kind"] in ("audio", "video_audio"):
+                rows = None
+                encode_error = None
+                length = 0
+                if rank == 0:
+                    try:
+                        waveform, sample_rate = decoded[index]["audio"]
+                        with self._component_on_device(self.audio_vae):
+                            rows, length = self.audio_vae.encode_waveform(torch.from_numpy(waveform), sample_rate)
+                        if length < 1 or tuple(rows.shape) != (2 * length, 32):
+                            raise OmniClientError("timeline guide audio VAE returned empty or invalid stereo rows")
+                        cropped_t = min(length, block["ref_audio_t"])
+                        # VAE rows are channel-major: crop time independently for
+                        # both channels, never slice the already-flattened prefix.
+                        rows = rows.reshape(2, length, 32)[:, :cropped_t].reshape(-1, 32)
+                        length = cropped_t
+                    except Exception as exc:
+                        encode_error = exc
+                _broadcast_rank0_exception(encode_error)
+                rows = _broadcast_tensor(rows, dtype=torch.float32, device=self.device)
+                length = rows.shape[0] // 2
+                block["ref_audio_t"] = length
+                audio_parts.append(rows)
+                audio_lengths.append(length)
+        return (
+            blocks,
+            torch.cat(visual_parts) if visual_parts else None,
+            visual_shapes,
+            torch.cat(audio_parts) if audio_parts else None,
+            audio_lengths,
+        )
+
     @staticmethod
     def _is_output_owner_rank() -> bool:
         """Whether this rank's output is returned by the diffusion executor."""
@@ -1732,41 +1955,66 @@ class MiniMaxH3Pipeline(
         prepared_videos: list[dict[str, Any]] | None,
         *,
         video_count: int,
+        guided: bool = False,
     ) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
         rows: list[torch.Tensor] = []
         shapes: list[tuple[int, int, int]] = []
         _, rank, _ = _dit_rank_world()
-        # Keep image and video references in one residency window when both
-        # appear in a request; otherwise the video branch would reload the VAE.
+        # Preserve the legacy shared residency window. Guided encodes close
+        # their individual contexts before agreeing on any-rank errors, so an
+        # offload failure cannot strand peers in the next encode/transfer.
         needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
-        video_vae_context = self._component_on_device(self.video_vae) if needs_video_vae else nullcontext()
-        with video_vae_context:
-            if images:
-                image_rows = None
-                if rank == 0:
-                    image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
-                rows.append(
-                    _broadcast_tensor(
-                        image_rows,
-                        dtype=torch.float32,
-                        device=self.device,
+        video_vae_context = (
+            self._component_on_device(self.video_vae) if needs_video_vae and not guided else nullcontext()
+        )
+        preparation_error = None
+        combined_rows = None
+        try:
+            with video_vae_context:
+                if images:
+                    image_rows = None
+                    encode_error = None
+                    if rank == 0:
+                        try:
+                            with self._component_on_device(self.video_vae) if guided else nullcontext():
+                                image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
+                        except Exception as exc:
+                            encode_error = exc
+                    if guided:
+                        _broadcast_rank0_exception(encode_error)
+                    elif encode_error is not None:
+                        raise encode_error
+                    rows.append(
+                        _broadcast_tensor(
+                            image_rows,
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
                     )
-                )
-                shapes.extend((1, image.height // 16, image.width // 16) for image in images)
-            if video_count:
-                video_rows, video_shapes = self._encode_video_conditions_resident(
-                    prepared_videos,
-                    count=video_count,
-                )
-                rows.append(video_rows)
-                shapes.extend(video_shapes)
-        return (torch.cat(rows) if rows else None), shapes
+                    shapes.extend((1, image.height // 16, image.width // 16) for image in images)
+                if video_count:
+                    video_rows, video_shapes = self._encode_video_conditions_resident(
+                        prepared_videos,
+                        count=video_count,
+                        **({"guided": True} if guided else {}),
+                    )
+                    rows.append(video_rows)
+                    shapes.extend(video_shapes)
+            combined_rows = torch.cat(rows) if rows else None
+        except Exception as exc:
+            preparation_error = exc
+        if guided:
+            _synchronize_any_rank_exception(preparation_error)
+        elif preparation_error is not None:
+            raise preparation_error
+        return combined_rows, shapes
 
     def _encode_audio_conditions_resident(
         self,
         audios: list[tuple[torch.Tensor, int]],
         *,
         max_duration_seconds: float | None = None,
+        guided: bool = False,
     ) -> tuple[torch.Tensor | None, list[int]]:
         if not audios:
             return None, []
@@ -1777,20 +2025,28 @@ class MiniMaxH3Pipeline(
         _, rank, _ = _dit_rank_world()
         rows = None
         lengths = torch.zeros(len(audios), dtype=torch.long, device=self.device)
+        encode_error = None
         if rank == 0:
-            bounded_audios = []
-            for waveform, sample_rate in audios:
-                if max_duration_seconds is not None:
-                    max_samples = int(round(max_duration_seconds * int(sample_rate)))
-                    waveform = waveform[..., :max_samples]
-                bounded_audios.append((waveform, sample_rate))
-            encoded = [self.audio_vae.encode_waveform(*audio) for audio in bounded_audios]
-            rows = torch.cat([item[0] for item in encoded])
-            lengths = torch.tensor(
-                [int(item[1]) for item in encoded],
-                dtype=torch.long,
-                device=self.device,
-            )
+            try:
+                bounded_audios = []
+                for waveform, sample_rate in audios:
+                    if max_duration_seconds is not None:
+                        max_samples = int(round(max_duration_seconds * int(sample_rate)))
+                        waveform = waveform[..., :max_samples]
+                    bounded_audios.append((waveform, sample_rate))
+                encoded = [self.audio_vae.encode_waveform(*audio) for audio in bounded_audios]
+                rows = torch.cat([item[0] for item in encoded])
+                lengths = torch.tensor(
+                    [int(item[1]) for item in encoded],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            except Exception as exc:
+                encode_error = exc
+        if guided:
+            _broadcast_rank0_exception(encode_error)
+        elif encode_error is not None:
+            raise encode_error
         group, _, world_size = _dit_rank_world()
         if world_size > 1:
             dist.broadcast(lengths, src=0, group=group)
@@ -1804,35 +2060,53 @@ class MiniMaxH3Pipeline(
         prepared_videos: list[dict[str, Any]] | None,
         *,
         count: int,
+        guided: bool = False,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
         group, rank, world_size = _dit_rank_world()
         distributed_encode = self.video_vae.is_distributed_enabled()
-        if distributed_encode:
-            # Native tiled encode uses collectives, so every VPP rank must
-            # enter each reference encode in the same input order.
+        if distributed_encode and not guided:
             prepared_videos_list = [prepared_videos]
-            dist.broadcast_object_list(
-                prepared_videos_list,
-                src=0,
-                group=group,
-                device=self.device,
-            )
+            dist.broadcast_object_list(prepared_videos_list, src=0, group=group, device=self.device)
             prepared_videos = prepared_videos_list[0]
-
         rows = None
         shapes = torch.zeros((count, 3), dtype=torch.long, device=self.device)
+        encoded = []
+        for index in range(count):
+            frames = None
+            prep_error = None
+            if rank == 0 or (distributed_encode and not guided):
+                try:
+                    if prepared_videos is None or len(prepared_videos) != count:
+                        raise ValueError("reference-video preparation is incomplete")
+                    frames = load_video_frames(prepared_videos[index]["prepared_path"])
+                except Exception as exc:
+                    prep_error = exc
+            # A decoder error must be agreed on before any rank enters the
+            # distributed VAE's collectives. Encode occurrences sequentially.
+            if guided:
+                _broadcast_rank0_exception(prep_error)
+            elif prep_error is not None:
+                raise prep_error
+            if distributed_encode and guided:
+                payload = [frames]
+                dist.broadcast_object_list(payload, src=0, group=group, device=self.device)
+                frames = payload[0]
+            encode_error = None
+            try:
+                if rank == 0 or distributed_encode:
+                    with self._component_on_device(self.video_vae) if guided else nullcontext():
+                        encoded.append(self.video_vae.encode_video(frames))
+            except Exception as exc:
+                encode_error = exc
+            if guided and distributed_encode:
+                _synchronize_any_rank_exception(encode_error)
+            elif guided:
+                _broadcast_rank0_exception(encode_error)
+            if encode_error is not None:
+                raise encode_error
         if rank == 0 or distributed_encode:
-            if prepared_videos is None or len(prepared_videos) != count:
-                raise ValueError("reference-video preparation is incomplete")
-            encoded = [
-                self.video_vae.encode_video(load_video_frames(item["prepared_path"])) for item in prepared_videos
-            ]
             rows = torch.cat([item[0] for item in encoded])
-            shapes = torch.tensor(
-                [item[1] for item in encoded],
-                dtype=torch.long,
-                device=self.device,
-            )
+            shapes = torch.tensor([item[1] for item in encoded], dtype=torch.long, device=self.device)
         if distributed_encode:
             return (
                 rows.to(device=self.device, dtype=torch.float32),
@@ -1851,6 +2125,7 @@ class MiniMaxH3Pipeline(
         prepared_videos: list[dict[str, Any]] | None,
         *,
         has_audio: list[bool],
+        guided: bool = False,
     ) -> tuple[torch.Tensor | None, list[int]]:
         _, rank, _ = _dit_rank_world()
         count = sum(has_audio)
@@ -1858,29 +2133,37 @@ class MiniMaxH3Pipeline(
             return None, []
         rows = None
         lengths = torch.zeros(count, dtype=torch.long, device=self.device)
+        encode_error = None
         if rank == 0:
-            if prepared_videos is None:
-                raise ValueError("rank 0 reference-video preparation is incomplete")
-            encoded = [
-                self.audio_vae.encode_waveform(
-                    *load_video_audio(
-                        item["original_path"],
-                        start_time_seconds=float(item.get("start_time_seconds", 0.0)),
-                        duration_seconds=item.get(
-                            "audio_duration_seconds",
-                            item.get("duration_seconds"),
-                        ),
+            try:
+                if prepared_videos is None:
+                    raise ValueError("rank 0 reference-video preparation is incomplete")
+                encoded = [
+                    self.audio_vae.encode_waveform(
+                        *load_video_audio(
+                            item["original_path"],
+                            start_time_seconds=float(item.get("start_time_seconds", 0.0)),
+                            duration_seconds=item.get(
+                                "audio_duration_seconds",
+                                item.get("duration_seconds"),
+                            ),
+                        )
                     )
+                    for item in prepared_videos
+                    if item["input_has_audio"]
+                ]
+                rows = torch.cat([item[0] for item in encoded])
+                lengths = torch.tensor(
+                    [item[1] for item in encoded],
+                    dtype=torch.long,
+                    device=self.device,
                 )
-                for item in prepared_videos
-                if item["input_has_audio"]
-            ]
-            rows = torch.cat([item[0] for item in encoded])
-            lengths = torch.tensor(
-                [item[1] for item in encoded],
-                dtype=torch.long,
-                device=self.device,
-            )
+            except Exception as exc:
+                encode_error = exc
+        if guided:
+            _broadcast_rank0_exception(encode_error)
+        elif encode_error is not None:
+            raise encode_error
         group, _, world_size = _dit_rank_world()
         if world_size > 1:
             dist.broadcast(lengths, src=0, group=group)
@@ -1896,6 +2179,7 @@ class MiniMaxH3Pipeline(
         has_audio: list[bool],
         standalone_audios: list[tuple[torch.Tensor, int]],
         max_duration_seconds: float,
+        guided: bool = False,
     ) -> tuple[torch.Tensor | None, list[int], torch.Tensor | None, list[int]]:
         # Embedded and standalone audio are consecutive direct Audio-VAE
         # calls. Keep the component resident across both paths.
@@ -1905,10 +2189,12 @@ class MiniMaxH3Pipeline(
             embedded_condition, embedded_lengths = self._encode_video_audio_conditions_resident(
                 prepared_videos,
                 has_audio=has_audio,
+                **({"guided": True} if guided else {}),
             )
             external_condition, external_lengths = self._encode_audio_conditions_resident(
                 standalone_audios,
                 max_duration_seconds=max_duration_seconds,
+                **({"guided": True} if guided else {}),
             )
         return (
             embedded_condition,
@@ -1984,6 +2270,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
@@ -1991,6 +2278,31 @@ class MiniMaxH3Pipeline(
         Shared by request-mode :meth:`diffuse` and step-mode
         :meth:`prepare_encode` so both paths start from identical state.
         """
+        if guide_blocks:
+            limits = TimelineGuideLimits.from_config(getattr(self.od_config, "model_config", None))
+            guide_rows = ref_rows = visual_rows = audio_rows = 0
+            for blocks, is_guide in ((guide_blocks, True), (ref_blocks or [], False)):
+                for block in blocks:
+                    vr = (
+                        (int(block.get("latent_t", 1)) * (int(block["latent_h"]) // 2) * (int(block["latent_w"]) // 2))
+                        if block["kind"] != "audio"
+                        else 0
+                    )
+                    ar = int(block.get("ref_audio_t", 0)) * 2
+                    visual_rows += vr
+                    audio_rows += ar
+                    if is_guide:
+                        guide_rows += vr + ar
+                    else:
+                        ref_rows += vr + ar
+            expected_packed_rows = self._check_timeline_rows(
+                limits,
+                guide_rows,
+                int(text_embeddings.shape[0]) + ref_rows + latent_t * (latent_h // 2) * (latent_w // 2) + audio_t * 2,
+            )
+            for rows, expected, features in ((visual_condition, visual_rows, 96), (audio_condition, audio_rows, 32)):
+                if (rows is None and expected) or (rows is not None and tuple(rows.shape) != (expected, features)):
+                    raise OmniClientError("timeline guide/reference anchors do not match the packed modality rows")
         initial_video, initial_audio = self._initial_noise(
             seed=seed,
             latent_t=latent_t,
@@ -1998,8 +2310,8 @@ class MiniMaxH3Pipeline(
             latent_w=latent_w,
             audio_t=audio_t,
         )
-        if task == "ref2va":
-            if ref_blocks is None:
+        if task == "ref2va" or guide_blocks:
+            if ref_blocks is None and not guide_blocks:
                 if visual_condition_shape is None or ref_audio_t is None:
                     raise ValueError("ref2va condition metadata is missing")
                 _, ref_h, ref_w = visual_condition_shape
@@ -2013,7 +2325,8 @@ class MiniMaxH3Pipeline(
                 latent_h=latent_h,
                 latent_w=latent_w,
                 audio_t=audio_t,
-                ref_blocks=ref_blocks,
+                ref_blocks=ref_blocks or [],
+                **({"guide_blocks": guide_blocks} if guide_blocks else {}),
                 seq_len=pad_seq_len,
             )
         else:
@@ -2040,6 +2353,8 @@ class MiniMaxH3Pipeline(
             int(packed["seq_len"]),
         )
 
+        if guide_blocks and int(packed["seq_len"]) != expected_packed_rows:
+            raise OmniClientError("timeline guide packed row count differs from the admitted layout")
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"]] = text_tags.cpu()
         branch = MiniMaxH3DenoiseBranch(
@@ -2063,6 +2378,10 @@ class MiniMaxH3Pipeline(
                 imgvid_cond_num_frames=len(condition_shapes),
                 seed=seed,
                 noise_aug=MINIMAX_H3_IMGVID_COND_TIMESTEP,
+                # Per-request selection, derived from this request's own guide
+                # blocks. Guided and non-guided requests can share a co-batch,
+                # so no global or pipeline-level state may decide this.
+                guided=bool(guide_blocks),
             )
             full_video = torch.zeros(
                 branch.img_pos.shape[0],
@@ -2084,6 +2403,7 @@ class MiniMaxH3Pipeline(
                 condition_audio_t=condition_audio_t,
                 seed=seed,
                 noise_aug=MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+                guided=bool(guide_blocks),
             )
             full_audio = torch.zeros(
                 branch.audio_pos.shape[0],
@@ -2174,6 +2494,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
@@ -2198,6 +2519,7 @@ class MiniMaxH3Pipeline(
             visual_condition_shapes=visual_condition_shapes,
             audio_condition_lengths=audio_condition_lengths,
             keyframe_frame_indices=keyframe_frame_indices,
+            guide_blocks=guide_blocks,
             pad_seq_len=pad_seq_len,
         )
         branch = inputs["branch"]
@@ -2400,6 +2722,26 @@ class MiniMaxH3Pipeline(
             turbo_spec=turbo_spec,
             has_native_lora=has_native_lora,
         )
+        descriptors = extra.get(GUIDES_EXTRA_KEY, [])
+        guide_limits = None
+        guide_quality_plan = None
+        guide_blocks = None
+        if descriptors != []:
+            guide_limits = TimelineGuideLimits.from_config(getattr(self.od_config, "model_config", None))
+            validation_error = None
+            _, rank, _ = _dit_rank_world()
+            if rank == 0:
+                try:
+                    validate_guide_descriptors(descriptors, guide_limits)
+                except ValueError as exc:
+                    validation_error = OmniClientError(str(exc))
+            _broadcast_rank0_exception(validation_error)
+            guide_quality_plan = self._quality_policy.resolve(
+                quality=quality,
+                num_inference_steps=int(sampling.num_inference_steps or 50),
+                extra_args=extra,
+            )
+            self._validate_timeline_guide_profile(sampling, task, guide_quality_plan)
         if turbo_spec is not None:
             self._validate_turbo_sampling(sampling, turbo_spec)
         if has_native_lora:
@@ -2446,7 +2788,43 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(f"{task} does not accept a video condition")
 
         image = images[0] if images else None
-        height, width, num_frames, latent_t, audio_t = self._resolve_shape(task, sampling, image)
+        try:
+            height, width, num_frames, latent_t, audio_t = self._resolve_shape(task, sampling, image)
+        except OmniClientError:
+            raise
+        except ValueError as exc:
+            if guide_limits is None:
+                raise
+            raise OmniClientError(str(exc)) from exc
+        # Guided Ref2VA scales ordinary reference images down to the target
+        # pixel area instead of the 2048-short-edge reference canvas, matching
+        # the native multi-frame reference workflow. The admission estimate, the
+        # Qwen presentation and the VAE encode all read this one selection.
+        guided_reference_target = (width, height) if (guide_limits is not None and task == "ref2va") else None
+        if guide_limits is not None:
+            # A lower bound, before canvas resizing, media decoding or VAE
+            # allocations.
+            reference_rows = sum(
+                (w // 32) * (h // 32)
+                for w, h in (
+                    _reference_image_shape(item, target=guided_reference_target)
+                    if task == "ref2va"
+                    else (width, height)
+                    for item in images
+                )
+            )
+            target_rows = latent_t * (height // 32) * (width // 32) + audio_t * 2
+            minimum_guide_rows = sum(
+                ((height // 32) * (width // 32) if "image" in item or "video" in item else 0)
+                + (2 if "audio" in item else 0)
+                for item in descriptors
+            )
+            keyframe_rows = reference_rows if task == "fl2va" else 0
+            self._check_timeline_rows(
+                guide_limits,
+                minimum_guide_rows + keyframe_rows,
+                reference_rows + target_rows - keyframe_rows,
+            )
         if task == "fl2va":
             for item in images:
                 _validate_reference_image(item)
@@ -2455,7 +2833,7 @@ class MiniMaxH3Pipeline(
         elif task == "ref2va":
             prepared_images = []
             for item in images:
-                ref_width, ref_height = _reference_image_shape(item)
+                ref_width, ref_height = _reference_image_shape(item, target=guided_reference_target)
                 prepared_images.append(item.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
             keyframe_frame_indices = None
         else:
@@ -2560,6 +2938,43 @@ class MiniMaxH3Pipeline(
                     "MiniMax H3 diffusion stage requires text_encoder_output when text_encoder is not loaded"
                 )
 
+            if guide_limits is not None:
+                estimate_error = None
+                other_rows = 0
+                group, rank, world_size = _dit_rank_world()
+                if rank == 0:
+                    try:
+                        other_rows = int(text_embeddings.shape[0]) + target_rows + reference_rows
+                        for item in prepared_videos or []:
+                            frames = min(num_frames, math.ceil(float(item["duration_seconds"]) * 24))
+                            vt = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(minimax_h3_align_frame_count(frames))
+                            other_rows += vt * (item["height"] // 32) * (item["width"] // 32)
+                            if item["input_has_audio"]:
+                                other_rows += 2 * math.ceil(float(item["audio_duration_seconds"]) * 40 + 1)
+                        for waveform, sample_rate in standalone_audios:
+                            other_rows += 2 * math.ceil(min(num_frames / 24, waveform.shape[-1] / sample_rate) * 40 + 1)
+                        self._check_timeline_rows(
+                            guide_limits,
+                            minimum_guide_rows + keyframe_rows,
+                            other_rows - keyframe_rows,
+                        )
+                    except Exception as exc:
+                        estimate_error = exc
+                _broadcast_rank0_exception(estimate_error)
+                if world_size > 1:
+                    payload = [other_rows]
+                    dist.broadcast_object_list(payload, src=0, group=group)
+                    other_rows = payload[0]
+                guide_blocks, guide_visual, guide_shapes, guide_audio, guide_lengths = self._encode_timeline_guides(
+                    descriptors,
+                    width=width,
+                    height=height,
+                    num_frames=num_frames,
+                    limits=guide_limits,
+                    other_rows=other_rows,
+                    keyframe_rows=keyframe_rows,
+                )
+
             # ``prepared_videos`` is intentionally ``None`` on non-zero DiT
             # ranks; the distributed video encoder broadcasts the prepared
             # metadata inside ``_encode_visual_conditions``.  Use the global
@@ -2570,6 +2985,7 @@ class MiniMaxH3Pipeline(
                     prepared_images,
                     prepared_videos,
                     video_count=video_count,
+                    **({"guided": True} if guide_blocks else {}),
                 )
                 (
                     embedded_audio_condition,
@@ -2581,6 +2997,7 @@ class MiniMaxH3Pipeline(
                     has_audio=has_audio,
                     standalone_audios=standalone_audios,
                     max_duration_seconds=float(num_frames) / float(sampling.fps or MINIMAX_H3_FPS),
+                    **({"guided": True} if guide_blocks else {}),
                 )
                 audio_parts = [
                     item for item in (embedded_audio_condition, external_audio_condition) if item is not None
@@ -2626,12 +3043,36 @@ class MiniMaxH3Pipeline(
                 if len(audio_lengths) == 1:
                     ref_audio_t = audio_lengths[0]
 
+        if guide_blocks:
+            # Packing traverses guides, then references, independently for each
+            # modality. Legacy keyframes become trailing guide anchors only on
+            # this path; their stretched pixels and Qwen presentation stay intact.
+            if task == "fl2va":
+                for index, shape in zip(keyframe_frame_indices, visual_shapes, strict=True):
+                    guide_blocks.append(
+                        {
+                            "kind": "image",
+                            "frame_index": resolve_guide_start(index, num_frames),
+                            "latent_h": shape[1],
+                            "latent_w": shape[2],
+                        }
+                    )
+                ref_blocks = []
+            visual_parts = [item for item in (guide_visual, visual_condition) if item is not None]
+            audio_parts = [item for item in (guide_audio, audio_condition) if item is not None]
+            visual_condition = torch.cat(visual_parts) if visual_parts else None
+            audio_condition = torch.cat(audio_parts) if audio_parts else None
+            visual_shapes = guide_shapes + (visual_shapes or [])
+            audio_lengths = guide_lengths + (audio_lengths or [])
+            visual_shape = visual_shapes[0] if len(visual_shapes) == 1 else None
+            ref_audio_t = audio_lengths[0] if len(audio_lengths) == 1 else None
+
         seed = int(sampling.seed if sampling.seed is not None else 42)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
         pad_seq_len = _resolve_pad_seq_len(extra.get("pad_seq_len"))
-        quality_plan = self._quality_policy.resolve(
+        quality_plan = guide_quality_plan or self._quality_policy.resolve(
             quality=quality,
             num_inference_steps=num_steps,
             extra_args=extra,
@@ -2657,6 +3098,7 @@ class MiniMaxH3Pipeline(
             "visual_condition_shapes": visual_shapes,
             "audio_condition_lengths": audio_lengths,
             "keyframe_frame_indices": keyframe_frame_indices,
+            "guide_blocks": guide_blocks,
             "pad_seq_len": pad_seq_len,
             "seed": seed,
             "num_steps": num_steps,

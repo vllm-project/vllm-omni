@@ -23,11 +23,9 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3TextConditioning,
 )
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    MINIMAX_H3_OUTPUT_SHORT_EDGE,
     load_minimax_h3_images,
-    resolve_minimax_h3_aspect_ratio,
-    resolve_minimax_h3_output_canvas,
     resolve_minimax_h3_reference_image_shape,
+    resolve_minimax_h3_target_canvas,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
@@ -36,6 +34,7 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     sample_reference_video_frames,
     serialize_prepared_reference_videos,
 )
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
 
 
 def _items(value: Any) -> list[Any]:
@@ -107,48 +106,46 @@ def _prepare_qwen_images(
     if not values:
         return []
     images = load_minimax_h3_images(values)
-    if task == "ref2va":
-        return [
-            image.resize(
-                resolve_minimax_h3_reference_image_shape(image),
-                Image.Resampling.LANCZOS,
-            )
-            for image in images
-        ]
-    if task != "fl2va":
+    if task not in ("fl2va", "ref2va"):
         return images
 
     sampling = _diffusion_sampling_params(sampling_params_list)
     extra_args = sampling.extra_args or {}
-    target = extra_args.get("target")
-    if target is not None and not isinstance(target, Mapping):
-        raise OmniClientError("MiniMax H3 extra_args['target'] must be an object")
-    target = target if isinstance(target, Mapping) else {}
-    aspect_ratio = resolve_minimax_h3_aspect_ratio(
-        task,
-        target.get("aspect_ratio", extra_args.get("aspect_ratio")),
-        images[0],
-    )
-    if not 0.25 <= aspect_ratio <= 4.0:
-        raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be in [1:4, 4:1], got {aspect_ratio}")
-    height = sampling.height
-    width = sampling.width
-    if height is None or width is None:
-        short_edge = target.get(
-            "short_edge",
-            extra_args.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE),
+    if task == "ref2va":
+        # Same guided predicate as the diffusion pipeline's request preparation.
+        if extra_args.get(GUIDES_EXTRA_KEY, []) == []:
+            return [
+                image.resize(
+                    resolve_minimax_h3_reference_image_shape(image),
+                    Image.Resampling.LANCZOS,
+                )
+                for image in images
+            ]
+        # Guided Ref2VA: resolve the very same target canvas the diffusion
+        # pipeline resolves, then apply the identical down-only reference
+        # policy, so the Qwen presentation and the VAE reference agree.
+        target_height, target_width = resolve_minimax_h3_target_canvas(
+            task,
+            height=sampling.height,
+            width=sampling.width,
+            extra_args=extra_args,
+            image=images[0],
         )
-        if isinstance(short_edge, bool) or not isinstance(short_edge, (int, np.integer)):
-            raise OmniClientError(
-                f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {short_edge!r}"
+        return [
+            image.resize(
+                resolve_minimax_h3_reference_image_shape(image, target=(target_width, target_height)),
+                Image.Resampling.LANCZOS,
             )
-        height, width = resolve_minimax_h3_output_canvas(aspect_ratio, int(short_edge))
-    height = int(height) // 32 * 32
-    width = int(width) // 32 * 32
-    if min(height, width) <= 0:
-        raise OmniClientError(f"invalid MiniMax H3 canvas {width}x{height}")
-    if width > 4 * height or height > 4 * width:
-        raise OmniClientError("MiniMax H3 canvas aspect ratio must be in [1:4, 4:1]")
+            for image in images
+        ]
+
+    height, width = resolve_minimax_h3_target_canvas(
+        task,
+        height=sampling.height,
+        width=sampling.width,
+        extra_args=extra_args,
+        image=images[0],
+    )
     return [image.resize((width, height), Image.Resampling.LANCZOS) for image in images]
 
 
@@ -163,6 +160,18 @@ def prepare_text_encoder_prompt(
     video blocks.  Audio is represented only by its H3 text label and is not
     sent to Qwen3-VL.
     """
+    # Reject request-visible incompatibilities before split-stage Qwen work.
+    # Startup cache, fused adapters and resolved attention roles are checked by
+    # the diffusion pipeline, which owns those model instances/configurations.
+    for sampling in sampling_params_list:
+        if not isinstance(sampling, OmniDiffusionSamplingParams) or not (sampling.extra_args or {}).get(
+            GUIDES_EXTRA_KEY
+        ):
+            continue
+        if sampling.quality == "high":
+            raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
+        if sampling.lora_request is not None and float(sampling.lora_scale) != 0.0:
+            raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
     if isinstance(prompt, str):
         return prompt
     if not isinstance(prompt, dict):

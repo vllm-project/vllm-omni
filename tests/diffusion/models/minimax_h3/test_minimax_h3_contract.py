@@ -90,6 +90,796 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     assert encoder.pushes[1].shape == (3, 2, 2, 3)
 
 
+def _timeline_pipeline(monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.partition = "combined"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(model_config={}, cache_backend="none")
+    pipeline.transformer = nn.Identity()
+    pipeline.text_encoder = object()
+    pipeline.encode_prompt = Mock(return_value=(torch.ones(3, 8), torch.ones(3, dtype=torch.long)))
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    pipeline._cache_dit_runtime = Mock()
+    pipeline.video_vae = SimpleNamespace(
+        encode_image=Mock(side_effect=lambda image: torch.full((image.width * image.height // 1024, 96), 2.0)),
+        is_distributed_enabled=lambda: False,
+    )
+    pipeline.audio_vae = SimpleNamespace()
+    monkeypatch.setattr(pipeline, "_component_on_device", lambda component: nullcontext())
+    return pipeline
+
+
+def _timeline_sampling(tmp_path, **kwargs):
+    from PIL import Image
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
+
+    path = tmp_path / "guide.png"
+    Image.new("RGB", (64, 64), "red").save(path)
+    return OmniDiffusionSamplingParams(
+        height=64,
+        width=64,
+        num_frames=124,
+        fps=24,
+        num_inference_steps=3,
+        quality="lossless",
+        extra_args={"aspect_ratio": "1:1", GUIDES_EXTRA_KEY: [{"frame_index": 36, "image": str(path)}]},
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
+def test_timeline_request_keeps_task_and_qwen_references(monkeypatch, tmp_path, task):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    sampling.extra_args["task"] = task
+    images = [] if task == "t2va" else [Image.new("RGB", (256, 256))]
+    if task == "fl2va":
+        images.append(Image.new("RGB", (256, 256)))
+    monkeypatch.setattr(mod, "_reference_image_shape", lambda image, *, target=None: (64, 64))
+    context = pipeline._prepare_request_inputs(
+        prompt="original text",
+        multi_modal_data={"image": images} if images else {},
+        sampling=sampling,
+    )
+    assert context["task"] == task
+    text_call = pipeline.encode_prompt.call_args.kwargs
+    assert text_call["prompt"] == "original text"
+    assert len(text_call["images"]) == len(images)
+    assert context["guide_blocks"][0]["frame_index"] == 36
+    if task == "fl2va":
+        assert [block["frame_index"] for block in context["guide_blocks"]] == [36, 0, 123]
+        assert context["ref_blocks"] == []
+    if task == "ref2va":
+        assert text_call["condition_labels"] == [("image", 1)]
+        assert context["ref_blocks"] == [{"kind": "image", "latent_h": 4, "latent_w": 4}]
+    inputs = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))
+    branch = inputs["branch"]
+    assert int((~branch.update_mask).sum()) == 4 * (1 + len(images))
+    assert inputs["cond_anchor"].shape == (4 * (1 + len(images)), 96)
+    assert branch.img_position_ids_dev[branch.img_pos[0], 0] == pytest.approx(3 + (1 if task == "ref2va" else 0) + 60)
+
+
+@pytest.mark.parametrize("frame_index, resolved", [(-1, 123), (-22, 102)])
+def test_timeline_negative_index_resolves_after_upward_output_alignment(monkeypatch, tmp_path, frame_index, resolved):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    sampling.num_frames = 120
+    sampling.extra_args[mod.GUIDES_EXTRA_KEY][0]["frame_index"] = frame_index
+    image = Image.new("RGB", (256, 256))
+    context = pipeline._prepare_request_inputs(
+        prompt="aligned guide",
+        multi_modal_data={"image": [image, image]},
+        sampling=sampling,
+    )
+    assert context["num_frames"] == 124
+    assert [block["frame_index"] for block in context["guide_blocks"]] == [resolved, 0, 123]
+    branch = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))["branch"]
+    assert branch.img_position_ids_dev[branch.img_pos[0], 0] == pytest.approx(3 + 5 * resolved / 3)
+
+
+@pytest.mark.parametrize("profile", ["high", "cache", "distilled", "fasth3", "lora", "active_layer", "refiner"])
+def test_timeline_rejects_effective_acceleration_before_encoding(monkeypatch, tmp_path, profile):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+    from vllm_omni.diffusion.sched import DMD2SigmaSchedule
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    if profile == "high":
+        sampling.quality = "high"
+    elif profile == "cache":
+        pipeline.od_config.cache_backend = "cache_dit"
+        pipeline.od_config.cache_config = object()
+        pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+        sampling.quality = None
+    elif profile == "distilled":
+        pipeline._base_schedule_by_partition = {"fl2va": DMD2SigmaSchedule.from_positions([1.0, 0.0])}
+    elif profile == "fasth3":
+        pipeline._fasth3 = SimpleNamespace(check_task=lambda task: None)
+    elif profile == "lora":
+        sampling.lora_request = SimpleNamespace(lora_int_id=17)
+        pipeline._turbo_lora_specs = {}
+        pipeline._native_lora_adapter_ids = set()
+    elif profile == "active_layer":
+        pipeline.transformer._diffusion_lora_active_slices = (True,)
+    else:
+        attention = object.__new__(mod.MiniMaxH3Attention)
+        nn.Module.__init__(attention)
+        attention.attention = SimpleNamespace(attn_backend=SimpleNamespace(get_name=lambda: "FASTVIDEO_VSA"))
+        pipeline.transformer.add_module("token_refiner", attention)
+    with pytest.raises(OmniClientError, match="timeline guides"):
+        pipeline._prepare_request_inputs(prompt="test", multi_modal_data={}, sampling=sampling)
+    pipeline.encode_prompt.assert_not_called()
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+def test_timeline_accepts_actual_sdpa_backend_and_lossless_cache_override(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    pipeline.od_config.cache_backend = "cache_dit"
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    attention = object.__new__(mod.MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    attention.attention = SimpleNamespace(attn_backend=SDPABackend)
+    pipeline.transformer.add_module("token_refiner", attention)
+    sampling = _timeline_sampling(tmp_path)
+    context = pipeline._prepare_request_inputs(prompt="dense guide", multi_modal_data={}, sampling=sampling)
+    assert context["guide_blocks"][0]["frame_index"] == 36
+    pipeline._cache_dit_runtime.prepare.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("role", ["self", "token_refiner"])
+@pytest.mark.parametrize("source", ["impl", "role_config"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"quant": {}},
+        {"quant": {"dtype_qk": "int8"}},
+        {"skip_softmax_threshold": 0.1, "disabled_until_timestep": 0.5},
+        {"target_sparsity": 0.5},
+    ],
+)
+def test_timeline_trtllm_checks_effective_dense_profile(monkeypatch, tmp_path, role, source, options):
+    from vllm_omni.diffusion.attention.backends.trtllm_attn import (
+        QuantConfig,
+        SkipSoftmaxConfig,
+        TrtllmAttentionBackend,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    attention = object.__new__(mod.MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    impl_options = options if source == "impl" else {}
+    attention.attention = SimpleNamespace(
+        attn_backend=TrtllmAttentionBackend,
+        attention=SimpleNamespace(
+            quant=QuantConfig.from_backend_kwargs(impl_options),
+            skip=SkipSoftmaxConfig.from_backend_kwargs(impl_options),
+        ),
+        attn_spec=SimpleNamespace(backend_kwargs=lambda: options if source == "role_config" else {}),
+    )
+    pipeline.transformer.add_module(role, attention)
+    if (
+        (options.get("quant") or {}).get("dtype_qk")
+        or "skip_softmax_threshold" in options
+        or "target_sparsity" in options
+    ):
+        with pytest.raises(OmniClientError, match="dense unquantized TRTLLM_ATTN"):
+            pipeline._prepare_request_inputs(prompt="test", multi_modal_data={}, sampling=_timeline_sampling(tmp_path))
+        pipeline.encode_prompt.assert_not_called()
+    else:
+        context = pipeline._prepare_request_inputs(
+            prompt="test",
+            multi_modal_data={},
+            sampling=_timeline_sampling(tmp_path),
+        )
+        assert context["guide_blocks"]
+
+
+def test_timeline_allows_preloaded_inactive_adapters_but_rejects_mixin_fusions(monkeypatch, tmp_path):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    pipeline._turbo_lora_specs = {7: object()}
+    pipeline._native_lora_adapter_ids = {8}
+    pipeline._lora_sigma_schedules = {8: object()}
+    pipeline.transformer._diffusion_lora_active_slices = (False, False)
+    sampling = _timeline_sampling(tmp_path)
+    sampling.lora_request = SimpleNamespace(lora_int_id=8)
+    sampling.lora_scale = 0.0
+    assert pipeline._prepare_request_inputs(prompt="inactive", multi_modal_data={}, sampling=sampling)["guide_blocks"]
+    # LoraLoaderMixin writes this after params.add_(delta), not on registration.
+    pipeline._lora_loaded = {"fused": {"weight": torch.ones(1)}}
+    with pytest.raises(OmniClientError, match="fused LoRA"):
+        pipeline._prepare_request_inputs(prompt="fused", multi_modal_data={}, sampling=sampling)
+
+
+def test_timeline_reused_source_charges_shared_decode_budget_before_vae(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    descriptor = sampling.extra_args[mod.GUIDES_EXTRA_KEY][0]
+    sampling.extra_args[mod.GUIDES_EXTRA_KEY].append(dict(descriptor))
+    pipeline.od_config.model_config = {"minimax_h3_timeline_guides": {"max_decoded_visual_pixels": 64 * 64}}
+    with pytest.raises(OmniClientError, match="aggregate decoded visual pixel budget"):
+        pipeline._prepare_request_inputs(prompt="reused source", multi_modal_data={}, sampling=sampling)
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+def test_timeline_all_decoders_share_one_request_budget(monkeypatch):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    budgets = []
+
+    def decode_image(*args, budget):
+        budgets.append(budget)
+        budget.add_visual(4096)
+        return Image.new("RGB", (64, 64))
+
+    def decode_video(*args, budget):
+        budgets.append(budget)
+        budget.add_visual(5 * 4096)
+        return [Image.new("RGB", (64, 64)) for _ in range(5)]
+
+    def decode_audio(*args, budget):
+        budgets.append(budget)
+        budget.add_audio(1600)
+        return np.zeros((2, 800), np.float32), 32000
+
+    monkeypatch.setattr(mod, "decode_guide_image", decode_image)
+    monkeypatch.setattr(mod, "decode_guide_video", decode_video)
+    monkeypatch.setattr(mod, "decode_guide_audio", decode_audio)
+    pipeline.video_vae.encode_video = Mock(return_value=(torch.ones(8, 96), (2, 4, 4)))
+    pipeline.audio_vae.encode_waveform = Mock(return_value=(torch.ones(2, 32), 1))
+    pipeline._encode_timeline_guides(
+        [{"frame_index": 0, "image": "still"}, {"frame_index": 5, "video": "clip", "audio": "sound"}],
+        width=64,
+        height=64,
+        num_frames=124,
+        limits=TimelineGuideLimits(),
+        other_rows=1,
+    )
+    assert len(budgets) == 3 and all(budget is budgets[0] for budget in budgets)
+    assert budgets[0].decoded_visual_pixels == 6 * 4096
+    assert budgets[0].decoded_audio_samples == 1600
+
+
+def test_timeline_center_crop_does_not_change_first_last_stretch(monkeypatch, tmp_path):
+    from PIL import Image, ImageDraw
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    image = Image.new("RGB", (256, 512), "red")
+    ImageDraw.Draw(image).rectangle((0, 128, 255, 383), fill="blue")
+    image.save(sampling.extra_args[mod.GUIDES_EXTRA_KEY][0]["image"])
+    context = pipeline._prepare_request_inputs(
+        prompt="first and last",
+        multi_modal_data={"image": [image, image]},
+        sampling=sampling,
+    )
+    encoded = [call.args[0] for call in pipeline.video_vae.encode_image.call_args_list]
+    assert len(encoded) == 3
+    assert encoded[0].getpixel((32, 8)) == (0, 0, 255)
+    assert encoded[1].getpixel((32, 8)) == encoded[2].getpixel((32, 8)) == (255, 0, 0)
+    assert [block["frame_index"] for block in context["guide_blocks"]] == [36, 0, 123]
+
+
+@pytest.mark.parametrize("guided", [True, False])
+def test_timeline_shape_validation_errors_are_client_errors_only_for_guides(monkeypatch, tmp_path, guided):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    if not guided:
+        sampling.extra_args.pop(mod.GUIDES_EXTRA_KEY)
+    pipeline._resolve_shape = Mock(side_effect=ValueError("t2va requires an explicit aspect_ratio"))
+    with pytest.raises(ValueError, match="explicit aspect_ratio") as error:
+        pipeline._prepare_request_inputs(prompt="shape validation", multi_modal_data={}, sampling=sampling)
+    if guided:
+        assert isinstance(error.value, OmniClientError) and error.value.status_code == 400
+    else:
+        assert type(error.value) is ValueError
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+def test_timeline_clip_audio_order_and_channel_major_crop(monkeypatch):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    events = []
+    frames = [Image.new("RGB", (64, 64), (index, 2 * index, 3 * index)) for index in range(22)]
+    monkeypatch.setattr(mod, "decode_guide_video", lambda *args, **kwargs: frames)
+    monkeypatch.setattr(mod, "decode_guide_image", lambda *args, **kwargs: frames[0])
+    monkeypatch.setattr(mod, "decode_guide_audio", lambda *args, **kwargs: (np.zeros((2, 8000), np.float32), 32000))
+
+    def encode_video(value):
+        assert isinstance(value, np.ndarray)
+        assert value.dtype == np.uint8 and value.shape == (22, 64, 64, 3)
+        assert value.flags.c_contiguous
+        np.testing.assert_array_equal(value, np.stack([np.asarray(frame) for frame in frames]))
+        events.append("video")
+        return torch.full((28, 96), 3.0), (7, 4, 4)
+
+    def encode_image(value):
+        events.append("image")
+        return torch.full((4, 96), 7.0)
+
+    stereo = torch.arange(2 * 10 * 32, dtype=torch.float32).reshape(2, 10, 32)
+
+    def encode_audio(waveform, rate):
+        assert waveform.shape == (2, 8000) and rate == 32000
+        events.append("audio")
+        return stereo.reshape(-1, 32), 10
+
+    pipeline.video_vae.encode_video = encode_video
+    pipeline.video_vae.encode_image = encode_image
+    pipeline.audio_vae.encode_waveform = encode_audio
+    blocks, visual, shapes, audio, lengths = pipeline._encode_timeline_guides(
+        [
+            {"frame_index": -22, "video": "clip", "audio": "sound"},
+            {"frame_index": 36, "image": "still"},
+            {"frame_index": -1, "audio": "sound"},
+        ],
+        width=64,
+        height=64,
+        num_frames=124,
+        limits=TimelineGuideLimits(),
+        other_rows=1,
+    )
+    assert events == ["video", "audio", "image", "audio"]
+    assert [block["frame_index"] for block in blocks] == [102, 36, 123]
+    assert [block["kind"] for block in blocks] == ["video_audio", "image", "audio"]
+    assert shapes == [(7, 4, 4), (1, 4, 4)]
+    assert lengths == [10, 2]
+    torch.testing.assert_close(visual[:28], torch.full((28, 96), 3.0))
+    torch.testing.assert_close(visual[28:], torch.full((4, 96), 7.0))
+    torch.testing.assert_close(audio[-4:], stereo[:, :2].reshape(-1, 32))
+
+
+def test_timeline_row_limits_precede_large_canvas_and_vae_allocations(monkeypatch, tmp_path):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    sampling.width = sampling.height = 65536
+    with pytest.raises(OmniClientError, match="row limit"):
+        pipeline._prepare_request_inputs(prompt="test", multi_modal_data={}, sampling=sampling)
+    pipeline.encode_prompt.assert_not_called()
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+@pytest.mark.parametrize("reference_kind", ["image", "video", "audio"])
+def test_timeline_total_row_preflight_includes_ordinary_references(monkeypatch, tmp_path, reference_kind):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    pipeline.od_config.model_config = {
+        "minimax_h3_timeline_guides": {
+            "max_packed_rows": 576,
+            "max_decoded_visual_pixels": 64 * 64,
+        }
+    }
+    monkeypatch.setattr(mod, "_reference_image_shape", lambda image, *, target=None: (64, 64))
+    sampling = _timeline_sampling(tmp_path)
+    sampling.extra_args["task"] = "ref2va"
+    image = Image.new("RGB", (256, 256))
+    # The larger ordinary source is not charged against the guide-only decode
+    # budget. One ordinary image plus the guide still fits the packed-row cap.
+    baseline = pipeline._prepare_request_inputs(prompt="ref", multi_modal_data={"image": image}, sampling=sampling)
+    assert baseline["visual_condition"].shape == (8, 96)
+    pipeline.video_vae.encode_image.reset_mock()
+    if reference_kind == "image":
+        media = {"image": [image, image, image]}
+    elif reference_kind == "video":
+        pipeline._prepare_reference_videos = Mock(
+            return_value=[
+                {
+                    "original_path": "ordinary.mp4",
+                    "prepared_path": "prepared.mp4",
+                    "width": 64,
+                    "height": 64,
+                    "duration_seconds": 2.0,
+                    "audio_duration_seconds": 2.0,
+                    "input_has_audio": True,
+                }
+            ]
+        )
+        media = {"video": "ordinary.mp4"}
+    else:
+        media = {"image": image, "audio": (torch.zeros(2, 64000), 32000)}
+    with pytest.raises(OmniClientError, match="packed-request row limit"):
+        pipeline._prepare_request_inputs(prompt="ref", multi_modal_data=media, sampling=sampling)
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+@pytest.mark.parametrize("preencoded", [False, True])
+def test_timeline_forward_fanout_preserves_raw_and_muxed_outputs(monkeypatch, tmp_path, preencoded):
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path, num_outputs_per_prompt=2, seed=17)
+    sampling.extra_args["preencode_mp4"] = preencoded
+    pipeline.diffuse = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    pipeline.decode = Mock(return_value=(torch.zeros(1, 3, 1, 2, 2), torch.ones(1, 2, 4)))
+    pipeline.decode_to_mp4 = Mock(return_value=b"muxed-video-audio")
+    result = pipeline.forward(
+        DiffusionRequestBatch([OmniDiffusionRequest(prompt="guide", sampling_params=sampling, request_id="guide")])
+    )
+    assert [call.kwargs["seed"] for call in pipeline.diffuse.call_args_list] == [17, 18]
+    assert all(call.kwargs["guide_blocks"][0]["frame_index"] == 36 for call in pipeline.diffuse.call_args_list)
+    assert pipeline.video_vae.encode_image.call_count == 1
+    if preencoded:
+        assert result.output == ([b"muxed-video-audio", b"muxed-video-audio"], None)
+        pipeline.decode.assert_not_called()
+    else:
+        assert result.output[0].shape == (2, 1, 2, 2, 3)
+        assert result.output[1].shape == (2, 2, 4)
+        pipeline.decode_to_mp4.assert_not_called()
+
+
+def test_timeline_audio_only_has_no_ref2va_minimum(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    descriptor = sampling.extra_args[mod.GUIDES_EXTRA_KEY][0]
+    descriptor["audio"] = descriptor.pop("image")
+    descriptor["frame_index"] = -1
+    monkeypatch.setattr(mod, "decode_guide_audio", lambda *args, **kwargs: (np.zeros((1, 80), np.float32), 32000))
+    pipeline.audio_vae.encode_waveform = Mock(return_value=(torch.ones(2, 32), 1))
+    context = pipeline._prepare_request_inputs(prompt="audio only", multi_modal_data={}, sampling=sampling)
+    assert context["task"] == "t2va"
+    assert context["audio_condition_lengths"] == [1]
+    assert context["guide_blocks"] == [{"kind": "audio", "frame_index": 123, "ref_audio_t": 1}]
+    inputs = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))
+    assert inputs["cond_anchor"] is None
+    assert inputs["audio_anchor"].shape == (2, 32)
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+def test_timeline_anchor_shape_rejection_precedes_noise_and_packing(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    context = pipeline._prepare_request_inputs(
+        prompt="guide", multi_modal_data={}, sampling=_timeline_sampling(tmp_path)
+    )
+    context["visual_condition"] = torch.ones(3, 96)
+    pipeline._initial_noise = Mock(side_effect=AssertionError("must reject before noise allocation"))
+    monkeypatch.setattr(mod, "minimax_h3_packed_sequence_ref2va_blocks", Mock(side_effect=AssertionError("packing")))
+    with pytest.raises(OmniClientError, match="anchors do not match"):
+        pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))
+    pipeline._initial_noise.assert_not_called()
+
+
+@pytest.mark.parametrize("task", ["ref2va", "fl2va"])
+def test_timeline_padded_row_limit_includes_refs_and_legacy_before_noise(monkeypatch, tmp_path, task):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    sampling.extra_args["task"] = task
+    monkeypatch.setattr(mod, "_reference_image_shape", lambda image, *, target=None: (64, 64))
+    image = Image.new("RGB", (256, 256))
+    context = pipeline._prepare_request_inputs(
+        prompt="row limit",
+        multi_modal_data={"image": [image, image]},
+        sampling=sampling,
+    )
+    admitted = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))
+    assert admitted["branch"].used_len == 577
+    assert admitted["branch"].seq_len == 640
+    assert admitted["cond_anchor"].shape == (12, 96)
+    # All unpadded rows fit; only the canonical 64-row padding exceeds this cap.
+    # The two ordinary refs, or adapted first/last anchors, cross the boundary.
+    pipeline.od_config.model_config = {"minimax_h3_timeline_guides": {"max_packed_rows": 577}}
+    pipeline._initial_noise = Mock(side_effect=AssertionError("must reject before noise allocation"))
+    packing = Mock(side_effect=AssertionError("must reject before packing allocation"))
+    monkeypatch.setattr(mod, "minimax_h3_packed_sequence_ref2va_blocks", packing)
+    with pytest.raises(OmniClientError, match="packed-request row limit"):
+        pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))
+    pipeline._initial_noise.assert_not_called()
+    packing.assert_not_called()
+
+
+def test_timeline_guide_row_limit_precedes_vae(monkeypatch, tmp_path):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    pipeline.od_config.model_config = {"minimax_h3_timeline_guides": {"max_guide_rows": 3}}
+    with pytest.raises(OmniClientError, match="guide-row limit"):
+        pipeline._prepare_request_inputs(prompt="guide", multi_modal_data={}, sampling=_timeline_sampling(tmp_path))
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+def test_timeline_rank_zero_decode_error_precedes_tensor_collectives(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    monkeypatch.setattr(mod, "_dit_rank_world", lambda: (None, 0, 2))
+    broadcast = Mock()
+    monkeypatch.setattr(mod.dist, "broadcast_object_list", broadcast)
+    tensor_broadcast = Mock(side_effect=AssertionError("must agree on preparation failure first"))
+    monkeypatch.setattr(mod, "_broadcast_tensor", tensor_broadcast)
+    monkeypatch.setattr(mod, "decode_guide_image", Mock(side_effect=ValueError("bad guide image")))
+    with pytest.raises(OmniClientError, match="bad guide image"):
+        pipeline._encode_timeline_guides(
+            [{"frame_index": 36, "image": "broken"}],
+            width=64,
+            height=64,
+            num_frames=124,
+            limits=TimelineGuideLimits(),
+            other_rows=1,
+        )
+    assert broadcast.call_args.args[0][0]["status_code"] == 400
+    tensor_broadcast.assert_not_called()
+
+
+def test_timeline_distributed_video_encode_uses_manifest_order(monkeypatch):
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    frames = [Image.new("RGB", (64, 64)) for _ in range(5)]
+    blocks = [
+        {"kind": "video", "frame_index": index, "latent_t": 2, "latent_h": 4, "latent_w": 4, "ref_audio_t": 0}
+        for index in (36, 0, 36)
+    ]
+    wire = iter([blocks, frames, frames, frames])
+    monkeypatch.setattr(mod, "_dit_rank_world", lambda: (None, 1, 2))
+    monkeypatch.setattr(mod, "_broadcast_rank0_exception", lambda error: None)
+    monkeypatch.setattr(mod.dist, "all_gather_object", Mock())
+    monkeypatch.setattr(mod.dist, "broadcast_object_list", lambda payload, **kwargs: payload.__setitem__(0, next(wire)))
+    monkeypatch.setattr(mod, "_broadcast_tensor", lambda rows, **kwargs: rows)
+    monkeypatch.setattr(mod, "decode_guide_video", Mock(side_effect=AssertionError("nonzero rank must not decode")))
+    pipeline.video_vae.is_distributed_enabled = lambda: True
+    pipeline.video_vae.encode_video = Mock(return_value=(torch.ones(8, 96), (2, 4, 4)))
+    result = pipeline._encode_timeline_guides(
+        [{"frame_index": index, "video": "shared"} for index in (36, 0, 36)],
+        width=64,
+        height=64,
+        num_frames=124,
+        limits=TimelineGuideLimits(),
+        other_rows=1,
+    )
+    assert [block["frame_index"] for block in result[0]] == [36, 0, 36]
+    assert pipeline.video_vae.encode_video.call_count == 3
+    for call in pipeline.video_vae.encode_video.call_args_list:
+        assert call.args[0].dtype == np.uint8 and call.args[0].shape == (5, 64, 64, 3)
+        np.testing.assert_array_equal(call.args[0], np.stack([np.asarray(frame) for frame in frames]))
+
+
+@pytest.mark.parametrize("work", ["guide", "ordinary_reference"])
+@pytest.mark.parametrize("failure_phase", ["encode", "cleanup"])
+def test_guided_distributed_vae_agrees_on_nonzero_failure_after_cleanup(monkeypatch, work, failure_phase):
+    from contextlib import contextmanager
+
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    frames = [Image.new("RGB", (64, 64)) for _ in range(5)]
+    descriptors = [{"frame_index": index, "video": "clip"} for index in (0, 10)]
+    blocks = [
+        {"kind": "video", "frame_index": index, "latent_t": 2, "latent_h": 4, "latent_w": 4, "ref_audio_t": 0}
+        for index in (0, 10)
+    ]
+    failure = f"rank-one {failure_phase} failure after native collectives"
+    peer_error = {"type": "RuntimeError", "message": failure, "status_code": None, "error_type": None}
+    messages = []
+    # Simulate each participant's view of the same two-rank agreement. The
+    # native encode has completed its collectives before rank one's failure.
+    for rank in (0, 1):
+        pipeline = _timeline_pipeline(monkeypatch)
+        events = []
+        agreements = []
+
+        @contextmanager
+        def component_context(component):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("cleanup")
+                if rank == 1 and failure_phase == "cleanup":
+                    raise RuntimeError(failure)
+
+        def encode_video(value):
+            if work == "guide":
+                assert isinstance(value, np.ndarray) and value.shape == (5, 64, 64, 3)
+            else:
+                assert value is frames
+            events.append("native_collectives_complete")
+            if rank == 1 and failure_phase == "encode":
+                raise RuntimeError(failure)
+            return torch.ones(8, 96), (2, 4, 4)
+
+        def agree(errors, local_error, *, group):
+            assert group == "dit"
+            assert events[:3] == ["enter", "native_collectives_complete", "cleanup"]
+            if not agreements:
+                assert local_error == (peer_error if rank == 1 else None)
+            agreements.append(local_error)
+            errors[:] = [None, peer_error]
+
+        wire = iter([blocks, frames] if work == "guide" else [frames])
+
+        def broadcast(payload, **kwargs):
+            if rank == 1:
+                payload[0] = next(wire)
+
+        monkeypatch.setattr(mod, "_dit_rank_world", lambda: ("dit", rank, 2))
+        monkeypatch.setattr(mod, "_broadcast_rank0_exception", lambda error: None)
+        monkeypatch.setattr(mod.dist, "broadcast_object_list", broadcast)
+        monkeypatch.setattr(mod.dist, "all_gather_object", agree)
+        transfer = Mock(side_effect=AssertionError("must not transfer rows after a peer failure"))
+        monkeypatch.setattr(mod, "_broadcast_tensor", transfer)
+        monkeypatch.setattr(mod, "decode_guide_video", lambda *args, **kwargs: frames)
+        monkeypatch.setattr(mod, "load_video_frames", lambda path: frames)
+        monkeypatch.setattr(pipeline, "_component_on_device", component_context)
+        pipeline.video_vae.is_distributed_enabled = lambda: True
+        pipeline.video_vae.encode_video = Mock(side_effect=encode_video)
+        with pytest.raises(RuntimeError, match=failure) as error:
+            if work == "guide":
+                pipeline._encode_timeline_guides(
+                    descriptors,
+                    width=64,
+                    height=64,
+                    num_frames=124,
+                    limits=TimelineGuideLimits(),
+                    other_rows=1,
+                )
+            else:
+                pipeline._encode_visual_conditions(
+                    [],
+                    [{"prepared_path": "first"}, {"prepared_path": "second"}] if rank == 0 else None,
+                    video_count=2,
+                    guided=True,
+                )
+        messages.append(str(error.value))
+        assert agreements
+        assert pipeline.video_vae.encode_video.call_count == 1
+        transfer.assert_not_called()
+    assert messages[0] == messages[1]
+
+
+def test_any_rank_vae_failure_preserves_client_status(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    monkeypatch.setattr(mod, "_dit_rank_world", lambda: ("dit", 0, 2))
+
+    def agree(errors, local_error, **kwargs):
+        assert local_error is None
+        errors[1] = {
+            "type": "OmniClientError",
+            "message": "invalid latent shape",
+            "status_code": 400,
+            "error_type": "invalid_request_error",
+        }
+
+    monkeypatch.setattr(mod.dist, "all_gather_object", agree)
+    with pytest.raises(OmniClientError, match=r"\[rank 1\].*invalid latent shape") as error:
+        mod._synchronize_any_rank_exception(None)
+    assert error.value.status_code == 400
+
+
+def test_timeline_guides_do_not_substitute_for_ref2va_references(monkeypatch, tmp_path):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    pipeline.partition = "ref2va"
+    pipeline.supported_tasks = frozenset({"ref2va"})
+    with pytest.raises(OmniClientError, match="at least one image or video reference"):
+        pipeline._prepare_request_inputs(prompt="guide", multi_modal_data={}, sampling=_timeline_sampling(tmp_path))
+    pipeline.video_vae.encode_image.assert_not_called()
+
+
+def test_empty_timeline_guides_preserve_legacy_path(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    sampling = _timeline_sampling(tmp_path)
+    sampling.extra_args.pop(mod.GUIDES_EXTRA_KEY)
+    pipeline._encode_timeline_guides = Mock(side_effect=AssertionError("legacy path must not encode guides"))
+    first = pipeline._prepare_request_inputs(prompt="plain", multi_modal_data={}, sampling=sampling)
+    sampling.extra_args[mod.GUIDES_EXTRA_KEY] = []
+    second = pipeline._prepare_request_inputs(prompt="plain", multi_modal_data={}, sampling=sampling)
+    assert first["guide_blocks"] is second["guide_blocks"] is None
+    first_inputs = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(first))
+    second_inputs = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(second))
+    for key in ("video_rows", "audio_rows"):
+        torch.testing.assert_close(first_inputs[key], second_inputs[key], rtol=0, atol=0)
+    pipeline._encode_timeline_guides.assert_not_called()
+
+
+@pytest.mark.parametrize("preencoded", [False, True])
+def test_timeline_split_conditioning_reaches_step_prepare_and_decode(monkeypatch, tmp_path, preencoded):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3TextConditioning
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    pipeline.text_encoder = None
+    sampling = _timeline_sampling(tmp_path)
+    sampling.extra_args["preencode_mp4"] = preencoded
+    text = MiniMaxH3TextConditioning(
+        hidden_states=torch.ones(3, 5120, dtype=torch.bfloat16),
+        token_tags=torch.ones(3, dtype=torch.long),
+    )
+    state = StepRequestState(
+        request_id="split-guide",
+        sampling=sampling,
+        prompt={"prompt": "guide", "additional_information": {"text_encoder_output": text.to_payload()}},
+    )
+    pipeline.prepare_encode(state)
+    pipeline.encode_prompt.assert_not_called()
+    branch = state.extra[mod._STEP_BRANCH]
+    assert int((~branch.update_mask).sum()) == 4
+    assert branch.img_position_ids_dev[branch.img_pos[0], 0] == 63
+    pipeline.decode = Mock(return_value=(torch.zeros(1, 3, 124, 2, 2), torch.zeros(1, 2, 16000)))
+    pipeline.decode_to_mp4 = Mock(return_value=b"muxed")
+    output = pipeline.post_decode(state)
+    call = pipeline.decode_to_mp4.call_args if preencoded else pipeline.decode.call_args
+    assert call.args[0].shape == (1, 24, 37, 4, 4)
+    assert call.args[1].shape == (2, 32, 207)
+    if preencoded:
+        assert output.output == (b"muxed", None)
+    else:
+        assert output.output[0].shape == (1, 124, 2, 2, 3)
+
+
 def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatch):
     """A client's encoder options must survive the worker-side pre-encode path."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -373,6 +1163,17 @@ def test_modular_diffusers_index_is_resolved_generically(tmp_path):
     assert config.supports_multimodal_inputs
     assert config.max_multimodal_image_inputs == 9
     assert config.supports_mixed_reference_inputs
+    assert config.supports_timeline_guides
+
+
+def test_timeline_guide_capability_is_declared_by_shared_metadata():
+    """Both H3 aliases share the guide contract; other pipelines must not."""
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    assert get_diffusion_model_metadata("MiniMaxH3Pipeline").supports_timeline_guides
+    assert get_diffusion_model_metadata("MiniMaxH3ModularPipeline").supports_timeline_guides
+    assert not get_diffusion_model_metadata("WanPipeline").supports_timeline_guides
+    assert not get_diffusion_model_metadata(None).supports_timeline_guides
 
 
 @pytest.mark.parametrize(
@@ -1301,8 +2102,8 @@ def test_fl2va_supports_first_last_and_explicit_frame_index_contracts():
 
 
 def test_minimax_h3_uses_the_official_output_canvas_policy():
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-        _resolve_output_canvas,
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        resolve_minimax_h3_output_canvas as _resolve_output_canvas,
     )
 
     assert _resolve_output_canvas(21 / 9, 768) == (672, 1536)
@@ -2115,16 +2916,12 @@ def test_video_vae_encode_uses_configured_parallel_tiling():
     assert shape == (2, 2, 2)
 
 
-def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
+@pytest.mark.parametrize("guided", [False, True])
+def test_distributed_video_vae_encodes_references_sequentially(monkeypatch, guided):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import (
         pipeline_minimax_h3 as pipeline_module,
     )
-
-    prepared = [
-        {"prepared_path": "video-1.mp4"},
-        {"prepared_path": "video-2.mp4"},
-    ]
 
     class FakeVideoVAE:
         def __init__(self):
@@ -2149,23 +2946,37 @@ def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
         lambda: ("dit-group", 1, 4),
     )
 
-    def fake_broadcast_object_list(values, *, src, group, device):
+    frame_payloads = iter(["frames:video-1.mp4", "frames:video-2.mp4"])
+
+    def fake_broadcast_object_list(values, *, src, group, device=None):
         assert values == [None]
-        assert (src, group, device) == (0, "dit-group", torch.device("cpu"))
-        values[0] = prepared
+        assert (src, group) == (0, "dit-group")
+        if device is not None:
+            assert device == torch.device("cpu")
+            values[0] = (
+                next(frame_payloads)
+                if guided
+                else [
+                    {"prepared_path": "video-1.mp4"},
+                    {"prepared_path": "video-2.mp4"},
+                ]
+            )
 
     monkeypatch.setattr(
         pipeline_module.dist,
         "broadcast_object_list",
         fake_broadcast_object_list,
     )
+    monkeypatch.setattr(pipeline_module.dist, "all_gather_object", Mock())
     monkeypatch.setattr(
         pipeline_module,
         "load_video_frames",
-        lambda path: f"frames:{path}",
+        Mock(side_effect=AssertionError("only rank zero decodes reference files"))
+        if guided
+        else lambda path: f"frames:{path}",
     )
 
-    rows, shapes = pipeline._encode_video_conditions_resident(None, count=2)
+    rows, shapes = pipeline._encode_video_conditions_resident(None, count=2, guided=guided)
 
     assert pipeline.video_vae.calls == [
         "frames:video-1.mp4",
@@ -2713,8 +3524,8 @@ def test_g1_fanout_uses_incrementing_output_seeds():
 def test_g3_task_specific_aspect_ratio_policy():
     from PIL import Image
 
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-        _resolve_minimax_h3_aspect_ratio,
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        resolve_minimax_h3_aspect_ratio as _resolve_minimax_h3_aspect_ratio,
     )
 
     image = Image.new("RGB", (1280, 720))
