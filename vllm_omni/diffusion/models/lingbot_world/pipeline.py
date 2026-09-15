@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -99,6 +100,10 @@ _CAMERA_SPATIAL_FOLD = 8
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
 _MAX_SEQUENCE_LENGTH = 512
+# Distinct prompts whose text encodes are kept. One entry is a single padded
+# sequence -- a few MiB at 512 tokens -- so a handful covers a session's prompt
+# plus the switches it makes, at no meaningful cost next to its KV.
+_PROMPT_EMBEDS_CACHE_SIZE = 4
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 _PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
 _PREPROCESSED_CAMERA_ACTIONS_KEY = "_lingbot_camera_actions"
@@ -569,6 +574,8 @@ class LingBotWorldCausalDMDPipeline(
         self._ar_width = int(model_config.get("ar_diffusion_width", 832))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
         self._ar_sessions: dict[str, _LingBotARSessionState] = {}
+        # Text encodes keyed by what they depend on; see encode_prompt.
+        self._prompt_embeds_cache: OrderedDict[tuple[str, int, torch.dtype], torch.Tensor] = OrderedDict()
         # One temporal decoder cache per stepwise session, keyed the way the
         # runner keys AR sessions (session_id == request_id) so both are
         # released together rather than through two independent lifecycles.
@@ -1221,8 +1228,27 @@ class LingBotWorldCausalDMDPipeline(
         max_sequence_length: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Encode ``prompt`` with UMT5, reusing the result for a prompt already encoded.
+
+        The encode depends only on the whitespace-normalised text, the sequence
+        length and the dtype -- the tokenizer and text encoder are fixed once
+        loaded -- so those three are the key. That covers every caller the same
+        way: a realtime tick repeats its session's prompt on every block, a
+        stepwise request encodes once per request, and a server tends to open
+        many sessions with the same scene prompt.
+
+        A hit returns the stored tensor itself. Callers only read it: the
+        cross-attention projection and the DMD transformer both work out of
+        place, so a shared encode is never changed under another session.
+        """
+        text = " ".join(prompt.strip().split())
+        key = (text, int(max_sequence_length), dtype)
+        cached = self._prompt_embeds_cache.get(key)
+        if cached is not None:
+            self._prompt_embeds_cache.move_to_end(key)
+            return cached
         text_inputs = self.tokenizer(
-            [" ".join(prompt.strip().split())],
+            [text],
             padding="max_length",
             max_length=max_sequence_length,
             truncation=True,
@@ -1234,7 +1260,11 @@ class LingBotWorldCausalDMDPipeline(
         attention_mask = text_inputs.attention_mask.to(self.device)
         prompt_embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
-        return prompt_embeds * attention_mask.unsqueeze(-1).to(dtype=prompt_embeds.dtype)
+        prompt_embeds = prompt_embeds * attention_mask.unsqueeze(-1).to(dtype=prompt_embeds.dtype)
+        self._prompt_embeds_cache[key] = prompt_embeds
+        if len(self._prompt_embeds_cache) > _PROMPT_EMBEDS_CACHE_SIZE:
+            self._prompt_embeds_cache.popitem(last=False)
+        return prompt_embeds
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         inputs = self._parse_request(req)
