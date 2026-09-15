@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Characterization tests for ``vllm_omni.worker.base.OmniGPUWorkerBase``.
 
 Pins the CURRENT behaviour of ``determine_available_memory`` (device-level
@@ -53,6 +53,30 @@ def _make_worker(*, requested_memory: int, kv_cache_memory_bytes: int = 0, model
     worker.requested_memory = requested_memory
     worker.local_rank = 0
     return worker
+
+
+def test_prefix_cache_memory_stats_reports_disabled_cache():
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.model_runner = SimpleNamespace(omni_prefix_cache=None)
+
+    stats = worker.get_omni_prefix_cache_memory_stats()
+
+    assert stats == {
+        "enabled": False,
+        "static_cache_bytes": 0,
+        "pending_write_bytes": 0,
+        "total_cpu_bytes": 0,
+        "pinned_bytes": 0,
+    }
+
+
+def test_prefix_cache_memory_stats_delegates_to_cache():
+    expected = {"enabled": True, "total_cpu_bytes": 123}
+    prefix_cache = SimpleNamespace(memory_stats=lambda: expected)
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.model_runner = SimpleNamespace(omni_prefix_cache=prefix_cache)
+
+    assert worker.get_omni_prefix_cache_memory_stats() is expected
 
 
 # --------------------------------------------------------------------------- #

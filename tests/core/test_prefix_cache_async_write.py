@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
@@ -26,6 +29,33 @@ def get_omni_pcache() -> OmniTensorPrefixCache:
         hidden_size=HIDDEN_SIZE,
         hs_dtype=DTYPE,
     )
+
+
+def test_schedule_async_write_accepts_hidden_states_without_mm_outputs():
+    cache = get_omni_pcache()
+    num_tokens = 4
+    slots = torch.arange(
+        num_tokens,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    hidden_states = torch.arange(
+        num_tokens * HIDDEN_SIZE,
+        dtype=DTYPE,
+        device="cuda",
+    ).reshape(num_tokens, HIDDEN_SIZE)
+
+    cache.schedule_async_write(
+        hidden_states_gpu=hidden_states,
+        multimodal_outputs_gpu=None,
+        slot_mapping_gpu=slots,
+        num_tokens_unpadded=num_tokens,
+        num_tokens_padded=num_tokens,
+    )
+    torch.accelerator.synchronize()
+    assert cache.drain_ready_async_writes() == 1
+    rows = cache.hidden_states_cache.view(-1, HIDDEN_SIZE)
+    assert torch.equal(rows[:num_tokens], hidden_states.cpu())
 
 
 def test_drain_ready_async_writes_is_a_noop_before_the_event_is_ready(monkeypatch):

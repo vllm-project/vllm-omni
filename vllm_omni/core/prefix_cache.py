@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Utilities for Prefix Caching in Omni models.
 """
@@ -63,8 +66,8 @@ class OmniTensorPrefixCache:
 
         # Defer initialization of the mm_outputs_cache until we
         # actually see mm output tensors dependent on num tokens.
-        self.mm_outputs_cache = {}
-        self.mm_cache_keys = set()
+        self.mm_outputs_cache: dict[str, torch.Tensor] = {}
+        self.mm_cache_keys: set[str] = set()
         self._new_req_cache_hit_ids: set[str] = set()
         self._deferred_mm_outputs: dict[str, dict[str, list[tuple[int, torch.Tensor]]]] = {}
 
@@ -80,6 +83,50 @@ class OmniTensorPrefixCache:
         self._async_initialized: bool = False
         self._async_copy_stream: torch.cuda.Stream | None = None
         self._pending_write: _PendingAsyncWrite | None = None
+
+    @staticmethod
+    def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
+        if tensor is None:
+            return 0
+        return tensor.numel() * tensor.element_size()
+
+    def memory_stats(self) -> dict[str, object]:
+        """Return tensor-accounted CPU memory owned by this cache."""
+        hidden_states_bytes = self._tensor_nbytes(self.hidden_states_cache)
+        mm_cache_bytes = {key: self._tensor_nbytes(tensor) for key, tensor in self.mm_outputs_cache.items()}
+        static_tensors = [
+            self.hidden_states_cache,
+            *self.mm_outputs_cache.values(),
+        ]
+
+        pending_tensors: list[torch.Tensor] = []
+        if self._pending_write is not None:
+            pending_tensors = [
+                self._pending_write.slots_cpu,
+                *self._pending_write.mm_cpu.values(),
+            ]
+            if self._pending_write.hidden_cpu is not None:
+                pending_tensors.append(self._pending_write.hidden_cpu)
+
+        static_cache_bytes = hidden_states_bytes + sum(mm_cache_bytes.values())
+        pending_write_bytes = sum(self._tensor_nbytes(tensor) for tensor in pending_tensors)
+        pinned_bytes = sum(
+            self._tensor_nbytes(tensor) for tensor in [*static_tensors, *pending_tensors] if tensor.is_pinned()
+        )
+        return {
+            "enabled": True,
+            "num_blocks": self.num_blocks,
+            "block_size": self.block_size,
+            "hidden_size": self.default_hidden_size,
+            "hidden_dtype": str(self.hidden_states_cache.dtype),
+            "hidden_states_bytes": hidden_states_bytes,
+            "mm_cache_bytes": mm_cache_bytes,
+            "mm_cache_bytes_total": sum(mm_cache_bytes.values()),
+            "static_cache_bytes": static_cache_bytes,
+            "pending_write_bytes": pending_write_bytes,
+            "total_cpu_bytes": static_cache_bytes + pending_write_bytes,
+            "pinned_bytes": pinned_bytes,
+        }
 
     def maybe_init_missing_mm_cache_keys(self, multimodal_outputs: dict, seq_len: int):
         """Given multimodal outputs from executing the model, dynamically
@@ -221,6 +268,7 @@ class OmniTensorPrefixCache:
         # allocates pinned host destinations for the ``.to("cpu",
         # non_blocking=True)`` results.
         copy_stream = self._async_copy_stream
+        assert copy_stream is not None
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(copy_stream):
             copy_stream.wait_stream(default_stream)
@@ -234,8 +282,10 @@ class OmniTensorPrefixCache:
             if hidden_states_gpu is not None:
                 hidden_cpu = hidden_states_gpu[:num_tokens_unpadded].to("cpu", non_blocking=True)
             mm_cpu: dict[str, torch.Tensor] = {}
-            for k in cacheable_mm_keys:
-                mm_cpu[k] = multimodal_outputs_gpu[k][:num_tokens_unpadded].to("cpu", non_blocking=True)
+            if cacheable_mm_keys:
+                assert multimodal_outputs_gpu is not None
+                for k in cacheable_mm_keys:
+                    mm_cpu[k] = multimodal_outputs_gpu[k][:num_tokens_unpadded].to("cpu", non_blocking=True)
 
             event = torch.cuda.Event()
             event.record()

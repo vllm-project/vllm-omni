@@ -2658,6 +2658,7 @@ class Orchestrator:
             )
             req_state.stage_submit_ts[next_logical] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            req_state.pipeline_timings[f"transfer_{src_stage_id}_to_{next_logical}_ms"] = _tx_ms
             self._emit_tx_edge(
                 from_stage=src_stage_id,
                 from_replica=src_replica_id if src_replica_id is not None else 0,
@@ -2735,6 +2736,7 @@ class Orchestrator:
         if callable(decode):
             req_state.streaming.source_token_decoder = decode
 
+        _t_process_inputs = _time.perf_counter()
         try:
             next_inputs = next_client.process_engine_inputs(
                 source_outputs,
@@ -2774,6 +2776,9 @@ class Orchestrator:
             )
             return
         finally:
+            req_state.pipeline_timings[f"input_processing_{src_stage_id}_to_{next_logical}_ms"] = (
+                _time.perf_counter() - _t_process_inputs
+            ) * 1000.0
             req_state.streaming.source_token_decoder = previous_decoder
 
         if not next_inputs:
@@ -2848,6 +2853,7 @@ class Orchestrator:
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        req_state.pipeline_timings[f"transfer_{src_stage_id}_to_{next_logical}_ms"] = _tx_ms
         self._emit_tx_edge(
             from_stage=src_stage_id,
             from_replica=src_replica_id if src_replica_id is not None else 0,
