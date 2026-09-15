@@ -17,6 +17,7 @@ _DIM = _HEADS * _HEAD_DIM
 
 @pytest.fixture
 def _dist_env():
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -25,10 +26,13 @@ def _dist_env():
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29519")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    # vLLM 0.28+: parallel-state init, CustomOp construction and the linear
+    # layers' forward all read the current vLLM config.
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        initialize_model_parallel()
+        yield
+        cleanup_dist_env_and_memory()
 
 
 def test_packed_table_uses_row_zero_like_rotary_embedding(monkeypatch):
@@ -50,12 +54,10 @@ def test_packed_table_uses_row_zero_like_rotary_embedding(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_z_image_attention_fused_matches_eager(_dist_env):
-    from vllm.config import VllmConfig, set_current_vllm_config
-
     from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageAttention, _packed_qk_norm_rope_table
 
     torch.manual_seed(3)
-    with set_current_vllm_config(VllmConfig()), torch.device("cuda"):
+    with torch.device("cuda"):
         attn = ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
     attn = attn.to(torch.bfloat16).eval()
     with torch.no_grad():

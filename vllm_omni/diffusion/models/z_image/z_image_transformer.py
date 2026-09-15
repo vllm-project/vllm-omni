@@ -42,7 +42,6 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
-from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -634,7 +633,8 @@ def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torc
     table repeats row 0 for the batch, in the activation dtype the eager
     chain casts to. ``None`` under sequence parallelism (cos/sin are sharded
     and the eager chain is kept) or below the token gate."""
-    if get_sequence_parallel_world_size() > 1:
+    od_config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
+    if od_config is not None and (od_config.parallel_config.sequence_parallel_size or 1) > 1:
         return None
     return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype, min_tokens=_FUSED_MIN_TOKENS)
 
