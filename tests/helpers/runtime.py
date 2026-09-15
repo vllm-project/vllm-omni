@@ -8,7 +8,6 @@ this module re-exports them for backward-compatible imports.
 """
 
 import errno
-import json
 import os
 import socket
 import subprocess
@@ -16,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Generator, Mapping
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -41,77 +40,6 @@ logger = init_logger(__name__)
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
-
-# Prefetch only Stage 0: one pass warms the OS page cache; later stages use
-# ``lazy`` so they do not repeat prefetch I/O (global prefetch raised total
-# latency on VIRTIOFS). Auto-prefetch skips unrecognized FS unless forced.
-_STAGE_SAFETENSORS_LOAD_OVERRIDES: dict[str, dict[str, str]] = {
-    "0": {"safetensors_load_strategy": "prefetch"},
-    "1": {"safetensors_load_strategy": "lazy"},
-    "2": {"safetensors_load_strategy": "lazy"},
-}
-_SAFETENSORS_LOAD_STRATEGY_FLAG = "--safetensors-load-strategy"
-_STAGE_OVERRIDES_FLAG = "--stage-overrides"
-
-
-def _merge_stage_safetensors_load_overrides(
-    existing: Mapping[Any, Any] | None,
-) -> dict[str, dict[str, Any]]:
-    """Prefetch defaults first; caller keys on the same stage win."""
-    merged: dict[str, dict[str, Any]] = {
-        stage_id: dict(overrides) for stage_id, overrides in _STAGE_SAFETENSORS_LOAD_OVERRIDES.items()
-    }
-    if existing is None:
-        return merged
-    for stage_id, overrides in existing.items():
-        base = merged.get(str(stage_id), {})
-        merged[str(stage_id)] = {**base, **dict(overrides)}
-    return merged
-
-
-def _cli_flag_last_index(args: list[str], flag: str) -> int | None:
-    prefix = f"{flag}="
-    last: int | None = None
-    for i, arg in enumerate(args):
-        if arg == flag or arg.startswith(prefix):
-            last = i
-    return last
-
-
-def _cli_has_flag(args: list[str], flag: str) -> bool:
-    return _cli_flag_last_index(args, flag) is not None
-
-
-def _inject_stage_safetensors_load_overrides(serve_args: list[str]) -> list[str]:
-    """Same merge as OmniRunner: keep caller ``--stage-overrides``, fill prefetch defaults.
-
-    A global ``--safetensors-load-strategy`` still skips injection entirely.
-    """
-    args = list(serve_args)
-    if _cli_has_flag(args, _SAFETENSORS_LOAD_STRATEGY_FLAG):
-        return args
-    payload = json.dumps(_merge_stage_safetensors_load_overrides(None), separators=(",", ":"))
-    idx = _cli_flag_last_index(args, _STAGE_OVERRIDES_FLAG)
-    if idx is None:
-        args.extend([_STAGE_OVERRIDES_FLAG, payload])
-        return args
-    token = args[idx]
-    if token.startswith(f"{_STAGE_OVERRIDES_FLAG}="):
-        raw = token.split("=", 1)[1]
-        existing = json.loads(raw) if raw else {}
-        if not isinstance(existing, dict):
-            raise TypeError(f"{_STAGE_OVERRIDES_FLAG} must be a JSON object, got {type(existing).__name__}")
-        merged = json.dumps(_merge_stage_safetensors_load_overrides(existing), separators=(",", ":"))
-        args[idx] = f"{_STAGE_OVERRIDES_FLAG}={merged}"
-        return args
-    if idx + 1 >= len(args) or args[idx + 1].startswith("-"):
-        args.insert(idx + 1, payload)
-        return args
-    existing = json.loads(args[idx + 1])
-    if not isinstance(existing, dict):
-        raise TypeError(f"{_STAGE_OVERRIDES_FLAG} must be a JSON object, got {type(existing).__name__}")
-    args[idx + 1] = json.dumps(_merge_stage_safetensors_load_overrides(existing), separators=(",", ":"))
-    return args
 
 
 def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
@@ -235,7 +163,7 @@ class OmniServer:
     ) -> None:
         cleanup_test_environment()
         self.model = model
-        self.serve_args = _inject_stage_safetensors_load_overrides(serve_args)
+        self.serve_args = list(serve_args)
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
@@ -681,10 +609,6 @@ class OmniRunner:
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
         self.omni: Any = None
-        if "safetensors_load_strategy" not in kwargs:
-            existing = kwargs.get("stage_overrides")
-            if existing is None or isinstance(existing, dict):
-                kwargs["stage_overrides"] = _merge_stage_safetensors_load_overrides(existing)
         try:
             from vllm_omni.entrypoints.omni import Omni
 
