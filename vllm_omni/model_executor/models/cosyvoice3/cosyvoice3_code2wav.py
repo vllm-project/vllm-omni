@@ -11,16 +11,20 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from typing import cast
 
-import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
+from vllm_omni.model_executor.models.common.audio_stream_utils import (
+    build_overlap_window,
+    fade_in_out,
+)
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
     CausalConditionalCFM,
     CausalMaskedDiffWithDiT,
@@ -113,12 +117,11 @@ class CosyVoice3Code2Wav(nn.Module):
         self.hift = self.hift.float()
 
         # Streaming/chunking parameters
-        self.token_overlap_len = 20
-        self.mel_overlap_len = int(self.token_overlap_len / self.flow_model.input_frame_rate * 22050 / 256)
-        self.mel_window = np.hamming(2 * self.mel_overlap_len)
         self.mel_cache_len = 20
-        self.source_cache_len = int(self.mel_cache_len * 256)
-        self.speech_window = np.hamming(2 * self.source_cache_len)
+        upsample_rates = getattr(self.hift, "upsample_rates", [8, 5, 3])
+        istft_hop_len = getattr(self.hift, "istft_params", {}).get("hop_len", 4)
+        upsample_scale = int(math.prod(upsample_rates) * istft_hop_len)
+        self.source_cache_len = int(self.mel_cache_len * upsample_scale)
 
     @property
     def input_frame_rate(self) -> int:
@@ -215,6 +218,13 @@ class CosyVoice3Code2Wav(nn.Module):
 
         return feat
 
+    def _get_speech_window(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        cached = getattr(self, "_torch_speech_window", None)
+        if cached is None or cached.device != device or cached.dtype != dtype:
+            cached = build_overlap_window(self.source_cache_len, device=device, dtype=dtype)
+            self._torch_speech_window = cached
+        return cached
+
     def _stream_hift_from_feat(
         self,
         feat: torch.Tensor,
@@ -222,18 +232,23 @@ class CosyVoice3Code2Wav(nn.Module):
         cache_state: dict[str, torch.Tensor] | None = None,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        hift_weight = self.hift.m_source.l_linear.weight
-        chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+        hift_param = next(self.hift.parameters(), None) if hasattr(self, "hift") else None
+        if hift_param is None and hasattr(self, "hift") and hasattr(self.hift, "m_source"):
+            l_linear = getattr(self.hift.m_source, "l_linear", None)
+            if l_linear is not None:
+                hift_param = getattr(l_linear, "weight", None)
+        device = hift_param.device if hift_param is not None else feat.device
+        dtype = hift_param.dtype if hift_param is not None else feat.dtype
+        chunk_mel = feat.to(device=device, dtype=dtype)
 
         cached_mel = None if not cache_state else cache_state.get("mel")
-        speech_offset_obj = None if not cache_state else cache_state.get("speech_offset")
-        try:
-            speech_offset = int(speech_offset_obj) if speech_offset_obj is not None else 0
-        except (TypeError, ValueError):
-            speech_offset = 0
+        cached_speech = None if not cache_state else cache_state.get("speech")
 
+        # Bounded mel cache (Task C1): bound history to self.mel_cache_len frames
         if isinstance(cached_mel, torch.Tensor) and cached_mel.numel() > 0:
             cached_mel = cached_mel.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
+            if cached_mel.shape[-1] > self.mel_cache_len:
+                cached_mel = cached_mel[..., -self.mel_cache_len :]
             tts_mel = torch.cat([cached_mel, chunk_mel], dim=-1) if chunk_mel.numel() > 0 else cached_mel
         else:
             tts_mel = chunk_mel
@@ -243,18 +258,155 @@ class CosyVoice3Code2Wav(nn.Module):
         else:
             tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
 
-        tts_speech = tts_speech.reshape(tts_speech.shape[0], -1)
-        speech_offset = max(0, min(speech_offset, int(tts_speech.shape[-1])))
-        emitted_speech = tts_speech[:, speech_offset:]
+        tts_speech = tts_speech.reshape(tts_speech.shape[0], 1, -1)
+
+        # Overlap-add crossfade with previous chunk's speech (Task C1)
+        if isinstance(cached_speech, torch.Tensor) and cached_speech.numel() > 0:
+            cached_speech = cached_speech.to(device=tts_speech.device, dtype=tts_speech.dtype)
+            window = self._get_speech_window(device=tts_speech.device, dtype=tts_speech.dtype)
+            tts_speech = fade_in_out(tts_speech, cached_speech, window)
 
         if finalize:
-            return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), None
+            return tts_speech, None
+
+        overlap_len = min(int(self.source_cache_len), int(tts_speech.shape[-1]))
+        if overlap_len > 0:
+            emitted_speech = tts_speech[..., :-overlap_len]
+            tail_speech = tts_speech[..., -overlap_len:]
+        else:
+            emitted_speech = tts_speech
+            tail_speech = tts_speech[..., :0]
 
         new_state = {
-            "mel": tts_mel.detach().cpu().contiguous(),
+            "mel": tts_mel[..., -self.mel_cache_len :].detach(),
+            "speech": tail_speech.detach(),
             "speech_offset": int(tts_speech.shape[-1]),
         }
-        return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
+        return emitted_speech, new_state
+
+    def _stream_hift_from_feat_batch(
+        self,
+        items: list[tuple[int, torch.Tensor, dict[str, torch.Tensor] | None]],
+        *,
+        finalize: bool = False,
+    ) -> list[tuple[int, tuple[torch.Tensor, dict[str, torch.Tensor] | None]]]:
+        """Batch HiFT vocoder inference across streaming requests via equal-length bucketing.
+
+        Items with equal mel length are stacked and inferred in a single batched
+        kernel invocation, completely eliminating serial vocoder tail latency
+        while avoiding padding artifacts.
+        """
+        if not items:
+            return []
+
+        # Route to patched method seam or fallback if hift is not initialized
+        if type(self)._stream_hift_from_feat != self._stream_hift_from_feat or not hasattr(self, "hift"):
+            return [(idx, self._stream_hift_from_feat(f, cache_state=cs, finalize=finalize)) for idx, f, cs in items]
+
+        # Prepare per-item bounded mel and retrieve cached speech
+        prepared: list[tuple[int, torch.Tensor, torch.Tensor | None]] = []
+        hift_param = next(self.hift.parameters(), None) if hasattr(self, "hift") else None
+        if hift_param is None and hasattr(self, "hift") and hasattr(self.hift, "m_source"):
+            l_linear = getattr(self.hift.m_source, "l_linear", None)
+            if l_linear is not None:
+                hift_param = getattr(l_linear, "weight", None)
+        device = hift_param.device if hift_param is not None else items[0][1].device
+        dtype = hift_param.dtype if hift_param is not None else items[0][1].dtype
+
+        for orig_idx, feat, cache_state in items:
+            chunk_mel = feat.to(device=device, dtype=dtype)
+            cached_mel = None if not cache_state else cache_state.get("mel")
+            cached_speech = None if not cache_state else cache_state.get("speech")
+
+            if isinstance(cached_mel, torch.Tensor) and cached_mel.numel() > 0:
+                cached_mel = cached_mel.to(device=device, dtype=dtype)
+                if cached_mel.shape[-1] > self.mel_cache_len:
+                    cached_mel = cached_mel[..., -self.mel_cache_len :]
+                tts_mel = torch.cat([cached_mel, chunk_mel], dim=-1) if chunk_mel.numel() > 0 else cached_mel
+            else:
+                tts_mel = chunk_mel
+            prepared.append((orig_idx, tts_mel, cached_speech))
+
+        # Group by tts_mel.shape[-1]
+        buckets: dict[int, list[tuple[int, torch.Tensor, torch.Tensor | None]]] = {}
+        for orig_idx, tts_mel, cached_speech in prepared:
+            mel_len = int(tts_mel.shape[-1])
+            buckets.setdefault(mel_len, []).append((orig_idx, tts_mel, cached_speech))
+
+        results: list[tuple[int, tuple[torch.Tensor, dict[str, torch.Tensor] | None]]] = []
+        window = self._get_speech_window(device=device, dtype=dtype)
+
+        for mel_len, bucket_items in buckets.items():
+            if mel_len == 0:
+                for orig_idx, tts_mel, _ in bucket_items:
+                    empty_speech = torch.zeros((1, 1, 0), device=device, dtype=dtype)
+                    state = (
+                        None
+                        if finalize
+                        else {
+                            "mel": tts_mel[..., -self.mel_cache_len :].detach(),
+                            "speech": torch.zeros((1, 1, 0), device=device, dtype=dtype),
+                            "speech_offset": 0,
+                        }
+                    )
+                    results.append((orig_idx, (empty_speech, state)))
+                continue
+
+            if len(bucket_items) == 1:
+                orig_idx, tts_mel, cached_speech = bucket_items[0]
+                tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+                tts_speech = tts_speech.reshape(1, 1, -1)
+                if isinstance(cached_speech, torch.Tensor) and cached_speech.numel() > 0:
+                    cached_speech = cached_speech.to(device=device, dtype=dtype)
+                    tts_speech = fade_in_out(tts_speech, cached_speech, window)
+
+                if finalize:
+                    results.append((orig_idx, (tts_speech, None)))
+                else:
+                    overlap_len = min(int(self.source_cache_len), int(tts_speech.shape[-1]))
+                    if overlap_len > 0:
+                        emitted = tts_speech[..., :-overlap_len]
+                        tail = tts_speech[..., -overlap_len:]
+                    else:
+                        emitted = tts_speech
+                        tail = tts_speech[..., :0]
+                    state = {
+                        "mel": tts_mel[..., -self.mel_cache_len :].detach(),
+                        "speech": tail.detach(),
+                        "speech_offset": int(tts_speech.shape[-1]),
+                    }
+                    results.append((orig_idx, (emitted, state)))
+                continue
+
+            # Batched execution for multiple requests with identical mel length
+            batch_mel = torch.cat([item[1] for item in bucket_items], dim=0)
+            batch_speech, _ = self.hift.inference(speech_feat=batch_mel, finalize=finalize)
+            batch_speech = batch_speech.reshape(batch_speech.shape[0], 1, -1)
+
+            for row, (orig_idx, tts_mel, cached_speech) in enumerate(bucket_items):
+                tts_speech = batch_speech[row : row + 1]
+                if isinstance(cached_speech, torch.Tensor) and cached_speech.numel() > 0:
+                    cached_speech = cached_speech.to(device=device, dtype=dtype)
+                    tts_speech = fade_in_out(tts_speech, cached_speech, window)
+
+                if finalize:
+                    results.append((orig_idx, (tts_speech, None)))
+                else:
+                    overlap_len = min(int(self.source_cache_len), int(tts_speech.shape[-1]))
+                    if overlap_len > 0:
+                        emitted = tts_speech[..., :-overlap_len]
+                        tail = tts_speech[..., -overlap_len:]
+                    else:
+                        emitted = tts_speech
+                        tail = tts_speech[..., :0]
+                    state = {
+                        "mel": tts_mel[..., -self.mel_cache_len :].detach(),
+                        "speech": tail.detach(),
+                        "speech_offset": int(tts_speech.shape[-1]),
+                    }
+                    results.append((orig_idx, (emitted, state)))
+
+        return results
 
     @torch.inference_mode()
     def forward_streaming_batch(
@@ -359,6 +511,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     prompt_feat_lens=prompt_feat_lens,
                 )
 
+            shift_items = []
             for row, (index, item) in enumerate(group):
                 trim_mel = max(0, int(item.get("token_offset_tokens", 0))) * int(self.token_mel_ratio)
                 valid_tokens = int(token_lens[row].item())
@@ -368,11 +521,11 @@ class CosyVoice3Code2Wav(nn.Module):
                 row_feat = feat[row : row + 1, :, :valid_mel]
                 if trim_mel > 0:
                     row_feat = row_feat[:, :, trim_mel:]
-                results[index] = self._stream_hift_from_feat(
-                    row_feat,
-                    cache_state=item.get("cache_state"),  # type: ignore[arg-type]
-                    finalize=finalize,
-                )
+                shift_items.append((index, row_feat, item.get("cache_state")))
+
+            hift_results = self._stream_hift_from_feat_batch(shift_items, finalize=finalize)
+            for orig_idx, res in hift_results:
+                results[orig_idx] = res
 
         assert all(result is not None for result in results), "every streaming item must produce exactly one result"
         return cast(list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]], results)
@@ -390,13 +543,11 @@ class CosyVoice3Code2Wav(nn.Module):
         token_offset_tokens: int = 0,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Decode streaming audio using cumulative mel + emitted-speech offset.
+        """Decode streaming audio using bounded mel cache and Hamming cross-fade.
 
-        This mirrors upstream CosyVoice3 streaming semantics more closely than
-        waveform-domain overlap-add: keep a cumulative mel history per request,
-        re-run causal HiFT on the history, and emit only the newly grown speech
-        suffix. That preserves causal look-right handling without double
-        trimming or duplicated overlap at chunk boundaries.
+        Retains a bounded mel prefix (up to mel_cache_len frames) across chunks
+        to avoid cumulative recomputation overhead, blending overlapping audio
+        boundaries via smooth cross-fading.
         """
         feat = self._forward_mel(
             token=token,
@@ -433,8 +584,14 @@ class CosyVoice3Code2Wav(nn.Module):
         )
 
         # Run vocoder
-        hift_weight = self.hift.m_source.l_linear.weight
-        tts_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+        hift_param = next(self.hift.parameters(), None) if hasattr(self, "hift") else None
+        if hift_param is None and hasattr(self, "hift") and hasattr(self.hift, "m_source"):
+            l_linear = getattr(self.hift.m_source, "l_linear", None)
+            if l_linear is not None:
+                hift_param = getattr(l_linear, "weight", None)
+        device = hift_param.device if hift_param is not None else feat.device
+        dtype = hift_param.dtype if hift_param is not None else feat.dtype
+        tts_mel = feat.to(device=device, dtype=dtype)
 
         if tts_mel.shape[-1] == 0:
             tts_speech = torch.zeros(

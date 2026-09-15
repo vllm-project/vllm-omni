@@ -31,6 +31,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.common.audio_stream_utils import fade_in_out
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -50,26 +51,6 @@ def _get_left_context_size(info: dict[str, Any]) -> Any | None:
     if not isinstance(meta, dict):
         return None
     return meta.get("left_context_size")
-
-
-def fade_in_out(
-    fade_in_mel: torch.Tensor,
-    fade_out_mel: torch.Tensor,
-    window: torch.Tensor,
-) -> torch.Tensor:
-    """Cross-fade two overlapping waveform segments using a Hamming window.
-
-    The window is split in half: the first half ramps *up* (fade-in) and
-    the second half ramps *down* (fade-out).  The overlap region of
-    ``fade_in_mel`` is blended with the tail of ``fade_out_mel``.
-    """
-    mel_overlap_len = int(window.shape[0] / 2)
-    fade_in_mel = fade_in_mel.clone()
-    fade_in_mel[..., :mel_overlap_len] = (
-        fade_in_mel[..., :mel_overlap_len] * window[:mel_overlap_len]
-        + fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
-    )
-    return fade_in_mel
 
 
 @dataclass

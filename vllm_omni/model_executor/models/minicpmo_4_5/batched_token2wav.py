@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.common.audio_stream_utils import fade_in_out
+
 from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
 
 logger = init_logger(__name__)
@@ -776,17 +778,7 @@ class BatchedToken2Wav(nn.Module):
         previous: torch.Tensor,
         window: torch.Tensor,
     ) -> torch.Tensor:
-        overlap = min(
-            int(window.shape[0] // 2),
-            int(speech.shape[-1]),
-            int(previous.shape[-1]),
-        )
-        result = speech.clone()
-        if overlap > 0:
-            result[..., :overlap] = (
-                result[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[-overlap:]
-            )
-        return result
+        return fade_in_out(speech, previous, window)
 
     def decode_batch(
         self,
