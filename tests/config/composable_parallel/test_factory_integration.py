@@ -137,3 +137,34 @@ def test_cli_overrides_strategy_with_warning():
     assert _resolved(stages, "talker").runtime.num_replicas == 3
     # ...and the override was warned about, naming the conflicting field.
     assert any("num_replicas" in m and "overrides the strategy-derived" in m for m in messages)
+
+
+def test_stage_override_devices_satisfy_strategy_post_cli():
+    """Documented flow: default deploy + strategy + --stage-overrides devices.
+
+    The device guard must judge the post-CLI layout (deferred to the
+    reconciliation pass), not the deploy defaults -- otherwise the
+    documented usage in strategy_tp2.yaml / the example README can never
+    resolve.
+    """
+    resolution = StageConfigFactory._resolve_legacy_from_registry(
+        OMNI_PIPELINES["qwen2_5_omni"],
+        {"stage_0_devices": "2,3"},
+        str(_DEPLOY),
+        strategy_specs={"thinker": [_tp(2)]},
+    )
+    thinker = next(s for s in resolution.stage_configs if s.model_stage == "thinker")
+    assert thinker.yaml_engine_args["tensor_parallel_size"] == 2
+    assert thinker.runtime_overrides["devices"] == "2,3"
+
+
+def test_missing_stage_override_devices_still_rejected_post_cli():
+    # The guard itself must not disappear: TP=2 with only the default
+    # single-GPU deploy and no CLI devices still fails, just later (post-CLI).
+    with pytest.raises(StrategyApplyError):
+        StageConfigFactory._resolve_legacy_from_registry(
+            OMNI_PIPELINES["qwen2_5_omni"],
+            {},
+            str(_DEPLOY),
+            strategy_specs={"thinker": [_tp(2)]},
+        )

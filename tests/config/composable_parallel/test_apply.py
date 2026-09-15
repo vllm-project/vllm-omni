@@ -152,3 +152,12 @@ def test_conflicting_lb_policy_across_roles():
                 "code2wav": [_stage_replica(2, "least_queue")],
             },
         )
+
+
+def test_apply_skips_device_guard_when_deferred():
+    # With validate_devices=False the eager pre-CLI device check is skipped;
+    # the caller (config factory) re-checks against post-CLI overrides.
+    stages = _qwen_stages()
+    stages[0].yaml_runtime["devices"] = "0"
+    apply_strategy_specs(stages, {"thinker": [_tp(2)]}, validate_devices=False)
+    assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
