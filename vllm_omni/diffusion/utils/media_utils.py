@@ -51,8 +51,11 @@ def _validate_video_chunk(chunk: np.ndarray, *, width: int, height: int) -> None
 class ChunkedMP4Encoder:
     """Encode temporal video chunks while the producer is still decoding.
 
-    A bounded queue and one muxing worker provide ordered backpressure while
-    keeping host memory bounded by ``max_pending`` chunks. Chunks use the same
+    A bounded queue and one muxing worker provide ordered backpressure. What
+    that bounds is pending raw-frame memory: at most ``max_pending`` chunks wait
+    to be encoded, so the bound is in chunks rather than bytes and a taller
+    frame or a longer chunk raises it. The muxed container is not bounded -- it
+    accumulates in memory and grows with output duration. Chunks use the same
     ``(T, H, W, 3)`` uint8 contract as :func:`mux_video_audio_bytes`.
     """
 
