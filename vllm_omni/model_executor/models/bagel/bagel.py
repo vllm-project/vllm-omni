@@ -19,7 +19,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.bagel import BagelForConditionalGeneration
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsEncoderCudaGraph
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -42,6 +42,12 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.transformers_utils.processors.bagel import BagelProcessor
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.bagel.autoencoder import (
@@ -412,7 +418,7 @@ class VAEEncoder(nn.Module):
     info=OmniBagelProcessingInfo,
     dummy_inputs=OmniBagelDummyInputsBuilder,
 )
-class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
+class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsEncoderCudaGraph):
     """
     Omni version of BagelForConditionalGeneration.
 
@@ -661,6 +667,87 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
     def _process_img2text_input(self, multimodal_input):
         return self._process_image_input(multimodal_input)
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        # img2img also runs the VAE and updates request-local RoPE metadata.
+        # Only the fixed-resolution image-understanding path is captured.
+        return EncoderCudaGraphConfig(
+            modalities=["image"],
+            buffer_keys=["pixel_values"],
+            out_hidden_size=self.config.llm_config.hidden_size,
+        )
+
+    def _encoder_tokens_per_image(self) -> int:
+        config = self.config.vit_config
+        return (config.image_size // config.patch_size) ** 2
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
+        tokens = self._encoder_tokens_per_image()
+        # At most one image per prompt; do not capture more images than the
+        # scheduler can admit, even when its token budget is much larger.
+        scheduler = vllm_config.scheduler_config
+        items = min(scheduler.max_num_seqs, max(1, scheduler.max_num_batched_tokens // tokens))
+        return tokens, tokens * items
+
+    @staticmethod
+    def _encoder_pixel_values(mm_kwargs: dict[str, Any]) -> torch.Tensor:
+        pixels = mm_kwargs["pixel_values"]
+        if pixels.ndim == 5:
+            pixels = pixels.flatten(0, 1)
+        return pixels
+
+    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
+        pixels = self._encoder_pixel_values(mm_kwargs)
+        config = self.config.vit_config
+        expected = (config.num_channels, config.image_size, config.image_size)
+        if pixels.ndim != 4 or tuple(pixels.shape[1:]) != expected:
+            raise ValueError(f"BAGEL image encoder expects [N, {expected}], got {tuple(pixels.shape)}")
+        tokens = self._encoder_tokens_per_image()
+        return [EncoderItemSpec(input_size=tokens, output_tokens=tokens) for _ in range(pixels.shape[0])]
+
+    def select_encoder_cudagraph_items(self, mm_kwargs: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+        return {"pixel_values": self._encoder_pixel_values(mm_kwargs)[indices]}
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+    ) -> EncoderCudaGraphCaptureInputs:
+        config = self.config.vit_config
+        tokens = self._encoder_tokens_per_image()
+        # A budget below one image is never replayed; the manager uses eager
+        # for that item. Keep its otherwise unused capture valid.
+        batch_size = min(max_batch_size, max(1, token_budget // tokens))
+        pixels = torch.zeros(
+            batch_size, config.num_channels, config.image_size, config.image_size, device=device, dtype=dtype
+        )
+        side = config.image_size // config.patch_size
+        coords = torch.arange(side, device=device)
+        position_ids = (coords[:, None] * self.config.vit_max_num_patch_per_side + coords).flatten()
+        # The loader can leave the non-persistent sin-cos buffer on CPU.
+        # Match eager placement before capture, preserving its dtype.
+        positions = self.vit_pos_embed(position_ids).to(device=device).unsqueeze(0)
+        return EncoderCudaGraphCaptureInputs(values={"pixel_values": pixels, "pos_embeds": positions})
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ) -> EncoderCudaGraphReplayBuffers:
+        return EncoderCudaGraphReplayBuffers(values={"pixel_values": self._encoder_pixel_values(mm_kwargs)})
+
+    def encoder_cudagraph_forward(self, inputs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
+        features = self.connector(self.vit_model(inputs["pixel_values"]))
+        return (features + inputs["pos_embeds"]).flatten(0, 1)
+
+    def encoder_eager_forward(self, mm_kwargs: dict[str, Any], path: str = "default") -> torch.Tensor:
+        return torch.cat(self._process_image_input(mm_kwargs), dim=0)
 
     def _process_img2img_input(self, multimodal_input):
         pixel_values = multimodal_input["pixel_values"]
