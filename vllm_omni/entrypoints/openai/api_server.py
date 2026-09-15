@@ -1806,6 +1806,8 @@ async def generate_images(
                 extra_body["system_prompt"] = request.system_prompt
             if request.return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = request.return_stage_metrics
+            for extra_key, extra_value in (request.model_extra or {}).items():
+                extra_body.setdefault(extra_key, extra_value)
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
@@ -2066,18 +2068,21 @@ async def edit_images(
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
-        # Currently only have one diffusion stage.
-        diffusion_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
-        if not diffusion_stage_ids:
+        # Image edits (img2img) are only validated for classical diffusion
+        # stages. LLM-typed DiT stages (e.g. MammothModa2) are admitted to
+        # /v1/images/generations but not to edits until that path is validated
+        # end-to-end, so keep the pre-existing diffusion-only gate here.
+        image_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
+        if not image_stage_ids:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
                 detail="No diffusion stage found in multi-stage pipeline.",
             )
-        diffusion_stage_id = diffusion_stage_ids[0]
+        image_stage_id = image_stage_ids[0]
         apply_stage_default_sampling_params(
             default_sample_param,
             gen_params,
-            str(diffusion_stage_id),
+            str(image_stage_id),
         )
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
