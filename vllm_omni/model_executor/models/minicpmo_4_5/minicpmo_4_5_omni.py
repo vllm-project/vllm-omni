@@ -547,13 +547,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
             if isinstance(thinker_output, tuple):
-                embeds, text_hidden_states = thinker_output
+                _, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
 
             # Prepare hidden states for downstream stages
-            # Ensure correct shape: (batch_size, seq_len, hidden_dim)
-            if added_batch_dim:
+            # Ensure correct shape: (seq_len, hidden_dim)
+            if text_hidden_states.ndim == 3 and text_hidden_states.shape[0] == 1:
                 text_hidden_states = text_hidden_states.squeeze(0)
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
-"""Stage input processor for MammothModa2 (AR -> diffusion)."""
+"""Stage input processor for MammothModa2 (AR -> DiT)."""
 
 from collections.abc import Mapping
 from typing import Any
@@ -71,12 +70,20 @@ def ar2diffusion(
             f"request_id={getattr(ar_output, 'request_id', None)}"
         )
 
+    # The text/image condition split is performed in the DiT pipeline, which sources
+    # the distinguishing token ids (gen_vocab_start_index, vision placeholder ids)
+    # from the model config. Pass through the raw AR hidden states + token ids and
+    # the question/answer boundary so the pipeline can reconstruct the masks.
     return {
         "prompt": "",
         "height": height,
         "width": width,
         "additional_information": {
-            "full_hidden_states": full_hidden_states.float().contiguous(),
+            # The EngineCore payload serializer preserves bfloat16 as raw bytes.
+            # Keep the AR representation compact across the CPU/IPC boundary;
+            # the DiT selects its conditioning rows and casts them only when it
+            # consumes them.
+            "full_hidden_states": full_hidden_states.contiguous(),
             "full_token_ids": full_token_ids,
             "answer_start_index": len(prompt_token_ids),
             **{

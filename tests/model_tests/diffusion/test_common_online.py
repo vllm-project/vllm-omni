@@ -8,6 +8,7 @@ encoding) using tiny models.
 """
 
 import pytest
+from xdist import is_xdist_worker
 
 from tests.helpers.runtime import OmniServer, OnlineOmniClient
 from tests.model_tests.diffusion.case_filtering import get_parametrized_options
@@ -28,6 +29,23 @@ from tests.model_tests.diffusion.task_runners import (
 
 # NOTE : Hardware marks are added dynamically based on test requirements
 pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
+
+
+@pytest.fixture(autouse=True)
+def _disable_global_gpu_cleanup_for_parallel_workers(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not wait on total GPU usage while sibling xdist workers are active.
+
+    ``cleanup_test_environment`` observes the whole device, not allocations
+    owned by the current worker.  Waiting for the device to fall below its
+    global threshold therefore turns server teardown into a cross-worker
+    barrier when online tests run with xdist.  ``OmniServer`` still tears down
+    its own subprocess tree; retain the broader cleanup for non-xdist runs.
+    """
+    if is_xdist_worker(request):
+        monkeypatch.setattr("tests.helpers.runtime.cleanup_test_environment", lambda: None)
 
 
 @pytest.mark.parametrize(

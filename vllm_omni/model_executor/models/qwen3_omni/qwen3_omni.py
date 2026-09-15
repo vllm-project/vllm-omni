@@ -34,6 +34,7 @@ from vllm.model_executor.models.qwen3_omni_moe_thinker import (
 from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
+    make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -53,6 +54,7 @@ from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     apply_outer_quant_config_mapping,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+    PP_CAPTURE_PREFIX,
     Qwen3OmniMoeThinkerDummyInputsBuilder,
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerMultiModalProcessor,
@@ -274,6 +276,18 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
+        if self.model_stage == "thinker":
+            capture_indices = self._thinker_capture_layer_indices()
+            start_layer = self.thinker.language_model.model.start_layer
+            incoming_captures = [f"{PP_CAPTURE_PREFIX}{index}" for index in capture_indices if index < start_layer]
+            if incoming_captures:
+                self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+                    ["hidden_states", "residual", *incoming_captures], thinker_config.text_config.hidden_size
+                )
+
+    def _thinker_capture_layer_indices(self) -> list[int]:
+        accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
+        return [0, int(accept_layer)] if self.is_staged_run and accept_layer is not None else []
 
     @classmethod
     async def buffer_realtime_audio(
@@ -441,11 +455,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Only staged runs have a talker stage to consume the capture; in a
             # plain vLLM run capturing would waste a clone per layer per step
             # and make the thinker return a tuple stock vLLM cannot handle.
-            accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
+            capture_indices = self._thinker_capture_layer_indices()
             capture_kwargs = {}
-            if accept_layer is not None and self.is_staged_run:
+            if capture_indices:
                 capture_kwargs = {
-                    "capture_layer_indices": [0, int(accept_layer)],
+                    "capture_layer_indices": capture_indices,
                     "return_hidden_states": True,
                 }
 

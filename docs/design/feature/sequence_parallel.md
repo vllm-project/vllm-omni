@@ -77,7 +77,9 @@ Use it when plain Ulysses-SP would otherwise fail because:
 
 - `auto_pad=True` pads sequence tokens in `_sp_plan` and requires attention backends that support `attention_mask`.
 - `advanced_uaa` does not depend on mask-based token padding inside Ulysses attention. It is therefore a better fit for non-divisible head counts and uneven Ulysses shard sizes.
-- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume `attention_mask`.
+- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume arbitrary
+  `attention_mask` values. A model with contiguous suffix padding may instead publish `valid_kv_length`; Ring trims
+  each circulated K/V block against that global valid prefix.
 - `advanced_uaa` is still experimental and hybrid mode remains limited by Ring's equal-shape requirement.
 
 ---
@@ -416,7 +418,7 @@ _sp_plan = {
 | Constraint | Description |
 |------------|-------------|
 | **Attention Backend Compatibility** | The attention backends must support `attention_mask`. Currently only `TORCH_SDPA` and `FLASH_ATTN` (default for diffusion models) are supported. |
-| **Ring Attention Limitation** | Ring attention does not support `attention_mask`. Therefore, when using `auto_pad=True`, the combination of Ulysses + Ring attention is not feasible. |
+| **Ring Attention Limitation** | Ring attention does not support arbitrary `attention_mask` values, so `auto_pad=True` remains incompatible. Contiguous suffix padding is supported when the model publishes the global `valid_kv_length` prefix. |
 
 1. Enable `auto_pad=True` for all sequence-dimension inputs in `_sp_plan`:
 ```python
