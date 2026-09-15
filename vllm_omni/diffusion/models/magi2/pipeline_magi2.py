@@ -546,12 +546,13 @@ class Magi2Pipeline(
         if not od_config.model:
             raise ValueError("MAGI-2 requires od_config.model")
         _validate_native_topology(od_config)
-        if not current_omni_platform.is_cuda() or not current_omni_platform.is_available():
-            raise RuntimeError("MAGI-2 Preview requires CUDA GPUs")
+        supported_gpu = current_omni_platform.is_cuda() or current_omni_platform.is_musa()
+        if not supported_gpu or not current_omni_platform.is_available():
+            raise RuntimeError("MAGI-2 Preview requires available CUDA or MUSA GPUs")
 
         self.od_config = od_config
         self.dtype = od_config.dtype or torch.bfloat16
-        self.device_str = f"cuda:{torch.accelerator.current_device_index()}"
+        self.device_str = f"{current_omni_platform.device_type}:{torch.accelerator.current_device_index()}"
         self.checkpoint_root = _resolve_checkpoint_root(
             str(od_config.model),
             od_config.revision,
@@ -1062,11 +1063,13 @@ class Magi2Pipeline(
         seed = _resolve_request_seed(sampling)
         _seed_request(seed)
 
-        has_cuda = current_omni_platform.is_cuda() and current_omni_platform.is_available()
-        device_index = torch.accelerator.current_device_index() if has_cuda else None
+        has_accelerator = (
+            current_omni_platform.is_cuda() or current_omni_platform.is_musa()
+        ) and current_omni_platform.is_available()
+        device_index = torch.accelerator.current_device_index() if has_accelerator else None
         # Sampling reserved memory is qualification instrumentation, not part
         # of ordinary serving. It starts only when the pipeline profiler is
-        # explicitly enabled, so every CUDA request avoids a 20 Hz thread.
+        # explicitly enabled, so ordinary GPU requests avoid a 20 Hz thread.
         monitor = (
             _PeakReservedMonitor(device_index)
             if device_index is not None and getattr(self, "enable_diffusion_pipeline_profiler", False)
@@ -1087,7 +1090,7 @@ class Magi2Pipeline(
                 height=height,
                 num_inference_steps=steps,
             )
-            if has_cuda:
+            if has_accelerator:
                 torch.accelerator.synchronize()
         finally:
             if monitor_started:
@@ -1098,7 +1101,7 @@ class Magi2Pipeline(
             video = _resize_video(video, output_width, output_height)
 
         peak_memory_mb = monitor.peak_bytes / 1024**2 if monitor is not None else 0.0
-        if has_cuda and dist.is_available() and dist.is_initialized() and self._parallel_group.world_size > 1:
+        if has_accelerator and dist.is_available() and dist.is_initialized() and self._parallel_group.world_size > 1:
             peak = torch.tensor(peak_memory_mb, device=self.device_str)
             dist.all_reduce(
                 peak,
