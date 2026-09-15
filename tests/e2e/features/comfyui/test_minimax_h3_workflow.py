@@ -62,7 +62,7 @@ def test_workflow_links_and_native_defaults():
     )
     assert graph[4]["type"] == "SaveVideo"
     assert graph[4]["widgets_values"][1] == "mp4"
-    assert widget_inputs(graph[5])["local_path"] == ""
+    assert widget_inputs(graph[5]) == {"local_path": "", "name": "h3-turbo-v1.0-768p", "scale": 1.0, "int_id": 0}
     for node in graph.values():
         if node["type"].startswith("VLLMOmni"):
             widget_inputs(node)
@@ -86,7 +86,7 @@ async def test_workflow_serializes_t2va_request(monkeypatch, turbo):
     kwargs.update(sampling_params=sampling, model_params=params)
     if turbo:
         lora = widget_inputs(graph[5])
-        lora["local_path"] = "/server/models/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+        assert nodes.VLLMOmniRemoteLoRA.VALIDATE_INPUTS(lora["local_path"], lora["name"]) is True
         kwargs["lora"] = nodes.VLLMOmniRemoteLoRA().get_lora(**lora)[0]
 
     captured = {}
@@ -115,7 +115,7 @@ async def test_workflow_serializes_t2va_request(monkeypatch, turbo):
     assert json.loads(captured["extra_params"]) == {"task": "t2va", "audio_flow_shift": 3.0, "aspect_ratio": "16:9"}
     assert "input_reference" not in captured
     if turbo:
-        assert json.loads(captured["lora"]) == kwargs["lora"]
+        assert json.loads(captured["lora"]) == {"name": "h3-turbo-v1.0-768p", "scale": 1.0, "int_id": None}
     else:
         assert "lora" not in captured
 
@@ -145,3 +145,36 @@ def test_h3_params_infer_supported_aspect_ratio_from_dimensions(width, height, a
     fields = _minimaxh3_params_builder(params, extra_params={"task": "t2va"}, width=width, height=height)
     assert "aspect_ratio" not in fields
     assert json.loads(fields["extra_params"])["aspect_ratio"] == aspect_ratio
+
+
+@pytest.mark.parametrize("int_id, expected_id", [(0, None), (10, 10)])
+def test_remote_lora_preserves_legacy_widget_order_and_explicit_path(int_id, expected_id):
+    # ComfyUI restores saved widget values positionally, including the path first.
+    legacy_node = {
+        "type": "VLLMOmniRemoteLoRA",
+        "widgets_values": [" /server/models/legacy.safetensors ", " legacy ", 0.7, int_id],
+    }
+    values = widget_inputs(legacy_node)
+    assert list(values) == ["local_path", "name", "scale", "int_id"]
+    assert nodes.VLLMOmniRemoteLoRA.VALIDATE_INPUTS(values["local_path"], values["name"]) is True
+    assert nodes.VLLMOmniRemoteLoRA().get_lora(**values)[0] == {
+        "local_path": "/server/models/legacy.safetensors",
+        "name": "legacy",
+        "scale": 0.7,
+        "int_id": expected_id,
+    }
+
+
+def test_remote_lora_omits_blank_path_for_registered_name():
+    assert nodes.VLLMOmniRemoteLoRA.VALIDATE_INPUTS("  ", " registered ") is True
+    assert nodes.VLLMOmniRemoteLoRA().get_lora("  ", " registered ", 0.5, 0)[0] == {
+        "name": "registered",
+        "scale": 0.5,
+        "int_id": None,
+    }
+
+
+@pytest.mark.parametrize("local_path", ["", "/server/models/legacy.safetensors"])
+@pytest.mark.parametrize("name", ["", "  "])
+def test_remote_lora_requires_name_with_or_without_path(local_path, name):
+    assert nodes.VLLMOmniRemoteLoRA.VALIDATE_INPUTS(local_path, name) == "LoRA name must be provided."

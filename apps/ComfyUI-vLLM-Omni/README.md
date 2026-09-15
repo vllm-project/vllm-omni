@@ -145,7 +145,9 @@ Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Vide
 for remote video generation with audio. It includes connected base presets and
 optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
 [workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
-settings, and saved-video/audio validation.
+settings, and saved-video/audio validation. Register Turbo with `--lora-modules`
+on the server and select its name in Remote LoRA; the workflow can leave the
+server path blank.
 
 #### FastH3 text-to-video
 

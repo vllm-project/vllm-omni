@@ -33,7 +33,7 @@ import copy
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -98,10 +98,12 @@ class OmniStreamingVideoOutputHandler:
         stage_configs: list[Any] | None = None,
         stall_timeout: float = _DEFAULT_STALL_TIMEOUT,
         start_timeout: float = _DEFAULT_START_TIMEOUT,
+        lora_modules: Mapping[str, str] | None = None,
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        self._lora_modules = lora_modules
         self._stall_timeout = stall_timeout
         self._start_timeout = start_timeout
 
@@ -593,10 +595,9 @@ class OmniStreamingVideoOutputHandler:
                 return copy.deepcopy(params)
         return OmniDiffusionSamplingParams()
 
-    @staticmethod
-    def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
+    def _apply_lora(self, lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
         try:
-            lora_request, lora_scale = parse_lora_request(lora_body)
+            lora_request, lora_scale = parse_lora_request(lora_body, self._lora_modules)
         except ValueError as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,

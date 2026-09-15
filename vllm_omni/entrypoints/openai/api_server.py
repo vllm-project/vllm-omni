@@ -125,7 +125,11 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _load_input_images,
     _update_if_not_none,
 )
-from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
+from vllm_omni.entrypoints.openai.lora import (
+    _get_lora_from_json_str,
+    _parse_lora_request,
+    build_diffusion_lora_registry,
+)
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -562,6 +566,7 @@ async def omni_init_app_state(
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
+        state.diffusion_lora_modules = build_diffusion_lora_registry(getattr(args, "lora_modules", None))
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = openai_models_serving._DiffusionServingModels(base_model_paths)
@@ -572,10 +577,12 @@ async def omni_init_app_state(
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
+            lora_modules=state.diffusion_lora_modules,
         )
         state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
+            lora_modules=state.diffusion_lora_modules,
         )
 
         # audio related
@@ -593,11 +600,13 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            lora_modules=state.diffusion_lora_modules,
         )
         state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
             engine_client=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            lora_modules=state.diffusion_lora_modules,
         )
 
         state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
@@ -1796,7 +1805,7 @@ async def generate_images(
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
-                _parse_lora_request(request.lora)
+                _parse_lora_request(request.lora, getattr(raw_request.app.state, "diffusion_lora_modules", None))
                 extra_body["lora"] = request.lora
             if request.bot_task is not None:
                 extra_body["bot_task"] = request.bot_task
@@ -1845,7 +1854,9 @@ async def generate_images(
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_request, lora_scale = _parse_lora_request(request.lora)
+        lora_request, lora_scale = _parse_lora_request(
+            request.lora, getattr(raw_request.app.state, "diffusion_lora_modules", None)
+        )
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
 
@@ -2082,7 +2093,9 @@ async def edit_images(
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_dict = _get_lora_from_json_str(lora)
-        lora_request, lora_scale = _parse_lora_request(lora_dict)
+        lora_request, lora_scale = _parse_lora_request(
+            lora_dict, getattr(raw_request.app.state, "diffusion_lora_modules", None)
+        )
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
         # 3.2 Validate resolution if provided
@@ -2218,7 +2231,7 @@ async def edit_images(
             if lora is not None:
                 # Validate LoRA, then pass through.
                 lora_dict = _get_lora_from_json_str(lora)
-                _parse_lora_request(lora_dict)
+                _parse_lora_request(lora_dict, getattr(raw_request.app.state, "diffusion_lora_modules", None))
                 extra_body["lora"] = lora_dict
             if bot_task is not None:
                 extra_body["bot_task"] = bot_task

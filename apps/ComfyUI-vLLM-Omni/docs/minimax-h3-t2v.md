@@ -14,9 +14,9 @@ optional Turbo presets and Remote LoRA are disconnected.
 
 ## Server and client setup
 
-Install vLLM-Omni using the current [installation guide](../../../../docs/getting_started/installation/README.md).
+Install vLLM-Omni using the current [installation guide](../../../docs/getting_started/installation/README.md).
 Download the FL2VA partition of `MiniMaxAI/MiniMax-H3`, preserving its directory
-layout. Use the [H3 deployment recipe](../../../../recipes/MiniMaxAI/MiniMax-H3.md)
+layout. Use the [H3 deployment recipe](../../../recipes/MiniMaxAI/MiniMax-H3.md)
 to choose parallelism and offload settings for your hardware.
 
 For a two-GPU server with sufficient memory, this is a starting command. Replace
@@ -26,6 +26,7 @@ The served name must match the workflow's **model** field.
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
 CUDA_VISIBLE_DEVICES=0,1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
 vllm serve "${MODEL_ROOT}" --omni --host 127.0.0.1 --port 8000 \
   --served-model-name MiniMaxAI/MiniMax-H3 --trust-remote-code \
   --task-type fl2va --num-gpus 2 --tensor-parallel-size 2 \
@@ -81,17 +82,35 @@ For Turbo, download this exact **Diffusers-layout** artifact from
 minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
 ```
 
-Preload it by adding `--lora-backend peft --lora-path "${TURBO_LORA}"` to the
-FL2VA server command, where `TURBO_LORA` is the full server-side artifact path.
-Enter that same path in Remote LoRA's **local_path**; this is a server path,
-not a browser or ComfyUI path. Keep the filename unchanged. The `_comfyui_`
-export is not supported by the remote backend.
+Register it on the FL2VA server with these additional arguments, where
+`TURBO_LORA` is the full path to the downloaded artifact on that server:
+
+```bash
+--lora-backend peft \
+  --lora-modules "h3-turbo-v1.0-768p=${TURBO_LORA}"
+```
+
+In Remote LoRA, use **name** `h3-turbo-v1.0-768p`, **scale** `1.0`, and
+**int_id** `0`; leave **local_path** empty. The server resolves the name to its
+configured path and derives the internal adapter ID. The same workflow can
+connect to another server that registers the same name at a different path.
+The service URL must still be reachable from ComfyUI.
+
+The adapter loads on first use. Optionally add `--lora-path "${TURBO_LORA}"`
+to preload the same adapter; registration alone does not enable it for Base
+requests. Keep the artifact filename unchanged. The `_comfyui_` export is not
+supported by the remote backend.
+
+Name-only selection requires a server with named diffusion LoRA support and a
+matching registration. An unknown name is an error. Older workflows with an
+explicit server-side **local_path** remain supported; a path that conflicts
+with a registered name is rejected.
 
 Connect **Turbo sampling**, **Turbo H3 params**, and **Remote LoRA** to Generate
 Video's `sampling_params`, `model_params`, and `lora` inputs respectively,
 replacing the two base links. Four forwards require **5** inference steps in
 this backend. Other Turbo filenames can require different settings; consult the
-[artifact contract table](../../../../recipes/MiniMaxAI/MiniMax-H3.md#turbo-lora).
+[artifact contract table](../../../recipes/MiniMaxAI/MiniMax-H3.md#turbo-lora).
 To return to base, reconnect both base presets and disconnect LoRA.
 
 ## Validation
@@ -129,6 +148,25 @@ decoding fix from upstream. The historical run below used the then-separate
 A silent saved file still does not pass WF-01 acceptance.
 
 ## Recorded validation
+
+### Named-adapter validation (2026-09-15)
+
+The server registered `h3-turbo-v1.0-768p` with `--lora-modules`, without
+`--lora-path`. The real ComfyUI workflow sent the adapter name and scale with an
+empty path and automatic ID, then saved a new bakery clip. The first request
+loaded the registered adapter through the existing PEFT manager.
+
+- Two H20-3e GPUs, TP 2, `TORCH_SDPA`; Python 3.12.13, vLLM 0.29.0,
+  PyTorch 2.13.0+cu129; upstream baseline `92715f3f` plus WF-01 changes.
+- 1344 x 768, 243 frames, 24 FPS, seed 1101, 5 inference steps, flow shifts
+  6/3 and LoRA scale 1; ComfyUI execution took 392.66 seconds.
+- Saved H.264 video and stereo 32 kHz AAC audio both lasted 10.125 seconds.
+  Full FFmpeg decode passed; decoded audio was nonzero (RMS 0.11565).
+- 322 focused API tests passed, with one existing expected failure; all
+  44 ComfyUI tests passed. Base request behavior and legacy explicit paths
+  were covered by automated tests. A full 50-step Base run was not repeated.
+
+### Initial template validation
 
 The original workflow was validated on two H20-3e GPUs with vLLM-Omni base commit `bad50980`, vLLM 0.29.0,
 PyTorch 2.13.0+cu129, and ComfyUI commit

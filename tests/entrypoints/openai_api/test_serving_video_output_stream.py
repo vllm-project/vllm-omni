@@ -965,9 +965,9 @@ class TestStreamingVideoOutputExtraParams:
 
     @staticmethod
     def _handler() -> OmniStreamingVideoOutputHandler:
-        handler = object.__new__(OmniStreamingVideoOutputHandler)
-        handler._engine_client = SimpleNamespace(default_sampling_params_list=[])
-        return handler
+        return OmniStreamingVideoOutputHandler(
+            engine_client=SimpleNamespace(default_sampling_params_list=[]),
+        )
 
     async def test_preencode_mp4_is_rejected_for_streaming_sessions(self):
         """Worker-side pre-encoding emits one progressive MP4 the fMP4 encoder cannot consume."""

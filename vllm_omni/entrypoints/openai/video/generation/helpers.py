@@ -834,6 +834,8 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
+    handler.resolve_lora_request(request.lora)
+
     normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
     if normalized_control_type is not None:
         # Make the selected transfer mode visible while choosing the model's

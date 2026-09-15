@@ -5,13 +5,31 @@
 Use this module for HTTP-facing LoRA parsing shared by OpenAI-compatible
 endpoint families."""
 
+from __future__ import annotations
+
 import json
+from collections.abc import Mapping, Sequence
 from http import HTTPStatus
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
 
 from vllm_omni.entrypoints.openai.utils import parse_lora_request
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.openai.models.protocol import LoRAModulePath
+
+
+def build_diffusion_lora_registry(lora_modules: Sequence[LoRAModulePath] | None) -> dict[str, str]:
+    """Register --lora-modules names without loading or activating adapters."""
+    registry: dict[str, str] = {}
+    for module in lora_modules or ():
+        if not module.name or not module.path:
+            raise ValueError("Diffusion LoRA registration requires a name and path.")
+        if module.name in registry:
+            raise ValueError(f"Duplicate diffusion LoRA name: '{module.name}'.")
+        registry[module.name] = module.path
+    return registry
 
 
 def _get_lora_from_json_str(lora_body):
@@ -28,9 +46,9 @@ def _get_lora_from_json_str(lora_body):
     return lora_dict
 
 
-def _parse_lora_request(lora_body: dict[str, Any]):
+def _parse_lora_request(lora_body: dict[str, Any] | None, lora_modules: Mapping[str, str] | None = None):
     try:
-        return parse_lora_request(lora_body)
+        return parse_lora_request(lora_body, lora_modules)
     except ValueError as e:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,

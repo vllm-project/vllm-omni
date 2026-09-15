@@ -736,8 +736,17 @@ class VLLMOmniRemoteLoRA:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "local_path": ("STRING", {"default": ""}),
-                "name": ("STRING", {"default": ""}),
+                "local_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "Optional server-side path for direct-path requests. "
+                            "Leave empty to use the LoRA name registered on the server."
+                        ),
+                    },
+                ),
+                "name": ("STRING", {"default": "", "tooltip": "LoRA name registered on the server."}),
                 "scale": (
                     "FLOAT",
                     {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1},
@@ -761,19 +770,20 @@ class VLLMOmniRemoteLoRA:
 
     @classmethod
     def VALIDATE_INPUTS(cls, local_path, name) -> str | Literal[True]:
-        if not local_path.strip() or not name.strip():
-            return "Both local_path and name must be provided."
+        if not name.strip():
+            return "LoRA name must be provided."
         return True
 
     def get_lora(self, local_path: str, name: str, scale: float, int_id: int):
         local_path = local_path.strip()
         name = name.strip()
         lora = {
-            "local_path": local_path or None,
             "name": name or None,
             "scale": float(scale),
             "int_id": int(int_id) if int_id > 0 else None,
         }
+        if local_path:
+            lora["local_path"] = local_path
         return (lora,)
 
 
