@@ -38,11 +38,10 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
 
 List a component to select it for offload. Module mode rejects `layer_options`
 such as `weight_transfer` and `resident_layers`. The
-`enable_cpu_offload=True` compatibility entry point remains supported. New
-integrations should prefer the explicit config; existing model-specific stage
-lifecycles do not need to migrate until equivalent component coverage exists.
-For example, MiniMax-H3's compatibility lifecycle also stages its VAEs, while
-the compact selector intentionally covers only `dit` and `text_encoder`.
+`enable_cpu_offload=True` compatibility entry point remains supported.
+Select `vae` as well when the pipeline implements a module-offload lifecycle
+covering its VAE encode/decode calls. Pipelines without that lifecycle reject
+VAE selection before installing hooks.
 
 ## Model integration
 
@@ -62,8 +61,9 @@ class MyPipeline(nn.Module, SupportsComponentDiscovery):
 ```
 
 All entries may be dotted paths. DiT and encoder lists are both required for
-mutual exclusion. VAE modules are pinned but not swapped; resident modules are
-small modules that must stay on the accelerator for layerwise paths.
+mutual exclusion. The generic forward-hook path keeps VAEs resident. Selected
+VAEs require `SupportsModelCpuOffload`, because encode/decode may bypass
+`forward()`. Resident modules are small modules that stay on the accelerator.
 
 ## Split-model components
 

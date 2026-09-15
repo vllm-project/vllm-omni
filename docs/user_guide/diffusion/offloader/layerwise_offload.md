@@ -19,8 +19,9 @@ stream.
 | last block | Prefetch block 0 | Compute last block | Free last block |
 
 Selected, plan-declared text-encoder blocks can use the same rank-local
-streaming mechanism. Image encoders, VAEs, and non-block DiT modules remain
-device resident.
+streaming mechanism. Image encoders, unselected VAEs, and non-block DiT
+modules remain device resident. Selected VAEs use pipeline-managed stage
+transfers rather than block streaming.
 
 ## Usage
 
@@ -44,12 +45,13 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
 
 ## Component selection
 
-Add `dit`, `text_encoder`, or both to the `components` list. Omitting
-`layer_options` uses safe rank-local defaults:
+Select `dit`, `text_encoder`, and/or `vae` in `components`. Omitting
+`layer_options` uses ordinary rank-local layerwise loading:
 
 - `["dit"]` streams only DiT blocks.
 - `["text_encoder"]` streams only declared text-encoder blocks.
 - Listing both streams both components.
+- `"vae"` stages the model-declared VAEs around encode/decode.
 
 ```bash
 # DiT-only layer offload
@@ -101,11 +103,26 @@ See the [layerwise design](../../../design/feature/offloader/layerwise_offload.m
 for the discovery and hook invariants. Both ordinary and distributed layerwise
 offload consume the same `OffloadPlan` metadata.
 
+### VAE stage lifecycle
+
+To support `components: ["vae"]`, declare every VAE in `_vae_modules` and
+`OffloadPlan.on_demand_component_paths`. Each wrapper must implement
+`load_to_device()` and `offload_to_cpu()`. The pipeline must call these around
+all encode/decode entry points and release the selected component on failure.
+The resolver validates the declaration before installing hooks or moving
+weights; it does not assume that `encode()` or `decode()` invokes `forward()`.
+
+Use the same component selection for initial placement and runtime staging to
+avoid materializing an offloaded VAE on the accelerator during startup.
+Test repeated calls, exceptions, and unselected components. Module-mode VAE
+offload additionally requires the pipeline-owned `SupportsModelCpuOffload`
+lifecycle.
+
 ## Limitations
 
-- The default weight transfer is `rank-local`. Set a selected component's
-  `weight_transfer` to `allgather` to shard its host weights across a
-  compatible multi-device group; backend selection is automatic.
+- Explicit `weight_transfer` selects the [bounded two-slot backend](distributed_layerwise_offload.md),
+  including `rank-local` with zero resident layers. `allgather` additionally
+  shards host weights across a compatible multi-device group.
 - Setup consolidates and pins block parameters, increasing cold-start time.
 - Performance depends on block compute time and host-to-device bandwidth;
   lightweight blocks may not hide transfers.

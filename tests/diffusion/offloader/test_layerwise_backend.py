@@ -646,7 +646,32 @@ class TestLayerwiseComponentConfig:
         plan = OffloadPlan(encoder_component_types={"mllm": "text_encoder"})
         assert config.offloads_encoder("mllm", plan)
 
-    @pytest.mark.parametrize("component", ["image_encoder", "vae", "scheduler", "text-encoder"])
+    def test_explicit_rank_local_selects_bounded_backend_without_resident_layers(self):
+        config = _resolve_offload_config(
+            {
+                "mode": "layer",
+                "components": ["dit", "text_encoder", "vae"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+            }
+        )
+        assert config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        assert config.dlo_resident_layers == 0
+        assert config.offloads("vae")
+        assert not config.uses_allgather("dit")
+        assert not config.uses_allgather("text_encoder")
+
+    @pytest.mark.parametrize("mode", ["module", "layer"])
+    def test_vae_selection_does_not_require_layer_transport(self, mode):
+        config = _resolve_offload_config({"mode": mode, "components": ["vae"]})
+        assert config.offloads("vae")
+        assert not config.offloads("dit")
+
+    @pytest.mark.parametrize("options", [{}, {"weight_transfer": "allgather"}, {"resident_layers": 1}])
+    def test_vae_rejects_layer_options(self, options):
+        with pytest.raises(ValueError, match="VAE offload uses component staging"):
+            _resolve_offload_config({"mode": "layer", "components": ["vae"], "layer_options": {"vae": options}})
+
+    @pytest.mark.parametrize("component", ["image_encoder", "scheduler", "text-encoder"])
     def test_unknown_or_noncanonical_component_is_rejected(self, component):
         with pytest.raises(ValueError, match="Unknown diffusion offload component"):
             OffloadConfig.from_od_config(

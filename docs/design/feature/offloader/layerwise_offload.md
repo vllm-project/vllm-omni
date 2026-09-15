@@ -42,8 +42,9 @@ item must be an executable `nn.Module`; ordering must match forward execution.
 Multiple containers are streamed as separate hook rings.
 
 Non-block state of a selected DiT or text encoder remains device resident.
-Unselected components, VAEs, and declared resident modules are not streamed by
-this backend.
+Unselected components and declared resident modules stay resident. Selected
+VAEs use their declared pipeline-managed lifecycle; their weights are staged
+as complete components, not streamed through the block ring.
 
 ## Invariants and limitations
 

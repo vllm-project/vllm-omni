@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -448,7 +449,26 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
     ]
 
 
-def test_serve_cli_forwards_compact_diffusion_offload_config():
+@pytest.mark.parametrize(
+    "expected",
+    [
+        {
+            "mode": "layer",
+            "components": ["dit", "text_encoder"],
+            "layer_options": {
+                "dit": {"weight_transfer": "rank-local", "resident_layers": 20},
+                "text_encoder": {"weight_transfer": "allgather"},
+            },
+            "pin_memory": True,
+        },
+        {
+            "mode": "layer",
+            "components": ["dit", "text_encoder", "vae"],
+            "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+        },
+    ],
+)
+def test_serve_cli_forwards_compact_diffusion_offload_config(expected):
     """Ensure component-specific layer settings reach the diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -460,10 +480,7 @@ def test_serve_cli_forwards_compact_diffusion_offload_config():
             "MiniMaxAI/MiniMax-H3",
             "--omni",
             "--diffusion-offload-config",
-            '{"mode":"layer","components":["dit","text_encoder"],'
-            '"layer_options":{"dit":{"weight_transfer":"rank-local","resident_layers":20},'
-            '"text_encoder":{"weight_transfer":"allgather"}},'
-            '"pin_memory":true}',
+            json.dumps(expected),
         ]
     )
 
@@ -471,17 +488,11 @@ def test_serve_cli_forwards_compact_diffusion_offload_config():
     stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
     engine_args = stage_cfg["engine_args"]
 
-    expected = {
-        "mode": "layer",
-        "components": ["dit", "text_encoder"],
-        "layer_options": {
-            "dit": {"weight_transfer": "rank-local", "resident_layers": 20},
-            "text_encoder": {"weight_transfer": "allgather"},
-        },
-        "pin_memory": True,
-    }
     assert args.diffusion_offload_config == expected
     assert engine_args["diffusion_offload_config"] == expected
+    config = _terminal_config(stage_cfg)
+    assert config.diffusion_offload_config == expected
+    assert config.enable_distributed_layerwise_offload
 
 
 def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch, mocker):

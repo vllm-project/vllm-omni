@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for SequentialOffloadBackend."""
 
@@ -85,12 +85,13 @@ def test_model_level_backend_delegates_to_custom_pipeline_offload() -> None:
     assert pipeline.disable_called is True
 
 
-def test_model_level_backend_passes_explicit_component_selection() -> None:
+@pytest.mark.parametrize("components", [frozenset({"dit", "text_encoder"}), frozenset({"vae"})])
+def test_model_level_backend_passes_explicit_component_selection(components: frozenset[str]) -> None:
     pipeline = _CustomPipeline()
     backend = ModelLevelOffloadBackend(
         OffloadConfig(
             strategy=OffloadStrategy.MODEL_LEVEL,
-            components=frozenset({"dit", "text_encoder"}),
+            components=components,
         ),
         torch.device("cpu"),
     )
@@ -98,7 +99,7 @@ def test_model_level_backend_passes_explicit_component_selection() -> None:
     backend.enable(pipeline)
 
     assert pipeline.enable_args is not None
-    assert pipeline.enable_args["offload_components"] == frozenset({"dit", "text_encoder"})
+    assert pipeline.enable_args["offload_components"] == components
 
 
 def test_model_level_backend_rolls_back_partial_custom_enable() -> None:
@@ -282,6 +283,21 @@ def test_component_selective_model_offload_requires_swap_counterpart(component, 
 
     with pytest.raises(ValueError, match=message):
         backend.enable(pipeline)
+
+
+def test_vae_module_offload_requires_pipeline_lifecycle() -> None:
+    pipeline = nn.Module()
+    pipeline.transformer = _create_simple_module()
+    pipeline.text_encoder = _create_simple_module()
+    pipeline.vae = _create_simple_module()
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, components=frozenset({"vae"})),
+        torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="pipeline-owned module lifecycle"):
+        backend.enable(pipeline)
+    assert not backend.enabled
+    assert not hasattr(pipeline.transformer, "_hook_registry")
 
 
 def test_sequential_offload_can_begin_with_dit_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

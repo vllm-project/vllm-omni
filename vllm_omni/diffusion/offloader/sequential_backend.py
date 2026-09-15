@@ -328,6 +328,8 @@ class ModelLevelOffloadBackend(OffloadBackend):
             return
 
         resolved = resolve_offload_plan(pipeline, self.config)
+        if any(component.selected for component in resolved.vaes):
+            raise ValueError("Selected VAE module offload requires a pipeline-owned module lifecycle")
         dits = [component.module for component in resolved.dits]
         encoders = [component.module for component in resolved.encoders]
         vaes = [component.module for component in resolved.vaes]

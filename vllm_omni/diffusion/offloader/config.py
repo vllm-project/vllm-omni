@@ -11,7 +11,9 @@ from typing import Any, TypeVar
 
 DIT_COMPONENT = "dit"
 TEXT_ENCODER_COMPONENT = "text_encoder"
-OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT, TEXT_ENCODER_COMPONENT})
+VAE_COMPONENT = "vae"
+LAYER_OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT, TEXT_ENCODER_COMPONENT})
+OFFLOAD_COMPONENTS = LAYER_OFFLOAD_COMPONENTS | {VAE_COMPONENT}
 DEFAULT_OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT})
 
 _KeyT = TypeVar("_KeyT")
@@ -110,7 +112,7 @@ class ResolvedOffload:
     @property
     def any_allgather(self) -> bool:
         return self.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and any(
-            self.uses_allgather(component) for component in self.components
+            self.uses_allgather(component) for component in self.components & LAYER_OFFLOAD_COMPONENTS
         )
 
 
@@ -206,8 +208,11 @@ def parse_diffusion_offload_config(value: Any) -> ParsedDiffusionOffloadConfig |
             "diffusion_offload_config.layer_options requires selecting the same component(s): "
             + ", ".join(unselected_options)
         )
+    if VAE_COMPONENT in raw_layer_options:
+        raise ValueError("VAE offload uses component staging and does not accept layer_options")
     layer_options = {
-        component: _parse_layer_options(component, raw_layer_options.get(component, {})) for component in components
+        component: _parse_layer_options(component, raw_layer_options.get(component, {}))
+        for component in components & LAYER_OFFLOAD_COMPONENTS
     }
 
     pin_memory = value.get("pin_memory")
@@ -240,9 +245,11 @@ def _public_strategy(public: ParsedDiffusionOffloadConfig) -> OffloadStrategy:
     if public.mode is OffloadMode.MODULE:
         return OffloadStrategy.MODEL_LEVEL
 
+    # An explicit transport requests DLO's shared two-slot buffering even
+    # for rank-local transfer with no retained layers. Unspecified transport
+    # preserves ordinary layerwise loading for existing compact configs.
     needs_distributed_backend = any(
-        settings.weight_transfer is DLOTransfer.ALLGATHER or settings.resident_layers
-        for settings in public.layer_options.values()
+        settings.weight_transfer is not None or settings.resident_layers for settings in public.layer_options.values()
     )
     return OffloadStrategy.DISTRIBUTED_LAYER_WISE if needs_distributed_backend else OffloadStrategy.LAYER_WISE
 
@@ -304,7 +311,7 @@ def resolve_offload(config: Any) -> ResolvedOffload:
         strategy = _public_strategy(public)
         if legacy is not OffloadStrategy.NONE and legacy is not strategy:
             raise ValueError("diffusion_offload_config cannot be combined with legacy enable_*_offload flags")
-        transfers = {component: DLOTransfer.RANK_LOCAL for component in OFFLOAD_COMPONENTS}
+        transfers = {component: DLOTransfer.RANK_LOCAL for component in LAYER_OFFLOAD_COMPONENTS}
         for component, options in public.layer_options.items():
             transfers[component] = options.weight_transfer or DLOTransfer.RANK_LOCAL
         dit_options = public.layer_options.get(DIT_COMPONENT)
@@ -386,13 +393,13 @@ def parse_dlo_transfer(value: Mapping[str, str | DLOTransfer]) -> dict[str, DLOT
     if not isinstance(value, Mapping):
         raise TypeError(f"offload transfers must be a mapping, got {type(value).__name__}")
     _validate_string_keys(value, "offload transfers")
-    missing = sorted(OFFLOAD_COMPONENTS - set(value))
+    missing = sorted(LAYER_OFFLOAD_COMPONENTS - set(value))
     if missing:
         raise ValueError("offload transfers require every component; missing: " + ", ".join(missing))
     resolved: dict[str, DLOTransfer] = {}
     for component, raw_transfer in value.items():
-        if component not in OFFLOAD_COMPONENTS:
-            choices = ", ".join(sorted(OFFLOAD_COMPONENTS))
+        if component not in LAYER_OFFLOAD_COMPONENTS:
+            choices = ", ".join(sorted(LAYER_OFFLOAD_COMPONENTS))
             raise ValueError(f"Unknown offload transfer component {component!r}; choose from: {choices}")
         resolved[component] = _parse_enum(raw_transfer, DLOTransfer, "offload transfer")
     return resolved
