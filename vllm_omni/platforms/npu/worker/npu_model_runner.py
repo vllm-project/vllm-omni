@@ -72,6 +72,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             apply_model_patches(self.model_config)
         NPUModelRunner.load_model(self, *args, **kwargs)
+        from vllm_omni.platforms.npu.models import apply_post_load_model_patches
+
+        apply_post_load_model_patches(self.model, self.model_config)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
