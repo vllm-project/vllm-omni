@@ -32,9 +32,8 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
-_EMBED_LAYER_KEY = "0"
-_HIDDEN_LAYER_KEY = "24"
+# Pooling output layer indices (semantic names for clarity)
+# Actual layer indices are integers; these functions provide semantic access
 # Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
 # set use REPLACE semantics (subsequent emissions discard prior chunks)
 # instead of CONCAT.  qwen3-omni currently has none — model_outputs is
@@ -48,14 +47,30 @@ _QWEN3_CODEC_EOS_TOKEN_ID = 4198
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
-    """Fetch layer tensor with tolerant key lookup (str/int)."""
+    """Fetch layer tensor with tolerant key lookup (str/int/semantic)."""
     if not isinstance(layers, dict):
         return None
-    key_int = int(key)
-    val = layers.get(key_int)
+    # Try direct string key first (supports semantic keys like "embedding")
+    val = layers.get(key)
     if val is None:
-        val = layers.get(key)
+        # Try converting to int for backward compatibility with numeric string keys
+        try:
+            key_int = int(key)
+            val = layers.get(key_int)
+        except (ValueError, TypeError):
+            pass
     return val if isinstance(val, torch.Tensor) else None
+
+
+def _get_embedding_layer_index() -> int:
+    """Return the layer index for word embeddings (always layer 0)."""
+    return 0
+
+
+def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
+    """Read accept_hidden_layer index from model config."""
+    mc = transfer_manager._get_model_config()
+    return int(mc.hf_config.talker_config.accept_hidden_layer)
 
 
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
@@ -172,88 +187,6 @@ def _extract_qwen3_full_payload_codec_rows(
         "valid_rows": int(filtered_rows.shape[0]) if filtered_rows.ndim > 0 else 0,
         "trailing_placeholder_count": trailing_placeholder_count,
     }
-
-
-# =========================
-# PD disaggregation helpers
-# =========================
-
-
-def _get_prefill_multimodal_output(
-    request_id: str,
-    streaming_context: Any | None,
-) -> dict[str, Any] | None:
-    bridge_states = getattr(streaming_context, "bridge_states", None)
-    if not isinstance(bridge_states, dict):
-        return None
-    by_req = bridge_states.get("pd_prefill_multimodal_output_by_req")
-    if not isinstance(by_req, dict):
-        return None
-    prefill_mm = by_req.get(request_id)
-    return prefill_mm if isinstance(prefill_mm, Mapping) else None
-
-
-def _merge_pd_embeddings(
-    decode_emb: torch.Tensor,
-    decode_hid: torch.Tensor,
-    prefill_mm: dict[str, Any],
-    device: torch.device,
-    expected_total: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge prefill prompt embeddings with decode generated embeddings.
-
-    In PD mode the prefill engine processes the prompt and the decode engine
-    generates tokens starting from position 1.  This function concatenates
-    them, removing the overlapping token(s):
-
-        merged = prefill[:P] + decode[overlap:]
-
-    where overlap = P + D - expected_total.
-    """
-    try:
-        p_layers = prefill_mm.get("hidden_states", {}).get("layers", {})
-        p_emb = p_layers[int(_EMBED_LAYER_KEY)].detach().to(device=device, dtype=torch.float)
-        p_hid = p_layers[int(_HIDDEN_LAYER_KEY)].detach().to(device=device, dtype=torch.float)
-    except (KeyError, AttributeError, TypeError) as exc:
-        available_keys = list(prefill_mm.keys()) if isinstance(prefill_mm, Mapping) else type(prefill_mm).__name__
-        logger.error(
-            "_merge_pd_embeddings: failed to extract prefill embeddings (%s). "
-            "Expected keys %r and %r, got: %s. "
-            "Falling back to decode-only embeddings – talker user-segment will be degraded.",
-            exc,
-            _EMBED_LAYER_KEY,
-            _HIDDEN_LAYER_KEY,
-            available_keys,
-        )
-        return decode_emb, decode_hid
-
-    if p_emb.shape[0] == 0 or decode_emb.shape[0] == 0:
-        return decode_emb, decode_hid
-
-    raw_total = p_emb.shape[0] + decode_emb.shape[0]
-    overlap = max(0, raw_total - expected_total) if expected_total is not None else 0
-
-    merged_emb = torch.cat([p_emb, decode_emb[overlap:]], dim=0)
-    merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
-    return merged_emb, merged_hid
-
-
-def _resolve_tts_token_embedding(
-    key: str,
-    *,
-    thinker_mm: dict[str, Any],
-    prefill_mm: dict[str, Any] | None,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """Return TTS BOS/EOS/PAD embedding tensors for the talker projection path.
-
-    Values are taken from the current thinker (decode) ``multimodal_output``; in
-    PD mode, missing keys may be filled from the paired prefill stage output.
-    """
-    val = thinker_mm.get("embed", {}).get(key)
-    if val is None and prefill_mm is not None:
-        val = prefill_mm.get("embed", {}).get(key)
-    return val.detach().to(device=device, dtype=torch.float) if val is not None else None
 
 
 # =========================
@@ -454,13 +387,25 @@ def thinker2talker_async_chunk(
     thinker_layers = thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {}
     thinker_embed_raw = multimodal_output.get("embed", {})
     thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
-    thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
-    thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
+
+    embedding_idx = _get_embedding_layer_index()
+    accept_hidden_idx = _get_accept_hidden_layer_index(transfer_manager)
+
+    # Remap numeric layer indices to semantic keys
+    semantic_layers = {
+        "embedding": thinker_layers.get(embedding_idx) or thinker_layers.get(str(embedding_idx)),
+        "accept_hidden": thinker_layers.get(accept_hidden_idx) or thinker_layers.get(str(accept_hidden_idx)),
+    }
+    thinker_emb = _layer_tensor(semantic_layers, "embedding")
+    thinker_hid = _layer_tensor(semantic_layers, "accept_hidden")
     if thinker_emb is None or thinker_hid is None:
         logger.debug(
-            "thinker2talker_async_chunk: missing thinker layers for req=%s (embed=%s hidden=%s)",
+            "thinker2talker_async_chunk: missing thinker layers for req=%s "
+            "(embedding_layer=%d:%s accept_hidden_layer=%d:%s)",
             request_id,
+            embedding_idx,
             thinker_emb is not None,
+            accept_hidden_idx,
             thinker_hid is not None,
         )
         return None
@@ -542,21 +487,27 @@ def thinker2talker_full_payload(
         )
         return None
 
+    embedding_idx = _get_embedding_layer_index()
+    accept_hidden_idx = _get_accept_hidden_layer_index(transfer_manager)
+
+    # Use semantic keys instead of numeric indices
     layers = {
-        0: pooling_output.get("hidden_states.layer_0"),
-        24: pooling_output.get("hidden_states.layer_24"),
+        "embedding": pooling_output.get(f"hidden_states.layer_{embedding_idx}"),
+        "accept_hidden": pooling_output.get(f"hidden_states.layer_{accept_hidden_idx}"),
     }
-    thinker_emb = _layer_tensor(layers, _EMBED_LAYER_KEY)
-    thinker_hid = _layer_tensor(layers, _HIDDEN_LAYER_KEY)
+    thinker_emb = _layer_tensor(layers, "embedding")
+    thinker_hid = _layer_tensor(layers, "accept_hidden")
     if thinker_emb is None:
         hidden = pooling_output.get("hidden")
         thinker_emb = hidden if isinstance(hidden, torch.Tensor) else None
     if thinker_emb is None or thinker_hid is None:
         logger.warning(
             "thinker2talker_full_payload: missing thinker tensors for req=%s "
-            "(embed=%s hidden=%s keys=%s); consumer wait gate may hang.",
+            "(embedding_layer=%d:%s accept_hidden_layer=%d:%s keys=%s); consumer wait gate may hang.",
             rid,
+            embedding_idx,
             thinker_emb is not None,
+            accept_hidden_idx,
             thinker_hid is not None,
             list(pooling_output.keys()),
         )
