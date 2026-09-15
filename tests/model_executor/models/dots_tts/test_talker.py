@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the dots.tts talker's stop-signal pairing and
 per-request state lifecycle.
 
@@ -135,3 +135,17 @@ class TestStateEviction:
         talker.on_requests_finished(["never-seen"])
         talker._flush_deferred_cleanup()
         assert talker._active_states == {}
+
+
+class TestNoiseSeed:
+    def test_sampling_seed_initializes_private_generator(self, mocker) -> None:
+        talker = _make_bare_talker()
+        talker.model = mocker.MagicMock()
+        talker.model.embed_tokens = mocker.MagicMock()
+        input_ids = torch.tensor([1, 2], dtype=torch.long)
+
+        talker.preprocess(input_ids, request_id="random-engine-id", _omni_seed=1234)
+        state = talker._active_states["random-engine-id"]
+
+        assert state.noise_generator is not None
+        assert state.noise_generator.initial_seed() == 1234

@@ -161,3 +161,12 @@ models:
     trust_remote_code: true
     task_extra_body:
       default_voice: {}
+
+  dots-studio/dots.tts-soar:
+    supported_tasks: [default_voice]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice:
+        voice: default

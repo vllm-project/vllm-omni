@@ -37,7 +37,6 @@ state) and ``ming_flash_omni`` (AudioVAE weight-loading pattern).
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -105,6 +104,64 @@ _DIT_NOISE_SEED = 20260601  # base seed for per-request FM noise (voxcpm2 parity
 _PATCH_ENCODER_OUT_DS_RATE = 2  # patch_size / in_ds_rate = 4 / 2 (VAESemanticEncoder hardcodes in_ds_rate=2)
 
 
+_QKV_STACKED_PARAMS_MAPPING = (
+    (".qkv_proj.weight", ".q_proj.weight", "q"),
+    (".qkv_proj.weight", ".k_proj.weight", "k"),
+    (".qkv_proj.weight", ".v_proj.weight", "v"),
+)
+
+
+def _load_stacked_qkv_weights(
+    module: nn.Module,
+    shards: Iterable[tuple[str, torch.Tensor]],
+    *,
+    component: str,
+) -> set[str]:
+    """Pack checkpoint Q/K/V tensors into every ``qkv_proj`` parameter.
+
+    ``QKVParallelLinear`` owns the physical packed layout, but needs an
+    explicit ``q`` / ``k`` / ``v`` shard id.  Refuse incomplete packing: a
+    partially initialized attention projection can otherwise serve garbage.
+    """
+    params = dict(module.named_parameters())
+    expected = {name for name in params if name.endswith(".qkv_proj.weight")}
+    seen: dict[str, set[str]] = {}
+    loaded: set[str] = set()
+
+    for source_name, tensor in shards:
+        mapping = next(
+            (
+                (target_suffix, source_suffix, shard_id)
+                for target_suffix, source_suffix, shard_id in _QKV_STACKED_PARAMS_MAPPING
+                if source_name.endswith(source_suffix)
+            ),
+            None,
+        )
+        if mapping is None:
+            continue
+        target_suffix, source_suffix, shard_id = mapping
+        target_name = source_name[: -len(source_suffix)] + target_suffix
+        if target_name not in params:
+            raise ValueError(f"{component} checkpoint shard {source_name!r} maps to missing {target_name!r}")
+        param = params[target_name]
+        weight_loader = getattr(param, "weight_loader", None)
+        if not callable(weight_loader):
+            raise TypeError(f"{component} packed parameter {target_name!r} has no shard-aware weight_loader")
+        weight_loader(param, tensor, shard_id)
+        seen.setdefault(target_name, set()).add(shard_id)
+        loaded.add(target_name)
+
+    if seen:
+        missing = {
+            name: sorted({"q", "k", "v"} - seen.get(name, set()))
+            for name in expected
+            if seen.get(name, set()) != {"q", "k", "v"}
+        }
+        if missing:
+            raise ValueError(f"{component} checkpoint has incomplete QKV shards: {missing}")
+    return loaded
+
+
 class _IOHelper:
     """Latent stats wrapper.  Holds (mean, var) over the 128-dim VAE latent
     space and normalizes / denormalizes between DiT-internal space (which
@@ -159,11 +216,7 @@ class _RequestState:
     precomputed_stop_logits: torch.Tensor | None = None
     is_stopping: bool = False
     prefill_completed: bool = False
-    # Per-request FM noise counter: draw #n of this request hashes to a
-    # deterministic Generator seed (see _run_dit_n_step_euler), so outputs
-    # are reproducible run-to-run and concurrent requests cannot perturb
-    # each other's noise streams (voxcpm2 _fill_deterministic_cfm_noise).
-    noise_step: int = 0
+    noise_generator: torch.Generator | None = None
     # Per-request FM static workspace (lazy-allocated by
     # _initialize_request_fm_state on first _finish_decode call).  Sized for
     # _MAX_AUDIO_PATCHES × (_HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE) = 1024 × 5
@@ -583,7 +636,10 @@ class DotsTTSForConditionalGeneration(nn.Module):
             state.precomputed_stop_logits = None
             state.is_stopping = False
             state.prefill_completed = False
-            state.noise_step = 0
+            seed = info_dict.get("_omni_seed")
+            state.noise_generator = torch.Generator(device=dev).manual_seed(
+                _DIT_NOISE_SEED if seed is None else int(seed)
+            )
             # Reset AR-loop state on every prefill.
             state.patch_encoder_state = None
             state.vocoder_stream_state = None
@@ -984,22 +1040,12 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # state stays fp32; DiT matmuls still run bf16 under the autocast
         # block below, and the result is cast back to the sequence dtype
         # on return.
-        # Deterministic per-request noise (voxcpm2 _fill_deterministic_cfm_
-        # noise pattern): hash seed:request_key:draw# into a private
-        # Generator instead of the global CUDA RNG, so outputs reproduce
-        # run-to-run and concurrent requests cannot perturb each other's
-        # noise streams.  request_key strips the engine's per-run "<idx>_"
-        # uuid suffix so replay across runs keys on the stable batch index.
-        request_key = state.request_id.split("_", 1)[0]
-        if not request_key.isdigit():
-            request_key = state.request_id
-        noise_key = f"{_DIT_NOISE_SEED}:{request_key}:{state.noise_step}".encode()
-        digest = hashlib.blake2b(noise_key, digest_size=8).digest()
-        gen = torch.Generator(device=device)
-        gen.manual_seed(int.from_bytes(digest, "little") & 0x7FFF_FFFF_FFFF_FFFF)
+        # Each request owns a private generator seeded from sampling params.
+        # Its draw sequence is deterministic yet independent of global RNG
+        # state and of interleaving with other requests.
+        gen = state.noise_generator
         z = torch.empty((1, _LATENT_PATCH_SIZE, _LATENT_DIM), device=device, dtype=torch.float32)
         z.normal_(generator=gen)
-        state.noise_step += 1
         dt = 1.0 / num_steps
         times = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
 
@@ -1013,6 +1059,22 @@ class DotsTTSForConditionalGeneration(nn.Module):
             dtype=dtype if use_amp else torch.float32,
             enabled=use_amp,
         ):
+            cfg_batch_size = g_cond_batched.size(0)
+
+            attn_bias = torch.zeros(
+                cfg_batch_size,
+                self._head.blocks[0].attn.num_heads,
+                total_len,
+                total_len,
+                dtype=dtype,
+                device=device,
+            )
+
+            attn_bias.masked_fill_(
+                attn_mask.logical_not(),
+                float("-inf"),
+            )
+
             for step in range(num_steps):
                 t = times[step].reshape(1)
                 z_proj = self._coordinate_proj(z)
@@ -1025,7 +1087,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 vt = self._head(
                     x=z_batched,
                     timesteps=t_batched,
-                    attn_mask=attn_mask,
+                    attn_mask=attn_bias,
                     pos_ids=pos_ids,
                     g_cond=g_cond_batched,
                 )
@@ -1282,10 +1344,11 @@ class DotsTTSForConditionalGeneration(nn.Module):
         ]
         projector_state_keys = {prefix: set(mod.state_dict().keys()) for prefix, _, mod in projector_specs}
         projector_matched: dict[str, list[tuple[str, torch.Tensor]]] = {prefix: [] for prefix, _, _ in projector_specs}
-
         matched_vae: list[tuple[str, torch.Tensor]] = []
         matched_dit: list[tuple[str, torch.Tensor]] = []
+        matched_dit_stacked: list[tuple[str, torch.Tensor]] = []
         matched_patch: list[tuple[str, torch.Tensor]] = []
+        matched_patch_stacked: list[tuple[str, torch.Tensor]] = []
         matched_llm: list[tuple[str, torch.Tensor]] = []
         matched_speaker: list[tuple[str, torch.Tensor]] = []
         skipped_lm_head = 0
@@ -1297,11 +1360,17 @@ class DotsTTSForConditionalGeneration(nn.Module):
         for name, tensor in weights:
             if name.startswith(DIT_PREFIX):
                 candidate = name[len(DIT_PREFIX) :]
+                for _param_name, weight_name, _shard_id in _QKV_STACKED_PARAMS_MAPPING:
+                    if candidate.endswith(weight_name):
+                        matched_dit_stacked.append((candidate, tensor))
                 if candidate in dit_state_keys:
                     matched_dit.append((candidate, tensor))
                 continue
             if name.startswith(PATCH_PREFIX):
                 candidate = name[len(PATCH_PREFIX) :]
+                for _param_name, weight_name, _shard_id in _QKV_STACKED_PARAMS_MAPPING:
+                    if candidate.endswith(weight_name):
+                        matched_patch_stacked.append((candidate, tensor))
                 if candidate in patch_state_keys:
                     matched_patch.append((candidate, tensor))
                 continue
@@ -1360,6 +1429,16 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 len(dit_state_keys),
             )
 
+        if matched_dit_stacked:
+            loaded.update(
+                f"_head.{name}"
+                for name in _load_stacked_qkv_weights(
+                    self._head,
+                    matched_dit_stacked,
+                    component="dots.tts DiT",
+                )
+            )
+
         if matched_patch:
             patch_loader = AutoWeightsLoader(self._patch_encoder)
             loaded_patch = patch_loader.load_weights(iter(matched_patch))
@@ -1368,6 +1447,16 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 "DotsTTS load_weights: loaded %d/%d patch_encoder tensors.",
                 len(loaded_patch),
                 len(patch_state_keys),
+            )
+
+        if matched_patch_stacked:
+            loaded.update(
+                f"_patch_encoder.{name}"
+                for name in _load_stacked_qkv_weights(
+                    self._patch_encoder,
+                    matched_patch_stacked,
+                    component="dots.tts PatchEncoder",
+                )
             )
 
         any_projector_matched = False
