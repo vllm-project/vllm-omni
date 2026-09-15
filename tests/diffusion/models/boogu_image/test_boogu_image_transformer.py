@@ -624,6 +624,7 @@ def test_transformer_forward_batch_invariant_to_partner_padding():
         BooguImageTransformer2DModel,
     )
 
+    torch.manual_seed(0)
     model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
     _randomize_parameters(model)
     # _randomize_parameters' uniform(-0.02, 0.02) scale (tuned for the other
