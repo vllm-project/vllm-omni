@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import huggingface_hub
 import pytest
 
+from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
     _resolve_model_dir,
@@ -27,7 +27,7 @@ def _no_hub(monkeypatch):
     def _fail(*args, **kwargs):  # pragma: no cover - must not be reached
         raise AssertionError("snapshot_download must not be called here")
 
-    monkeypatch.setattr(huggingface_hub.HfApi, "snapshot_download", _fail)
+    patch_hf_snapshot_download(monkeypatch, _fail)
 
 
 def test_local_directory_is_returned_unchanged(tmp_path, monkeypatch):
@@ -38,13 +38,13 @@ def test_local_directory_is_returned_unchanged(tmp_path, monkeypatch):
 def test_repo_id_resolves_via_snapshot_download(tmp_path, monkeypatch):
     calls = {}
 
-    def _fake_snapshot_download(self, model_ref, revision=None, allow_patterns=None):
+    def _fake_snapshot_download(model_ref, revision=None, allow_patterns=None):
         calls["model_ref"] = model_ref
         calls["revision"] = revision
         calls["allow_patterns"] = allow_patterns
         return str(tmp_path / "snapshot")
 
-    monkeypatch.setattr(huggingface_hub.HfApi, "snapshot_download", _fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, _fake_snapshot_download)
     resolved = _resolve_model_dir("openbmb/MiniCPM-o-4_5", revision="abc123")
     assert resolved == str(tmp_path / "snapshot")
     assert calls["model_ref"] == "openbmb/MiniCPM-o-4_5"
@@ -56,7 +56,7 @@ def test_snapshot_download_failure_propagates(monkeypatch):
     def _raise(*args, **kwargs):
         raise FileNotFoundError("offline and not cached")
 
-    monkeypatch.setattr(huggingface_hub.HfApi, "snapshot_download", _raise)
+    patch_hf_snapshot_download(monkeypatch, _raise)
     with pytest.raises(FileNotFoundError):
         _resolve_model_dir("openbmb/MiniCPM-o-4_5")
 

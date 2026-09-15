@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Opt-in cleanup fixtures for GPU memory, pipeline registry, and speaker cache."""
+"""Cleanup fixtures for GPU memory, pipeline registry, and speaker cache."""
 
 from __future__ import annotations
 

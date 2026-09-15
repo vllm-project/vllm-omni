@@ -417,10 +417,7 @@ class TestOmniDiffusionConfigAttentionParsing:
     """Test OmniDiffusionConfig attention shorthand and structured config."""
 
     @pytest.fixture(autouse=True)
-    def _clear_diffusion_attention_backend_env(self, monkeypatch):
-        # OmniDiffusionConfig.__post_init__ applies DIFFUSION_ATTENTION_BACKEND via
-        # build_attention_config(); clear it so these tests assert config defaults,
-        # not whatever the process inherited from CI / sibling tests.
+    def _clear_inherited_attention_backend(self, monkeypatch):
         monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
     def test_diffusion_attention_backend_sets_default(self):
@@ -949,6 +946,12 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
 
 
 class TestOptInFloat32Fallback:
+    @pytest.fixture(autouse=True)
+    def _clear_inherited_attention_backend(self, monkeypatch):
+        # Weekly CPU exports DIFFUSION_ATTENTION_BACKEND; OmniDiffusionConfig
+        # treats that as an explicit default and these auto-backend cases break.
+        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
+
     @staticmethod
     def _make_attention(monkeypatch, *, backend=None, allow=True, kv_cache_dtype=None):
         events, state = [], {}
