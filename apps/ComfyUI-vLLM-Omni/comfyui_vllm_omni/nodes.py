@@ -14,6 +14,7 @@ from .utils.types import (
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
     FastH3Deployment,
+    LatentMaskEditing,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
     VideoReferences,
@@ -205,6 +206,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "lora": ("REMOTE_LORA",),
                 "model_params": ("VIDEO_PARAMS",),
                 "fast_h3": ("FASTH3_DEPLOYMENT",),
+                "latent_edit": ("LATENT_MASK_EDITING",),
             },
         }
 
@@ -237,6 +239,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         model_params: dict | None = None,
         lora: dict | None = None,
         fast_h3: dict | None = None,
+        latent_edit: dict | None = None,
         **kwargs,
     ):
         if kwargs:
@@ -320,6 +323,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             sampling_params=sampling_params,
             lora=lora,
             model_params=model_params,
+            latent_edit=latent_edit,
         )
         return (output,)
 
@@ -952,3 +956,43 @@ class VLLMOmniVideoReferences:
         if video_2 is not None:
             refs["video_2"] = video_2
         return (refs,)
+
+
+class VLLMOmniLatentMaskEditing:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "source_video": ("VIDEO",),
+                "source_audio": ("AUDIO",),
+                "video_mask": ("MASK",),
+                "audio_mask": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT_MASK_EDITING",)
+    RETURN_NAMES = ("latent_edit",)
+    FUNCTION = "get_latent_edit"
+    CATEGORY = "vLLM-Omni"
+
+    def get_latent_edit(
+        self,
+        source_video: VideoInput | None = None,
+        source_audio: AudioInput | None = None,
+        video_mask: torch.Tensor | None = None,
+        audio_mask: float = -1.0,
+        **kwargs,
+    ):
+        if kwargs:
+            logger.info("Uncaught kwargs: %s", kwargs)
+        edit = LatentMaskEditing()
+        if source_video is not None:
+            edit["source_video"] = source_video
+        if source_audio is not None:
+            edit["source_audio"] = source_audio
+        if video_mask is not None:
+            edit["video_mask"] = video_mask
+        if audio_mask >= 0.0:
+            edit["audio_mask"] = audio_mask
+        return (edit,)
