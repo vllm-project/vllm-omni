@@ -51,6 +51,7 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
     resolve_stage_async_chunk,
+    validate_stage_async_chunk_edges,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -1966,6 +1967,7 @@ class VllmOmniConfig:
         if len(pipeline_cfg.stages) <= 1:
             deploy.async_chunk = False
         _validate_async_chunk_support(pipeline_cfg, deploy)
+        validate_stage_async_chunk_edges(pipeline_cfg, deploy)
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
         model = cli_overrides.get("model")
 

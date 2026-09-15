@@ -888,6 +888,24 @@ def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | N
     return bool(deploy.async_chunk and (stage is None or stage.async_chunk is not False))
 
 
+def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
+    stages = {stage.stage_id: stage for stage in pipeline.stages}
+    deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+    for consumer in pipeline.stages:
+        for source_id in consumer.input_sources:
+            producer = stages[source_id]
+            if not producer.async_chunk_process_next_stage_input_func:
+                continue
+            producer_async = resolve_stage_async_chunk(deploy, deploy_by_id.get(source_id))
+            consumer_async = resolve_stage_async_chunk(deploy, deploy_by_id.get(consumer.stage_id))
+            if producer_async != consumer_async:
+                raise ValueError(
+                    f"Pipeline {pipeline.model_type!r} has incompatible async_chunk settings on "
+                    f"connector edge {source_id} -> {consumer.stage_id}. "
+                    "Set the same async_chunk mode on both stages or disable pipeline-wide async_chunk."
+                )
+
+
 def _select_processor_funcs(
     ps: StagePipelineConfig,
     async_chunk: bool,
@@ -1058,6 +1076,7 @@ def merge_pipeline_deploy(
             "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
         )
 
+    validate_stage_async_chunk_edges(pipeline, deploy)
     result: list[StageConfig] = []
     for ps in pipeline.stages:
         ds = deploy_by_id.get(ps.stage_id)
