@@ -114,8 +114,7 @@ class ISTFT(nn.Module):
             raise ValueError(f"Expected spec rank-3 [Batch, Freq, Time], got {tuple(spec.shape)}")
         _, _, T = spec.shape
 
-        # Inverse FFT
-        ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+        ifft = torch.fft.irfft(spec.to(torch.complex64), self.n_fft, dim=1, norm="backward")
         ifft = ifft * self.window[None, :, None]
 
         # Overlap and Add
@@ -219,7 +218,7 @@ class ISTFTHead(FourierHead):
         # phase = torch.atan2(y, x)
         # S = mag * torch.exp(phase * 1j)
         # better directly produce the complex value
-        S = mag * (x + 1j * y)
+        S = mag.float() * (x.float() + 1j * y.float())
         audio, audio_buffer, window_buffer = self.istft(
             S, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
         )
