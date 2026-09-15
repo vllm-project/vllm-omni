@@ -50,6 +50,50 @@ def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
     assert "--stage-init-timeout" in message
 
 
+@pytest.mark.parametrize(
+    ("connector_name", "expected_bootstrap_addr"),
+    [
+        ("MooncakeConnector", "http://10.0.0.8:25301"),
+        ("NixlConnector", "http://10.0.0.8:25301"),
+    ],
+)
+def test_detect_pd_config_returns_connector_metadata(monkeypatch, connector_name, expected_bootstrap_addr):
+    monkeypatch.setattr(async_omni_engine_module.vllm_envs, "VLLM_MOONCAKE_BOOTSTRAP_PORT", 25301)
+    engine = object.__new__(AsyncOmniEngine)
+    kv_cfg = types.SimpleNamespace(
+        kv_connector=connector_name,
+        kv_ip="10.0.0.8",
+    )
+    engine.stage_configs = [
+        types.SimpleNamespace(
+            stage_id=0,
+            is_prefill_only=True,
+            engine_input_source=[],
+            engine_args=types.SimpleNamespace(kv_transfer_config=kv_cfg),
+        ),
+        types.SimpleNamespace(
+            stage_id=1,
+            is_decode_only=True,
+            engine_input_source=[0],
+            engine_args=types.SimpleNamespace(),
+        ),
+    ]
+    engine.stage_clients = [
+        types.SimpleNamespace(
+            vllm_config=types.SimpleNamespace(
+                kv_transfer_config=types.SimpleNamespace(engine_id="prefill-engine"),
+            )
+        )
+    ]
+
+    assert engine._detect_pd_config() == {
+        "pd_pair": (0, 1),
+        "connector_name": connector_name,
+        "bootstrap_addr": expected_bootstrap_addr,
+        "prefill_engine_id": "prefill-engine",
+    }
+
+
 def _make_llm_metadata(
     stage_id: int,
     *,
