@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
+
 import pytest
 
 from tests.helpers import gpu_telemetry as gt
@@ -17,6 +19,18 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # index, sm, sm_max, mem, power, temp, util, throttle
 _ROW = "0, 1980, 1980, 2619, 412.50, 61, 96, 0x0000000000000000"
+
+
+def _sample_once_then_set(event: threading.Event, n: int):
+    """Wrap the real _sample_once so `event` fires once `n` samples are recorded."""
+    real = GpuTelemetrySampler._sample_once
+
+    def wrapped(self):
+        real(self)
+        if len(self._samples) >= n:
+            event.set()
+
+    return wrapped
 
 
 def test_parse_sample_line_with_throttle():
@@ -117,6 +131,7 @@ def test_sampler_falls_back_to_legacy_throttle_field(monkeypatch):
     monkeypatch.delenv(gt.ENV_INTERVAL, raising=False)
     monkeypatch.setattr(gt.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
     seen = []
+    sampled = threading.Event()
 
     def fake_query(self, fields):
         seen.append(fields)
@@ -127,8 +142,10 @@ def test_sampler_falls_back_to_legacy_throttle_field(monkeypatch):
         return "0, 1980, 1980, 2619, 412.50, 61, 96\n"
 
     monkeypatch.setattr(GpuTelemetrySampler, "_run_query", fake_query)
+    monkeypatch.setattr(GpuTelemetrySampler, "_sample_once", _sample_once_then_set(sampled, 1))
     t = GpuTelemetrySampler(interval_s=0.01)
     t.start()
+    assert sampled.wait(timeout=5.0), "sampler thread never recorded a sample"
     t.stop()
     assert t._throttle_field == "clocks_throttle_reasons.active"
     s = t.summary()
@@ -147,12 +164,12 @@ def test_sampler_collects_samples_from_fake_nvidia_smi(monkeypatch):
         ]
     )
     last = "0, 1620, 1980, 2619, 700, 78, 94, 0x0000000000000004\n"
+    got_three = threading.Event()
     monkeypatch.setattr(GpuTelemetrySampler, "_run_query", lambda self, fields: next(rows, last))
+    monkeypatch.setattr(GpuTelemetrySampler, "_sample_once", _sample_once_then_set(got_three, 3))
 
     with GpuTelemetrySampler(interval_s=0.005) as t:
-        import time
-
-        time.sleep(0.1)
+        assert got_three.wait(timeout=5.0), "sampler thread never reached three samples"
     s = t.summary()
     assert s["available"] is True and s["interval_s"] == 0.005
     g = s["gpus"]["0"]
