@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Multimodal output data structures for vLLM-Omni.
 
 This module defines structured types for multimodal outputs.
@@ -113,7 +115,7 @@ class MultimodalPayload(Mapping):
             return self.tensors[key]
         return self.metadata.get(key, default)
 
-    def __contains__(self, key: str) -> bool:
+    def __contains__(self, key: object) -> bool:
         return key in self.tensors or key in self.metadata
 
     def __getitem__(self, key: str) -> Any:
@@ -145,15 +147,24 @@ class MultimodalPayload(Mapping):
     def merged_with(self, incoming: MultimodalPayload) -> MultimodalPayload:
         """Merge *incoming* onto this payload and return the result.
 
-        Tensor values accumulate into lists for deferred concatenation;
-        non-tensor values are replaced with the latest. When this payload
+        Content tensors accumulate into lists for deferred concatenation;
+        known sample-rate keys are snapshots replaced immediately, including
+        in DELTA streams that do not consolidate each emission. Missing keys
+        retain their previous value. Other values keep the existing merge
+        behavior. When this payload
         is empty, *incoming* is returned as-is, so callers should use the
         return value: ``accumulated = accumulated.merged_with(incoming)``.
         """
         if self.is_empty:
             return incoming
+        # Capture before merging: incoming may be this payload. Store these
+        # snapshots in only one partition even if their representation changes.
+        snapshots = {key: incoming[key] for key in _METADATA_TENSOR_KEYS if key in incoming}
         _append_entries(self.tensors, incoming.tensors)
         _append_entries(self.metadata, incoming.metadata)
+        for key, value in snapshots.items():
+            self.tensors.pop(key, None)
+            self.metadata[key] = value
         return self
 
     def consolidate_tensors(self, strategy: TensorAccumulationStrategy) -> None:

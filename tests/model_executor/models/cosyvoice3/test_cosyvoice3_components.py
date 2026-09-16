@@ -110,6 +110,75 @@ def test_noncausal_hift_inference_runs_with_real_sinegen(sampling_rate):
     assert torch.isfinite(speech).all()
 
 
+def test_causal_hift_routes_npu_transforms_to_cpu_fallback(causal_hift, monkeypatch):
+    class NpuTensor:
+        device = SimpleNamespace(type="npu")
+
+    tensor = NpuTensor()
+    stft_calls = []
+    istft_calls = []
+
+    def fake_stft(value):
+        stft_calls.append(value)
+        return ("real", "imag")
+
+    def fake_istft(magnitude, phase):
+        istft_calls.append((magnitude, phase))
+        return "waveform"
+
+    monkeypatch.setattr(causal_hift, "_stft_on_cpu", fake_stft)
+    monkeypatch.setattr(causal_hift, "_istft_on_cpu", fake_istft)
+
+    assert causal_hift._stft(tensor) == ("real", "imag")
+    assert causal_hift._istft(tensor, tensor) == "waveform"
+    assert stft_calls == [tensor]
+    assert istft_calls == [(tensor, tensor)]
+
+
+def test_causal_hift_stft_cpu_fallback_uses_float32(causal_hift, monkeypatch):
+    original_stft = torch.stft
+
+    def assert_cpu_float32_stft(input, *args, window, **kwargs):
+        assert input.device.type == "cpu"
+        assert input.dtype == torch.float32
+        assert window.device.type == "cpu"
+        assert window.dtype == torch.float32
+        return original_stft(input, *args, window=window, **kwargs)
+
+    monkeypatch.setattr(torch, "stft", assert_cpu_float32_stft)
+
+    waveform = torch.randn(1, 64, dtype=torch.float64)
+    real, imag = causal_hift._stft_on_cpu(waveform)
+
+    assert real.device == waveform.device
+    assert imag.device == waveform.device
+    assert real.dtype == waveform.dtype
+    assert imag.dtype == waveform.dtype
+
+
+def test_causal_hift_istft_cpu_fallback_uses_float32(causal_hift, monkeypatch):
+    original_istft = torch.istft
+
+    def assert_cpu_complex64_istft(input, *args, window, **kwargs):
+        assert input.device.type == "cpu"
+        assert input.dtype == torch.complex64
+        assert window.device.type == "cpu"
+        assert window.dtype == torch.float32
+        return original_istft(input, *args, window=window, **kwargs)
+
+    monkeypatch.setattr(torch, "istft", assert_cpu_complex64_istft)
+
+    waveform = torch.randn(1, 64, dtype=torch.float32)
+    spec = torch.stft(waveform, 16, 4, 16, window=causal_hift.stft_window, return_complex=True)
+    magnitude = torch.abs(spec).to(torch.float64)
+    phase = torch.angle(spec).to(torch.float64)
+    reconstructed = causal_hift._istft_on_cpu(magnitude, phase)
+
+    assert reconstructed.device == magnitude.device
+    assert reconstructed.dtype == magnitude.dtype
+    torch.testing.assert_close(reconstructed, waveform.to(torch.float64), rtol=1e-5, atol=1e-5)
+
+
 class TestPreLookaheadLayer:
     """Tests for PreLookaheadLayer."""
 
