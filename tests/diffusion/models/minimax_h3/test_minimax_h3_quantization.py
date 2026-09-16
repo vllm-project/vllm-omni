@@ -641,6 +641,42 @@ def test_comfy_checkpoint_rejects_missing_or_ambiguous_partition_token(tmp_path,
         inspect_comfy_checkpoint(checkpoint)
 
 
+@pytest.mark.parametrize("partition,prefix", [("fl2va", "FL2VA"), ("ref2va", "Ref2VA")])
+@pytest.mark.parametrize("load_text_encoder", [False, True])
+def test_convrot_override_download_patterns(partition, prefix, load_text_encoder, mocker, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline
+
+    download = mocker.patch.object(pipeline, "download_weights_from_hf_specific", return_value=str(tmp_path))
+
+    result = pipeline._resolve_minimax_h3_model_root(
+        "MiniMaxAI/MiniMax-H3",
+        "test-revision",
+        partition,
+        load_text_encoder=load_text_encoder,
+        skip_transformer=True,
+    )
+
+    patterns = download.call_args.kwargs["allow_patterns"]
+    expected = {
+        f"{prefix}/model_index.json",
+        f"{prefix}/transformer/config.json",
+        f"{prefix}/video_vae/**",
+        f"{prefix}/audio_vae/**",
+    }
+    if load_text_encoder:
+        expected.update({f"{prefix}/tokenizer/**", f"{prefix}/processor/**", f"{prefix}/text_encoder/**"})
+    assert set(patterns) == expected
+    assert len(patterns) == len(expected)
+    assert result == tmp_path
+    download.assert_called_once_with(
+        model_name_or_path="MiniMaxAI/MiniMax-H3",
+        cache_dir=None,
+        allow_patterns=patterns,
+        revision="test-revision",
+        require_all=True,
+    )
+
+
 def test_comfy_checkpoint_rejects_wrong_serving_partition(tmp_path):
     from vllm_omni.diffusion.models.minimax_h3.comfy_checkpoint import inspect_comfy_checkpoint
 

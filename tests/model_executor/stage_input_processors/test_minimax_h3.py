@@ -466,7 +466,8 @@ def test_diffusion_resolver_normalizes_partial_partition_directory(tmp_path):
     assert resolve_minimax_h3_diffusion_model_path(str(ref2va), None, "ref2va") == str(ref2va)
 
 
-def test_diffusion_resolver_skips_native_transformer_for_override(monkeypatch, tmp_path):
+@pytest.mark.parametrize("partition,prefix", [("fl2va", "FL2VA"), ("ref2va", "Ref2VA")])
+def test_diffusion_resolver_skips_native_transformer_for_override(partition, prefix, monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
 
     calls = []
@@ -480,15 +481,20 @@ def test_diffusion_resolver_skips_native_transformer_for_override(monkeypatch, t
     resolved = resolve_minimax_h3_diffusion_model_path(
         "MiniMaxAI/MiniMax-H3",
         None,
-        "fl2va",
+        partition,
         model_paths={"transformer": "/models/convrot.safetensors"},
     )
 
-    assert resolved == str(tmp_path / "FL2VA")
+    assert resolved == str(tmp_path / prefix)
     assert len(calls) == 1
-    assert calls[0]["allow_patterns"] == pipeline_module.MINIMAX_H3_OVERRIDE_DOWNLOAD_PATTERNS["fl2va"]["diffusion"]
+    assert calls[0]["allow_patterns"] == [
+        f"{prefix}/model_index.json",
+        f"{prefix}/transformer/config.json",
+        f"{prefix}/video_vae/**",
+        f"{prefix}/audio_vae/**",
+    ]
     transformer_patterns = [pattern for pattern in calls[0]["allow_patterns"] if "transformer" in pattern]
-    assert transformer_patterns == ["FL2VA/transformer/config.json"]
+    assert transformer_patterns == [f"{prefix}/transformer/config.json"]
 
 
 def test_diffusion_resolver_rejects_convrot_hsdp_before_download(monkeypatch):

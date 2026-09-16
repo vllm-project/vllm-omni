@@ -224,42 +224,6 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
         "Ref2VA/transformer/**",
     ],
 }
-MINIMAX_H3_OVERRIDE_DOWNLOAD_PATTERNS = {
-    "fl2va": {
-        "diffusion": [
-            "FL2VA/model_index.json",
-            "FL2VA/transformer/config.json",
-            "FL2VA/video_vae/**",
-            "FL2VA/audio_vae/**",
-        ],
-        "all": [
-            "FL2VA/model_index.json",
-            "FL2VA/tokenizer/**",
-            "FL2VA/processor/**",
-            "FL2VA/text_encoder/**",
-            "FL2VA/transformer/config.json",
-            "FL2VA/video_vae/**",
-            "FL2VA/audio_vae/**",
-        ],
-    },
-    "ref2va": {
-        "diffusion": [
-            "Ref2VA/model_index.json",
-            "Ref2VA/transformer/config.json",
-            "Ref2VA/video_vae/**",
-            "Ref2VA/audio_vae/**",
-        ],
-        "all": [
-            "Ref2VA/model_index.json",
-            "Ref2VA/tokenizer/**",
-            "Ref2VA/processor/**",
-            "Ref2VA/text_encoder/**",
-            "Ref2VA/transformer/config.json",
-            "Ref2VA/video_vae/**",
-            "Ref2VA/audio_vae/**",
-        ],
-    },
-}
 
 
 def _validate_int8_convrot_override_pair(
@@ -308,8 +272,12 @@ def _resolve_minimax_h3_model_root(
     if skip_transformer:
         if partition == "combined":
             raise ValueError("A MiniMax-H3 transformer override does not support combined mode.")
-        scope = "all" if load_text_encoder else "diffusion"
-        allow_patterns = MINIMAX_H3_OVERRIDE_DOWNLOAD_PATTERNS[partition][scope]
+        prefix = {"fl2va": "FL2VA", "ref2va": "Ref2VA"}[partition]
+        components = ["model_index.json"]
+        if load_text_encoder:
+            components.extend(["tokenizer/**", "processor/**", "text_encoder/**"])
+        components.extend(["transformer/config.json", "video_vae/**", "audio_vae/**"])
+        allow_patterns = [f"{prefix}/{component}" for component in components]
     elif load_text_encoder:
         allow_patterns = (
             MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
