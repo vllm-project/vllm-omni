@@ -50,7 +50,7 @@ MODEL_PATH = os.environ.get("MAMMOTH_MODA2_MODEL", "bytedance-research/MammothMo
 # Serialized INT8 W8A8 checkpoint (compressed-tensors). Override via env for CI
 # or hub ids; the default points at the locally produced llm-compressor
 # checkpoint.
-INT8_MODEL_PATH = os.environ.get("MAMMOTH_MODA2_INT8_MODEL", "/root/autodl-fs/MammothModa2-Dev-W8A8")
+INT8_MODEL_PATH = os.environ.get("MAMMOTH_MODA2_INT8_MODEL", "wenjyanasd/MammothModa2-Dev-W8A8")
 # The checkpoint's ``config.json`` declares ``quant_method: compressed-tensors``;
 # setting the same stage key makes the A/B arm explicit and deterministic
 # instead of relying on auto-detection.
@@ -70,6 +70,12 @@ _CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 # NOTE: provisional — will be finalized from the value measured on the target
 # GPU.
 MIN_LOGPROB_COSINE = 0.90
+
+# Minimum number of aligned greedy steps required before the logprob gate can
+# be scored (cosine needs at least two points). A shorter shared prefix means
+# the two arms diverge almost immediately, which must fail rather than fall
+# back to NaN and silently skip the gate.
+MIN_SHARED_PREFIX = 2
 
 # Decoded-image A/B thresholds (same seed + greedy AR + deterministic DiT).
 MIN_IMAGE_COSINE = 0.98
@@ -186,15 +192,24 @@ def test_bf16_vs_int8_generation_consistency():
     # Compare top-1 logprobs only while both runs stay on the same decoding
     # path. After the first greedy-token divergence each model continues from a
     # different context, so later logprobs are uncorrelated and would dominate
-    # (and deflate) the cosine. Positional drift is reported via token_agree /
-    # agree_prefix but is not gated (see the MIN_LOGPROB_COSINE comment).
+    # (and deflate) the cosine. Drift beyond the shared prefix is reported but
+    # not scored; a shared prefix shorter than MIN_SHARED_PREFIX is gated.
     agree_prefix = next(
         (i for i, (a, b) in enumerate(zip(bf16_ids[:common], int8_ids[:common])) if a != b),
         common,
     )
     lp_len = min(agree_prefix, len(bf16_lp), len(int8_lp))
-    logprob_cos = _cosine_sim(bf16_lp[:lp_len], int8_lp[:lp_len]) if lp_len > 1 else float("nan")
-    logprob_mae = _mean_abs_diff(bf16_lp[:lp_len], int8_lp[:lp_len]) if lp_len > 0 else float("nan")
+
+    # Diverging within the first step or two is the strongest possible failure
+    # signal, so it must fail here instead of degrading the metrics to NaN and
+    # turning the gate below into a no-op.
+    assert lp_len >= MIN_SHARED_PREFIX, (
+        f"BF16/INT8 agree on only {lp_len} step(s) before diverging "
+        f"(agree_prefix={agree_prefix}/{common}); cannot score logprobs"
+    )
+
+    logprob_cos = _cosine_sim(bf16_lp[:lp_len], int8_lp[:lp_len])
+    logprob_mae = _mean_abs_diff(bf16_lp[:lp_len], int8_lp[:lp_len])
 
     print(
         f"[INT8 A/B] token_agreement={token_agree:.4f} "
@@ -203,10 +218,11 @@ def test_bf16_vs_int8_generation_consistency():
         f"logprob_mae={logprob_mae:.4f}"
     )
 
-    if logprob_cos == logprob_cos:  # not NaN
-        assert logprob_cos >= MIN_LOGPROB_COSINE, (
-            f"BF16/INT8 logprob sequences diverge too much: cosine={logprob_cos:.4f} < {MIN_LOGPROB_COSINE}"
-        )
+    # NaN (unscorable logprobs) fails the comparison below rather than skipping
+    # the gate, so a broken run cannot pass by returning non-finite metrics.
+    assert logprob_cos >= MIN_LOGPROB_COSINE, (
+        f"BF16/INT8 logprob sequences diverge too much: cosine={logprob_cos:.4f} < {MIN_LOGPROB_COSINE}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,29 +245,34 @@ _VISION_START_TOKEN_ID = 151652
 _VISION_END_TOKEN_ID = 151653
 
 
+_T2I_GEN_CONFIG_FILE = "t2i_generation_config.json"
+
+
 def _load_t2i_gen_config(model: str) -> dict:
     """Load ``t2i_generation_config.json`` from a local dir or hub id.
 
     The t2i generation constants are model-family level, not weight level, and
     the serialized W8A8 checkpoint directory may omit this file, so fall back to
-    the BF16 baseline checkpoint.
+    the BF16 baseline checkpoint. Only the single config file is fetched from the
+    Hub (``hf_hub_download``), never a whole snapshot: the runner loads the
+    weights itself, so a ``snapshot_download`` here would pull a second copy of
+    a multi-GB checkpoint just to read a few constants.
     """
     import json
     from pathlib import Path
 
     for candidate in (model, MODEL_PATH):
-        local = Path(candidate) / "t2i_generation_config.json"
+        local = Path(candidate) / _T2I_GEN_CONFIG_FILE
         if local.exists():
             return json.loads(local.read_text(encoding="utf-8"))
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     for candidate in (model, MODEL_PATH):
         try:
-            weights_dir = Path(snapshot_download(candidate))
+            cfg_path = Path(hf_api().hf_hub_download(repo_id=candidate, filename=_T2I_GEN_CONFIG_FILE))
         except Exception:
             continue
-        cfg_path = weights_dir / "t2i_generation_config.json"
         if cfg_path.exists():
             return json.loads(cfg_path.read_text(encoding="utf-8"))
 
