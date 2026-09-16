@@ -52,6 +52,46 @@ def cpu_layers(monkeypatch):
         yield
 
 
+@pytest.fixture
+def control_startup(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    path = tmp_path / "control.safetensors"
+    path.touch()
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    config = SimpleNamespace(
+        model="/unused/FL2VA",
+        task_type="fl2va",
+        model_loaded={"text_encoder": True},
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
+        controlnet_model_path=str(path),
+        diffusion_offload_config=None,
+        revision=None,
+    )
+    return pipeline_module, config
+
+
+def write_ffv1(path, frames, *, rate=24, frame_pts=None):
+    from fractions import Fraction
+
+    import av
+
+    gray = frames[0].ndim == 2
+    with av.open(str(path), "w") as output:
+        stream = output.add_stream("ffv1", rate=rate)
+        stream.height, stream.width = frames[0].shape[:2]
+        stream.pix_fmt = "gray" if gray else "bgr0"
+        for i, pixels in enumerate(frames):
+            frame = av.VideoFrame.from_ndarray(pixels, format="gray" if gray else "rgb24")
+            if frame_pts is not None:
+                frame.time_base = Fraction(1, rate)
+                frame.pts = frame_pts[i]
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+
+
 def tiny_arch():
     return blocks.MiniMaxH3DiTArchConfig(
         num_layers=2,
@@ -124,7 +164,7 @@ def test_original_loader_qkv_and_swiglu_order(cpu_layers):
             model.load_weights(subset)
     malformed = dict(weights)
     malformed["control_blocks.0.adaln_proj.linear.weight"] = torch.zeros(8, 4)
-    with pytest.raises((ValueError, AssertionError, RuntimeError)):
+    with pytest.raises(ValueError, match="shape"):
         model.load_weights(malformed.items())
 
 
@@ -235,6 +275,7 @@ def test_canvas_mask_channel_order_and_zero_control():
     assert rows.shape == (2, 196)
     assert torch.all(rows[:, :96] == 0.25)
     assert rows[:, 96:100].tolist() == [[1, 0, 1, 0], [1, 0, 1, 0]]
+    assert rows[:, 100:].tolist() == [[0.75, 0, 0.75, 0] * 24] * 2
     assert torch.equal(seen[-1][0, 0, 0], torch.tensor([[0.75, 0], [0.75, 0]]))
     no_mask = build_control_rows(control, None, None, **kwargs)
     assert no_mask[:, 96:].count_nonzero() == 0
@@ -263,7 +304,7 @@ def test_control_mode_errors_and_no_control():
     for extra in (
         {"canny": {"source_path": "x"}},
         {"canny": {"mask_path": "x"}},
-        {"inpaint": {"source_path": "x"}},
+        {"inpaint": {"control_path": "x"}},
         {"inpaint": {"mask_path": "x", "unknown": 1}},
         {"canny": {"control_path": "x"}, "depth": {"control_path": "x"}},
     ):
@@ -272,20 +313,10 @@ def test_control_mode_errors_and_no_control():
 
 
 def test_lossless_temporal_mask_sampling(tmp_path):
-    import av
     import numpy as np
 
     path = tmp_path / "mask.mkv"
-    with av.open(str(path), "w") as output:
-        stream = output.add_stream("ffv1", rate=12)
-        stream.width = stream.height = 8
-        stream.pix_fmt = "gray"
-        for i in range(2):
-            frame = av.VideoFrame.from_ndarray(np.full((8, 8), 255 * i, dtype=np.uint8), format="gray")
-            for packet in stream.encode(frame):
-                output.mux(packet)
-        for packet in stream.encode():
-            output.mux(packet)
+    write_ffv1(path, [np.full((8, 8), 255 * i, dtype=np.uint8) for i in range(2)], rate=12)
     pixels = load_control_pixels(str(path), height=8, width=8, num_frames=5, mask=True)
     assert pixels[0, 0, :, 0, 0].tolist() == [0, 0, 1, 1, 1]
 
@@ -346,22 +377,22 @@ def test_transformer_baseline_zero_strength_and_request_isolation(cpu_layers):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-def test_original_loader_shards_tp2_without_truncating_invalid_weights(cpu_layers, rank):
+def test_original_loader_shards_tp2_without_truncating_invalid_weights(cpu_layers):
     arch = tiny_arch()
     weights = original_weights(arch)
-    with ExitStack() as stack:
-        for module in ("vllm.model_executor.layers.linear", "vllm.model_executor.parameter"):
-            stack.enter_context(patch(module + ".get_tensor_model_parallel_world_size", return_value=2))
-            stack.enter_context(patch(module + ".get_tensor_model_parallel_rank", return_value=rank))
-        model = MiniMaxH3ControlNet(arch, (0, 1))
-        model.load_weights(weights.items())
-    qkv = torch.cat([weights[f"control_blocks.0.attn.to_{part}.weight"].chunk(2)[rank] for part in "qkv"])
-    assert torch.equal(model.control_blocks[0].attn.qkv_proj.weight, qkv)
-    up, gate = weights["control_blocks.0.ff.net.0.proj.weight"].chunk(2)
-    assert torch.equal(model.control_blocks[0].mlp.fc1.weight, torch.cat((gate.chunk(2)[rank], up.chunk(2)[rank])))
-    out = weights["control_blocks.0.attn.to_out.0.weight"].chunk(2, dim=1)[rank]
-    assert torch.equal(model.control_blocks[0].attn.out_proj.weight, out)
+    for rank in (0, 1):
+        with ExitStack() as stack:
+            for module in ("vllm.model_executor.layers.linear", "vllm.model_executor.parameter"):
+                stack.enter_context(patch(module + ".get_tensor_model_parallel_world_size", return_value=2))
+                stack.enter_context(patch(module + ".get_tensor_model_parallel_rank", return_value=rank))
+            model = MiniMaxH3ControlNet(arch, (0, 1))
+            model.load_weights(weights.items())
+        qkv = torch.cat([weights[f"control_blocks.0.attn.to_{part}.weight"].chunk(2)[rank] for part in "qkv"])
+        assert torch.equal(model.control_blocks[0].attn.qkv_proj.weight, qkv)
+        up, gate = weights["control_blocks.0.ff.net.0.proj.weight"].chunk(2)
+        assert torch.equal(model.control_blocks[0].mlp.fc1.weight, torch.cat((gate.chunk(2)[rank], up.chunk(2)[rank])))
+        out = weights["control_blocks.0.attn.to_out.0.weight"].chunk(2, dim=1)[rank]
+        assert torch.equal(model.control_blocks[0].attn.out_proj.weight, out)
     invalid = dict(weights)
     invalid["control_blocks.0.attn.to_q.weight"] = torch.zeros(32, 8)
     with pytest.raises(ValueError, match="shape"):
@@ -403,60 +434,27 @@ def test_vae_control_uses_normalized_posterior_mode():
         {"enable_cpu_offload": True},
     ],
 )
-def test_startup_rejects_public_and_legacy_offload(tmp_path, monkeypatch, offload):
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
-
-    path = tmp_path / "control.safetensors"
-    path.touch()
-    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
-    config = SimpleNamespace(
-        model="/unused/FL2VA",
-        task_type="fl2va",
-        model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
-        controlnet_model_path=str(path),
-        **offload,
-    )
+def test_startup_rejects_public_and_legacy_offload(control_startup, offload):
+    pipeline_module, config = control_startup
+    vars(config).update(offload)
     with pytest.raises(ValueError, match="no cache/offload"):
         pipeline_module.MiniMaxH3Pipeline(od_config=config)
 
 
 @pytest.mark.parametrize("partition", ["combined", "ref2va"])
-def test_control_rejects_secondary_or_ref2va_partition_before_loading(tmp_path, monkeypatch, partition):
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
-
-    path = tmp_path / "control.safetensors"
-    path.touch()
-    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+def test_control_rejects_secondary_or_ref2va_partition_before_loading(control_startup, monkeypatch, partition):
+    pipeline_module, config = control_startup
     monkeypatch.setattr(pipeline_module, "_minimax_h3_partition_for_task", lambda *args: partition)
-    config = SimpleNamespace(
-        model="/unused/MiniMax-H3",
-        task_type="auto",
-        model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
-        controlnet_model_path=str(path),
-    )
+    config.model = "/unused/MiniMax-H3"
+    config.task_type = "auto"
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
         with pytest.raises(ValueError, match="FL2VA checkpoint partition"):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)
         resolve_root.assert_not_called()
 
 
-def test_startup_accepts_resident_default_policy(tmp_path, monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
-
-    path = tmp_path / "control.safetensors"
-    path.touch()
-    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
-    config = SimpleNamespace(
-        model="/unused/FL2VA",
-        task_type="fl2va",
-        model_loaded={"text_encoder": True},
-        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1),
-        controlnet_model_path=str(path),
-        diffusion_offload_config=None,
-        revision=None,
-    )
+def test_startup_accepts_resident_default_policy(control_startup):
+    pipeline_module, config = control_startup
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root", side_effect=RuntimeError("guard accepted")):
         with pytest.raises(RuntimeError, match="guard accepted"):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)
@@ -476,8 +474,9 @@ def test_existing_turbo_targets_cannot_bind_control_branch(cpu_layers, native):
         full_name = f"transformer.controlnet.{name}"
         assert re.search(pattern, full_name) is None
         # The manager expands fused QKV names before matching too.
-        for part in "qkv":
-            assert re.search(pattern, full_name.replace("qkv_proj", f"to_{part}")) is None
+        if name.endswith("qkv_proj"):
+            for part in "qkv":
+                assert re.search(pattern, full_name.replace("qkv_proj", f"to_{part}")) is None
 
 
 @pytest.mark.parametrize(
@@ -494,18 +493,7 @@ def test_millisecond_container_timestamps_preserve_24fps_and_vfr_hold(tmp_path, 
     import numpy as np
 
     path = tmp_path / "quantized-timestamps.mkv"
-    with av.open(str(path), "w") as output:
-        stream = output.add_stream("ffv1", rate=24)
-        stream.width = stream.height = 8
-        stream.pix_fmt = "gray"
-        for i, pts in enumerate(frame_pts):
-            frame = av.VideoFrame.from_ndarray(np.full((8, 8), 40 * i, dtype=np.uint8), format="gray")
-            frame.time_base = Fraction(1, 24)
-            frame.pts = pts
-            for packet in stream.encode(frame):
-                output.mux(packet)
-        for packet in stream.encode():
-            output.mux(packet)
+    write_ffv1(path, [np.full((8, 8), 40 * i, dtype=np.uint8) for i in range(len(frame_pts))], frame_pts=frame_pts)
     with av.open(str(path)) as source:
         assert source.streams.video[0].time_base == Fraction(1, 1000)
     pixels = load_control_pixels(str(path), height=8, width=8, num_frames=7)
@@ -515,21 +503,12 @@ def test_millisecond_container_timestamps_preserve_24fps_and_vfr_hold(tmp_path, 
 
 
 def test_control_decode_resizes_each_frame_before_accumulation(tmp_path, monkeypatch):
-    import av
     import numpy as np
 
     path = tmp_path / "control.mkv"
     y, x = np.indices((48, 64))
     originals = [np.stack(((x * 3 + i * 11) % 256, y * 5, (x + y) * 2), axis=-1).astype(np.uint8) for i in range(3)]
-    with av.open(str(path), "w") as output:
-        stream = output.add_stream("ffv1", rate=24)
-        stream.width, stream.height = 64, 48
-        stream.pix_fmt = "bgr0"
-        for pixels in originals:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(pixels, format="rgb24")):
-                output.mux(packet)
-        for packet in stream.encode():
-            output.mux(packet)
+    write_ffv1(path, originals)
     expected = F.interpolate(
         torch.from_numpy(np.stack(originals)).permute(0, 3, 1, 2).float() / 255,
         (6, 8),
@@ -563,7 +542,6 @@ def test_control_decode_resizes_each_frame_before_accumulation(tmp_path, monkeyp
 
 @pytest.mark.parametrize("static", [True, False], ids=["static-mask", "temporal-mask"])
 def test_control_mask_threshold_resize_threshold_boundary(tmp_path, static):
-    import av
     import numpy as np
     from PIL import Image
 
@@ -572,15 +550,7 @@ def test_control_mask_threshold_resize_threshold_boundary(tmp_path, static):
     if static:
         Image.fromarray(pixels).save(path)
     else:
-        with av.open(str(path), "w") as output:
-            stream = output.add_stream("ffv1", rate=24)
-            stream.width = stream.height = 8
-            stream.pix_fmt = "gray"
-            for frame_pixels in (pixels, pixels[:, ::-1].copy()):
-                for packet in stream.encode(av.VideoFrame.from_ndarray(frame_pixels, format="gray")):
-                    output.mux(packet)
-            for packet in stream.encode():
-                output.mux(packet)
+        write_ffv1(path, [pixels, pixels[:, ::-1].copy()])
     actual = load_control_pixels(str(path), height=2, width=4, num_frames=4, mask=True)
     expected = torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]], dtype=torch.float32)
     if static:
@@ -596,21 +566,9 @@ def test_control_mask_threshold_resize_threshold_boundary(tmp_path, static):
 
 
 @pytest.mark.parametrize("degree", ["ulysses_degree", "ring_degree", "allgather_degree"])
-def test_control_rejects_sequence_parallel_before_weight_loading(tmp_path, monkeypatch, degree):
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
-
-    path = tmp_path / "control.safetensors"
-    path.touch()
-    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
-    parallel = SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1, ring_degree=1, allgather_degree=1)
-    setattr(parallel, degree, 2)
-    config = SimpleNamespace(
-        model="/unused/FL2VA",
-        task_type="fl2va",
-        model_loaded={"text_encoder": True},
-        parallel_config=parallel,
-        controlnet_model_path=str(path),
-    )
+def test_control_rejects_sequence_parallel_before_weight_loading(control_startup, degree):
+    pipeline_module, config = control_startup
+    setattr(config.parallel_config, degree, 2)
     with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
         with pytest.raises(ValueError, match="no cache/offload/SP"):
             pipeline_module.MiniMaxH3Pipeline(od_config=config)

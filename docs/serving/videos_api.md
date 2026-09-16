@@ -235,6 +235,7 @@ preprocessing workflows prepare those videos before uploading them.
 ```bash
 curl -s http://localhost:8091/v1/videos/sync \
   -F "prompt=A person walking through a garden" \
+  -F "aspect_ratio=16:9" \
   -F "control_type=canny" \
   -F "control_reference=@canny.mp4;type=video/mp4" \
   -F 'extra_params={"canny":{"control_context_scale":1.0}}' \
@@ -246,6 +247,7 @@ For inpainting, upload the source and mask using their explicit roles:
 ```bash
 curl -s http://localhost:8091/v1/videos/sync \
   -F "prompt=A red jacket on the person" \
+  -F "aspect_ratio=16:9" \
   -F "control_type=inpaint" \
   -F "source_reference=@source.mp4;type=video/mp4" \
   -F "mask_reference=@mask.png;type=image/png" \

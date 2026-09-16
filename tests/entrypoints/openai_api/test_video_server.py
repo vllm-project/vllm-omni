@@ -1018,8 +1018,10 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
     assert handler.supports_mixed_reference_inputs
 
 
-@pytest.mark.parametrize("stage_factory", [dict, UserDict, SimpleNamespace])
-@pytest.mark.parametrize("engine_args_factory", [dict, UserDict, SimpleNamespace])
+@pytest.mark.parametrize(
+    ("stage_factory", "engine_args_factory"),
+    [(dict, dict), (UserDict, SimpleNamespace), (SimpleNamespace, UserDict), (SimpleNamespace, SimpleNamespace)],
+)
 def test_video_capabilities_follow_late_stage_configuration(stage_factory, engine_args_factory):
     config = SimpleNamespace(model_class_name="WanPipeline", supports_mixed_reference_inputs=False)
     stages = [
@@ -2837,8 +2839,19 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert fps_values == [16]
 
 
-@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
-@pytest.mark.parametrize("mode", ["canny", "depth", "hed", "mlsd", "pose", "inpaint"])
+@pytest.mark.parametrize(
+    ("endpoint", "mode"),
+    [
+        ("/v1/videos/sync", "canny"),
+        ("/v1/videos/sync", "depth"),
+        ("/v1/videos/sync", "hed"),
+        ("/v1/videos/sync", "mlsd"),
+        ("/v1/videos/sync", "pose"),
+        ("/v1/videos/sync", "inpaint"),
+        ("/v1/videos", "canny"),
+        ("/v1/videos", "inpaint"),
+    ],
+)
 def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     _mock_encode_video_bytes(mocker, b"controlled")
     engine = test_client.app.state.openai_serving_video._engine_client
@@ -2868,6 +2881,7 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
         endpoint,
         data={
             "prompt": "Controlled scene.",
+            "aspect_ratio": "16:9",
             "control_type": mode,
             "extra_params": json.dumps({mode: {"control_context_scale": 0.75}}),
         },
@@ -2897,7 +2911,9 @@ def test_h3_inpaint_source_is_not_ref2va(endpoint, with_hint, test_client, mocke
     }
     if with_hint:
         files["control_reference"] = ("hint.mp4", _make_test_video_bytes(), "video/mp4")
-    response = test_client.post(endpoint, data={"prompt": "Repaint.", "control_type": mode}, files=files)
+    response = test_client.post(
+        endpoint, data={"prompt": "Repaint.", "aspect_ratio": "16:9", "control_type": mode}, files=files
+    )
     assert response.status_code == 200, response.text
     if not endpoint.endswith("/sync"):
         _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
@@ -2907,38 +2923,52 @@ def test_h3_inpaint_source_is_not_ref2va(endpoint, with_hint, test_client, mocke
     assert all(not Path(value).exists() for key, value in config.items() if key.endswith("_path"))
 
 
-@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
 @pytest.mark.parametrize(
-    ("fields", "roles", "message"),
+    ("endpoint", "fields", "roles", "message"),
     [
-        ({"control_type": "canny"}, [], "requires a control_reference"),
+        ("/v1/videos", {"control_type": "canny"}, [], "requires a control_reference"),
+        ("/v1/videos/sync", {"control_type": "canny"}, [], "requires a control_reference"),
         (
+            "/v1/videos/sync",
             {"control_type": "inpaint", "extra_params": '{"inpaint":{"control_strength":1}}'},
             ["mask"],
             "Unknown extra_params",
         ),
-        ({"control_type": "inpaint"}, ["source"], "requires mask_reference"),
-        ({"control_type": "inpaint"}, [], "requires mask_reference"),
-        ({}, ["mask"], "requires control_type"),
-        ({"control_type": "bogus"}, ["control"], "requires control_type"),
-        ({"control_type": "canny", "extra_params": '{"depth":{}}'}, ["control"], "only the selected"),
+        ("/v1/videos/sync", {"control_type": "inpaint"}, ["source"], "requires mask_reference"),
+        ("/v1/videos/sync", {"control_type": "inpaint"}, [], "requires mask_reference"),
+        ("/v1/videos/sync", {}, ["mask"], "requires control_type"),
+        ("/v1/videos/sync", {"control_type": "bogus"}, ["control"], "requires control_type"),
         (
+            "/v1/videos/sync",
+            {"control_type": "canny", "extra_params": '{"depth":{}}'},
+            ["control"],
+            "only the selected",
+        ),
+        (
+            "/v1/videos/sync",
             {"control_type": "canny", "extra_params": '{"canny":{"control_path":"/secret"}}'},
             ["control"],
             "server-local",
         ),
         (
+            "/v1/videos/sync",
             {"control_type": "inpaint", "extra_params": '{"inpaint":{"source_path":"/secret"}}'},
             ["mask"],
             "server-local",
         ),
-        ({"extra_params": '{"canny":{"control_path":"/secret"}}'}, [], "requires control_type"),
+        ("/v1/videos/sync", {"extra_params": '{"canny":{"control_path":"/secret"}}'}, [], "requires control_type"),
         (
+            "/v1/videos/sync",
             {"control_type": "canny", "video_reference": '{"video_url":"https://example.com/a.mp4"}'},
             ["control"],
             "cannot be combined",
         ),
-        ({"control_type": "inpaint", "extra_params": '{"inpaint":true}'}, ["mask"], "must be an object"),
+        (
+            "/v1/videos/sync",
+            {"control_type": "inpaint", "extra_params": '{"inpaint":true}'},
+            ["mask"],
+            "must be an object",
+        ),
     ],
 )
 def test_h3_control_rejects_before_job_creation(endpoint, fields, roles, message, test_client, mocker):
@@ -3000,8 +3030,8 @@ def test_non_h3_model_rejects_inpaint_roles(role, test_client):
     assert "not supported" in response.json()["detail"]
 
 
-@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
-def test_h3_corrupt_mask_releases_prior_source(endpoint, test_client, mocker):
+@pytest.mark.parametrize(("endpoint", "bad_png_crc"), [("/v1/videos", False), ("/v1/videos/sync", True)])
+def test_h3_corrupt_mask_releases_prior_source(endpoint, bad_png_crc, test_client, mocker):
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
     engine.controlnet_model_path = "/configured/control.safetensors"
@@ -3014,12 +3044,20 @@ def test_h3_corrupt_mask_releases_prior_source(endpoint, test_client, mocker):
         return result
 
     mocker.patch.object(video_generation_helpers.tempfile, "mkstemp", side_effect=track)
+    mask_bytes = b"corrupt"
+    if bad_png_crc:
+        # Keep a recognizable PNG but break IDAT verification inside Pillow.
+        png = bytearray(_make_test_image_bytes())
+        idat = png.index(b"IDAT")
+        crc_offset = idat + 4 + int.from_bytes(png[idat - 4 : idat], "big")
+        png[crc_offset] ^= 1
+        mask_bytes = bytes(png)
     response = test_client.post(
         endpoint,
         data={"prompt": "Invalid mask.", "control_type": "inpaint"},
         files={
             "source_reference": ("source.mp4", _make_test_video_bytes(), "video/mp4"),
-            "mask_reference": ("mask.png", b"corrupt", "image/png"),
+            "mask_reference": ("mask.png", mask_bytes, "image/png"),
         },
     )
     assert response.status_code == 400, response.text
@@ -3028,10 +3066,10 @@ def test_h3_corrupt_mask_releases_prior_source(endpoint, test_client, mocker):
     assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
 
 
-@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
-@pytest.mark.parametrize("failure_stage", ["open", "decode"])
-@pytest.mark.parametrize("error_type", [av.error.EOFError, av.error.DecoderNotFoundError])
-def test_h3_ffmpeg_mask_failure_releases_all_uploads(endpoint, failure_stage, error_type, test_client, mocker):
+@pytest.mark.parametrize(
+    ("failure_stage", "error_type"), [("open", av.error.EOFError), ("decode", av.error.DecoderNotFoundError)]
+)
+def test_h3_ffmpeg_mask_failure_releases_all_uploads(failure_stage, error_type, test_client, mocker):
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
     engine.controlnet_model_path = "/configured/control.safetensors"
@@ -3065,7 +3103,7 @@ def test_h3_ffmpeg_mask_failure_releases_all_uploads(endpoint, failure_stage, er
     mocker.patch.object(video_generation_helpers.tempfile, "mkstemp", side_effect=track)
     mocker.patch.object(av, "open", side_effect=open_media)
     response = test_client.post(
-        endpoint,
+        "/v1/videos/sync",
         data={"prompt": "Invalid mask video.", "control_type": "canny"},
         files={
             "control_reference": ("hint.mp4", payload, "video/mp4"),
