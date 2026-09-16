@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 from torch import nn
 
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace import (
     Wan22VACEPipeline,
     create_vace_transformer_from_config,
@@ -33,6 +35,8 @@ def test_vace_default_flow_shift_preserves_compact_offload_runtime_state(monkeyp
         )
         enable_layerwise_offload: bool = True
         post_init_calls: int = 0
+        _resolved_diffusion_offload: object = None
+        _diffusion_offload_flags_materialized: bool = False
 
         def __post_init__(self) -> None:
             self.post_init_calls += 1
@@ -41,7 +45,7 @@ def test_vace_default_flow_shift_preserves_compact_offload_runtime_state(monkeyp
     resolved_offload = object()
     config._resolved_diffusion_offload = resolved_offload
     config._diffusion_offload_flags_materialized = True
-    captured = {}
+    captured: dict[str, object] = {}
 
     def capture_base_init(self, *, od_config, prefix="") -> None:
         captured.update(od_config=od_config, prefix=prefix)
@@ -51,6 +55,7 @@ def test_vace_default_flow_shift_preserves_compact_offload_runtime_state(monkeyp
     Wan22VACEPipeline(od_config=config, prefix="stage")
 
     forwarded = captured["od_config"]
+    assert isinstance(forwarded, RuntimeConfig)
     assert forwarded is not config
     assert config.flow_shift is None
     assert forwarded.flow_shift == 3.0
@@ -75,7 +80,7 @@ def _make_vace_pipeline() -> Wan22VACEPipeline:
 
 
 def _make_vace_sampling(**overrides):
-    values = {
+    values: dict[str, object] = {
         "height": 16,
         "width": 16,
         "num_frames": 5,
@@ -123,7 +128,7 @@ def test_vace_preprocess_collects_reference_video_and_mask_inputs() -> None:
 
 
 def test_create_vace_transformer_from_config_maps_vace_specific_keys(monkeypatch) -> None:
-    captured = {}
+    captured: dict[str, object] = {}
 
     class FakeVACETransformer:
         def __init__(self, **kwargs) -> None:
@@ -203,7 +208,9 @@ def test_vace_diffuse_passes_context_and_scale_to_cfg_branches() -> None:
     torch.testing.assert_close(result, torch.ones_like(latents))
 
 
-def test_vace_forward_batches_random_inputs_and_splits_outputs(monkeypatch) -> None:
+@pytest.mark.parametrize("solver", ["unipc", "euler"])
+@pytest.mark.parametrize("shift", [3.0, 5.0, 12.0])
+def test_vace_forward_batches_random_inputs_and_splits_outputs(monkeypatch, solver: str, shift: float) -> None:
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace.current_omni_platform",
         SimpleNamespace(is_available=lambda: False),
@@ -211,10 +218,10 @@ def test_vace_forward_batches_random_inputs_and_splits_outputs(monkeypatch) -> N
     pipeline = _make_vace_pipeline()
     pipeline.transformer.vace_patch_embedding = None
     pipeline.transformer_2 = None
-    pipeline.scheduler = StubScheduler([9])
-    pipeline.od_config = SimpleNamespace(flow_shift=3.0)
-    pipeline._sample_solver = "unipc"
-    pipeline._flow_shift = 3.0
+    pipeline.scheduler = build_wan_scheduler(solver, shift)
+    pipeline.od_config = SimpleNamespace(flow_shift=shift)
+    pipeline._sample_solver = solver
+    pipeline._flow_shift = shift
     pipeline.boundary_ratio = None
     pipeline._guidance_scale = None
     pipeline._num_timesteps = None
@@ -247,6 +254,8 @@ def test_vace_forward_batches_random_inputs_and_splits_outputs(monkeypatch) -> N
                     generator=gen_a,
                     latents=latents_a,
                     num_outputs_per_prompt=2,
+                    num_inference_steps=50,
+                    extra_args={"sample_solver": solver, "flow_shift": shift},
                 ),
             ),
             SimpleNamespace(
@@ -256,12 +265,25 @@ def test_vace_forward_batches_random_inputs_and_splits_outputs(monkeypatch) -> N
                     generator=gen_b,
                     latents=latents_b,
                     num_outputs_per_prompt=2,
+                    num_inference_steps=50,
+                    extra_args={"sample_solver": solver, "flow_shift": shift},
                 ),
             ),
         ]
     )
 
     outputs = pipeline.forward(batch)
+    if solver == "unipc":
+        sigmas = np.linspace(float(np.float32(0.999)), 0.0, 51)[:-1]
+        sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+        torch.testing.assert_close(
+            pipeline.scheduler.sigmas, torch.tensor(np.append(sigmas, 0.0), dtype=torch.float32), rtol=0, atol=0
+        )
+        assert pipeline.scheduler.timesteps.tolist() == (sigmas * 1000).astype(np.int64).tolist()
+    else:
+        reference = build_wan_scheduler("euler", shift)
+        reference.set_timesteps(50, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
     assert prepare_call["batch_size"] == 4
     assert prepare_call["generator"] == [gen_a, gen_a, gen_b, gen_b]

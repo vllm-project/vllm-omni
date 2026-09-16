@@ -316,8 +316,12 @@ arrives, checkpointing the response's history position so a later committed user
 outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
 horizon.
 
-TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
-every token interval is present.
+Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
+continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration. Global
+TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
+token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
+excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
+`response_created_to_first_audio_ms` as client-envelope diagnostics.
 
 The checked-in local performance configuration measures four deterministic cases from each OmniInteract subset (12 videos
 total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its

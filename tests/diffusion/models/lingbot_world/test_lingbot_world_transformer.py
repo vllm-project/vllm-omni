@@ -35,11 +35,13 @@ def _tiny_model(
     num_layers: int = 2,
     num_frames_per_block: int = 1,
     sliding_window_num_frames: int = 3,
+    attention_head_dim: int = 2,
+    rope_max_seq_len: int = 16,
 ):
     return module.CausalLingBotWorldTransformer3DModel(
         patch_size=(1, 2, 2),
         num_attention_heads=2,
-        attention_head_dim=2,
+        attention_head_dim=attention_head_dim,
         in_channels=36,
         out_channels=2,
         text_dim=6,
@@ -48,7 +50,7 @@ def _tiny_model(
         num_layers=num_layers,
         cross_attn_norm=True,
         eps=1e-6,
-        rope_max_seq_len=16,
+        rope_max_seq_len=rope_max_seq_len,
         sink_size=1,
         num_frames_per_block=num_frames_per_block,
         sliding_window_num_frames=sliding_window_num_frames,
@@ -121,7 +123,8 @@ def _assert_self_cache_unchanged(cache, snapshot) -> None:
 
 
 @pytest.mark.cpu
-def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera_path() -> None:
+@pytest.mark.parametrize("num_chunks", [4, 18])
+def test_tiny_transformer_runs_contiguous_chunks_with_explicit_cache_commit_and_camera_path(num_chunks) -> None:
     torch.manual_seed(7)
     module = attention_tests._load_module()
     model = _tiny_model(module).eval()
@@ -135,7 +138,7 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
     assert model.patch_embedding.in_channels == 36
     assert model.patch_embedding_wancamctrl.in_features == 6 * 8 * 8 * 1 * 2 * 2
 
-    for start_frame in range(4):
+    for start_frame in range(num_chunks):
         hidden_states = torch.randn(1, 36, 1, 4, 4)
         timestep = torch.tensor([float(start_frame + 1)])
         snapshot = _self_cache_snapshot(cache)
@@ -169,7 +172,7 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
         expected_token_end = (start_frame + 1) * 2 * 2
         assert all(layer_cache.absolute_end == expected_token_end for layer_cache in cache.self_attention)
 
-    assert len(outputs) == 4
+    assert len(outputs) == num_chunks
     assert all(len(outputs) == 1 for outputs in cross_key_outputs)
     assert len(text_projection_outputs) == 1
 
@@ -991,3 +994,42 @@ def test_sp4_direct_matches_sp1_bf16(tmp_path):
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 def test_tp2_sp2_paged_matches_sp1_bf16(tmp_path):
     _run(tmp_path, 2, 2, "paged", torch.bfloat16, 1)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("start_frame", [0, 1021, 1023, 1024, 21600])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_temporal_rope_matches_absolute_positions_without_growing_cache(start_frame, dtype):
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, attention_head_dim=128, rope_max_seq_len=1024).to(dtype)
+    buffers = {name: (value.data_ptr(), value.shape) for name, value in model.named_buffers()}
+    cosine, sine = model._rotary_embedding(
+        frames=3, height=2, width=3, start_frame=start_frame, dtype=dtype, device=torch.device("cpu")
+    )
+    # Independent complex-valued reference uses absolute (time, height, width)
+    # coordinates, including blocks crossing the original precomputed table.
+    grids = torch.meshgrid(
+        torch.arange(start_frame, start_frame + 3, dtype=torch.float64),
+        torch.arange(2, dtype=torch.float64),
+        torch.arange(3, dtype=torch.float64),
+        indexing="ij",
+    )
+    reference = []
+    for positions, dim in zip(grids, (44, 42, 42), strict=True):
+        frequencies = 1.0 / 10000 ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim)
+        phase = positions.flatten()[:, None] * frequencies[None, :]
+        reference.append(torch.polar(torch.ones_like(phase), phase))
+    expected = torch.cat(reference, dim=-1)
+    torch.testing.assert_close(cosine, expected.real.float().to(dtype), rtol=0, atol=0)
+    torch.testing.assert_close(sine, expected.imag.float().to(dtype), rtol=0, atol=0)
+    assert {name: (value.data_ptr(), value.shape) for name, value in model.named_buffers()} == buffers
+
+
+@pytest.mark.cpu
+def test_temporal_rope_extension_keeps_spatial_limit():
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1)
+    with pytest.raises(ValueError, match="Spatial RoPE"):
+        model._rotary_embedding(
+            frames=3, height=17, width=1, start_frame=16, dtype=torch.float32, device=torch.device("cpu")
+        )

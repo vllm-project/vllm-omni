@@ -139,6 +139,10 @@ You can configure per-stage sampling parameters for multi-stage models.
 >
 > Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
 
+#### H3 video upscale (WF-07)
+
+The **vLLM-Omni MiniMax H3 Video Upscale** template generates video remotely, upscales it with SeedVR2, and saves the original and upscaled videos with the generated audio and FPS. See [workflow setup](docs/wf07-h3-upscale.md).
+
 #### FastH3 text-to-video
 
 FastH3 is fused into MiniMax-H3 when the vLLM-Omni server starts; it is not a request-switchable LoRA. Download one adapter variant and start a non-offloaded FL2VA server. For the Dense / Data-Free profile:

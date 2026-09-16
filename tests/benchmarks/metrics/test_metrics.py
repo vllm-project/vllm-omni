@@ -150,16 +150,16 @@ def test_unmeasured_duplex_latency_does_not_add_zero_samples():
     measured.audio_ttfp = 0.2
     measured.audio_rtf = 0.5
     measured.duplex_session_metrics = {
-        "mean_ttft_ms": 100.0,
-        "mean_ttfp_ms": 200.0,
-        "mean_rtf": 0.5,
+        "ttft_ms": 100.0,
+        "ttfp_ms": 200.0,
+        "rtf": 0.5,
     }
     listen_only = _make_output(100, output_tokens=0)
     listen_only.ttft = listen_only.audio_ttfp = listen_only.audio_rtf = 0.0
     listen_only.duplex_session_metrics = {
-        "mean_ttft_ms": None,
-        "mean_ttfp_ms": None,
-        "mean_rtf": None,
+        "ttft_ms": None,
+        "ttfp_ms": None,
+        "rtf": None,
     }
 
     metrics = _calculate_test_metrics([measured, listen_only], {"ttft": 150.0})
@@ -174,9 +174,9 @@ def test_unmeasured_duplex_latency_does_not_add_zero_samples():
 def test_all_unmeasured_duplex_latency_is_not_reported_as_zero():
     listen_only = _make_output(100, output_tokens=0)
     listen_only.duplex_session_metrics = {
-        "mean_ttft_ms": None,
-        "mean_ttfp_ms": None,
-        "mean_rtf": None,
+        "ttft_ms": None,
+        "ttfp_ms": None,
+        "rtf": None,
     }
 
     metrics = _calculate_test_metrics(
@@ -196,13 +196,13 @@ def test_unmeasured_duplex_tpot_does_not_add_zero_or_misalign_goodput():
     missing_tpot.itl = []
     missing_tpot.text_latency = missing_tpot.ttft = 0.1
     missing_tpot.tpot_measured = False
-    missing_tpot.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+    missing_tpot.duplex_session_metrics = {"ttft_ms": 100.0}
 
     slow_ttft = _make_output(100, output_tokens=5)
     slow_ttft.ttft = 1.0
     slow_ttft.text_latency = 1.4
     slow_ttft.itl = [0.1] * 4
-    slow_ttft.duplex_session_metrics = {"mean_ttft_ms": 1000.0}
+    slow_ttft.duplex_session_metrics = {"ttft_ms": 1000.0}
 
     metrics = _calculate_test_metrics(
         [missing_tpot, slow_ttft],
@@ -219,7 +219,7 @@ def test_all_unmeasured_duplex_token_timing_is_not_reported_as_zero():
     output.itl = []
     output.text_latency = output.ttft
     output.tpot_measured = False
-    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+    output.duplex_session_metrics = {"ttft_ms": 100.0}
 
     metrics = _calculate_test_metrics([output], {"tpot": float("inf")})
 
@@ -236,7 +236,7 @@ def test_duplex_response_timings_do_not_build_a_session_token_timeline():
         {"response_id": "r1", "stage0_tokens": {"itls_ms": [100.0, 100.0]}},
         {"response_id": "r2", "stage0_tokens": {"itls_ms": [100.0, 100.0]}},
     ]
-    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+    output.duplex_session_metrics = {"ttft_ms": 100.0}
 
     metrics = _calculate_test_metrics([output])
 
@@ -252,7 +252,7 @@ def test_unmeasured_tpot_stays_missing_after_tokenizer_fallback():
     output.itl = []
     output.text_latency = output.ttft
     output.tpot_measured = False
-    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+    output.duplex_session_metrics = {"ttft_ms": 100.0}
 
     def tokenizer(text, *, add_special_tokens):
         assert text == output.generated_text
@@ -282,7 +282,7 @@ def test_unmeasured_tpot_stays_missing_after_tokenizer_fallback():
 def test_zero_itl_does_not_create_zero_tpot():
     output = _make_output(100, output_tokens=3)
     output.itl = [0.0, 0.0]
-    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+    output.duplex_session_metrics = {"ttft_ms": 100.0}
 
     metrics = _calculate_test_metrics([output], {"tpot": 1.0})
 
@@ -357,9 +357,9 @@ def test_single_token_responses_do_not_report_zero_tpot(capsys):
 def test_duplex_goodput_does_not_pair_measurements_from_different_requests():
     text_only, audio_only = _make_output(100), _make_output(100)
     text_only.ttft, text_only.audio_ttfp = 0.1, 0.0
-    text_only.duplex_session_metrics = {"mean_ttft_ms": 100.0, "mean_ttfp_ms": None, "mean_rtf": None}
+    text_only.duplex_session_metrics = {"ttft_ms": 100.0, "ttfp_ms": None, "rtf": None}
     audio_only.ttft, audio_only.audio_ttfp = 0.0, 0.2
-    audio_only.duplex_session_metrics = {"mean_ttft_ms": None, "mean_ttfp_ms": 200.0, "mean_rtf": None}
+    audio_only.duplex_session_metrics = {"ttft_ms": None, "ttfp_ms": 200.0, "rtf": None}
 
     metrics = _calculate_test_metrics([text_only, audio_only], {"ttft": 500.0, "audio_ttft": 500.0})
 

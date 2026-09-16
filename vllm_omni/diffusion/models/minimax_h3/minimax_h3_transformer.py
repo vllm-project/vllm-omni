@@ -44,6 +44,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -67,6 +71,15 @@ logger = init_logger(__name__)
 # packing, and ``_run_packed_attention`` re-checks it per forward; a name-only
 # gate would let FLASH_ATTN's NPU/XPU code paths through even though those
 # variants would silently attend across request boundaries.
+def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
+    """Match :meth:`Attention._get_active_parallel_strategy` for Ring."""
+    if not getattr(attention_layer, "use_ring", False) or getattr(attention_layer, "skip_sequence_parallel", False):
+        return False
+    if is_forward_context_available() and not get_forward_context().sp_active:
+        return False
+    return True
+
+
 def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     """True if this attention layer keeps N-document packed boundaries.
 
@@ -78,7 +91,7 @@ def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     backend = getattr(attention_layer, "attn_backend", None)
     if backend is None or not backend.supports_multi_doc_packed_varlen():
         return False
-    return not getattr(attention_layer, "use_ring", False)
+    return not _ring_sequence_parallel_is_active(attention_layer)
 
 
 @dataclass
@@ -508,6 +521,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         attn_mask = None
         mask_free_packed_padding = False
+        use_ring = _ring_sequence_parallel_is_active(self.attention)
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
             # rows are block-diagonal rather than a prefix: neither a KV prefix
@@ -534,12 +548,15 @@ class MiniMaxH3Attention(nn.Module):
             # supports_packed_mask_free: backend consumes the packed metadata
             # without ever reading attn_mask (CUDA packed varlen, NPU
             # npu_attn_varlen opt-in with its own fallback rebuild).
-            use_ring = getattr(self.attention, "use_ring", False)
             mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
-            if used < packed_total and not no_mask:
+            # Hybrid Ulysses reshards Q to one ring partition before the ring
+            # kernel runs, so a global [packed_total] mask cannot pass its
+            # query-length check. Ring consumes valid_kv_length directly and
+            # trims the circulated K/V blocks instead.
+            if used < packed_total and not no_mask and not use_ring:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -563,7 +580,7 @@ class MiniMaxH3Attention(nn.Module):
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
                 # fixed-size P2P buffers and still needs the mask.
-                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                "npu_attn_varlen": not use_ring,
                 # fp16-range protection for the ascend_laser_attention kernel
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
