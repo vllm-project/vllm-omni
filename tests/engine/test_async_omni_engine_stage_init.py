@@ -11,6 +11,7 @@ import types
 
 import pytest
 
+from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -1195,22 +1196,20 @@ def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monk
     never materialized. Stage init must fetch exactly those subfolders instead
     of joining onto a path that exists nowhere.
     """
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
     _make_snapshot(snapshot, ["tokenizer"])
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if kwargs.get("local_files_only"):
             return str(snapshot)
         _make_snapshot(snapshot, ["language_model"])
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1230,18 +1229,16 @@ def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monk
 
 def test_build_engine_args_skips_hub_call_when_cached_snapshot_is_complete(monkeypatch, tmp_path):
     """A warm cache stays offline-friendly: no outgoing Hub request."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
     _make_snapshot(snapshot, ["language_model", "tokenizer"])
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         assert kwargs.get("local_files_only"), "warm cache must not reach the Hub"
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1262,8 +1259,6 @@ def test_build_engine_args_redownloads_a_partial_subdir(monkeypatch, tmp_path):
     that local path leaves vLLM's loader without any fallback for the missing
     weights.
     """
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
@@ -1273,14 +1268,14 @@ def test_build_engine_args_redownloads_a_partial_subdir(monkeypatch, tmp_path):
     _make_snapshot(snapshot, ["tokenizer"])
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if kwargs.get("local_files_only"):
             return str(snapshot)
         _make_snapshot(snapshot, ["language_model"])
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1301,8 +1296,6 @@ def test_build_engine_args_redownloads_when_index_lists_missing_shards(monkeypat
     The index downloads early; accepting it as proof of weights converts the
     Hub ID into a local path vLLM cannot fetch the remaining shards for.
     """
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
@@ -1322,13 +1315,13 @@ def test_build_engine_args_redownloads_when_index_lists_missing_shards(monkeypat
     _make_snapshot(snapshot, ["tokenizer"])
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if not kwargs.get("local_files_only"):
             (partial / "model-00002-of-00002.safetensors").write_text("x")
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1345,8 +1338,6 @@ def test_build_engine_args_redownloads_when_index_lists_missing_shards(monkeypat
 
 def test_build_engine_args_redownloads_shards_without_their_index(monkeypatch, tmp_path):
     """Shard-named weights always ship an index; one without it is partial."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
@@ -1356,7 +1347,7 @@ def test_build_engine_args_redownloads_shards_without_their_index(monkeypatch, t
     _make_snapshot(snapshot, ["tokenizer"])
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if not kwargs.get("local_files_only"):
             shards = {f"w{i}.weight": f"model-0000{i}-of-00004.safetensors" for i in range(1, 5)}
@@ -1365,7 +1356,7 @@ def test_build_engine_args_redownloads_shards_without_their_index(monkeypatch, t
                 (partial / shard).write_text("x")
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1381,8 +1372,6 @@ def test_build_engine_args_redownloads_shards_without_their_index(monkeypatch, t
 
 def test_build_engine_args_redownloads_a_tokenizer_folder_without_vocabulary(monkeypatch, tmp_path):
     """Templates and configs download first; alone they are not a tokenizer."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
@@ -1392,13 +1381,13 @@ def test_build_engine_args_redownloads_a_tokenizer_folder_without_vocabulary(mon
     (partial / "chat_template.jinja").write_text("{{ messages }}")
     calls = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         calls.append(kwargs)
         if not kwargs.get("local_files_only"):
             _make_snapshot(snapshot, ["tokenizer"])
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1416,19 +1405,17 @@ def test_build_engine_args_redownloads_a_tokenizer_folder_without_vocabulary(mon
 def test_build_engine_args_forwards_revision_and_download_dir(monkeypatch, tmp_path):
     """revision/download_dir must shape snapshot selection (they cannot be
     corrected downstream once the repo ID is a local path)."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "pinned"
     _make_snapshot(snapshot, ["language_model", "tokenizer"])
     seen = []
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         seen.append(kwargs)
         return str(snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1453,8 +1440,6 @@ def test_build_engine_args_forwards_revision_and_download_dir(monkeypatch, tmp_p
 
 def test_build_engine_args_resolves_tokenizer_revision_separately(monkeypatch, tmp_path):
     """A tokenizer pinned to a different revision resolves against its own snapshot."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     model_snapshot = tmp_path / "snapshots" / "model-rev"
@@ -1462,12 +1447,12 @@ def test_build_engine_args_resolves_tokenizer_revision_separately(monkeypatch, t
     tokenizer_snapshot = tmp_path / "snapshots" / "tok-rev"
     _make_snapshot(tokenizer_snapshot, ["tokenizer"])
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         if kwargs.get("revision") == "tok-rev":
             return str(tokenizer_snapshot)
         return str(model_snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1490,8 +1475,6 @@ def test_build_engine_args_resolves_tokenizer_revision_separately(monkeypatch, t
 def test_build_engine_args_resolves_root_tokenizer_revision_separately(monkeypatch, tmp_path):
     """An empty tokenizer_subdir targets the snapshot root and still honors
     its own revision."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     model_snapshot = tmp_path / "snapshots" / "model-rev"
@@ -1504,12 +1487,12 @@ def test_build_engine_args_resolves_root_tokenizer_revision_separately(monkeypat
     tokenizer_snapshot.mkdir(parents=True, exist_ok=True)
     (tokenizer_snapshot / _SUBDIR_ARTIFACT["tokenizer"]).write_text("x")
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         if kwargs.get("revision") == "tok-rev":
             return str(tokenizer_snapshot)
         return str(model_snapshot)
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1531,19 +1514,17 @@ def test_build_engine_args_resolves_root_tokenizer_revision_separately(monkeypat
 
 def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeypatch, tmp_path):
     """An undownloadable subfolder raises here instead of reaching HuggingFace."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     snapshot = tmp_path / "snapshots" / "deadbeef"
     _make_snapshot(snapshot, ["tokenizer"])
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         if kwargs.get("local_files_only"):
             return str(snapshot)
         raise OSError("offline")
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1558,14 +1539,12 @@ def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeyp
 
 def test_build_engine_args_fails_closed_on_cold_cache_instead_of_joining_repo_id(monkeypatch):
     """With nothing cached, the stage must not join a subdir onto the repo id."""
-    from huggingface_hub import HfApi
-
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
-    def fake_snapshot_download(self, repo_id, **kwargs):
+    def fake_snapshot_download(repo_id, **kwargs):
         raise OSError("offline")
 
-    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,

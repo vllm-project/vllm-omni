@@ -16,6 +16,7 @@ from tests.diffusion.quantization.test_quantization_quality import (
     _maybe_save_output,
 )
 from tests.helpers.mark import hardware_marks
+from tests.helpers.mock import patch_hf_snapshot_download
 
 _MINIMAX_H3_REPO = "MiniMaxAI/MiniMax-H3"
 _MINIMAX_H3_REVISION = "48d93ede732756e404a3b1b2f3b3a9b5a22f6cfc"
@@ -252,13 +253,13 @@ def test_resolve_fl2va_model_ref(tmp_path, monkeypatch):
     fl2va_root.mkdir()
     (fl2va_root / "model_index.json").write_text("{}", encoding="utf-8")
 
-    def fake_snapshot_download(self, *, repo_id, revision, allow_patterns):
+    def fake_snapshot_download(*, repo_id, revision, allow_patterns):
         assert repo_id == _MINIMAX_H3_REPO
         assert revision == _MINIMAX_H3_REVISION
         assert allow_patterns == ["FL2VA/**"]
         return str(tmp_path)
 
-    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
     assert _resolve_fl2va_model_ref() == str(fl2va_root)
 
 
