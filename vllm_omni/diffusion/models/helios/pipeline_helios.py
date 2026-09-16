@@ -67,6 +67,33 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
+def _block_noise_cholesky_factor(
+    block_size: int,
+    gamma: float,
+    device: torch.device | str,
+) -> torch.Tensor:
+    # At the shipped gamma=1/3 and block_size=4 this covariance is singular.
+    # Its 1e-8 ridge is rounded away in float32, and Ascend's Cholesky kernel
+    # faults on the resulting zero pivot. Factor the tiny matrix on CPU in
+    # float64 for NPU so the ridge is representable, then transfer the factor.
+    use_npu_fallback = current_omni_platform.is_npu()
+    factor_device = torch.device("cpu") if use_npu_fallback else device
+    factor_dtype = torch.float64 if use_npu_fallback else torch.float32
+    eye = torch.eye(block_size, device=factor_device, dtype=factor_dtype)
+    cov = (
+        eye * (1 + gamma)
+        - torch.ones(
+            block_size,
+            block_size,
+            device=factor_device,
+            dtype=factor_dtype,
+        )
+        * gamma
+    )
+    cov += eye * 1e-8
+    return torch.linalg.cholesky(cov).to(device=device, dtype=torch.float32)
+
+
 def load_json_config(model_path: str, subfolder: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:
@@ -1594,12 +1621,7 @@ class HeliosPipeline(
 
         device = generator.device if generator is not None else self.device
 
-        # Allocate directly on the execution device in float32 to use the device solver
-        # and avoid fp16/bf16 Cholesky on the covariance matrix.
-        eye = torch.eye(block_size, device=device, dtype=torch.float32)
-        cov = eye * (1 + gamma) - torch.ones(block_size, block_size, device=device, dtype=torch.float32) * gamma
-        cov += eye * 1e-8
-        L = torch.linalg.cholesky(cov)
+        L = _block_noise_cholesky_factor(block_size, gamma, device)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
         z = torch.randn(block_number, block_size, generator=generator, device=device)
         noise = z @ L.T
