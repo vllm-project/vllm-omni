@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from copy import copy, deepcopy
@@ -46,6 +47,11 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role, stage_sends_async_output
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.platforms.npu.worker.multi_step_decode import (
+    execute_multi_step_window,
+    shrink_refused_multi_step_window,
+    validate_multi_step_plan,
+)
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -142,6 +148,24 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        # Completed multi-step window output awaiting sample_tokens(); see
+        # multi_step_decode.execute_multi_step_window.
+        self._multi_step_pending_output: OmniModelRunnerOutput | None = None
+        # Stage-1 per-step timing (env-gated diagnostic; OMNI_MSD_STEP_TIMING=1).
+        # ``off_*`` accumulates single-step decode calls (one token/request per
+        # step), ``win_*`` accumulates window calls (window_k tokens/request per
+        # call) so the two paths are compared on equal footing.
+        if os.environ.get("OMNI_MSD_STEP_TIMING"):
+            self._msd_timing: dict[str, float | int] = {
+                "off_total": 0.0,
+                "off_steps": 0,
+                "win_total": 0.0,
+                "win_tokens": 0,
+            }
+            self._msd_t0: float | None = None
+        else:
+            self._msd_timing = None
+            self._msd_t0 = None
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -383,6 +407,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        if self._msd_timing is not None and scheduler_output.total_num_scheduled_tokens > 0:
+            self._msd_t0 = time.perf_counter()
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
@@ -455,6 +481,35 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             if kv_connector_metadata is not None:
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+        #  -------------------------------------- Omni-new -------------------------------------------------
+
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # [Omni] Multi-step decode window.  When the scheduler emitted a
+        # window plan and this runner can host it, the K decode steps
+        # (forward -> sampling -> input feedback) run inside this single
+        # engine call; the built output is stashed for sample_tokens().
+        # Any refusal here falls back to the normal single-step path below
+        # -- the scheduler-side reconcile in update_from_output absorbs
+        # the accounting shortfall.
+        multi_step_plan = validate_multi_step_plan(self, scheduler_output)
+        if multi_step_plan is not None:
+            if self._msd_timing is not None:
+                self._msd_win_t0 = time.perf_counter()
+            execute_multi_step_window(self, scheduler_output, multi_step_plan)
+            if self._msd_timing is not None:
+                self._msd_timing["win_total"] += time.perf_counter() - self._msd_win_t0
+                self._msd_timing["win_tokens"] += int(
+                    multi_step_plan[next(iter(multi_step_plan))]
+                )
+                self._msd_t0 = None
+                self._msd_log()
+            return None
+        # Runner declined the planned window: shrink the K-token schedule
+        # back to one token per request so the single-step fallback below
+        # never executes the un-produced K-1 slots (see
+        # shrink_refused_multi_step_window); the scheduler-side reconcile
+        # absorbs the reservation shortfall.
+        shrink_refused_multi_step_window(scheduler_output)
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -864,7 +919,25 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
             self._omni_routed_experts_d2h(scheduler_output)
 
+        if self._msd_timing is not None and self._msd_t0 is not None:
+            self._msd_timing["off_total"] += time.perf_counter() - self._msd_t0
+            self._msd_timing["off_steps"] += 1
+            self._msd_t0 = None
+            self._msd_log()
+
         return None
+
+    def _msd_log(self) -> None:
+        _msd = self._msd_timing
+        if _msd is None:
+            return
+        if int(_msd["off_steps"]) % 100 == 0 or int(_msd["win_tokens"]) % 1200 < 12:
+            off_ms = 1e3 * _msd["off_total"] / max(int(_msd["off_steps"]), 1)
+            win_ms = 1e3 * _msd["win_total"] / max(int(_msd["win_tokens"]), 1)
+            logger.info(
+                "MSD per-step=%.3fms (n=%d) MSD per-token=%.3fms (n=%d)",
+                off_ms, int(_msd["off_steps"]), win_ms, int(_msd["win_tokens"]),
+            )
 
     def _sample(
         self,
@@ -902,6 +975,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # [Omni] A multi-step window already produced its full output inside
+        # execute_model(); hand it over unchanged.
+        pending_multi_step_output = self._multi_step_pending_output
+        if pending_multi_step_output is not None:
+            self._multi_step_pending_output = None
+            return pending_multi_step_output
+        #  -------------------------------------- Omni-new -------------------------------------------------
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
