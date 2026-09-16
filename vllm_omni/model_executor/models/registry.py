@@ -326,12 +326,6 @@ _OMNI_MODELS = {
         "voxcpm2_talker",
         "VoxCPM2TalkerForConditionalGeneration",
     ),
-    ## dots.tts
-    "DotsTTSForConditionalGeneration": (
-        "dots_tts",
-        "dots_tts_talker",
-        "DotsTTSForConditionalGeneration",
-    ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
         "voxtral_tts",
@@ -400,11 +394,6 @@ _OMNI_MODELS = {
         "moss_tts",
         "modeling_moss_tts_codec",
         "MossTTSCodecDecoder",
-    ),
-    "DyninOmniForConditionalGeneration": (
-        "dynin_omni",
-        "dynin_omni",
-        "DyninOmniForConditionalGeneration",
     ),
     ## IndexTTS2
     "IndexTTS2TalkerForConditionalGeneration": (
