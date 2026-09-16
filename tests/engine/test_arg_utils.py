@@ -543,3 +543,40 @@ def test_tensor_parallel_size_none_is_handled():
     )
     assert isinstance(args, dict)
     assert "tensor_parallel_size" not in args
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/7564
+def test_from_cli_args_preserves_text_encoder_tp_size():
+    """`--text-encoder-tp-size` must survive from_cli_args field filtering.
+
+    Library callers build engine args via ``OmniEngineArgs.from_cli_args``;
+    the dataclass field filter drops any namespace attribute the dataclass
+    does not declare, silently resetting the diffusion text-encoder TP to 1.
+    """
+    engine_args = OmniEngineArgs.from_cli_args(
+        SimpleNamespace(text_encoder_tp_size=2),
+    )
+    assert engine_args.text_encoder_tp_size == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/7564
+def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
+    """The preserved CLI value must land in DiffusionParallelConfig.
+
+    Mirrors the library flow: from_cli_args -> kwargs -> the generic
+    diffusion fallback, which resolves the field through
+    ``DiffusionParallelConfig.from_stage_overrides``.
+    """
+    from dataclasses import asdict
+
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    engine_args = OmniEngineArgs.from_cli_args(
+        SimpleNamespace(text_encoder_tp_size=2),
+    )
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {k: v for k, v in asdict(engine_args).items() if v is not None},
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config["text_encoder_tp_size"] == 2
