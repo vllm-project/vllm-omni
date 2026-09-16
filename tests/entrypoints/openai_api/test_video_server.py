@@ -88,7 +88,10 @@ class FakeAsyncOmni:
         self.captured_sampling_params_list = None
 
     def get_diffusion_od_config(self):
-        return SimpleNamespace(model_class_name=self.model_class_name)
+        return SimpleNamespace(
+            model_class_name=self.model_class_name,
+            controlnet_model_path=getattr(self, "controlnet_model_path", None),
+        )
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
@@ -2960,3 +2963,373 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("mode", ["canny", "depth", "hed", "mlsd", "pose", "inpaint"])
+def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
+    _mock_encode_video_bytes(mocker, b"controlled")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    captured = {}
+    original = engine.generate
+
+    async def generate(prompt, request_id, sampling_params_list):
+        config = sampling_params_list[0].extra_args[mode]
+        captured.update(config)
+        for key in ("control_path", "source_path", "mask_path"):
+            if key in config:
+                assert Path(config[key]).is_file()
+        async for output in original(prompt, request_id, sampling_params_list):
+            yield output
+
+    mocker.patch.object(engine, "generate", generate)
+    files = (
+        {"mask_reference": ("mask.png", _make_test_image_bytes(), "image/png")}
+        if mode == "inpaint"
+        else {
+            "control_reference": ("hint.mp4", _make_test_video_bytes(), "video/mp4"),
+        }
+    )
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "Controlled scene.",
+            "control_type": mode,
+            "extra_params": json.dumps({mode: {"control_context_scale": 0.75}}),
+        },
+        files=files,
+    )
+    assert response.status_code == 200, response.text
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    assert captured["control_context_scale"] == 0.75
+    assert not engine.captured_prompt.get("multi_modal_data", {}).get("video")
+    for key in ("control_path", "source_path", "mask_path"):
+        if key in captured:
+            assert not Path(captured[key]).exists()
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("with_hint", [False, True])
+def test_h3_inpaint_source_is_not_ref2va(endpoint, with_hint, test_client, mocker):
+    _mock_encode_video_bytes(mocker)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3ModularPipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    mode = "canny" if with_hint else "inpaint"
+    files = {
+        "source_reference": ("source.mp4", _make_test_video_bytes(), "video/mp4"),
+        "mask_reference": ("mask.png", _make_test_image_bytes(), "image/png"),
+    }
+    if with_hint:
+        files["control_reference"] = ("hint.mp4", _make_test_video_bytes(), "video/mp4")
+    response = test_client.post(endpoint, data={"prompt": "Repaint.", "control_type": mode}, files=files)
+    assert response.status_code == 200, response.text
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    config = engine.captured_sampling_params_list[0].extra_args[mode]
+    assert "source_path" in config and "mask_path" in config
+    assert not engine.captured_prompt.get("multi_modal_data", {}).get("video")
+    assert all(not Path(value).exists() for key, value in config.items() if key.endswith("_path"))
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize(
+    ("fields", "roles", "message"),
+    [
+        ({"control_type": "canny"}, [], "requires a control_reference"),
+        (
+            {"control_type": "inpaint", "extra_params": '{"inpaint":{"control_strength":1}}'},
+            ["mask"],
+            "Unknown extra_params",
+        ),
+        ({"control_type": "inpaint"}, ["source"], "requires mask_reference"),
+        ({"control_type": "inpaint"}, [], "requires mask_reference"),
+        ({}, ["mask"], "requires control_type"),
+        ({"control_type": "bogus"}, ["control"], "requires control_type"),
+        ({"control_type": "canny", "extra_params": '{"depth":{}}'}, ["control"], "only the selected"),
+        (
+            {"control_type": "canny", "extra_params": '{"canny":{"control_path":"/secret"}}'},
+            ["control"],
+            "server-local",
+        ),
+        (
+            {"control_type": "inpaint", "extra_params": '{"inpaint":{"source_path":"/secret"}}'},
+            ["mask"],
+            "server-local",
+        ),
+        ({"extra_params": '{"canny":{"control_path":"/secret"}}'}, [], "requires control_type"),
+        (
+            {"control_type": "canny", "video_reference": '{"video_url":"https://example.com/a.mp4"}'},
+            ["control"],
+            "cannot be combined",
+        ),
+        ({"control_type": "inpaint", "extra_params": '{"inpaint":true}'}, ["mask"], "must be an object"),
+    ],
+)
+def test_h3_control_rejects_before_job_creation(endpoint, fields, roles, message, test_client, mocker):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    persist = mocker.spy(video_generation_helpers, "_persist_uploaded_control_reference")
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Invalid.", **fields},
+        files={f"{role}_reference": (f"{role}.mp4", b"unread", "video/mp4") for role in roles},
+    )
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    persist.assert_not_called()
+    assert engine.captured_prompt is None
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+@pytest.mark.parametrize("strength", [-1, float("nan"), float("inf"), 10**1000, "1", True])
+def test_h3_control_rejects_invalid_strength(strength, test_client):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "Invalid.",
+            "control_type": "inpaint",
+            "extra_params": json.dumps({"inpaint": {"control_context_scale": strength}}),
+        },
+        files={"mask_reference": ("mask.png", b"unread", "image/png")},
+    )
+    assert response.status_code == 400
+    assert "finite, non-negative" in response.json()["detail"]
+
+
+def test_h3_control_requires_configured_checkpoint(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Missing weights.", "control_type": "inpaint"},
+        files={"mask_reference": ("mask.png", b"unread", "image/png")},
+    )
+    assert response.status_code == 400
+    assert "--controlnet-model-path" in response.json()["detail"]
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+@pytest.mark.parametrize("role", ["source", "mask"])
+def test_non_h3_model_rejects_inpaint_roles(role, test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3OmniDiffusersPipeline"
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Unsupported."},
+        files={f"{role}_reference": ("media.mp4", b"unread", "video/mp4")},
+    )
+    assert response.status_code == 400
+    assert "not supported" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_corrupt_mask_releases_prior_source(endpoint, test_client, mocker):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    created = []
+    original = video_generation_helpers.tempfile.mkstemp
+
+    def track(*args, **kwargs):
+        result = original(*args, **kwargs)
+        created.append(result[1])
+        return result
+
+    mocker.patch.object(video_generation_helpers.tempfile, "mkstemp", side_effect=track)
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Invalid mask.", "control_type": "inpaint"},
+        files={
+            "source_reference": ("source.mp4", _make_test_video_bytes(), "video/mp4"),
+            "mask_reference": ("mask.png", b"corrupt", "image/png"),
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "Invalid conditioning media" in response.json()["detail"]
+    assert created and all(not Path(path).exists() for path in created)
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_inpaint_generation_failure_releases_all_uploads(endpoint, test_client, mocker):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    paths: list[str] = []
+
+    async def fail(request, *args, **kwargs):
+        paths.extend(value for key, value in request.extra_params["canny"].items() if key.endswith("_path"))
+        assert len(paths) == 3 and all(Path(path).exists() for path in paths)
+        raise RuntimeError("controlled failure")
+
+    mocker.patch.object(OmniOpenAIServingVideo, "generate_video_bytes", side_effect=fail)
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Fail.", "control_type": "canny"},
+        files={
+            "control_reference": ("hint.mp4", _make_test_video_bytes(), "video/mp4"),
+            "source_reference": ("source.mp4", _make_test_video_bytes(), "video/mp4"),
+            "mask_reference": ("mask.png", _make_test_image_bytes(), "image/png"),
+        },
+    )
+    if endpoint.endswith("/sync"):
+        assert response.status_code == 500
+    else:
+        assert response.status_code == 200
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.FAILED.value)
+    assert len(paths) == 3 and all(not Path(path).exists() for path in paths)
+
+
+def test_h3_inpaint_timeout_releases_uploads(test_client, mocker, monkeypatch):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    paths: list[str] = []
+    cancelled = []
+
+    async def block(request, *args, **kwargs):
+        paths.extend(value for key, value in request.extra_params["inpaint"].items() if key.endswith("_path"))
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    mocker.patch.object(OmniOpenAIServingVideo, "generate_video_bytes", side_effect=block)
+    monkeypatch.setattr(api_server, "VIDEO_SYNC_TIMEOUT_S", 0.01)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Timeout.", "control_type": "inpaint"},
+        files={
+            "source_reference": ("source.mp4", _make_test_video_bytes(), "video/mp4"),
+            "mask_reference": ("mask.png", _make_test_image_bytes(), "image/png"),
+        },
+    )
+    assert response.status_code == 504
+    assert cancelled == [True]
+    assert len(paths) == 2 and all(not Path(path).exists() for path in paths)
+
+
+@pytest.mark.parametrize("role", ["source", "mask"])
+def test_h3_inpaint_upload_limit(role, test_client, monkeypatch):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    monkeypatch.setattr(video_generation_helpers, "CONTROL_REFERENCE_MAX_BYTES", 3)
+    files = {"mask_reference": ("mask.png", b"png", "image/png")}
+    files[f"{role}_reference"] = (f"{role}.mp4", b"oversize", "video/mp4")
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Too large.", "control_type": "inpaint"},
+        files=files,
+    )
+    assert response.status_code == 400
+    assert f"{role}_reference exceeds" in response.json()["detail"]
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+def test_conditioning_validation_stops_at_frame_budget(mocker):
+    class Frame:
+        width = height = 16
+        time = None
+
+    class Container:
+        streams = SimpleNamespace(video=[object()])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def decode(self, **kwargs):
+            yield Frame()
+            yield Frame()
+            raise AssertionError("Decoder read beyond the validation prefix.")
+
+    mocker.patch("av.open", return_value=Container())
+    video_api_utils.validate_control_media_file("unused.mp4", max_frames=1)
+
+
+def test_other_inpaint_capability_does_not_select_h3(test_client, mocker):
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "supported_control_upload_types",
+        new_callable=mocker.PropertyMock,
+        return_value=frozenset({"inpaint"}),
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Other model.", "control_type": "inpaint"},
+        files={"mask_reference": ("mask.png", b"unread", "image/png")},
+    )
+    assert response.status_code == 400
+    assert "not supported by this model" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("typed_stage", [False, True])
+def test_h3_control_checkpoint_falls_back_to_resolved_stage(typed_stage):
+    projection = {
+        "model_class_name": "MiniMaxH3ModularPipeline",
+        "controlnet_model_path": "/loaded/control.safetensors",
+    }
+    stage = (
+        SimpleNamespace(stage_type="diffusion", diffusion_config=SimpleNamespace(**projection))
+        if typed_stage
+        else {"stage_type": "diffusion", "engine_args": projection}
+    )
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace(model_class_name="MiniMaxH3ModularPipeline")),
+        model_name="h3",
+        stage_configs=[stage],
+    )
+    try:
+        assert handler.controlnet_configured
+    finally:
+        handler.shutdown()
+
+
+def test_h3_control_full_config_takes_precedence_over_stage():
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace(model_class_name="MiniMaxH3Pipeline", controlnet_model_path=None)),
+        model_name="h3",
+        stage_configs=[
+            {
+                "stage_type": "diffusion",
+                "engine_args": {
+                    "model_class_name": "MiniMaxH3Pipeline",
+                    "controlnet_model_path": "/stale/control.safetensors",
+                },
+            }
+        ],
+    )
+    try:
+        assert not handler.controlnet_configured
+    finally:
+        handler.shutdown()
+
+
+def test_h3_control_does_not_borrow_another_stage_checkpoint():
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace(model_class_name="MiniMaxH3Pipeline")),
+        model_name="h3",
+        stage_configs=[
+            {
+                "stage_type": "diffusion",
+                "engine_args": {
+                    "model_class_name": "AnotherPipeline",
+                    "controlnet_model_path": "/other/control.safetensors",
+                },
+            }
+        ],
+    )
+    try:
+        assert not handler.controlnet_configured
+    finally:
+        handler.shutdown()

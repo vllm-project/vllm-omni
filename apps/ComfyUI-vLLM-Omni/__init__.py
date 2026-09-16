@@ -20,6 +20,7 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
     VLLMOmniGenerateVideo,
+    VLLMOmniMiniMaxH3Control,
     VLLMOmniMiniMaxH3Params,
     VLLMOmniQwenTTSParams,
     VLLMOmniRemoteLoRA,
@@ -40,6 +41,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniTTS": VLLMOmniTTS,
     "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
     "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
+    "VLLMOmniMiniMaxH3Control": VLLMOmniMiniMaxH3Control,
     # === Params ===
     "VLLMOmniARSampling": VLLMOmniARSampling,
     "VLLMOmniDiffusionSampling": VLLMOmniDiffusionSampling,
@@ -60,6 +62,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniTTS": "TTS (Text to Speech)",
     "VLLMOmniVoiceClone": "TTS Voice Cloning",
     "VLLMOmniVideoReferences": "Video References",
+    "VLLMOmniMiniMaxH3Control": "MiniMax-H3 Control",
     # === Params ===
     "VLLMOmniARSampling": "AR Sampling Params",
     "VLLMOmniDiffusionSampling": "Diffusion Sampling Params",

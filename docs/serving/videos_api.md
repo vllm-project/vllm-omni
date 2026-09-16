@@ -69,7 +69,9 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
 | `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
-| `control_type` | string | null | Model control name associated with `control_reference`; currently Cosmos3 supports `edge`, `blur`, `depth`, `seg`, and `wsm` |
+| `source_reference` | file | null | H3 inpainting source video, up to 512 MiB; requires `mask_reference` |
+| `mask_reference` | file | null | H3 static mask image or temporal mask video, up to 512 MiB; white means regenerate |
+| `control_type` | string | null | Cosmos3: `edge`, `blur`, `depth`, `seg`, `wsm`; H3: `canny`, `depth`, `hed`, `mlsd`, `pose`, `inpaint`. See model-specific requirements below |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
 | `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
 | `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
@@ -213,6 +215,90 @@ can differ from the original host, and vLLM-Omni does not yet fully implement
 upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
+
+### MiniMax H3 control and inpainting
+
+MiniMax H3 FL2VA accepts preprocessed control videos when the server is
+started with `--controlnet-model-path /absolute/path/to/control.safetensors`.
+Use the original MiniMax H3 Fun ControlNet Union checkpoint. The checkpoint
+is loaded at startup; requests cannot select or download weights.
+
+Both `POST /v1/videos` and `POST /v1/videos/sync` accept these multipart fields:
+
+| Field | Meaning |
+| --- | --- |
+| `control_type` | `canny`, `depth`, `hed`, `mlsd`, `pose`, or `inpaint` |
+| `control_reference` | Prepared hint video; required for every type except `inpaint` |
+| `source_reference` | Optional source video for inpainting; requires `mask_reference` |
+| `mask_reference` | Static mask image or temporal mask video; required for `inpaint` |
+| `extra_params.<control_type>.control_context_scale` | Finite, non-negative strength, default `1.0`; `0` bypasses conditioning |
+
+Generated-audio quality validation is incomplete: Turbo control samples and
+a Base inpainting sample were very quiet despite valid audio streams. See
+the [H3 recipe](../../recipes/MiniMaxAI/MiniMax-H3.md#validation-status) for
+the tested configuration and current limitations.
+
+The hint type describes supplied pixels. Selecting `pose` does not detect
+poses, and selecting `canny` does not extract edges. Clients and ComfyUI
+preprocessing workflows prepare those videos before uploading them.
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=A person walking through a garden" \
+  -F "control_type=canny" \
+  -F "control_reference=@canny.mp4;type=video/mp4" \
+  -F 'extra_params={"canny":{"control_context_scale":1.0}}' \
+  -o controlled.mp4
+```
+
+For inpainting, upload the source and mask using their explicit roles:
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=A red jacket on the person" \
+  -F "control_type=inpaint" \
+  -F "source_reference=@source.mp4;type=video/mp4" \
+  -F "mask_reference=@mask.png;type=image/png" \
+  -F 'extra_params={"inpaint":{"control_context_scale":1.0}}' \
+  -o inpainted.mp4
+```
+
+White mask values (`1`) mean regenerate; black (`0`) means preserve through
+conditioning. Masks are thresholded at `> 0.5`. Static masks broadcast across
+frames; prefer PNG for static masks and lossless FFV1/MKV for temporal masks.
+Inpainting is learned conditioning and does not guarantee pixel-exact
+compositing outside the mask. A mask without a source is permitted and uses
+zero source pixels. Missing control pixels use zero hint channels. To combine
+an edge/pose/etc. hint with inpainting, select that hint's `control_type` and
+upload all three roles.
+
+Output uses H3's 24 FPS and `17k+5` frame grid. Media is aligned to the requested
+output canvas and time grid; extra frames are truncated and short inputs hold
+their final frame. Masks follow the same geometry as the source. Control
+videos' audio streams are not conditioning inputs; generated H3 audio is
+returned with the video.
+
+These fields are separate from `input_reference`, `input_references`,
+`image_reference`, `video_reference`, and `audio_reference`. Combining those
+reference/keyframe inputs with control is currently rejected. In particular,
+do not send an inpainting source via `video_reference`: that role selects
+Ref2VA rather than inpainting.
+
+Each uploaded role has a 512 MiB limit. Empty, oversized, undecodable inputs
+and invalid combinations return HTTP 400 before a job is queued. Media
+validation inspects a bounded prefix; decoder errors later in a stream may
+still fail the generation job. The server owns
+the temporary upload paths and releases them on completion, failure, or
+cancellation. Send files, not server-local paths or tensors in `extra_params`.
+Only the selected control namespace may appear in the request. Models without
+H3 inpainting support continue to reject source and mask uploads.
+
+CTRL-02 can transport these fields through the existing Generate Video node;
+media must remain multipart files, separate from JSON scalar parameters.
+IMAGE batches from pose preprocessors can use ComfyUI's built-in video
+adapters at 24 FPS. Control and source are distinct roles even when they
+originate from the same clip; detector selection belongs to the client
+workflow.
 
 ### Speech-to-Video
 
