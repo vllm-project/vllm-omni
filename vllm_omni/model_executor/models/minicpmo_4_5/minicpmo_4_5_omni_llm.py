@@ -4500,8 +4500,14 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             cache_length = _get_audio_cache_length(self.audio_past_key_values)
             apm_max_len = self.apm.embed_positions.weight.shape[0]
             if cache_length + current_seq_len >= apm_max_len:
+                # Official MiniCPM-o 4.5 (checkpoint modeling and the unified
+                # duplex demo) resets the audio KV at the APM's absolute
+                # position limit instead of sliding it: the learned Whisper
+                # positions cannot be re-aligned the way RoPE caches can.
                 logger.warning(
-                    "audio_past_key_values length %s exceeds %s, reset.",
+                    "audio_past_key_values length %s exceeds the APM position limit %s "
+                    "(~30s of streamed audio); resetting the audio encoder cache "
+                    "to match official MiniCPM-o 4.5 streaming behavior.",
                     cache_length + current_seq_len,
                     apm_max_len,
                 )

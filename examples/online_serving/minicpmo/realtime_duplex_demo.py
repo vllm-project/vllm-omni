@@ -437,6 +437,14 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     if not input_pcm16:
         raise ValueError("input WAV has no audio")
 
+    # Long inputs need proportionally longer waits: realtime pacing already
+    # spends the clip duration streaming, and burst mode leaves the server a
+    # full backlog to process after the commit. Scale with the clip unless
+    # the operator pinned a timeout explicitly.
+    timeout_s = args.timeout_s
+    if timeout_s is None:
+        timeout_s = max(60.0, 45.0 + 1.5 * _pcm16_wav_duration_s(Path(input_wav)))
+
     collector = _StreamingEventCollector(stream_writer)
     client = DuplexClient(
         args.url,
@@ -448,7 +456,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         session_id=args.session_id,
         reconnect=None,
         heartbeat_interval_s=None,
-        handshake_timeout_s=args.timeout_s,
+        handshake_timeout_s=timeout_s,
     )
     async with client:
         consume_task = asyncio.create_task(collector.consume(client))
@@ -477,7 +485,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         try:
             await wait_for_condition(
                 lambda: _input_committed_index(collector.events, commit_event_cursor) is not None,
-                timeout_s=args.timeout_s,
+                timeout_s=timeout_s,
                 label="input_audio_buffer.committed",
             )
             committed_index = _input_committed_index(collector.events, commit_event_cursor)
@@ -488,7 +496,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             if wait_for_post_commit_decision:
                 await wait_for_condition(
                     lambda: _post_commit_model_decision(collector.events, committed_index) is not None,
-                    timeout_s=args.timeout_s,
+                    timeout_s=timeout_s,
                     label="post-commit model decision or response drain",
                 )
                 post_commit_decision = _post_commit_model_decision(collector.events, committed_index)
@@ -496,7 +504,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             wait_error = str(exc)
         await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
-        await client.close(timeout_s=args.timeout_s)
+        await client.close(timeout_s=timeout_s)
         # close() returns when the client's reader observed session.closed;
         # the collector is a separate subscriber task, so wait for it to
         # drain before checking, or a normal close reads as a failure.
@@ -691,7 +699,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
     parser.add_argument("--chunk-ms", type=int, default=200)
-    parser.add_argument("--timeout-s", type=float, default=60.0)
+    parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Wait budget for the handshake, input commit, post-commit model "
+            "decision, and session close. Default scales with the input clip "
+            "(max(60, 45 + 1.5 * duration_s)) so long videos do not trip the "
+            "post-commit waits; pass a value to pin it."
+        ),
+    )
     parser.add_argument(
         "--temperature",
         type=float,
