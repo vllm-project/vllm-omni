@@ -33,6 +33,8 @@ from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
+    fused_qk_norm_rope_available,
+    fused_qk_norm_rope_min_tokens,
     pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -65,6 +67,13 @@ def _packed_qk_norm_rope_table(
     Stored in the activation dtype like the eager chain's cos/sin.
     """
     cos, sin = image_rotary_emb
+    rotary_dim = 2 * cos.shape[-1]
+    # No table (no allocation, no copy) unless the CUDA kernel would run for
+    # these activations: CPU/NPU/ROCm and non-bf16 paths keep the eager chain.
+    if not fused_qk_norm_rope_available(cos.device, dtype, rotary_dim, rotary_dim):
+        return None
+    if batch_size * (cos.shape[0] + text_seq_len) < fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS):
+        return None
     cos = torch.cat((cos, cos.new_ones((text_seq_len, cos.shape[-1]))), dim=0)
     sin = torch.cat((sin, sin.new_zeros((text_seq_len, sin.shape[-1]))), dim=0)
     return pack_qk_norm_rope_table(cos, sin, batch_size, dtype=dtype, min_tokens=_FUSED_MIN_TOKENS)
