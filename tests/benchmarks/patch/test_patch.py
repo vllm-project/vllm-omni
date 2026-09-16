@@ -311,32 +311,37 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch,
     session_id = output.duplex_request_metrics[0]["session_id"]
     assert len(output.duplex_request_metrics) == 4
     for index, metrics in enumerate(output.duplex_request_metrics):
-        assert metrics == {
+        has_tpot = index + 1 != missing_metrics_turn
+        measurement_origin = {
+            "ttft": "first silence append client send to first non-empty text delta",
+            "ttfp": "first silence append client send to first audio packet",
+            "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+        }
+        expected_metrics = {
             "session_id": session_id,
             "request_index": index,
             "utterance_id": f"utt-{index}",
             # Response ids are per session, and each utterance now gets its own.
             "response_id": "resp-1",
             "source": "client_monotonic_receive",
-            "measurement_origin": {
-                "ttft": "first silence append client send to first non-empty text delta",
-                "ttfp": "first silence append client send to first audio packet",
-                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
-                "tpot": "Stage-0 engine mean time per output token",
-            },
+            "measurement_origin": measurement_origin,
             "ttft_ms": pytest.approx(20.0, abs=2.0),
-            "tpot_ms": 10.0,
             "ttfp_ms": pytest.approx(30.0, abs=2.0),
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
             "audio_duration_ms": 100.0,
         }
+        if has_tpot:
+            measurement_origin["tpot"] = "Stage-0 engine mean time per output token"
+            expected_metrics["tpot_ms"] = 10.0
+
+        assert metrics == expected_metrics
     session = output.duplex_session_metrics
     assert session["session_id"] == session_id
     assert session["audio_turn_count"] == 4
     assert session["ttft_ms"]["count"] == 4
     assert session["ttft_ms"]["mean"] == pytest.approx(20.0, abs=2.0)
-    assert session["tpot_ms"] == {"count": 4, "mean": 10.0, "p50": 10.0, "p99": 10.0}
+    assert session["tpot_ms"] == {"count": len(measured_turns), "mean": 10.0, "p50": 10.0, "p99": 10.0}
     assert session["ttfp_ms"]["count"] == 4
     assert session["ttfp_ms"]["mean"] == pytest.approx(30.0, abs=2.0)
     assert session["rtf"]["count"] == 4
