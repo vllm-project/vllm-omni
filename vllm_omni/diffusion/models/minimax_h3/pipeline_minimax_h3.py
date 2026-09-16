@@ -128,11 +128,11 @@ from .denoise_loop import (
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .lora import TurboSpec, load_minimax_h3_turbo_lora
-from .minimax_h3_transformer import (
+from .minimax_h3_blocks import (
     MiniMaxH3Attention,
-    MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
 )
+from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
     load_minimax_h3_native_lora,

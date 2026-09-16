@@ -11,6 +11,7 @@ import json
 import os
 import threading
 import time
+from collections import UserDict
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -1015,6 +1016,71 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
     handler._stage_configs = handler._engine_client.stage_configs
 
     assert handler.supports_mixed_reference_inputs
+
+
+@pytest.mark.parametrize("stage_factory", [dict, UserDict, SimpleNamespace])
+@pytest.mark.parametrize("engine_args_factory", [dict, UserDict, SimpleNamespace])
+def test_video_capabilities_follow_late_stage_configuration(stage_factory, engine_args_factory):
+    config = SimpleNamespace(model_class_name="WanPipeline", supports_mixed_reference_inputs=False)
+    stages = [
+        stage_factory(
+            model_arch="MiniMaxH3TextEncoder",
+            engine_args=engine_args_factory(model_class_name="MiniMaxH3ModularPipeline"),
+        ),
+        stage_factory(model_arch="Cosmos3OmniPipeline"),
+    ]
+    handler = OmniOpenAIServingVideo.for_diffusion(SimpleNamespace(od_config=config), model_name="test-model")
+    try:
+        assert not handler.supports_mixed_reference_inputs
+        assert not handler.is_minimax_h3
+        assert handler.supported_control_upload_types == frozenset()
+
+        handler.set_stage_configs_if_missing(stages)
+
+        assert handler.supports_mixed_reference_inputs
+        assert handler.is_minimax_h3
+        assert handler.supported_control_upload_types == frozenset(
+            {"canny", "depth", "hed", "mlsd", "pose", "inpaint", "edge", "blur", "seg", "wsm"}
+        )
+
+        stages.clear()
+
+        assert not handler.supports_mixed_reference_inputs
+        assert not handler.is_minimax_h3
+        assert handler.supported_control_upload_types == frozenset()
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("has_config", [False, True])
+def test_video_capabilities_preserve_missing_config_fallback(has_config):
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace() if has_config else None),
+        model_name="test-model",
+        stage_configs=[{"model_arch": "MiniMaxH3Pipeline"}],
+    )
+    try:
+        assert handler.supports_mixed_reference_inputs is has_config
+        assert handler.is_minimax_h3
+        assert handler.supported_control_upload_types == frozenset({"canny", "depth", "hed", "mlsd", "pose", "inpaint"})
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("capability", [False, True])
+def test_mixed_reference_capability_preserves_explicit_config_opt_in(capability):
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(
+            od_config=SimpleNamespace(model_class_name="WanPipeline", supports_mixed_reference_inputs=capability)
+        ),
+        model_name="test-model",
+    )
+    try:
+        assert handler.supports_mixed_reference_inputs is capability
+        assert not handler.is_minimax_h3
+        assert handler.supported_control_upload_types == frozenset()
+    finally:
+        handler.shutdown()
 
 
 @pytest.mark.parametrize("model_class_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])

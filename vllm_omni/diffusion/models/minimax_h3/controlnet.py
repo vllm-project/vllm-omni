@@ -19,7 +19,7 @@ from torch.nn import functional as F
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from .minimax_h3_transformer import MiniMaxH3DiTArchConfig, MiniMaxH3DiTBlock
+from .minimax_h3_blocks import MiniMaxH3DiTArchConfig, MiniMaxH3DiTBlock
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 CONTROL_TYPES = frozenset({"canny", "depth", "hed", "mlsd", "pose", "inpaint"})

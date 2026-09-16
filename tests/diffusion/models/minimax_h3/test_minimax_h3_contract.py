@@ -1154,7 +1154,7 @@ def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
 
 
 def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks
 
     class InactiveContext:
         sp_active = False
@@ -1162,13 +1162,13 @@ def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatc
     attention = _fake_packed_attention("CUDNN_ATTN")
     attention.attention.use_ring = True
     monkeypatch.setattr(
-        minimax_h3_transformer,
+        minimax_h3_blocks,
         "is_forward_context_available",
         lambda: True,
         raising=False,
     )
     monkeypatch.setattr(
-        minimax_h3_transformer,
+        minimax_h3_blocks,
         "get_forward_context",
         InactiveContext,
         raising=False,

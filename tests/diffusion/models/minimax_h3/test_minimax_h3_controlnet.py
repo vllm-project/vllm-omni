@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 from vllm_omni.diffusion.models.minimax_h3.controlnet import (
     MiniMaxH3ControlNet,
@@ -43,7 +44,7 @@ class CPUAttention(nn.Module):
 
 @pytest.fixture
 def cpu_layers(monkeypatch):
-    monkeypatch.setattr(h3, "Attention", CPUAttention)
+    monkeypatch.setattr(blocks, "Attention", CPUAttention)
     with ExitStack() as stack:
         for module in ("vllm.model_executor.layers.linear", "vllm.model_executor.parameter", h3.__name__):
             for name, value in (("get_tensor_model_parallel_world_size", 1), ("get_tensor_model_parallel_rank", 0)):
@@ -52,7 +53,7 @@ def cpu_layers(monkeypatch):
 
 
 def tiny_arch():
-    return h3.MiniMaxH3DiTArchConfig(
+    return blocks.MiniMaxH3DiTArchConfig(
         num_layers=2,
         token_refiner_num_layers=0,
         hidden_size=8,
@@ -173,7 +174,7 @@ def test_control_stream_matches_reference_and_never_injects_audio(cpu_layers):
     video, audio = torch.tensor([1, 3]), torch.tensor([2])
     indices = torch.tensor([1, 0, 2, 0, 1])
     # The official control forward rounds the shared embedding before SiLU.
-    temb = torch.randn(1, 4).bfloat16()
+    temb = torch.randn(1, 4, generator=torch.Generator().manual_seed(5)).bfloat16()
     rope = torch.cat((torch.ones(5, 3), torch.zeros(5, 3)), -1).bfloat16()
     actual = model(
         hidden,
@@ -323,7 +324,7 @@ def test_transformer_baseline_zero_strength_and_request_isolation(cpu_layers):
     }
     adaln_dtypes = []
     for module in model.modules():
-        if isinstance(module, h3.MiniMaxH3AdalnProj):
+        if isinstance(module, blocks.MiniMaxH3AdalnProj):
             module.register_forward_pre_hook(lambda _module, args: adaln_dtypes.append(args[0].dtype))
     before = model(**kwargs)
     assert adaln_dtypes == [torch.float32] * 3  # two main blocks plus final head
