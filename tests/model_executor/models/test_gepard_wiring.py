@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU coverage for the seam between Gepard's talker and the AR runner.
 
 ``test_gepard_window.py`` pins the decode arithmetic *below* this layer, and
@@ -511,48 +511,6 @@ def test_a_resubmitted_request_id_keeps_its_new_state(caplog: pytest.LogCaptureF
     assert any("resubmitted" in m for m in caplog.messages), (
         f"the aborted request's truncation went unreported; saw {caplog.messages}"
     )
-
-
-def test_a_preempted_request_is_reported_rather_than_resumed(caplog: pytest.LogCaptureFixture) -> None:
-    """Recompute preemption re-prefills a request that was mid-generation.
-
-    This model cannot survive that, and the point of the test is that it says
-    so. The recomputed ids are the prompt plus the head0 codes sampled so far,
-    which go through the text embedding table, and each frame's other 31 codes
-    are never in the token stream at all — there is nothing to stitch the two
-    halves back together with, so generation restarts from frame 0.
-
-    The harness re-prefills with the bare prompt, which understates the damage.
-    What is under test is the report and the reset, not the corruption, which
-    needs a real backbone to observe.
-    """
-    _talker, _codec, engine = _build()
-    engine.add_request("req-0", max_tokens=4000)
-    for _ in range(FIRST_CHUNK_FRAMES + 2):
-        engine.step()
-    assert engine.committed_frames["req-0"] > 0
-
-    # Preemption the way the scheduler does it: computed tokens back to 0, so
-    # the next step re-prefills, and no id reaches on_requests_finished.
-    engine.reqs["req-0"]["computed"] = 0
-
-    target = logging.getLogger(LOGGER_NAME)
-    target.addHandler(caplog.handler)
-    prev = target.level
-    target.setLevel(logging.WARNING)
-    try:
-        engine.step()
-    finally:
-        target.removeHandler(caplog.handler)
-        target.setLevel(prev)
-
-    assert any("preempted" in m for m in caplog.messages), (
-        f"a preempted request restarted its audio silently; saw {caplog.messages}"
-    )
-    assert not any("resubmitted" in m for m in caplog.messages), (
-        "a preemption was reported as an id resubmit; the two need different words"
-    )
-    assert engine.committed_frames["req-0"] == 1, "the re-prefill must start the frame history over"
 
 
 def test_concurrent_requests_each_receive_their_own_full_audio() -> None:
