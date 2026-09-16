@@ -258,6 +258,7 @@ def _make_compile_runner(
     *,
     compile_granularity: str = "regional",
     compile_dynamic: bool = True,
+    compile_mode: str = "default",
     use_hsdp: bool = False,
 ):
     runner = object.__new__(DiffusionModelRunner)
@@ -265,6 +266,7 @@ def _make_compile_runner(
     runner.od_config = SimpleNamespace(
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
+        diffusion_compile_mode=compile_mode,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
     )
     return runner
@@ -460,7 +462,7 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
         (
             runner.pipeline.transformer,
             (),
-            {"dynamic": True},
+            {"mode": "default", "dynamic": True},
         )
     ]
 
@@ -481,7 +483,7 @@ def test_compile_transformer_uses_regional_dynamic_false_config(monkeypatch):
 
     DiffusionModelRunner._compile_transformer(runner, "transformer")
 
-    assert regional_calls == [(model, {"dynamic": False})]
+    assert regional_calls == [(model, {"mode": "default", "dynamic": False})]
     assert model.compile_calls == []
     assert runner.pipeline.transformer is compiled_model
 
@@ -501,9 +503,44 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
 
     DiffusionModelRunner._compile_transformer(runner, "transformer")
 
-    assert model.compile_calls == [((), {"dynamic": False})]
+    assert model.compile_calls == [((), {"mode": "default", "dynamic": False})]
     assert regional_calls == []
     assert runner.pipeline.transformer is model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_forwards_regional_compile_mode(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_mode="reduce-overhead")
+    regional_calls = []
+
+    def _regionally_compile(target, **kwargs):
+        regional_calls.append((target, kwargs))
+        return target
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert regional_calls == [(model, {"mode": "reduce-overhead", "dynamic": True})]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_forwards_full_compile_mode(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(
+        model,
+        compile_granularity="full",
+        compile_mode="max-autotune",
+    )
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", lambda *a, **k: None)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"mode": "max-autotune", "dynamic": True})]
 
 
 @pytest.mark.core_model

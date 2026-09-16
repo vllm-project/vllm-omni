@@ -108,26 +108,21 @@ base_config: vllm_omni/deploy/Gr00tN1d7.yaml
 stages:
   - stage_id: 0
     enforce_eager: false
-    compile_mode: default          # or reduce-overhead
+    diffusion_compile_mode: default    # or reduce-overhead
 ```
-
-!!! warning
-    Keep `compile_mode` at the stage level, not under `model_config:`. Overlay
-    merging is deep only for the keys in `_DEEP_MERGE_KEYS`; a `model_config:`
-    block in an overlay **replaces** the base block instead of merging, which
-    drops `policy_server_config` and silently disables OpenPI serving
-    (`Robot OpenPI serving disabled for model ...`, and the client fails its
-    msgpack handshake with `TypeError: a bytes-like object is required`).
 
 ```bash
 vllm serve nvidia/GR00T-N1.7-3B --omni --deploy-config gr00t_compile.yaml
 ```
 
+`diffusion_compile_mode` is also available as `--diffusion-compile-mode` on the
+command line, applied to every diffusion stage.
+
 Measured on 1xA30, DP=1, 30 requests/client after 20 warmup requests. Actions were
 checked against the golden values in
 `tests/e2e/online_serving/test_gr00t_openpi_expansion.py` (atol 1e-2) before each run:
 
-| `compile_mode` | latency | throughput | golden values |
+| `diffusion_compile_mode` | latency | throughput | golden values |
 |---|---|---|---|
 | (eager, default) | 146.9 ms | 7.49 req/s | PASS |
 | `default` | 102.9 ms (-30%) | 10.69 req/s (+43%) | PASS |

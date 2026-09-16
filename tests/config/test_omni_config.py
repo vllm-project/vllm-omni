@@ -1122,6 +1122,75 @@ def test_from_pipeline_config_routes_regional_compile_dynamic(tmp_path):
     assert overridden_stage.diffusion_config.diffusion_compile_dynamic is True
 
 
+def test_from_pipeline_config_routes_compile_mode_through_base_config_overlay(tmp_path):
+    """A stage-level compile mode must survive a ``base_config`` overlay.
+
+    This is the shape the GR00T recipe documents: a thin overlay that flips
+    ``enforce_eager`` and sets a compile mode on top of a shipped deploy YAML.
+    Before ``diffusion_compile_mode`` became a structured stage field the key
+    was dropped on the way into the diffusion projection, so the overlay
+    silently ran the default mode.
+    """
+    base_path = tmp_path / "dreamzero.yaml"
+    base_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    enforce_eager: true",
+            ]
+        )
+    )
+    overlay_path = tmp_path / "dreamzero_compile.yaml"
+    overlay_path.write_text(
+        "\n".join(
+            [
+                "base_config: dreamzero.yaml",
+                "stages:",
+                "  - stage_id: 0",
+                "    enforce_eager: false",
+                "    diffusion_compile_mode: reduce-overhead",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(overlay_path)).stage_by_id(0)
+
+    assert stage.diffusion_config.diffusion_compile_mode == "reduce-overhead"
+    assert stage.diffusion_config.enforce_eager is False
+
+
+def test_from_pipeline_config_defaults_and_overrides_compile_mode(tmp_path):
+    deploy_path = tmp_path / "dreamzero_compile_mode.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+            ]
+        )
+    )
+
+    default_stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+    overridden_stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+        cli_overrides={"diffusion_compile_mode": "max-autotune"},
+    ).stage_by_id(0)
+
+    assert default_stage.diffusion_config.diffusion_compile_mode == "default"
+    assert overridden_stage.diffusion_config.diffusion_compile_mode == "max-autotune"
+
+
+def test_structured_diffusion_config_rejects_invalid_compile_mode():
+    with pytest.raises(ValidationError, match="diffusion_compile_mode"):
+        omni_config_module._DiffusionConfigProjection(diffusion_compile_mode="turbo")
+
+
 def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
     with pytest.raises(ValidationError, match="diffusion_compile_dynamic"):
         omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")

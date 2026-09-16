@@ -29,10 +29,27 @@ still contain graph breaks; it does not force one graph. It is rejected when
 HSDP, sequence parallelism, CPU offload, or layerwise offload is enabled. Use
 regional scope with those features.
 
-These settings control the generic model-runner compilation path. Pipelines
-that provide their own `setup_compile()` implementation manage their compilation
-policy independently. Compilation is lazy, so backend or graph errors can first
-surface on the initial request.
+## Compile mode
+
+`--diffusion-compile-mode` selects the `torch.compile` mode. It accepts
+`default` (the default), `reduce-overhead`, `max-autotune`, and
+`max-autotune-no-cudagraphs`, and has a per-stage deploy equivalent:
+
+```yaml
+stages:
+  - stage_id: 0
+    diffusion_compile_mode: reduce-overhead
+```
+
+Unlike granularity and dynamic shapes, this one also reaches pipelines that
+implement their own `setup_compile()`, so it is the single knob for compile mode
+across both paths. `reduce-overhead` adds CUDA graphs and their static-address
+constraints; prefer `default` unless you have measured a reason not to.
+
+Granularity and dynamic shapes control the generic model-runner compilation path
+only. Pipelines that provide their own `setup_compile()` implementation manage
+the rest of their compilation policy independently. Compilation is lazy, so
+backend or graph errors can first surface on the initial request.
 
 ## Pinning one packed shape (MiniMax-H3)
 

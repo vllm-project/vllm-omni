@@ -234,12 +234,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
+        compile_mode = self.od_config.diffusion_compile_mode
         try:
             if compile_granularity == "full":
-                model.compile(dynamic=compile_dynamic)
+                model.compile(mode=compile_mode, dynamic=compile_dynamic)
                 compiled_model = model
             else:
-                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+                compiled_model = regionally_compile(model, mode=compile_mode, dynamic=compile_dynamic)
             setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
             logger.warning(
@@ -253,10 +254,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return
 
         logger.info(
-            "Model runner: %s configured for lazy %s torch.compile with dynamic=%s; "
+            "Model runner: %s configured for lazy %s torch.compile with mode=%s, dynamic=%s; "
             "compilation errors may surface on the first request.",
             attr_name,
             compile_granularity,
+            compile_mode,
             compile_dynamic,
         )
 

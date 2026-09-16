@@ -197,6 +197,7 @@ def test_default_stage_config_preserves_omitted_dp_for_runtime_inference():
             "enforce_eager": None,
             "diffusion_compile_granularity": None,
             "diffusion_compile_dynamic": None,
+            "diffusion_compile_mode": None,
         }
     )[0]
 
@@ -209,6 +210,7 @@ def test_default_stage_config_preserves_omitted_dp_for_runtime_inference():
     assert terminal_config.enforce_eager is False
     assert terminal_config.diffusion_compile_granularity == "regional"
     assert terminal_config.diffusion_compile_dynamic is True
+    assert terminal_config.diffusion_compile_mode == "default"
 
 
 def test_default_stage_config_propagates_ulysses_mode():
@@ -559,6 +561,8 @@ def test_serve_cli_accepts_diffusion_compile_controls():
             "--diffusion-compile-granularity",
             "full",
             "--no-diffusion-compile-dynamic",
+            "--diffusion-compile-mode",
+            "reduce-overhead",
         ]
     )
 
@@ -569,6 +573,8 @@ def test_serve_cli_accepts_diffusion_compile_controls():
     assert args.diffusion_compile_dynamic is False
     assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "full"
     assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is False
+    assert args.diffusion_compile_mode == "reduce-overhead"
+    assert stage_cfg["engine_args"]["diffusion_compile_mode"] == "reduce-overhead"
 
 
 def test_serve_cli_accepts_diffusion_attention_backend():

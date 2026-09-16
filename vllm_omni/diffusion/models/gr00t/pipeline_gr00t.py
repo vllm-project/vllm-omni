@@ -55,18 +55,10 @@ class Gr00tN1d7Pipeline(nn.Module):
         self._validate_policy_server_config(model_config.get("policy_server_config"))
 
         # Resolved here so it lands on the instance before the runner's post-load
-        # hook calls setup_compile().
-        #
-        # Prefer the stage-level ``compile_mode`` (an unrecognised stage key, so it
-        # rides in ``engine_extras``, which base_config overlays deep-merge). A
-        # ``model_config.compile_mode`` is honoured too for direct edits of this
-        # model's deploy YAML, but note that an overlay setting ``model_config:``
-        # replaces the base block wholesale rather than merging it -- only the
-        # keys in _DEEP_MERGE_KEYS are merged -- which would drop
-        # ``policy_server_config`` and silently disable OpenPI serving.
-        self.compile_mode = str(
-            getattr(od_config, "compile_mode", None) or model_config.get("compile_mode") or "default"
-        )
+        # hook calls setup_compile(). ``diffusion_compile_mode`` is a structured
+        # stage field, so it is validated at config build and survives a
+        # base_config overlay.
+        self.compile_mode = od_config.diffusion_compile_mode
 
     def setup_compile(self) -> None:
         """torch.compile the action head, which dominates kernel-launch overhead.
@@ -85,8 +77,8 @@ class Gr00tN1d7Pipeline(nn.Module):
         graph capture (``assert dst.data_ptr() == src.data_ptr()``) and moves the
         actions past the e2e tolerance (eef_9d 1.5e-2 against atol 1e-2).
 
-        ``compile_mode`` on the stage selects the torch.compile mode; measured on an
-        A30 against the eager baseline:
+        ``diffusion_compile_mode`` on the stage selects the torch.compile mode;
+        measured on an A30 against the eager baseline:
 
             default          -32% latency (146.9 -> 102.9 ms), +43% throughput
             reduce-overhead  -32% latency (146.9 ->  99.3 ms), +48% throughput
@@ -94,12 +86,12 @@ class Gr00tN1d7Pipeline(nn.Module):
         ``default`` is the default here: it carries 92% of the win with none of the
         CUDA graph static-address constraints.
         """
-        mode = getattr(self, "compile_mode", "default")
+        mode = self.compile_mode
         if not torch.cuda.is_available():
             logger.info("GR00T setup_compile skipped: CUDA is not available.")
             return
 
-        if "reduce-overhead" in mode:
+        if mode == "reduce-overhead":
             # The action head runs three compiled regions back-to-back inside one
             # torch.inference_mode() block. cudagraph_trees' warmup teardown trips
             #   cudagraph_trees.py dealloc_current_path_weakrefs
