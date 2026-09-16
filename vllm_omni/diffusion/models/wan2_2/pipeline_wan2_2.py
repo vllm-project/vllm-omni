@@ -26,6 +26,14 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -51,9 +59,11 @@ FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
+        # Keep native Wan's unshifted training endpoints; set_timesteps applies
+        # the requested shift to the interpolated inference sigmas.
         return FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
     if sample_solver == "euler":
@@ -766,7 +776,10 @@ class Wan22Pipeline(
                 self._sample_solver = sample_solver
                 self._flow_shift = flow_shift
 
-            self.scheduler.set_timesteps(num_steps, device=device)
+            if sample_solver == "unipc":
+                self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+            else:
+                self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
@@ -907,6 +920,7 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
+        media = None
         if output_type == "latent":
             output = latents
         else:
@@ -920,7 +934,27 @@ class Wan22Pipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            decoded = self.vae.decode(latents, return_dict=False)[0]
+            # Distributed VAE decode uses broadcast_result=False, so only the
+            # output-owning rank receives the full [B, C, T, H, W] video; other
+            # ranks get an empty placeholder. Emit typed media only from the
+            # owning rank and keep the placeholder on the legacy output field, so
+            # the media batch-dimension check in split_diffusion_output_by_request
+            # does not trip on every non-owner rank.
+            if decoded.dim() == 5:
+                output = None
+                media = DiffusionMediaOutput(
+                    video=VideoMediaOutput(
+                        tensor=decoded,
+                        spec=VideoTensorSpec(
+                            layout=VideoTensorLayout.BCTHW,
+                            encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                            value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                        ),
+                    )
+                )
+            else:
+                output = decoded
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -947,6 +981,7 @@ class Wan22Pipeline(
         return split_diffusion_output_by_request(
             DiffusionOutput(
                 output=output,
+                media=media,
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             ),
             req,

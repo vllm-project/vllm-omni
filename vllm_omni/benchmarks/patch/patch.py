@@ -2272,9 +2272,11 @@ async def _async_request_omniinteract(
         output.audio_duration = case_result.audio_bytes / (24_000 * 2)
         output.audio_frames = case_result.audio_bytes // 2
         session_metrics = case_result.duplex_session_metrics
-        output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-        output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-        output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+        from vllm_omni.clients.duplex import metric_mean
+
+        output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
+        output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
+        output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
         token_timing_measured = _apply_stage0_token_timings(
             output,
             [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
@@ -2524,9 +2526,11 @@ async def async_request_openai_realtime_duplex(
             await client.close_session(timeout_s=30.0)
 
             output.generated_text = " ".join(filter(None, turn_transcripts))
-            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            from vllm_omni.clients.duplex import metric_mean
+
+            output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
+            output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
+            output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
             output.audio_duration = (
                 sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
             )
@@ -2926,7 +2930,7 @@ async def benchmark(
 
         def measured_ttft(output: RequestFuncOutput) -> float | None:
             session_metrics = getattr(output, "duplex_session_metrics", None)
-            if isinstance(session_metrics, dict) and session_metrics.get("mean_ttft_ms") is None:
+            if isinstance(session_metrics, dict) and session_metrics.get("ttft_ms") is None:
                 return None
             return output.ttft
 
@@ -2975,7 +2979,9 @@ async def benchmark(
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
+            "total_input_sequences": metrics.total_input_sequences,
             "request_throughput": metrics.request_throughput,
+            "input_sequence_throughput": metrics.input_sequence_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
@@ -2996,6 +3002,24 @@ async def benchmark(
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics
+        from vllm_omni.clients.duplex import distribution_summary
+
+        for session_key, result_key, digits in (
+            ("stream_ttft_ms", "duplex_stream_ttft_ms", 3),
+            ("stream_ttfp_ms", "duplex_stream_ttfp_ms", 3),
+            ("stream_rtf", "duplex_stream_rtf", 6),
+        ):
+            values = [
+                float(value)
+                for metric in duplex_session_metrics
+                if isinstance((value := metric.get(session_key)), int | float)
+                and not isinstance(value, bool)
+                and np.isfinite(value)
+                and value >= 0
+            ]
+            summary = distribution_summary(values, digits=digits)
+            if summary is not None:
+                result[result_key] = summary
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
 

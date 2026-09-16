@@ -87,6 +87,11 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "AuKForConditionalGeneration": (
+        "auk",
+        "auk",
+        "AuKForConditionalGeneration",
+    ),
     "NemotronDenseForCausalLM": (
         "audex",
         "audex_thinker",
@@ -486,6 +491,16 @@ _OMNI_MODELS = {
         "minimax_music3",
         "acoustic",
         "MiniMaxMusic3AcousticForConditionalGeneration",
+    ),
+    "BreezeForConditionalGeneration": (
+        "breeze_tts_2",
+        "modeling_breeze_tts_2_talker",
+        "BreezeTTS2TalkerForGeneration",
+    ),
+    "BreezeTTS2MimiCodec": (
+        "breeze_tts_2",
+        "modeling_breeze_tts_2_codec",
+        "BreezeTTS2MimiCodec",
     ),
 }
 

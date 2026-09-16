@@ -45,9 +45,71 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Rotate interleaved pairs before rounding back to the activation dtype.
+
+    Qwen-Image's reference uses complex FP32 multiplication. Rounding the
+    frequencies to BF16 before rotation loses positional precision; those
+    errors accumulate across the denoising steps.
+    """
+    paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+
+
+def _qwen_image_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    freqs: torch.Tensor,
+    rope: RotaryEmbedding,
+    eps: float,
+    *,
+    use_fused: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    head_dim = q.shape[-1]
+    rotary_dim = freqs.shape[-1] * 2
+    if use_fused and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True):
+        batch, seq_len, num_heads, _ = q.shape
+        num_kv_heads = k.shape[2]
+        rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
+        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(batch * seq_len, rotary_dim)
+        fused_q, fused_k = fused_qk_norm_rope(
+            q.reshape(batch * seq_len, num_heads, head_dim),
+            k.reshape(batch * seq_len, num_kv_heads, head_dim),
+            norm_q.weight,
+            norm_k.weight,
+            rope_table,
+            eps,
+            interleaved=True,
+        )
+        return (
+            fused_q.reshape(batch, seq_len, num_heads, head_dim),
+            fused_k.reshape(batch, seq_len, num_kv_heads, head_dim),
+        )
+
+    q = norm_q(q)
+    k = norm_k(k)
+    if q.device.type == "cuda":
+        return (
+            _apply_qwen_image_rotary_emb(q, freqs),
+            _apply_qwen_image_rotary_emb(k, freqs),
+        )
+
+    # Retain the platform-specific kernels on other accelerators, which may
+    # not support complex tensors.
+    cos = torch.real(freqs).to(q.dtype)
+    sin = torch.imag(freqs).to(q.dtype)
+    return rope(q, cos, sin), rope(k, cos, sin)
 
 
 def _normalize_qwen_image_weight_name(name: str) -> str:
@@ -637,20 +699,25 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        img_query = self.norm_q(img_query)
-        img_key = self.norm_k(img_key)
-        txt_query = self.norm_added_q(txt_query)
-        txt_key = self.norm_added_k(txt_key)
-
-        img_cos = torch.real(vid_freqs).to(img_query.dtype)
-        img_sin = torch.imag(vid_freqs).to(img_query.dtype)
-        txt_cos = torch.real(txt_freqs).to(txt_query.dtype)
-        txt_sin = torch.imag(txt_freqs).to(txt_query.dtype)
-
-        img_query = self.rope(img_query, img_cos, img_sin)
-        img_key = self.rope(img_key, img_cos, img_sin)
-        txt_query = self.rope(txt_query, txt_cos, txt_sin)
-        txt_key = self.rope(txt_key, txt_cos, txt_sin)
+        img_query, img_key = _qwen_image_qk_norm_rope(
+            img_query,
+            img_key,
+            self.norm_q,
+            self.norm_k,
+            vid_freqs,
+            self.rope,
+            self.eps,
+            use_fused=self.qk_norm,
+        )
+        txt_query, txt_key = _qwen_image_qk_norm_rope(
+            txt_query,
+            txt_key,
+            self.norm_added_q,
+            self.norm_added_k,
+            txt_freqs,
+            self.rope,
+            self.eps,
+        )
 
         seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)

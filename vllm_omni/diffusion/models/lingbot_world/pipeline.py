@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -15,10 +15,11 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
+from diffusers.models.autoencoders.autoencoder_kl_wan import CACHE_T, WanAttentionBlock, WanResample, WanResidualBlock
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -63,10 +64,25 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.streaming_decode import (
+    StreamingDecodeState,
+    WanStreamingDecoder,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
 )
+
+logger = init_logger(__name__)
+
+# Resident streaming-decoder cache per session, as bytes per output pixel in
+# fp32: measured once on the reference checkpoint at 37832 KiB for a 64x64
+# output. Every cached tensor is [B, C, <= CACHE_T, H/8, W/8] per causal
+# convolution, so the total scales with height * width and never with session
+# length; tests/diffusion/ar_diffusion/test_streaming_decode.py pins that
+# scaling, and at 832x480 in bf16 this yields the 1801 MiB the decoder was
+# measured to hold.
+_STREAMING_DECODE_BYTES_PER_PIXEL_FP32 = 37832 * 1024 / (64 * 64)
 
 if TYPE_CHECKING:
     from diffusers.video_processor import VideoProcessor
@@ -82,7 +98,6 @@ LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _CAMERA_SPATIAL_FOLD = 8
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
-_MAX_RAW_FRAMES = 117
 _MAX_SEQUENCE_LENGTH = 512
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 _PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
@@ -135,12 +150,13 @@ class _LingBotRequestInputs:
 
 @dataclass
 class _LingBotARSessionState:
-    """Small model-owned state; attention tensors remain runner-owned."""
+    """Model-owned state; attention tensors remain runner-owned."""
 
     next_chunk_index: int = 0
     prompt: str | None = None
     generator_state: torch.Tensor | None = None
-    image_condition: torch.Tensor | None = None
+    encoder_cache: list[torch.Tensor | None] | None = None
+    pending_encoder_cache: list[torch.Tensor | None] | None = None
     camera_tail: CameraTrajectory | None = None
     camera_pitch: float = 0.0
 
@@ -203,7 +219,6 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
         return
     unsupported_sizes = {
         "pipeline_parallel_size": "pipeline parallelism",
-        "sequence_parallel_size": "sequence parallelism",
         "cfg_parallel_size": "CFG parallelism",
         "vae_patch_parallel_size": "VAE parallelism",
     }
@@ -211,6 +226,25 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
         size = getattr(parallel_config, field, 1) or 1
         if size > 1:
             raise NotImplementedError(f"LingBot World v1 does not support {feature} ({field}={size}).")
+    sequence_parallel_size = getattr(parallel_config, "sequence_parallel_size", 1) or 1
+    ulysses_degree = getattr(parallel_config, "ulysses_degree", 1) or 1
+    ring_degree = getattr(parallel_config, "ring_degree", 1) or 1
+    allgather_degree = getattr(parallel_config, "allgather_degree", 1) or 1
+    ulysses_mode = getattr(parallel_config, "ulysses_mode", "strict")
+    ulysses_a2a_permute = bool(getattr(parallel_config, "ulysses_a2a_permute", False))
+    if (
+        sequence_parallel_size != ulysses_degree
+        or ring_degree != 1
+        or allgather_degree != 1
+        or ulysses_mode != "strict"
+        or ulysses_a2a_permute
+    ):
+        raise NotImplementedError(
+            "LingBot World sequence parallelism requires pure Ulysses with ulysses_a2a_permute disabled: "
+            f"sequence_parallel_size={sequence_parallel_size}, ulysses_degree={ulysses_degree}, "
+            f"ring_degree={ring_degree}, allgather_degree={allgather_degree}, ulysses_mode={ulysses_mode!r}, "
+            f"ulysses_a2a_permute={ulysses_a2a_permute}."
+        )
     if getattr(parallel_config, "use_hsdp", False):
         raise NotImplementedError("LingBot World v1 does not support HSDP.")
     if getattr(parallel_config, "enable_expert_parallel", False):
@@ -535,10 +569,21 @@ class LingBotWorldCausalDMDPipeline(
         self._ar_width = int(model_config.get("ar_diffusion_width", 832))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
         self._ar_sessions: dict[str, _LingBotARSessionState] = {}
+        # One temporal decoder cache per stepwise session, keyed the way the
+        # runner keys AR sessions (session_id == request_id) so both are
+        # released together rather than through two independent lifecycles.
+        self._streaming_decode_states: dict[str, StreamingDecodeState] = {}
+        self._cached_streaming_decoder: WanStreamingDecoder | None = None
+        self._streaming_decode_unsupported = False
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "vae.encode",
+                "_prepare_condition_chunk",
                 "vae.decode",
+                # Streaming decode never reaches vae.decode, so it needs its
+                # own stage or a streamed rollout reports no decode time at
+                # all -- the one stage this path changes.
+                "_streaming_decode_chunk",
                 "_generate_block",
                 "text_encoder.forward",
                 "tokenizer.forward",
@@ -557,8 +602,6 @@ class LingBotWorldCausalDMDPipeline(
         latent_height = self._ar_height // spatial
         latent_width = self._ar_width // spatial
         tokens_per_frame = (latent_height // patch_height) * (latent_width // patch_width)
-        tp_size = get_tensor_model_parallel_world_size()
-        num_local_heads = int(self.transformer.config.num_attention_heads) // tp_size
         total_window_frames = (
             int(self.transformer.config.local_attn_size)
             if int(self.transformer.config.local_attn_size) != -1
@@ -568,18 +611,18 @@ class LingBotWorldCausalDMDPipeline(
         recent_window_frames = total_window_frames - sink_frames
         if recent_window_frames <= 0:
             raise ValueError("LingBot AR-Diffusion cache needs a positive recent window after reserving sink frames.")
-        horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+        condition_latent_frames = int(self.transformer.config.num_frames_per_block)
         condition_channels = self.vae_scale_factor_temporal + int(self.transformer.config.out_channels)
         condition_bytes_per_session = (
             condition_channels
-            * horizon_latent_frames
+            * condition_latent_frames
             * latent_height
             * latent_width
             * torch.empty((), dtype=self.transformer.dtype).element_size()
         )
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
-            num_kv_heads=num_local_heads,
+            num_kv_heads=int(self.transformer.blocks[0].self_attn.num_sp_heads),
             head_size=int(self.transformer.config.attention_head_dim),
             tokens_per_frame=tokens_per_frame,
             frames_per_block=int(self.transformer.config.num_frames_per_block),
@@ -593,7 +636,56 @@ class LingBotWorldCausalDMDPipeline(
                     _MAX_SEQUENCE_LENGTH,
                 ),
             ),
-            model_owned_state_bytes_per_session=condition_bytes_per_session,
+            model_owned_state_bytes_per_session=(
+                condition_bytes_per_session
+                + 2 * self._condition_encoder_cache_bytes()  # Committed and in-flight histories.
+                + self._streaming_decode_bytes_per_session()
+            ),
+        )
+
+    def _condition_encoder_cache_bytes(self) -> int:
+        """Bound one Wan encoder history from its per-convolution input grids."""
+        if getattr(self.vae.config, "patch_size", None) is not None:
+            raise ValueError("Stateful LingBot conditioning requires an unpatched Wan VAE.")
+        encoder = self.vae.encoder
+        height, width = self._ar_height, self._ar_width
+        elements = CACHE_T * encoder.conv_in.in_channels * height * width
+        for layer in encoder.down_blocks:
+            if isinstance(layer, WanResidualBlock):
+                elements += CACHE_T * (layer.conv1.in_channels + layer.conv2.in_channels) * height * width
+            elif isinstance(layer, WanResample) and layer.mode in ("downsample2d", "downsample3d"):
+                height, width = height // 2, width // 2
+                if layer.mode == "downsample3d":
+                    # Temporal downsampling retains one frame after spatial downsampling.
+                    elements += layer.time_conv.in_channels * height * width
+            elif not isinstance(layer, WanAttentionBlock):
+                raise ValueError("Stateful LingBot conditioning requires the Wan encoder cache layout.")
+        for layer in encoder.mid_block.resnets:
+            elements += CACHE_T * (layer.conv1.in_channels + layer.conv2.in_channels) * height * width
+        elements += CACHE_T * encoder.conv_out.in_channels * height * width
+        return elements * torch.empty((), dtype=self.vae.dtype).element_size()
+
+    def _streaming_decode_bytes_per_session(self) -> int:
+        """Resident streaming-decoder bytes one session can hold, for admission.
+
+        ``model_owned_state_bytes_per_session`` is what the runner subtracts
+        from the KV budget before sizing the block pools, and this cache is
+        three orders of magnitude larger than the image condition that used to
+        be the only entry: leaving it out lets the profiler report a
+        configuration as fitting and then OOM partway through the second
+        session's rollout.
+
+        Declared for every session rather than only for pixel-output ones: the
+        field is documented as a conservative upper bound, it is fixed at load
+        time, and whether a request asks for pixels is not known then.
+        """
+        decoder = self._streaming_decoder()
+        if decoder is None:
+            return 0
+        return decoder.declared_state_bytes(
+            height=self._ar_height,
+            width=self._ar_width,
+            dtype=self.vae.dtype,
         )
 
     @contextmanager
@@ -612,11 +704,19 @@ class LingBotWorldCausalDMDPipeline(
         finally:
             self._ar_diffusion_kv_state = None
 
+    def _release_condition_encoder_state(self, session_id: str) -> None:
+        state = self._ar_sessions.pop(session_id, None)
+        if state is not None:
+            state.encoder_cache = None
+            state.pending_encoder_cache = None
+
     def reset_ar_diffusion_session(self, session_id: str) -> None:
-        self._ar_sessions.pop(session_id, None)
+        self._release_condition_encoder_state(session_id)
+        self._release_streaming_decode_state(session_id)
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
-        self._ar_sessions.pop(session_id, None)
+        self._release_condition_encoder_state(session_id)
+        self._release_streaming_decode_state(session_id)
 
     def _parse_request(self, req: DiffusionRequestBatch) -> _LingBotRequestInputs:
         if req.num_reqs != 1 or len(req.prompts) != 1:
@@ -742,8 +842,6 @@ class LingBotWorldCausalDMDPipeline(
         num_frames = getattr(sampling, "num_frames", None)
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
             raise ValueError(f"num_frames must be a positive integer, got {num_frames!r}.")
-        if num_frames > _MAX_RAW_FRAMES:
-            raise ValueError(f"num_frames must not exceed {_MAX_RAW_FRAMES}.")
         temporal_factor = self.vae_scale_factor_temporal
         if (num_frames - 1) % temporal_factor:
             raise ValueError(
@@ -846,16 +944,16 @@ class LingBotWorldCausalDMDPipeline(
             raise RuntimeError(
                 f"vae.encode returned an incompatible image latent shape: got {tuple(latent_condition.shape)}."
             )
+        return self._condition_from_latents(latent_condition, first_frame=True, dtype=dtype)
+
+    def _condition_from_latents(
+        self, latent_condition: torch.Tensor, *, first_frame: bool, dtype: torch.dtype
+    ) -> torch.Tensor:
         latent_mean, latent_std = self._vae_latent_stats(latent_condition)
         latent_condition = (latent_condition - latent_mean) / latent_std
-        temporal_mask = latent_condition.new_zeros(
-            1,
-            self.vae_scale_factor_temporal,
-            inputs.num_latent_frames,
-            latent_condition.shape[-2],
-            latent_condition.shape[-1],
-        )
-        temporal_mask[:, :, 0] = 1
+        temporal_mask = latent_condition.new_zeros(1, self.vae_scale_factor_temporal, *latent_condition.shape[2:])
+        if first_frame:
+            temporal_mask[:, :, 0] = 1
         condition = torch.cat((temporal_mask, latent_condition), dim=1).to(dtype=dtype)
         if condition.shape[1] != 20:
             raise RuntimeError(
@@ -863,6 +961,78 @@ class LingBotWorldCausalDMDPipeline(
                 f"got {condition.shape[1]}."
             )
         return condition
+
+    @torch.no_grad()
+    def _prepare_condition_chunk(
+        self,
+        inputs: _LingBotRequestInputs,
+        *,
+        start_frame: int,
+        encoder_cache: list[torch.Tensor | None] | None,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, list[torch.Tensor | None]]:
+        """Continue the causal encoder without modifying its committed history."""
+        if getattr(self.vae.config, "patch_size", None) is not None or self.vae_scale_factor_temporal != 4:
+            raise ValueError("Stateful LingBot conditioning requires an unpatched Wan VAE with temporal factor 4.")
+        if getattr(self.vae, "use_tiling", False) and (
+            inputs.height > self.vae.tile_sample_min_height or inputs.width > self.vae.tile_sample_min_width
+        ):
+            raise ValueError("Stateful LingBot conditioning does not support tiled VAE encoding.")
+        if (encoder_cache is None) != (start_frame == 0):
+            raise ValueError("LingBot condition encoder history must match the current temporal position.")
+
+        count = int(self.vae._cached_conv_counts["encoder"])
+        # Wan replaces cache entries with new tensors; a separate list keeps the
+        # committed history intact until this AR block succeeds.
+        pending_cache = [None] * count if encoder_cache is None else list(encoder_cache)
+        if len(pending_cache) != count:
+            raise ValueError("LingBot condition encoder cache has an incompatible number of slots.")
+        block_frames = int(self.transformer.config.num_frames_per_block)
+        zeros = torch.zeros(
+            1,
+            3,
+            self.vae_scale_factor_temporal,
+            inputs.height,
+            inputs.width,
+            device=self.device,
+            dtype=self.vae.dtype,
+        )
+        image = (
+            self._prepare_image_tensor(inputs.image, height=inputs.height, width=inputs.width)
+            .unsqueeze(2)
+            .to(dtype=self.vae.dtype)
+            if start_frame == 0
+            else None
+        )
+        context = getattr(self.vae, "_execution_context", None)
+        encoded_frames = []
+        with context() if callable(context) else nullcontext():
+            for index in range(block_frames):
+                # Match Wan's encode loop: one opening pixel frame, then four
+                # fresh zero pixel frames per subsequent latent frame.
+                pixel_frames = image if start_frame == 0 and index == 0 else zeros
+                encoded_frames.append(self.vae.encoder(pixel_frames, feat_cache=pending_cache, feat_idx=[0]))
+            # The posterior projection is pointwise in time. GPU bitwise parity
+            # with the whole-clip projection still requires the real-weight gate.
+            moments = self.vae.quant_conv(torch.cat(encoded_frames, dim=2))
+        latent_condition = moments.chunk(2, dim=1)[0]
+        expected_shape = (
+            1,
+            self.transformer.config.out_channels,
+            block_frames,
+            inputs.height // self.vae_scale_factor_spatial,
+            inputs.width // self.vae_scale_factor_spatial,
+        )
+        if latent_condition.shape != expected_shape:
+            raise RuntimeError(
+                f"Wan condition encoder returned {tuple(latent_condition.shape)}, expected {expected_shape}."
+            )
+        condition = self._condition_from_latents(
+            latent_condition,
+            first_frame=start_frame == 0,
+            dtype=dtype,
+        )
+        return condition, pending_cache
 
     def _prepare_camera(
         self,
@@ -960,20 +1130,11 @@ class LingBotWorldCausalDMDPipeline(
             def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
                 for block in self.transformer.blocks:
                     cross_attention = block.cross_attn
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
-                        2,
-                        (
-                            cross_attention.num_local_heads,
-                            cross_attention.head_dim,
-                        ),
+                    shape = (cross_attention.num_local_heads, cross_attention.head_dim)
+                    key = cross_attention.shard_kv_heads(
+                        cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
                     )
-                    value = cross_attention.v(projected_text).unflatten(
-                        2,
-                        (
-                            cross_attention.num_local_heads,
-                            cross_attention.head_dim,
-                        ),
-                    )
+                    value = cross_attention.shard_kv_heads(cross_attention.v(projected_text).unflatten(2, shape))
                     yield key, value
 
             state.populate_cross_attention(
@@ -1091,6 +1252,11 @@ class LingBotWorldCausalDMDPipeline(
             raise RuntimeError("LingBot typed ticks require ARDiffusionEngine session binding.")
         if tick is None and self._ar_diffusion_kv_state is not None:
             raise ValueError("LingBot ARDiffusionEngine requests must carry ar_diffusion_tick.")
+        if tick is not None and inputs.output_type != "latent":
+            raise ValueError(
+                "LingBot realtime ticks currently require output_type='latent'; "
+                "stateful streaming VAE decode is a separate integration step."
+            )
         session_state: _LingBotARSessionState | None = None
         if tick is not None:
             if tick.prompt is not None and " ".join(tick.prompt.split()) != " ".join(inputs.prompt.split()):
@@ -1106,16 +1272,6 @@ class LingBotWorldCausalDMDPipeline(
                     "LingBot AR-Diffusion request resolution must match the "
                     "fixed cache geometry "
                     f"{self._ar_height}x{self._ar_width}."
-                )
-            horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-            max_realtime_ticks = horizon_latent_frames // block_frames
-            if tick.chunk_index >= max_realtime_ticks:
-                raise ValueError(
-                    "LingBot realtime generation currently supports at most "
-                    f"{max_realtime_ticks} ticks per generation epoch "
-                    f"(chunk_index 0 through {max_realtime_ticks - 1}) because "
-                    f"the image-condition horizon is {_MAX_RAW_FRAMES} pixel "
-                    "frames; reset or create a session to start a new world."
                 )
             session_state = self._ar_sessions.setdefault(
                 tick.session_id,
@@ -1141,26 +1297,12 @@ class LingBotWorldCausalDMDPipeline(
             condition = self._prepare_condition(inputs, dtype=dtype)
         else:
             assert session_state is not None
-            if session_state.image_condition is None:
-                horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-                session_state.image_condition = self._prepare_condition(
-                    replace(
-                        inputs,
-                        num_frames=_MAX_RAW_FRAMES,
-                        num_latent_frames=horizon_latent_frames,
-                    ),
-                    dtype=dtype,
-                )
-            block_frames = int(self.transformer.config.num_frames_per_block)
-            condition_start = tick.chunk_index * block_frames
-            condition_stop = condition_start + block_frames
-            if condition_stop > session_state.image_condition.shape[2]:
-                raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
-            condition = session_state.image_condition[
-                :,
-                :,
-                condition_start:condition_stop,
-            ]
+            condition, pending_encoder_cache = self._prepare_condition_chunk(
+                inputs,
+                start_frame=tick.chunk_index * block_frames,
+                encoder_cache=session_state.encoder_cache,
+                dtype=dtype,
+            )
         camera_pitch: float | None = None
         if inputs.camera_actions is not None:
             assert session_state is not None
@@ -1240,6 +1382,7 @@ class LingBotWorldCausalDMDPipeline(
             assert session_state is not None
             session_state.prompt = inputs.prompt
             session_state.generator_state = inputs.generator.get_state()
+            session_state.encoder_cache = pending_encoder_cache
             session_state.camera_tail = camera_tail
             if camera_pitch is not None:
                 session_state.camera_pitch = camera_pitch
@@ -1248,11 +1391,6 @@ class LingBotWorldCausalDMDPipeline(
         # Phase 4: either expose model-space latents or invert the checkpoint's
         # latent normalization and decode to pixel-space video.
         if tick is not None:
-            if inputs.output_type != "latent":
-                raise ValueError(
-                    "LingBot realtime ticks currently require output_type='latent'; "
-                    "stateful streaming VAE decode is a separate integration step."
-                )
             output = {
                 "payload": {"latents": generated_latents},
                 "metadata": {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(tick).to_dict()},
@@ -1273,15 +1411,90 @@ class LingBotWorldCausalDMDPipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
+    def _vae_would_tile(self, latents: torch.Tensor) -> bool:
+        """Whether ``vae.decode`` would take its tiled path for this shape.
+
+        Tiled decode splits a frame spatially and drives the module's own
+        ``feat_cache`` across those tiles, so a per-session cache threaded
+        through it is a separate design and is not attempted here. The test
+        mirrors ``AutoencoderKLWan._decode``: the flag alone does not tile, the
+        latent also has to exceed a tile, so a sub-threshold resolution with
+        tiling enabled still streams. A VAE that sets the flag but reports no
+        tile size is treated as tiling, because the safe answer when the
+        threshold is unknown is the one that keeps ``vae.decode`` in charge.
+        """
+        if not bool(getattr(self.vae, "use_tiling", False)):
+            return False
+        compression = int(getattr(self.vae, "spatial_compression_ratio", None) or self.vae_scale_factor_spatial)
+        tile_latent_min_height = int(getattr(self.vae, "tile_sample_min_height", None) or 0) // compression
+        tile_latent_min_width = int(getattr(self.vae, "tile_sample_min_width", None) or 0) // compression
+        return bool(latents.shape[-2] > tile_latent_min_height or latents.shape[-1] > tile_latent_min_width)
+
+    def _streaming_decoder(self) -> WanStreamingDecoder | None:
+        """The session-owned streaming decoder, or ``None`` on a VAE that cannot stream.
+
+        Only the decoder's own capability is decided here, and the decision is
+        cached including the negative. Whether a particular *shape* would have
+        been tiled is a per-call question and lives in :meth:`_vae_would_tile`.
+        """
+        if self._streaming_decode_unsupported:
+            return None
+        if self._cached_streaming_decoder is not None:
+            return self._cached_streaming_decoder
+        try:
+            decoder = WanStreamingDecoder(
+                self.vae,
+                bytes_per_pixel_fp32=_STREAMING_DECODE_BYTES_PER_PIXEL_FP32,
+            )
+            # Materialize the cache geometry now: a decoder that cannot report
+            # it would otherwise fail on the first chunk instead.
+            _ = decoder.num_causal_convs
+        except TypeError as exc:
+            logger.warning(
+                "LingBot streaming decode is unavailable (%s); AR blocks will be decoded independently, "
+                "which drops each block's opening frame and restarts temporal context at every boundary.",
+                exc,
+            )
+            self._streaming_decode_unsupported = True
+            return None
+        self._cached_streaming_decoder = decoder
+        return decoder
+
+    def _streaming_decode_state(self, decoder: WanStreamingDecoder, session_id: str) -> StreamingDecodeState:
+        state = self._streaming_decode_states.get(session_id)
+        if state is None:
+            state = decoder.new_decode_state(session_id)
+            self._streaming_decode_states[session_id] = state
+        return state
+
+    def _release_streaming_decode_state(self, session_id: str) -> None:
+        """Drop one session's decoder cache. Safe for a session that never decoded.
+
+        The state is released directly rather than through
+        ``WanStreamingDecoder.release``, which is the same one-line call: the
+        decoder's method exists for a caller holding only the
+        ``SupportsStreamingDecode`` protocol, and this pipeline holds the state.
+        """
+        state = self._streaming_decode_states.pop(session_id, None)
+        if state is not None:
+            state.release()
+
     def _decode_chunk_to_pixels(
-        self, latents: torch.Tensor, *, output_type: str
+        self, latents: torch.Tensor, *, output_type: str, session_id: str | None = None
     ) -> torch.Tensor | np.ndarray | list[list[PIL.Image.Image]]:
         """Decode one AR block so streaming consumers receive pixels, not latents.
 
-        Blocks are decoded independently, which keeps the shared VAE stateless
-        and lets a rollout be served without a per-session temporal cache. That
-        is the same shape Helios streams today; cross-block ``feat_cache``
-        continuity is a separate decision and is not made here.
+        With a ``session_id`` the block is decoded through that session's own
+        temporal cache, so chunk *N + 1* continues chunk *N*: the causal decoder
+        expands the session's opening latent frame to one raw frame and every
+        later one to the full temporal factor, which is the frame timeline an
+        offline whole-clip decode of the same latents produces. The cache lives
+        on the session rather than on the shared VAE module, so concurrent
+        sessions cannot overwrite one another's temporal context.
+
+        Without a ``session_id`` -- or on a VAE that cannot stream -- blocks are
+        decoded independently: every block re-expands its own opening frame, so
+        the rollout loses frames and continuity at each block boundary.
 
         The registered post-process hook returns a ``{"payload", "metadata"}``
         envelope untouched, so the pixel conversion it would do for a bare
@@ -1289,8 +1502,33 @@ class LingBotWorldCausalDMDPipeline(
         """
         latent_mean, latent_std = self._vae_latent_stats(latents)
         vae_latents = (latents * latent_std + latent_mean).to(dtype=self.vae.dtype)
-        video = self.vae.decode(vae_latents, return_dict=False)[0]
+        decoder = None
+        if session_id is not None and not self._vae_would_tile(vae_latents):
+            decoder = self._streaming_decoder()
+        if decoder is None:
+            video = self.vae.decode(vae_latents, return_dict=False)[0]
+        else:
+            video = self._streaming_decode_chunk(decoder, vae_latents, cast(str, session_id))
         return self._video_processor().postprocess_video(video, output_type=output_type)
+
+    def _streaming_decode_chunk(
+        self, decoder: WanStreamingDecoder, vae_latents: torch.Tensor, session_id: str
+    ) -> torch.Tensor:
+        """Decode one chunk through ``session_id``'s temporal cache.
+
+        A separate method so the profiler has a stage to wrap: streaming never
+        calls ``vae.decode``, and without this a profiled rollout would report
+        no decode time for the one stage this path changes.
+        """
+        state = self._streaming_decode_state(decoder, session_id)
+        try:
+            return decoder.decode_chunk(vae_latents, state)
+        except Exception:
+            # A half-advanced cache cannot be resumed: the session's next chunk
+            # would continue from a temporal context that was never completed,
+            # so drop it here rather than at close.
+            self._release_streaming_decode_state(session_id)
+            raise
 
     def _video_processor(self) -> VideoProcessor:
         processor = getattr(self, "_cached_video_processor", None)
@@ -1300,12 +1538,6 @@ class LingBotWorldCausalDMDPipeline(
             processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
             self._cached_video_processor = processor
         return processor
-
-    def _horizon_latent_frames(self) -> int:
-        return (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-
-    def _max_realtime_chunks(self) -> int:
-        return self._horizon_latent_frames() // int(self.transformer.config.num_frames_per_block)
 
     def _require_bound_ar_state(self) -> None:
         if self._ar_diffusion_kv_state is None:
@@ -1333,13 +1565,6 @@ class LingBotWorldCausalDMDPipeline(
             )
         block_frames = int(self.transformer.config.num_frames_per_block)
         total_chunks = inputs.num_latent_frames // block_frames
-        max_chunks = self._max_realtime_chunks()
-        if total_chunks > max_chunks:
-            raise ValueError(
-                "LingBot step execution currently supports at most "
-                f"{max_chunks} chunks because the image-condition horizon is "
-                f"{_MAX_RAW_FRAMES} pixel frames."
-            )
         if inputs.camera_action_script is not None and len(inputs.camera_action_script) != total_chunks:
             raise ValueError(
                 "camera_action_script must contain one action list per generated chunk; "
@@ -1349,14 +1574,6 @@ class LingBotWorldCausalDMDPipeline(
         prompt_embeds = self.encode_prompt(
             inputs.prompt,
             max_sequence_length=inputs.max_sequence_length,
-            dtype=dtype,
-        )
-        image_condition = self._prepare_condition(
-            replace(
-                inputs,
-                num_frames=_MAX_RAW_FRAMES,
-                num_latent_frames=self._horizon_latent_frames(),
-            ),
             dtype=dtype,
         )
         camera_trajectory_cache = None
@@ -1387,7 +1604,6 @@ class LingBotWorldCausalDMDPipeline(
         state.chunk_num_steps = len(LINGBOT_DMD_TIMESTEPS)
         state.extra = {
             "inputs": inputs,
-            "image_condition": image_condition,
             "schedule": _build_shifted_flow_schedule(flow_shift=inputs.flow_shift),
             "dtype": dtype,
             "block_frames": block_frames,
@@ -1398,7 +1614,12 @@ class LingBotWorldCausalDMDPipeline(
             "camera_embedding_cache": camera_embedding_cache,
         }
         self._ar_text_caches(prompt_embeds, invalidate=False)
-        self._prepare_next_chunk(state)
+        self._ar_sessions[state.request_id] = _LingBotARSessionState()
+        try:
+            self._prepare_next_chunk(state)
+        except Exception:
+            self._release_condition_encoder_state(state.request_id)
+            raise
         return state
 
     def _prepare_next_chunk(self, state: StepRequestState) -> None:
@@ -1407,10 +1628,15 @@ class LingBotWorldCausalDMDPipeline(
         block_frames = int(extra["block_frames"])
         start_frame = state.chunk_index * block_frames
         stop_frame = start_frame + block_frames
-        image_condition = extra["image_condition"]
-        if stop_frame > image_condition.shape[2]:
-            raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
-        condition = image_condition[:, :, start_frame:stop_frame]
+        session_state = self._ar_sessions[state.request_id]
+        if session_state.next_chunk_index != state.chunk_index:
+            raise ValueError("LingBot condition chunks must be contiguous within the session.")
+        condition, pending_encoder_cache = self._prepare_condition_chunk(
+            inputs,
+            start_frame=start_frame,
+            encoder_cache=session_state.encoder_cache,
+            dtype=extra["dtype"],
+        )
         previous = extra.get("camera_tail")
         if extra.get("camera_action_script") is not None:
             chunk_actions = extra["camera_action_script"][state.chunk_index]
@@ -1480,6 +1706,7 @@ class LingBotWorldCausalDMDPipeline(
         )
         state.step_in_chunk = 0
         state.step_index = 0
+        session_state.pending_encoder_cache = pending_encoder_cache
 
     def denoise_step(
         self,
@@ -1543,6 +1770,9 @@ class LingBotWorldCausalDMDPipeline(
         latents = state.latents
         if latents is None:
             raise RuntimeError("LingBot step execution requires latents before post_decode.")
+        session_state = self._ar_sessions[state.request_id]
+        if session_state.pending_encoder_cache is None:
+            raise RuntimeError("LingBot condition encoder has no prepared chunk to commit.")
         self._dmd_blocks.commit_block_kv(
             latents=latents,
             condition=extra["condition"],
@@ -1560,7 +1790,13 @@ class LingBotWorldCausalDMDPipeline(
         if inputs.output_type == "latent":
             payload: dict[str, Any] = {"latents": latents}
         else:
-            payload = {"video": self._decode_chunk_to_pixels(latents, output_type=inputs.output_type)}
+            payload = {
+                "video": self._decode_chunk_to_pixels(
+                    latents,
+                    output_type=inputs.output_type,
+                    session_id=state.request_id,
+                )
+            }
         output = {
             "payload": payload,
             "metadata": {
@@ -1572,10 +1808,15 @@ class LingBotWorldCausalDMDPipeline(
                 ).to_dict()
             },
         }
+        session_state.encoder_cache = session_state.pending_encoder_cache
+        session_state.pending_encoder_cache = None
+        session_state.next_chunk_index += 1
         state.chunk_index += 1
         finished = state.request_denoise_completed
         if not finished:
             self._prepare_next_chunk(state)
+        else:
+            self._release_condition_encoder_state(state.request_id)
         return DiffusionOutput(
             output=output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,

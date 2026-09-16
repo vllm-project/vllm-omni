@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import stat
+import tempfile
 import time
 import uuid
 from collections import defaultdict
@@ -23,7 +24,7 @@ import regex as re
 import torch
 from safetensors import SafetensorError, safe_open
 
-from ..config import CapacityPolicy, IntegrityPolicy, StorageClass, StorageDomainPolicy, ValidationLevel
+from ..config import CapacityPolicy, IntegrityPolicy, StorageClass, StorageDomainPolicy, ValidationLevel, WaitPolicy
 from ..errors import FailureCode, HostWeightError, HostWeightFailure, ResolutionStage
 from ..identity import CanonicalJson, WeightArtifactIdentity, canonical_json
 from ..inspection import (
@@ -298,25 +299,27 @@ def _move_artifact_locked(source: Path, destination: Path) -> None:
 
 def _write_atomic_json(path: Path, value: object, *, mode: int = 0o444) -> None:
     data = canonical_json(value)
-    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+    handle = tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)
+    temporary = Path(handle.name)
+    write_error: BaseException | None = None
     try:
-        offset = 0
-        while offset < len(data):
-            count = os.write(fd, data[offset:])
-            if count <= 0:
-                raise OSError(errno.EIO, f"short write for {temporary}")
-            offset += count
-        os.fsync(fd)
-        os.fchmod(fd, mode)
-        os.fsync(fd)
+        with handle:
+            try:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.fchmod(handle.fileno(), mode)
+                os.fsync(handle.fileno())
+            except BaseException as error:
+                write_error = error
+                raise
+        os.replace(temporary, path)
     except BaseException:
-        os.close(fd)
-        temporary.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+        if write_error is not None:
+            raise write_error
         raise
-    else:
-        os.close(fd)
-    os.replace(temporary, path)
     _fsync_directory(path.parent)
 
 
@@ -429,6 +432,8 @@ class FilesystemHostWeightStore:
         domain: StorageDomainPolicy,
         capacity: CapacityPolicy,
         integrity: IntegrityPolicy,
+        *,
+        wait: WaitPolicy = WaitPolicy(),
     ) -> None:
         self.domain_policy = domain
         self.capacity_policy = capacity
@@ -464,7 +469,7 @@ class FilesystemHostWeightStore:
                 )
             )
         try:
-            self._initialize_domain()
+            self._initialize_domain(deadline=time.monotonic() + wait.coordination_timeout_seconds)
         except HostWeightError:
             raise
         except OSError as exc:
@@ -485,7 +490,7 @@ class FilesystemHostWeightStore:
                 )
             ) from exc
 
-    def _initialize_domain(self) -> None:
+    def _initialize_domain(self, *, deadline: float) -> None:
         try:
             self.filesystem_type = detect_filesystem_type(self.root)
             detected_storage_class = _storage_class_for_filesystem_type(self.filesystem_type)
@@ -545,7 +550,7 @@ class FilesystemHostWeightStore:
                         )
                     )
 
-        with FileLock(self.locks_dir / "domain-init.lock", exclusive=True, deadline=None):
+        with FileLock(self.locks_dir / "domain-init.lock", exclusive=True, deadline=deadline):
             domain_path = self.root / _DOMAIN_FILE
             if domain_path.exists():
                 domain_metadata = _read_json_file(domain_path)

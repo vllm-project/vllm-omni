@@ -11,7 +11,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -149,12 +149,9 @@ class StageRuntime:
         self.stage_pools: list[StagePool] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
-        # Serialize all LLM replica spawning + handshake across device groups
-        # to prevent ZMQ port-allocation races (get_engine_zmq_addresses) and
-        # CUDA-context conflicts when multiple engine core subprocesses
-        # initialize simultaneously on different GPUs.  Matches the old
-        # AsyncOmniEngine._initialize_llm_replica pattern which used a single
-        # ``llm_stage_launch_lock`` for all replicas.
+        # Serialize process spawning and process-global environment overlays.
+        # Readiness waits use per-device initialization protection so different
+        # device groups can initialize concurrently.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
 
@@ -778,43 +775,25 @@ class StageRuntime:
                 spawn_device_lock=self._spawn_device_lock,
                 omni_parallel_stage_init=self._parallel_stage_init,
             )
-            # G2 launch lock serializes engine-core *spawning* across replicas
-            # (ZMQ port-allocation races + simultaneous CUDA context init).
-            #   * Default path: hold it across the whole launch context manager,
-            #     whose __exit__ waits for READY — this serializes the full child
-            #     init (spawn + load + profile + KV + capture).
-            #   * Parallel path: hold it only around the spawn (__enter__); run
-            #     the READY-wait (__exit__) outside the lock so replicas init
-            #     concurrently, coordinated by the child SH/EX device locks.
-            if self._parallel_stage_init:
-                # The per-stage runtime.env overlay mutates os.environ
-                # (process-global), so it must be applied under the launch lock
-                # and only needs to cover the spawn (__enter__) — children
-                # inherit the env at spawn time; the READY-wait needs no env.
-                g2_start = time.perf_counter()
+            # Only process spawning and the runtime.env overlay need the global
+            # launch lock. The launch context's exit waits for READY: holding the
+            # lock there serializes model loading and compilation even across
+            # different GPUs. Default initialization keeps its per-device EX
+            # locks until READY; parallel_stage_init uses child phase locks.
+            g2_start = time.perf_counter()
+            with ExitStack() as launch_stack:
                 with self._replica_launch_lock:
-                    with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
-                        resources = launch_cm.__enter__()
-                g2_spawned = time.perf_counter()
-                launch_cm.__exit__(None, None, None)
-                logger.debug(
-                    "[stage_init] Stage-%s G2 spawn(locked)=%.3fs, READY(unlocked)=%.3fs",
-                    plan.metadata.stage_id,
-                    g2_spawned - g2_start,
-                    time.perf_counter() - g2_spawned,
-                )
-            else:
-                g2_start = time.perf_counter()
-                with self._replica_launch_lock, stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                     g2_locked = time.perf_counter()
-                    with launch_cm as resources:
-                        pass
-                logger.debug(
-                    "[stage_init] Stage-%s G2 launch-lock wait=%.3fs, spawn+READY=%.3fs",
-                    plan.metadata.stage_id,
-                    g2_locked - g2_start,
-                    time.perf_counter() - g2_locked,
-                )
+                    with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
+                        resources = launch_stack.enter_context(launch_cm)
+                g2_spawned = time.perf_counter()
+            logger.debug(
+                "[stage_init] Stage-%s G2 launch-lock wait=%.3fs, spawn=%.3fs, READY=%.3fs",
+                plan.metadata.stage_id,
+                g2_locked - g2_start,
+                g2_spawned - g2_locked,
+                time.perf_counter() - g2_spawned,
+            )
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:

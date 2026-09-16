@@ -178,6 +178,8 @@ class DuplexPlaybackCursor:
     sent_ms: int = 0
     played_ms: int = 0
     committed_ms: int = 0
+    generated_frames: int = 0
+    sample_rate_hz: int | None = None
 
     def acknowledge(self, played_ms: int, committed_ms: int | None = None) -> None:
         self.played_ms = max(self.played_ms, max(0, int(played_ms)))
@@ -411,6 +413,10 @@ class ResponseState:
     active_request_id: str | None = None
     active_response_id: str | None = None
     active_response_turn_id: int | None = None
+    request_started_at_s_by_turn: dict[int, float] = field(default_factory=dict)
+    active_response_request_started_at_s: float | None = None
+    active_response_ttft_ms: float | None = None
+    active_response_ttfp_ms: float | None = None
     active_response_input_commit_seq: int | None = None
     active_response_awaits_input_commit: bool = False
     last_response_id: str | None = None
@@ -653,6 +659,45 @@ class DuplexSession:
 
     def bind_response_turn(self, turn_id: int | None) -> None:
         self._response.active_response_turn_id = turn_id
+
+    def mark_model_turn_request_started(self, turn_id: int, started_at_s: float) -> None:
+        """Record the latest native request start that can own one model turn."""
+        turn_id = int(turn_id)
+        started_at_s = float(started_at_s)
+        if self.active_response_turn_id == turn_id:
+            if self._response.active_response_request_started_at_s is None:
+                self._response.active_response_request_started_at_s = started_at_s
+            return
+        self._response.request_started_at_s_by_turn[turn_id] = started_at_s
+
+    def mark_response_first_outputs(
+        self,
+        *,
+        observed_at_s: float,
+        has_text: bool,
+        has_audio: bool,
+    ) -> dict[str, object]:
+        """Return server-monotonic TTF metrics observed for the active response."""
+        started_at_s = self._response.active_response_request_started_at_s
+        if started_at_s is None:
+            return {}
+        elapsed_ms = max(0.0, (float(observed_at_s) - started_at_s) * 1000.0)
+        if has_text and self._response.active_response_ttft_ms is None:
+            self._response.active_response_ttft_ms = elapsed_ms
+        if has_audio and self._response.active_response_ttfp_ms is None:
+            self._response.active_response_ttfp_ms = elapsed_ms
+        metrics: dict[str, object] = {
+            "source": "server_monotonic_request_start",
+            "measurement_origin": {
+                "ttft": "native model-turn request execution start to first non-empty text output",
+                "ttfp": "native model-turn request execution start to first audio output",
+            },
+        }
+        if self._response.active_response_ttft_ms is not None:
+            metrics["ttft_ms"] = self._response.active_response_ttft_ms
+        if self._response.active_response_ttfp_ms is not None:
+            metrics["ttfp_ms"] = self._response.active_response_ttfp_ms
+        return metrics
 
     def active_response_accepts_model_turn(self, turn_id: int | None) -> bool:
         if self._response.active_response_id is None:
@@ -938,6 +983,11 @@ class DuplexSession:
     def complete_model_turn(self, turn_id: int) -> None:
         """Advance the model-owned output identity after its terminal signal."""
         completed_turn_id = int(turn_id)
+        self._response.request_started_at_s_by_turn = {
+            pending_turn_id: started_at_s
+            for pending_turn_id, started_at_s in self._response.request_started_at_s_by_turn.items()
+            if pending_turn_id > completed_turn_id
+        }
         if completed_turn_id >= self.turn_id:
             self.turn_id = completed_turn_id + 1
 
@@ -974,6 +1024,12 @@ class DuplexSession:
         response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self._response.active_response_id = response_id
         self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
+        self._response.active_response_request_started_at_s = self._response.request_started_at_s_by_turn.pop(
+            self._response.active_response_turn_id,
+            None,
+        )
+        self._response.active_response_ttft_ms = None
+        self._response.active_response_ttfp_ms = None
         self._response.active_response_input_commit_seq = self.input_commit_seq
         self._response.active_response_awaits_input_commit = self.turn_state == DuplexTurnState.USER_SPEAKING
         self._response.last_response_id = response_id
@@ -1055,17 +1111,22 @@ class DuplexSession:
 
             tpot_ms = raw_values.get("vllm_tpot_ms")
             token_count = raw_values.get("num_tokens_out")
-            if isinstance(tpot_ms, int | float) and tpot_ms > 0:
-                weight = max(int(token_count) - 1, 1) if isinstance(token_count, int | float) else 1
-                self._response.stage_metric_tpot_weighted_ms[stage_id] = (
-                    self._response.stage_metric_tpot_weighted_ms.get(stage_id, 0.0) + float(tpot_ms) * weight
+            if isinstance(tpot_ms, int | float) and not isinstance(tpot_ms, bool) and tpot_ms > 0:
+                weight = (
+                    max(int(token_count) - 1, 0)
+                    if isinstance(token_count, int | float) and not isinstance(token_count, bool)
+                    else 1
                 )
-                self._response.stage_metric_tpot_weight[stage_id] = (
-                    self._response.stage_metric_tpot_weight.get(stage_id, 0) + weight
-                )
-                current["vllm_tpot_ms"] = self._response.stage_metric_tpot_weighted_ms[stage_id] / float(
-                    self._response.stage_metric_tpot_weight[stage_id]
-                )
+                if weight > 0:
+                    self._response.stage_metric_tpot_weighted_ms[stage_id] = (
+                        self._response.stage_metric_tpot_weighted_ms.get(stage_id, 0.0) + float(tpot_ms) * weight
+                    )
+                    self._response.stage_metric_tpot_weight[stage_id] = (
+                        self._response.stage_metric_tpot_weight.get(stage_id, 0) + weight
+                    )
+                    current["vllm_tpot_ms"] = self._response.stage_metric_tpot_weighted_ms[stage_id] / float(
+                        self._response.stage_metric_tpot_weight[stage_id]
+                    )
 
             for name, value in raw_values.items():
                 if name not in handled_fields:
@@ -1103,25 +1164,54 @@ class DuplexSession:
         if text:
             self._response.assistant_text_buffer.append(text)
 
+    def record_generated_audio(self, response_id: str, *, frame_count: int, sample_rate_hz: int) -> int | None:
+        """Accumulate source frames, rounding only the cumulative duration.
+
+        A late chunk cannot change a different response's playback cursor.
+        This records encoded audio, not transport delivery or client playback.
+        """
+        if response_id != self.active_response_id:
+            return None
+        if type(frame_count) is not int or frame_count < 0:
+            raise ValueError("Audio frame_count must be a non-negative integer")
+        if type(sample_rate_hz) is not int or sample_rate_hz <= 0:
+            raise ValueError("Audio sample_rate_hz must be a positive integer")
+        playback = self._playback.current
+        if playback.sample_rate_hz is not None and playback.sample_rate_hz != sample_rate_hz:
+            raise ValueError("Audio sample rate changed within a response")
+        playback.sample_rate_hz = sample_rate_hz
+        playback.generated_frames += frame_count
+        playback.generated_ms = playback.generated_frames * 1000 // sample_rate_hz
+        return playback.generated_ms
+
     def mark_audio_sent(
         self,
         duration_ms: int | None = None,
         *,
+        response_id: str | None = None,
         text_chars: int | None = None,
         audio_text_marks: list[dict[str, object]] | None = None,
     ) -> None:
-        playback = self._playback.current
+        """Record cumulative audio accepted by the output path.
+
+        ``sent_ms`` includes queued/journaled output; only client acknowledgements
+        establish ``played_ms``. It is not confirmation of socket delivery.
+        """
+        playback = self._playback.current if response_id is None else self._playback.by_response.get(response_id)
+        if playback is None:
+            return
+        is_current = response_id is None or response_id == self.active_response_id
         if duration_ms is not None:
             playback.generated_ms = max(playback.generated_ms, duration_ms)
             playback.sent_ms = max(playback.sent_ms, duration_ms)
-            if text_chars is not None and text_chars >= 0:
+            if is_current and text_chars is not None and text_chars >= 0:
                 self._response.assistant_audio_text_marks.append(
                     DuplexAssistantAudioTextMark(
                         text_chars=int(text_chars),
                         audio_end_ms=max(0, int(duration_ms)),
                     )
                 )
-        if audio_text_marks:
+        if is_current and audio_text_marks:
             for raw_mark in audio_text_marks:
                 if not isinstance(raw_mark, dict):
                     continue
@@ -1135,7 +1225,8 @@ class DuplexSession:
                         audio_end_ms=max(0, int(raw_audio_end_ms)),
                     )
                 )
-        self.turn_state = DuplexTurnState.ASSISTANT_PLAYING
+        if is_current:
+            self.turn_state = DuplexTurnState.ASSISTANT_PLAYING
 
     def _playback_cursor_for_response(self, response_id: str | None = None) -> DuplexPlaybackCursor:
         if response_id is None:
@@ -1240,6 +1331,9 @@ class DuplexSession:
             self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.active_response_request_started_at_s = None
+        self._response.active_response_ttft_ms = None
+        self._response.active_response_ttfp_ms = None
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
@@ -1557,6 +1651,10 @@ class DuplexSession:
         self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.request_started_at_s_by_turn.clear()
+        self._response.active_response_request_started_at_s = None
+        self._response.active_response_ttft_ms = None
+        self._response.active_response_ttfp_ms = None
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
@@ -1572,6 +1670,10 @@ class DuplexSession:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
+        self._response.request_started_at_s_by_turn.clear()
+        self._response.active_response_request_started_at_s = None
+        self._response.active_response_ttft_ms = None
+        self._response.active_response_ttfp_ms = None
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self.clear_server_vad_audio()

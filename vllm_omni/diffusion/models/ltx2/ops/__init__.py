@@ -17,9 +17,10 @@ from vllm_omni.platforms import current_omni_platform
 
 # Pointwise fusions are launch/memory-traffic reductions whose first execution
 # for every runtime key is checked bit-for-bit; failures use the ordinary model
-# math. Both paths remain SM90-only until other architectures are validated.
-# The FNA schedule is performance-tuned for SM90 and has no silent fallback.
-_CUDA_COMPUTE_CAPABILITIES = frozenset({90})
+# math. The FNA schedule is performance-tuned for SM90 and has no silent
+# fallback, so qualify the two paths independently.
+_FUSION_CUDA_COMPUTE_CAPABILITIES = frozenset({90, 100, 103})
+_FNA_CUDA_COMPUTE_CAPABILITIES = frozenset({90})
 
 
 @dataclass(frozen=True)
@@ -66,9 +67,10 @@ def resolve_ltx2_vae_operators(device: torch.device) -> LTX2VAEOperatorSet | Non
     if device.type != "cuda" or not current_omni_platform.is_cuda() or not current_omni_platform.is_available():
         return None
     device_index = device.index if device.index is not None else torch.accelerator.current_device_index()
-    if _cuda_compute_capability(int(device_index)) not in _CUDA_COMPUTE_CAPABILITIES:
+    capability = _cuda_compute_capability(int(device_index))
+    if capability not in _FUSION_CUDA_COMPUTE_CAPABILITIES:
         return None
-    return _operator_set(has_tilelang())
+    return _operator_set(capability in _FNA_CUDA_COMPUTE_CAPABILITIES and has_tilelang())
 
 
 def _eligible_operators(tensor: torch.Tensor) -> LTX2VAEOperatorSet | None:
@@ -78,7 +80,7 @@ def _eligible_operators(tensor: torch.Tensor) -> LTX2VAEOperatorSet | None:
 
 
 def is_ltx2_fusion_eligible(tensor: torch.Tensor) -> bool:
-    """Allow self-verifying pointwise fusions on validated SM90 devices."""
+    """Allow self-verifying pointwise fusions on qualified CUDA devices."""
 
     return _eligible_operators(tensor) is not None
 

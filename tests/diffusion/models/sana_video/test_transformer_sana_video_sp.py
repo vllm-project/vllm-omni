@@ -41,8 +41,8 @@ def tp1_group():
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29501")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
+    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="gloo")
+    initialize_model_parallel(backend="gloo")
     yield
     cleanup_dist_env_and_memory()
 
@@ -54,7 +54,7 @@ def force_default_gemm(monkeypatch):
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
 
 
@@ -482,7 +482,11 @@ class _LockstepP2PDist:
 def test_tiny_transformer_sp2_lockstep_matches_dense(tp1_group, force_default_gemm, mocker, task) -> None:
     """Two lockstep rank threads over uneven frame shards must reproduce the
     dense tiny-transformer output, and must actually have sharded the work."""
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
     from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
+
+    # These CPU tensor tests must not probe a CUDA device during construction.
+    mocker.patch("vllm_omni.diffusion.attention.selector._cached_get_backend_cls", return_value=SDPABackend)
 
     torch.manual_seed(3)
     model = SanaVideoTransformer3DModel(**_TINY_SP_CONFIG).eval()
