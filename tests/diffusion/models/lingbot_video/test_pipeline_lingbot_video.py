@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -71,7 +71,11 @@ def test_component_discovery_declarations():
     assert LingBotVideoPipeline.max_outputs_per_prompt == 1
 
 
-def test_constructor_declares_native_transformer_weight_source(mocker):
+@pytest.mark.parametrize(
+    ("model_config", "saved_config"),
+    [({}, {"depth": 0}), ({"transformer_subfolder": "custom_transformer"}, {"depth": 1, "prefix": "saved"})],
+)
+def test_constructor_declares_native_transformer_weight_source(mocker, tmp_path, model_config, saved_config):
     from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
 
     transformer = nn.Linear(2, 2)
@@ -80,10 +84,11 @@ def test_constructor_declares_native_transformer_weight_source(mocker):
         "LingBotVideoTransformer3DModel",
         return_value=transformer,
     )
+    transformer_factory.load_config.return_value = saved_config
     config_helper = mocker.patch.object(
         module,
         "get_transformer_config_kwargs",
-        return_value={"depth": 0},
+        return_value=saved_config.copy(),
     )
     mocker.patch.object(module, "get_local_device", return_value=torch.device("cpu"))
     mocker.patch.object(
@@ -107,28 +112,35 @@ def test_constructor_declares_native_transformer_weight_source(mocker):
         return_value=object(),
     )
     od_config = SimpleNamespace(
-        model="/tmp/lingbot-model",
+        model=str(tmp_path),
         revision="test-revision",
         dtype=torch.bfloat16,
-        model_config={},
+        model_config=model_config,
         tf_model_config=object(),
     )
 
     pipeline = module.LingBotVideoPipeline(od_config=od_config)
 
-    config_helper.assert_called_once_with(
-        od_config.tf_model_config,
-        module.LingBotVideoTransformer3DModel,
+    subfolder = model_config.get("transformer_subfolder", "transformer")
+    transformer_factory.load_config.assert_called_once_with(
+        od_config.model,
+        subfolder=subfolder,
+        revision="test-revision",
+        local_files_only=True,
     )
+    config_helper.assert_called_once()
+    loaded_config, model_class = config_helper.call_args.args
+    assert loaded_config.to_dict() == saved_config
+    assert model_class is module.LingBotVideoTransformer3DModel
     transformer_factory.assert_called_once_with(
-        depth=0,
+        depth=saved_config["depth"],
         prefix="transformer",
     )
     assert pipeline.transformer is transformer
     assert len(pipeline.weights_sources) == 1
     source = pipeline.weights_sources[0]
     assert source.model_or_path == od_config.model
-    assert source.subfolder == "transformer"
+    assert source.subfolder == subfolder
     assert source.revision == "test-revision"
     assert source.prefix == "transformer."
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -360,10 +360,17 @@ class LingBotVideoPipeline(
                 fall_back_to_pt=True,
             )
         ]
+        transformer_config = LingBotVideoTransformer3DModel.load_config(
+            model,
+            subfolder=transformer_subfolder,
+            revision=getattr(od_config, "revision", None),
+            local_files_only=local_files_only,
+        )
         transformer_kwargs = get_transformer_config_kwargs(
-            od_config.tf_model_config,
+            TransformerConfig.from_dict(transformer_config),
             LingBotVideoTransformer3DModel,
         )
+        transformer_kwargs.pop("prefix", None)
         self.transformer = LingBotVideoTransformer3DModel(
             **transformer_kwargs,
             prefix="transformer",
