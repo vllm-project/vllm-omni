@@ -1,6 +1,18 @@
 [
     {
         "test_name": "test_lingbot_video_single_device",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": ["H100", "B200"]
+                    },
+                    "num_cards": 1
+                }
+            },
+            "full_model",
+            "diffusion"
+        ],
         "description": "Single-device LingBot dense T2V baseline at 320x192, 9 frames, 2 steps.",
         "server_type": "vllm-omni",
         "server_params": {
