@@ -542,10 +542,9 @@ def test_comfy_checkpoint_inspection_derives_quantized_layers_and_curve_arch(tmp
         checkpoint_path,
     )
 
-    info = inspect_comfy_checkpoint(checkpoint_path)
+    info = inspect_comfy_checkpoint(checkpoint_path, expected_partition="fl2va")
 
     assert resolve_comfy_checkpoint_path(str(tmp_path)) == checkpoint_path
-    assert info.partition == "fl2va"
     assert set(info.layer_configs) == {prefix}
     assert info.layer_configs[prefix].convrot
     assert info.layer_configs[prefix].convrot_groupsize == 4
@@ -584,8 +583,7 @@ def test_comfy_checkpoint_resolution_preserves_snapshot_symlink_suffix(tmp_path)
     assert resolved == snapshot.absolute()
     assert resolved.suffix == ".safetensors"
     assert resolved.is_symlink()
-    info = inspect_comfy_checkpoint(resolved)
-    assert info.partition == "ref2va"
+    info = inspect_comfy_checkpoint(resolved, expected_partition="ref2va")
     assert set(info.layer_configs) == {"blocks.0.attn.qkv_proj"}
 
 
@@ -737,7 +735,7 @@ def test_convrot_rejects_resolved_fasth3_fusion(monkeypatch, mocker, tmp_path):
     mocker.patch.object(
         pipeline,
         "inspect_comfy_checkpoint",
-        return_value=MiniMaxH3ComfyCheckpoint(checkpoint, "fl2va", {}, None, None),
+        return_value=MiniMaxH3ComfyCheckpoint({}, None, None),
     )
     mocker.patch.object(pipeline, "MiniMaxH3DiTModel", return_value=transformer)
     resolve_fusion = mocker.patch.object(pipeline, "resolve_fasth3_fusion", return_value=object())

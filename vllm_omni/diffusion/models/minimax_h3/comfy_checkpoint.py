@@ -22,8 +22,6 @@ from vllm_omni.quantization.int8_convrot_config import Int8ConvRotLayerConfig
 
 @dataclass(frozen=True)
 class MiniMaxH3ComfyCheckpoint:
-    path: Path
-    partition: Literal["fl2va", "ref2va"]
     layer_configs: dict[str, Int8ConvRotLayerConfig]
     adaln_curve_grid: int | None
     adaln_curve_dim: int | None
@@ -195,8 +193,6 @@ def inspect_comfy_checkpoint(
             curve_grid = curve_dim = None
 
     return MiniMaxH3ComfyCheckpoint(
-        path=checkpoint_path,
-        partition=partition,
         layer_configs=layer_configs,
         adaln_curve_grid=curve_grid,
         adaln_curve_dim=curve_dim,
