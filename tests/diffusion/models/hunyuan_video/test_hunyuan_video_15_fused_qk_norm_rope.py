@@ -36,21 +36,34 @@ def _dist_env():
         cleanup_dist_env_and_memory()
 
 
+def test_packed_table_skipped_on_cpu(monkeypatch):
+    """No table (no allocation) where the fused kernel cannot run."""
+    from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import _packed_qk_norm_rope_table
+
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
+    cos, sin = torch.randn(50, _HEAD_DIM // 2), torch.randn(50, _HEAD_DIM // 2)
+    assert _packed_qk_norm_rope_table((cos, sin), 7, 2, torch.bfloat16) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_packed_table_video_rows_then_identity_text_rows(monkeypatch):
     from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import _packed_qk_norm_rope_table
 
     monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
-    cos, sin = torch.randn(50, _HEAD_DIM // 2), torch.randn(50, _HEAD_DIM // 2)
+    cos, sin = torch.randn(50, _HEAD_DIM // 2, device="cuda"), torch.randn(50, _HEAD_DIM // 2, device="cuda")
     table = _packed_qk_norm_rope_table((cos, sin), text_seq_len=7, batch_size=2, dtype=torch.bfloat16)
     assert table.shape == (2 * 57, _HEAD_DIM) and table.dtype == torch.bfloat16
     half = _HEAD_DIM // 2
     torch.testing.assert_close(table[:50, :half].float(), cos.to(torch.bfloat16).float())
     torch.testing.assert_close(table[:50, half:].float(), sin.to(torch.bfloat16).float())
-    assert torch.equal(table[50:57, :half], torch.ones(7, half, dtype=torch.bfloat16))
-    assert torch.equal(table[50:57, half:], torch.zeros(7, half, dtype=torch.bfloat16))
+    assert torch.equal(table[50:57, :half], torch.ones(7, half, dtype=torch.bfloat16, device="cuda"))
+    assert torch.equal(table[50:57, half:], torch.zeros(7, half, dtype=torch.bfloat16, device="cuda"))
     assert torch.equal(table[:57], table[57:])
     monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "1000000")
     assert _packed_qk_norm_rope_table((cos, sin), 7, 2, torch.bfloat16) is None
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
+    assert _packed_qk_norm_rope_table((cos, sin), 7, 2, torch.float16) is None  # non-bf16 activations
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
