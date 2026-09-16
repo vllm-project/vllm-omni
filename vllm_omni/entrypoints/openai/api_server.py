@@ -88,6 +88,7 @@ from vllm_omni.config.endpoint_policy import (
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
+from vllm_omni.entrypoints.duplex.openai import dispatch_realtime_websocket
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import _warmup_duplex_realtime
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
@@ -149,7 +150,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSessionCapacityError,
     RolloutSessionClosedError,
@@ -607,7 +607,6 @@ async def omni_init_app_state(
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
             allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
-        state.openai_serving_duplex = None
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
@@ -1474,32 +1473,8 @@ async def streaming_video_output(websocket: WebSocket):
 
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
-    """WebSocket endpoint for OpenAI-style realtime interactions."""
-    # Hold real clients until the startup duplex warmup finishes (the warmup
-    # connection marks itself with vllm_omni_warmup=1 and passes through).
-    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
-    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
-        try:
-            await asyncio.wait_for(warmup_done.wait(), timeout=120)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
-    duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
-    duplex_query = websocket.query_params.get("duplex")
-    use_duplex_realtime = duplex_handler is not None and (
-        duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
-    )
-    if use_duplex_realtime and duplex_handler is not None:
-        await duplex_handler.handle_realtime_session(websocket)
-        return
-
-    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
-    if serving is None:
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
-        await websocket.close()
-        return
-    connection = RealtimeConnection(websocket, serving)
-    await connection.handle_connection()
+    """Handle an OpenAI-compatible Realtime API session."""
+    await dispatch_realtime_websocket(websocket)
 
 
 @router.websocket("/v1/realtime/robot/openpi")
