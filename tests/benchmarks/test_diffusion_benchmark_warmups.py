@@ -3,7 +3,6 @@
 
 import importlib
 import sys
-from argparse import Namespace
 
 import pytest
 
@@ -11,6 +10,9 @@ from benchmarks.diffusion import backends
 from benchmarks.diffusion.backends import RequestFuncInput, RequestFuncOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu, pytest.mark.asyncio]
+
+ENDPOINT = "/v1/chat/completions"
+TEST_MODEL = "test-model"
 
 
 @pytest.fixture
@@ -21,12 +23,18 @@ def diffusion_benchmark(monkeypatch):
 
 
 @pytest.fixture
-def warmup_args():
-    return Namespace(
-        warmup_requests=2,
-        warmup_concurrency=2,
-        warmup_num_inference_steps=4,
-        task="t2i",
+def warmup_args(diffusion_benchmark):
+    from benchmarks.diffusion.diffusion_benchmark_serving import build_parser
+
+    parser = build_parser()
+    return parser.parse_args(
+        [
+            f"--endpoint={ENDPOINT}",
+            "--dataset=random",
+            "--task=t2i",
+            "--warmup-requests=2",
+            "--warmup-num-inference-steps=4",
+        ]
     )
 
 
@@ -35,8 +43,8 @@ def input_requests():
     return [
         RequestFuncInput(
             prompt=prompt,
-            api_url="http://test.local/v1/chat/completions",
-            model="test-model",
+            api_url=f"http://test.local{ENDPOINT}",
+            model=TEST_MODEL,
             num_inference_steps=20,
         )
         for prompt in ("first", "second")
@@ -96,19 +104,6 @@ async def test_failed_warmups_abort_without_exposing_response_errors(
 async def test_benchmark_does_not_start_measurement_after_failed_warmup(
     monkeypatch, mocker, diffusion_benchmark, warmup_args, input_requests
 ):
-    args = Namespace(
-        **vars(warmup_args),
-        base_url="http://test.local",
-        endpoint="/v1/chat/completions",
-        dataset="random",
-        model="test-model",
-        enable_negative_prompt=False,
-        return_stage_metrics=False,
-        extra_body=None,
-        max_concurrency=1,
-        disable_tqdm=True,
-        slo=False,
-    )
     sent = []
 
     async def failed_request(req, session, pbar):
@@ -117,8 +112,8 @@ async def test_benchmark_does_not_start_measurement_after_failed_warmup(
 
     monkeypatch.setitem(
         diffusion_benchmark.backends_function_mapping["2i"],
-        args.endpoint,
-        (failed_request, args.endpoint),
+        warmup_args.endpoint,
+        (failed_request, warmup_args.endpoint),
     )
     dataset = mocker.Mock(spec=diffusion_benchmark.RandomDataset)
     dataset.get_requests.return_value = input_requests
@@ -128,6 +123,6 @@ async def test_benchmark_does_not_start_measurement_after_failed_warmup(
     monkeypatch.setattr(diffusion_benchmark, "time", timer)
 
     with pytest.raises(RuntimeError, match="2/2 warmup requests failed"):
-        await diffusion_benchmark.benchmark(args)
+        await diffusion_benchmark.benchmark(warmup_args)
 
     assert len(sent) == warmup_args.warmup_requests

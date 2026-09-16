@@ -1461,7 +1461,7 @@ async def benchmark(args):
         print(f"Metrics saved to {args.output_file}")
 
 
-if __name__ == "__main__":
+def build_parser():
     parser = argparse.ArgumentParser(description="Benchmark serving for diffusion models.")
     parser.add_argument(
         "--base-url",
@@ -1643,6 +1643,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Request stage duration metrics from endpoints that support return_stage_metrics.",
     )
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_parser()
     args = parser.parse_args()
     asyncio.run(benchmark(args))
