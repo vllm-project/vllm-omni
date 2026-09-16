@@ -690,9 +690,6 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     session_id = duplex_state.get("session_id")
     if isinstance(session_id, str) and session_id:
         metadata["session_id"] = session_id
-    incarnation = duplex_state.get("incarnation")
-    if isinstance(incarnation, int):
-        metadata["incarnation"] = incarnation
     epoch = duplex_state.get("epoch")
     if isinstance(epoch, int):
         metadata["epoch"] = epoch

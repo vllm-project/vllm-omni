@@ -16,9 +16,11 @@ import time
 import traceback
 from collections.abc import Iterable, Sequence
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
+import av
 import pytest
 import requests
 import torch
@@ -82,6 +84,7 @@ class SamplingKind(str, Enum):
     VIDEO_FASTH3 = "video_fasth3"
     VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
     VIDEO_REF2VA_MULTI_VIDEO = "video_ref2va_multi_video"
+    VIDEO_REF2VA_MIXED = "video_ref2va_mixed"
 
 
 # Pre-defined arguments to be used in function calls during the tests
@@ -152,6 +155,13 @@ H3_MODEL_PARAMS = MiniMaxH3ModelSpecificParams(
         "flow_shift": 12.0,
     }
 )
+
+H3_STAGE_CONFIG = {
+    "stage_type": "diffusion",
+    "final_output": True,
+    "final_output_type": "video",
+    "engine_args": {"model_class_name": "MiniMaxH3Pipeline"},
+}
 
 LORA_PARAMS = {"local_path": "test_lora_path", "name": "test_name", "scale": 0.7, "int_id": 10}
 
@@ -442,17 +452,30 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "audio_flow_shift": 3.0,
                 },
             )
-        elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_MULTI_VIDEO:
+        elif sampling_case.kind in (SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, SamplingKind.VIDEO_REF2VA_MIXED):
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
             multi_modal_data = prompt.get("multi_modal_data")
             assert isinstance(multi_modal_data, dict)
             input_videos = multi_modal_data.get("video")
             assert isinstance(input_videos, list)
-            assert len(input_videos) == 2
             assert all(isinstance(path, str) for path in input_videos)
-            assert "image" not in multi_modal_data
-            assert "audio" not in multi_modal_data
+            if sampling_case.kind is SamplingKind.VIDEO_REF2VA_MULTI_VIDEO:
+                assert len(input_videos) == 2
+                assert "image" not in multi_modal_data
+                assert "audio" not in multi_modal_data
+            else:
+                assert [Path(path).read_bytes() for path in input_videos] == [b"video-1", b"video-2", b"video-3"]
+                images = multi_modal_data.get("image")
+                assert isinstance(images, list)
+                assert len(images) == 6
+                assert [image.getpixel((0, 0)) for image in images] == [(i * 40,) * 3 for i in range(1, 7)]
+                audios = multi_modal_data.get("audio")
+                assert isinstance(audios, list)
+                assert len(audios) == 3
+                for path, sample_rate in zip(audios, (24000, 32000, 48000)):
+                    with av.open(path) as container:
+                        assert container.streams.audio[0].sample_rate == sample_rate
             _assert_sampling_param_values(
                 received_sampling_params_list[0],
                 {
@@ -970,7 +993,7 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+                stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, sampling_params=None),
@@ -981,12 +1004,23 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+                stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),
             "multi_video",
             id="ref2va-multi-video",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MIXED, sampling_params=None),
+            "mixed",
+            id="ref2va-mixed-12-references",
         ),
     ],
     indirect=["server_case", "sampling_case"],
@@ -1017,6 +1051,17 @@ async def test_video_generation_node_minimax_h3_ref2va(
         prompt = (
             "Remove the green screen background of Video 1 and replace it with the fairytale environment from Video 2."
         )
+    elif ref_mode == "mixed":
+        inputs = {f"image_{i}": torch.full((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), i * 40 / 255) for i in range(1, 7)}
+        inputs.update({f"video_{i}": VideoInput(f"video-{i}".encode()) for i in range(1, 4)})
+        inputs.update(
+            {
+                f"audio_{i}": {"waveform": torch.zeros(1, 1, sample_rate), "sample_rate": sample_rate}
+                for i, sample_rate in enumerate((24000, 32000, 48000), start=1)
+            }
+        )
+        (references,) = refs_node.get_references(**inputs)
+        prompt = "Combine the subjects from the images with the reference videos and audio clips."
     else:
         raise AssertionError(f"Unknown ref_mode: {ref_mode}")
 
