@@ -1,0 +1,56 @@
+[
+  {
+    "test_name": "test_hunyuanvideo15_i2v_cachedit_tp2_vae_patch2_stability",
+    "description": "HunyuanVideo-1.5 I2V 24h: CacheDiT + TP=2 + VAE patch parallel=2 + VAE tiling",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H800"]
+          },
+          "num_cards": 2
+        }
+      },
+      "local_model",
+      "diffusion"
+    ],
+    "server_params": {
+      "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
+      "serve_args": {
+        "flow-shift": 5.0,
+        "cache-backend": "cache_dit",
+        "tensor-parallel-size": 2,
+        "vae-patch-parallel-size": 2,
+        "vae-use-tiling": true,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "dataset": "random",
+        "task": "i2v",
+        "backend": "v1/videos",
+        "duration_sec": 86400,
+        "max_concurrency": 1,
+        "num_prompts_per_batch": 50,
+        "num_input_images": 1,
+        "seed": 42,
+        "enable_negative_prompt": true,
+        "random_request_config": [
+          {
+            "width": 832,
+            "height": 480,
+            "num_inference_steps": 4,
+            "num_frames": 33,
+            "fps": 24,
+            "weight": 1
+          }
+        ],
+        "extra_body": {
+          "guidance_scale": 6.0,
+          "flow_shift": 5.0
+        }
+      }
+    ]
+  }
+]

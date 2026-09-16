@@ -48,7 +48,7 @@
 #     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. H800 or A3).
 #     Otherwise -m defaults to H800. PYTEST_MARK is rejected unless stability is enabled.
 #     model_type: omni → qwen3_omni + minicpmo_4_5; tts → qwen3_tts;
-#                 diffusion → qwen_image + wan22 + hunyuan_image + minimax_h3; all → all seven
+#                 diffusion → qwen_image + wan22 + hunyuan_image + minimax_h3 + hunyuanvideo15; all → all eight
 #     stability_minimax_h3 also exports VLLM_TEST_MINIMAX_H3_FASTH3_LORA (same as test-merge.yml)
 #     before pytest, otherwise collection skipif skips the case.
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
@@ -606,6 +606,7 @@ STABILITY_CASES: list[tuple[str, str, tuple[str, ...]]] = [
     ("stability_wan22", "tests/dfx/stability/scripts/test_stability_wan22.py", ("diffusion",)),
     ("stability_hunyuan_image", "tests/dfx/stability/scripts/test_stability_hunyuan_image.py", ("diffusion",)),
     ("stability_minimax_h3", "tests/dfx/stability/scripts/test_stability_minimax_h3.py", ("diffusion",)),
+    ("stability_hunyuanvideo15", "tests/dfx/stability/scripts/test_stability_hunyuanvideo15.py", ("diffusion",)),
 ]
 
 
