@@ -16,7 +16,6 @@ from typing import Any
 
 import torch
 from torch.nn import Module
-from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -27,14 +26,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    is_layer_skipped,
-)
 from vllm.model_executor.parameter import ChannelQuantScaleParameter
 
 from vllm_omni.quantization.int8_config import create_weight_parameter
-
-logger = init_logger(__name__)
 
 _FORMAT = "int8_tensorwise"
 
@@ -77,29 +71,14 @@ class DiffusionInt8ConvRotConfig(QuantizationConfig):
     def __init__(
         self,
         layer_configs: Mapping[str, Mapping[str, Any] | Int8ConvRotLayerConfig] | None = None,
-        quantized_layers: list[str] | None = None,
-        convrot_groupsize: int = 256,
-        ignored_layers: list[str] | None = None,
     ) -> None:
         super().__init__()
-        self.ignored_layers = ignored_layers or []
         self.layer_configs: dict[str, Int8ConvRotLayerConfig] = {}
         self.is_checkpoint_quantized = True
         self.is_checkpoint_int8_convrot_serialized = True
 
         if layer_configs:
             self.configure_layers(layer_configs)
-        if quantized_layers:
-            default = Int8ConvRotLayerConfig.from_mapping(
-                {
-                    "format": _FORMAT,
-                    "convrot": True,
-                    "convrot_groupsize": convrot_groupsize,
-                }
-            )
-            for prefix in quantized_layers:
-                self.layer_configs.setdefault(prefix, default)
-        self._validate_checkpoint_layers_are_quantized(self.layer_configs)
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -120,12 +99,7 @@ class DiffusionInt8ConvRotConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> DiffusionInt8ConvRotConfig:
-        return cls(
-            layer_configs=config.get("layer_configs"),
-            quantized_layers=config.get("quantized_layers"),
-            convrot_groupsize=config.get("convrot_groupsize", 256),
-            ignored_layers=config.get("ignored_layers"),
-        )
+        return cls(layer_configs=config.get("layer_configs"))
 
     def configure_layers(
         self,
@@ -139,21 +113,9 @@ class DiffusionInt8ConvRotConfig(QuantizationConfig):
             parsed[prefix] = (
                 value if isinstance(value, Int8ConvRotLayerConfig) else Int8ConvRotLayerConfig.from_mapping(value)
             )
-        self._validate_checkpoint_layers_are_quantized(parsed)
         if self.layer_configs and self.layer_configs != parsed:
             raise ValueError("ConvRot layer metadata was already configured with different checkpoint values.")
         self.layer_configs = parsed
-
-    def _validate_checkpoint_layers_are_quantized(
-        self,
-        layer_configs: Mapping[str, Int8ConvRotLayerConfig],
-    ) -> None:
-        conflicts = sorted(prefix for prefix in layer_configs if is_layer_skipped(prefix, self.ignored_layers))
-        if conflicts:
-            raise ValueError(
-                "Checkpoint-marked INT8 ConvRot layers cannot also be ignored: "
-                f"{conflicts[:5]}. Remove them from ignored_layers."
-            )
 
     def validate_model_bindings(self, model: Module) -> None:
         """Require every checkpoint marker to bind an executable ConvRot layer."""
@@ -182,8 +144,6 @@ class DiffusionInt8ConvRotConfig(QuantizationConfig):
     ) -> QuantizeMethodBase | None:
         if not isinstance(layer, LinearBase):
             return None
-        if is_layer_skipped(prefix, self.ignored_layers):
-            return UnquantizedLinearMethod()
         layer_config = self.layer_configs.get(prefix)
         if layer_config is None:
             return UnquantizedLinearMethod()
@@ -309,29 +269,6 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
         self._cuda_impl = impl
         return impl
 
-    @staticmethod
-    def _run_custom_op(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        bias: torch.Tensor | None,
-        output_dtype_code: int,
-        convrot: bool,
-        convrot_groupsize: int,
-    ) -> torch.Tensor:
-        # comfy-kitchen registers a fake implementation for this op, so Dynamo
-        # keeps it opaque instead of tracing into the CUDA backend's DLPack calls.
-        return torch.ops.comfy_kitchen.int8_linear(
-            x,
-            weight,
-            weight_scale,
-            bias,
-            output_dtype_code,
-            convrot,
-            convrot_groupsize,
-            None,
-        )
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -346,11 +283,13 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
             dtype_code = 1
         else:
             raise TypeError(f"{self.prefix} INT8 ConvRot supports only FP16/BF16 activations, got {x.dtype}.")
-        # Normal model loading resolves this before regional torch.compile is
-        # installed. Keep the lazy path for direct callers and unusual loaders.
+        # CPU-offloaded weights defer CUDA backend validation until the first
+        # CUDA activation reaches apply().
         if self._cuda_impl is None:
             self._resolve_cuda_impl(layer, x, bias=bias)
-        return self._run_custom_op(
+        # The registered fake implementation keeps this op opaque to Dynamo,
+        # avoiding tracing into the CUDA backend's DLPack calls.
+        return torch.ops.comfy_kitchen.int8_linear(
             x.contiguous(),
             layer.weight,
             layer.weight_scale,
@@ -358,6 +297,7 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
             dtype_code,
             self.layer_config.convrot,
             self.layer_config.convrot_groupsize,
+            None,
         )
 
 

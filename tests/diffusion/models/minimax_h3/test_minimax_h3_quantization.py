@@ -377,43 +377,42 @@ def test_int8_convrot_factory_routes_only_checkpoint_marked_layers(mocker):
     from vllm_omni.quantization import build_quant_config
     from vllm_omni.quantization.int8_convrot_config import Int8ConvRotLinearMethod
 
-    config = build_quant_config(
-        {
-            "method": "int8_convrot",
-            "quantized_layers": ["blocks.0.attn.qkv_proj"],
-        }
+    config = build_quant_config({"method": "int8_convrot"})
+    config.configure_layers(
+        {"blocks.0.attn.qkv_proj": {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 64}}
     )
     linear = mocker.Mock(spec=LinearBase)
 
     assert config.get_name() == "int8_convrot"
-    assert isinstance(config.get_quant_method(linear, "blocks.0.attn.qkv_proj"), Int8ConvRotLinearMethod)
+    method = config.get_quant_method(linear, "blocks.0.attn.qkv_proj")
+    assert isinstance(method, Int8ConvRotLinearMethod)
+    assert method.layer_config.convrot_groupsize == 64
     assert isinstance(config.get_quant_method(linear, "blocks.0.attn.out_proj"), UnquantizedLinearMethod)
 
 
-def test_int8_convrot_rejects_ignored_checkpoint_layers():
-    from vllm_omni.quantization.int8_convrot_config import (
-        DiffusionInt8ConvRotConfig,
-        Int8ConvRotLayerConfig,
-    )
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("quantized_layers", ["blocks.0.attn.qkv_proj"]),
+        ("convrot_groupsize", 256),
+        ("ignored_layers", ["blocks.0.attn.qkv_proj"]),
+    ],
+)
+def test_int8_convrot_rejects_manual_layer_options(option, value):
+    from vllm_omni.quantization import build_quant_config
 
-    prefix = "blocks.0.attn.qkv_proj"
-    with pytest.raises(ValueError, match="cannot also be ignored"):
-        DiffusionInt8ConvRotConfig(
-            quantized_layers=[prefix],
-            ignored_layers=[prefix],
-        )
-    config = DiffusionInt8ConvRotConfig(ignored_layers=[prefix])
-    with pytest.raises(ValueError, match="cannot also be ignored"):
-        config.configure_layers({prefix: Int8ConvRotLayerConfig(True, 256)})
+    with pytest.raises(TypeError, match=f"unexpected keyword argument '{option}'"):
+        build_quant_config({"method": "int8_convrot", option: value})
 
 
 @pytest.mark.parametrize("prefix", ["final_layer.video_out", "blocks.99.missing"])
 def test_int8_convrot_rejects_checkpoint_markers_without_executable_binding(prefix):
     from vllm_omni.quantization.int8_convrot_config import (
         DiffusionInt8ConvRotConfig,
+        Int8ConvRotLayerConfig,
     )
 
-    config = DiffusionInt8ConvRotConfig(quantized_layers=[prefix])
+    config = DiffusionInt8ConvRotConfig(layer_configs={prefix: Int8ConvRotLayerConfig(convrot=True)})
 
     with pytest.raises(ValueError, match="unbound markers"):
         config.validate_model_bindings(nn.Module())
@@ -427,7 +426,7 @@ def test_int8_convrot_accepts_exact_executable_bindings():
     )
 
     prefix = "blocks.0.attn.qkv_proj"
-    config = DiffusionInt8ConvRotConfig(quantized_layers=[prefix])
+    config = DiffusionInt8ConvRotConfig(layer_configs={prefix: Int8ConvRotLayerConfig(convrot=True)})
     model = nn.Module()
     model.linear = nn.Linear(1, 1)
     model.linear.quant_method = Int8ConvRotLinearMethod(
@@ -442,20 +441,10 @@ def test_int8_convrot_accepts_exact_executable_bindings():
 def test_component_config_reports_offline_only_when_every_quantizer_is_offline():
     from vllm_omni.quantization import build_quant_config
 
-    offline = build_quant_config(
-        {
-            "transformer": {
-                "method": "int8_convrot",
-                "quantized_layers": ["blocks.0.attn.qkv_proj"],
-            }
-        }
-    )
+    offline = build_quant_config({"transformer": {"method": "int8_convrot"}})
     mixed = build_quant_config(
         {
-            "transformer": {
-                "method": "int8_convrot",
-                "quantized_layers": ["blocks.0.attn.qkv_proj"],
-            },
+            "transformer": {"method": "int8_convrot"},
             "text_encoder": {"method": "fp8"},
         }
     )
@@ -480,7 +469,8 @@ def test_int8_convrot_checkpoint_and_quantization_must_be_configured_together():
         _validate_int8_convrot_override_pair(True, None)
 
 
-def test_int8_convrot_apply_resolves_native_cuda_backend_once(monkeypatch, mocker):
+@pytest.mark.parametrize(("dtype", "dtype_code"), [(torch.bfloat16, 2), (torch.float16, 1)])
+def test_int8_convrot_apply_resolves_native_cuda_backend_once(monkeypatch, mocker, dtype, dtype_code):
     from vllm_omni.quantization.int8_convrot_config import (
         DiffusionInt8ConvRotConfig,
         Int8ConvRotLayerConfig,
@@ -498,10 +488,10 @@ def test_int8_convrot_apply_resolves_native_cuda_backend_once(monkeypatch, mocke
         prefix="blocks.0.attn.qkv_proj",
     )
     monkeypatch.setattr(method, "_load_comfy_kitchen", lambda: kitchen)
-    monkeypatch.setattr(method, "_run_custom_op", custom_op)
+    monkeypatch.setattr(torch.ops.comfy_kitchen, "int8_linear", custom_op, raising=False)
     activation = mocker.Mock(spec=torch.Tensor)
     activation.is_cuda = True
-    activation.dtype = torch.bfloat16
+    activation.dtype = dtype
     layer = nn.Module()
     layer.weight = object()
     layer.weight_scale = object()
@@ -512,6 +502,16 @@ def test_int8_convrot_apply_resolves_native_cuda_backend_once(monkeypatch, mocke
     assert registry.get_implementation.call_args.kwargs["backend"] == "cuda"
     implementation.assert_not_called()
     assert custom_op.call_count == 2
+    custom_op.assert_called_with(
+        activation.contiguous.return_value,
+        layer.weight,
+        layer.weight_scale,
+        None,
+        dtype_code,
+        True,
+        256,
+        None,
+    )
 
     activation.dtype = torch.float32
     with pytest.raises(TypeError, match="supports only FP16/BF16"):
