@@ -53,6 +53,7 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.rainfusion_cp import RainFusionCPLayout
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -506,6 +507,7 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
+        rainfusion_cp_extra: dict[str, int | bool] | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -588,6 +590,10 @@ class MiniMaxH3Attention(nn.Module):
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
                 "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+                # Pure AllGather-KV CP sends local Q and full K/V to the
+                # backend. The values describe a global rf_v2 permutation
+                # already applied before sp_prepare.
+                **(rainfusion_cp_extra or {}),
                 # Present only for a VSA artifact; the VSA backend reads it as
                 # the learned compression gate and every other backend ignores it.
                 **({"gate_compress": gate_compress.unsqueeze(0)} if gate_compress is not None else {}),
@@ -620,6 +626,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        rainfusion_cp_extra: dict[str, int | bool] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -679,6 +686,7 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
+            rainfusion_cp_extra=rainfusion_cp_extra,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -898,6 +906,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        rainfusion_cp_extra: dict[str, int | bool] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -934,6 +943,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            rainfusion_cp_extra=rainfusion_cp_extra,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1241,6 +1251,57 @@ class MiniMaxH3DiTModel(nn.Module):
             hooks_applied=hooks_applied,
         )
 
+    def _rainfusion_cp_layout(
+        self,
+        *,
+        video_layout: VideoTokenLayout | None,
+        max_seqlen: int,
+        num_requests: int,
+    ) -> RainFusionCPLayout | None:
+        """Return a pre-SP layout only for pure AllGather-KV T2V RainFusion.
+
+        The T2V packing path publishes the legacy single-video tail contract.
+        Ref2VA's ``video_spans`` remains on its existing global-Q path because
+        a local-Q rectangle cannot express its discontiguous clip plan.
+        """
+        if num_requests != 1 or video_layout is None or video_layout.video_spans:
+            return None
+        if video_layout.prefix_len is None or video_layout.latent_grid is None:
+            return None
+        if int(video_layout.prefix_len) + math.prod(video_layout.latent_grid) != max_seqlen:
+            return None
+        if not self.blocks or self.blocks[0].attn.attention.attn_backend is None:
+            return None
+        if self.blocks[0].attn.attention.attn_backend.get_name() != "RAINFUSION_ATTN":
+            return None
+
+        try:
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_allgather_parallel_rank,
+                get_allgather_parallel_world_size,
+                get_ring_parallel_world_size,
+                get_ulysses_parallel_world_size,
+            )
+
+            world_size = int(get_allgather_parallel_world_size())
+            rank = int(get_allgather_parallel_rank())
+            if (
+                world_size <= 1
+                or int(get_ulysses_parallel_world_size()) != 1
+                or int(get_ring_parallel_world_size()) != 1
+            ):
+                return None
+        except AssertionError:
+            # Unit construction and non-distributed paths retain the existing
+            # non-CP behavior rather than fabricating a rank.
+            return None
+        return RainFusionCPLayout.build(
+            prefix_len=int(video_layout.prefix_len),
+            latent_grid=tuple(int(dim) for dim in video_layout.latent_grid),
+            world_size=world_size,
+            rank=rank,
+        )
+
     def prepare_rope_table(
         self,
         img_position_ids: torch.Tensor,
@@ -1501,10 +1562,34 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        local_span = self._rope_local_span(seq_len)
+        rainfusion_cp_layout = self._rainfusion_cp_layout(
+            video_layout=video_layout,
+            max_seqlen=max_seqlen,
+            num_requests=num_requests,
+        )
+        if rainfusion_cp_layout is not None and rainfusion_cp_layout.used_len > seq_len:
+            raise ValueError(
+                "RainFusion CP logical sequence exceeds the packed input: "
+                f"used={rainfusion_cp_layout.used_len}, packed={seq_len}."
+            )
+        # CP must reorder *before* SP splits rows.  It therefore builds the
+        # full RoPE table here rather than consuming the rank-local cached
+        # table prepared by the ordinary denoise branch.
+        local_span = (0, seq_len) if rainfusion_cp_layout is not None else self._rope_local_span(seq_len)
         local_start, local_len = local_span
         rope_table = kwargs.get("rope_table")
-        if rope_table is None:
+        if rainfusion_cp_layout is not None:
+            if rope_table is None:
+                full_rope = _build_rope_table(self.rope(img_position_ids).to(device))
+            else:
+                self._validate_prepared_rope_table(
+                    rope_table,
+                    local_len=seq_len,
+                    device=device,
+                )
+                full_rope = rope_table
+            rope_table = rainfusion_cp_layout.prearrange(full_rope)
+        elif rope_table is None:
             if current_omni_platform.is_npu():
                 rope_table = self.prepare_rope_table(
                     img_position_ids,
@@ -1541,12 +1626,20 @@ class MiniMaxH3DiTModel(nn.Module):
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
 
-        hidden = decoder_input
+        rainfusion_cp_extra = None
+        if rainfusion_cp_layout is not None:
+            hidden = rainfusion_cp_layout.prearrange(decoder_input)
+            block_combined = rainfusion_cp_layout.prearrange(combined_indices)
+            rainfusion_cp_extra = rainfusion_cp_layout.attention_extra()
+            packed_total = rainfusion_cp_layout.physical_len
+        else:
+            hidden = decoder_input
+            block_combined = combined_indices
+            packed_total = seq_len
         cu_seqlens = cu_seqlens.to(device)
         block_rope = rope_table
-        block_combined = combined_indices
 
-        if local_len == seq_len:
+        if rainfusion_cp_layout is not None or local_len == seq_len:
             hidden, block_rope, block_combined = self.sp_prepare(
                 hidden,
                 block_rope,
@@ -1566,12 +1659,23 @@ class MiniMaxH3DiTModel(nn.Module):
                 rope_table=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                packed_total=seq_len,
+                packed_total=packed_total,
                 num_requests=num_requests,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                rainfusion_cp_extra=rainfusion_cp_extra,
             )
-        if local_len == seq_len:
+        if rainfusion_cp_layout is not None:
+            hidden = rainfusion_cp_layout.restore(self.sp_gather(hidden))
+            video_logits, audio_logits = self.final_layer(
+                hidden,
+                t_emb=t_emb,
+                # CP removed only the original trailing alignment padding.
+                # The final AdaLN index vector must cover exactly the restored
+                # logical rows, not the source packing capacity.
+                inverse_indices=inverse_indices[: rainfusion_cp_layout.used_len],
+            )
+        elif local_len == seq_len:
             hidden = self.sp_gather(hidden)
             video_logits, audio_logits = self.final_layer(
                 hidden,
