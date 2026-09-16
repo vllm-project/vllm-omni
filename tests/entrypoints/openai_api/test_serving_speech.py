@@ -5212,6 +5212,52 @@ class TestTTSAsyncOffloading:
             for call in log_info.call_args_list
         )
 
+    @pytest.mark.parametrize("word_timestamps", [False, True])
+    def test_streaming_timestamps_retain_complete_audio(self, qwen3_tts_server, mocker, word_timestamps):
+        from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+
+        defaults = [SamplingParams(), SamplingParams()]
+        qwen3_tts_server.engine_client.default_sampling_params_list = defaults
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._adapter._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        request = OpenAICreateSpeechRequest(
+            input="hello", stream=True, response_format="pcm", word_timestamps=word_timestamps
+        )
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+        expected = RequestOutputKind.CUMULATIVE if word_timestamps else RequestOutputKind.DELTA
+        assert all(sp.output_kind == expected for sp in params)
+        assert all(sp.output_kind == RequestOutputKind.CUMULATIVE for sp in defaults)
+        assert all(sp is not original for sp, original in zip(params, defaults))
+
+    @pytest.mark.asyncio
+    async def test_cumulative_timestamp_audio_emits_each_sample_once(self, qwen3_tts_server):
+        audio = torch.linspace(-0.5, 0.5, 2400)
+
+        async def cumulative_generator():
+            for end in (800, 1600, 2400, 2400):
+                yield OmniRequestOutput(
+                    request_id="req-cumulative",
+                    final_output_type="audio",
+                    _multimodal_output={"audio": audio[:end], "sr": 24000},
+                )
+
+        chunks = [
+            chunk
+            async for chunk in qwen3_tts_server._generate_pcm_chunks(
+                cumulative_generator(), "req-cumulative", cumulative_audio=True
+            )
+        ]
+        assert len(chunks) == 3
+        assert len(b"".join(chunks)) == 2400 * 2
+        decoded = np.frombuffer(b"".join(chunks), dtype=np.int16)
+        assert np.all(np.diff(decoded.astype(np.int32)) >= 0)
+
     def test_prepare_speech_generation_treats_sse_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
         """stream_format=sse should request delta-style multimodal outputs."""
         qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)

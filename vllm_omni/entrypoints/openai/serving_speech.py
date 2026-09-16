@@ -32,6 +32,7 @@ from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -1444,14 +1445,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tts_params: dict[str, Any] | None = None,
         collect: dict | None = None,
         target_sample_rate: int | None = None,
+        cumulative_audio: bool = False,
     ):
         """Generate audio chunks for streaming response.
 
         Handles two audio output modes from the engine:
         - Cumulative mode (list): Engine returns growing list of chunks;
         we emit only the new tail on each iteration.
-        - Per-step mode (tensor): Engine returns single tensor per iteration;
-        we emit it directly.
+        - Tensor mode: Emit each tensor directly, or only its new samples when
+        cumulative_audio is set for requests that retain audio for alignment.
 
         Args:
             generator: Async generator from the engine
@@ -1462,6 +1464,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             Raw audio bytes for each chunk (with WAV header for first chunk if wav format)
         """
         prev_count = 0
+        emitted_samples = 0
         sample_rate_val = 24000
         first_chunk = True
         first_audio_chunk_s: float | None = None
@@ -1563,6 +1566,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    if cumulative_audio and not isinstance(audio_val, list):
+                        total_samples = chunk_np.shape[-1]
+                        chunk_np = chunk_np[..., emitted_samples:]
+                        emitted_samples = total_samples
+                        if chunk_np.size == 0:
+                            continue
                     if resampler is not None:
                         chunk_np = resampler.process(chunk_np)
                         if chunk_np.size == 0:
@@ -1957,6 +1966,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             from vllm_omni.model_executor.stage_input_processors.forced_aligner import TIMESTAMPS_MODALITY
 
             output_modalities.append(TIMESTAMPS_MODALITY)
+            if is_streaming_request:
+                # The aligner consumes the terminal waveform, so retain earlier
+                # audio chunks instead of draining them after each DELTA output.
+                sampling_params_list = [
+                    sp.clone() if isinstance(sp, SamplingParams) else sp for sp in sampling_params_list
+                ]
+                for sp in sampling_params_list:
+                    if isinstance(sp, SamplingParams):
+                        sp.output_kind = RequestOutputKind.CUMULATIVE
 
         generator = self.engine_client.generate(
             prompt=prompt,
@@ -1990,6 +2008,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tts_params: dict[str, Any] | None = None,
         collect: dict | None = None,
         target_sample_rate: int | None = None,
+        cumulative_audio: bool = False,
     ):
         """Yield raw PCM byte chunks from the engine generator.
 
@@ -2009,6 +2028,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params=tts_params,
                 collect=collect,
                 target_sample_rate=target_sample_rate,
+                cumulative_audio=cumulative_audio,
             )
         ) as chunks:
             async for chunk in chunks:
@@ -2024,6 +2044,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request_id,
                     tts_params=tts_params,
                     target_sample_rate=request.sample_rate,
+                    cumulative_audio=request.word_timestamps,
                 )
             ) as chunks:
                 async for chunk in chunks:

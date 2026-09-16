@@ -56,6 +56,7 @@ def _build_test_app(
             include_sample_rate=False,
             tts_params=None,
             collect=None,
+            cumulative_audio=False,
         ):
             for chunk in (b"\x01\x02", b"\x03\x04\x05"):
                 yield (chunk, 24000) if include_sample_rate else chunk
@@ -386,9 +387,11 @@ class TestStreamingSpeechWebSocket:
             include_sample_rate=False,
             tts_params=None,
             collect=None,
+            cumulative_audio=False,
         ):
             assert request_start_s is not None
             assert request_arrival_ts is not None
+            assert cumulative_audio is True
             for chunk in (first_chunk, second_chunk):
                 yield (chunk, 1000) if include_sample_rate else chunk
             if collect is not None:
@@ -480,6 +483,7 @@ class TestStreamingSpeechWebSocket:
             include_sample_rate=False,
             tts_params=None,
             collect=None,
+            cumulative_audio=False,
         ):
             chunk = b"\x01" * 1000
             yield (chunk, 1000) if include_sample_rate else chunk
