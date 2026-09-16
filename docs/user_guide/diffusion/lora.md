@@ -152,33 +152,6 @@ curl -s http://localhost:8091/v1/chat/completions \
 For Wan2.2 MoE serving, pass the high-noise checkpoint first and the low-noise
 checkpoint second to `--lora-path`.
 
-### Named adapters for diffusion serving
-
-Register adapters with `--lora-modules name=path` when starting a pure-diffusion
-server using the PEFT backend. For example, add these arguments to a supported
-model's serving command:
-
-```bash
---lora-backend peft --lora-modules "my-adapter=/server/models/my-adapter"
-```
-
-Clients can then send `{"name": "my-adapter", "scale": 1.0}` in the `lora`
-field without knowing the server filesystem. For multipart image/video
-requests, encode this object as the `lora` form field; chat requests use their
-existing LoRA field. Image, video, chat and streaming-video serving resolve the
-name through the same server registration.
-
-The path must refer to an adapter supported by the selected pipeline. Adapters
-are loaded on first use and cached by their path-derived ID; optional
-`--lora-path` preloading can use the same path. Registration does not enable an
-adapter on requests that omit `lora`.
-
-Unknown names are rejected, and duplicate registrations fail at startup.
-Registered adapters use a server-derived ID; clients should omit `int_id`.
-Explicit-path requests remain supported. A registered name with a conflicting
-path is rejected. To move weights to another server directory, update the
-server registration while retaining the name used by clients.
-
 !!! note "Server-side Path Requirement"
     The LoRA adapter path (`local_path`) must be readable on the **server** machine. If your client and server are on different machines, ensure the LoRA adapter is accessible via a shared mount or copied to the server.
 

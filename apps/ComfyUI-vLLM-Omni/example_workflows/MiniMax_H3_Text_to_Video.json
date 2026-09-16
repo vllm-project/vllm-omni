@@ -224,7 +224,7 @@
         1.0,
         0
       ],
-      "title": "Optional Turbo: registered LoRA"
+      "title": "Optional Turbo: server LoRA path"
     },
     {
       "id": 6,
@@ -316,7 +316,7 @@
         "Node name for S&R": "Note"
       },
       "widgets_values": [
-        "MiniMax H3 Text to Video (WF-01)\n\nBASE: connected presets, 50 steps / video flow 12 / audio flow 3.\n\nTURBO: select the server-registered LoRA name h3-turbo-v1.0-768p with scale 1.0. Leave local_path empty and int_id at 0; the server resolves its adapter path and ID. The server must register minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors from lightx2v/Minimax-h3-Turbo under that name. Connect Turbo sampling, Turbo H3 params, and LoRA to Generate Video, replacing the two Base links. The 4-forward artifact needs 5 steps, video flow 6, audio flow 3. Do not use the ComfyUI-layout artifact.\n\nKeep frame, references and fast_h3 disconnected for this Base/Turbo T2VA workflow. Native landscape canvas: 1344x768, 24fps, duration 5.167 seconds = 124 frames (17*7+5). The client selects the supported 16:9 preset from the dimensions. Save Video keeps video and audio together.\n\nSet URL and served model name for your server. See docs/minimax-h3-t2v.md for setup and saved-video/audio validation. Source topology: Comfy-Org/workflow_templates/templates/video_minimax_h3_t2v.json."
+        "MiniMax H3 Text to Video (WF-01)\n\nBASE: connected presets, 50 steps / video flow 12 / audio flow 3.\n\nTURBO: set Remote LoRA local_path to the SERVER path of minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors from lightx2v/Minimax-h3-Turbo. Keep name h3-turbo-v1.0-768p, scale 1.0 and int_id 0. Connect Turbo sampling, Turbo H3 params, and LoRA to Generate Video, replacing the two Base links. Use 5 steps (4 forwards), video flow 6 and audio flow 3. Do not use the ComfyUI-layout artifact.\n\nKeep frame, references and fast_h3 disconnected. 1344x768, 24 FPS, duration 5.167 seconds = 124 frames (17*7+5). The client selects the named 16:9 preset from the dimensions. Save Video preserves video and audio.\n\nSet URL and served model name for your server. See docs/minimax-h3-t2v.md for setup and validation. Source: Comfy-Org/workflow_templates/templates/video_minimax_h3_t2v.json."
       ],
       "title": "Setup / Base and Turbo"
     }

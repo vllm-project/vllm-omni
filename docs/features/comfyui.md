@@ -87,8 +87,7 @@ The **MiniMax H3 Text to Video** template uses the existing remote Generate Vide
 H3 Params, sampling, and Remote LoRA nodes. It includes Base settings and an
 optional Turbo preset, with native resolution, 24 FPS, and `17k+5` frame counts.
 ComfyUI receives the generated video and audio from the server; it does not load
-H3 weights locally. Register Turbo with the server's `--lora-modules` option to
-select it by name without putting a server file path in the workflow.
+H3 weights locally. Configure the server-side LoRA path before enabling Turbo.
 
 See the [H3 workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/minimax-h3-t2v.md)
 for server setup, template import, Turbo configuration, recorded validation,

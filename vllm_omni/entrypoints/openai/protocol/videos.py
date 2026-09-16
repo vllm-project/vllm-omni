@@ -281,8 +281,7 @@ class VideoGenerationRequest(BaseModel):
             "Optional LoRA adapter for this request. Expected shape: "
             "{name/path/scale/int_id}. Field names are flexible "
             "(e.g. name|lora_name|adapter, path|lora_path|local_path, "
-            "scale|lora_scale, int_id|lora_int_id). "
-            "Names registered with --lora-modules may omit the path and int_id."
+            "scale|lora_scale, int_id|lora_int_id)."
         ),
     )
 

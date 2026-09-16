@@ -91,7 +91,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `frame_interpolation_exp` | integer | null | Interpolation exponent; `1=2x`, `2=4x`, and so on |
 | `frame_interpolation_scale` | number | null | RIFE inference scale |
 | `frame_interpolation_model_path` | string | null | Local path or Hugging Face repo for the interpolation model |
-| `lora` | string | null | JSON-encoded LoRA configuration, e.g. `{"name":"my-adapter","scale":1.0}` for a server-registered adapter; explicit server paths remain supported |
+| `lora` | string | null | JSON-encoded LoRA configuration object |
 | `extra_params` | string | null | JSON-encoded object for additional model-specific parameters |
 
 ### Create Response

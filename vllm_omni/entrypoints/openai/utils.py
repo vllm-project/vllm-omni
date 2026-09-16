@@ -20,8 +20,6 @@ LONGEVITY:
 
 from __future__ import annotations
 
-import math
-from collections.abc import Mapping
 from typing import Any
 
 from vllm_omni.lora.request import LoRARequest
@@ -61,16 +59,11 @@ def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
     return False
 
 
-def parse_lora_request(
-    lora_body: Any, lora_modules: Mapping[str, str] | None = None
-) -> tuple[LoRARequest | None, float | None]:
+def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None]:
     """Parse a request-level LoRA object into a LoRARequest and optional scale.
 
-    Registered names resolve to server-owned paths and cache IDs. Explicit paths
-    remain supported for adapters without a registration.
-
     Raises:
-        ValueError: If the object or adapter selection is invalid.
+        ValueError: If the object shape is invalid or required fields are missing.
     """
     if lora_body is None:
         return None, None
@@ -91,40 +84,14 @@ def parse_lora_request(
     lora_int_id = lora_body.get("int_id")
     if lora_int_id is None:
         lora_int_id = lora_body.get("lora_int_id")
-    if lora_int_id is not None:
-        try:
-            lora_int_id = int(lora_int_id)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("Invalid lora object: int_id must be an integer.") from exc
-    if not lora_name:
-        raise ValueError("Invalid lora object: name is required.")
-    lora_name = str(lora_name)
-    registered_path = (lora_modules or {}).get(lora_name)
-    if registered_path is not None:
-        if lora_path and str(lora_path) != registered_path:
-            raise ValueError(f"Invalid lora object: path conflicts with registered adapter '{lora_name}'.")
-        lora_path = registered_path
-        server_int_id = stable_lora_int_id(registered_path)
-        if lora_int_id is not None and lora_int_id != server_int_id:
-            raise ValueError(f"Invalid lora object: int_id conflicts with registered adapter '{lora_name}'.")
-        lora_int_id = server_int_id
-    elif not lora_path:
-        raise ValueError(
-            f"Invalid lora object: unknown LoRA name '{lora_name}'. "
-            "Register it with --lora-modules or provide an explicit path."
-        )
-    elif lora_int_id is None:
+    if lora_int_id is None and lora_path:
         lora_int_id = stable_lora_int_id(str(lora_path))
 
-    scale = None
-    if lora_scale is not None:
-        try:
-            scale = float(lora_scale)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("Invalid lora object: scale must be a finite number.") from exc
-        if not math.isfinite(scale):
-            raise ValueError("Invalid lora object: scale must be a finite number.")
-    return LoRARequest(lora_name, int(lora_int_id), str(lora_path)), scale
+    if not lora_name or not lora_path:
+        raise ValueError("Invalid lora object: both name and path are required.")
+
+    scale = float(lora_scale) if lora_scale is not None else None
+    return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
 
 
 def get_supported_speakers_from_hf_config(hf_config: Any) -> set[str]:

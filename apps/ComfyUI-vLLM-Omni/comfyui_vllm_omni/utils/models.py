@@ -68,8 +68,7 @@ def _minimaxh3_params_builder(
 
     if "flow_shift" in params:
         form_fields["flow_shift"] = params.pop("flow_shift")
-    # Keep explicit ratios from older H3 Params exports ahead of size inference.
-    for key in ("audio_flow_shift", "aspect_ratio"):
+    for key in ("audio_flow_shift",):
         if key in params:
             merged_extra_params[key] = params.pop(key)
     if params:
