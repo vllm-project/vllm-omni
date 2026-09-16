@@ -1,14 +1,14 @@
 [
     {
         "test_name": "test_hunyuan_image_stability_tp2_fp8_sp2",
+        "description": "H800: AR+DiT moe default (2+2 GPUs), TP=2 USP=2 FP8",
         "mark": [
             {
                 "hardware_marks": {
                     "res": {
-                        "cuda": "H800",
-                        "npu": "A3"
+                        "cuda": "H800"
                     },
-                    "num_cards": 2
+                    "num_cards": 4
                 }
             },
             "local_model",
@@ -16,6 +16,66 @@
         ],
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
+            "serve_args": {
+                "tensor-parallel-size": 2,
+                "usp": 2,
+                "quantization": "fp8",
+                "distributed-executor-backend": "mp",
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2i",
+                "backend": "vllm-omni",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "width": {
+                    "min": 512,
+                    "max": 1024
+                },
+                "height": {
+                    "min": 512,
+                    "max": 1024
+                },
+                "num_inference_steps": 50,
+                "enable_negative_prompt": true
+            }
+        ]
+    },
+    {
+        "test_name": "test_hunyuan_image_stability_tp2_fp8_sp2_a3",
+        "description": "A3: same TP=2 USP=2 FP8, but override NPU moe devices (default 4+4/TP4) to 2+2 dies so layout matches world size",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "npu": "A3"
+                    },
+                    "num_cards": 4
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "tencent/HunyuanImage-3.0-Instruct",
+            "stage_overrides": {
+                "0": {
+                    "devices": "0,1",
+                    "tensor_parallel_size": 2
+                },
+                "1": {
+                    "devices": "2,3",
+                    "parallel_config": {
+                        "tensor_parallel_size": 2,
+                        "ulysses_degree": 2
+                    }
+                }
+            },
             "serve_args": {
                 "tensor-parallel-size": 2,
                 "usp": 2,
