@@ -1,7 +1,7 @@
 [
     {
         "test_name": "test_hunyuan_image_stability_tp2_fp8_sp2",
-        "description": "H800: AR+DiT moe default (2+2 GPUs), TP=2 USP=2 FP8",
+        "description": "H800: AR+DiT moe, TP=2 USP=2 FP8; DiT world_size=TP*USP=4 so stage-1 uses all 4 GPUs",
         "mark": [
             {
                 "hardware_marks": {
@@ -16,6 +16,20 @@
         ],
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
+            "stage_overrides": {
+                "0": {
+                    "devices": "0,1",
+                    "tensor_parallel_size": 2
+                },
+                "1": {
+                    "devices": "0,1,2,3",
+                    "parallel_config": {
+                        "tensor_parallel_size": 2,
+                        "ulysses_degree": 2,
+                        "sequence_parallel_size": 2
+                    }
+                }
+            },
             "serve_args": {
                 "tensor-parallel-size": 2,
                 "usp": 2,
@@ -48,7 +62,7 @@
     },
     {
         "test_name": "test_hunyuan_image_stability_tp2_fp8_sp2_a3",
-        "description": "A3: same TP=2 USP=2 FP8, but override NPU moe devices (default 4+4/TP4) to 2+2 dies so layout matches world size",
+        "description": "A3: same TP=2 USP=2 FP8; DiT needs 4 dies (TP*USP). Override NPU moe 4+4/TP4 to shared 4-die layout. Requires ASCEND_RT_VISIBLE_DEVICES with 4 dies.",
         "mark": [
             {
                 "hardware_marks": {
@@ -69,10 +83,12 @@
                     "tensor_parallel_size": 2
                 },
                 "1": {
-                    "devices": "2,3",
+                    "devices": "0,1,2,3",
                     "parallel_config": {
                         "tensor_parallel_size": 2,
-                        "ulysses_degree": 2
+                        "ulysses_degree": 2,
+                        "sequence_parallel_size": 2,
+                        "enable_expert_parallel": false
                     }
                 }
             },
