@@ -579,6 +579,9 @@ def test_runner_aligns_prefill_mask_with_flattened_scheduled_tokens(mocker):
     runner.enable_prompt_embeds = False
     runner.uses_mrope = False
     runner.uses_xdrope_dim = 0
+    # Upstream vLLM initializes this in GPUModelRunner.__init__; this fixture
+    # bypasses construction with object.__new__.
+    runner._pp_recv_work = None
     scheduler_output = PrefillMaskSchedulerOutput()
     scheduled_tokens = np.array([1, 1, 3, 2], dtype=np.int32)
 
