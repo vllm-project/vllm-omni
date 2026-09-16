@@ -1496,7 +1496,7 @@ rejected.
 | `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 12 | 8 |
 | `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 8 | 6 | 8 |
 | `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 4 | 12 | 8 |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 8 | 6 | 8 |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 8 | 12 | 8 |
 
 `audio_flow_shift` is `3.0` across the family. Each row is the complete
 published filename; use it verbatim as `TURBO_FILE` below.
@@ -1523,6 +1523,10 @@ Ref2VA artifacts support `--task-type ref2va` and combined servers. In combined
 mode, Ref2VA adapters bind to `transformers_ref` and FL2VA adapters bind to
 `transformer`; switching adapter families keeps their weights isolated. An
 FL2VA-only server still rejects Ref2VA artifacts.
+
+The Ref2VA 8-step v1.0 768p artifact uses video/audio shifts **12/3**,
+as specified in the [publisher release](https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/51).
+Do not infer its video shift from the FL2VA 768p profiles.
 
 Download the artifact you want:
 

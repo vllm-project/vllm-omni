@@ -33,10 +33,10 @@ _TURBO_FFN_HIDDEN_SIZE = 14336
 # the only place the sampler contract is recorded.
 _TURBO_NAME_RE = re.compile(
     r"^minimax_h3_(?P<task>fl2v|ref2v)_turbo_(?P<steps>\d+)step"
-    r"_v\d+\.\d+(?P<res>_768p)?(?:_bf16)?\.safetensors$"
+    r"_v(?P<version>\d+\.\d+)(?P<res>_768p)?(?:_bf16)?\.safetensors$"
 )
-# The 768p retrains moved to a shorter video flow shift; the 544p artifacts keep
-# the base model's.
+# FL 768p retrains use a shorter video flow shift; Ref8 v1.0 keeps 12.
+# Other artifacts retain their existing sampling contracts.
 _TURBO_VIDEO_SHIFT_768P = 6.0
 _TURBO_VIDEO_SHIFT_544P = 12.0
 _TURBO_AUDIO_SHIFT = 3.0
@@ -85,11 +85,16 @@ def parse_turbo_filename(name: str) -> TurboSpec | None:
     steps = int(match.group("steps"))
     if steps <= 0:
         return None
+    video_shift = _TURBO_VIDEO_SHIFT_768P if match.group("res") else _TURBO_VIDEO_SHIFT_544P
+    # Ref8 v1.0 differs from the FL 768p family. Publisher's release settings:
+    # https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/51
+    if match.group("task") == "ref2v" and steps == 8 and match.group("version") == "1.0" and match.group("res"):
+        video_shift = 12.0
     return TurboSpec(
         filename=name,
         task_family=match.group("task"),
         denoise_steps=steps,
-        video_shift=_TURBO_VIDEO_SHIFT_768P if match.group("res") else _TURBO_VIDEO_SHIFT_544P,
+        video_shift=video_shift,
         audio_shift=_TURBO_AUDIO_SHIFT,
         rank=_TURBO_RANK,
         alpha=_TURBO_DEFAULT_ALPHA,
