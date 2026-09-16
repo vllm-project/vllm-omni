@@ -69,7 +69,7 @@ tts_no_async_chunk_server_params = [
 DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 180.0
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     tts_async_chunk_server_params + tts_no_async_chunk_server_params,
@@ -99,7 +99,7 @@ def test_voice_clone_streaming_001(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     tts_async_chunk_server_params + tts_no_async_chunk_server_params,
@@ -127,7 +127,7 @@ def test_response_format_001(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_xvector_then_icl_same_ref_audio_keeps_engine_alive(omni_server, online_client) -> None:
     """Regression for #5049: x-vector-only then ICL on the same ``ref_audio``.

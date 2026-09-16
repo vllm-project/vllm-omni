@@ -316,8 +316,12 @@ arrives, checkpointing the response's history position so a later committed user
 outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
 horizon.
 
-TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
-every token interval is present.
+Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
+continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration. Global
+TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
+token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
+excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
+`response_created_to_first_audio_ms` as client-envelope diagnostics.
 
 The checked-in local performance configuration measures four deterministic cases from each OmniInteract subset (12 videos
 total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
@@ -435,6 +439,76 @@ This should be seen as an edge case, and if this behavior can be avoided by sett
 - The resulting request contains synthetic image data in `multi_modal_data` (OpenAI Chat format). When `random-mm` is used with the OpenAI Chat backend, prompts remain text and MM content is attached via `multi_modal_data`.
 
 </details>
+
+### Image / video generation
+
+For `/v1/images/generations`, `/v1/images/edits`, and `/v1/videos`, set `--endpoint` to that path and omit `--backend`. The endpoint path is registered as the bench request adapter, so a separate named backend is not required.
+
+Example (`/v1/images/generations`):
+
+```bash
+vllm bench serve --omni \
+  --endpoint /v1/images/generations \
+  --dataset-name random \
+  --model ~/models/Qwen/Qwen-Image \
+  --tokenizer ~/models/Qwen/Qwen-Image/tokenizer \
+  --max-concurrency 1 \
+  --num-warmups 2 \
+  --num-prompts 10 \
+  --random-input-len 64 \
+  --random-output-len 1 \
+  --ignore-eos \
+  --percentile-metrics e2el \
+  --extra-body '{
+    "num_inference_steps": 20,
+    "seed": 42,
+    "true_cfg_scale": 4.0
+  }'
+```
+
+If successful, following output is like:
+
+```text
+============ Serving Benchmark Result ============
+Successful requests:                     3  
+Failed requests:                         0  
+Maximum request concurrency:             1  
+Benchmark duration (s):                  8.42  
+Request throughput (req/s):              0.36  
+Peak concurrent requests:                2.00  
+-------------------Peak Memory--------------------
+Mean PEAK_MEMORY_MB (MB):                58832.00  
+Median PEAK_MEMORY_MB (MB):              58832.00  
+P99 PEAK_MEMORY_MB (MB):                 58832.00  
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          2798.16  
+Median E2EL (ms):                        2799.83  
+P99 E2EL (ms):                           2800.03  
+================== Image Result ==================
+Total images generated:                  3  
+Image throughput (img/s):                0.36  
+Average pixels per image:                1048576.00
+Mean denoise step latency (ms):          136.59  
+---------------- Image Generation ----------------
+Mean IMAGE_GENERATION (ms):              2731.84  
+Median IMAGE_GENERATION (ms):            2732.02  
+P99 IMAGE_GENERATION (ms):               2734.65  
+==================================================
+```
+
+Use the same pattern with `--endpoint /v1/images/edits` or `--endpoint /v1/videos` (and model-specific `--extra-body` as needed). Pure image/video runs omit the Text Result section when there is no generated text.
+
+`/v1/images/edits` defaults to **non-streaming JSON** (`stream=false`) so single-stage edit models are not rejected by the server. For multi-stage pipelines that need SSE (AR TTFT / image chunks), pass `"stream": true` in `--extra-body`.
+
+`/v1/videos` is an async job API: the client creates a job, then polls until `completed`/`failed`. Measured **e2el** therefore includes client poll sleep and any overshoot after the job actually finishes. Tune polling via `--extra-body`:
+
+- `poll_interval_s` (default `2.0`): sleep between status polls
+- `poll_timeout_s` (default `21600`, i.e. 6 hours): give up waiting for the job
+
+**VIDEO_RTF** prefers server-reported generation time when available:
+
+- `video_rtf = video_generation_time_ms / 1000 / video_duration`, where `video_generation_time_ms` comes from response `stage_durations` (or `inference_time_s` as fallback)
+- If generation time is missing, falls back to `e2el / video_duration` (this fallback *does* include poll overhead)
 
 ### Multi-Stage Benchmark
 

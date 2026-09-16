@@ -46,11 +46,14 @@ class OmniInteractionEvent(OmniTextPrompt, total=False):
     pass
 
 
-class OmniInteractionPrompt(TypedDict, total=False):
-    """Mid-stream interaction payload."""
+class OmniInteractionPrompt(TypedDict):
+    """Normalized mid-stream interaction payload passed to ``submit_interaction``.
 
-    event_id: NotRequired[str]
-    event: NotRequired[OmniInteractionEvent]
+    WebSocket clients payload may omit ``event_id``; the API layer assigns a fallback ID in this case.
+    """
+
+    event_id: str
+    event: OmniInteractionEvent
     transition_chunks: NotRequired[int]
 
 
@@ -345,6 +348,11 @@ class OmniDiffusionSamplingParams:
 
     # results
     output: torch.Tensor | None = None
+
+    # Internal control-plane event used by asynchronous APIs. When enabled,
+    # the diffusion engine emits a non-terminal output when the scheduler
+    # first admits this request for execution.
+    emit_request_lifecycle: bool = False
 
     def __post_init__(self) -> None:
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:

@@ -17,6 +17,7 @@ Common `PipelineConfig` fields include:
 | ------- | ------------- |
 | `model_type` | Pipeline identifier used during model and config resolution. |
 | `default_deploy_config_name` | Bundled deploy YAML loaded when the user does not pass `deploy_config`. |
+| `duplex_plugin` | Dotted path of the model's `DuplexModelPlugin`. Set only for full-duplex models; it makes `vllm-omni serve` run the model through `DuplexOmni` (a server whose every surface runs on a duplex session) and the engine host a `DuplexOrchestrator` with the plugin loaded. |
 | `model_arch` | Default Hugging Face architecture for the pipeline. |
 | `hf_architectures` | Architecture names used to identify checkpoints whose `model_type` is shared. |
 | `hf_config_predicate` | Optional predicate used to select between pipelines with otherwise identical HF metadata. |
@@ -38,7 +39,7 @@ Common `StagePipelineConfig` fields include:
 | `custom_process_input_func` | Processor applied to this stage's incoming payload. |
 | `custom_process_next_stage_input_func` | Processor used for full-payload handoff to the next stage. |
 | `async_chunk_process_next_stage_input_func` | Processor used for async chunk handoff. |
-| `sampling_constraints` | Model-owned sampling constraints that deploy defaults cannot override. |
+| `sampling_constraints` | Model-owned sampling constraints that deploy defaults cannot override. Scalar values replace deploy defaults; required `stop_token_ids` extend and deduplicate them. |
 
 To add or change topology, define and register a new pipeline variant. Use
 deploy YAML only for runtime placement, resource sizing, connectors, and other
@@ -52,7 +53,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | ------- | ------ | ---------- | --------- | ------------- |
 | `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
-| `session_mode` | str | optional | `"turn"` | Session behavior. MiniCPM-o 4.5 deploy YAMLs set `"duplex"` so `/v1/realtime` and chat share the same profile. |
+| `session_mode` | str | optional | `"turn"` | Session behavior. Duplex models (pipelines with a `duplex_plugin`, e.g. MiniCPM-o 4.5) set `"duplex"`; `vllm-omni serve` then serves it over `/v1/realtime?duplex=1` and `/v1/chat/completions`, both on duplex sessions. |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
 | `duplex_session` | dict | optional | runtime defaults | Full-duplex session lifecycle, buffering, replay, and capacity limits. |
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
@@ -97,7 +98,7 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `devices` | str \| null | optional | `null` | Device list assigned to this stage. The number of device ids must equal this stage's local world size (`tensor_parallel_size` × local data-parallel size × `pipeline_parallel_size`, or `num_replicas` × that product for a replica pool); a mismatch fails early — see the note below. |
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `input_connectors` | dict \| null | optional | `null` | Keyed by `from_stage_<n>`; values are names registered under top-level `connectors:`. |
-| `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Deep-merged with pipeline `sampling_constraints` (pipeline wins). |
+| `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Merged with pipeline `sampling_constraints`; scalar constraints win, while required `stop_token_ids` are appended and deduplicated. |
 | `engine_extras` | dict | optional | `{}` | Catch-all for engine fields not listed above; deep-merged across overlays and forwarded to the stage engine. |
 
 **Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. A top-level `--tensor-parallel-size` is broadcast to every stage, so it can make a single-GPU stage violate this contract ([issue #5003](gh-issue:5003)); fix that case with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set TP only on the multi-GPU stage.

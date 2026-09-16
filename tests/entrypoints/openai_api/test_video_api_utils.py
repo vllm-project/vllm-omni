@@ -23,9 +23,9 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _png_bytes() -> bytes:
+def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     buffer = BytesIO()
-    Image.new("RGB", (2, 1), color=(12, 34, 56)).save(buffer, format="PNG")
+    Image.new("RGB", size, color=(12, 34, 56)).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -120,6 +120,52 @@ async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
 
     assert image.size == (2, 1)
     assert image.mode == "RGB"
+
+
+def test_decode_image_bytes_rejects_image_over_pixel_limit_before_conversion(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+
+    def _unexpected_convert(*args, **kwargs):
+        pytest.fail("over-limit images must be rejected before conversion")
+
+    monkeypatch.setattr(Image.Image, "convert", _unexpected_convert)
+
+    with pytest.raises(
+        InvalidInputReferenceError,
+        match=r"Image dimensions 20x20 \(400 pixels\) exceed the maximum of 100 pixels",
+    ):
+        video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+
+def test_decode_image_bytes_maps_pillow_pixel_limit_error(monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(InvalidInputReferenceError, match="decoder pixel limit") as exc_info:
+        video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+    assert isinstance(exc_info.value.__cause__, Image.DecompressionBombError)
+
+
+@pytest.mark.parametrize("max_pixels", [0, 400])
+def test_decode_image_bytes_allows_disabled_or_inclusive_pixel_limit(monkeypatch, max_pixels):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", max_pixels)
+
+    image = video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+    assert image.size == (20, 20)
+    assert image.mode == "RGB"
+
+
+@pytest.mark.asyncio
+async def test_decode_input_reference_preserves_image_pixel_limit_error(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(InvalidInputReferenceError, match="VLLM_MAX_IMAGE_PIXELS"):
+        await video_api_utils.decode_input_reference(
+            image_reference=None,
+            video_reference=None,
+            input_reference_bytes=_png_bytes((20, 20)),
+        )
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):

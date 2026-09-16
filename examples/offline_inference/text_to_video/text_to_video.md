@@ -262,16 +262,14 @@ python text_to_video.py \
 - `--num-inference-steps`: sampling steps. Default depends on model.
 - `--fps`: frames per second for the saved MP4.
 - `--output`: path to save the generated video.
-- `--extra-body`: JSON dict of model-specific knobs (declared in `vllm_omni/model_extras/`), merged into sampling `extra_args`. See the Helios recipes above.
+- `--extra-body`: JSON object of model-specific generation knobs, filtered against the model's declared `extra_body_params` and merged into sampling `extra_args` (see the Helios and Cosmos3 examples above and [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)).
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
 - `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
 - `--tensor-parallel-size`: tensor parallel size (effective for models that support TP, e.g. LTX2).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
-- `--enable-distributed-layerwise-offload`: enable distributed layerwise offload.
-- `--dlo-use-allgather` / `--dlo-no-use-allgather`: use sharded AllGather reconstruction (the default) or stream rank-local weights without AllGather.
-- `--dlo-resident-layers`: keep this many leading main-DiT blocks device-resident during distributed layerwise offload (default: `0`).
+- `--diffusion-offload-config`: component-selective offload JSON; do not combine it with the legacy flags above.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
 - `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (such as `fp8` for FP8).
@@ -279,7 +277,6 @@ python text_to_video.py \
 - `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
 - `--lora-scale`: scale factor for LoRA weights.
 - `--lora-backend`: backend for loading LoRA adapters. Default: peft. Available options: peft, distill.
-- `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
 
 ### Wan2.2-specific
 
@@ -299,4 +296,6 @@ python text_to_video.py \
 | 720p I2V | 7.0 | 6.0 | 50 |
 | CFG-distilled | (same) | 1.0 | 50 |
 
-> If you encounter OOM errors, try `--vae-use-slicing`, `--vae-use-tiling`, `--enable-cpu-offload`, or `--quantization fp8`.
+> If you encounter OOM errors, try `--vae-use-slicing`, `--vae-use-tiling`,
+> module/layer offload through `--diffusion-offload-config`, or
+> `--quantization fp8`.

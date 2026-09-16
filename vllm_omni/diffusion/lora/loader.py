@@ -10,11 +10,11 @@ from diffusers.loaders.lora_conversion_utils import (
     _convert_non_diffusers_qwen_lora_to_diffusers,
     _convert_non_diffusers_wan_lora_to_diffusers,
 )
-from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -43,6 +43,7 @@ def _prepare_lora_delta(
     lora_a_suffix: str = "lora_A.weight",
     lora_b_suffix: str = "lora_B.weight",
     lora_bias_suffix: str = "bias",
+    compute_device: torch.device | None = None,
 ):
     used_keys: set[str] = set()
     # stacked_params_mapping                       param_to_weight_names
@@ -70,6 +71,8 @@ def _prepare_lora_delta(
                 if lora_bias_key not in lora_state_dict:
                     return None, used_keys
                 delta = lora_state_dict[lora_bias_key]
+                if compute_device is not None and compute_device.type != "cpu":
+                    delta = delta.to(compute_device)
                 stacked_deltas.append(delta)
                 used_keys.add(lora_bias_key)
         else:
@@ -80,6 +83,9 @@ def _prepare_lora_delta(
                     return None, used_keys
                 a = lora_state_dict[lora_a_key]
                 b = lora_state_dict[lora_b_key]
+                if compute_device is not None and compute_device.type != "cpu":
+                    a = a.to(compute_device)
+                    b = b.to(compute_device)
                 delta = torch.matmul(b, a)
                 stacked_deltas.append(delta)
                 used_keys.add(lora_a_key)
@@ -94,7 +100,10 @@ def _prepare_lora_delta(
         if lora_bias_key not in lora_state_dict:
             return None, used_keys
         used_keys.add(lora_bias_key)
-        return lora_state_dict[lora_bias_key], used_keys
+        delta = lora_state_dict[lora_bias_key]
+        if compute_device is not None and compute_device.type != "cpu":
+            delta = delta.to(compute_device)
+        return delta, used_keys
 
     lora_a_key = f"{base_key}.{lora_a_suffix}"
     lora_b_key = f"{base_key}.{lora_b_suffix}"
@@ -102,9 +111,13 @@ def _prepare_lora_delta(
         return None, used_keys
     a = lora_state_dict[lora_a_key]
     b = lora_state_dict[lora_b_key]
+    if compute_device is not None and compute_device.type != "cpu":
+        a = a.to(compute_device)
+        b = b.to(compute_device)
+    delta = torch.matmul(b, a)
     used_keys.add(lora_a_key)
     used_keys.add(lora_b_key)
-    return torch.matmul(b, a), used_keys
+    return delta, used_keys
 
 
 def _load_lora_state_dict(
@@ -131,7 +144,7 @@ def _load_lora_state_dict(
 
     # finally, we try to load it from the internet
     try:
-        model_file = hf_hub_download(
+        model_file = hf_api().hf_hub_download(
             pretrained_model_name_or_path,
             filename=weights_name,
             subfolder=subfolder,
@@ -209,6 +222,7 @@ class LoraLoaderMixin:
     # Set by the pipeline this mixin is combined with; annotated, not assigned.
     transformer: torch.nn.Module
     _lora_loaded: dict[str | None, dict[str, torch.Tensor]]
+    _lora_is_fused: bool
 
     # Lazy initialization to avoid MRO issues: __init__ may not be called
     # when mixin with nn.Module
@@ -221,6 +235,18 @@ class LoraLoaderMixin:
     @lora_loaded.setter
     def lora_loaded(self, value):
         self._lora_loaded = value
+
+    @property
+    def lora_is_fused(self) -> bool:
+        """True when LoRA weights are fused into base weights.
+
+        Mixin loads are in-place fusions, so non-empty `_lora_loaded` implies fused.
+        """
+        return getattr(self, "_lora_is_fused", False) or bool(getattr(self, "_lora_loaded", None))
+
+    @lora_is_fused.setter
+    def lora_is_fused(self, value: bool):
+        self._lora_is_fused = value
 
     @classmethod
     def load_lora_into_module(
@@ -254,6 +280,7 @@ class LoraLoaderMixin:
             else:
                 continue
 
+            compute_dev = params.device if params.device.type != "cpu" else None
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,
@@ -262,6 +289,7 @@ class LoraLoaderMixin:
                 lora_a_suffix,
                 lora_b_suffix,
                 lora_bias_suffix,
+                compute_device=compute_dev,
             )
             if delta is None:
                 continue
@@ -306,6 +334,7 @@ class LoraLoaderMixin:
             else:
                 continue
 
+            compute_dev = param.device if param.device.type != "cpu" else None
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,
@@ -314,6 +343,7 @@ class LoraLoaderMixin:
                 lora_a_suffix,
                 lora_b_suffix,
                 lora_bias_suffix,
+                compute_device=compute_dev,
             )
             if delta is None:
                 continue

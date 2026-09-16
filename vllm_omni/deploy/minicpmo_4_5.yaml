@@ -1,12 +1,11 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
 async_chunk: true
-# Native full-duplex shares this profile with /v1/chat/completions. Every other
-# duplex_session knob keeps its runtime default.
+# session_mode: duplex makes vllm-omni serve run this model duplex-only
+# (/v1/realtime?duplex=1); every other duplex_session knob keeps its runtime default.
 session_mode: duplex
 # Keep the active window aligned with the session and stage capacities below.
 # A smaller window serializes first-packet generation for concurrent chat turns.
-active_stream_window: 4
 duplex_session:
   # Matches Stage 0/1 max_num_seqs below.
   max_sessions: 4
@@ -30,6 +29,7 @@ connectors:
       enable_hift_graph: true
       enable_cfm_graph: true
       cfm_max_graphs: 32
+      cfm_graph_bucket_frames: 16
 
 stages:
   - stage_id: 0
@@ -64,13 +64,8 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 4
-    # Native duplex uses MiniCPMTTS.generate_with_buffer's supported
-    # sliding_recompute policy: retain one completed condition/codec chunk
-    # when the next condition arrives. Other deploy profiles continue to use
-    # the checkpoint's full_attention policy.
-    hf_overrides:
-      tts_config:
-        attention_type: sliding_recompute
+    # Preserve the checkpoint's full-attention Talker prompt while it fits;
+    # native duplex rolls over to a one-chunk window at context capacity.
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
     gpu_memory_utilization: 0.15
     enforce_eager: false
@@ -118,8 +113,10 @@ platforms:
   cuda:
     stages:
       - stage_id: 1
-        # Four Talker streams need much less KV than automatic sizing.
-        # Leave single-GPU headroom for concurrent Stage 2 diffusion batches.
+        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
+        # (4 * 4096 = 16384 tokens). Keep the reported CUDA KV token capacity
+        # above that bound because physical-preemption replay is unsupported.
+        # The explicit cap leaves device headroom for concurrent Stage 2.
         kv_cache_memory_bytes: 2147483648  # 2 GiB
 
   npu:

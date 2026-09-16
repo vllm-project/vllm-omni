@@ -33,6 +33,7 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.max_pending_turns_per_session == 4
     assert deploy.duplex_session.max_sessions == 1
     assert deploy.duplex_session.completed_append_cache_size == 256
+    assert deploy.duplex_session.server_vad_model_path is None
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -44,6 +45,29 @@ def test_duplex_session_runtime_accepts_disabled_idle_expiry(tmp_path) -> None:
     deploy = load_deploy_config(deploy_path)
 
     assert deploy.duplex_session.idle_ttl_s is None
+
+
+def test_duplex_session_runtime_accepts_local_server_vad_model(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  server_vad_model_path: /models/silero_vad.onnx\nstages: []\n",
+        encoding="utf-8",
+    )
+
+    deploy = load_deploy_config(deploy_path)
+
+    assert deploy.duplex_session.server_vad_model_path == "/models/silero_vad.onnx"
+
+
+def test_duplex_session_runtime_rejects_empty_server_vad_model_path(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  server_vad_model_path: ''\nstages: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="server_vad_model_path"):
+        load_deploy_config(deploy_path)
 
 
 @pytest.mark.parametrize(

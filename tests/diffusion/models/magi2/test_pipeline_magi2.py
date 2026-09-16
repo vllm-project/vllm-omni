@@ -578,6 +578,8 @@ class _FakeLayerwiseHook:
     def __init__(self) -> None:
         self._prev_hook = None
         self.current_slot = 0
+        self.dp_size = 1
+        self.rank_local_mmap = False
         self.prefetch_layer = Mock()
         self.get_weights = Mock()
 
@@ -625,7 +627,7 @@ def test_dlo_no_allgather_enable_preserves_staged_aux_and_streams_blocks(
     assert len(hooks) == len(pipeline.transformer.block)
     assert all(stager.offload.call_count == 1 for stager in stagers)
     assert all(stager.load.call_count == 0 for stager in stagers)
-    hooks[-1].prefetch_layer.assert_called_once_with(
-        slot=hooks[0].current_slot,
-        non_blocking=False,
-    )
+    # First prefetch stays lazy so ranks with different local groups cannot
+    # enter collectives in a different order during startup.
+    for hook in hooks:
+        hook.prefetch_layer.assert_not_called()

@@ -63,14 +63,14 @@ class _StreamingOutputWriter:
     def handle(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
         if event_type in {
-            "response.audio_transcript.delta",
+            "response.output_audio_transcript.delta",
             "response.output_text.delta",
         }:
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
                 print(delta, end="", file=sys.stderr, flush=True)
             return
-        if event_type != "response.audio.delta":
+        if event_type != "response.output_audio.delta":
             return
 
         delta = event.get("delta") or event.get("audio")
@@ -445,7 +445,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             ref_audio=_ref_audio_data_url(args.ref_audio),
             temperature=args.temperature,
         ),
-        session_id=args.session_id,
         reconnect=None,
         heartbeat_interval_s=None,
         handshake_timeout_s=args.timeout_s,
@@ -509,12 +508,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
 
         audio = collector.audio_bytes()
         first_text_at_s = collector.first_received_at(
-            "response.audio_transcript.delta",
+            "response.output_audio_transcript.delta",
             "response.output_text.delta",
             after_s=commit_sent_at_s,
         )
         first_audio_at_s = collector.first_received_at(
-            "response.audio.delta",
+            "response.output_audio.delta",
             after_s=commit_sent_at_s,
         )
         response_created_at_s = collector.first_received_at(
@@ -536,7 +535,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             for event in collector.events
             if event.get("type")
             in {
-                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
                 "response.output_text.delta",
             }
         ]
@@ -638,7 +637,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
-    parser.add_argument("--session-id")
     parser.add_argument(
         "--input-wav",
         help="Mono 16 kHz PCM16 clip to stream. Optional when --input-video carries the audio track.",

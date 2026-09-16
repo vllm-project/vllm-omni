@@ -303,7 +303,7 @@ def _pipeline_stub(fusion=None):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
-    pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._fasth3 = fusion
     pipeline.od_config = SimpleNamespace()
     pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0

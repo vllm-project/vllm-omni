@@ -1,7 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Shared helper utilities for OpenAI-compatible video generation API.
+Shared media utilities for OpenAI-compatible video APIs.
+
+PUT HERE:
+  - Shared media backends reused by generation and streaming serving:
+    decode/encode of image/video/audio references and frames, streaming
+    encoders, frame/audio coercion. No FastAPI Request / job-store orchestration.
+
+DO NOT PUT HERE:
+  - ``/v1/videos*`` multipart form parsing, upload limits, job runners,
+    cleanup, or response factories — those go in ``video.generation.helpers``.
+
+LONGEVITY:
+  - This root utils file is a **temporary shared home**.
+  - TODO(#5227, P1.3): tidy up / move into the video family (e.g.
+    ``video/generation/media.py``) in the P1.3 video modality PR; do not treat this
+    file as the long-term owner.
+  - ``video.generation.helpers`` is the longer home for ``/v1/videos*``
+    endpoint logic through P0.2/P0.3 until P1.3 further splits it.
+
+See ``openai/README.md`` and ``video/README.md`` (utils vs helpers, no overlap).
 """
 
 from __future__ import annotations
@@ -71,6 +90,21 @@ class VideoFrames(list[Image.Image]):
         self.source_path = source_path
 
 
+class _ImagePixelLimitError(InvalidInputReferenceError):
+    """An image exceeded a configured or decoder-enforced pixel limit."""
+
+
+def _validate_image_pixel_limit(image: Image.Image) -> None:
+    width, height = image.size
+    max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+    if max_pixels > 0 and width * height > max_pixels:
+        raise _ImagePixelLimitError(
+            f"Image dimensions {width}x{height} ({width * height} pixels) exceed "
+            f"the maximum of {max_pixels} pixels. Set "
+            f"VLLM_MAX_IMAGE_PIXELS to increase this limit."
+        )
+
+
 def positive_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -87,7 +121,13 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
+        with Image.open(BytesIO(image_bytes)) as image:
+            _validate_image_pixel_limit(image)
+            return image.convert("RGB")
+    except _ImagePixelLimitError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise _ImagePixelLimitError(f"Invalid {source}: image exceeds the decoder pixel limit.") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
 
@@ -135,7 +175,9 @@ def _decode_video_bytes(
         frames_array, metadata = loader.load_bytes(
             video_bytes,
             num_frames=num_frames,
-            backend="pyav",
+            # vLLM 0.29 removed the "pyav" decoder backend; "opencv" is
+            # upstream's default and the remaining CPU-only option.
+            backend="opencv",
             keep=keep,
         )
     except Exception as exc:
@@ -158,6 +200,8 @@ def _decode_media_bytes(
 ) -> Image.Image | VideoFrames:
     try:
         return _decode_image_bytes(media_bytes, source=source)
+    except _ImagePixelLimitError:
+        raise
     except InvalidInputReferenceError:
         try:
             return _decode_video_bytes(

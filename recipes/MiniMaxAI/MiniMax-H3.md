@@ -23,6 +23,12 @@ One vLLM-Omni diffusion stage can load both DiTs while instantiating the
 tokenizer, processor, Qwen3-VL text encoder, video VAE, and audio VAE only
 once. Requests select the DiT with `extra_params.task`.
 
+This single-stage recipe uses the default `model_loaded.text_encoder: true` and
+`model_loaded.vae_encoder: true`. Precomputed text conditioning can replace the
+local Qwen call. Setting `model_loaded.text_encoder: false` while leaving
+`model_loaded.vae_encoder: true` requires precomputed text conditioning;
+reference media is still encoded locally.
+
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
 ## Prerequisites
@@ -35,7 +41,7 @@ hf auth login
 export MODEL=MiniMaxAI/MiniMax-H3
 ```
 
-The vLLM-Omni pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
+By default, the pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
 `Ref2VA/transformer/**`. It does not download or load the diffusers-format
 `transformer`, `transformer_ref`, or `vae` weights at the repository root, nor
 duplicate Ref2VA copies of shared components.
@@ -117,11 +123,12 @@ same time on a host sized for this minimum.
 The consumer-GPU profiles below are HBM budgets only. They still require the
 host-RAM budget above.
 
-### Single GPU: accuracy and memory first
+### Single GPU: blockwise capacity path
 
-The single-GPU configuration uses model-level CPU offload.
-This matches the accuracy-qualified reference path and prevents the Qwen3-VL
-encoder and DiT from being resident on the GPU at the same time.
+Use ordinary layerwise offload when one GPU cannot keep the Qwen3-VL encoder
+and DiT resident together. The component list below streams the active DiT,
+the Qwen vision blocks, and the first 50 Qwen text layers. Encoder blocks stay
+rank-local; the video/audio VAEs remain resident.
 
 ```bash
 export MODEL=MiniMaxAI/MiniMax-H3
@@ -129,20 +136,37 @@ export PORT=8091
 
 CUDA_VISIBLE_DEVICES=0 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --trust-remote-code \
+  --task-type fl2va \
   --num-gpus 1 \
-  --enable-cpu-offload \
+  --diffusion-offload-config \
+  '{"mode":"layer","components":["dit","text_encoder"]}' \
+  --enforce-eager \
   --diffusion-attention-backend FLASH_ATTN
 ```
 
-Use a GPU with enough memory for the active H3 component and enough system RAM
-for both offloaded DiTs plus the shared components. Model-level offload keeps
-the two DiTs mutually exclusive on GPU, but adds PCIe/NVLink transfer latency.
+This is a capacity profile, not a latency profile: every denoising step streams
+DiT blocks over the host link, while encoder blocks are streamed only during
+the short conditioning phase. It requires host memory for the complete
+checkpoint plus pinned transfer buffers. Re-measure peak HBM on the target
+shape; this command does not claim a particular GPU model as validated.
+
+A one-B300 correctness smoke selected only `text_encoder` (keeping the DiT and
+VAEs resident) and completed a 384x672, 5-second T2VA request with two denoise
+steps. It installed 77 encoder hooks across the vision and text stacks, used a
+77,728 MiB worker peak, and measured 2.803 seconds encode, 2.706 seconds
+denoise, and 4.503 seconds decode. These reduced-step numbers validate the
+execution path; they are not a quality or production-latency benchmark.
+
+To use whole-component behavior, change the config to
+`{"mode":"module","components":["dit","text_encoder"]}`. Module
+offload swaps the complete encoder and DiT and therefore has a higher
+encode-phase peak than encoder blockwise offload.
 
 ### Two 24/32 GB GPUs: TP2 distributed layerwise offload
 
@@ -483,10 +507,9 @@ Add this option to an existing H3 server command:
 
 Use the FL2VA-only partition for this capacity test. Loading the combined
 service would also load the Ref2VA DiT and would test a different memory
-budget. A no-offload capacity check should contain none of
-`--enable-cpu-offload`, `--enable-layerwise-offload`, or
-`--enable-distributed-layerwise-offload`. VAE tiling changes decode placement
-but does not offload model weights to the CPU.
+budget. A no-offload capacity check should omit
+`--diffusion-offload-config` and all legacy `--enable-*-offload` aliases. VAE
+tiling changes decode placement but does not offload model weights to the CPU.
 
 The run passes the capacity check when the server initializes, the request
 finishes without CUDA OOM or Xid errors, `peak_used_mib` remains below the
@@ -518,10 +541,11 @@ For example, keep the first main block's attention projections in BF16 with:
 ```
 
 The structured option replaces `--quantization fp8`. Online FP8 can be used
-with H3 layerwise offload and with both DLO transfer paths. The default
-AllGather path uses the ordinary loader to finalize FP8 weights and scales
-before sharding them across ranks. `--dlo-no-use-allgather` instead retains
-complete rank-local tensors and avoids the synchronized request-wave contract.
+with H3 layerwise offload and with either DiT DLO transfer. DiT `allgather`
+uses the ordinary loader to finalize FP8 weights and scales before sharding
+them across ranks. DiT `rank-local` instead retains complete loader-produced
+tensors and avoids the synchronized request-wave contract. H3's TP-sharded
+text encoder uses `rank-local`.
 
 ## AMD ROCm (gfx942 / gfx950)
 
@@ -566,6 +590,13 @@ vllm serve "${MODEL}" \
   --num-gpus 1 --enable-cpu-offload \
   --diffusion-attention-backend FLASH_ATTN
 ```
+
+This validated ROCm capacity recipe intentionally retains the compatibility
+full-topology alias because MiniMax-H3 also stages its VAEs on that path. The
+compact API in this release selects only `dit` and `text_encoder`, so replacing
+the flag would change residency rather than perform a mechanical migration.
+No removal deadline is assigned until the compact API offers equivalent
+component coverage.
 
 ### ROCm four GPUs
 
@@ -844,13 +875,51 @@ balanced switch order.
 
 ### Turbo LoRA
 
-Only the native Diffusers 4-step FL2VA/T2VA v1.0 artifact is supported:
+The eight Diffusers-layout LightX2V Turbo artifacts are supported. The
+filename records the contract, so the server reads the step count, task family
+and flow shift from it and validates each request against the artifact that is
+loaded. It does not rewrite request or deploy-config sampling values: the
+request must carry that artifact's own settings, listed here, or it is
+rejected.
 
-```text
-lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
-```
+| Artifact | Task | Forwards | `num_inference_steps` | `flow_shift` | declared `alpha` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | T2VA / FL2VA | 4 | 5 | 12 | none -> 8 |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 9 | 12 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 9 | 6 | 8 |
+| `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 5 | 12 | 8 |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 9 | 6 | 8 |
 
-Download only that file:
+`audio_flow_shift` is `3.0` across the family. Each row is the complete
+published filename; use it verbatim as `TURBO_FILE` below.
+
+Alpha needs no manual compensation: the server reads it from the artifact's
+metadata, falling back to 8 with a warning for
+`minimax_h3_fl2v_turbo_4step_v0.1`, the one artifact that declares none. The
+request-level `scale` is a further multiplier on top of it.
+
+> [!NOTE]
+> Every artifact is rank 128 and the delta is applied at `scale * alpha /
+> rank`, so the `alpha=8` rows drive at 1/16 the strength of the `alpha=128`
+> rows. 8 is the default of LightX2V's reference script, which never reads the
+> metadata; its documented `v0.1` command does not override that default.
+
+Every artifact except `minimax_h3_fl2v_turbo_4step_v0.1` also ships a
+`_comfyui_` export of the same weights. Those fuse Q/K/V into one projection
+and are **not** supported; downloading one is refused by name. Take the
+Diffusers file. The filename is the contract, so do not rename an artifact
+either -- a renamed file is rejected rather than served on a guess.
+
+FL2VA artifacts serve `t2va` and `fl2va` on any FL2VA or combined server.
+Ref2VA artifacts require
+`--task-type ref2va`: a combined server serves `ref2va` from a second DiT that
+the adapter cannot bind to, so loading one there is refused rather than silently
+running an undistilled model on the few-step schedule.
+
+Download the artifact you want:
 
 ```bash
 export TURBO_DIR=/path/to/minimax-h3-turbo
@@ -859,10 +928,19 @@ hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
 export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
 ```
 
+`--lora-path` accepts one artifact, or a directory holding exactly one.
+
+> [!IMPORTANT]
+> This changes earlier behaviour. `--lora-path /path/to/minimax-h3-turbo`
+> pointing at a full clone of the Turbo repository used to select the v1.0 768p
+> file implicitly; a directory holding several recognized artifacts is now
+> rejected as ambiguous. Name the artifact instead:
+> `--lora-path /path/to/minimax-h3-turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors`.
+
 Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
-`--lora-path` preloads the adapter; each request still activates it and uses
-the published sampling settings:
+`--lora-path` preloads the adapter; each request still activates it and must
+carry that artifact's sampling settings:
 
 ```bash
 -F 'num_inference_steps=5' \
@@ -871,14 +949,25 @@ the published sampling settings:
 -F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
 ```
 
-For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
-ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
-dynamic-only and does not support prefusion or LoRA composition. DLO is
+Switching to another FL2VA artifact means repointing `TURBO_FILE`, which moves
+both `--lora-path` and the request's `lora.path`, and carrying that row's
+`num_inference_steps` and `flow_shift`: `9` and `6` for `8step_v1.0_768p`, `9`
+and `12` for the 544p `8step_v1.0`. A request that does not match the loaded
+artifact is rejected, so a mismatch cannot silently degrade output.
+
+The two `ref2v` rows are not served by this FL2VA command. Start a
+`--task-type ref2va` server, take a request from
+[Ref2VA](#3-ref2va-image-only-imageaudio-or-mixed-references) and override
+`num_inference_steps` and `flow_shift` with that row's values; those examples
+already send `audio_flow_shift=3.0`.
+
+For FL2VA, change `task` and add `input_reference` as shown above. This
+integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
 supported by keeping the request-switchable LoRA A/B buffers resident on the
 accelerator while DLO streams only the base blocks; budget for this additional
 fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
-The five requested sigma points produce the four denoiser evaluations expected
-by the Turbo artifact.
+The requested sigma points always number one more than the artifact's denoiser
+evaluations.
 
 ### FlashGen native LoRA
 
@@ -1147,25 +1236,21 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
-- The serving path accepts fewer references than the model supports. H3 documents up
-  to 9 images, 3 video clips, and 3 audio clips (12 files) per Omni Reference
-  request; the current vLLM-Omni path takes exactly one image plus one audio
-  reference, or one or more videos with no separate `audio_reference` (it uses the
-  source soundtracks).
+- Ref2VA accepts up to 9 images, 3 video clips, and 3 audio clips, with at most
+  12 references in total. At least one image or video is required; audio-only
+  requests are rejected.
 - The 768 px short-edge mode is available for T2VA and FL2VA; 1344x768 is the
   documented 16:9 request shape.
 - `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
 - VAE patch parallelism requires size 1 or the full DiT group size and supports the
   H3 native `tile` mode only.
-- A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
-  pure Ulysses.
+- Ulysses x Ring hybrid attention supports H3's single-request contiguous suffix
+  padding. Arbitrary attention masks and multi-request packed batches remain
+  unsupported on the Ring path.
 - Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
   in host memory on every rank during startup before retaining only each rank's
   shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional standalone
-  audio reference.
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.
