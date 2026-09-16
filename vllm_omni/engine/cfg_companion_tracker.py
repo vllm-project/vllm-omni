@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CFG companion request tracker for the Omni orchestrator.
 
 Encapsulates all bookkeeping for Classifier-Free Guidance companion
@@ -8,20 +10,30 @@ deferred forwarding, and cleanup).
 from __future__ import annotations
 
 import logging
-from typing import Any
+import math
+import time
+from collections.abc import Callable
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class _PendingParent(TypedDict):
+    engine_outputs: object
+    stage_id: int
+    deferred_at: float
 
 
 class CfgCompanionTracker:
     """Manages CFG companion request lifecycle in the orchestrator scheduling loop."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
         self._companion_map: dict[str, dict[str, str]] = {}  # parent -> {role: companion_id}
         self._companion_ids: set[str] = set()
         self._companion_to_parent: dict[str, str] = {}  # companion -> parent
         self._done: dict[str, set[str]] = {}  # parent -> completed companion ids
-        self._pending_parents: dict[str, dict[str, Any]] = {}  # parent -> deferred result
+        self._pending_parents: dict[str, _PendingParent] = {}  # parent -> deferred result
         self._companion_outputs: dict[str, Any] = {}  # companion_id -> engine output
 
     def is_companion(self, req_id: str) -> bool:
@@ -99,18 +111,46 @@ class CfgCompanionTracker:
 
         Deferred parents are released when their companions' processed outputs
         arrive, and failed by the orchestrator when a companion errors or is
-        aborted. TODO: a deadline for deferred parents and detection of a
-        companion replica dying silently (no error output, no abort) still
-        need a liveness owner in the orchestrator loop.
+        aborted. Re-deferring the same parent updates its latest output without
+        extending the original deadline.
         """
-        self._pending_parents[parent_id] = {
-            "engine_outputs": engine_outputs,
-            "stage_id": stage_id,
-        }
+        pending = self._pending_parents.get(parent_id)
+        if pending is None:
+            self._pending_parents[parent_id] = {
+                "engine_outputs": engine_outputs,
+                "stage_id": stage_id,
+                "deferred_at": self._clock(),
+            }
+        else:
+            pending["engine_outputs"] = engine_outputs
+            pending["stage_id"] = stage_id
         logger.debug("Parent %s deferred, waiting for CFG companions", parent_id)
 
-    def pop_pending_parent(self, parent_id: str) -> dict[str, Any] | None:
+    def pop_pending_parent(self, parent_id: str) -> _PendingParent | None:
         return self._pending_parents.pop(parent_id, None)
+
+    def pop_expired_parents(
+        self,
+        timeout_s: float,
+        *,
+        now: float | None = None,
+    ) -> list[tuple[str, _PendingParent]]:
+        """Remove and return parents whose companion wait exceeded ``timeout_s``.
+
+        Claiming expired entries in the tracker keeps repeated reaper ticks
+        idempotent. The orchestrator owns the terminal error and cleanup.
+        """
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s}")
+        current = self._clock() if now is None else now
+        expired: list[tuple[str, _PendingParent]] = []
+        for parent_id, pending in list(self._pending_parents.items()):
+            if current - pending["deferred_at"] < timeout_s:
+                continue
+            claimed = self._pending_parents.pop(parent_id, None)
+            if claimed is not None:
+                expired.append((parent_id, claimed))
+        return expired
 
     def cleanup_parent(self, parent_id: str) -> list[str]:
         companion_ids = list(self._companion_map.pop(parent_id, {}).values())

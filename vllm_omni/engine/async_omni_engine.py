@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import math
 import queue
 import shutil
 import threading
@@ -133,6 +134,7 @@ class AsyncOmniEngine:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
+    _cfg_companion_timeout_s: float = 600.0
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -147,6 +149,7 @@ class AsyncOmniEngine:
         log_stats: bool = False,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
+        cfg_companion_timeout: float = 600.0,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -195,6 +198,9 @@ class AsyncOmniEngine:
         self._omni_heartbeat_timeout: float = float(kwargs.get("omni_heartbeat_timeout") or 30.0)
         if self._omni_heartbeat_timeout <= 0:
             raise ValueError(f"--omni-heartbeat-timeout must be > 0, got {self._omni_heartbeat_timeout}")
+        self._cfg_companion_timeout_s = float(cfg_companion_timeout)
+        if not math.isfinite(self._cfg_companion_timeout_s) or self._cfg_companion_timeout_s <= 0:
+            raise ValueError(f"--cfg-companion-timeout must be finite and > 0, got {self._cfg_companion_timeout_s}")
         # Concurrent same-device stage init (admission + SH/EX phase locks).
         # Sourced from the parallel_stage_init orchestrator/CLI arg (config,
         # not an env var); default False preserves serial init.
@@ -423,6 +429,7 @@ class AsyncOmniEngine:
                 duplex_runtime_extension=duplex_runtime_extension,
                 enable_duplex_control=self._duplex_control_enabled,
                 duplex_session_config=self.duplex_session_config,
+                cfg_companion_timeout=self._cfg_companion_timeout_s,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

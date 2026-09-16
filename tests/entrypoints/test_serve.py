@@ -754,3 +754,24 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
 
     with pytest.raises(RuntimeError, match=r"exited with code 137"):
         run_headless(_make_headless_args(stage_id=1))
+
+
+def test_serve_parser_accepts_cfg_companion_timeout() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-companion-timeout", "45"])
+
+    assert args.cfg_companion_timeout == 45.0
+    assert args.get_explicit_kwargs_dict()["cfg_companion_timeout"] == 45.0
+
+
+@pytest.mark.parametrize("value", ["0", "nan", "inf"])
+def test_serve_parser_rejects_invalid_cfg_companion_timeout(value: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--cfg-companion-timeout", value])

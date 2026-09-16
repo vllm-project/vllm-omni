@@ -60,6 +60,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
+from vllm_omni.errors import OmniClientError, OmniServerError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
@@ -5102,6 +5103,8 @@ class TestTTSAsyncOffloading:
             models=mock_models,
             request_logger=mocker.MagicMock(),
         )
+        # Request-preparation unit tests should not download a tokenizer.
+        server._tts_tokenizer = lambda text, padding=False: {"input_ids": text.split()}
         yield server
         server.shutdown()
 
@@ -5726,3 +5729,110 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+class TestSpeechRequestErrors:
+    @pytest.fixture(params=[504, 429])
+    def request_error(self, request):
+        if request.param == 504:
+            return OmniServerError(
+                "CFG companion deadline exceeded: speech__neg",
+                status_code=504,
+                error_type="GatewayTimeoutError",
+            )
+        return OmniClientError("Too many requests", status_code=429, error_type="RateLimitError")
+
+    @pytest.mark.parametrize("stream_format", [None, "sse", "audio"])
+    def test_speech_request_error_before_response(self, test_app, mocker, request_error, stream_format):
+        server = test_app.state.openai_serving_speech
+        server._adapter = None
+        server._tts_model_type = None
+        mocker.patch.object(server, "_uses_native_speed_control", return_value=False)
+
+        async def generate():
+            raise request_error
+            yield  # pragma: no cover
+
+        # Non-streaming errors arise while consuming engine output; streaming
+        # setup errors can still be reported with an HTTP error status.
+        if stream_format is None:
+            mocker.patch.object(server, "_prepare_speech_generation", return_value=("speech-test", generate(), {}))
+        else:
+            mocker.patch.object(server, "_prepare_speech_generation", side_effect=request_error)
+
+        app = FastAPI()
+        app.state.openai_serving_speech = server
+        app.add_api_route("/v1/audio/speech", api_server_module.create_speech, methods=["POST"])
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "response_format": "pcm", "stream_format": stream_format},
+        )
+        assert response.status_code == request_error.status_code, response.text
+        error = response.json()["error"]
+        assert error["code"] == request_error.status_code
+        assert error["type"] == request_error.error_type
+        assert error["message"] == str(request_error)
+
+    def test_diffusion_speech_request_error(self, mocker, request_error):
+        async def generate(**kwargs):
+            raise request_error
+            yield  # pragma: no cover
+
+        engine = mocker.MagicMock()
+        engine.generate.side_effect = generate
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=engine, model_name="test-model")
+        app = FastAPI()
+        app.state.openai_serving_speech = server
+        app.add_api_route("/v1/audio/speech", api_server_module.create_speech, methods=["POST"])
+        response = TestClient(app).post("/v1/audio/speech", json={"input": "Hello"})
+        assert response.status_code == request_error.status_code, response.text
+        error = response.json()["error"]
+        assert error["code"] == request_error.status_code
+        assert error["type"] == request_error.error_type
+        assert error["message"] == str(request_error)
+
+    @pytest.mark.parametrize("partial_audio", [False, True])
+    @pytest.mark.parametrize("status_code", [504, 429, 500])
+    def test_sse_error_metadata(self, test_app, mocker, partial_audio, status_code):
+        server = test_app.state.openai_serving_speech
+        server._adapter = None
+        server._tts_model_type = None
+        mocker.patch.object(server, "_uses_native_speed_control", return_value=False)
+        message = "speech generation failed"
+        failure: Exception
+        if status_code == 504:
+            failure = OmniServerError(message, status_code=504, error_type="GatewayTimeoutError")
+            error_type = "GatewayTimeoutError"
+        elif status_code == 429:
+            failure = OmniClientError(message, status_code=429, error_type="RateLimitError")
+            error_type = "RateLimitError"
+        else:
+            failure = RuntimeError(message)
+            error_type = "server_error"
+
+        async def generate():
+            if partial_audio:
+                yield create_mock_audio_output_for_test()
+            raise failure
+
+        mocker.patch.object(server, "_prepare_speech_generation", return_value=("speech-test", generate(), {}))
+        app = FastAPI()
+        app.state.openai_serving_speech = server
+        app.add_api_route("/v1/audio/speech", api_server_module.create_speech, methods=["POST"])
+        response = TestClient(app).post(
+            "/v1/audio/speech", json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"}
+        )
+        # Headers are already sent: the error belongs to the SSE payload.
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        assert [event["type"] for event in events] == (
+            (["speech.audio.delta"] if partial_audio else []) + ["speech.audio.error"]
+        )
+        assert events[-1]["error"] == {
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": status_code,
+            **({"partial_audio": True, "action": "discard"} if partial_audio else {}),
+        }
