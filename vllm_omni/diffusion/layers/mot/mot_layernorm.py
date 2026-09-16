@@ -83,6 +83,17 @@ class MoTRMSNorm(CustomOp):
         )
 
     # ------------------------------------------------------------------
+    # NPU fast-path (not implemented yet; reserved for future optimization)
+    # ------------------------------------------------------------------
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        text_indices: torch.Tensor | None = None,
+        vae_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward_native(x, text_indices, vae_indices)
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _rms_norm_native(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

@@ -1,31 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 remote-code VAE adapters and exact latent contracts."""
 
 from __future__ import annotations
 
 import importlib
 import json
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from PIL import Image
+from safetensors import safe_open
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from vllm.logger import init_logger
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
+from vllm_omni.diffusion.offloader.module_residency import (
+    BoundedAllocatorCache,
+    PinnedModuleStager,
+)
 
+from .chunked_decode import decode_h3_chunks
+from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+
+
+logger = init_logger(__name__)
+
+
+@contextmanager
+def _minimax_h3_keyframe_encode_context(
+    device: torch.device,
+) -> Iterator[None]:
+    if device.type != "cuda":
+        yield
+        return
+
+    # The official keyframe latent uses cuDNN's TF32 convolution path. The
+    # default non-deterministic algorithm can select numerically different
+    # reductions on H100s, and the difference is amplified by the denoiser.
+    # Pin both the algorithm and math mode for this sensitive encode only.
+    with torch.backends.cudnn.flags(
+        enabled=True,
+        benchmark=False,
+        deterministic=True,
+        allow_tf32=True,
+    ):
+        yield
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -42,11 +77,23 @@ def _load_component_config(component_path: str) -> dict[str, Any]:
 def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
+    *,
+    trust_remote_code: bool,
 ) -> nn.Module:
     auto_map = config.get("auto_map") or {}
     class_reference = auto_map.get("AutoModel")
     if not isinstance(class_reference, str):
         raise ValueError(f"{component_path}/config.json must define auto_map.AutoModel")
+    if not trust_remote_code:
+        raise ValueError(
+            f"Loading {component_path} executes the modeling code shipped with "
+            f"the checkpoint (auto_map.AutoModel = {class_reference}). Pass "
+            "--trust-remote-code (or trust_remote_code=True) to allow it."
+        )
+    # ``trust_remote_code`` is checked here rather than forwarded to
+    # ``get_class_from_dynamic_module``: that helper takes no such argument and
+    # would silently absorb it into ``**kwargs``, so forwarding it would read
+    # like a gate while executing the remote code unconditionally.
     component_cls = get_class_from_dynamic_module(
         class_reference,
         component_path,
@@ -59,6 +106,121 @@ def _load_remote_component(
     # explicitly right after this returns, so nothing depends on the context.
     with torch.device("cpu"):
         return component_cls.from_pretrained(component_path)
+
+
+def _check_trust_remote_code(
+    component_path: str,
+    config: dict[str, Any],
+    trust_remote_code: bool,
+) -> None:
+    """Apply the remote-code gate before either full or encoder-only loading."""
+
+    class_reference = (config.get("auto_map") or {}).get("AutoModel")
+    if isinstance(class_reference, str) and not trust_remote_code:
+        raise ValueError(
+            f"Loading {component_path} executes the modeling code shipped with "
+            f"the checkpoint (auto_map.AutoModel = {class_reference}). Pass "
+            "--trust-remote-code (or trust_remote_code=True) to allow it."
+        )
+
+
+def _load_selected_state_dict(
+    model: nn.Module,
+    weights_path: Path,
+    prefixes: tuple[str, ...],
+) -> None:
+    with safe_open(str(weights_path), framework="pt", device="cpu") as checkpoint:
+        selected = sorted(name for name in checkpoint.keys() if name.startswith(prefixes))
+        if not selected:
+            raise ValueError(f"{weights_path}: no VAE weights match prefixes {prefixes!r}")
+        state_dict = {name: checkpoint.get_tensor(name) for name in selected}
+    model.load_state_dict(state_dict, strict=True)
+
+
+def _remove_modules(model: nn.Module, names: tuple[str, ...]) -> None:
+    for name in names:
+        if not isinstance(getattr(model, name, None), nn.Module):
+            raise ValueError(f"MiniMax H3 VAE model has no module {name!r}")
+        delattr(model, name)
+
+
+def _load_video_vae_encoder(
+    component_path: str,
+    config: dict[str, Any],
+) -> nn.Module:
+    class_reference = (config.get("auto_map") or {}).get("AutoModel")
+    if not isinstance(class_reference, str):
+        raise ValueError(f"{component_path}/config.json must define auto_map.AutoModel")
+    component_cls = get_class_from_dynamic_module(class_reference, component_path)
+    component_module = importlib.import_module(component_cls.__module__)
+    source_classes = getattr(component_module, "_SOURCE_CLASSES", None)
+    source_class_name = config.get("source_class_name")
+    if not isinstance(source_classes, dict) or source_class_name not in source_classes:
+        raise ValueError(f"unsupported MiniMax H3 video VAE source class {source_class_name!r}")
+    if bool(config["vae_parallel_tiling"]):
+        ensure_parallel_state = getattr(component_module, "_ensure_vae_parallel_state", None)
+        if not callable(ensure_parallel_state):
+            raise ValueError("MiniMax H3 video VAE remote module does not expose its parallel-state initializer")
+        ensure_parallel_state()
+
+    source_path = Path(component_path) / str(config["source_path"])
+    weights_path = source_path / str(config["source_safetensors_path"])
+    load_kwargs = {
+        "clip_length": int(config["vae_clip_length"]),
+        "token_drop": int(config["vae_token_drop"]),
+        "encoder_tiling": int(config["vae_encoder_tiling"]),
+        "decoder_tiling": int(config["vae_decoder_tiling"]),
+        "parallel_tiling": int(config["vae_parallel_tiling"]),
+        "tile_size": int(config["vae_tile_size"]),
+        "tile_overlap_min": int(config["vae_tile_overlap_min"]),
+        "encoder_parallel": int(config["vae_encoder_parallel"]),
+        "decoder_parallel": int(config["vae_decoder_parallel"]),
+        "chunk_dim": int(config["vae_chunk_dim"]),
+    }
+    source_cls = source_classes[source_class_name]
+    source_config = source_cls.load_config(str(source_path))
+    with set_default_torch_dtype(torch.float32), torch.device("cpu"):
+        model, _unused = source_cls.from_config(source_config, return_unused_kwargs=True, **load_kwargs)
+    _remove_modules(model, ("decoder", "post_quant_conv"))
+    _load_selected_state_dict(model, weights_path, ("encoder.", "quant_conv."))
+    model.eval()
+    return component_cls(model)
+
+
+def _load_audio_vae_encoder(
+    component_path: str,
+    config: dict[str, Any],
+) -> nn.Module:
+    class_reference = (config.get("auto_map") or {}).get("AutoModel")
+    if not isinstance(class_reference, str):
+        raise ValueError(f"{component_path}/config.json must define auto_map.AutoModel")
+    component_cls = get_class_from_dynamic_module(class_reference, component_path)
+    component_module = importlib.import_module(component_cls.__module__)
+    load_yaml = getattr(component_module, "_load_yaml", None)
+    model_cls = getattr(component_module, "DacAudioVAE", None)
+    if not callable(load_yaml) or not isinstance(model_cls, type):
+        raise ValueError("MiniMax H3 audio VAE remote module does not expose its source loader")
+
+    component_dir = Path(component_path)
+    audio_config = load_yaml(component_dir / str(config["source_config_path"]))
+    metadata_path = component_dir / str(config["source_metadata_path"])
+    metadata_doc = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = metadata_doc["metadata"]["kwargs"]
+    with set_default_torch_dtype(torch.float32), torch.device("cpu"):
+        model = model_cls(
+            encoder_rates=metadata["encoder_rates"],
+            decoder_rates=metadata["decoder_rates"],
+            attn_proj=metadata["attn_proj"],
+            decoder_type=metadata["decoder_type"],
+            decoder_dim=audio_config["model_config"]["decoder_dim"],
+            vae_latent_channels=audio_config["model_config"]["vae_latent_channels"],
+            sample_rate=metadata["sample_rate"],
+        )
+    _remove_modules(model, ("decoder", "dec_in_proj", "logs_proj"))
+    weights_path = component_dir / str(config["source_safetensors_path"])
+    _load_selected_state_dict(model, weights_path, ("encoder.", "pre_block.", "mean_proj."))
+    model.eval()
+    return component_cls(model)
 
 
 class _AudioVAEDeterminismContext(AbstractContextManager):
@@ -111,19 +273,36 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        encode_only: bool = False,
+        decode_only: bool = False,
+        trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
+        self.encode_only = bool(encode_only)
+        self.decode_only = bool(decode_only)
+        if self.encode_only and self.decode_only:
+            raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
         self.config_dict = _load_component_config(component_path)
-        self.remote = _load_remote_component(
-            component_path,
-            self.config_dict,
-        )
-        # Match the reference loader contract: video VAE weights stay FP32.
-        # Keyframe encoding is numerically sensitive to first casting the
-        # checkpoint through FP16; decode still runs under FP16 autocast.
+        _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
+        if self.encode_only:
+            self.remote = _load_video_vae_encoder(component_path, self.config_dict)
+        else:
+            self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
+            if self.decode_only:
+                _remove_modules(self.remote.model, ("encoder", "quant_conv"))
+        # Match the reference loader contract before installing inference-only
+        # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
+        # weights may be materialized in FP16 because reference decode casts
+        # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        decoder = getattr(self.remote.model, "decoder", None)
+        if decoder is not None:
+            install_h3_vae_optimizations(
+                decoder,
+                device=device,
+            )
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
@@ -136,6 +315,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.use_slicing = False
         self.parallel_size = 1
         self.device_module = torch.get_device_module()
+        self._tile_gather_workspace: torch.Tensor | None = None
+        self._tile_gather_stats = {"hits": 0, "allocs": 0, "workspace_bytes": 0}
+        self._checkpoint_tile_gather = None
+        if self._tile_gather_reuse_enabled():
+            self._install_persistent_tile_gather()
 
     def load_to_device(self) -> None:
         if self._stager is not None:
@@ -143,21 +327,31 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         else:
             self.remote.to(self._device_target)
 
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        if self._stager is not None:
+            self._stager.set_cache_retention(cache)
+
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            torch.accelerator.empty_cache()
+            cache = getattr(self, "_omni_component_cache", None)
+            if cache is None:
+                torch.accelerator.empty_cache()
+            else:
+                cache.release_if_needed()
 
     def set_parallel_size(
         self,
         parallel_size: int,
         mode: str = "tile",
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
         if mode != "tile":
             raise ValueError(f"MiniMax H3 VAE supports its native tile parallel mode only, got {mode!r}")
-        group = get_dit_group()
+        group = process_group if process_group is not None else get_world_group().device_group
         world_size = dist.get_world_size(group)
         rank = dist.get_rank(group)
         parallel_size = int(parallel_size)
@@ -170,9 +364,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.parallel_size = parallel_size
         enabled = parallel_size > 1
 
-        package = self.remote.__class__.__module__.rsplit(".", 1)[0]
-        parallel_module = importlib.import_module(f"{package}.parallel")
-        state = parallel_module.get_parallel_state()
+        state = self._native_parallel_state()
         state.clear()
         state.update(
             group_size=parallel_size,
@@ -187,28 +379,253 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         )
         self.model.parallel_tiling = enabled
 
+    def _native_parallel_state(self) -> dict[str, Any]:
+        """Return the checkpoint's own mutable parallel-state dict."""
+
+        package = self.remote.__class__.__module__.rsplit(".", 1)[0]
+        parallel_module = importlib.import_module(f"{package}.parallel")
+        return parallel_module.get_parallel_state()
+
+    def _tile_gather_reuse_enabled(self) -> bool:
+        """Whether this device needs the tiled-VAE gather address kept stable.
+
+        XPU only. The accumulation this guards against is an XCCL-side
+        registration that is kept for every distinct receive-buffer address and
+        never reclaimed; no other backend in tree does that, so everywhere else
+        the checkpoint's own method is left in place and behaviour is unchanged.
+        The stable address comes from one grow-only byte workspace, so what the
+        adapter holds resident is one buffer for the largest geometry it has
+        seen rather than one per geometry.
+        """
+
+        return self._device_target.type == "xpu"
+
+    def _install_persistent_tile_gather(self) -> None:
+        """Route the checkpoint's tiled-VAE gather through a bounded workspace.
+
+        The checkpoint's ``_all_gather_tiled_results`` allocates its gather
+        output afresh on every call. Model-level offload calls ``empty_cache()``
+        once per request, so the next request's output lands on a new device
+        address; XCCL registers a non-reclaimable resource per new receive
+        address, and the registrations accumulate until the card is full. The
+        replacement below keeps a single byte workspace alive on this adapter
+        and carves every gather out of its front, so the address the collective
+        writes to is the same one every request.
+
+        The workspace only ever grows: a geometry that fits in the current
+        block reuses it as is, and a larger one replaces the block, which
+        drops the previous allocation before allocating its own. Resident
+        memory is therefore bounded by one buffer for the largest geometry the
+        adapter has seen, not by one buffer per distinct geometry.
+
+        The override is bound on the checkpoint *instance*, not its class: the
+        class is remote code shared by every component loaded from the same
+        checkpoint, and only this adapter knows the device it runs on.
+        """
+
+        self._checkpoint_tile_gather = self.model._all_gather_tiled_results
+        self.model._all_gather_tiled_results = self._persistent_tile_gather
+        logger.info(
+            "[H3_VAE_GATHER] persistent tile gather installed device=%s",
+            self._device_target.type,
+        )
+
+    def _persistent_tile_gather(
+        self,
+        tasks: list[torch.Tensor],
+        num_tiles: int,
+    ) -> list[torch.Tensor]:
+        """Equal-shape replacement for the checkpoint's tiled-result gather.
+
+        Contract kept identical to the checkpoint's method: return a list of
+        ``num_tiles`` tensors in global tile order, and raise on an empty local
+        share so a rank that owns no tile cannot silently skip the collective.
+
+        Tile ownership is round-robin (``range(sp_rank, num_tiles, sp_size)``),
+        so every rank can compute every other rank's task count from
+        ``num_tiles`` and ``sp_size`` alone. That makes the per-rank payloads
+        equal once the leading task dimension is padded to ``max_tasks``, which
+        is what lets a single ``all_gather_into_tensor`` into a stable buffer
+        replace the variable-shape gather.
+
+        The landing buffer is a view onto the front of one byte workspace that
+        this adapter keeps alive and only ever grows, so its address stays
+        stable across requests while resident memory stays bounded by the
+        largest geometry seen rather than growing per geometry. A byte
+        workspace is dtype-agnostic, so mixed-precision requests share it too.
+
+        Returned tiles are cloned out of the buffer: the buffer is overwritten
+        by the next call and callers hold the tiles past that point.
+        """
+
+        state = self._native_parallel_state()
+        group = state["sp_process_group"]
+        sp_size = int(state["sp_size"])
+        sp_rank = int(state["sp_rank"])
+
+        if not tasks:
+            raise ValueError(f"Found empty tasks on sp rank {sp_rank}")
+
+        max_tasks = -(-num_tiles // sp_size)
+        if len(tasks) > max_tasks:
+            raise ValueError(
+                f"sp rank {sp_rank} holds {len(tasks)} tiles but round-robin "
+                f"ownership of {num_tiles} tiles across {sp_size} ranks allows "
+                f"at most {max_tasks}"
+            )
+        if len(tasks) == max_tasks:
+            stacked = torch.stack(tasks, dim=0)
+        else:
+            # Pad the leading (task) dimension only. The padded slots belong to
+            # ranks whose share is short by construction, and the unpacking loop
+            # below never reads them back.
+            stacked = tasks[0].new_empty((max_tasks, *tasks[0].shape))
+            torch.stack(tasks, dim=0, out=stacked[: len(tasks)])
+            stacked[len(tasks) :].zero_()
+
+        need_bytes = sp_size * stacked.numel() * stacked.element_size()
+        workspace = self._tile_gather_workspace
+        if workspace is None or workspace.device != stacked.device or workspace.numel() < need_bytes:
+            # Drop the previous block before allocating its replacement so the
+            # two are never resident at once; only one workspace is ever held.
+            workspace = None
+            self._tile_gather_workspace = None
+            workspace = torch.empty(need_bytes, dtype=torch.uint8, device=stacked.device)
+            self._tile_gather_workspace = workspace
+            self._tile_gather_stats["allocs"] += 1
+            self._tile_gather_stats["workspace_bytes"] = need_bytes
+            reuse = "alloc"
+        else:
+            self._tile_gather_stats["hits"] += 1
+            reuse = "hit"
+        buffer = workspace[:need_bytes].view(stacked.dtype).view(sp_size, *stacked.shape)
+        # Quantities, not just presence: a line that only says "installed"
+        # cannot distinguish a buffer that is being reused from one that is
+        # reallocated every request, which is the whole failure being fixed.
+        # Debug level, because this fires once per decoder tile batch (12 times
+        # per request on the canonical 1344x768 geometry) and the one-shot
+        # "installed" line above is what an operator needs at info level.
+        logger.debug(
+            "[H3_VAE_GATHER] reuse=%s shape=%s/%s need_mib=%.2f workspace_mib=%.2f buf_ptr=0x%x hits=%d allocs=%d",
+            reuse,
+            tuple(stacked.shape),
+            stacked.dtype,
+            need_bytes / (1024.0 * 1024.0),
+            self._tile_gather_stats["workspace_bytes"] / (1024.0 * 1024.0),
+            workspace.data_ptr(),
+            self._tile_gather_stats["hits"],
+            self._tile_gather_stats["allocs"],
+        )
+        dist.all_gather_into_tensor(buffer, stacked, group=group)
+
+        results: list[torch.Tensor] = [None] * num_tiles  # type: ignore[list-item]
+        for rank in range(sp_size):
+            num_rank_tasks = -(-(num_tiles - rank) // sp_size)
+            for k in range(num_rank_tasks):
+                results[k * sp_size + rank] = buffer[rank][k].clone()
+        return results
+
+    def _decoder_tile_count(self, latent: torch.Tensor) -> int:
+        """Number of decoder tiles the checkpoint will split ``latent`` into.
+
+        Mirrors the checkpoint's ``decode_tiled``: the grid is computed from the
+        pixel-space dimensions, so it is a pure function of the latent shape and
+        resolves identically on every rank.
+        """
+
+        ratio = int(self.model.vae_ratio)
+        rows, _, _ = self.model.split_tiles(int(latent.shape[-2]) * ratio, True)
+        cols, _, _ = self.model.split_tiles(int(latent.shape[-1]) * ratio, True)
+        return len(rows) * len(cols)
+
+    def _encoder_tile_count(self, height: int, width: int) -> int:
+        processor = getattr(self.model, "processor", None)
+        align = getattr(processor, "_align_to_total_patch_size", None)
+        if callable(align):
+            height, width = align(int(height), int(width))
+        rows, _, _ = self.model.split_tiles(int(height), False)
+        cols, _, _ = self.model.split_tiles(int(width), False)
+        return len(rows) * len(cols)
+
+    def _encoder_tiling_context(
+        self,
+        height: int,
+        width: int,
+    ) -> AbstractContextManager:
+        parallel_size = int(getattr(self, "parallel_size", 1))
+        if parallel_size <= 1:
+            return nullcontext()
+        num_tiles = self._encoder_tile_count(height, width)
+        if num_tiles >= parallel_size:
+            return nullcontext()
+        logger.warning_once(
+            "MiniMax-H3 VAE encode splits a %dx%d input into %d tile(s) but "
+            "the tile group has %d ranks; encoding rank-locally for this "
+            "shape instead, which avoids ranks without tiles hanging the "
+            "collective.",
+            width,
+            height,
+            num_tiles,
+            parallel_size,
+        )
+        return self._rank_local_tiling()
+
+    @contextmanager
+    def _rank_local_tiling(self) -> Iterator[None]:
+        state = self._native_parallel_state()
+        saved_state = dict(state)
+        saved_tiling = self.model.parallel_tiling
+        state.update(
+            group_size=1,
+            group_rank=0,
+            local_process_group=None,
+            sp_size=1,
+            sp_rank=0,
+            sp_enabled=False,
+            sp_process_group=None,
+            tp_size=1,
+            tp_rank=0,
+        )
+        self.model.parallel_tiling = False
+        try:
+            yield
+        finally:
+            state.clear()
+            state.update(saved_state)
+            self.model.parallel_tiling = saved_tiling
+
     def is_distributed_enabled(self) -> bool:
         return self.parallel_size > 1 and dist.is_initialized()
 
     @torch.inference_mode()
     def encode_image(self, image: Image.Image) -> torch.Tensor:
+        if getattr(self, "decode_only", False):
+            raise RuntimeError("MiniMax H3 decode-only video VAE cannot encode images")
         previous_parallel = self.model.parallel_tiling
-        self.model.parallel_tiling = False
+        if int(getattr(self, "parallel_size", 1)) <= 1:
+            self.model.parallel_tiling = False
         parameter = next(self.parameters())
         previous_dtype = parameter.dtype
         if previous_dtype != torch.float32:
             self.to(torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
-            with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
+            with (
+                self._encoder_tiling_context(image.height, image.width),
+                torch.random.fork_rng(
+                    devices=devices,
+                    device_type=parameter.device.type,
+                ),
+            ):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                latent = self.model.encode_images(
-                    image,
-                    use_fp16_latent=True,
-                )[0]
+                with _minimax_h3_keyframe_encode_context(parameter.device):
+                    latent = self.model.encode_images(
+                        image,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             self.model.parallel_tiling = previous_parallel
             if previous_dtype != torch.float32:
@@ -238,13 +655,26 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self,
         frames: Any,
     ) -> tuple[torch.Tensor, tuple[int, int, int]]:
+        if getattr(self, "decode_only", False):
+            raise RuntimeError("MiniMax H3 decode-only video VAE cannot encode videos")
         parameter = next(self.parameters())
         previous_dtype = parameter.dtype
         if previous_dtype != torch.float32:
             self.to(torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
+        shape = getattr(frames, "shape", None)
+        if int(getattr(self, "parallel_size", 1)) > 1:
+            if shape is None or len(shape) != 4:
+                raise ValueError("parallel MiniMax H3 video encode requires a rank-4 frame array")
+            if int(shape[-1]) in {1, 3, 4}:
+                frame_height, frame_width = int(shape[-3]), int(shape[-2])
+            else:
+                frame_height, frame_width = int(shape[-2]), int(shape[-1])
+            tiling_context = self._encoder_tiling_context(frame_height, frame_width)
+        else:
+            tiling_context = nullcontext()
         try:
-            with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
+            with tiling_context, torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):
@@ -280,26 +710,86 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
+    def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
+        """Pick the tiling mode a decode of ``latent`` can safely use.
+
+        The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
+        and then rejects an empty share inside the gather. A rank with no
+        tiles raises and leaves the collective while the others block in it
+        forever, so too few tiles hangs the whole stage rather than failing
+        it. Tile count depends only on the latent shape, so every rank takes
+        this branch together.
+        """
+        num_tiles = self._decoder_tile_count(latent)
+        if self.parallel_size > 1 and num_tiles < self.parallel_size:
+            logger.warning_once(
+                "MiniMax-H3 VAE decode splits into %d tile(s) but the tile group has "
+                "%d ranks; decoding rank-locally for this shape instead, which is "
+                "slower but avoids ranks without tiles hanging the collective.",
+                num_tiles,
+                self.parallel_size,
+            )
+            return self._rank_local_tiling()
+        return nullcontext()
+
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "encode_only", False):
+            raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
+        with self._decode_tiling_context(latent):
+            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
+
+    def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         channels = int(self.config_dict["latent_channels"])
-        mean = torch.tensor(
-            self.config_dict["latents_mean"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        std = torch.tensor(
-            self.config_dict["latents_std"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
+        mean = torch.tensor(self.config_dict["latents_mean"], device=latent.device, dtype=latent.dtype)
+        std = torch.tensor(self.config_dict["latents_std"], device=latent.device, dtype=latent.dtype)
+        shape = (1, channels, 1, 1, 1)
+        return latent * std.view(shape) + mean.view(shape)
+
+    @staticmethod
+    def _normalize_decoded_frames(decoded: torch.Tensor) -> torch.Tensor:
+        """Canonicalize remote H3 decoder output to [B,C,T,H,W]."""
+        frames = decoded
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
         return frames.float()
+
+    # Chunks are reverted through the checkpoint's processor, which
+    # denormalizes and clamps into the unit interval.
+    chunk_value_range: ClassVar[tuple[float, float]] = (0.0, 1.0)
+
+    @torch.inference_mode()
+    def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
+        """Decode temporal clips and synchronously publish frames-only chunks.
+
+        Implements :class:`SupportsChunkedVAEDecode`. Every rank participating
+        in distributed VAE execution must invoke this method with a callback so
+        the temporal collectives stay in lockstep; ``on_chunk`` is called only
+        on the rank that owns output. Chunks arrive as ``[B, C, T, H, W]``
+        float frames, normalized through the checkpoint's processor to match
+        the complete decode path. After a callback failure, the remaining
+        chunks are decoded and discarded before the exception is re-raised.
+        """
+        if getattr(self, "encode_only", False):
+            raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
+        if not callable(on_chunk):
+            raise TypeError("on_chunk must be callable")
+        if not callable(getattr(self.model, "_adaptive_decode", None)):
+            raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
+        group = None
+        if self.is_distributed_enabled():
+            group = self._native_parallel_state().get("sp_process_group")
+            if group is None or dist.get_world_size(group) != self.parallel_size:
+                raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
+        # Native H3 tiling performs its own collectives for every temporal clip,
+        # so this path needs the same too-few-tiles fallback as the complete
+        # decode: without it a shape that leaves some ranks tileless hangs the
+        # gather instead of decoding rank-locally.
+        with self._decode_tiling_context(z):
+            decode_h3_chunks(self, z, on_chunk, group=group)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
@@ -309,14 +799,24 @@ class MiniMaxH3AudioVAE(nn.Module):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        encode_only: bool = False,
+        decode_only: bool = False,
+        trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
+        self.encode_only = bool(encode_only)
+        self.decode_only = bool(decode_only)
+        if self.encode_only and self.decode_only:
+            raise ValueError("MiniMax H3 audio VAE cannot be both encode-only and decode-only")
         self.config_dict = _load_component_config(component_path)
-        self.remote = _load_remote_component(
-            component_path,
-            self.config_dict,
-        )
+        _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
+        if self.encode_only:
+            self.remote = _load_audio_vae_encoder(component_path, self.config_dict)
+        else:
+            self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
+            if self.decode_only:
+                _remove_modules(self.remote.model, ("encoder", "pre_block", "mean_proj"))
         # The checkpoint's audio VAE contract is FP32 for both reference
         # encoding and waveform decoding.
         initial_device = load_device or device
@@ -337,12 +837,21 @@ class MiniMaxH3AudioVAE(nn.Module):
         else:
             self.remote.to(self._device_target)
 
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        if self._stager is not None:
+            self._stager.set_cache_retention(cache)
+
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            torch.accelerator.empty_cache()
+            cache = getattr(self, "_omni_component_cache", None)
+            if cache is None:
+                torch.accelerator.empty_cache()
+            else:
+                cache.release_if_needed()
 
     @torch.inference_mode()
     def encode_waveform(
@@ -350,6 +859,8 @@ class MiniMaxH3AudioVAE(nn.Module):
         waveform: torch.Tensor,
         sample_rate: int,
     ) -> tuple[torch.Tensor, int]:
+        if getattr(self, "decode_only", False):
+            raise RuntimeError("MiniMax H3 decode-only audio VAE cannot encode waveforms")
         import torchaudio
 
         waveform = waveform.float()
@@ -395,6 +906,8 @@ class MiniMaxH3AudioVAE(nn.Module):
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "encode_only", False):
+            raise RuntimeError("MiniMax H3 encode-only audio VAE cannot decode latents")
         channels = int(self.config_dict["latent_channels"])
         mean = torch.tensor(
             self.config_dict["latents_mean"],

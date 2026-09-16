@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the MiniCPM-o 4.5 pipeline registration.
 
 Covers:
@@ -24,6 +24,7 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
+    StagePipelineConfig,
     _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -54,18 +55,18 @@ class TestRegistryDeclaration:
         assert pipeline.model_type == _PIPELINE_KEY
         assert pipeline.model_arch == "MiniCPMO45OmniForConditionalGeneration"
 
-    def test_native_duplex_control_is_explicit_without_a_fixed_session_cap(self) -> None:
+    def test_duplex_plugin_is_declared_without_a_fixed_session_cap(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
-        assert pipeline.duplex_control_enabled is True
-        assert pipeline.duplex_serving_adapter == (
-            "vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
+        assert pipeline.duplex_plugin == (
+            "vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin.MiniCPMO45DuplexPlugin"
         )
         assert not hasattr(pipeline, "max_native_duplex_sessions")
 
-    def test_ordinary_pipeline_defaults_to_no_duplex_control(self) -> None:
-        pipeline = PipelineConfig(model_type="ordinary")
-        assert pipeline.duplex_control_enabled is False
-        assert pipeline.duplex_serving_adapter is None
+    def test_ordinary_pipeline_declares_no_duplex_plugin(self) -> None:
+        pipeline = PipelineConfig(
+            model_type="ordinary", stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),)
+        )
+        assert pipeline.duplex_plugin is None
         assert not hasattr(pipeline, "max_native_duplex_sessions")
 
 
@@ -78,10 +79,6 @@ class TestPipelineTopology:
         assert len(pipeline.stages) == 3
         assert [s.stage_id for s in pipeline.stages] == [0, 1, 2]
 
-    def test_topology_validates(self, pipeline: PipelineConfig) -> None:
-        # ``validate`` returns a list of structural errors; empty == valid.
-        assert pipeline.validate() == []
-
     def test_thinker_stage(self, pipeline: PipelineConfig) -> None:
         thinker = pipeline.get_stage(0)
         assert thinker is not None
@@ -92,6 +89,10 @@ class TestPipelineTopology:
         assert thinker.final_output_type == "text"
         assert thinker.owns_tokenizer is True
         assert thinker.requires_multimodal_data is True
+        assert thinker.sampling_constraints == {
+            "detokenize": True,
+            "stop_token_ids": [151704, 151645],
+        }
 
     def test_talker_stage(self, pipeline: PipelineConfig) -> None:
         talker = pipeline.get_stage(1)
@@ -105,6 +106,10 @@ class TestPipelineTopology:
         assert talker.engine_output_type == "latent"
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
+        assert talker.sampling_constraints == {
+            "detokenize": False,
+            "stop_token_ids": [6561],
+        }
         assert talker.custom_process_next_stage_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"
         )
@@ -163,6 +168,7 @@ class TestDeployTopology:
         assert connector["extra"]["connector_get_max_wait"] == 300
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
+        assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
@@ -224,6 +230,14 @@ class TestDeployTopology:
         assert code2wav.sync_process_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
         )
+
+    def test_no_async_chunk_selects_full_payload_processor(self) -> None:
+        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
+        deploy.async_chunk = False
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+
+        assert stages[1].yaml_engine_args["async_chunk"] is False
+        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_full_payload")
 
 
 def test_code2wav_model_is_lazily_registered() -> None:

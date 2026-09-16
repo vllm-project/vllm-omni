@@ -66,6 +66,8 @@ def test_npu_platform_defers_minimax_h3_encoder_patch() -> None:
     runtime_src = src[runtime_start:]
     assert "apply_minimax_h3_qwen3vl_patch" not in init_src
     assert "apply_minimax_h3_qwen3vl_patch" in runtime_src
+    assert "apply_minimax_h3_qwen3vl_sdpa_patch" not in init_src
+    assert "apply_minimax_h3_qwen3vl_sdpa_patch" in runtime_src
     assert "apply_minimax_h3_qwen3vl_swiglu_patch" in runtime_src
 
 
@@ -91,5 +93,29 @@ from vllm_omni.diffusion.data import DiffusionOutput
 
 if DiffusionOutput is None or LoRAConfig is None:
     raise SystemExit("expected LoRAConfig and DiffusionOutput")
+"""
+    )
+
+
+def test_pipeline_registry_does_not_import_pi0_runtime() -> None:
+    """Resolving the pi0 topology must not import its runtime pipeline.
+
+    ``pipeline_pi0`` imports ``diffusion.data``. Importing it while
+    ``diffusion.data`` is only partially initialized closes the Ascend plugin's
+    circular-import loop, so the registry must depend only on a lightweight
+    pipeline-config module.
+    """
+    _assert_isolated_import_succeeds(
+        """
+import sys
+
+from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+
+if "vllm_omni.diffusion.models.pi0.pipeline_pi0" in sys.modules:
+    raise SystemExit("pipeline_registry imported the pi0 runtime pipeline")
+
+pipeline = resolve_pipeline_config("pi0")
+if pipeline is None or pipeline.model_type != "pi0":
+    raise SystemExit("expected the registered pi0 pipeline config")
 """
     )

@@ -33,9 +33,20 @@ from vllm.platforms import current_platform
 from x_transformers.x_transformers import RotaryEmbedding
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
+from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
-from vllm_omni.model_executor.models.common.ming.dit import CondEmbedder, DiTBlock, FinalLayer, get_epss_timesteps
-from vllm_omni.model_executor.models.common.ming.fm import apply_sway_sampling, integrate_cfm_steps
+from vllm_omni.model_executor.models.common.ming.cfm_solver import (
+    apply_sway_sampling,
+    get_epss_timesteps,
+    integrate_cfm_steps,
+)
+from vllm_omni.model_executor.models.common.ming.dit_blocks import CondEmbedder, DiTBlock, FinalLayer
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
 
 logger = init_logger(__name__)
 
@@ -459,58 +470,6 @@ def silence_holder(
 
 
 ########################################################################
-# Audio Postprocess
-# Ported from:
-# https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/talker_module/aggregator.py
-########################################################################
-
-
-class Aggregator(nn.Module):
-    """Maps generated audio latent patches back to LLM embedding space."""
-
-    def __init__(
-        self,
-        in_channels: int = 64,
-        hidden_size: int = 1152,
-        depth: int = 28,
-        num_heads: int = 16,
-        mlp_ratio: float = 4.0,
-        llm_input_dim: int = 896,
-        **kwargs,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels
-        self.num_heads = num_heads
-
-        self.word_embedder = nn.Embedding(1, hidden_size)
-        self.x_embedder = nn.Linear(in_channels, hidden_size)
-        self.hidden_size = hidden_size
-
-        self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
-
-        self.blocks = nn.ModuleList(
-            [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **kwargs) for _ in range(depth)]
-        )
-        self.final_layer = FinalLayer(hidden_size, llm_input_dim)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.x_embedder(x)
-        cls_embed = self.word_embedder(torch.zeros((x.shape[0], 1), dtype=torch.long, device=x.device))
-        x = torch.cat([cls_embed, x], dim=1)
-
-        rope = self.rotary_embed.forward_from_seq_len(x.shape[1])
-        if mask is not None:
-            mask_pad = mask.clone().detach()[:, :1]
-            mask = torch.cat([mask_pad, mask], dim=-1)
-        for block in self.blocks:
-            x = block(x, mask, rope)
-        x = self.final_layer(x)
-        x = x[:, :1, :]
-        return x
-
-
-########################################################################
 # Prompt Builder
 # Adapted from:
 # https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/modeling_bailing_talker.py
@@ -622,6 +581,13 @@ class MingAudioGenerator:
     for a single TTS request. The generator is stateless across requests.
     """
 
+    _STATIC_CACHE_LEN = 2048
+    """Positions the talker's StaticCache is preallocated for.
+
+    Read by both ``_init_kv_cache`` and ``model_local_kv_specs`` so the
+    declaration cannot drift from the allocation.
+    """
+
     def __init__(
         self,
         config,
@@ -655,6 +621,49 @@ class MingAudioGenerator:
         # For FA2, let it see a full-length seq Q
         # trailing latent frames prepended on each decode call
         self._vae_decode_pad_frames = 32
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the talker's preallocated decode cache.
+
+        This is the case that a static table cannot hold. ``self._llm_config``
+        is a ``Qwen2Config`` resolved from the checkpoint at load time, so
+        layers, kv-heads and head-dim do not exist anywhere in this repo, and
+        the dtype is whatever the weights loaded as. Reading them off the same
+        objects ``_init_kv_cache`` builds from is the only way to get a real
+        number.
+
+        Unlike the other three this is not a ceiling that a short utterance
+        stays under. transformers v5 initializes ``StaticLayer`` lazily, but
+        the first write to a layer allocates all ``max_cache_len`` positions at
+        once rather than growing, so a prefill brings the full extent into
+        existence on step 0 of every generation.
+
+        Width is fixed at one row, not ``max_num_seqs``. ``forward`` takes only
+        ``runtime_additional_information[0]`` and runs the whole AR loop inline
+        before returning, so one worker holds one cache no matter how many
+        sequences the scheduler admits. Declaring this per-sequence -- which an
+        earlier revision did, by deriving the multiplier from scope -- reported
+        ``max_num_seqs`` times the real figure.
+
+        The caveat is that nothing enforces the serialization. ``StaticCache``
+        is built outside ``_sampler_pool``'s lock, so overlapping calls to
+        ``generate_latents`` would coexist. If this model ever gains a
+        concurrent entry point, this row count is the line to revisit.
+        """
+        return [
+            spec_from_hf_config(
+                self._llm_config,
+                name="talker_llm_static_cache",
+                dtype=next(self._model.parameters()).dtype,
+                physical_capacity_positions=self._STATIC_CACHE_LEN,
+                capacity_source=f"hardcoded max_cache_len={self._STATIC_CACHE_LEN} in _init_kv_cache",
+                scope=ModelLocalKVScope.INVOCATION,
+                rows=RowDriver.FIXED,
+                rows_fixed=1,
+                rows_reason="forward() handles one request and runs the AR loop inline",
+                allocation_note="full extent on first write per layer, not grown; rebuilt per text segment",
+            )
+        ]
 
     @cached_property
     def _sampler_pool(self) -> CFMGraphExecutorPool | None:
@@ -837,7 +846,7 @@ class MingAudioGenerator:
     def _init_kv_cache(
         self, use_static_cache: bool, device: torch.device, dtype: torch.dtype
     ) -> tuple[StaticCache | None, int]:
-        max_cache_len = 2048
+        max_cache_len = self._STATIC_CACHE_LEN
         if not use_static_cache:
             return None, max_cache_len
         cache = StaticCache(

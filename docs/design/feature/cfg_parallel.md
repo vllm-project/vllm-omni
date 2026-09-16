@@ -63,7 +63,7 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
 
 ### N-Branch CFG (3+ branches)
 
-Some models require more than 2 CFG branches. For example, Bagel and OmniGen2 use 3 branches, DreamID Omni uses 4 branches.
+Some models require more than 2 CFG branches. For example, Bagel and OmniGen2 use 3 branches.
 
 `predict_noise_with_multi_branch_cfg()` handles these by automatically dispatching N branches across M GPUs using round-robin (rule: branch `i` → rank `i % M`):
 

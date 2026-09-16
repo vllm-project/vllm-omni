@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict batched codec-to-waveform stage for MiniCPM-o 4.5."""
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -39,9 +40,9 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     """
     if Path(model_ref).is_dir():
         return model_ref
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+    return hf_api().snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -57,6 +58,92 @@ def _scalar(value: Any, default: Any = None) -> Any:
     return default if value is None else value
 
 
+_REF_TARGET_SAMPLE_RATE = 24000
+# Overridable per deployment via ``ref_audio_max_seconds``.
+_REF_MAX_SECONDS = 6.0
+# Channel ceiling for the optional (channels, samples) downmix guard.
+_REF_MAX_CHANNELS = 8
+
+
+@lru_cache(maxsize=8)
+def _get_resampler(orig_freq: int, new_freq: int):
+    """Cached anti-aliased resampler matching token2wav's own loader.
+
+    ``torchaudio`` is imported lazily (it is not a hard runtime requirement of
+    this model on every platform) and the transform is built once per rate pair
+    instead of once per request, keeping it off the first-packet path.
+    """
+    import torchaudio
+
+    return torchaudio.transforms.Resample(orig_freq=orig_freq, new_freq=new_freq)
+
+
+def _read_reference_wav(path: str) -> tuple[Any, int]:
+    """Read a WAV file for :func:`_normalize_reference`.
+
+    ``soundfile`` returns ``(samples, channels)`` for multi-channel files
+    while the normalizer expects ``(channels, samples)``. Without the
+    transpose a stereo prompt looks like a huge channel count, the downmix
+    guard rejects it, and the caller silently falls back to the raw file --
+    a second L0 value for the same content.
+    """
+    waveform, sample_rate_hz = sf.read(path, dtype="float32", always_2d=False)
+    if getattr(waveform, "ndim", 1) > 1:
+        waveform = waveform.T
+    return waveform, int(sample_rate_hz)
+
+
+def _normalize_reference(
+    ref_audio: Any,
+    sample_rate_hz: int,
+    *,
+    max_seconds: float = _REF_MAX_SECONDS,
+) -> tuple[torch.Tensor, int]:
+    """Normalize a per-request reference waveform onto a shared grid.
+
+    MiniCPM-o streaming uses the reference-audio length as the CFM attention
+    cache origin (L0). Unnormalized references give every request a distinct
+    L0, which explodes the CFM CUDA-graph cache key space (see #6628). Fold
+    every reference onto the same sample rate and a fixed length (truncate
+    long ones, zero-pad short ones) so L0 becomes one constant value.
+
+    References longer than ``max_seconds`` are truncated with a warning;
+    the window is configurable via ``ref_audio_max_seconds``.
+    """
+    tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
+    if tensor.dim() > 1:
+        # (channels, samples) -> mono; plain reshape(-1) would interleave.
+        # Upstream flattens request references to 1-D, so anything else is a
+        # non-standard caller: reject layouts we cannot downmix unambiguously
+        # instead of silently averaging the waveform away.
+        if tensor.shape[0] > _REF_MAX_CHANNELS:
+            raise ValueError(f"reference audio must be 1-D or (channels, samples); got shape {tuple(tensor.shape)}")
+        tensor = tensor.mean(dim=0)
+    waveform = tensor.reshape(-1).cpu().contiguous()
+    if waveform.numel() == 0:
+        # Keep the caller's "empty_ref_audio" error path intact: an empty
+        # waveform must not be zero-padded into a valid-length reference.
+        return waveform, _REF_TARGET_SAMPLE_RATE
+    if sample_rate_hz != _REF_TARGET_SAMPLE_RATE:
+        # Match token2wav's own loader (torchaudio, anti-aliased): it only
+        # resamples when the stored rate differs, so this output is what the
+        # model consumes.
+        waveform = _get_resampler(sample_rate_hz, _REF_TARGET_SAMPLE_RATE)(waveform.view(1, -1)).view(-1).contiguous()
+    max_samples = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
+    if waveform.numel() > max_samples:
+        logger.warning(
+            "Reference audio is %.2fs, truncating to the %.2fs window (set ``ref_audio_max_seconds`` to keep more).",
+            waveform.numel() / _REF_TARGET_SAMPLE_RATE,
+            max_seconds,
+        )
+        waveform = waveform[:max_samples].contiguous()
+    elif waveform.numel() < max_samples:
+        # Zero-pad short references so every request shares one L0; trailing
+        # silence has minimal style impact (verified via E3 WER/SIM).
+        waveform = torch.nn.functional.pad(waveform, (0, max_samples - waveform.numel()))
+    return waveform, _REF_TARGET_SAMPLE_RATE
+
+
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         return value.reshape(-1).to(device=fallback.device, dtype=torch.long)
@@ -69,6 +156,17 @@ def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
 # OmniGPUModelRunner._preprocess and the NPU _gather_runtime_additional_information
 # override). A step carrying only these has no producer payload at all.
 _RUNNER_STAMPED_KEYS = frozenset({"request_id", "req_id", "generated_len", "meta"})
+_PRODUCER_META_KEYS = frozenset(
+    {
+        "cache_epoch",
+        "chunk_seq",
+        "code_flat_numel",
+        "last_chunk",
+        "prompt_cache_id",
+        "prompt_wav",
+        "ref_audio_sr",
+    }
+)
 
 
 def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> bool:
@@ -77,9 +175,12 @@ def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> 
     Any real async-chunk payload brings producer metadata along, whether the
     transport delivers it nested under ``meta`` or as flattened ``meta.*`` keys.
     """
+    codes = info.get("codes")
+    if isinstance(codes, Mapping) and any(value is not None for value in codes.values()):
+        return True
     if any(key not in _RUNNER_STAMPED_KEYS for key in info):
         return True
-    return meta is not info and any(key not in _RUNNER_STAMPED_KEYS for key in meta)
+    return any(meta.get(key) is not None for key in _PRODUCER_META_KEYS)
 
 
 @dataclass(frozen=True)
@@ -121,13 +222,15 @@ class _WorkItem:
 
 
 class MiniCPMO45Code2Wav(nn.Module):
-    """LLM_GENERATION model that admits only true exact-shape GPU batches."""
+    """LLM_GENERATION model with request-owned state and compatible batching."""
 
     input_modalities = "audio"
     have_multimodal_outputs = True
     enable_update_additional_information = True
+    replace_runtime_additional_information = True
     requires_raw_input_tokens = True
     requires_request_ids = True
+    requires_exact_input_shape = True
     has_preprocess = False
     has_postprocess = False
 
@@ -165,18 +268,68 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+            "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
         }
+        self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
+        if self._ref_max_seconds <= 0:
+            raise ValueError("MiniCPM-o Code2Wav ref_audio_max_seconds must be > 0")
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._initial_batch_size = int(extra.get("code2wav_initial_batch_size", 0))
+        if self._initial_batch_size < 0:
+            raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
+        if self._initial_batch_size and self._initial_batch_size < self._min_batch_size:
+            raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
+        self._default_prompt_normalized: tuple[str, str] | None = None
 
     @property
     def _default_prompt_wav(self) -> str:
         if self._prompt_wav_override is not None:
             return str(self._prompt_wav_override)
         return str(Path(self.model_path) / "assets" / "HT_ref_audio.wav")
+
+    def _normalized_default_prompt(self) -> tuple[str, str]:
+        """Fold the shipped default prompt onto the request-reference grid.
+
+        The shipped asset is 6.016 s and is loaded directly by token2wav, so a
+        request without a reference would otherwise keep a second L0 value a
+        couple of frames away from the normalized request references -- two
+        graph-key families instead of one (both use ``ref_audio_max_seconds``).
+        Returns ``(prompt_wav,
+        prompt_cache_id)``; if the asset cannot be read, the shipped path is
+        returned unchanged.
+        """
+        if self._default_prompt_normalized is not None:
+            return self._default_prompt_normalized
+        source = self._default_prompt_wav
+        fallback = (source, self._default_prompt_id)
+        try:
+            waveform, sample_rate_hz = _read_reference_wav(source)
+            normalized, target_sr = _normalize_reference(
+                waveform,
+                sample_rate_hz,
+                max_seconds=self._ref_max_seconds,
+            )
+        except Exception:
+            logger.warning("Could not normalize the default prompt %s; using it as-is", source)
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        if normalized.numel() == 0:
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        digest = sha256()
+        digest.update(normalized.numpy().tobytes())
+        digest.update(str(target_sr).encode())
+        cache_id = f"default-ref-{digest.hexdigest()[:24]}-{target_sr}"
+        path = Path(self._runtime_prompt_dir.name) / f"{cache_id}.wav"
+        if not path.is_file():
+            sf.write(path, normalized.numpy(), target_sr, format="WAV")
+        logger.info("Default prompt normalized onto the %.2fs window: %s", self._ref_max_seconds, path)
+        self._default_prompt_normalized = (str(path), cache_id)
+        return self._default_prompt_normalized
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
@@ -199,9 +352,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         sample_rate: Any,
     ) -> tuple[str, _RuntimePrompt]:
         sample_rate_hz = int(_scalar(sample_rate, 0))
-        waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
+        waveform, sample_rate_hz = _normalize_reference(
+            ref_audio,
+            sample_rate_hz,
+            max_seconds=self._ref_max_seconds,
+        )
         if waveform.numel() == 0:
             raise _batch_error("empty_ref_audio")
         if not bool(torch.isfinite(waveform).all().item()):
@@ -252,6 +409,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                 ref_audio,
                 meta.get("ref_audio_sr"),
             )
+            logger.debug(
+                "MiniCPM-o Code2Wav selected runtime reference prompt_cache_id=%s prompt_wav=%s",
+                entry.cache_id,
+                entry.path,
+            )
             return entry.cache_id, entry.path, cache_key
 
         if previous is not None:
@@ -262,9 +424,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is not None:
             return entry.cache_id, entry.path, cache_key
 
+        default_wav, default_cache_id = self._normalized_default_prompt()
         return (
-            str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id)),
-            str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav)),
+            str(_scalar(meta.get("prompt_cache_id"), default_cache_id)),
+            str(_scalar(meta.get("prompt_wav"), default_wav)),
             None,
         )
 
@@ -467,12 +630,62 @@ class MiniCPMO45Code2Wav(nn.Module):
         return (
             item.prompt_cache_id,
             item.prompt_wav,
-            int(item.tokens.numel()),
             cache_signature,
-            item.last_chunk,
-            item.tts_is_last_chunk,
             item.cache_epoch,
         )
+
+    def _iter_limited_batches(
+        self,
+        buckets: Iterable[list[_WorkItem]],
+        *,
+        maximum: int,
+    ) -> Iterable[list[_WorkItem]]:
+        for bucket in buckets:
+            if not bucket:
+                continue
+            if not maximum:
+                yield bucket
+                continue
+            batch_count = (len(bucket) + maximum - 1) // maximum
+            if len(bucket) < batch_count * self._min_batch_size:
+                raise _batch_error(
+                    "initial_batch_partition_below_minimum",
+                    size=len(bucket),
+                    minimum=self._min_batch_size,
+                    maximum=maximum,
+                )
+            batch_size, larger_batches = divmod(len(bucket), batch_count)
+            start = 0
+            for batch_index in range(batch_count):
+                stop = start + batch_size + (batch_index < larger_batches)
+                yield bucket[start:stop]
+                start = stop
+
+    def _iter_decode_batches(
+        self,
+        buckets: Iterable[list[_WorkItem]],
+    ) -> Iterable[list[_WorkItem]]:
+        for bucket in buckets:
+            if not self._initial_batch_size:
+                yield bucket
+                continue
+            initial = [item for item in bucket if item.chunk_seq <= 1]
+            steady = [item for item in bucket if item.chunk_seq > 1]
+
+            undersized = [
+                {"wave": wave, "size": len(items)}
+                for wave, items in (("initial", initial), ("steady", steady))
+                if items and len(items) < self._min_batch_size
+            ]
+            if undersized:
+                raise _batch_error(
+                    "decode_wave_below_minimum",
+                    minimum=self._min_batch_size,
+                    waves=undersized,
+                )
+            yield from self._iter_limited_batches([initial], maximum=self._initial_batch_size)
+            if steady:
+                yield steady
 
     @torch.inference_mode()
     def forward(
@@ -609,7 +822,10 @@ class MiniCPMO45Code2Wav(nn.Module):
                     (item.prompt_cache_id, item.prompt_wav),
                     [],
                 ).append(item)
-        for bucket in initial_marker_buckets.values():
+        for bucket in self._iter_limited_batches(
+            initial_marker_buckets.values(),
+            maximum=self._initial_batch_size,
+        ):
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
@@ -641,7 +857,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
                 )
-        for bucket in buckets.values():
+        for bucket in self._iter_decode_batches(buckets.values()):
             batch_size = len(bucket)
             try:
                 features = self.backend.prepare_prompt(
@@ -652,13 +868,23 @@ class MiniCPMO45Code2Wav(nn.Module):
                     states = self.backend.setup_batch(features, batch_size)
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
-                tokens = torch.stack([item.tokens for item in bucket], dim=0)
-                audios, next_states = self.backend.decode_batch(
-                    tokens,
-                    features,
-                    states,
-                    last_chunk=bucket[0].last_chunk,
-                )
+                token_lengths = {int(item.tokens.numel()) for item in bucket}
+                last_chunk_values = {item.last_chunk for item in bucket}
+                if len(token_lengths) > 1 or len(last_chunk_values) > 1:
+                    audios, next_states = self.backend.decode_ragged_batch(
+                        [item.tokens for item in bucket],
+                        features,
+                        states,
+                        last_chunks=[item.last_chunk for item in bucket],
+                    )
+                else:
+                    tokens = torch.stack([item.tokens for item in bucket], dim=0)
+                    audios, next_states = self.backend.decode_batch(
+                        tokens,
+                        features,
+                        states,
+                        last_chunk=bucket[0].last_chunk,
+                    )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -807,4 +1033,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             connector_config=self._connector_config,
             hift_graph_config=self._hift_graph_config,
             cfm_graph_config=self._cfm_graph_config,
+            bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
         )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Inject MiniCPM-o Code2Wav NPUGraph acceleration on Ascend."""
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from contextlib import nullcontext
+from typing import cast
 from weakref import WeakKeyDictionary
 
 import torch
@@ -24,6 +25,7 @@ _original_decode_batch = None
 _backend_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
 _ENABLE_KEY = "code2wav_enable_npu_graph"
 _MAX_GRAPHS_KEY = "code2wav_max_npu_graphs"
+_BF16_ATTENTION_CACHE_KEY = "code2wav_bfloat16_attention_cache"
 
 
 def _config_bool(value: object, default: bool) -> bool:
@@ -73,10 +75,15 @@ def _graphable_estimator_step(
     cond,
     cnn_cache,
     att_cache,
+    valid_frames=None,
 ):
     """Run the CFM estimator body after host-backed timestep embedding."""
     width = int(x.shape[-1])
     speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
+    if valid_frames is not None and valid_frames < width:
+        # Match the CUDA path: padded columns must not carry the speaker vector.
+        speaker_features = speaker_features.clone()
+        speaker_features[:, :, valid_frames:] = 0.0
     estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
     cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
     old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
@@ -104,10 +111,19 @@ def _patched_estimator_step(
     cond,
     cnn_cache,
     att_cache,
+    attn_mask=None,
+    valid_lengths=None,
+    valid_frames=None,
 ):
     assert _original_estimator_step is not None
     graph_runner = _backend_graph_runners.get(self)
-    if graph_runner is None or self._trt_stepper is not None or self._cfm_graph_wrapper is not None:
+    if (
+        graph_runner is None
+        or self._trt_stepper is not None
+        or self._cfm_graph_wrapper is not None
+        or attn_mask is not None
+        or valid_lengths is not None
+    ):
         return _original_estimator_step(
             self,
             estimator,
@@ -118,9 +134,17 @@ def _patched_estimator_step(
             cond=cond,
             cnn_cache=cnn_cache,
             att_cache=att_cache,
+            attn_mask=attn_mask,
+            valid_lengths=valid_lengths,
+            valid_frames=valid_frames,
         )
     if (cnn_cache is None) != (att_cache is None):
         raise ValueError("estimator CNN and attention caches must both be present or absent")
+
+    # valid_frames only matters for padded inputs; skip forwarding it for
+    # unpadded calls so platform-owned graphable bodies that predate the
+    # padding feature keep working with the old signature.
+    graphable_kwargs = {"valid_frames": valid_frames} if valid_frames is not None else {}
 
     # The upstream embedder creates a frequency tensor on the host. Keep it
     # outside capture while retaining the tensor-only estimator body in graph.
@@ -140,6 +164,7 @@ def _patched_estimator_step(
                 cond=step_cond,
                 cnn_cache=None,
                 att_cache=None,
+                **graphable_kwargs,
             ),
         )
 
@@ -157,6 +182,7 @@ def _patched_estimator_step(
             cond=step_cond,
             cnn_cache=step_cnn,
             att_cache=step_att,
+            **graphable_kwargs,
         ),
     )
 
@@ -198,8 +224,15 @@ def _patched_build_backend(self) -> None:
     if self.backend is not None:
         return
 
+    extra = self._extra_config()
+    if bool(extra.get(_BF16_ATTENTION_CACHE_KEY, False)):
+        raise ValueError(
+            "MiniCPM-o Code2Wav code2wav_bfloat16_attention_cache is "
+            "currently supported only on CUDA; leave it unset or false on NPU."
+        )
+
     config = _graph_config(self)
-    max_graphs = max(0, int(config.get(_MAX_GRAPHS_KEY, 32)))
+    max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, 32))))
     graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), False)
     if graph_enabled:
         # NPUOmniPlatform enables internal format for quantized LLM kernels.

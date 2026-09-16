@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +38,21 @@ _DETOK = MagicMock(
     num_output_tokens=MagicMock(return_value=1),
 )
 _LOGPROBS = MagicMock(logprobs=None, cumulative_logprob=None, prompt_logprobs=None)
+
+
+@dataclass
+class _StreamingUpdate:
+    final: bool
+    prompt: object | None
+    prompt_token_ids: list[int]
+    arrival_time: float
+
+
+@dataclass
+class _FinishedRequestMetric:
+    request_id: str
+    mean_time_per_output_token: float
+
 
 _DEFAULT_STATE_KWARGS = dict(
     request_id="r",
@@ -128,6 +144,119 @@ def test_native_text_metrics_include_segment_generation_token_count(monkeypatch)
     )
 
     assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 27
+
+
+def test_native_text_metrics_exclude_cross_segment_gap(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+
+    def update_segment(_output, timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.num_generation_tokens = 2 if timestamp == 10.03 else 1
+        native_stats.first_token_ts = 10.02 if timestamp == 10.03 else timestamp
+        native_stats.last_token_ts = timestamp
+        native_stats.first_token_latency = 0.01
+
+    iteration_stats.update_from_output.side_effect = update_segment
+    processor._update_stats_from_output(
+        state,
+        MagicMock(),
+        10.0,
+        iteration_stats,
+    )
+    first_segment = processor.pop_native_text_metrics("r")
+    assert first_segment["vllm_tpot_ms"] == 0.0
+    assert first_segment["vllm_itls_ms"] == []
+
+    state.apply_streaming_update(
+        _StreamingUpdate(
+            final=False,
+            prompt=None,
+            prompt_token_ids=[],
+            arrival_time=10.01,
+        )
+    )
+    state.is_prefilling = True
+    processor._update_stats_from_output(
+        state,
+        MagicMock(),
+        10.02,
+        iteration_stats,
+    )
+    state.is_prefilling = False
+    processor._update_stats_from_output(
+        state,
+        MagicMock(),
+        10.03,
+        iteration_stats,
+    )
+    second_segment = processor.pop_native_text_metrics("r")
+
+    assert second_segment["num_generation_tokens"] == 2
+    assert second_segment["vllm_itls_ms"] == pytest.approx([10.0])
+    assert second_segment["vllm_tpot_ms"] == pytest.approx(10.0)
+
+
+def test_native_text_tpot_weights_multi_token_engine_output(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+
+    def update_segment(_output, timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.num_generation_tokens = 1 if timestamp == 10.0 else 4
+        native_stats.first_token_ts = 10.0
+        native_stats.last_token_ts = timestamp
+        native_stats.first_token_latency = 0.01
+
+    iteration_stats.update_from_output.side_effect = update_segment
+    state.is_prefilling = True
+    processor._update_stats_from_output(state, MagicMock(), 10.0, iteration_stats)
+    state.is_prefilling = False
+    processor._update_stats_from_output(state, MagicMock(), 10.03, iteration_stats)
+    record = processor.pop_native_text_metrics("r")
+
+    assert record["num_generation_tokens"] == 4
+    assert record["vllm_itls_ms"] == pytest.approx([30.0])
+    assert record["vllm_itl_ms"] == pytest.approx(30.0)
+    assert record["vllm_tpot_ms"] == pytest.approx(10.0)
+    assert "_tpot_elapsed_ms" not in record
+    assert "_tpot_intervals" not in record
+
+
+@pytest.mark.parametrize(
+    ("finished_tpot_s", "expected_tpot_ms"),
+    [(0.0, 19.0), (0.023, 23.0)],
+)
+def test_native_text_tpot_only_accepts_positive_finished_metric(
+    monkeypatch,
+    finished_tpot_s,
+    expected_tpot_ms,
+):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_finished", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {"r": {"vllm_tpot_ms": 19.0}}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+    iteration_stats.finished_requests = [
+        _FinishedRequestMetric(
+            request_id="r",
+            mean_time_per_output_token=finished_tpot_s,
+        )
+    ]
+
+    processor._update_stats_from_finished(
+        state,
+        FinishReason.STOP,
+        iteration_stats,
+    )
+
+    assert processor.pop_native_text_metrics("r")["vllm_tpot_ms"] == expected_tpot_ms
 
 
 def test_delta_drains_output_modality_per_step():
@@ -581,18 +710,18 @@ def test_mm_only_terminal_finish_removes_request_state(monkeypatch):
 
 def test_no_detokenizer_make_request_output_with_routed_experts():
     """make_request_output accepts the routed_experts arg that the multimodal
-    output channel (_process_mm_only_outputs) passes positionally, and attaches
-    it to the completion output.
+    output channel (_process_mm_only_outputs) passes, and attaches it to the
+    completion output.
 
-    Regression: the call site passes 6 positional args
-    (..., kv_transfer_params, routed_experts) but the override previously took
-    only 5, raising TypeError on every generation-stage output.
+    routed_experts is omni-specific keyword-only: the 6th positional now
+    matches upstream's ec_transfer_params so that super().process_outputs()
+    calls do not misroute it.
     """
     s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
     s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
     routed_experts = np.zeros((2, 3), dtype=np.int32)
     # Mirror the exact call shape of _process_mm_only_outputs.
-    result = s.make_request_output([], None, FinishReason.STOP, None, None, routed_experts)
+    result = s.make_request_output([], None, FinishReason.STOP, None, None, routed_experts=routed_experts)
     assert result is not None
     assert not isinstance(result, PoolingRequestOutput)
     assert result.outputs[0].routed_experts is routed_experts
@@ -663,3 +792,99 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.finish_reason == FinishReason.STOP
     assert finished.num_prompt_tokens == state.prompt_len
     assert finished.num_generation_tokens == 2
+
+
+def test_ec_transfer_params_survive_both_construction_paths():
+    """v0.28 contract: encoder-cache transfer metadata must reach
+    RequestOutput.ec_transfer_params through BOTH omni construction paths —
+    the upstream-delegating one (logprobs processor present) and the
+    no-detokenizer generation-stage one (direct RequestOutput build).
+    Regression: the override accepted the argument but dropped it."""
+    ec = {"remote_handle": "enc-cache-1"}
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    out = state.make_request_output([1], None, None, None, {"kv": 1}, ec)
+    assert out is not None and out.ec_transfer_params == ec
+
+    kwargs = dict(_DEFAULT_STATE_KWARGS)
+    kwargs.update(logprobs_processor=None, detokenizer=None)
+    gen_state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    completion = gen_state._new_completion_output([1], None, None)
+    direct = gen_state._new_request_output("r", [completion], False, {"kv": 1}, ec)
+    assert direct.ec_transfer_params == ec
+
+
+def test_num_cache_creation_tokens_reaches_direct_request_output():
+    """v0.28 contract: prefix-cache creation usage must reach
+    RequestOutput.num_cache_creation_tokens through the no-detokenizer
+    direct build, which previously passed only num_cached_tokens."""
+    kwargs = dict(_DEFAULT_STATE_KWARGS)
+    kwargs.update(logprobs_processor=None, detokenizer=None)
+    gen_state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    gen_state.num_cached_tokens = 3
+    gen_state.num_cache_creation_tokens = 2
+
+    completion = gen_state._new_completion_output([1], None, None)
+    direct = gen_state._new_request_output("r", [completion], False, None, None)
+
+    assert direct.num_cached_tokens == 3
+    assert direct.num_cache_creation_tokens == 2
+
+
+def _abort_processor_with_parent(child_ids: list[str]):
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.request_states = {}
+    processor.external_req_ids = {}
+    processor.parent_requests = {}
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = SimpleNamespace(request_finished=lambda *_args, **_kwargs: None)
+    parent = SimpleNamespace(request_id="parent", child_requests=set(child_ids))
+    processor.parent_requests["parent"] = parent
+    for child_id in child_ids:
+        req_state = SimpleNamespace(
+            parent_req=parent,
+            lora_name=None,
+            output_kind=RequestOutputKind.CUMULATIVE,
+            detokenizer=SimpleNamespace(output_token_ids=[7, 8]),
+            queue=None,
+            external_req_id="parent",
+            make_request_output=MagicMock(return_value=SimpleNamespace(request_id=child_id)),
+        )
+        processor.request_states[child_id] = req_state
+    return processor, parent
+
+
+def test_abort_last_parallel_child_drops_parent_request():
+    processor, parent = _abort_processor_with_parent(["0_parent", "1_parent"])
+
+    aborted, _outputs = processor.abort_requests_collecting_outputs(["0_parent"], internal=True)
+    assert aborted == ["0_parent"]
+    assert "parent" in processor.parent_requests
+    assert parent.child_requests == {"1_parent"}
+
+    aborted, _outputs = processor.abort_requests_collecting_outputs(["1_parent"], internal=True)
+    assert aborted == ["1_parent"]
+    assert "parent" not in processor.parent_requests
+    assert not parent.child_requests
+
+
+def test_abort_snapshot_leaves_state_until_commit():
+    processor, parent = _abort_processor_with_parent(["0_parent"])
+    processor.external_req_ids["parent"] = ["0_parent"]
+
+    aborted, outputs = processor.abort_requests_collecting_outputs(
+        ["parent"],
+        internal=False,
+        commit_state=False,
+    )
+    assert aborted == ["0_parent"]
+    assert outputs
+    assert "0_parent" in processor.request_states
+    assert processor.external_req_ids["parent"] == ["0_parent"]
+    assert "parent" in processor.parent_requests
+    assert parent.child_requests == {"0_parent"}
+
+    processor.commit_aborted_request_state(["parent"], internal=False)
+    assert "0_parent" not in processor.request_states
+    assert "parent" not in processor.parent_requests
+    assert "parent" not in processor.external_req_ids

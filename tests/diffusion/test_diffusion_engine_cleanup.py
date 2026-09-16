@@ -12,6 +12,7 @@ import pytest
 from vllm_omni.diffusion import diffusion_engine as diffusion_engine_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -86,6 +87,50 @@ def test_emit_step_outputs_finalizes_finished_request_without_stream() -> None:
     engine._emit_outputs({request_id}, [request_id], SimpleNamespace(get_request_output=lambda _request_id: None))
 
     assert engine.scheduler.get_request_state(request_id) is None
+
+
+def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine, Mock]:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(diffusion_kv_mode=mode)
+    cleanup = Mock()
+    engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup)
+    return engine, cleanup
+
+
+def test_paged_terminal_output_clears_worker_rows() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    engine._finalize_finished_request = lambda request_id, *_args: request_id
+    engine._put_output = lambda *_args: None
+
+    engine._emit_finished_outputs({"req-0", "req-1"})
+
+    cleanup.assert_called_once()
+    assert set(cleanup.call_args.args[0]) == {"req-0", "req-1"}
+
+
+def test_paged_abort_clears_worker_rows_before_scheduler_free() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    engine.scheduler = SimpleNamespace(
+        get_request_state=lambda _request_id: None,
+        finish_requests=Mock(side_effect=AssertionError("unknown request must not be logically freed")),
+    )
+
+    engine._abort_requests(["req-idle", "req-idle"])
+
+    cleanup.assert_called_once_with(["req-idle"])
+    engine.scheduler.finish_requests.assert_not_called()
+
+
+def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.DENSE_LEGACY)
+    engine._finalize_finished_request = lambda request_id, *_args: request_id
+    engine._put_output = lambda *_args: None
+    engine.scheduler = SimpleNamespace(get_request_state=lambda _request_id: None)
+
+    engine._emit_finished_outputs({"req-0"})
+    engine._abort_requests(["req-idle"])
+
+    cleanup.assert_not_called()
 
 
 def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:

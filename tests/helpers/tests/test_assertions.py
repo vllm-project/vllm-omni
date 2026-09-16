@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
 import pytest
 
 from tests.helpers import assertions
-from tests.helpers.assertions import _assert_transcript_matches, _resolve_audio_transcript
+from tests.helpers.assertions import (
+    _assert_transcript_matches,
+    _resolve_audio_transcript,
+    assert_audio_speech_response,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -71,6 +75,40 @@ def test_resolve_transcript_leaves_language_unset_by_default(monkeypatch):
     assert captured["model_size"] == "small"
 
 
+@pytest.mark.parametrize(
+    ("request_config", "expected_text"),
+    [
+        ({"input": "spoken words"}, "spoken words"),
+        (
+            {
+                "input": "<|style:whispering|>spoken words",
+                "transcript_expected_text": "spoken words",
+            },
+            "spoken words",
+        ),
+    ],
+)
+def test_speech_transcript_expected_text(monkeypatch, request_config, expected_text):
+    captured: dict = {}
+
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", lambda *_args, **_kwargs: "spoken words")
+
+    def capture_match(_transcript, _audio_bytes, expected_text, **_kwargs):
+        captured["expected_text"] = expected_text
+
+    monkeypatch.setattr(assertions, "_assert_transcript_matches", capture_match)
+    response = SimpleNamespace(success=True, audio_bytes=b"fake-wav", audio_format="audio/wav")
+    request_config["response_format"] = "wav"
+
+    assert_audio_speech_response(
+        response,
+        request_config,
+        "advanced_model",
+    )
+
+    assert captured["expected_text"] == expected_text
+
+
 def test_escalated_transcript_keeps_declared_language(monkeypatch):
     # The escalated pass must honour the same language, otherwise a request that
     # pins one silently falls back to auto-detection on retry.
@@ -88,3 +126,50 @@ def test_escalated_transcript_keeps_declared_language(monkeypatch):
 
     assert captured["model_size"] == "large-v3"
     assert captured["language"] == "en"
+
+
+def test_bounded_tail_after_complete_answer_passes():
+    # The exact shape from the #6815 nightly failure: the full answer is spoken
+    # verbatim, then a two-word unrelated tail trips the cosine gate.
+    assert assertions._transcript_has_bounded_tail(
+        "The squares in this image are black. nack shit.",
+        "The squares in this image are black.",
+    )
+
+
+def test_bounded_tail_exact_match_passes():
+    assert assertions._transcript_has_bounded_tail(
+        "The squares in this image are black.",
+        "The squares in this image are black.",
+    )
+
+
+def test_bounded_tail_rejects_different_content():
+    assert not assertions._transcript_has_bounded_tail(
+        "The circles in this picture are black and white.",
+        "The squares in this image are black.",
+    )
+
+
+def test_bounded_tail_rejects_long_tail():
+    # Eight expected words allow at most max(2, ceil(0.2 * 8)) = 2 tail words.
+    assert not assertions._transcript_has_bounded_tail(
+        "The squares in this image are black and some extra words follow here",
+        "The squares in this image are black.",
+    )
+
+
+def test_bounded_tail_rejects_word_boundary_split():
+    assert not assertions._transcript_has_bounded_tail(
+        "The squares in this image are blacks.",
+        "The squares in this image are black.",
+    )
+
+
+def test_bounded_tail_allows_ratio_bound_for_long_answers():
+    expected = " ".join(["word"] * 20)
+    four_word_tail = expected + " one two three four"
+    five_word_tail = expected + " one two three four five"
+    # Twenty expected words allow up to max(2, ceil(0.2 * 20)) = 4 tail words.
+    assert assertions._transcript_has_bounded_tail(four_word_tail, expected)
+    assert not assertions._transcript_has_bounded_tail(five_word_tail, expected)

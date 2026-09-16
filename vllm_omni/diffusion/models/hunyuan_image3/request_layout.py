@@ -50,6 +50,7 @@ def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
         "ratio_index": _to_python_scalar(image_info.ratio_index),
         "add_timestep_token": image_info.add_timestep_token,
         "add_guidance_token": image_info.add_guidance_token,
+        "add_timestep_r_token": image_info.add_timestep_r_token,
         "use_front_boi_token": image_info.use_front_boi_token,
         "add_image_shape_token": image_info.add_image_shape_token,
     }
@@ -68,6 +69,7 @@ def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
         ratio_index=payload.get("ratio_index"),
         add_timestep_token=payload.get("add_timestep_token", True),
         add_guidance_token=payload.get("add_guidance_token", False),
+        add_timestep_r_token=payload.get("add_timestep_r_token", False),
         use_front_boi_token=payload.get("use_front_boi_token", True),
         add_image_shape_token=payload.get("add_image_shape_token", True),
     )
@@ -197,7 +199,21 @@ def resolve_hunyuan_guidance_scale(sampling: Any, default_scale: float = 5.0) ->
 def hunyuan_num_image_tokens(image_info: ImageInfo) -> int:
     """Return the generated-image span overwritten on every denoise step."""
 
-    return int(image_info.image_token_length) + int(image_info.add_timestep_token) + int(image_info.add_guidance_token)
+    return int(image_info.image_token_length) + hunyuan_num_special_tokens(image_info)
+
+
+def hunyuan_num_special_tokens(image_info: ImageInfo) -> int:
+    """Return the generated-image prefix tokens emitted before latent tokens."""
+
+    return (
+        int(image_info.add_timestep_token) + int(image_info.add_guidance_token) + int(image_info.add_timestep_r_token)
+    )
+
+
+def hunyuan_cfg_factor(image_info: ImageInfo, guidance_scale: float) -> int:
+    """Return the execution branch count for standard or embedded CFG."""
+
+    return 1 if image_info.add_guidance_token else 1 + int(guidance_scale > 1.0)
 
 
 def build_hunyuan_batch_rope_image_info(
@@ -242,6 +258,8 @@ def prepare_hunyuan_layout(
     image_processor: HunyuanImage3ImageProcessor,
     generation_config: GenerationConfig,
     image_base_size: int,
+    cfg_distilled: bool = False,
+    use_meanflow: bool = False,
 ) -> HunyuanPreparedLayout:
     """Build the CPU token/image layout reused by Scheduler and Worker."""
 
@@ -261,7 +279,12 @@ def prepare_hunyuan_layout(
     height = sampling.height or 1024
     width = sampling.width or 1024
     guidance_scale = resolve_hunyuan_guidance_scale(sampling)
-    generated_image_info = image_processor.build_image_info((height, width))
+    image_info_kwargs: dict[str, bool] = {}
+    if cfg_distilled:
+        image_info_kwargs["add_guidance_token"] = True
+    if use_meanflow:
+        image_info_kwargs["add_timestep_r_token"] = True
+    generated_image_info = image_processor.build_image_info((height, width), **image_info_kwargs)
     result = tokenizer_wrapper.apply_chat_template(
         batch_prompt=prompt,
         mode="gen_image",
@@ -273,7 +296,7 @@ def prepare_hunyuan_layout(
         bot_task=tokenizer_bot_task,
         image_base_size=image_base_size,
         sequence_template=getattr(generation_config, "sequence_template", "pretrain"),
-        cfg_factor=1 + int(guidance_scale > 1.0),
+        cfg_factor=hunyuan_cfg_factor(generated_image_info, guidance_scale),
         drop_think=getattr(generation_config, "drop_think", False),
     )
     tokenizer_output = result["output"]
@@ -337,7 +360,10 @@ def build_hunyuan_diffusion_kv_requests(
     """Build one persistent Scheduler KV request per Hunyuan execution row."""
 
     tokenizer_output = prepared_layout.tokenizer_output
-    cfg_factor = 1 + int(resolve_hunyuan_guidance_scale(request.sampling_params) > 1.0)
+    cfg_factor = hunyuan_cfg_factor(
+        prepared_layout.generated_image_info,
+        resolve_hunyuan_guidance_scale(request.sampling_params),
+    )
     if prepared_layout.num_branches != cfg_factor:
         raise ValueError(
             "Hunyuan tokenizer sequence count does not match CFG execution: "

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import math
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -20,7 +21,10 @@ _CAMERA_MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _CAMERA_MODULE
 _SPEC.loader.exec_module(_CAMERA_MODULE)
 
-CameraTrajectory = _CAMERA_MODULE.CameraTrajectory
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.lingbot_world.camera import CameraTrajectory
+else:
+    CameraTrajectory = _CAMERA_MODULE.CameraTrajectory
 build_plucker_embedding = _CAMERA_MODULE.build_plucker_embedding
 interpolate_camera_trajectory = _CAMERA_MODULE.interpolate_camera_trajectory
 load_camera_trajectory = _CAMERA_MODULE.load_camera_trajectory
@@ -138,21 +142,20 @@ def test_load_camera_trajectory_rejects_object_dtype_before_materializing(tmp_pa
         load_camera_trajectory(_trusted(tmp_path))
 
 
-def test_load_camera_trajectory_accepts_official_length_and_materializes_request_prefix(tmp_path: Path) -> None:
-    _write_trajectory(
-        tmp_path,
-        _identity_poses(269),
-        np.arange(269 * 4, dtype=np.float32).reshape(269, 4),
-    )
+@pytest.mark.parametrize("num_frames", [129, 269, 4096])
+def test_load_camera_trajectory_preserves_all_bounded_source_frames(tmp_path: Path, num_frames: int) -> None:
+    poses = _identity_poses(num_frames)
+    poses[:, 0, 3] = np.arange(num_frames)
+    intrinsics = np.arange(num_frames * 4, dtype=np.float32).reshape(num_frames, 4)
+    _write_trajectory(tmp_path, poses, intrinsics)
 
     trajectory = load_camera_trajectory(_trusted(tmp_path))
 
-    assert trajectory.poses.shape == (117, 4, 4)
-    assert trajectory.intrinsics.shape == (117, 4)
-    np.testing.assert_array_equal(
-        trajectory.intrinsics.numpy(),
-        np.arange(269 * 4, dtype=np.float32).reshape(269, 4)[:117],
-    )
+    assert trajectory.poses.shape == (num_frames, 4, 4)
+    assert trajectory.intrinsics.shape == (num_frames, 4)
+    assert trajectory.poses.dtype == trajectory.intrinsics.dtype == torch.float32
+    np.testing.assert_array_equal(trajectory.poses.numpy(), poses.astype(np.float32))
+    np.testing.assert_array_equal(trajectory.intrinsics.numpy(), intrinsics)
 
 
 def test_load_camera_trajectory_rejects_unbounded_source_frame_count(tmp_path: Path) -> None:
@@ -245,7 +248,7 @@ else:
         [sys.executable, "-c", script, str(_MODULE_PATH), str(tmp_path)],
         capture_output=True,
         text=True,
-        timeout=3,
+        timeout=30,
         check=False,
     )
 

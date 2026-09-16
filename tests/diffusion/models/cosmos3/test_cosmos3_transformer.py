@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -383,6 +383,117 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
         )
 
 
+def test_gen_sp_plan_auto_pads_hidden_states_and_rope_together() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    prepare_plan = Cosmos3VFMTransformer._sp_plan["gen_sp_prepare"]
+    assert set(prepare_plan) == {0, 1, 2}
+    assert all(spec.auto_pad for spec in prepare_plan.values())
+    assert [prepare_plan[index].split_dim for index in range(3)] == [1, 1, 1]
+
+
+def test_gen_sp_prepare_resets_branch_local_padding_metadata() -> None:
+    from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3GenSPPrepare
+
+    ctx = ForwardContext(sp_padding_size=1, sp_original_seq_len=12121)
+    hidden = torch.zeros(1, 4, 8)
+    rope = torch.zeros(1, 4, 1, 2)
+    with override_forward_context(ctx):
+        output = Cosmos3GenSPPrepare()(hidden, rope, rope)
+
+    assert output[0] is hidden
+    assert output[1] is rope
+    assert output[2] is rope
+    assert ctx.sp_padding_size == 0
+    assert ctx.sp_original_seq_len is None
+
+
+def test_sp_attention_masks_padded_gen_and_joint_und_keys() -> None:
+    from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3CrossAttention
+
+    class RecordingAttention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.metadata: Any | None = None
+
+        def forward(self, query, key, value, metadata):
+            del key, value
+            self.metadata = metadata
+            return query
+
+    module = object.__new__(Cosmos3CrossAttention)
+    nn.Module.__init__(module)
+    module.num_heads_local = 2
+    module.head_dim = 4
+    recording_attention = RecordingAttention()
+    module.attn = recording_attention
+
+    q = torch.zeros(1, 2, 2, 4)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    k_und = torch.zeros(1, 3, 2, 4)
+    v_und = torch.zeros_like(k_und)
+    ctx = ForwardContext(sp_padding_size=1, sp_original_seq_len=3)
+    with override_forward_context(ctx):
+        output = module._forward_sp(q, k, v, k_und, v_und)
+
+    assert output.shape == (1, 2, 8)
+    assert recording_attention.metadata is not None
+    assert recording_attention.metadata.attn_mask.tolist() == [[True, True, True, False]]
+    assert recording_attention.metadata.joint_attn_mask.tolist() == [[True, True, True]]
+
+
+def test_ulysses_2d_mask_uses_key_length_with_kv_only_joint_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    def fake_all_to_all(
+        _group: object,
+        tensor: torch.Tensor,
+        _scatter_idx: int,
+        _gather_idx: int,
+        _use_sync: bool,
+    ) -> torch.Tensor:
+        return torch.cat([tensor, tensor], dim=1)[:, :, :1]
+
+    monkeypatch.setattr(ulysses.SeqAllToAll4D, "apply", staticmethod(fake_all_to_all))
+    strategy = ulysses.UlyssesParallelAttention(
+        sp_group=SimpleNamespace(
+            ulysses_group=object(),
+            ulysses_world_size=2,
+            ulysses_rank=0,
+            ring_world_size=1,
+        ),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+    query = torch.zeros(1, 2, 2, 4)
+    key = torch.zeros_like(query)
+    value = torch.zeros_like(query)
+    joint_query = torch.zeros(1, 0, 2, 4)
+    joint_key = torch.zeros(1, 3, 2, 4)
+    metadata = AttentionMetadata(
+        attn_mask=torch.tensor([[True, True, True, False]]),
+        joint_attn_mask=torch.ones(1, 3, dtype=torch.bool),
+        joint_query=joint_query,
+        joint_key=joint_key,
+        joint_value=torch.zeros_like(joint_key),
+        joint_strategy="front",
+    )
+
+    query_out, key_out, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert query_out.shape[1] == 4
+    assert key_out.shape[1] == 7
+    assert metadata_out is not None
+    assert metadata_out.attn_mask.tolist() == [[True, True, True, True, True, True, False]]
+
+
 def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -399,6 +510,108 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
         fps=24.0,
     )
 
+    assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
+def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    class TrackingNorm(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return hidden_states + 5.0
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    norm = TrackingNorm()
+    model.norm_moe_gen = norm
+    captured: dict[str, torch.Tensor] = {}
+
+    def run_gen_layers(hidden_gen: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        captured["input"] = hidden_gen.detach().clone()
+        return hidden_gen + 2.0
+
+    monkeypatch.setattr(model, "_run_gen_layers", run_gen_layers)
+    forward_kwargs = {
+        "hidden_states": torch.zeros(1, 2, 1, 2, 2),
+        "timestep": torch.tensor([1.0]),
+        "text_ids": torch.tensor([[1, 2]], dtype=torch.long),
+        "text_mask": torch.ones(1, 2, dtype=torch.long),
+        "video_shape": (1, 2, 2),
+        "fps": 24.0,
+    }
+
+    full_output = model(**forward_kwargs)
+
+    assert norm.calls == 1
+    norm.calls = 0
+
+    ctx = extract_cosmos3_context(model, **forward_kwargs)
+    execution_input = ctx.hidden_states.detach().clone()
+    execution_output = ctx.run_transformer_blocks()[0]
+    residual = execution_output - execution_input
+    extracted_output = ctx.postprocess(execution_output)
+
+    assert norm.calls == 1
+    expected_residual = ((captured["input"] + 2.0) + 5.0) - captured["input"]
+    assert torch.equal(residual, expected_residual)
+    assert torch.equal(extracted_output, full_output)
+
+    norm.calls = 0
+
+    def fail_if_gen_layers_run(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("SeaCache hit unexpectedly executed GEN layers")
+
+    monkeypatch.setattr(model, "_run_gen_layers", fail_if_gen_layers_run)
+
+    cached_ctx = extract_cosmos3_context(model, **forward_kwargs)
+    cached_output = cached_ctx.postprocess(cached_ctx.hidden_states + residual)
+
+    assert norm.calls == 0
+    assert torch.equal(cached_output, full_output)
+    for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
+        assert not hasattr(model, name)
+
+
+def test_no_cache_still_runs_final_gen_norm_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    class CountingNorm(nn.Module):
+        def __init__(self, original: nn.Module) -> None:
+            super().__init__()
+            self.original = original
+            self.calls = 0
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return self.original(hidden_states)
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    norm = CountingNorm(model.norm_moe_gen)
+    model.norm_moe_gen = norm
+
+    output = model(
+        hidden_states=torch.zeros(1, 2, 1, 2, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+    )
+
+    assert norm.calls == 1
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
@@ -504,6 +717,35 @@ def test_model_cpu_offload_moves_reasoner_and_generator_between_cpu_and_device(
     assert generator_param.device == accelerator_device
 
 
+def test_multi_control_attention_weights_target_outputs() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3CrossAttention
+
+    class ControlValueAttention:
+        def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            del k
+            # Each per-control K/V layout is [text, control_i, target].
+            return v[:, 1:2].expand(q.shape[0], q.shape[1], -1, -1)
+
+    attention = SimpleNamespace(multi_control_attn=ControlValueAttention())
+    q = torch.zeros(1, 3, 1, 1)
+    k = torch.zeros_like(q)
+    v = torch.tensor([[[[10.0]], [[20.0]], [[30.0]]]])
+    text_kv = torch.zeros(1, 1, 1, 1)
+
+    output = Cosmos3CrossAttention._forward_multi_control(
+        attention,
+        q,
+        k,
+        v,
+        text_kv,
+        text_kv,
+        control_token_sizes=(1, 1),
+        control_weights=(0.25, 0.75),
+    )
+
+    torch.testing.assert_close(output, torch.tensor([[[10.0], [20.0], [17.5]]]))
+
+
 def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -521,9 +763,21 @@ def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatc
         video_shape=(1, 2, 2),
         fps=24.0,
         control_latents=[torch.ones_like(hidden_states), torch.full_like(hidden_states, 2.0)],
+        control_weights=[1.0, 3.0],
     )
 
     assert tuple(output.shape) == tuple(hidden_states.shape)
+    with pytest.raises(ValueError, match="control_weights length"):
+        model(
+            hidden_states=hidden_states,
+            timestep=torch.tensor([1.0]),
+            text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            text_mask=torch.ones(1, 2, dtype=torch.long),
+            video_shape=(1, 2, 2),
+            fps=24.0,
+            control_latents=[torch.ones_like(hidden_states), torch.full_like(hidden_states, 2.0)],
+            control_weights=[1.0],
+        )
     with pytest.raises(ValueError, match="control latent shape"):
         model(
             hidden_states=hidden_states,
@@ -680,7 +934,7 @@ def test_forward_returns_video_plus_optional_modality_predictions(
     assert [tuple(tensor.shape) for tensor in output] == expected_shapes
 
 
-def test_forward_with_sound_ulysses_error_mentions_combined_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_forward_with_sound_odd_sequence_uses_auto_padding_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 as cosmos3_module
 
     model = cosmos3_module.Cosmos3VFMTransformer(
@@ -691,16 +945,17 @@ def test_forward_with_sound_ulysses_error_mentions_combined_sequence(monkeypatch
     )
     monkeypatch.setattr(cosmos3_module, "_get_ulysses_state", lambda: (2, 0, None))
 
-    with pytest.raises(ValueError, match=r"GEN sequence length \(3 = video tokens 2 \+ sound tokens 1\)"):
-        model(
-            hidden_states=torch.zeros(1, 2, 1, 1, 2),
-            timestep=torch.tensor([1.0]),
-            text_ids=torch.tensor([[1, 2]], dtype=torch.long),
-            text_mask=torch.ones(1, 2, dtype=torch.long),
-            video_shape=(1, 1, 2),
-            fps=24.0,
-            sound_latents=torch.zeros(1, 3, 1),
-        )
+    output = model(
+        hidden_states=torch.zeros(1, 2, 1, 1, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 1, 2),
+        fps=24.0,
+        sound_latents=torch.zeros(1, 3, 1),
+    )
+
+    assert [tuple(tensor.shape) for tensor in output] == [(1, 2, 1, 1, 2), (1, 3, 1)]
 
 
 def test_sound_latent_frames_padded_for_sequence_parallel(monkeypatch: pytest.MonkeyPatch) -> None:

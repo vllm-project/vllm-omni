@@ -10,9 +10,10 @@ survives the runner's sparse-audio routing.
 
 These drive the real ``preprocess`` -> ``forward`` -> ``make_omni_output``
 sequence through a stand-in for ``GPUARModelRunner.execute_model``, and use the
-runner's own ``_resolve_sparse_mm_routing`` to decide what actually reaches the
-caller. Only the LM backbone and the frame sampler are stubbed out; every
-method under test is the real one, so a test here goes red when the engine
+shared ``sparse_audio.resolve_sparse_mm_routing`` helper used by the runner to
+decide what actually reaches the caller. Only the LM backbone and the frame
+sampler are stubbed out; every method under test is the real one, so a test
+here goes red when the engine
 path breaks — which a test that calls the flush by hand cannot do.
 """
 
@@ -33,7 +34,7 @@ from vllm_omni.model_executor.models.gepard.gepard_talker import (
 )
 from vllm_omni.model_executor.models.gepard.nanocodec import NanoCodec
 from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker import sparse_audio
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -219,7 +220,7 @@ class _MiniEngine:
                 self.committed_frames[req_id] = state.frame_count
 
         # --- runner: sparse-audio routing decides what reaches the caller ---
-        downstream, sparse_index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+        downstream, sparse_index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
             engine_output_type="audio",
             req_ids_output_copy=list(live),
             downstream_req_ids=list(live),

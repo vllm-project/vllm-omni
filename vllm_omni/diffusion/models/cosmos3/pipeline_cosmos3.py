@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
 One pipeline class serves the Cosmos3 family modes. Output modality is selected
@@ -34,6 +34,7 @@ import math
 import os
 import time
 from collections.abc import Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import fields
 from typing import Any, ClassVar
 
@@ -68,6 +69,7 @@ from vllm_omni.diffusion.models.schedulers.scheduling_flow_match_euler_discrete 
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -126,6 +128,7 @@ from .utils import (
     ROBOLAB_DEFAULT_RAW_ACTION_DIM,
     ROBOLAB_DEFAULT_RESOLUTION,
     ROBOLAB_MIDTRAIN_RAW_ACTION_DIM,
+    VIDEO_RES_SIZE_INFO,
     RoboLabActionPostprocessInputs,
     RoboLabPolicyInputs,
     build_abs_pose_from_components,
@@ -136,6 +139,7 @@ from .utils import (
     ensure_gripper_array,
     extract_robolab_image,
     extract_robolab_prompt_image,
+    get_robolab_domain_id,
     lazy_action_transform_pipeline,
     make_robolab_action_postprocess_inputs,
     next_robolab_seed,
@@ -163,6 +167,14 @@ COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{widt
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
 COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
+COSMOS3_TRANSFER_SYSTEM_PROMPT = (
+    "You are a helpful assistant that generates images or videos following the user's instructions"
+    " and control signals (edge maps, blur, depth, or segmentation)."
+)
+COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE = (
+    "Follow the {hint_names} control video precisely: shape, contour, silhouette, position, and motion of every "
+    "visible structure must align with the {hint_names} signal at every frame."
+)
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
 COSMOS3_T2V_DEFAULT_WIDTH = 1280
@@ -191,6 +203,7 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
 
 
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
@@ -233,6 +246,50 @@ def _format_json_object_prompt(
 
     prompt_obj.update(metadata)
     return json.dumps(prompt_obj)
+
+
+def _json_object_aspect_ratio(prompt: str) -> Any | None:
+    """Return an aspect-ratio field from a JSON-object prompt, if present."""
+    try:
+        prompt_obj = json.loads(prompt)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(prompt_obj, dict):
+        return None
+    return prompt_obj.get("aspect_ratio")
+
+
+def _normalize_aspect_ratio(value: Any) -> str | None:
+    """Normalize supported ratio spellings for comparison and prompt metadata."""
+    if value is None:
+        return None
+    parts = str(value).strip().replace(":", ",").split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        width, height = (int(part.strip()) for part in parts)
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    divisor = math.gcd(width, height)
+    return f"{width // divisor},{height // divisor}"
+
+
+def _aspect_ratio_for_dimensions(width: int, height: int) -> str:
+    """Return the nearest supported Cosmos aspect-ratio label."""
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Cosmos3 canvas dimensions must be positive, got {width}x{height}.")
+    canvas_ratio = width / height
+
+    def ratio_value(label: str) -> float:
+        ratio_width, ratio_height = (int(part) for part in label.split(","))
+        return ratio_width / ratio_height
+
+    return min(
+        (label for sizes in VIDEO_RES_SIZE_INFO.values() for label in sizes),
+        key=lambda label: abs(canvas_ratio - ratio_value(label)),
+    )
 
 
 def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransformer]:
@@ -492,6 +549,17 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
         # Resolve missing H/W.
         if transfer_requested:
+            requested_width = request.sampling_params.width
+            requested_height = request.sampling_params.height
+            if (
+                requested_width is not None
+                and requested_height is not None
+                and COSMOS3_TRANSFER_REQUESTED_SIZE_KEY not in extra
+            ):
+                extra[COSMOS3_TRANSFER_REQUESTED_SIZE_KEY] = {
+                    "width": int(requested_width),
+                    "height": int(requested_height),
+                }
             _set_transfer_size_from_image(request, image)
         elif request.sampling_params.height is None or request.sampling_params.width is None:
             if action_mode is not None:
@@ -869,11 +937,31 @@ class Cosmos3OmniDiffusersPipeline(
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        resolved_offload = resolve_offload(od_config)
+        if resolved_offload.public is not None and resolved_offload.strategy is OffloadStrategy.MODEL_LEVEL:
+            raise ValueError(
+                "Cosmos3 model offload uses reasoner/generator topology and does "
+                "not support the dit/text_encoder component selector"
+            )
         self.device = get_local_device()
         self.dtype = od_config.dtype
 
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
+
+        # Validate guidance parallelism from checkpoint metadata before loading
+        # components. Distilled checkpoints have only a conditional branch.
+        scheduler_config = FlowUniPCMultistepScheduler.load_config(
+            model_path,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+        )
+        self.is_distilled_model = scheduler_config.get("_class_name") == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS
+        if self.is_distilled_model and od_config.parallel_config.cfg_parallel_size > 1:
+            raise ValueError(
+                "Distilled Cosmos3 checkpoints run without classifier-free guidance. "
+                "Set --cfg-parallel-size 1 and use --ulysses-degree for multi-GPU inference."
+            )
 
         # --- Tokenizer ---
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -937,20 +1025,7 @@ class Cosmos3OmniDiffusersPipeline(
             logger.info("Cosmos3: session state manager enabled (max_sessions=%d)", mm_max_sessions)
 
         # --- Scheduler ---
-        # Distilled model differs from regular one only by scheduler,
-        # distilled one uses FlowMatchEulerDiscreteScheduler, while
-        # regular should use FlowUniPCMultistepScheduler
-
-        scheduler_config = FlowUniPCMultistepScheduler.load_config(
-            model_path,
-            subfolder="scheduler",
-            local_files_only=local_files_only,
-        )
-
-        scheduler_class_name = scheduler_config.get("_class_name")
-
-        self.is_distilled_model = False
-        if scheduler_class_name == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS:
+        if self.is_distilled_model:
             fixed_step_config = scheduler_config.get("fixed_step_sampler_config")
             if not isinstance(fixed_step_config, dict) or fixed_step_config.get("sample_type") != "sde":
                 raise ValueError("Cosmos3 distilled scheduler requires fixed_step_sampler_config.sample_type=sde.")
@@ -962,7 +1037,6 @@ class Cosmos3OmniDiffusersPipeline(
                 stochastic_sampling=True,
             )
             self._scheduler_init_t_list = list(t_list)
-            self.is_distilled_model = True
         else:
             # Preserve compatible solver settings from the checkpoint, but keep
             # the base shift neutral. The concrete request shift is applied when
@@ -1002,8 +1076,10 @@ class Cosmos3OmniDiffusersPipeline(
 
         self._guidance_scale = None
         self._num_timesteps = None
+        self._current_step_index = None
+        self._current_sigma = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
-        self._robolab_transform = None
+        self._robolab_transforms: dict[bool, Any] = {}
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
         # this pipeline. Tells the sequential-CFG loop to keep paired
@@ -1021,6 +1097,7 @@ class Cosmos3OmniDiffusersPipeline(
         device: torch.device,
         pin_memory: bool = True,
         use_hsdp: bool = False,
+        offload_components: frozenset[str] | None = None,
     ) -> None:
         """Enable Cosmos3 component-level model offload.
 
@@ -1029,6 +1106,11 @@ class Cosmos3OmniDiffusersPipeline(
         mutual-exclusion swaps.  The VAE stays resident on GPU like the generic
         model-level offloader.
         """
+        if offload_components is not None:
+            raise ValueError(
+                "Cosmos3 model offload uses reasoner/generator topology and does not support "
+                "the dit/text_encoder offload_components selector"
+            )
         self.vae.to(device, non_blocking=True)
         if isinstance(self._sound_tokenizer, nn.Module):
             self._sound_tokenizer.to(device)
@@ -1212,17 +1294,24 @@ class Cosmos3OmniDiffusersPipeline(
         or a tuple in video, action, sound order for multimodal generation.
         """
         cache_key = kwargs.pop("_cosmos3_cache_key", None)
-        if cache_key is None:
-            return self.transformer(**kwargs)
+        context_name = str(kwargs.pop("_cache_context", "cond"))
 
-        branch_caches = self._cosmos3_branch_caches
-        if branch_caches is None:
-            return self.transformer(**kwargs)
-
-        cache_key = str(cache_key)
-        self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(cache_key, (None, None))
-        prediction = self.transformer(**kwargs)
-        branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+        context_factory = getattr(self, "_cache_context_factory", None)
+        context = context_factory(context_name) if callable(context_factory) else nullcontext()
+        with context:
+            if cache_key is None:
+                prediction = self.transformer(**kwargs)
+            else:
+                branch_caches = self._cosmos3_branch_caches
+                if branch_caches is None:
+                    prediction = self.transformer(**kwargs)
+                else:
+                    cache_key = str(cache_key)
+                    self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
+                        cache_key, (None, None)
+                    )
+                    prediction = self.transformer(**kwargs)
+                    branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
         return prediction
 
     def combine_multi_branch_cfg_noise(
@@ -1316,11 +1405,18 @@ class Cosmos3OmniDiffusersPipeline(
             return val
         return default
 
-    def _get_robolab_transform(self):
-        if self._robolab_transform is None:
+    def _get_robolab_transform(self, *, format_prompt_as_json: bool = False):
+        transforms = getattr(self, "_robolab_transforms", None)
+        if transforms is None:
+            transforms = {}
+            self._robolab_transforms = transforms
+        if format_prompt_as_json not in transforms:
             action_dim = int(getattr(self.transformer, "action_dim", 64))
-            self._robolab_transform = lazy_action_transform_pipeline(action_dim)
-        return self._robolab_transform
+            transforms[format_prompt_as_json] = lazy_action_transform_pipeline(
+                action_dim,
+                format_prompt_as_json=format_prompt_as_json,
+            )
+        return transforms[format_prompt_as_json]
 
     def _build_robolab_policy_inputs(
         self,
@@ -1365,7 +1461,8 @@ class Cosmos3OmniDiffusersPipeline(
         resolution = str(extra_param("resolution", ROBOLAB_DEFAULT_RESOLUTION))
         fps = float(extra_param("conditioning_fps", ROBOLAB_DEFAULT_CONDITIONING_FPS))
         domain_name = str(extra_param("domain_name", ROBOLAB_DEFAULT_DOMAIN_NAME))
-        domain_id = resolve_domain_id(domain_name=domain_name, require_explicit=True)
+        domain_id = get_robolab_domain_id(domain_name)
+        format_prompt_as_json = self._truthy(extra_param("format_prompt_as_json", False))
 
         if use_state and history_length < 1:
             raise ValueError("RoboLab history_length must be >= 1 when use_state is true.")
@@ -1428,7 +1525,9 @@ class Cosmos3OmniDiffusersPipeline(
             "action": action,
             # Cosmos Framework consumes this as an integer conditioning bucket.
             "conditioning_fps": torch.tensor(fps, dtype=torch.long),
-            "mode": ACTION_MODE_POLICY,
+            # Cosmos Framework 1.2 renamed the internal policy transform mode to
+            # ``wam``. The public vLLM action_mode remains ``policy``.
+            "mode": "wam",
             "domain_id": torch.tensor(domain_id, dtype=torch.long),
             "viewpoint": "concat_view",
             "additional_view_description": ROBOLAB_CONCAT_VIEW_DESCRIPTION,
@@ -1436,7 +1535,9 @@ class Cosmos3OmniDiffusersPipeline(
         if history_action is not None:
             sample["history_action"] = history_action
 
-        sample = self._get_robolab_transform()(sample, resolution)
+        sample = self._get_robolab_transform(format_prompt_as_json=format_prompt_as_json)(sample, resolution)
+        if isinstance(sample.get("ai_caption"), dict):
+            sample["ai_caption"] = json.dumps(sample["ai_caption"])
         sequence_plan = sample["sequence_plan"]
         video_tensor = sample["video"].float() / 127.5 - 1.0
         raw_action_dim_tensor = sample.get("raw_action_dim")
@@ -1720,6 +1821,11 @@ class Cosmos3OmniDiffusersPipeline(
 
     def _resolve_guidance_scale(self, sp: OmniDiffusionSamplingParams, default: float) -> float:
         if self.is_distilled_model:
+            if sp.guidance_scale_provided and float(sp.guidance_scale) != 1.0:
+                logger.warning_once(
+                    "Distilled Cosmos3 checkpoints run without classifier-free guidance. "
+                    "The requested guidance_scale is overridden to 1.0; negative_prompt does not affect generation."
+                )
             return 1.0
         if sp.guidance_scale_provided:
             return float(sp.guidance_scale)
@@ -1743,6 +1849,39 @@ class Cosmos3OmniDiffusersPipeline(
     @property
     def num_timesteps(self):
         return self._num_timesteps
+
+    @property
+    def current_step_index(self):
+        return self._current_step_index
+
+    @property
+    def current_sigma(self):
+        return self._current_sigma
+
+    def _set_denoise_step_metadata(
+        self,
+        step_index: int,
+        timesteps: torch.Tensor,
+        scheduler: Any,
+    ) -> None:
+        self._current_step_index = step_index
+        self._num_timesteps = len(timesteps)
+        sigmas = getattr(scheduler, "sigmas", None)
+        self._current_sigma = sigmas[step_index] if sigmas is not None and step_index < len(sigmas) else None
+
+    def _clear_denoise_step_metadata(self) -> None:
+        self._current_step_index = None
+        self._current_sigma = None
+
+    def _set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+        setter = getattr(self.transformer, "set_mixed_precision_step", None)
+        if setter is not None:
+            setter(step_index, num_steps)
+
+    def _reset_mixed_precision(self) -> None:
+        resetter = getattr(self.transformer, "reset_mixed_precision", None)
+        if resetter is not None:
+            resetter()
 
     @staticmethod
     def _distilled_unsupported_error(detail: str) -> ValueError:
@@ -2068,6 +2207,12 @@ class Cosmos3OmniDiffusersPipeline(
         sp: OmniDiffusionSamplingParams,
         use_system_prompt: bool = False,
         is_t2i: bool = False,
+        system_prompt: str | None = None,
+        prompt_suffix: str | None = None,
+        use_duration_template: bool | None = None,
+        use_resolution_template: bool | None = None,
+        negative_metadata_mode: str | None = None,
+        aspect_ratio_override: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Format prompts with metadata templates and tokenize.
 
@@ -2075,24 +2220,67 @@ class Cosmos3OmniDiffusersPipeline(
 
         For T2I (``is_t2i=True``) the duration template is suppressed (no FPS
         or duration concept for a single image) and the image-flavored
-        resolution template is used.
+        resolution template is used. ``prompt_suffix`` is appended only to the
+        positive prompt, after metadata formatting. ``negative_metadata_mode``
+        controls whether the negative branch receives no metadata, the same
+        metadata as the positive branch, or inverse metadata.
         """
         # Route cosmos3-specific controls through ``_get_sp_param`` so they
         # are picked up from ``extra_args`` (OpenAI endpoint path) as well
         # as from direct attributes.
-        use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", False)) and not is_t2i
+        if use_duration_template is None:
+            use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", False))
+        if use_resolution_template is None:
+            use_resolution_template = bool(self._get_sp_param(sp, "use_resolution_template", False))
+        if negative_metadata_mode is None:
+            negative_metadata_mode = str(self._get_sp_param(sp, "negative_metadata_mode", "inverse"))
+        negative_metadata_mode = negative_metadata_mode.strip().lower()
+        if negative_metadata_mode not in {"none", "same", "inverse"}:
+            raise ValueError(
+                "Cosmos3 negative_metadata_mode must be one of 'none', 'same', or 'inverse'; "
+                f"got {negative_metadata_mode!r}."
+            )
+
+        use_duration_template = use_duration_template and not is_t2i
         dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
-        if bool(self._get_sp_param(sp, "use_resolution_template", False)):
+        if use_resolution_template:
             res_tmpl = COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_RESOLUTION_TEMPLATE
         else:
             res_tmpl = None
+        requested_aspect_ratio = self._get_sp_param(sp, "aspect_ratio", None)
+        prompt_aspect_ratio = _json_object_aspect_ratio(prompt)
+        metadata_aspect_ratio = requested_aspect_ratio if requested_aspect_ratio is not None else prompt_aspect_ratio
+        canvas_aspect_ratio = aspect_ratio_override or _aspect_ratio_for_dimensions(width, height)
+        normalized_metadata_ratio = _normalize_aspect_ratio(metadata_aspect_ratio)
+        has_aspect_ratio_conflict = (
+            aspect_ratio_override is None
+            and metadata_aspect_ratio is not None
+            and normalized_metadata_ratio != canvas_aspect_ratio
+        )
+        if has_aspect_ratio_conflict:
+            aspect_ratio_source = (
+                "requested aspect_ratio" if requested_aspect_ratio is not None else "JSON prompt aspect_ratio"
+            )
+            if _is_rank_zero():
+                logger.warning(
+                    "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
+                    aspect_ratio_source,
+                    metadata_aspect_ratio,
+                    width,
+                    height,
+                    canvas_aspect_ratio,
+                )
+            metadata_aspect_ratio = canvas_aspect_ratio
+        elif aspect_ratio_override is not None:
+            metadata_aspect_ratio = aspect_ratio_override
+
         json_prompt = _format_json_object_prompt(
             prompt,
             num_frames=num_frames,
             frame_rate=frame_rate,
             height=height,
             width=width,
-            aspect_ratio=self._get_sp_param(sp, "aspect_ratio", None),
+            aspect_ratio=metadata_aspect_ratio,
         )
         if json_prompt is not None:
             prompt = json_prompt
@@ -2106,37 +2294,44 @@ class Cosmos3OmniDiffusersPipeline(
                 duration_template=dur_tmpl,
                 resolution_template=res_tmpl,
             )
+        if prompt_suffix:
+            prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
         if _is_rank_zero():
-            logger.info("Final prompt: '%s'", prompt)
+            logger.debug("Final prompt: '%s'", prompt)
 
-        # Negative prompt: inverse templates ("not {duration}...", "not {height}x{width}...").
-        # Applied whenever the matching positive template is enabled; an empty
-        # negative_prompt yields output that starts with the template, not a dot.
-        inv_dur = COSMOS3_INVERSE_DURATION_TEMPLATE if dur_tmpl else None
-        if res_tmpl is None:
-            inv_res = None
-        elif is_t2i:
-            inv_res = COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
+        if negative_metadata_mode == "none":
+            negative_dur_tmpl = None
+            negative_res_tmpl = None
+        elif negative_metadata_mode == "same":
+            negative_dur_tmpl = dur_tmpl
+            negative_res_tmpl = res_tmpl
         else:
-            inv_res = COSMOS3_INVERSE_RESOLUTION_TEMPLATE
+            negative_dur_tmpl = COSMOS3_INVERSE_DURATION_TEMPLATE if dur_tmpl else None
+            if res_tmpl is None:
+                negative_res_tmpl = None
+            elif is_t2i:
+                negative_res_tmpl = COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
+            else:
+                negative_res_tmpl = COSMOS3_INVERSE_RESOLUTION_TEMPLATE
         negative_prompt = self._apply_metadata_templates(
             negative_prompt,
             num_frames,
             frame_rate,
             height,
             width,
-            duration_template=inv_dur,
-            resolution_template=inv_res,
-            force_duration_template=True,
+            duration_template=negative_dur_tmpl,
+            resolution_template=negative_res_tmpl,
+            force_duration_template=negative_metadata_mode == "inverse",
         )
 
-        default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
-        sys_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
+        if system_prompt is None:
+            default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
+            system_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
         cond_ids, cond_mask = self._tokenize_prompt(
-            prompt, max_sequence_length, use_system_prompt, system_prompt=sys_prompt
+            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
         uncond_ids, uncond_mask = self._tokenize_prompt(
-            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=sys_prompt
+            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
         return cond_ids, cond_mask, uncond_ids, uncond_mask
 
@@ -2685,7 +2880,9 @@ class Cosmos3OmniDiffusersPipeline(
                 # Each CFG-parallel rank runs exactly one branch (rank 0 -> cond,
                 # else uncond), so session keying loads/stores only this rank's branch.
                 cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     # Outside the interval, scale=1 makes the combined output equal
                     # the cond branch. Every rank remains on the same iteration and
@@ -2696,6 +2893,7 @@ class Cosmos3OmniDiffusersPipeline(
                         do_true_cfg=True,
                         true_cfg_scale=step_scale,
                         positive_kwargs=dict(
+                            _cache_context="cond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -2705,6 +2903,7 @@ class Cosmos3OmniDiffusersPipeline(
                             **shared_kwargs,
                         ),
                         negative_kwargs=dict(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -2724,13 +2923,16 @@ class Cosmos3OmniDiffusersPipeline(
                 uncond_cache: tuple = (None, None)
                 keep_uncond_for_cache = self._cache_requires_paired_cfg()
 
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     cfg_active = _cfg_active_at(t)
 
                     if not self._kv_load_und(kv_state, is_negative=False):
                         self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
-                    noise_cond = self.transformer(
+                    noise_cond = self.predict_noise(
+                        _cache_context="cond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=cond_ids,
@@ -2747,7 +2949,8 @@ class Cosmos3OmniDiffusersPipeline(
                     if cfg_active or keep_uncond_for_cache:
                         if not self._kv_load_und(kv_state, is_negative=True):
                             self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
-                        noise_uncond = self.transformer(
+                        noise_uncond = self.predict_noise(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -2778,10 +2981,13 @@ class Cosmos3OmniDiffusersPipeline(
             else:
                 # No CFG: a single cond branch per step. Bespoke (state None) keeps
                 # using the transformer-instance cache exactly as before.
-                for t in self.progress_bar(timesteps):
+                for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
+                    self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     self._kv_load_und(kv_state, is_negative=False)
-                    noise_pred = self.transformer(
+                    noise_pred = self.predict_noise(
+                        _cache_context="cond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=cond_ids,
@@ -2794,6 +3000,8 @@ class Cosmos3OmniDiffusersPipeline(
                         self._kv_capture_und(kv_state, is_negative=False)
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
         finally:
+            self._clear_denoise_step_metadata()
+            self._reset_mixed_precision()
             # Cosmos3 currently receives a unique request_id rather than a
             # reusable rollout session id. Retaining its state would only pin
             # K/V buffers on device after this generation finishes.
@@ -2857,11 +3065,76 @@ class Cosmos3OmniDiffusersPipeline(
         self,
         sp: OmniDiffusionSamplingParams,
         source_hw: tuple[int, int] | None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, str]:
         resolution = self._get_sp_param(sp, "resolution", self._get_sp_param(sp, "image_size", 720))
         source_h, source_w = source_hw or (COSMOS3_T2V_DEFAULT_HEIGHT, COSMOS3_T2V_DEFAULT_WIDTH)
         target_w, target_h = find_closest_target_size(int(source_h), int(source_w), resolution)
-        return int(target_h), int(target_w)
+        aspect_ratio = next(
+            ratio for ratio, size in VIDEO_RES_SIZE_INFO[str(resolution)].items() if size == (target_w, target_h)
+        )
+        return int(target_h), int(target_w), aspect_ratio
+
+    def _warn_transfer_bucket_conflicts(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        prompt: str,
+        *,
+        source_hw: tuple[int, int] | None,
+        height: int,
+        width: int,
+        aspect_ratio: str,
+    ) -> None:
+        """Explain transfer's bucket selection when it overrides request metadata."""
+        if not _is_rank_zero():
+            return
+
+        requested_size_data = self._get_sp_param(sp, COSMOS3_TRANSFER_REQUESTED_SIZE_KEY, None)
+        if isinstance(requested_size_data, Mapping):
+            requested_width = requested_size_data.get("width")
+            requested_height = requested_size_data.get("height")
+        else:
+            requested_width = getattr(sp, "width", None)
+            requested_height = getattr(sp, "height", None)
+        if requested_width is not None and requested_height is not None:
+            try:
+                requested_size = (int(requested_width), int(requested_height))
+            except (TypeError, ValueError):
+                requested_size = None
+            if requested_size is not None and requested_size != (width, height):
+                source_description = (
+                    f"control input {source_hw[1]}x{source_hw[0]} (WxH)"
+                    if source_hw is not None
+                    else "the default transfer geometry"
+                )
+                resolution = self._get_sp_param(sp, "resolution", self._get_sp_param(sp, "image_size", 720))
+                logger.warning(
+                    "Cosmos3 transfer ignores requested size=%dx%d (WxH); %s selected the %s resolution=%s "
+                    "bucket, %dx%d (WxH). Transfer supports canonical Cosmos buckets, not arbitrary output sizes.",
+                    *requested_size,
+                    source_description,
+                    aspect_ratio,
+                    resolution,
+                    width,
+                    height,
+                )
+
+        request_aspect_ratio = self._get_sp_param(sp, "aspect_ratio", None)
+        aspect_ratio_source = "requested aspect_ratio"
+        if request_aspect_ratio is None:
+            request_aspect_ratio = _json_object_aspect_ratio(prompt)
+            aspect_ratio_source = "JSON prompt aspect_ratio"
+        normalized_requested_ratio = _normalize_aspect_ratio(request_aspect_ratio)
+        if normalized_requested_ratio is not None and normalized_requested_ratio != aspect_ratio:
+            logger.warning(
+                "Cosmos3 transfer %s=%r conflicts with the control-selected %s bucket, %dx%d (WxH); "
+                "using %s for prompt metadata.",
+                aspect_ratio_source,
+                request_aspect_ratio,
+                aspect_ratio,
+                width,
+                height,
+                aspect_ratio,
+            )
 
     @staticmethod
     def _first_transfer_control_hw(transfer_config: Cosmos3TransferConfig) -> tuple[int, int] | None:
@@ -2890,6 +3163,7 @@ class Cosmos3OmniDiffusersPipeline(
         control_latents: list[torch.Tensor],
         shared_kwargs: dict[str, Any],
         *,
+        control_weights: list[float] | None = None,
         velocity_mask: torch.Tensor,
         condition_latents: torch.Tensor,
         guidance_interval: tuple[float, float] | None = None,
@@ -2912,7 +3186,9 @@ class Cosmos3OmniDiffusersPipeline(
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
         try:
-            for t in self.progress_bar(timesteps):
+            for step_index, t in enumerate(self.progress_bar(timesteps)):
+                self._set_denoise_step_metadata(step_index, timesteps, self.scheduler)
+                self._set_mixed_precision_step(step_index, len(timesteps))
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
@@ -2920,11 +3196,13 @@ class Cosmos3OmniDiffusersPipeline(
                 needs_control_cfg = step_control != 1.0
 
                 cond_full_kwargs = dict(
+                    _cache_context="cond",
                     hidden_states=latents,
                     timestep=timestep,
                     text_ids=cond_ids,
                     text_mask=cond_mask,
                     control_latents=control_latents,
+                    control_weights=control_weights,
                     _cosmos3_cache_key="transfer_cond_full",
                     **shared_kwargs,
                 )
@@ -2932,6 +3210,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
+                            _cache_context="cond_no_control",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -2941,11 +3220,13 @@ class Cosmos3OmniDiffusersPipeline(
                             **shared_kwargs,
                         ),
                         dict(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
                             text_mask=uncond_mask,
                             control_latents=control_latents,
+                            control_weights=control_weights,
                             _cosmos3_cache_key="transfer_uncond_full",
                             **shared_kwargs,
                         ),
@@ -2965,6 +3246,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
+                            _cache_context="cond_no_control",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -2988,11 +3270,13 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
                             text_mask=uncond_mask,
                             control_latents=control_latents,
+                            control_weights=control_weights,
                             _cosmos3_cache_key="transfer_uncond_full",
                             **shared_kwargs,
                         ),
@@ -3021,9 +3305,51 @@ class Cosmos3OmniDiffusersPipeline(
                 )[0]
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
         finally:
+            self._clear_denoise_step_metadata()
+            self._reset_mixed_precision()
             self._cosmos3_branch_caches = None
             self.transformer.reset_cache()
         return latents
+
+    def _transfer_vae_executor(self) -> Any | None:
+        """Return the active distributed VAE executor, if any."""
+        executor = getattr(self.vae, "distributed_executor", None)
+        is_distributed_enabled = getattr(self.vae, "is_distributed_enabled", None)
+        if executor is None or not callable(is_distributed_enabled) or not is_distributed_enabled():
+            return None
+        return executor
+
+    def _sync_transfer_overlap(
+        self,
+        output_video: torch.Tensor,
+        *,
+        overlap_frames: int,
+        reference_video: torch.Tensor,
+        vae_executor: Any | None,
+    ) -> torch.Tensor | None:
+        """Broadcast only the decoded frames needed to condition the next chunk."""
+        if overlap_frames <= 0:
+            return None
+
+        is_output_rank = vae_executor is None or vae_executor.rank == 0
+        if is_output_rank:
+            overlap = output_video[:, :, -overlap_frames:].contiguous()
+        else:
+            overlap = torch.empty(
+                (
+                    reference_video.shape[0],
+                    reference_video.shape[1],
+                    overlap_frames,
+                    reference_video.shape[3],
+                    reference_video.shape[4],
+                ),
+                device=self.device,
+                dtype=self.vae.dtype,
+            )
+
+        if vae_executor is not None:
+            overlap = vae_executor.broadcast_tensor(overlap)
+        return overlap
 
     def _forward_transfer(
         self,
@@ -3043,7 +3369,15 @@ class Cosmos3OmniDiffusersPipeline(
             source_hw = (int(input_frames.shape[-2]), int(input_frames.shape[-1]))
         else:
             source_hw = self._first_transfer_control_hw(transfer_config)
-        height, width = self._transfer_bucket_size(sp, source_hw)
+        height, width, transfer_aspect_ratio = self._transfer_bucket_size(sp, source_hw)
+        self._warn_transfer_bucket_conflicts(
+            sp,
+            prompt,
+            source_hw=source_hw,
+            height=height,
+            width=width,
+            aspect_ratio=transfer_aspect_ratio,
+        )
 
         if input_frames is not None:
             if tuple(input_frames.shape[-2:]) != (height, width):
@@ -3113,7 +3447,10 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+        transfer_prompt_suffix = None
+        if transfer_config.emphasize_control_in_prompt:
+            hint_names = ", ".join(hint.key for hint in transfer_config.ordered_hints)
+            transfer_prompt_suffix = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint_names)
 
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
@@ -3124,6 +3461,13 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
+        for ignored_key in ("system_prompt", "use_system_prompt"):
+            if self._get_sp_param(sp, ignored_key, None) is not None:
+                logger.warning_once(
+                    "Cosmos3 transfer ignores the '%s' request parameter and always "
+                    "tokenizes both CFG branches with the transfer-specific system prompt.",
+                    ignored_key,
+                )
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
             prompt,
             negative_prompt,
@@ -3133,13 +3477,21 @@ class Cosmos3OmniDiffusersPipeline(
             width,
             max_sequence_length,
             sp,
-            use_system_prompt,
+            use_system_prompt=True,
             is_t2i=False,
+            system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+            prompt_suffix=transfer_prompt_suffix,
+            use_duration_template=bool(self._get_sp_param(sp, "use_duration_template", True)),
+            use_resolution_template=bool(self._get_sp_param(sp, "use_resolution_template", True)),
+            negative_metadata_mode=str(self._get_sp_param(sp, "negative_metadata_mode", "same")),
+            aspect_ratio_override=transfer_aspect_ratio,
         )
 
         output_chunks: list[torch.Tensor] = []
         control_chunks_per_hint: dict[str, list[torch.Tensor]] = {key: [] for key in per_hint_frames}
         previous_output: torch.Tensor | None = None
+        vae_executor = self._transfer_vae_executor()
+        is_output_rank = vae_executor is None or vae_executor.rank == 0
 
         for chunk_id in range(num_chunks):
             start_frame = chunk_id * stride
@@ -3227,22 +3579,38 @@ class Cosmos3OmniDiffusersPipeline(
                 control_guidance=transfer_config.control_guidance,
                 control_guidance_interval=transfer_config.control_guidance_interval,
                 control_latents=control_latents,
+                control_weights=transfer_config.normalized_control_weights,
                 shared_kwargs=shared_kwargs,
                 velocity_mask=velocity_mask,
                 condition_latents=condition_latents,
                 generator=generator,
             )
             output_video = self._decode_latents(latents).clamp(-1, 1)
-            previous_output = output_video
+            if chunk_id + 1 < num_chunks:
+                previous_output = self._sync_transfer_overlap(
+                    output_video,
+                    overlap_frames=min(transfer_config.num_conditional_frames, chunk_frames),
+                    reference_video=target_norm,
+                    vae_executor=vae_executor,
+                )
 
-            if chunk_id == 0:
-                output_chunks.append(output_video)
-                for key, control in control_norms.items():
-                    control_chunks_per_hint[key].append(control)
-            else:
-                output_chunks.append(output_video[:, :, current_conditional_frames:])
-                for key, control in control_norms.items():
-                    control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
+            if is_output_rank:
+                if chunk_id == 0:
+                    output_chunks.append(output_video)
+                    for key, control in control_norms.items():
+                        control_chunks_per_hint[key].append(control)
+                else:
+                    output_chunks.append(output_video[:, :, current_conditional_frames:])
+                    for key, control in control_norms.items():
+                        control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
+
+        if not is_output_rank:
+            return DiffusionOutput(
+                output={
+                    "payload": {"video": output_video},
+                    "metadata": {"video": {"fps": frame_rate}},
+                },
+            )
 
         full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
         full_controls = {

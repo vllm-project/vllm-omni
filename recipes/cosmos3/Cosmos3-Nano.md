@@ -32,13 +32,13 @@ mode is selected per request:
   T2V/I2V `/v1/videos/sync` request to also generate synchronized audio, muxed into
   the mp4 as AAC 48 kHz stereo. See the official model card's "Video + Audio" examples.
 - **Action** — pass `extra_params={"action_mode": ...}` to drive Physical-AI tasks:
-  - `forward_dynamics` — given a first frame or video **and** an action trajectory,
+    - `forward_dynamics` — given a first frame or video **and** an action trajectory,
     roll out the resulting video. Synchronous: `POST /v1/videos/sync`.
-  - `policy` — given a first frame or video and a language instruction,
+    - `policy` — given a first frame or video and a language instruction,
     **predict** the action trajectory (and a rollout video). Use the async
     `POST /v1/videos` endpoint and read the predicted action from the top-level
     `action` field.
-  - `inverse_dynamics` — given a video, **recover** the action trajectory. Use
+    - `inverse_dynamics` — given a video, **recover** the action trajectory. Use
     the async `POST /v1/videos` endpoint and read the recovered action from
     the top-level `action` field
     (`{data, shape, dtype, raw_action_dim, domain_id}`).
@@ -50,9 +50,10 @@ mode is selected per request:
   **`nvidia/Cosmos3-Nano-Policy-DROID`** is served the same way
   (`domain_name=droid_lerobot`).
 
-- **DROID OpenPI policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and
-  connect an OpenPI-compatible websocket client to `/v1/realtime/robot/openpi`.
-  This path returns action chunks directly instead of an mp4.
+- **DROID policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and connect
+  RoboLab or another OpenPI-compatible client to
+  `/v1/realtime/robot/openpi`. This endpoint returns action chunks directly
+  instead of an mp4.
 
   Action requests can use `input_reference` or `video_reference` for video input.
   `policy` and `forward_dynamics` can also use an image reference; `inverse_dynamics`
@@ -105,6 +106,25 @@ vllm serve nvidia/Cosmos3-Nano \
   --init-timeout 1800
 ```
 
+For Cosmos3, SeaCache is the recommended default choice when opting into
+diffusion caching. Caching remains opt-in; add `--cache-backend sea_cache` to
+the command above. Its default threshold and maximum cached-step streak are
+tuned for Cosmos3, so no `--cache-config` is required.
+
+Override individual defaults with a JSON cache configuration; for example:
+
+```bash
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --cache-backend sea_cache \
+  --cache-config '{"sea_threshold":0.2,"sea_max_consecutive_cached":3}'
+```
+
+Lower `sea_threshold` values and smaller `sea_max_consecutive_cached` caps are
+more conservative. Higher values allow more cached steps and may improve
+speed, but can increase quality loss. Setting `sea_max_consecutive_cached` to
+`0` removes the streak cap.
+
 To run **without** guardrails (you are responsible for license compliance),
 add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
@@ -114,6 +134,38 @@ generation from ~50 GB to ~36 GB with BF16-level quality (T2V composition can
 shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
+
+For a serialized ModelOpt FP8 or NVFP4 checkpoint, an experimental
+mixed-precision schedule can use native W8A8/W4A4 in middle denoising steps
+and dense W8A16/W4A16 in the first and last steps:
+
+```bash
+vllm serve /path/to/Cosmos3-Nano-modelopt \
+  --omni \
+  --additional-config \
+  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+```
+
+The nested object's presence supplies an explicit runtime override; use an
+empty object for these defaults. A compatible checkpoint can instead declare
+the versioned `runtime.diffusion_step_policy` in its authoritative
+`transformer/config.json`. The checkpoint policy is used only when no runtime
+override is present. Use
+`--additional-config '{"cosmos3_mixed_precision":{"enabled":false}}'` to
+disable the checkpoint schedule without disabling checkpoint quantization.
+This path currently requires tensor parallel size 1 and does not support HSDP
+or block-scaled FP8. It keeps one live quantized weight representation:
+scheduled FP8 requires serialized tensorwise scales and a canonical backend,
+while scheduled NVFP4 requires a supported CUTLASS-compatible native or
+FlashInfer layout. Its dequantization is a correctness baseline; no speedup is
+implied. Quantized reasoner weights use A16 by default; set
+`"reasoner":"native"` in the nested object to keep W8A8/W4A4.
+The checkpoint's ModelOpt configuration selects FP8 or NVFP4; mixed FP8/NVFP4
+checkpoints are not supported by this schedule. BF16 linears are left unchanged.
+The schedule currently supports one active request per worker. Model-level and
+layer-wise offload are designed to work with this live-weight path but still
+require GPU validation. Distributed layer-wise offload and incompatible native
+weight layouts fail during loading.
 
 #### Verification
 
@@ -195,15 +247,29 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 
 # Transfer V2V with a precomputed depth control video. `control_path` can point
 # to a local image/video; edge and blur can also be computed from `input_reference`
-# by passing `"edge":true` or `"blur":true`.
+# by passing `"edge":true` or `"blur":true`. The reference negative prompt is
+# optional; omit the `negative_prompt` form field to use an empty negative branch.
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
   -F "model=nvidia/Cosmos3-Nano" \
   -F "prompt=Generate a realistic scene following the provided control video." \
+  --form-string "negative_prompt=$(jq -c . recipes/cosmos3/negative_prompt.json)" \
   -F "size=1280x720" -F "num_frames=121" \
   -F "num_inference_steps=50" -F "seed=125" \
   -F 'extra_params={"depth":{"control_path":"/path/to/depth_control.mp4"},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
   -o cosmos3_transfer_depth.mp4
+
+# The same transfer control can be uploaded by a remote client instead of
+# being placed on the server filesystem. Uploads are limited to 512 MiB.
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Generate a realistic scene following the provided world-state control." \
+  -F "input_reference=@/path/to/input.mp4;type=video/mp4" \
+  -F "control_reference=@/path/to/wsm.mp4;type=video/mp4" \
+  -F "control_type=wsm" \
+  -F 'extra_params={"wsm":{"control_weight":1.0},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
+  -o cosmos3_transfer_wsm.mp4
 
 # Text-to-video-with-sound
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
@@ -268,48 +334,79 @@ VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
 curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
 curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
 
-# DROID OpenPI policy server (websocket action serving).
-# Requires cosmos_framework on PYTHONPATH because the pipeline reuses the
-# reference RoboLab action transforms. If your checkpoint config already
-# includes policy_server_config, omit the stage_overrides file and flag.
-cat > cosmos3_droid_openpi_stage_overrides.json <<'JSON'
-{
-  "0": {
-    "model_config": {
-      "policy_server_config": {
-        "image_resolution": [540, 640],
-        "n_external_cameras": 2,
-        "needs_wrist_camera": true,
-        "needs_stereo_camera": false,
-        "needs_session_id": true,
-        "action_space": "joint_position"
-      }
-    }
-  }
-}
-JSON
+# DROID websocket policy server. Use the tested cosmos-framework revision
+# directly from source; installing the package can introduce dependency conflicts.
+export COSMOS_FRAMEWORK_ROOT=/path/to/cosmos-framework
+git -C "$COSMOS_FRAMEWORK_ROOT" checkout c14617c2bc93dacbf69674fb964eec93182933d9
+export PYTHONPATH="$COSMOS_FRAMEWORK_ROOT"
 
+# Validate every cosmos-framework symbol used by the action-policy pipeline
+# before allocating the model.
+python - <<'PY'
+from vllm_omni.diffusion.models.cosmos3.utils import (
+    get_robolab_domain_id,
+    preflight_cosmos3_action_framework_imports,
+)
+
+preflight_cosmos3_action_framework_imports()
+print("cosmos-framework action imports OK; DROID domain:", get_robolab_domain_id("droid_lerobot"))
+PY
+
+# The bundled deploy config (vllm_omni/deploy/cosmos3_policy_droid.yaml)
+# selects the registered cosmos3_policy pipeline and carries the DROID
+# checkpoint's serving defaults: JSON prompt formatting (a property of this
+# checkpoint's training recipe, not a generic server default), the
+# model-specific OpenPI binary handshake metadata (policy_server_config), and
+# guardrails off (policy serving emits robot actions; the guardrail stack is
+# not part of it, so --no-guardrails is implied).
+# Policy checkpoints cannot be auto-detected — they share their HF metadata
+# with the T2I/video Cosmos3 checkpoints — so --deploy-config is required.
+# Per-checkpoint model_config tweaks can be layered on top with
+# --stage-overrides; dict overrides deep-merge with the deploy yaml.
+export VLLM_OMNI_ROOT=/absolute/path/to/vllm-omni
 vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   --omni \
   --host 0.0.0.0 --port 8000 \
-  --model-class-name Cosmos3OmniDiffusersPipeline \
-  --no-guardrails \
-  --stage-overrides "$(cat cosmos3_droid_openpi_stage_overrides.json)"
+  --deploy-config "$VLLM_OMNI_ROOT/vllm_omni/deploy/cosmos3_policy_droid.yaml" \
+  --robot-openpi-idle-timeout 0
 
-# Point an OpenPI websocket client at:
-#   ws://localhost:8000/v1/realtime/robot/openpi
-# The first server message is policy_server_config. Each infer request sends a
-# msgpack-numpy observation dict and receives a writable float32 action array.
+# From a RoboLab checkout:
+python policies/cosmos3/run.py \
+  --remote-uri ws://localhost:8000/v1/realtime/robot/openpi \
+  --task BananaInBowlTask
+
+# For a server started with "--api-key $POLICY_API_KEY", pass the same value as
+# a Bearer token. --remote-token takes precedence over COSMOS3_API_TOKEN.
+COSMOS3_API_TOKEN="$POLICY_API_KEY" python policies/cosmos3/run.py \
+  --remote-uri wss://policy.example/v1/realtime/robot/openpi \
+  --task BananaInBowlTask
 ```
+
+The endpoint sends `policy_server_config` as its initial binary MsgPack
+message and returns the action array directly. RoboLab accepts that direct
+array as well as proxy responses shaped as `{"action": ...}` or
+`{"actions": ...}`, and turns structured server errors into client exceptions.
+
+RoboLab supplies `session_id=robolab-episode-<episode>-env-<env_id>`, so
+parallel environments have independent policy state even though they share
+one WebSocket. The server tracks interleaved session IDs independently.
+The default receive-idle timeout is 30 seconds; set
+`--robot-openpi-idle-timeout 0` when simulator steps between replans can take
+longer, or set another non-negative timeout in seconds.
+
+If vLLM-Omni is started with `--api-key` or `VLLM_API_KEY`, the standard
+OpenPI route uses the normal API authentication middleware. RoboLab's
+`--remote-token` and `COSMOS3_API_TOKEN` send the required
+`Authorization: Bearer ...` header.
 
 #### Notes
 
-- **Measured latency (1x B300, bf16, guardrails off):**
-  - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
-  - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
-  - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
-  - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
-  - Guardrails-on overhead: ~8% on T2I, negligible on video.
+- **Measured latency (1x B300, bf16, guardrails off, diffusion cache off):**
+    - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
+    - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
+    - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
+    - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
+    - Guardrails-on overhead: ~8% on T2I, negligible on video.
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 GPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
   ~33 GB on disk.
@@ -322,15 +419,34 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   `extra_params={"guardrails":false}` (per request) toggles safety. The
   per-request flag only takes effect when the server was launched **with**
   guardrails enabled (it cannot re-enable them on a `--no-guardrails` server).
-  `use_resolution_template` / `use_duration_template` are off by default and only
-  needed when not using upsampled prompts that already encode resolution/duration.
+  Outside transfer mode, `use_resolution_template` / `use_duration_template`
+  are off by default and only needed when not using upsampled prompts that
+  already encode resolution/duration.
   For V2V, `condition_frame_indexes_vision` selects the clean conditioned latent
   frame indexes (default `[0, 1]`), and `condition_video_keep` selects whether the
   API decodes the first or last needed reference frames (`"first"` by default).
 - **Transfer controls:** `extra_params` may include `edge`, `blur`, `depth`,
   `seg`, or `wsm`. Each hint accepts `true`, a path string, or an object such as
   `{"control_path": "/path/to/control.mp4"}`; `edge` also accepts
-  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`.
+  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`. Every hint
+  accepts a non-negative `control_weight`; weights are normalized across active
+  controls and therefore only set their relative influence. A single positive
+  weight always normalizes to `1.0`; use `control_guidance` to change the
+  absolute strength of a single control. With two or more active controls, the
+  per-control attention passes run replicated on every sequence-parallel
+  (Ulysses) rank, so Ulysses does not reduce per-rank memory or latency for
+  multi-control transfer requests.
+  Transfer always uses Cosmos3's transfer-specific system prompt. By default it
+  also appends a directive naming every active hint and asking the model to
+  follow its shape, position, and motion precisely; set the request-level
+  `emphasize_control_in_prompt` option to `false` for prompt ablations. Transfer
+  does not add a negative prompt automatically. An optional reference prompt is
+  provided in [`negative_prompt.json`](negative_prompt.json); compact the JSON
+  with `jq -c` and pass it through `negative_prompt` as shown in the transfer
+  example. Transfer enables duration/FPS and resolution metadata on both CFG
+  branches. Set `use_duration_template` or `use_resolution_template` to
+  `false` to disable either template. `negative_metadata_mode` accepts `same`
+  (the transfer default), `inverse`, or `none`.
   Transfer-level options include `control_guidance`,
   `control_guidance_interval`, `num_video_frames_per_chunk` (default `93`,
   `101` for WSM), `num_conditional_frames` (default `1`),
@@ -346,12 +462,12 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   `conditioning_fps`, `action_chunk_size`, `raw_action_dim`, `deterministic_seed`,
   and `session_id`.
 - **Known limitations:**
-  - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
+    - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
     `nvidia/Cosmos-1.0-Guardrail` repo (accept license + `HF_TOKEN`); otherwise
     the server fails at pipeline build with a gated-repo / safety-checker error.
-  - A guardrail-blocked prompt currently returns HTTP 500
+    - A guardrail-blocked prompt currently returns HTTP 500
     (`"Guardrail blocked prompt"`).
-  - Action `forward_dynamics`, `policy`, and `inverse_dynamics` are supported
+    - Action `forward_dynamics`, `policy`, and `inverse_dynamics` are supported
     online. Use async `POST /v1/videos` when you need the predicted/recovered
     action payload under the top-level `action` field; sync `/v1/videos/sync`
     returns raw MP4 bytes and does not expose action metadata in the response body.
@@ -482,14 +598,14 @@ so an md5 comparison across two runs also works as a smoke check.
   a ~390 s build of the VAE decode path *for that shape*, so warming 1024² images
   does nothing for 189-frame video. At 720p / 189 frames / 35 steps this is
   **540 s cold vs 161 s warm, with byte-identical output**.
-- **Measured on 1x MI350X (bf16, guardrails off, warm):** T2I 1024² @ 50 steps
+- **Measured on 1x MI350X (bf16, guardrails off, diffusion cache off, warm):** T2I 1024² @ 50 steps
   **~2.7 s**; T2V 1280×720 / 189 frames @ 35 steps **~161 s**, of which ~92% is
   the DiT denoise loop and ~4% VAE decode, so optimization effort belongs in the
   denoise loop. The optional flags act on different terms of the memory bill and
   are therefore complementary rather than redundant:
 
   | Flag | Latency | Peak reserved | Peak allocated | Acts on |
-  |---|---|---|---|---|
+  | --- | --- | --- | --- | --- |
   | *(none)* | 161 s | 120 GiB | 95 GiB | — |
   | `--vae-use-tiling` | 183 s (+13.5%) | **38 GiB** (−68%) | **36 GiB** (−62%) | decode activations |
   | `--enable-layerwise-offload` | 162 s (+0.8%) | 84 GiB (−30%) | 69 GiB (−27%) | weights |
@@ -671,11 +787,11 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 
 #### Notes
 
-- **Measured latency (1x Ascend 910B / 910C, bf16, guardrails off):**
-  - T2I 1024² — 10 steps → ~8 s
-  - T2V 1280×720 @ 20 steps — 49 frames → ~55 s
-  - I2V 1280×720 @ 10 steps — 25 frames → ~25 s
-  - V2V 480×320 @ 10 steps — 17 frames → ~12 s
+- **Measured latency (1x Ascend 910B / 910C, bf16, guardrails off, diffusion cache off):**
+    - T2I 1024² — 10 steps → ~8 s
+    - T2V 1280×720 @ 20 steps — 49 frames → ~55 s
+    - I2V 1280×720 @ 10 steps — 25 frames → ~25 s
+    - V2V 480×320 @ 10 steps — 17 frames → ~12 s
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 NPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
   ~33 GB on disk.
@@ -688,9 +804,9 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   (for model loading), `--tensor-parallel-size 8` for multi-NPU, and
   `--model-class-name Cosmos3OmniDiffusersPipeline` to force the pipeline class.
 - **Known limitations:**
-  - Transfer V2V with `extra_params` (`edge`/`blur`/`depth`/`seg`/`wsm`) hits a
+    - Transfer V2V with `extra_params` (`edge`/`blur`/`depth`/`seg`/`wsm`) hits a
     resolution-parsing bug; basic V2V without transfer hints works.
-  - FP8 online quantization and layerwise offload are not supported on NPU.
+    - FP8 online quantization and layerwise offload are not supported on NPU.
 
 ### 1x Ascend 910B / 910C (Atlas A2 / A3) — Offline generation
 

@@ -131,7 +131,7 @@ python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
     --enforce-eager
 ```
 
-`--streaming` uses `AsyncOmni` and the async_chunk stage config. It currently
+`--streaming` uses `AsyncOmni` and the async chunk deploy config. It currently
 supports one prompt per process invocation; use blocking mode for
 `--num-prompts > 1`.
 

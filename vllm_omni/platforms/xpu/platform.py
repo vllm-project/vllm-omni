@@ -11,6 +11,7 @@ from vllm.platforms.xpu import XPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.xpu.patch import apply_patches
 
 logger = init_logger(__name__)
 
@@ -30,6 +31,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.XPU
+
+    def __init__(self):
+        super().__init__()
+        apply_patches()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -102,8 +107,20 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def record_device_event(cls) -> torch.Event | None:
+        """Record an XPU event on the current stream to mark tensor readiness.
+
+        Deliberately a device-agnostic ``torch.Event`` rather than a
+        ``torch.xpu.Event``. The consumer (the async diffusion output thread)
+        waits with ``torch.Stream.wait_event`` on a generic ``torch.Stream``,
+        and that C-level binding silently no-ops for a ``torch.xpu.Event``
+        instead of enqueuing the dependency — the side stream then starts its
+        D2H copy while the compute stream is still writing the tensor, so the
+        host reads a partially-written image (garbage rows at the bottom of the
+        output). ``torch.Event`` dispatches through the accelerator hooks and
+        the wait is honored, which is the actual fix.
+        """
         try:
-            event = torch.xpu.Event()
+            event = torch.Event()
             event.record()
             return event
         except Exception:

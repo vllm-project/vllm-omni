@@ -6,6 +6,7 @@ import torch.nn as nn
 
 import vllm_omni.diffusion.compile as compile_module
 from vllm_omni.diffusion.compile import regionally_compile
+from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -74,6 +75,37 @@ def test_regionally_compile_does_not_partially_mutate_on_setup_failure(monkeypat
         regionally_compile(model, dynamic=True)
 
     assert [block.forward.__func__ for block in model.transformer_blocks] == original_forwards
+
+
+def test_regionally_compile_keeps_hook_dispatch_outside_compiled_graph(monkeypatch):
+    model = _ModelWithWrappedRepeatedBlocks()
+    block = model.transformer_blocks[0]
+    registry = HookRegistry.get_or_create(block)
+    hook = ModelHook()
+    registry.register_hook("test", hook)
+
+    wrapped_forward = block.forward
+    original_forward = block._omni_original_forward
+    compile_calls = []
+
+    def _compile(fn, *args, **kwargs):
+        compile_calls.append(fn)
+
+        def _compiled(*fn_args, **fn_kwargs):
+            return f"compiled:{fn(*fn_args, **fn_kwargs)}"
+
+        return _compiled
+
+    monkeypatch.setattr(compile_module.torch, "compile", _compile)
+
+    regionally_compile(model)
+
+    assert compile_calls[0] is original_forward
+    assert compile_calls[0] is not wrapped_forward
+    assert block.forward is wrapped_forward
+    assert block._omni_original_forward is not original_forward
+    assert hook.fn_ref.original_forward is block._omni_original_forward
+    assert block("ok") == "compiled:ok"
 
 
 def test_compiled_block_preserves_forward_signature_for_inspection(monkeypatch):
