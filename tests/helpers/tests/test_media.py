@@ -111,10 +111,12 @@ def _reset_transcriber_singletons():
     media.release_audio_transcriber()
     media._WHISPER_MODELS.clear()
     media._WHISPER_LOADED_DEVICE = None
+    media._TRANSCRIBER_RESERVED_GIB = 0.0
     yield
     media.release_audio_transcriber()
     media._WHISPER_MODELS.clear()
     media._WHISPER_LOADED_DEVICE = None
+    media._TRANSCRIBER_RESERVED_GIB = 0.0
 
 
 @pytest.mark.parametrize(
@@ -324,6 +326,31 @@ def test_whisper_resident_vram_tracks_gpu_device_after_success(monkeypatch):
     assert media.whisper_resident_device_index() is None
 
 
+def test_whisper_unknown_size_does_not_credit_eleven_gib(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0")],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "not-a-whisper-size")
+    assert media.whisper_resident_device_index() == 0
+    assert media.whisper_resident_vram_gib() == 0.0
+
+
+def test_whisper_resident_vram_caps_table_by_child_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 1.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_vram_gib() == pytest.approx(1.0)
+
+
+def test_whisper_resident_vram_caps_reserved_by_known_table(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 20.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_vram_gib() == pytest.approx(2.5)
+
+
+def test_whisper_unknown_size_uses_measured_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 3.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "not-a-whisper-size")
+    assert media.whisper_resident_vram_gib() == pytest.approx(3.0)
+
+
 def test_later_whisper_sizes_reuse_the_first_selected_device(monkeypatch):
     selected: list[str] = []
 
@@ -338,7 +365,7 @@ def test_later_whisper_sizes_reuse_the_first_selected_device(monkeypatch):
     monkeypatch.setitem(sys.modules, "whisper", SimpleNamespace(load_model=fake_model))
     monkeypatch.setattr(media, "_serialize_whisper_model_download", lambda model_size: nullcontext())
 
-    text, device = media._whisper_transcribe_in_current_process("/tmp/a.wav", "small")
+    text, device, _reserved = media._whisper_transcribe_in_current_process("/tmp/a.wav", "small")
     assert (text, device) == ("x", "cuda:1")
     media._whisper_transcribe_in_current_process("/tmp/b.wav", "large-v3")
     assert selected == ["cuda:1"]

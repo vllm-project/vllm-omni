@@ -3,9 +3,10 @@
 
 """Entrypoint sleep-mode coverage on small models.
 
-Layering:
-1. AR protocol (#4473) — ``Qwen/Qwen2.5-Omni-7B`` thinker-only on L4
-2. Diffusion sleep/wake/generate — ``riverclouds/qwen_image_random`` on L4
+Layering (tiny DiT before 7B on the same L4 so residual thinker weights cannot
+OOM the diffusion suite):
+1. Diffusion sleep/wake/generate — ``riverclouds/qwen_image_random`` on L4
+2. AR protocol (#4473) — ``Qwen/Qwen2.5-Omni-7B`` thinker-only on L4
 3. Light multistage orchestration — thinker-only AR + tiny DiT on L4×2
 
 BAGEL BagelPipeline TP=2 / coordinated dual-engine stay in
@@ -33,9 +34,24 @@ logger = logging.getLogger("OmniTest")
 
 MODEL_DIFF = "riverclouds/qwen_image_random"
 MODEL_AR = "Qwen/Qwen2.5-Omni-7B"
+# Sleep/wake on 24 GiB L4 needs CPU-offload headroom. The thinker-only CI overlay
+# is the abort-test profile (util 0.90 / max_model_len 16384); 16.78 GiB weights
+# already left 0 KV at util 0.85. Match the L4×2 fixture below.
+_AR_SLEEP_GPU_MEMORY_UTILIZATION = 0.45
+_AR_SLEEP_MAX_MODEL_LEN = 2048
+_AR_SLEEP_MAX_NUM_BATCHED_TOKENS = 2048
 AR_STAGE_CONFIG = modify_stage_config(
     get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml"),
-    updates={"stages": {0: {"enable_sleep_mode": True}}},
+    updates={
+        "stages": {
+            0: {
+                "enable_sleep_mode": True,
+                "gpu_memory_utilization": _AR_SLEEP_GPU_MEMORY_UTILIZATION,
+                "max_model_len": _AR_SLEEP_MAX_MODEL_LEN,
+                "max_num_batched_tokens": _AR_SLEEP_MAX_NUM_BATCHED_TOKENS,
+            }
+        }
+    },
 )
 
 
@@ -82,6 +98,28 @@ async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int] | None = None) -
         logger.warning("ensure_resume failed (stage_ids=%s): %s", stage_ids, e)
 
 
+async def _shutdown_engine_and_clear_gpu(engine: AsyncOmni) -> None:
+    """Drop the engine, then wait until this L4 is free for the next class.
+
+    ``shutdown()`` + a short sleep is not enough: residual thinker weights can
+    still occupy the device when the next class loads tiny DiT or another 7B.
+    """
+    from tests.helpers.clean import cleanup_test_environment, wait_for_gpu_memory_to_clear
+
+    engine.shutdown()
+    await asyncio.sleep(1.5)
+    cleanup_test_environment()
+    n = current_omni_platform.device_count()
+    if n <= 0:
+        return
+    # Fail closed. Module autouse cleanup only logs a note on timeout.
+    wait_for_gpu_memory_to_clear(
+        devices=list(range(n)),
+        threshold_ratio=0.15,
+        timeout_s=120,
+    )
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _module_device_cleanup():
     from tests.helpers.clean import cleanup_test_environment
@@ -94,7 +132,65 @@ def _module_device_cleanup():
 
 
 # ---------------------------------------------------------------------------
-# 1) AR protocol — Omni thinker-only (L4)
+# 1) Diffusion sleep/wake/generate — qwen_image_random (L4)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
+async def diffusion_engine():
+    """Shared tiny diffusion engine on L4."""
+    if current_omni_platform.is_rocm():
+        clean_device_envs()
+    engine = AsyncOmni(
+        model=MODEL_DIFF,
+        enable_sleep_mode=True,
+        tensor_parallel_size=1,
+        enforce_eager=True,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.5,
+        stage_init_timeout=1200,
+    )
+    yield engine
+    await _shutdown_engine_and_clear_gpu(engine)
+
+
+class TestOmniDiffusionSleepMode:
+    """Diffusion worker sleep/wake on ``qwen_image_random`` (TP=1)."""
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @pytest.mark.asyncio(loop_scope="class")
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    async def test_diffusion_sleep_handshake(self, diffusion_engine: AsyncOmni):
+        try:
+            acks = await diffusion_engine.sleep(level=1)
+            assert acks is not None
+            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
+            await diffusion_engine.wake_up()
+        finally:
+            await _ensure_awake(diffusion_engine)
+
+    @pytest.mark.omni
+    @pytest.mark.core_model
+    @pytest.mark.asyncio(loop_scope="class")
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    async def test_diffusion_sleep_wake_generate(self, diffusion_engine: AsyncOmni):
+        try:
+            acks = await diffusion_engine.sleep(level=1)
+            assert acks is not None
+            await diffusion_engine.wake_up()
+            await diffusion_engine.resume_generation()
+            async for _ in diffusion_engine.generate(
+                "test",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),
+            ):
+                pass
+        finally:
+            await _ensure_awake(diffusion_engine)
+
+
+# ---------------------------------------------------------------------------
+# 2) AR protocol — Omni thinker-only (L4)
 # ---------------------------------------------------------------------------
 
 
@@ -110,8 +206,7 @@ async def ar_engine():
         stage_init_timeout=1200,
     )
     yield engine
-    engine.shutdown()
-    await asyncio.sleep(1.5)
+    await _shutdown_engine_and_clear_gpu(engine)
 
 
 class TestOmniArSleepMode:
@@ -178,65 +273,6 @@ class TestOmniArSleepMode:
 
 
 # ---------------------------------------------------------------------------
-# 2) Diffusion sleep/wake/generate — qwen_image_random (L4)
-# ---------------------------------------------------------------------------
-
-
-@pytest_asyncio.fixture(scope="class", loop_scope="class")
-async def diffusion_engine():
-    """Shared tiny diffusion engine on L4."""
-    if current_omni_platform.is_rocm():
-        clean_device_envs()
-    engine = AsyncOmni(
-        model=MODEL_DIFF,
-        enable_sleep_mode=True,
-        tensor_parallel_size=1,
-        enforce_eager=True,
-        dtype="bfloat16",
-        gpu_memory_utilization=0.5,
-        stage_init_timeout=1200,
-    )
-    yield engine
-    engine.shutdown()
-    await asyncio.sleep(1.5)
-
-
-class TestOmniDiffusionSleepMode:
-    """Diffusion worker sleep/wake on ``qwen_image_random`` (TP=1)."""
-
-    @pytest.mark.advanced_model
-    @pytest.mark.omni
-    @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-    async def test_diffusion_sleep_handshake(self, diffusion_engine: AsyncOmni):
-        try:
-            acks = await diffusion_engine.sleep(level=1)
-            assert acks is not None
-            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
-            await diffusion_engine.wake_up()
-        finally:
-            await _ensure_awake(diffusion_engine)
-
-    @pytest.mark.omni
-    @pytest.mark.core_model
-    @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-    async def test_diffusion_sleep_wake_generate(self, diffusion_engine: AsyncOmni):
-        try:
-            acks = await diffusion_engine.sleep(level=1)
-            assert acks is not None
-            await diffusion_engine.wake_up()
-            await diffusion_engine.resume_generation()
-            async for _ in diffusion_engine.generate(
-                "test",
-                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),
-            ):
-                pass
-        finally:
-            await _ensure_awake(diffusion_engine)
-
-
-# ---------------------------------------------------------------------------
 # 3) Light multistage — small AR + small DiT (L4×2)
 # ---------------------------------------------------------------------------
 
@@ -246,11 +282,11 @@ class TestOmniDiffusionSleepMode:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_multistage_ar_diffusion_sleep_wake():
-    """Orchestration: sleep/wake both stages on thinker-only AR + tiny DiT.
+    """Orchestration: joint sleep/wake/resume on thinker-only AR + tiny DiT.
 
-    Covers joint ``sleep(stage_ids=[0, 1])`` / wake / resume that single-stage
-    suites do not. End-to-end cross-model generate is not required here —
-    BAGEL BagelPipeline TP=2 remains the heavy product path in expansion.
+    Covers ``sleep(stage_ids=[0, 1])`` then a 2-step tiny-DiT generate after
+    resume. BAGEL BagelPipeline TP=2 stays in expansion (diffusion-only); the
+    skipped dual-engine suite does not cover this path.
     """
     if current_omni_platform.is_rocm():
         clean_device_envs()
@@ -265,13 +301,13 @@ async def test_multistage_ar_diffusion_sleep_wake():
             "engine_args": {
                 "model": MODEL_AR,
                 "model_stage": "thinker",
-                "gpu_memory_utilization": 0.45,
+                "gpu_memory_utilization": _AR_SLEEP_GPU_MEMORY_UTILIZATION,
                 "dtype": "bfloat16",
                 "enable_sleep_mode": True,
                 "trust_remote_code": True,
                 "enforce_eager": True,
-                "max_model_len": 2048,
-                "max_num_batched_tokens": 2048,
+                "max_model_len": _AR_SLEEP_MAX_MODEL_LEN,
+                "max_num_batched_tokens": _AR_SLEEP_MAX_NUM_BATCHED_TOKENS,
             },
         },
         {
@@ -305,6 +341,14 @@ async def test_multistage_ar_diffusion_sleep_wake():
 
         await engine.wake_up(stage_ids=[0, 1])
         await engine.resume_generation(stage_ids=[0, 1])
-        logger.info("Light multistage joint sleep/wake/resume OK")
+        sp = OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256)
+        post_output = None
+        async for output in engine.generate(
+            "verify",
+            sampling_params_list=[SamplingParams(), sp],
+        ):
+            post_output = output
+        assert post_output is not None
+        logger.info("Light multistage joint sleep/wake/resume generate OK")
     finally:
-        engine.shutdown()
+        await _shutdown_engine_and_clear_gpu(engine)

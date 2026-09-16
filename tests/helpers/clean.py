@@ -138,7 +138,12 @@ def wait_for_gpu_memory_to_clear(
 
 
 def _whisper_vram_allowance() -> tuple[float, int | None]:
-    """Whisper GPU footprint and physical device, or ``(0.0, None)`` on CPU / unknown."""
+    """Living Whisper worker's GPU footprint and physical device.
+
+    Orthogonal to RFC #6851 leftover-engine PID reap / a raised wait ratio:
+    this only excludes the transcriber's own allocator (capped by current used
+    on that device). CPU / unknown device → ``(0.0, None)``.
+    """
     try:
         from tests.helpers.media import whisper_resident_device_index, whisper_resident_vram_gib
     except Exception:

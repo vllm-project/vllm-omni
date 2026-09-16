@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
@@ -136,6 +136,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
         free, total = torch.xpu.mem_get_info(device)
         return free, total
+
+    @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.xpu.memory_reserved(device))
 
     @classmethod
     def get_profiler_cls(cls) -> str:
