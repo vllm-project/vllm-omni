@@ -28,7 +28,7 @@ from vllm_omni.outputs.multimodal_accumulation import (
     is_non_final_delta_audio_chunk,
     replace_snapshot_keys,
 )
-from vllm_omni.outputs.output_modality import OutputModality, get_accumulation_strategy
+from vllm_omni.outputs.output_modality import OutputModality
 
 logger = init_logger(__name__)
 
@@ -140,8 +140,8 @@ class OmniRequestState(RequestState):
         """Consolidate accumulated tensor lists into single tensors.
 
         Uses TensorAccumulationStrategy derived from the output modality
-        to determine concatenation behavior. Metadata values always use
-        REPLACE (keep latest).
+        (with any per-key override applied) to determine concatenation
+        behavior. Metadata values always use REPLACE (keep latest).
         """
         if self.mm_accumulated.is_empty:
             return
@@ -150,10 +150,9 @@ class OmniRequestState(RequestState):
             modality = OutputModality.from_string(self.mm_type)
         except (ValueError, KeyError):
             modality = OutputModality.TEXT
-        strategy = get_accumulation_strategy(modality)
 
         try:
-            self.mm_accumulated.consolidate_tensors(strategy)
+            self.mm_accumulated.consolidate_tensors(modality)
             self.mm_accumulated.consolidate_metadata()
         except (RuntimeError, TypeError, KeyError):
             logger.exception("Error consolidating multimodal tensors")

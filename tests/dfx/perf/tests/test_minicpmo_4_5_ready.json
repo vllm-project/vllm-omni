@@ -26,8 +26,8 @@
       {
         "dataset_name": "seed-tts",
         "dataset_path": "zhaochenyang20/seed-tts-eval",
-        "backend": "openai-chat-omni",
-        "endpoint": "/v1/chat/completions",
+        "backend": "openai-realtime-tts",
+        "endpoint": "/v1/realtime",
         "num_prompts": [
           10,
           40
@@ -40,41 +40,7 @@
         "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
-        "extra_body": {
-          "modalities": [
-            "text",
-            "audio"
-          ],
-          "chat_template_kwargs": {
-            "enable_thinking": false,
-            "use_tts_template": true
-          }
-        },
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
-        "baseline": {
-          "H100": {
-            "request_throughput": [
-              0.9731,
-              1.1986
-            ],
-            "mean_ttft_ms": [
-              152.5665,
-              270.2559
-            ],
-            "mean_e2el_ms": [
-              1027.2953,
-              3306.3735
-            ],
-            "mean_audio_ttfp_ms": [
-              458.1553,
-              2030.2335
-            ],
-            "mean_audio_rtf": [
-              0.2357,
-              0.791
-            ]
-          }
-        }
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
       }
     ]
   }

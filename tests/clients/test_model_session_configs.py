@@ -18,13 +18,13 @@ from vllm_omni.clients.personaplex import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_minicpmo45_session_config_matches_native_duplex_deployment():
+def test_minicpmo45_session_config_matches_duplex_deployment():
     config = create_minicpmo45_session_config(ref_audio="data:audio/wav;base64,AAA=", temperature=0.0)
     payload = config.to_session_payload(model="openbmb/MiniCPM-o-4_5")
     assert payload["ref_audio"] == "data:audio/wav;base64,AAA="
     assert payload["overlap_policy"] == "listen_only"
     assert payload["playback_commit_policy"] == "ack_only"
-    assert payload["extra_body"]["native_duplex"] is True
+    assert "native_duplex" not in payload["extra_body"]
     assert payload["extra_body"]["auto_response"] is True
     assert payload["temperature"] == 0.0
 
@@ -41,8 +41,9 @@ def test_personaplex_session_config_matches_deployment():
 @pytest.mark.parametrize(
     "duplex_package",
     [
+        # PersonaPlex and Nemotron VoiceChat rejoin this list with the follow-up
+        # PRs that port them to the duplex plugin framework.
         "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
-        "vllm_omni.model_executor.models.personaplex.duplex",
     ],
 )
 def test_model_duplex_packages_stay_clear_of_client_library(duplex_package: str):

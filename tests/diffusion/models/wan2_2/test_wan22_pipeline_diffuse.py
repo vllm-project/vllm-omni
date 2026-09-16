@@ -10,13 +10,19 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.fixture(autouse=True)
+def _cpu_platform(monkeypatch):
+    module = importlib.import_module("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2")
+    monkeypatch.setattr(module.current_omni_platform, "is_available", lambda: False)
 
 
 class _StubTransformer(nn.Module):
@@ -51,10 +57,10 @@ class _StubScheduler:
     def __init__(self, timesteps: list[int]) -> None:
         self.timesteps = torch.tensor(timesteps, dtype=torch.int64)
         self.config = SimpleNamespace(num_train_timesteps=1000)
-        self.set_timesteps_calls: list[tuple[int, torch.device]] = []
+        self.set_timesteps_calls: list[tuple[int, torch.device, float | None]] = []
 
-    def set_timesteps(self, num_steps: int, device: torch.device) -> None:
-        self.set_timesteps_calls.append((num_steps, device))
+    def set_timesteps(self, num_steps: int, device: torch.device, shift: float | None = None) -> None:
+        self.set_timesteps_calls.append((num_steps, device, shift))
 
 
 @contextmanager
@@ -184,7 +190,24 @@ def test_forward_delegates_denoising_to_diffuse(
     assert captured["boundary_timestep"] == pytest.approx(875.0)
     assert captured["latent_condition"] is None
     assert captured["first_frame_mask"] is None
-    assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"))]
+    assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"), 5.0)]
+
+
+@pytest.mark.parametrize("solver", ["unipc", "euler"])
+def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: str) -> None:
+    pipeline = _make_pipeline()
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]
+    for shift in (3.0, 12.0, 5.0):
+        sampling = _make_sampling(num_inference_steps=5, extra_args={"sample_solver": solver, "flow_shift": shift})
+        request = OmniDiffusionRequest(prompt="prompt", request_id="schedule", sampling_params=sampling)
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+        reference = build_wan_scheduler(solver, shift)
+        if solver == "unipc":
+            reference.set_timesteps(5, device="cpu", shift=shift)
+            assert pipeline.scheduler.config.shift == pipeline.scheduler.config["shift"] == 1.0
+        else:
+            reference.set_timesteps(5, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
 
 def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:

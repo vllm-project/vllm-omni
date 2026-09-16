@@ -110,6 +110,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     covo_audio,
     dots_tts,
     fish_speech,
+    gepard,
     glm_tts,
     higgs_audio_v2,
     higgs_audio_v3,

@@ -171,6 +171,38 @@ def _short_transcript_contains_expected(transcript: str, expected: str) -> bool:
     return short_text and small_word_delta and expected_clean in transcript_clean
 
 
+_MAX_TAIL_WORDS_FLOOR = 2
+_TAIL_WORD_RATIO = 0.2
+
+
+def _transcript_has_bounded_tail(transcript: str, expected: str) -> bool:
+    """Pass when the expected text is spoken verbatim, only trailed by noise.
+
+    A short, unrelated tail after the complete expected sentence is the exact
+    case #6828's rationale anticipated: a different valid TTS sample can append
+    an audible tail even when the spoken text is identical, and Whisper can
+    hallucinate brief words on a non-speech tail. The length-penalized n-gram
+    cosine stays below the gate for such tails, so accept the match when the
+    expected text is a word-aligned prefix of the transcript and the trailing
+    words stay within the floor/ratio bounds.
+    """
+    transcript_clean = preprocess_text(transcript)
+    expected_clean = preprocess_text(expected)
+    if not transcript_clean or not expected_clean:
+        return False
+
+    transcript_words = transcript_clean.split()
+    expected_words = expected_clean.split()
+    if not transcript_words or not expected_words:
+        return False
+
+    if transcript_words[: len(expected_words)] != expected_words:
+        return False
+    tail_words = len(transcript_words) - len(expected_words)
+    max_tail_words = max(_MAX_TAIL_WORDS_FLOOR, math.ceil(_TAIL_WORD_RATIO * len(expected_words)))
+    return tail_words <= max_tail_words
+
+
 def assert_image_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
@@ -834,7 +866,16 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                         text_output.lower(),
                     )
                     print(f"similarity is: {similarity}")
-                    assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
+                    if similarity <= similarity_threshold and _transcript_has_bounded_tail(transcript, text_output):
+                        # The full answer is spoken verbatim and only a short
+                        # noise tail follows it; see #6828's rationale.
+                        print(
+                            "bounded-tail containment check passed: "
+                            f"text={text_output!r} is a word-aligned prefix of "
+                            f"transcript={transcript!r}"
+                        )
+                    else:
+                        assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
             if audio_ref_text:
                 assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(

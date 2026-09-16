@@ -749,7 +749,7 @@ def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
     return torch.cat((phase.cos(), phase.sin()), dim=1)
 
 
-def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _rope_axis(max_seq_len: int, dim: int, *, start: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     if dim == 0:
         empty = torch.empty(max_seq_len, 0, dtype=torch.float32)
         return empty, empty.clone()
@@ -759,7 +759,7 @@ def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
         10000,
         torch.arange(0, dim, 2, dtype=torch.float64) / dim,
     )
-    phase = torch.outer(torch.arange(max_seq_len, dtype=torch.float64), frequencies)
+    phase = torch.outer(torch.arange(start, start + max_seq_len, dtype=torch.float64), frequencies)
     return phase.cos().float(), phase.sin().float()
 
 
@@ -1028,23 +1028,29 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if start_frame + frames > self.config.rope_max_seq_len:
-            raise ValueError("Temporal RoPE positions exceed rope_max_seq_len.")
         if height > self.config.rope_max_seq_len or width > self.config.rope_max_seq_len:
             raise ValueError("Spatial RoPE positions exceed rope_max_seq_len.")
+        if start_frame + frames <= self._rope_temporal_cosine.shape[0]:
+            temporal_cosine = self._rope_temporal_cosine[start_frame : start_frame + frames]
+            temporal_sine = self._rope_temporal_sine[start_frame : start_frame + frames]
+        else:
+            # Keep absolute positions and checkpoint frequencies, computing only
+            # this block instead of growing a table for the whole session.
+            temporal_dim = self._rope_temporal_cosine.shape[1] * 2
+            temporal_cosine, temporal_sine = _rope_axis(frames, temporal_dim, start=start_frame)
+            temporal_cosine = temporal_cosine.to(self._rope_temporal_cosine)
+            temporal_sine = temporal_sine.to(self._rope_temporal_sine)
 
         def expand_axis(table: torch.Tensor, axis: str) -> torch.Tensor:
             if axis == "temporal":
-                return (
-                    table[start_frame : start_frame + frames].view(frames, 1, 1, -1).expand(frames, height, width, -1)
-                )
+                return table.view(frames, 1, 1, -1).expand(frames, height, width, -1)
             if axis == "height":
                 return table[:height].view(1, height, 1, -1).expand(frames, height, width, -1)
             return table[:width].view(1, 1, width, -1).expand(frames, height, width, -1)
 
         cosine = torch.cat(
             (
-                expand_axis(self._rope_temporal_cosine, "temporal"),
+                expand_axis(temporal_cosine, "temporal"),
                 expand_axis(self._rope_height_cosine, "height"),
                 expand_axis(self._rope_width_cosine, "width"),
             ),
@@ -1052,7 +1058,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         )
         sine = torch.cat(
             (
-                expand_axis(self._rope_temporal_sine, "temporal"),
+                expand_axis(temporal_sine, "temporal"),
                 expand_axis(self._rope_height_sine, "height"),
                 expand_axis(self._rope_width_sine, "width"),
             ),
