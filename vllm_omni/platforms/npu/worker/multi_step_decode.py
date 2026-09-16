@@ -528,6 +528,15 @@ def execute_multi_step_window(
             per_req_hidden: list[list[torch.Tensor]] = [[] for _ in range(num_reqs)]
             per_req_deltas: list[list[torch.Tensor]] = [[] for _ in range(num_reqs)]
             per_req_finished = [False] * num_reqs
+            # Duplex metadata (native_duplex / duplex_epoch / duplex_turn_id /
+            # llm_output_text_utf8 / turn_end) is emitted per step only for
+            # native-duplex requests.  The window keeps the last step's value
+            # per request (turn_end is OR-accumulated so a turn boundary inside
+            # the window is never lost); _build_window_output ships it in the
+            # same flat meta keys as the single-step path so Code2Wav can
+            # decide stream closure from turn_end instead of defaulting to
+            # non-duplex behavior and closing the stream prematurely.
+            per_req_meta: list[dict[str, object]] = [{} for _ in range(num_reqs)]
             sampled_steps: list[torch.Tensor] = []
             comp_cpu = runner.input_batch.num_computed_tokens_cpu
             steps_done = 0
@@ -684,6 +693,18 @@ def execute_multi_step_window(
                 # once at window end.
                 audio_deltas = None
                 finished_flags = None
+                # Duplex fields are per-step per-request values emitted only
+                # for native-duplex requests; keep the last step's value so
+                # the window output carries the same meta keys the single-step
+                # path ships (Code2Wav reads turn_end to close the stream).
+                duplex_keys = (
+                    "native_duplex",
+                    "duplex_epoch",
+                    "duplex_turn_id",
+                    "llm_output_text_utf8",
+                    "turn_end",
+                )
+                duplex_values: dict[str, list[object]] = {}
                 if isinstance(mm_outputs, dict):
                     codes = mm_outputs.get("codes")
                     if isinstance(codes, dict):
@@ -691,6 +712,10 @@ def execute_multi_step_window(
                     meta = mm_outputs.get("meta")
                     if isinstance(meta, dict):
                         finished_flags = meta.get("finished")
+                        for key in duplex_keys:
+                            value = meta.get(key)
+                            if isinstance(value, (list, tuple)):
+                                duplex_values[key] = list(value)
                 for i in range(num_reqs):
                     per_req_hidden[i].append(hidden_states[i : i + 1].detach())
                     if audio_deltas is not None and i < len(audio_deltas):
@@ -703,6 +728,24 @@ def execute_multi_step_window(
                             per_req_finished[i] = per_req_finished[i] or bool(flag.item())
                         else:
                             per_req_finished[i] = per_req_finished[i] or bool(flag)
+                    for key, values in duplex_values.items():
+                        if i < len(values):
+                            value = values[i]
+                            if key == "turn_end":
+                                # OR-accumulate so a turn boundary inside the
+                                # window is never dropped.
+                                prior = per_req_meta[i].get(key)
+                                prior_bool = (
+                                    bool(prior.item()) if isinstance(prior, torch.Tensor) else bool(prior)
+                                ) if prior is not None else False
+                                if isinstance(value, torch.Tensor):
+                                    per_req_meta[i][key] = torch.tensor(
+                                        prior_bool or bool(value.item()), dtype=torch.bool
+                                    )
+                                else:
+                                    per_req_meta[i][key] = bool(prior_bool or bool(value))
+                            else:
+                                per_req_meta[i][key] = value
 
                 # Engine binary STOP/CONTINUE token.  WIA derives it
                 # from the request-local state chain (identical values under
@@ -826,6 +869,7 @@ def execute_multi_step_window(
                 per_req_hidden,
                 per_req_deltas,
                 per_req_finished,
+                per_req_meta,
                 kv_connector_output,
                 cudagraph_stats,
             )
@@ -838,6 +882,7 @@ def _build_window_output(
     per_req_hidden: list[list[torch.Tensor]],
     per_req_deltas: list[list[torch.Tensor]],
     per_req_finished: list[bool],
+    per_req_meta: list[dict[str, object]],
     kv_connector_output: Any,
     cudagraph_stats: CUDAGraphStat | None,
 ) -> OmniModelRunnerOutput:
@@ -870,6 +915,16 @@ def _build_window_output(
         if per_req_deltas[i]:
             payload["codes.audio"] = torch.cat(per_req_deltas[i], dim=0).to("cpu")
         payload["meta.finished"] = torch.tensor(bool(per_req_finished[i]), dtype=torch.bool)
+        # Ship the window's duplex metadata under the same flat meta keys as
+        # the single-step path (meta.native_duplex, meta.duplex_epoch,
+        # meta.duplex_turn_id, meta.llm_output_text_utf8, meta.turn_end).
+        # Code2Wav's async-chunk processor reads turn_end to close the stream
+        # on the right boundary; without it a native-duplex request is treated
+        # as non-duplex and the stream can be closed prematurely.
+        for meta_key, meta_value in per_req_meta[i].items():
+            if meta_value is None:
+                continue
+            payload[f"meta.{meta_key}"] = meta_value
         pooler_output.append(flatten_payload(payload))
 
     pooler_output = pooler_output or []

@@ -335,6 +335,23 @@ def test_plan_window_refused_for_prefill_phase_request():
     assert plan_multi_step_window(scheduler, output, 8) is False
 
 
+def test_plan_window_refused_for_final_prefill_token():
+    # The base scheduler advances num_computed_tokens by the token it
+    # scheduled for this step, so the final prefill token (scheduled as a
+    # single token) leaves num_computed_tokens == num_prompt_tokens.  The
+    # gate must check the PRE-schedule count -- computed - scheduled_tokens
+    # -- so this request is refused instead of being treated as a decode
+    # step and opening a window on the prefill position.
+    requests = [make_request("r0", computed=100, prompt=100)]
+    scheduler = make_scheduler(requests)
+    output = make_scheduler_output(requests)
+    assert plan_multi_step_window(scheduler, output, 8) is False
+    # Plain decode (computed strictly past the prompt) still opens windows.
+    requests = [make_request("r0", computed=101, prompt=100)]
+    scheduler = make_scheduler(requests)
+    assert plan_multi_step_window(scheduler, make_scheduler_output(requests), 8) is True
+
+
 def test_plan_window_refused_for_logprobs_or_penalties():
     requests = [make_request("r0", max_tokens=2048)]
     requests[0].sampling_params.logprobs = 3

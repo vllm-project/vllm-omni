@@ -198,15 +198,26 @@ def scheduler_allows_multi_step(scheduler: Any) -> bool:
     return True
 
 
-def _request_admits_multi_step(request: Any) -> bool:
-    """Per-request eligibility for one multi-step window."""
+def _request_admits_multi_step(request: Any, scheduled_tokens: int = 1) -> bool:
+    """Per-request eligibility for one multi-step window.
+
+    ``scheduled_tokens`` is the number of tokens the base scheduler just
+    scheduled for this request this step; the gate must use the PRE-schedule
+    token count so the final prefill token (also scheduled as a single
+    token) cannot open a decode window.
+    """
     if request is None or request.is_finished():
         return False
     if getattr(request, "status", None) != RequestStatus.RUNNING:
         return False
     # Decode phase only: the window writes K contiguous post-prompt slots and
     # cannot interleave with chunked prefill or prefix-cache (re)computation.
-    if request.num_computed_tokens < request.num_prompt_tokens:
+    # The base scheduler already advanced num_computed_tokens by the tokens
+    # it scheduled for this step, so subtract them before comparing with the
+    # prompt length: a request executing its final prefill token has
+    # num_computed_tokens == num_prompt_tokens after the advance and would
+    # otherwise pass this gate while still in the prefill phase.
+    if request.num_computed_tokens - scheduled_tokens < request.num_prompt_tokens:
         return False
     if getattr(request, "has_encoder_inputs", False):
         return False
@@ -283,7 +294,7 @@ def plan_multi_step_window(scheduler: Any, scheduler_output: Any, steps: int) ->
         if num_tokens != 1:
             return False
         request = scheduler.requests.get(req_id)
-        if not _request_admits_multi_step(request):
+        if not _request_admits_multi_step(request, num_tokens):
             return False
         if req_id not in cached_index:
             return False
