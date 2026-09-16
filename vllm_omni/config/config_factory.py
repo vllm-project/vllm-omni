@@ -492,7 +492,7 @@ class StageConfigFactory:
 
         pipeline_cfg, deploy_cfg = inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
 
-        stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
+        stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg)
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
         applied = cls._apply_strategy_specs(stages, strategy_specs)

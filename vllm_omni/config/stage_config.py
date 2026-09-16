@@ -561,7 +561,8 @@ class DeployConfig:
     individual ``StageDeployConfig`` entries under ``stages:``.
     """
 
-    async_chunk: bool = True
+    # Async chunk's default depends on whether or not the pipeline supports it.
+    async_chunk: bool | None = None
     session_mode: str = "turn"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
@@ -601,6 +602,22 @@ _STAGE_RESERVED_KEYS = frozenset(
     }
 )
 
+# Pipeline-wide DeployConfig fields that are propagated to every stage's
+# engine args during merge. These live at top level of the deploy YAML.
+PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
+    "trust_remote_code",
+    "distributed_executor_backend",
+    "dtype",
+    "quantization",
+    "enable_prefix_caching",
+    "enable_chunked_prefill",
+    "data_parallel_size",
+    "pipeline_parallel_size",
+    "active_stream_window",
+    "custom_voice_dir",
+)
+
+
 # Fields on StageDeployConfig that are populated from engine_args dict
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 
@@ -613,7 +630,7 @@ def deploy_runtime_override_keys() -> frozenset[str]:
     They must remain overridable even if they are also modeled on
     ``OrchestratorArgs`` for top-level CLI parsing.
     """
-    return frozenset(_STAGE_DEPLOY_FIELDS) | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+    return frozenset(_STAGE_DEPLOY_FIELDS) | frozenset(PIPELINE_WIDE_ENGINE_FIELDS)
 
 
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
@@ -768,10 +785,10 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
+    # TODO (Alex): Clean this up, we should not have fallback values here
     kwargs: dict[str, Any] = {
-        "async_chunk": raw_dict.get("async_chunk", True),
+        "async_chunk": raw_dict.get("async_chunk"),
         "session_mode": raw_dict.get("session_mode", "turn"),
-        "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
@@ -781,19 +798,14 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
-    for name in (
-        "trust_remote_code",
-        "distributed_executor_backend",
-        "dtype",
-        "quantization",
-        "enable_prefix_caching",
-        "enable_chunked_prefill",
-        "data_parallel_size",
-        "pipeline_parallel_size",
-        "custom_voice_dir",
-    ):
+    for name in PIPELINE_WIDE_ENGINE_FIELDS:
         if name in raw_dict:
-            kwargs[name] = raw_dict[name]
+            value = raw_dict[name]
+            # NOTE: This is arguably bad behavior since it's a one-off for
+            # only this field. We should consider deprecating this coercion.
+            if name == "active_stream_window":
+                value = int(value or 0)
+            kwargs[name] = value
     return DeployConfig(**kwargs)
 
 
@@ -902,23 +914,6 @@ def _select_processor_funcs(
     return input_proc, next_stage_proc
 
 
-# Pipeline-wide DeployConfig fields that are propagated to every stage's
-# engine args during merge. These live at top level of the deploy YAML.
-_PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
-    "trust_remote_code",
-    "distributed_executor_backend",
-    "dtype",
-    "quantization",
-    "enable_prefix_caching",
-    "enable_chunked_prefill",
-    "data_parallel_size",
-    "pipeline_parallel_size",
-    "active_stream_window",
-    "custom_voice_dir",
-)
-PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
-
-
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -952,7 +947,7 @@ def _build_engine_args(
     engine_args["inline_diffusion"] = ps.inline_diffusion
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
-    for name in _PIPELINE_WIDE_ENGINE_FIELDS:
+    for name in PIPELINE_WIDE_ENGINE_FIELDS:
         value = getattr(deploy, name)
         if value is not None:
             engine_args[name] = value
@@ -1021,44 +1016,56 @@ def _build_extras(
     return extras
 
 
+def resolve_async_chunk_enabled(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+) -> bool:
+    """Given the pipeline config and deploy config, determine the value of async_chunk.
+    Note that this currently assumes the cli override has been externally handled.
+
+    The default is True if the model actually supports async chunk and is multistage,
+    and False otherwise. If the user tried to enable async chunk through the deploy
+    config, but it's inapplicable or unsupported, it will be disabled with a warning.
+    """
+    # Single stage should never use async chunk
+    if len(pipeline.stages) <= 1:
+        if deploy.async_chunk:
+            logger.warning(
+                "Deploy config set async_chunk=True, but async chunk is inapplicable "
+                "to single stage models. As such, it will be disabled."
+            )
+        return False
+
+    has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
+    has_next_stage_inps = any(stage.async_chunk_process_next_stage_input_func for stage in pipeline.stages)
+    supports_async_chunk = has_inter_stage_edges and has_next_stage_inps
+
+    # If async chunk was set, make sure it's supported if
+    # requested; otherwise warn and disable it.
+    if deploy.async_chunk is not None:
+        if deploy.async_chunk and not supports_async_chunk:
+            logger.warning(
+                "Deploy config set async_chunk=True, but the pipeline config does not support it; it will be disabled."
+            )
+            return False
+        return deploy.async_chunk
+
+    return supports_async_chunk
+
+
 def merge_pipeline_deploy(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
-    cli_overrides: dict[str, Any] | None = None,
 ) -> list[StageConfig]:
     """Merge pipeline + deploy + platform overrides → list[StageConfig]."""
-    if cli_overrides is None:
-        cli_overrides = {}
-
     deploy = _apply_platform_overrides(deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
-    # async_chunk is irrelevant for single-stage pipelines, so we always disable it
-    if len(pipeline.stages) <= 1:
-        deploy.async_chunk = False
-
-    # async_chunk only applies to multi-stage pipelines: a pipeline with no
-    # consumer stages (every stage has empty input_sources) has no inter-stage
-    # edges, so async_chunk is a no-op and we skip the check entirely.
-    # For pipelines that DO have inter-stage edges, require a dedicated per-step
-    # async producer (``async_chunk_process_next_stage_input_func``).
-    # ``custom_process_next_stage_input_func`` is the full-payload / connector-path
-    # producer and does NOT imply async_chunk support — pipelines like qwen2_5_omni
-    # and covo_audio have it but removed their consumer-side ``custom_process_input_func``
-    # because they don't support async_chunk, so accepting them here would silently
-    # miswire the consumer stage instead of raising a clear error.
-    _has_inter_stage_edges = any(ps.input_sources for ps in pipeline.stages)
-    if (
-        deploy.async_chunk
-        and _has_inter_stage_edges
-        and not any(ps.async_chunk_process_next_stage_input_func for ps in pipeline.stages)
-    ):
-        raise ValueError(
-            f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a dedicated async-chunk next-stage processor "
-            "(``async_chunk_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
-        )
+    # NOTE: The CLI override is applied to the Deployconfig for async chunk prior
+    # to this point. We are in the process of better organizing the creation of the
+    # DeployConfig/PipelineConfig, and this path will be removed with the incorporation
+    # of the OmniConfig.
+    deploy.async_chunk = resolve_async_chunk_enabled(pipeline, deploy)
 
     result: list[StageConfig] = []
     for ps in pipeline.stages:

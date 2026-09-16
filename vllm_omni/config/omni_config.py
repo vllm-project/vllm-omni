@@ -50,6 +50,7 @@ from vllm_omni.config.stage_config import (
     merge_sampling_constraints,
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
+    resolve_async_chunk_enabled,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -310,21 +311,6 @@ def _first_defined(*values: Any) -> Any:
         if value is not None:
             return _copy_value(value)
     return None
-
-
-def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
-    has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
-    if (
-        deploy.async_chunk
-        and has_inter_stage_edges
-        and not any(stage.async_chunk_process_next_stage_input_func for stage in pipeline.stages)
-    ):
-        raise ValueError(
-            f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a dedicated async-chunk next-stage processor "
-            "(``async_chunk_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
-        )
 
 
 def _resolve_execution_mode(execution_type: StageExecutionType) -> tuple[StageType, str | None]:
@@ -1956,17 +1942,17 @@ class VllmOmniConfig:
             deploy_config_path,
         )
 
-        if cli_overrides.get("async_chunk") is not None:
-            deploy.async_chunk = bool(cli_overrides["async_chunk"])
+        cli_async_chunk = cli_overrides.get("async_chunk")
+        if cli_async_chunk is not None:
+            deploy.async_chunk = bool(cli_async_chunk)
+
         for name in _PIPELINE_DEPLOY_CLI_FIELDS:
             if cli_overrides.get(name) is not None:
                 setattr(deploy, name, _copy_value(cli_overrides[name]))
 
         deploy = _apply_platform_overrides(deploy)
-        if len(pipeline_cfg.stages) <= 1:
-            deploy.async_chunk = False
-        _validate_async_chunk_support(pipeline_cfg, deploy)
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        deploy.async_chunk = resolve_async_chunk_enabled(pipeline_cfg, deploy)
         model = cli_overrides.get("model")
 
         stage_configs = tuple(

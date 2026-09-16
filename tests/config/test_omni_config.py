@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import fields
 from inspect import Parameter, signature
 from multiprocessing.reduction import ForkingPickler
@@ -629,6 +630,33 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
 
     assert pipeline.get_stage(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert pipeline.get_stage(1).custom_process_input_func is None
+
+
+def test_from_pipeline_config_async_chunk_none_preserves_yaml_default():
+    """Ensure passing None for async chunk in when creating from pipeline keeps yaml defaults."""
+    config = _from_pipeline_key("qwen3_tts", cli_overrides={"async_chunk": None})
+    talker_cfg = config.stage_by_id(0)
+    custom_proc = talker_cfg.custom_process_next_stage_input_func
+    assert custom_proc is not None
+    assert custom_proc.endswith("talker2code2wav_async_chunk")
+
+
+def test_from_pipeline_config_warns_when_single_stage_async_chunk_enabled(caplog: pytest.LogCaptureFixture):
+    """Ensure that we get a warning indicating async chunk is disabled if requested for single stage models."""
+    pipeline = PipelineConfig(
+        model_type="single_stage",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="stage", final_output=True),),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+        config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides={"async_chunk": True})
+
+    assert config.stage_by_id(0).connector_config.async_chunk is False
+    assert any(
+        record.levelno == logging.WARNING
+        and "async chunk is inapplicable to single stage models" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_joyai_code2wav_waits_for_full_payload():
