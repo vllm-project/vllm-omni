@@ -1,388 +1,635 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Unit tests for the SeaCache backend: SEA filter math, hook schedule, and
-per-model extractor wiring (FLUX.1, Qwen-Image, FLUX.2-klein)."""
 
+from __future__ import annotations
+
+import datetime
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.cache.seacache.backend import SeaCacheBackend
-from vllm_omni.diffusion.cache.seacache.config import SeaCacheConfig
-from vllm_omni.diffusion.cache.seacache.filter import (
-    ab_from_sigma,
+from tests.helpers.runtime import get_distributed_init_method
+from vllm_omni.diffusion.cache.seacache import (
+    SeaCacheBackend,
+    SeaCacheConfig,
+    SeaCacheRootHook,
+    apply_sea_cache_hook,
+)
+from vllm_omni.diffusion.cache.seacache.sea_filter import (
     apply_sea_filter,
-    rel_l1,
-    sea_filter_response,
+    extrapolate_residual,
+    indicator_distance,
 )
-from vllm_omni.diffusion.cache.seacache.hook import SeaCacheHook, apply_seacache_hook
-from vllm_omni.diffusion.cache.teacache.extractors import (
-    extract_flux2_klein_context,
-    extract_flux_context,
-    extract_qwen_context,
-)
+from vllm_omni.diffusion.cache.selector import get_cache_backend
+from vllm_omni.diffusion.cache.teacache.extractors import EXTRACTOR_REGISTRY, CacheContext, get_extractor
 from vllm_omni.diffusion.data import DiffusionCacheConfig
-from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-# Descending sigmas of a 6-step trajectory.
-_SIGMAS = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+
+class TinyCosmos3Transformer(torch.nn.Module):
+    """Small model that exposes a cache-neutral execution boundary."""
+
+    def _run_gen_layers(self, hidden_gen: torch.Tensor) -> torch.Tensor:
+        return hidden_gen * 2
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_ids: torch.Tensor | None = None,
+        text_mask: torch.Tensor | None = None,
+        video_shape: tuple[int, int, int] | None = None,
+        noisy_frame_mask: torch.Tensor | None = None,
+        control_latents: list[torch.Tensor] | torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del timestep, text_ids, text_mask, video_shape, noisy_frame_mask
+        if kwargs:
+            raise TypeError(f"Unexpected tiny transformer kwargs: {sorted(kwargs)}")
+        controls = (
+            []
+            if control_latents is None
+            else [control_latents]
+            if isinstance(control_latents, torch.Tensor)
+            else list(control_latents)
+        )
+        inputs = [*controls, hidden_states]
+        gen_input = torch.cat(
+            [value.movedim(1, -1).flatten(1, 3) for value in inputs],
+            dim=1,
+        )
+        return self._run_gen_layers(gen_input)
 
 
-@pytest.fixture(scope="function", autouse=True)
-def _cpu_runtime():
-    """Single-process distributed env and CPU dispatch for tiny transformers."""
-    import os
-
-    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
-    from vllm.distributed.parallel_state import (
-        cleanup_dist_env_and_memory,
-        init_distributed_environment,
-        initialize_model_parallel,
+def _extract_tiny_cosmos3_context(
+    module: TinyCosmos3Transformer,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_ids: torch.Tensor | None = None,
+    text_mask: torch.Tensor | None = None,
+    video_shape: tuple[int, int, int] | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+    control_latents: list[torch.Tensor] | torch.Tensor | None = None,
+    **kwargs,
+) -> CacheContext:
+    del timestep, text_ids, text_mask, video_shape
+    if kwargs:
+        raise TypeError(f"Unexpected tiny transformer kwargs: {sorted(kwargs)}")
+    controls = (
+        []
+        if control_latents is None
+        else [control_latents]
+        if isinstance(control_latents, torch.Tensor)
+        else list(control_latents)
     )
-
-    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
-
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29503")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    with (
-        patch(
-            "vllm_omni.diffusion.cache.seacache.hook.get_classifier_free_guidance_world_size",
-            return_value=1,
-        ),
-        patch(
-            "vllm_omni.diffusion.cache.seacache.hook.get_classifier_free_guidance_rank",
-            return_value=0,
-        ),
-        set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))),
-        patch(
-            "vllm_omni.diffusion.attention.layer.get_attn_backend_for_role",
-            return_value=(SDPABackend, None),
-        ),
-    ):
-        yield
-    cleanup_dist_env_and_memory()
-
-
-def _make_flux_module():
-    torch.manual_seed(1234)
-    module = FluxTransformer2DModel(
-        num_layers=2,
-        num_single_layers=2,
-        num_attention_heads=2,
-        attention_head_dim=16,
-        joint_attention_dim=32,
-        pooled_projection_dim=16,
-        axes_dims_rope=(4, 4, 8),
+    vision_items = [*controls, hidden_states]
+    gen_input = torch.cat(
+        [value.movedim(1, -1).flatten(1, 3) for value in vision_items],
+        dim=1,
     )
-    # vLLM linears allocate with torch.empty (filled at checkpoint load) and
-    # CustomOp bakes forward_cuda at construction; initialize the weights and
-    # force native RoPE so the forward is finite on CPU.
-    from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-
-    for param in module.parameters():
-        if param.dim() >= 2:
-            torch.nn.init.normal_(param, std=0.02)
-        else:
-            torch.nn.init.zeros_(param)
-    for sub in module.modules():
-        if isinstance(sub, RotaryEmbedding):
-            sub._forward_method = sub.forward_native
-    return module
-
-
-def _make_inputs(grid=(4, 4), txt_len=8, seed=0, sigma=1.0):
-    g = torch.Generator().manual_seed(seed)
-    h, w = grid
-    ids = torch.zeros(h, w, 3)
-    ids[..., 1] += torch.arange(h)[:, None]
-    ids[..., 2] += torch.arange(w)[None, :]
-    return {
-        "hidden_states": torch.randn(1, h * w, 64, generator=g),
-        "encoder_hidden_states": torch.randn(1, txt_len, 32, generator=g),
-        "pooled_projections": torch.randn(1, 16, generator=g),
-        "timestep": torch.tensor([sigma]),
-        "img_ids": ids.reshape(h * w, 3),
-        "txt_ids": torch.zeros(txt_len, 3),
-        "guidance": torch.tensor([3.5]),
-        "return_dict": False,
-    }
-
-
-def _count_block_runs(module):
-    runs = {"n": 0}
-    orig = module.transformer_blocks[0].forward
-
-    def counted(*args, **kwargs):
-        runs["n"] += 1
-        return orig(*args, **kwargs)
-
-    module.transformer_blocks[0].forward = counted
-    return runs
-
-
-def _get_hook(module):
-    return module._hook_registry.get_hook(SeaCacheHook._HOOK_NAME)
-
-
-def _get_state(hook, branch="positive"):
-    hook.state_manager.set_context(f"seacache_{branch}")
-    return hook.state_manager.get_state()
-
-
-def _hooked_module(thresh, num_steps=6):
-    module = _make_flux_module()
-    apply_seacache_hook(module, SeaCacheConfig(sea_thresh=thresh))
-    _get_hook(module).num_inference_steps = num_steps
-    return module
-
-
-def _response(shape, a, b, norm_mode="mean", dims=(-2, -3)):
-    return sea_filter_response(
-        shape=shape,
-        dims=dims,
-        a=a,
-        b=b,
-        power_exp=2.0,
-        norm_mode=norm_mode,
-        device=torch.device("cpu"),
+    return CacheContext(
+        modulated_input=gen_input,
+        hidden_states=gen_input,
+        encoder_hidden_states=None,
+        temb=torch.zeros_like(gen_input[:, 0]),
+        run_transformer_blocks=lambda: (module._run_gen_layers(gen_input),),
+        postprocess=lambda output: output,
+        extra_states={
+            "sea_cache_latents": vision_items,
+            "sea_cache_noisy_frame_mask": noisy_frame_mask,
+        },
     )
 
 
-def _mock_pipeline(transformer_cls="FluxTransformer2DModel", pipeline_cls="FluxPipeline"):
-    transformer = type(transformer_cls, (), {})()
-    return type(pipeline_cls, (), {"transformer": transformer})()
+class Cosmos3OmniDiffusersPipeline:
+    def __init__(self) -> None:
+        self.transformer = TinyCosmos3Transformer()
+        self._current_step_index: int | None = None
+        self._current_sigma: float | None = None
+        self._num_timesteps: int | None = None
+
+    @property
+    def current_step_index(self) -> int | None:
+        return self._current_step_index
+
+    @property
+    def current_sigma(self) -> float | None:
+        return self._current_sigma
+
+    @property
+    def num_timesteps(self) -> int | None:
+        return self._num_timesteps
 
 
-class TestSeaFilter:
-    @pytest.mark.parametrize("sigma", [0.9, 0.5, 0.1])
-    def test_normalization_pins_the_filter_gain(self, sigma):
-        a, b = ab_from_sigma(sigma)
-        for norm_mode, stat in (("mean", "mean"), ("peak", "amax")):
-            response = _response((1, 16, 16, 8), a, b, norm_mode=norm_mode)
-            assert getattr(response, stat)().item() == pytest.approx(1.0, abs=1e-5)
-
-    def test_passband_widens_as_sigma_falls(self):
-        """Guards against an inverted filter, e.g. swapped a/b."""
-        gains = []
-        for sigma in [0.95, 0.75, 0.55, 0.35, 0.15, 0.05]:
-            a, b = ab_from_sigma(sigma)
-            # fftfreq(16) reaches its maximum |f| = 0.5 at index 8.
-            gains.append(_response((16, 16), a, b, dims=(-2, -1))[8, 8].item())
-        assert all(x < y for x, y in zip(gains, gains[1:]))
-
-    def test_terminal_sigma_and_rel_l1(self):
-        # FLUX's first sigma is exactly 1.0; the clamp keeps the filter finite.
-        a, b = ab_from_sigma(1.0)
-        assert a > 0 and b < 1.0
-        assert torch.isfinite(apply_sea_filter(torch.randn(1, 8, 8, 4), a=a, b=b)).all()
-        x = torch.randn(1, 8, 8, 4, dtype=torch.bfloat16)
-        assert rel_l1(x, x) == 0.0
-        assert rel_l1(2 * x, x) == pytest.approx(1.0, rel=1e-3)
+def _latent(value: float) -> torch.Tensor:
+    return torch.full((1, 2, 2, 2, 2), value)
 
 
-class TestSeaCacheHook:
-    """Schedule and residual semantics on a tiny FLUX transformer."""
-
-    def test_zero_threshold_is_bit_identical(self):
-        """sea_thresh=0 is the uncached control: every step runs and the output
-        matches the un-hooked forward bit for bit."""
-        reference = _make_flux_module()
-        hooked = _hooked_module(0.0)
-        runs = _count_block_runs(hooked)
-        for step, sigma in enumerate(_SIGMAS):
-            inputs = _make_inputs(seed=100 + step, sigma=sigma)
-            assert torch.equal(reference(**inputs)[0], hooked(**inputs)[0])
-        assert runs["n"] == len(_SIGMAS)
-
-    def test_large_threshold_runs_first_and_last_only(self):
-        module = _hooked_module(1e9)
-        runs = _count_block_runs(module)
-        per_step = []
-        for step, sigma in enumerate(_SIGMAS):
-            before = runs["n"]
-            module(**_make_inputs(seed=200 + step, sigma=sigma))
-            per_step.append(runs["n"] - before)
-        assert per_step == [1, 0, 0, 0, 0, 1]
-
-    def test_skipped_step_reuses_the_cached_residual(self):
-        module = _hooked_module(1e9)
-        module(**_make_inputs(seed=500, sigma=1.0))
-        module(**_make_inputs(seed=501, sigma=0.8))
-        state = _get_state(_get_hook(module))
-        assert state.previous_residual is not None
-
-        skip_inputs = _make_inputs(seed=502, sigma=0.6)
-        actual = module(**skip_inputs)
-        ctx = extract_flux_context(module, **skip_inputs)
-        expected = ctx.postprocess(ctx.hidden_states + state.previous_residual)
-        assert torch.equal(expected[0], actual[0])
-
-    def test_cfg_branches_accumulate_independently(self):
-        module = _hooked_module(1e9, num_steps=4)
-        module.do_true_cfg = True
-        runs = _count_block_runs(module)
-        hook = _get_hook(module)
-        for step in range(4):
-            sigma = 1.0 - 0.25 * step
-            # Positive then negative, mirroring sequential CFG.
-            module(**_make_inputs(seed=800 + 2 * step, sigma=sigma))
-            module(**_make_inputs(seed=801 + 2 * step, sigma=sigma))
-        assert runs["n"] == 4
-        for branch in ("positive", "negative"):
-            state = _get_state(hook, branch)
-            assert state.real_steps == 2
-            assert state.skipped_steps == 2
-
-
-class TestSeaCacheExtractors:
-    def test_flux_extractor_provides_sigma_and_grid(self):
-        ctx = extract_flux_context(_make_flux_module(), **_make_inputs(sigma=0.37))
-        assert ctx.sigma == pytest.approx(0.37)
-        assert ctx.grid_hw == (4, 4)
-
-    def test_qwen_extractor_slices_to_the_noise_segment(self):
-        """Edit pipelines concatenate [noise tokens; condition tokens]; the
-        extractor must expose the noise grid so the SEA filter never sees the
-        step-constant condition segment."""
-        from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-            QwenImageTransformer2DModel,
+def _run_step(
+    transformer: TinyCosmos3Transformer,
+    timestep: int,
+    value: float,
+    *,
+    hook: SeaCacheRootHook | None = None,
+    context: str = "cond",
+    control: float | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    controls = None if control is None else [_latent(control)]
+    cache_context = hook.cache_context(context) if hook is not None else nullcontext()
+    with torch.inference_mode(), cache_context:
+        return transformer(
+            hidden_states=_latent(value),
+            timestep=torch.tensor([timestep]),
+            noisy_frame_mask=noisy_frame_mask,
+            control_latents=controls,
         )
 
-        od_config = MagicMock()
-        od_config.parallel_config.sequence_parallel_size = 1
-        torch.manual_seed(4321)
-        module = QwenImageTransformer2DModel(
-            od_config,
-            num_layers=2,
-            num_attention_heads=2,
-            attention_head_dim=16,
-            joint_attention_dim=32,
-            zero_cond_t=True,
-        )
-        g = torch.Generator().manual_seed(7)
-        # 16 noise tokens (4x4 grid) + 8 condition tokens; zero_cond_t doubles
-        # the timestep to [t, 0], broadcasting the modulation to batch 2.
-        ctx = extract_qwen_context(
-            module,
-            hidden_states=torch.randn(1, 24, 64, generator=g),
-            encoder_hidden_states=torch.randn(1, 8, 32, generator=g),
-            encoder_hidden_states_mask=torch.ones(1, 8, dtype=torch.bool),
-            timestep=torch.tensor([0.37]),
-            img_shapes=[[(1, 4, 4), (1, 2, 4)]],
-            txt_seq_lens=[8],
-        )
-        assert ctx.sigma == pytest.approx(0.37)
-        assert ctx.grid_hw == (4, 4)
-        assert ctx.grid_seq_len == 16
-        assert tuple(SeaCacheHook._decision_feature(ctx).shape) == (2, 16, 32)
 
-    def test_klein_extractor_excludes_condition_rows(self):
-        """Klein appends condition rows with T >= 10 after the noise grid
-        (the rows with T == 0)."""
-        from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
-            Flux2Transformer2DModel,
-        )
-
-        torch.manual_seed(4321)
-        module = Flux2Transformer2DModel(
-            num_layers=2,
-            num_single_layers=2,
-            num_attention_heads=2,
-            attention_head_dim=16,
-            joint_attention_dim=32,
-            axes_dims_rope=(4, 4, 4, 4),
-            guidance_embeds=False,
-        )
-
-        def rows(t_val, count):
-            return torch.cartesian_prod(
-                torch.full((1,), t_val, dtype=torch.int64),
-                torch.arange(4),
-                torch.arange(4),
-                torch.zeros(1, dtype=torch.int64),
-            )[:count]
-
-        g = torch.Generator().manual_seed(13)
-        ctx = extract_flux2_klein_context(
-            module,
-            hidden_states=torch.randn(1, 24, 128, generator=g),
-            encoder_hidden_states=torch.randn(1, 8, 32, generator=g),
-            timestep=torch.tensor([0.42]),
-            img_ids=torch.cat([rows(0, 16), rows(10, 8)]),
-            txt_ids=torch.zeros(8, 4),
-            guidance=None,
-        )
-        assert ctx.sigma == pytest.approx(0.42)
-        assert ctx.grid_hw == (4, 4)
-        assert ctx.grid_seq_len == 16
-        assert SeaCacheHook._decision_feature(ctx).shape[1] == 16
-
-    def test_run_full_stack_prefers_the_flux2_full_runner(self):
-        """Klein's run_transformer_blocks covers only the dual-stream blocks."""
-        hidden, encoder = torch.zeros(1, 4, 8), torch.zeros(1, 2, 8)
-        calls = []
-
-        def run_blocks():
-            calls.append("blocks")
-            return hidden, encoder
-
-        def run_full(h, c):
-            calls.append("full")
-            return h + 1.0, c
-
-        ctx = SimpleNamespace(
-            hidden_states=hidden,
-            encoder_hidden_states=encoder,
-            run_transformer_blocks=run_blocks,
-            extra_states={"run_flux2_full_transformer_with_single": run_full},
-        )
-        SeaCacheHook._run_full_stack(ctx)
-        assert calls == ["full"]
-        assert torch.equal(ctx.hidden_states, hidden + 1.0)
-
-
-class TestSeaCacheBackend:
-    @pytest.mark.parametrize(
-        ("kwargs", "transformer_cls", "match"),
-        [
-            ({}, "ZImageTransformer2DModel", "does not support transformer"),
-            ({"sea_thresh": -0.1}, "FluxTransformer2DModel", "non-negative"),
-            ({"sea_thresh": float("nan")}, "FluxTransformer2DModel", "finite"),
-            ({"sea_norm_mode": "lowpass"}, "FluxTransformer2DModel", "sea_norm_mode"),
-        ],
+def _apply_test_hook(
+    transformer: TinyCosmos3Transformer,
+    metadata: SimpleNamespace,
+    config: SeaCacheConfig | None = None,
+) -> SeaCacheRootHook:
+    return apply_sea_cache_hook(
+        transformer,
+        config or SeaCacheConfig(threshold=100.0),
+        current_step_callback=lambda: metadata.step,
+        current_sigma_callback=lambda: metadata.sigma,
+        num_inference_steps_callback=lambda: metadata.num_steps,
+        extractor_fn=_extract_tiny_cosmos3_context,
     )
-    @patch("vllm_omni.diffusion.cache.seacache.backend.apply_seacache_hook")
-    def test_enable_rejects_invalid_config_or_transformer(self, mock_apply_hook, kwargs, transformer_cls, match):
-        backend = SeaCacheBackend(DiffusionCacheConfig(**kwargs))
-        with pytest.raises(ValueError, match=match):
-            backend.enable(_mock_pipeline(transformer_cls))
-        mock_apply_hook.assert_not_called()
 
-    def test_refresh_resets_state_and_keeps_num_steps(self):
-        module = _make_flux_module()
-        pipeline = SimpleNamespace(transformer=module)
-        backend = SeaCacheBackend(DiffusionCacheConfig(sea_thresh=0.3))
-        backend.enable(pipeline)
-        hook = _get_hook(module)
-        hook.num_inference_steps = 28
-        _get_state(hook).skipped_steps = 5
 
-        backend.refresh(pipeline, num_inference_steps=50)
+def test_config_validation() -> None:
+    assert SeaCacheConfig().threshold == 0.25
+    with pytest.raises(ValueError, match="residual_order"):
+        SeaCacheConfig(residual_order=-1)
+    with pytest.raises(ValueError, match="max_consecutive_cached"):
+        SeaCacheConfig(max_consecutive_cached=-1)
 
-        assert hook.num_inference_steps == 50
-        assert _get_state(hook).skipped_steps == 0
 
-    @patch("vllm_omni.diffusion.cache.seacache.backend.apply_seacache_hook")
-    def test_enable_dispatches_klein_pipeline_by_alias(self, mock_apply_hook):
-        """Klein shares the Flux2Transformer2DModel class name with full Flux2,
-        so it dispatches by pipeline class to the extractor alias."""
-        backend = SeaCacheBackend(DiffusionCacheConfig(sea_thresh=0.3))
-        backend.enable(_mock_pipeline("Flux2Transformer2DModel", pipeline_cls="Flux2KleinPipeline"))
-        mock_apply_hook.assert_called_once()
-        assert mock_apply_hook.call_args.args[1].transformer_type == "Flux2Klein"
+def test_sea_filter_matches_reference_equation() -> None:
+    hidden = torch.randn(3, 4, 5, 2, dtype=torch.float32)
+    sigma = 0.4
+    power_exp = 3.0
+
+    spectrum = torch.fft.fftn(hidden, dim=(0, 1, 2))
+    gain = None
+    for axis in (0, 1, 2):
+        frequencies = torch.fft.fftfreq(hidden.shape[axis], dtype=torch.float32)
+        clean_power = 1.0 / (frequencies.abs().pow(power_exp) + 1e-16)
+        axis_gain = (1.0 - sigma) * clean_power / ((1.0 - sigma) ** 2 * clean_power + sigma**2 + 1e-16)
+        shape = [1] * hidden.ndim
+        shape[axis] = hidden.shape[axis]
+        gain = axis_gain.reshape(shape) if gain is None else gain * axis_gain.reshape(shape)
+    assert gain is not None
+    gain = gain / gain.mean()
+    expected = torch.fft.ifftn(spectrum * gain, dim=(0, 1, 2)).real
+
+    torch.testing.assert_close(
+        apply_sea_filter(hidden, sigma=sigma, power_exp=power_exp),
+        expected,
+    )
+
+
+def test_indicator_distance_and_linear_extrapolation() -> None:
+    previous = [torch.ones(2, 2)]
+    current = [torch.full((2, 2), 1.5)]
+    assert indicator_distance(current, previous) == pytest.approx(0.5)
+    assert indicator_distance([torch.ones(3)], previous) == float("inf")
+
+    history = [
+        (0, torch.full((2, 2), 2.0)),
+        (2, torch.full((2, 2), 6.0)),
+    ]
+    torch.testing.assert_close(
+        extrapolate_residual(history, step=3, order=1),
+        torch.full((2, 2), 8.0),
+    )
+    torch.testing.assert_close(
+        extrapolate_residual(history, step=3, order=0),
+        torch.full((2, 2), 6.0),
+    )
+    quadratic_history = [
+        (0, torch.zeros(2, 2)),
+        (1, torch.ones(2, 2)),
+        (2, torch.full((2, 2), 4.0)),
+    ]
+    torch.testing.assert_close(
+        extrapolate_residual(quadratic_history, step=3, order=2),
+        torch.full((2, 2), 9.0),
+    )
+
+
+def test_hook_skips_middle_steps_and_forces_endpoints() -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=4)
+    hook = _apply_test_hook(
+        transformer,
+        metadata,
+        SeaCacheConfig(threshold=100.0, max_consecutive_cached=2),
+    )
+    hook.refresh(transformer)
+
+    for step, timestep in enumerate((1000, 750, 500, 250)):
+        metadata.step = step
+        metadata.sigma = timestep / 1000
+        _run_step(transformer, timestep, 1.0 - step * 0.01, hook=hook)
+
+    assert hook.full_count == 2
+    assert hook.skip_count == 2
+    assert [step for step, _ in hook.state_manager._states["cond"].history] == [0, 3]
+
+
+def test_parameter_sharded_hook_skips_when_all_shard_ranks_agree(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook._parameter_sharded = True
+    fs_group = object()
+    reduced_groups: list[object] = []
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_fs_group",
+        lambda: SimpleNamespace(world_size=2, device_group=fs_group),
+    )
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 1)
+
+    def all_reduce(decision, *, op, group):
+        assert op == torch.distributed.ReduceOp.MAX
+        reduced_groups.append(group)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    _run_step(transformer, 1000, 1.0, hook=hook)
+    metadata.step = 1
+    metadata.sigma = 0.5
+    _run_step(transformer, 500, 0.99, hook=hook)
+
+    assert hook.full_count == 1
+    assert hook.skip_count == 1
+    assert reduced_groups == [fs_group, fs_group]
+
+
+def test_parameter_sharded_peer_forces_full_compute(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook._parameter_sharded = True
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_fs_group",
+        lambda: SimpleNamespace(world_size=2, device_group=object()),
+    )
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 1)
+    reduce_count = 0
+
+    def all_reduce(decision, *, op, group):
+        nonlocal reduce_count
+        del op, group
+        reduce_count += 1
+        if reduce_count == 2:
+            decision.fill_(1)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    _run_step(transformer, 1000, 1.0, hook=hook)
+    metadata.step = 1
+    metadata.sigma = 0.5
+    _run_step(transformer, 500, 0.99, hook=hook)
+
+    assert hook.full_count == 2
+    assert hook.skip_count == 0
+    assert hook.state_manager._states["cond"].accumulated_distance == 0.0
+
+
+def _uneven_cfg_sharded_worker(
+    rank: int,
+    init_method: str,
+    result_queue: torch.multiprocessing.Queue,
+) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=4,
+        timeout=datetime.timedelta(seconds=10),
+    )
+    try:
+        fs_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        sp_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        cfg_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 2], [1, 3])
+        ]
+        fs_group = next(group for ranks, group in fs_groups if rank in ranks)
+        sp_group = next(group for ranks, group in sp_groups if rank in ranks)
+        cfg_group = next(group for ranks, group in cfg_groups if rank in ranks)
+        parallel_state._FS = SimpleNamespace(world_size=2, device_group=fs_group)
+        parallel_state._SP = SimpleNamespace(world_size=2, device_group=sp_group)
+
+        hook = SeaCacheRootHook(SeaCacheConfig())
+        hook._parameter_sharded = True
+        hook._synchronize_compute(False, torch.device("cpu"))
+        if rank in (0, 1):
+            hook._synchronize_compute(False, torch.device("cpu"))
+
+        gathered = [torch.zeros(1) for _ in range(2)]
+        torch.distributed.all_gather(
+            gathered,
+            torch.tensor([rank], dtype=torch.float32),
+            group=cfg_group,
+        )
+        result_queue.put((rank, [int(value.item()) for value in gathered]))
+    finally:
+        parallel_state._FS = None
+        parallel_state._SP = None
+        torch.distributed.destroy_process_group()
+
+
+def test_parameter_sharded_hook_handles_uneven_cfg_branch_dispatch() -> None:
+    mp_context = torch.multiprocessing.get_context("spawn")
+    manager = mp_context.Manager()
+    result_queue = manager.Queue()
+    torch.multiprocessing.spawn(
+        _uneven_cfg_sharded_worker,
+        args=(get_distributed_init_method("seacache_uneven_cfg_"), result_queue),
+        nprocs=4,
+    )
+
+    results = sorted(result_queue.get(timeout=2) for _ in range(4))
+    assert results == [
+        (0, [0, 2]),
+        (1, [1, 3]),
+        (2, [0, 2]),
+        (3, [1, 3]),
+    ]
+
+
+def _hybrid_sp_worker(
+    rank: int,
+    init_method: str,
+    result_queue: torch.multiprocessing.Queue,
+) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=4,
+        timeout=datetime.timedelta(seconds=10),
+    )
+    try:
+        fs_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        ulysses_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        ring_groups = [
+            (ranks, torch.distributed.new_group(ranks, timeout=datetime.timedelta(seconds=10)))
+            for ranks in ([0, 2], [1, 3])
+        ]
+        sp_group = torch.distributed.new_group(
+            [0, 1, 2, 3],
+            timeout=datetime.timedelta(seconds=10),
+        )
+        fs_group = next(group for ranks, group in fs_groups if rank in ranks)
+        ulysses_group = next(group for ranks, group in ulysses_groups if rank in ranks)
+        ring_group = next(group for ranks, group in ring_groups if rank in ranks)
+        parallel_state._FS = SimpleNamespace(world_size=2, device_group=fs_group)
+        parallel_state._SP = SimpleNamespace(
+            world_size=4,
+            device_group=sp_group,
+            ulysses_world_size=2,
+            ulysses_group=ulysses_group,
+            ring_world_size=2,
+            ring_group=ring_group,
+        )
+
+        compute = rank == 3
+        non_sharded_hook = SeaCacheRootHook(SeaCacheConfig())
+        non_sharded_result = non_sharded_hook._synchronize_compute(compute, torch.device("cpu"))
+
+        sharded_hook = SeaCacheRootHook(SeaCacheConfig())
+        sharded_hook._parameter_sharded = True
+        sharded_result = sharded_hook._synchronize_compute(compute, torch.device("cpu"))
+        result_queue.put((rank, non_sharded_result, sharded_result))
+    finally:
+        parallel_state._FS = None
+        parallel_state._SP = None
+        torch.distributed.destroy_process_group()
+
+
+def test_hook_synchronizes_full_hybrid_sequence_parallel_group() -> None:
+    mp_context = torch.multiprocessing.get_context("spawn")
+    manager = mp_context.Manager()
+    result_queue = manager.Queue()
+    torch.multiprocessing.spawn(
+        _hybrid_sp_worker,
+        args=(get_distributed_init_method("seacache_hybrid_sp_"), result_queue),
+        nprocs=4,
+    )
+
+    results = sorted(result_queue.get(timeout=2) for _ in range(4))
+    assert results == [
+        (0, True, True),
+        (1, True, True),
+        (2, True, True),
+        (3, True, True),
+    ]
+
+
+def test_parameter_sharded_hook_fails_open_without_distributed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook = SeaCacheRootHook(SeaCacheConfig())
+    hook._parameter_sharded = True
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert hook._synchronize_compute(False, torch.device("cpu")) is True
+
+
+def test_hook_keeps_three_transfer_branches_separate() -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+
+    contexts = ("cond", "cond_no_control", "uncond")
+    for step, (timestep, value) in enumerate(((1000, 1.0), (500, 0.9))):
+        metadata.step = step
+        metadata.sigma = timestep / 1000
+        _run_step(transformer, timestep, value, hook=hook, context=contexts[0], control=0.5)
+        _run_step(transformer, timestep, value, hook=hook, context=contexts[1])
+        _run_step(transformer, timestep, value, hook=hook, context=contexts[2], control=0.5)
+
+    assert set(hook.state_manager._states) == set(contexts)
+    assert hook.full_count == 3
+    assert hook.skip_count == 3
+    assert len(hook.state_manager._states["cond"].previous_indicator) == 2
+    assert len(hook.state_manager._states["cond_no_control"].previous_indicator) == 1
+
+
+def test_hook_fails_open_without_noisy_vision() -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+    all_clean = torch.zeros(1, 1, 2, 1, 1)
+
+    _run_step(transformer, 1000, 1.0, hook=hook, noisy_frame_mask=all_clean)
+    metadata.step = 1
+    metadata.sigma = 0.5
+    _run_step(transformer, 500, 0.9, hook=hook, noisy_frame_mask=all_clean)
+
+    assert hook.full_count == 0
+    assert hook.skip_count == 0
+
+
+def test_conditioning_only_model_failure_runs_forward_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+    forward_calls = 0
+
+    def fail_forward(hidden_gen: torch.Tensor) -> torch.Tensor:
+        nonlocal forward_calls
+        forward_calls += 1
+        raise RuntimeError("model forward failed")
+
+    monkeypatch.setattr(transformer, "_run_gen_layers", fail_forward)
+    all_clean = torch.zeros(1, 1, 2, 1, 1)
+
+    with pytest.raises(RuntimeError, match="model forward failed"):
+        _run_step(transformer, 1000, 1.0, hook=hook, noisy_frame_mask=all_clean)
+
+    assert forward_calls == 1
+
+
+def test_hook_fails_open_without_explicit_context() -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=2)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+
+    _run_step(transformer, 1000, 1.0)
+
+    assert hook.full_count == 0
+    assert hook.skip_count == 0
+    assert hook.state_manager._states == {}
+
+
+def test_hook_uses_exact_sigma_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.cache.seacache import hook as hook_module
+
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.37, num_steps=2)
+    observed_sigmas: list[float] = []
+    original_filter = hook_module.apply_sea_filter
+
+    def recording_filter(hidden_states: torch.Tensor, sigma: float, power_exp: float) -> torch.Tensor:
+        observed_sigmas.append(sigma)
+        return original_filter(hidden_states, sigma, power_exp)
+
+    monkeypatch.setattr(hook_module, "apply_sea_filter", recording_filter)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+    _run_step(transformer, timestep=999, value=1.0, hook=hook)
+
+    assert observed_sigmas
+    assert all(sigma == pytest.approx(0.37) for sigma in observed_sigmas)
+
+
+def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(EXTRACTOR_REGISTRY, "TinyCosmos3Transformer", _extract_tiny_cosmos3_context)
+
+    class FSDPTinyCosmos3Transformer(TinyCosmos3Transformer):
+        pass
+
+    assert get_extractor(FSDPTinyCosmos3Transformer) is _extract_tiny_cosmos3_context
+    backend = get_cache_backend(
+        "sea_cache",
+        {
+            "sea_threshold": 0.4,
+            "sea_residual_order": 0,
+        },
+    )
+    assert isinstance(backend, SeaCacheBackend)
+    assert backend.config.sea_threshold == 0.4
+
+    pipeline = Cosmos3OmniDiffusersPipeline()
+    backend.enable(pipeline)
+    hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
+    assert isinstance(hook, SeaCacheRootHook)
+    assert callable(getattr(pipeline, "_cache_context_factory", None))
+    for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
+        assert not hasattr(pipeline.transformer, name)
+    pipeline._current_step_index = 0
+    pipeline._current_sigma = 1.0
+    pipeline._num_timesteps = 7
+    _run_step(pipeline.transformer, 1000, 1.0, hook=hook)
+    assert hook.full_count == 1
+
+    backend.refresh(pipeline, num_inference_steps=7)
+    assert hook.full_count == 0
+    assert hook.skip_count == 0
+    assert hook.state_manager._states == {}
+
+
+def test_backend_uses_resolved_pipeline_metadata_not_refresh_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(EXTRACTOR_REGISTRY, "TinyCosmos3Transformer", _extract_tiny_cosmos3_context)
+    pipeline = Cosmos3OmniDiffusersPipeline()
+    backend = SeaCacheBackend(DiffusionCacheConfig())
+    backend.enable(pipeline)
+    hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
+    assert isinstance(hook, SeaCacheRootHook)
+    backend.refresh(pipeline, num_inference_steps=35)
+    pipeline._num_timesteps = 50
+    pipeline._current_step_index = 0
+    pipeline._current_sigma = 1.0
+    _run_step(pipeline.transformer, 1000, 1.0, hook=hook)
+    assert hook.full_count == 1
+    assert hook.num_inference_steps_callback is not None
+    assert hook.num_inference_steps_callback() == 50
+
+    pipeline._current_step_index = 1
+    pipeline._current_sigma = 0.98
+    _run_step(pipeline.transformer, 980, 0.99, hook=hook)
+    assert hook.full_count == 1
+    assert hook.skip_count == 1
+
+
+def test_shared_config_defaults() -> None:
+    config = DiffusionCacheConfig()
+    assert config.sea_threshold == 0.25
+    assert config.sea_residual_order == 1
+    assert config.sea_max_consecutive_cached == 2
+    assert config.sea_power_exp == 3.0

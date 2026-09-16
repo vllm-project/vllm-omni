@@ -1,31 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Per-branch cache state for SeaCache, mirroring TeaCacheState."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 import torch
 
 
+@dataclass(slots=True)
 class SeaCacheState:
-    """Caching state for one CFG branch of a generation.
+    """Per-cache-context trajectory state."""
 
-    Attributes:
-        cnt: Number of forwards seen by this branch (0-based step index).
-        accumulated_rel_l1_distance: Accumulated filtered relative-L1 distance
-            since the last refresh.
-        previous_modulated_input: Block-0 modulated input of the previous step
-            (unfiltered on force-computed steps, filtered otherwise).
-        previous_residual: Cached block-stack output residual of the last
-            computed step.
-        real_steps: Steps where the transformer blocks ran.
-        skipped_steps: Steps where the cached residual was reused.
-    """
+    last_step: int | None = None
+    accumulated_distance: float = 0.0
+    previous_indicator: list[torch.Tensor] | None = None
+    history: list[tuple[int, torch.Tensor]] = field(default_factory=list)
+    consecutive_cached: int = 0
 
-    def __init__(self):
-        self.cnt = 0
-        self.accumulated_rel_l1_distance = 0.0
-        self.previous_modulated_input: torch.Tensor | None = None
-        self.previous_residual: torch.Tensor | None = None
-        self.real_steps = 0
-        self.skipped_steps = 0
+    def reset(self) -> None:
+        self.last_step = None
+        self.accumulated_distance = 0.0
+        self.previous_indicator = None
+        self.history.clear()
+        self.consecutive_cached = 0

@@ -712,8 +712,10 @@ class OmniServeCommand(CLISubcommand):
             "--cache-backend",
             type=str,
             default="none",
-            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', "
-            "'mag_cache', 'step_cache', 'sea_cache'",
+            help=(
+                "Cache backend for diffusion models, options: 'tea_cache', "
+                "'cache_dit', 'mag_cache', 'sea_cache', 'step_cache'"
+            ),
         )
         omni_config_group.add_argument(
             "--cache-config",
@@ -721,9 +723,9 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="JSON string of cache configuration. "
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
+            "SeaCache: '{\"sea_threshold\": 0.25}'. "
             'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
-            "Calibration mode: add '\"mag_calibrate\": true'. "
-            "SeaCache: '{\"sea_thresh\": 0.3}' (0.215 ~2x, 0.3 faster, 0.6 ~3x on FLUX.1).",
+            "Calibration mode: add '\"mag_calibrate\": true'",
         )
         omni_config_group.add_argument(
             "--video-output-transport",

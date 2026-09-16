@@ -19,12 +19,12 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     - cache_dit: Uses CacheDiTBackend with enable()/refresh() interface
     - tea_cache: Uses TeaCacheBackend with enable()/refresh() interface
     - mag_cache: Uses MagCacheBackend with enable()/refresh() interface
+    - sea_cache: Uses SeaCacheBackend for spectral residual caching
     - step_cache: Uses StepCacheBackend for DreamZero velocity step skip
-    - sea_cache: Uses SeaCacheBackend with enable()/refresh() interface
 
     Args:
         cache_backend: Cache backend name ("cache_dit", "tea_cache",
-            "mag_cache", "step_cache", "sea_cache", or None).
+            "mag_cache", "sea_cache", "step_cache", or None).
         cache_config: Cache configuration (dict or DiffusionCacheConfig instance).
 
     Returns:
@@ -45,12 +45,12 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         return TeaCacheBackend(cache_config)
     elif cache_backend == "mag_cache":
         return MagCacheBackend(cache_config)
-    elif cache_backend in ("sea_cache", "seacache"):
+    elif cache_backend == "sea_cache":
         return SeaCacheBackend(cache_config)
     elif cache_backend in ("step_cache", "stepcache", "step_cache_dit"):
         return StepCacheBackend(cache_config)
     else:
         raise ValueError(
             f"Unsupported cache backend: {cache_backend}. "
-            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'step_cache', 'sea_cache'"
+            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'sea_cache', 'step_cache'"
         )

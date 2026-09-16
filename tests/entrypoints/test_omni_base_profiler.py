@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for OmniBase and AsyncOmni profiler methods."""
 
 from types import SimpleNamespace
@@ -28,10 +31,14 @@ class TestOmniBaseProfiler:
     @pytest.fixture
     def omni_base_instance(self, mock_engine, mocker: MockerFixture):
         """Create an OmniBase instance with mocked dependencies."""
-        mocker.patch("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", return_value=mock_engine)
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        # ``OmniBase`` builds its engine through the ``_create_engine`` seam that
+        # ``AsyncOmni`` / ``DuplexOmni`` implement; there is no module-level
+        # engine class to patch any more.
+        mocker.patch.object(OmniBase, "_create_engine", return_value=mock_engine)
         mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
         mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
-        from vllm_omni.entrypoints.omni_base import OmniBase
 
         instance = OmniBase(model="test-model")
         return instance
@@ -48,10 +55,14 @@ class TestOmniBaseProfiler:
 
     def test_removed_diffusion_batch_size_fails_loudly(self, mock_engine, mocker: MockerFixture):
         """Legacy diffusion_batch_size callers receive an actionable error."""
-        mocker.patch("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", return_value=mock_engine)
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        # ``OmniBase`` builds its engine through the ``_create_engine`` seam that
+        # ``AsyncOmni`` / ``DuplexOmni`` implement; there is no module-level
+        # engine class to patch any more.
+        mocker.patch.object(OmniBase, "_create_engine", return_value=mock_engine)
         mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
         mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
-        from vllm_omni.entrypoints.omni_base import OmniBase
 
         with pytest.raises(TypeError, match="diffusion_batch_size.*max_num_seqs"):
             OmniBase(model="test-model", diffusion_batch_size=8)

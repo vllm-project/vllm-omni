@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 import functools
@@ -146,12 +146,19 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit", "tea_cache"],
+        choices=["cache_dit", "tea_cache", "sea_cache"],
         help=(
             "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache), "
+            "'sea_cache' (spectral latent caching with residual extrapolation). "
             "Default: None (no cache acceleration)."
         ),
+    )
+    parser.add_argument(
+        "--cache-config",
+        type=functools.partial(parse_json_object, flag_name="--cache-config"),
+        default=None,
+        help="Override cache parameters with a JSON object, e.g. '{\"sea_threshold\": 0.25}'.",
     )
     parser.add_argument(
         "--enable-cache-dit-summary",
@@ -518,6 +525,9 @@ def main():
             # Note: coefficients will use model-specific defaults based on model_type
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
+
+    if args.cache_config is not None:
+        cache_config = {**(cache_config or {}), **args.cache_config}
 
     profiler_enabled = args.profiler_config is not None
 
