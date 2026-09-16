@@ -10,9 +10,9 @@ Coverage:
 - CacheDiT + Layerwise CPU offloading (1 H100, B200, or Ascend A2) — ``full_model``
 - CacheDiT + TP=2 + VAE patch parallel=2 (2 H100s, B200s, or Ascend A2s) — ``full_model``
 
-HunyuanVideo-1.5 is a high-priority model, so only the most basic single-card deployment
-row runs on every PR (L2) and on merge (L3). The heavyweight feature combinations stay
-nightly-only (L4), together with the video similarity suites in
+HunyuanVideo-1.5 is a high-priority model. The CPU-offload row runs in the existing
+CUDA PR (L2) and merge (L3) lanes. The shared default and CacheDiT / parallel rows
+carry ``full_model`` (L4) marks, together with the video similarity suites in
 ``tests/e2e/accuracy/hunyuanvideo15_{t2v,i2v}/``.
 
 From ``tests/``::
