@@ -629,7 +629,10 @@ class Wan22I2VPipeline(
             self._flow_shift = flow_shift
 
         # Timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
+        if sample_solver == "unipc":
+            self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+        else:
+            self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 

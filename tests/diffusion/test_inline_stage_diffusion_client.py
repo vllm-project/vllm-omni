@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +10,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -78,6 +85,43 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     assert output is not None
     assert output.request_id == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_inline_non_streaming_dispatches_lifecycle_before_final(client, mock_engine):
+    lifecycle = OmniRequestOutput.from_diffusion(
+        request_id="req-lifecycle",
+        images=[],
+        custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+        finished=False,
+    )
+    intermediate = OmniRequestOutput.from_diffusion(
+        request_id="req-lifecycle",
+        images=[],
+        custom_output={"chunk": 0},
+        finished=False,
+    )
+    final = OmniRequestOutput.from_diffusion(request_id="req-lifecycle", images=[MagicMock()])
+
+    async def _step_streaming(_request):
+        yield [lifecycle]
+        yield [intermediate]
+        yield [final]
+
+    mock_engine.step_streaming = _step_streaming
+
+    await client.add_request_async("req-lifecycle", "A test prompt", OmniDiffusionSamplingParams())
+
+    outputs = []
+    for _ in range(20):
+        output = client.get_diffusion_output_nowait()
+        if output is not None:
+            outputs.append(output)
+            if output.finished:
+                break
+        await asyncio.sleep(0.01)
+
+    assert outputs == [lifecycle, final]
 
 
 @pytest.mark.asyncio

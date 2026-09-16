@@ -523,7 +523,7 @@ def test_cfm_graph_receives_bfloat16_cache_in_compute_dtype():
     seen_dtypes: list[torch.dtype] = []
 
     class RecordingGraph:
-        def replay(self, estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out):
+        def replay(self, estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out, attn_mask=None):
             del time_embedding, cnn_cache
             seen_dtypes.append(att_cache.dtype)
             return estimator_input[:, :1], cnn_out, att_out
@@ -1313,3 +1313,103 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     assert prompt_key not in model._runtime_prompts
     assert not Path(prompt_wav).exists()
     assert (prompt_cache_id, prompt_wav) not in model.backend._prompt_features
+
+
+def _eager_cfm_wrapper(estimator: nn.Module) -> SimpleNamespace:
+    """A CFM graph wrapper that honours the contract but runs eagerly.
+
+    ``_decode_cfm`` only takes the padded path when a wrapper is present, so
+    CPU tests that need that path (CUDA graphs are unavailable here) supply
+    this in place of the real wrapper.
+    """
+
+    def replay(estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out, attn_mask=None):
+        output = estimator.blocks_forward_chunk(
+            estimator_input,
+            time_emb,
+            attn_mask,
+            cnn_cache,
+            att_cache,
+            cnn_out,
+            att_out,
+        )
+        return output, cnn_out, att_out
+
+    return SimpleNamespace(enabled=True, replay=replay)
+
+
+def _padded_decode_adapter(bucket_frames: int) -> tuple[BatchedToken2Wav, int, int]:
+    """Build an adapter over a real ``DiT`` that exercises the CFM path.
+
+    Returns the adapter, the valid width, and the padding width. Every call
+    seeds the same way, so two adapters built here agree on weights and noise.
+    """
+    from cosyvoice2.flow.decoder_dit import DiT
+
+    torch.manual_seed(23)
+    estimator = DiT(
+        in_channels=4,
+        out_channels=1,
+        depth=2,
+        num_heads=2,
+        head_dim=2,
+        hidden_size=4,
+    ).eval()
+    token2wav = _FakeToken2Wav()
+    token2wav.flow.decoder.estimator = estimator
+    token2wav.flow.decoder.rand_noise = torch.randn(1, 1, 160)
+    adapter = BatchedToken2Wav(token2wav)
+    adapter._cfm_graph_wrapper = _eager_cfm_wrapper(estimator)
+    adapter._cfm_graph_bucket_frames = bucket_frames
+    mel_frames = 51  # the 16-frame grid pads this to 64
+    pad_frames = (-(-mel_frames // 16) * 16 - mel_frames) if bucket_frames else 0
+    return adapter, mel_frames, pad_frames
+
+
+def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():
+    """Caches the next chunk reads must not carry padding.
+
+    The padded steps still run, so ``step_cnn``/``step_att`` come back with
+    padding-derived values in them. Unless those positions are cleared, the
+    following chunk consumes them as its keys and as its CNN left context.
+    This drives a padded chunk through the real ``DiT`` and checks both caches
+    at the boundary.
+    """
+    adapter, mel_frames, pad_frames = _padded_decode_adapter(bucket_frames=16)
+    assert pad_frames == 13
+
+    mu = torch.randn(1, 1, mel_frames)
+    cond = torch.zeros(1, 1, mel_frames)
+    speakers = torch.randn(1, 1)
+    with torch.no_grad():
+        x, cnn, att = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+
+    assert int(x.shape[2]) == mel_frames
+    assert int(att.shape[4]) == mel_frames + pad_frames
+    # These columns become the next chunk's keys.
+    assert torch.count_nonzero(att[..., mel_frames : mel_frames + pad_frames, :]) == 0
+    # This tail becomes the next chunk's CNN left context.
+    assert torch.count_nonzero(cnn[..., -pad_frames:]) == 0
+
+
+def test_padding_does_not_change_the_valid_frames():
+    """A padded chunk returns the same valid frames as an exact-width one.
+
+    Masking takes the padded keys out of the attention and the padded CNN tail
+    never reaches the valid positions, so the only difference between the two
+    runs is the capture shape -- not the audio the chunk produces.
+    """
+    padded, mel_frames, pad_frames = _padded_decode_adapter(bucket_frames=16)
+    exact, _, exact_pad = _padded_decode_adapter(bucket_frames=0)
+    assert pad_frames == 13
+    assert exact_pad == 0
+
+    mu = torch.randn(1, 1, mel_frames, generator=torch.Generator().manual_seed(5))
+    cond = torch.zeros(1, 1, mel_frames)
+    speakers = torch.randn(1, 1, generator=torch.Generator().manual_seed(7))
+    with torch.no_grad():
+        padded_x, _, _ = padded._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+        exact_x, _, _ = exact._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+
+    assert int(padded_x.shape[2]) == int(exact_x.shape[2]) == mel_frames
+    assert torch.allclose(padded_x, exact_x, atol=1e-5)
