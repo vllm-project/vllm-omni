@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from typing import Literal
@@ -28,6 +31,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    cfg_companion_ids: dict[str, str] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
