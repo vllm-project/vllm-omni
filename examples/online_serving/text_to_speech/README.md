@@ -13,9 +13,11 @@ For the full list of supported architectures across all modalities, see
 ## Supported Models
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
-| --- | --- | --- | --- | --- | --- |
+|---|---|---|---|---|---|
+| Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | `stream=true` response, non-chunk | uploaded audio voice only; no presets | — |
 | IndexTTS-2.5 | native `checkpoints/` bundle | ✓ (`ref_audio` or uploaded `voice`) | `stream=true` response, non-chunk | uploaded audio voice only; no presets | — |
@@ -95,11 +97,51 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
+Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard and IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
 
 ---
+
+## Gepard-1.0
+
+Single-stage native AR TTS at 22.05 kHz mono. Zero-shot only: omit `voice` or pass `"default"`. Voice cloning from reference audio is not available yet.
+
+### Prerequisites
+
+Same NeMo NanoCodec install as the [offline Gepard section](../../offline_inference/text_to_speech/README.md#gepard-10). On a host whose CUDA toolkit cannot build kernels — no `nvcc`/`ninja`, or a consumer Blackwell (`sm_120`) card — also `export VLLM_USE_FLASHINFER_SAMPLER=0` before launch (same note as offline). That env is not a deploy-YAML field.
+
+### Launch
+
+```bash
+vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
+    --stage-init-timeout 900 \
+    --deploy-config vllm_omni/deploy/gepard.yaml
+# or:
+./gepard/run_server.sh
+```
+
+`--stage-init-timeout 900` matches the online e2e fixture and the offline example. Serve defaults to 300s, which is often too short for a cold download of the talker plus NanoCodec.
+
+The packaged `vllm_omni/deploy/gepard.yaml` must be passed with `--deploy-config`. The checkpoint self-identifies as `qwen3_5_text`, so omitting the YAML launches a diffusion fallback instead of the Gepard pipeline. The YAML sets `async_chunk: false`, `max_num_seqs: 4`, and currently pins `seed: 42`, so serving is deterministic by default until that YAML seed is removed. Pass an explicit per-request `seed` in tests and clients rather than depending on either default.
+
+### Sending requests
+
+```bash
+python examples/online_serving/text_to_speech/gepard/speech_client.py \
+    --text "Hello, this is Gepard speaking."
+
+python examples/online_serving/text_to_speech/gepard/speech_client.py \
+    --text "Hello, this is Gepard speaking." --seed 7 --stream --output output.pcm
+```
+
+### Notes
+
+- Output: 22.05 kHz mono. `max_new_tokens` is a **frame** budget (1 token = 1 frame = 1024 samples ≈ 46.4 ms at 21.5 fps; adapter bounds 1..4096).
+- Supported request fields: `input` (required), `voice` (`default` only), `response_format` (`wav` default; `wav/pcm/flac/mp3` non-streaming; `opus` 400 because 22.05 kHz is not an Opus sample rate; streaming `pcm/wav` only), `stream` / `stream_format`, `max_new_tokens`, `seed`.
+- Unsupported: `speed`, `extra_params` (including `temperature`/`top_p`/`top_k`), `ref_audio`, `ref_text`, `speaker_embedding`, `task_type`, `instructions`, `language`, and `word_timestamps`.
+- Concurrent requests at `max_num_seqs: 4` are supported. Native-AR recompute preemption is a known limitation of this architecture (a request that is preempted mid-generation can resume incorrectly); keep concurrency at or below `max_num_seqs` and treat preemption as out of scope until the platform fix lands.
+- Optional comparison against the upstream Gepard reference server needs Blackwell/Hopper + CUDA 13 + Postgres and is not part of CI.
 
 ## dots.tts
 
@@ -1025,3 +1067,63 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 - Voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 - Voice cloning is gated upstream and may require a recent `mistral_common`.
 - A standalone CLI client is not yet shipped; the gradio demo is the canonical reference for now.
+
+## Breeze-TTS-2
+
+Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder → bundled Qwen3-TTS codec) at 24 kHz mono, from [BreezeBlue](https://huggingface.co/BreezeBlue/Breeze-TTS-2). Four modes are selected automatically from the request fields: plain (`input`), voice design (`instructions`), clone (`ref_audio`+`ref_text`), and voice direction (reference trio + `instructions`).
+
+### Launch
+
+```bash
+vllm serve BreezeBlue/Breeze-TTS-2 --omni --port 8091
+# or:
+./breeze_tts_2/run_server.sh
+```
+
+The deploy config at `vllm_omni/deploy/breeze_tts_2.yaml` auto-loads (async-chunk streaming, 8-frame inter-stage chunks).
+
+### Sending requests
+
+```bash
+# Plain synthesis (speaker tags S0..S9, default S0)
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Breeze TTS 2 on vLLM-Omni.",
+        "voice": "S0",
+        "response_format": "wav",
+        "sample_rate": 24000
+    }' --output breeze_plain.wav
+
+# Voice direction (clone a reference, then steer the delivery)
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "We need to discuss what happened last night.",
+        "ref_audio": "file:///path/to/reference.wav",
+        "ref_text": "The exact transcript of the reference audio.",
+        "instructions": "Speak slowly with a restrained, serious tone.",
+        "response_format": "wav"
+    }' --output breeze_direction.wav
+```
+
+### Streaming PCM
+
+```bash
+curl -N -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Streaming output from Breeze TTS 2.",
+        "stream": true,
+        "stream_format": "audio",
+        "response_format": "pcm",
+        "sample_rate": 24000
+    }' --output breeze_stream.pcm
+```
+
+### Notes
+
+- Only `sample_rate=24000` is accepted; `speed` must be `1.0`.
+- `guidance_scale`/`cfg_scale` must be `1.0`; `negative_prompt` is rejected (CFG companion support is a follow-up).
+- `instructions` without `ref_audio` is voice design; with `ref_audio`+`ref_text` it is voice direction.
+- See [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the full recipe and the offline example under [`examples/offline_inference/text_to_speech/breeze_tts_2/`](../../offline_inference/text_to_speech/breeze_tts_2/).

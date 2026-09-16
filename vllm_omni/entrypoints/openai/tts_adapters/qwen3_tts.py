@@ -374,6 +374,12 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         elif params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
 
+        # Do not set ``full_utterance_decode`` here. That flag is an explicit
+        # Code2Wav emit opt-in (offline / advanced callers via
+        # additional_information) and must stay independent of prompt-mode
+        # ``non_streaming_mode`` (#4198 / #6898). Online serving keeps the
+        # default windowed async-chunk path (incl. #5202 incremental decode).
+
         return params
 
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:

@@ -1332,6 +1332,10 @@ class TestDeployConfigLoading:
         assert deploy.duplex_session.max_sessions == max_sessions
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert stages[0].yaml_extras["default_sampling_params"]["stop_token_ids"] == [
+            151704,
+            151645,
+        ]
 
     def test_load_minicpmo_default_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
@@ -2583,6 +2587,26 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "rocm"])
+    def test_qwen3_tts_default_code2wav_dtype_is_bf16(self, deploy_name, platform):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+
+        assert stages[1].yaml_engine_args["dtype"] == "bfloat16"
+
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
+    def test_qwen3_tts_propagates_explicit_code2wav_dtype(self, deploy_name, platform, dtype):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        deploy.stages[1].engine_extras["dtype"] = dtype
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+
+        assert stages[1].yaml_engine_args["dtype"] == dtype
+
     def test_higgs_audio_v3_rocm_uses_triton_attention(self):
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
@@ -3212,7 +3236,7 @@ class TestSentinelDefaultPrecedence:
 
 
 class TestSamplingConstraintsPrecedence:
-    """Test that pipeline sampling_constraints override deploy defaults."""
+    """Test scalar constraint precedence and additive required stop tokens."""
 
     def test_constraints_win(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -3231,6 +3255,47 @@ class TestSamplingConstraintsPrecedence:
         assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
         # Pipeline says stop_token_ids=[2150] for talker
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [2150]
+
+    def test_required_stop_tokens_extend_yaml_defaults(self, tmp_path):
+        pipeline = PipelineConfig(
+            model_type="required_stop_tokens",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="thinker",
+                    final_output=True,
+                    sampling_constraints={
+                        "detokenize": True,
+                        "stop_token_ids": [151704, 151645],
+                    },
+                ),
+            ),
+        )
+        deploy_path = tmp_path / "required-stop-tokens.yaml"
+        deploy_path.write_text(
+            """
+stages:
+  - stage_id: 0
+    default_sampling_params:
+      max_tokens: 7
+      stop_token_ids: [100, 151704]
+""",
+            encoding="utf-8",
+        )
+
+        legacy_stage = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))[0]
+        structured_stage = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            deploy_config_path=str(deploy_path),
+        ).stage_by_id(0)
+        expected = {
+            "max_tokens": 7,
+            "detokenize": True,
+            "stop_token_ids": [100, 151704, 151645],
+        }
+
+        assert legacy_stage.yaml_extras["default_sampling_params"] == expected
+        assert structured_stage.model_config.default_sampling_params == expected
 
 
 class TestPipelineConfigResolvers:

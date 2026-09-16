@@ -86,7 +86,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import _warmup_duplex_realtime
@@ -138,6 +138,10 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationResponse,
     ResponseFormat,
 )
+from vllm_omni.entrypoints.openai.protocol.rollout import (
+    CreateSessionRequest,
+    RolloutStepRequest,
+)
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
     VideoGenerationRequest,
@@ -146,8 +150,14 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.rollout_session import (
+    RolloutSessionCapacityError,
+    RolloutSessionClosedError,
+    RolloutSessionNotFoundError,
+)
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -190,6 +200,8 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingName
 
 logger = init_logger(__name__)
 router = APIRouter()
+
+VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
 
 profiler_router = APIRouter()
 
@@ -604,6 +616,10 @@ async def omni_init_app_state(
             engine_client=engine_client,
             model_name=model_name,
         )
+        if state.openai_serving_realtime_robot is not None:
+            state.rl_rollout_serving = ServingRLRollout(state.openai_serving_realtime_robot)
+        else:
+            state.rl_rollout_serving = None
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -949,6 +965,7 @@ async def omni_init_app_state(
         stage_configs=state.stage_configs,
     )
     state.openai_serving_realtime_robot = None
+    state.rl_rollout_serving = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1529,6 +1546,78 @@ async def duplex_websocket(websocket: WebSocket):
     await handler.handle_session(websocket)
 
 
+# RL Rollout serving (RFC #3747, P0)
+
+
+def _rl_rollout_serving(request: Request) -> ServingRLRollout:
+    serving = getattr(request.app.state, "rl_rollout_serving", None)
+    if serving is None:
+        raise HTTPException(status_code=501, detail="RL rollout serving not available for this model.")
+    return serving
+
+
+@router.post("/v1/realtime/sessions")
+async def create_rollout_session(body: CreateSessionRequest, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.create_session(body)).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RolloutSessionCapacityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/v1/realtime/sessions/{session_id}/step")
+async def rollout_step(session_id: str, body: RolloutStepRequest, request: Request):
+    serving = _rl_rollout_serving(request)
+    response = await serving.step(session_id, body)
+    if response.error is not None:
+        status_code = None
+        if response.error.code == "session_not_found":
+            status_code = 404
+        elif response.error.code == "session_closed":
+            status_code = 410
+        elif response.error.code in {"invalid_request", "step_already_committed", "step_out_of_order"}:
+            status_code = 400
+        if status_code is not None:
+            return JSONResponse(content=response.model_dump(), status_code=status_code)
+    return response.model_dump()
+
+
+@router.post("/v1/realtime/sessions/{session_id}/reset")
+async def reset_rollout_session(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.reset_session(session_id)).model_dump()
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
+
+
+@router.post("/v1/realtime/sessions/{session_id}/close")
+async def close_rollout_session(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        await serving.close_session(session_id)
+        return {"session_id": session_id, "closed": True}
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        return {"session_id": session_id, "closed": True}
+
+
+@router.get("/v1/realtime/sessions/{session_id}/status")
+async def rollout_session_status(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.get_status(session_id)).model_dump()
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
+
+
 # Health and Model endpoints for diffusion mode
 
 
@@ -1605,7 +1694,9 @@ def _build_image_generation_response(
     output_format = _choose_output_format(request.output_format or "png", None)
     image_data = [
         ImageData(
-            b64_json=encode_image_base64_with_compression(image, format=output_format),
+            b64_json=encode_image_base64_with_compression(
+                image, format=output_format, output_compression=request.output_compression
+            ),
             revised_prompt=None,
         )
         for image in images
@@ -2429,11 +2520,11 @@ async def retrieve_video(video_id: str) -> VideoResponse | JSONResponse:
 
 
 @router.delete("/v1/videos/{video_id}")
-async def delete_video(video_id: str) -> VideoDeleteResponse:
+async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteResponse:
     """Delete a stored video job and any generated output.
 
-    If the job is still queued or running, this endpoint first attempts to
-    cancel the in-flight generation task before removing the stored metadata.
+    In-flight jobs get a bounded engine abort, then frontend cancel. The job
+    is re-read afterwards so a completed save is not orphaned.
 
     Args:
         video_id: Identifier of the video job to delete.
@@ -2450,19 +2541,37 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
         raise HTTPException(status_code=404, detail="Video not found")
 
     if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
+        handler = raw_request.app.state.openai_serving_video
+        try:
+            await asyncio.wait_for(handler.abort_request(video_id), timeout=VIDEO_ABORT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out aborting video request %s after %.1fs; "
+                "engine abort is best-effort until the current batch drains",
+                video_id,
+                VIDEO_ABORT_TIMEOUT_S,
+            )
+        except Exception:
+            logger.exception("Failed to abort in-flight video request %s", video_id)
         task = await VIDEO_TASKS.get(video_id)
         if task is not None:
             task.cancel()
             try:
-                await asyncio.wait_for(task, timeout=2.0)
+                # Cancel cleanup may spend a full abort budget; +2s covers scheduling slack.
+                await asyncio.wait_for(task, timeout=VIDEO_ABORT_TIMEOUT_S + 2.0)
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:
                 pass
 
+        job = await VIDEO_STORE.get(video_id)
+        if job is None:
+            return VideoDeleteResponse(id=video_id, deleted=True)
+        if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
             await VIDEO_STORE.pop(video_id)
             return VideoDeleteResponse(id=job.id, deleted=True)
-    elif job.status is VideoGenerationStatus.FAILED:
+
+    if job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:
                 await STORAGE_MANAGER.delete(video_id)

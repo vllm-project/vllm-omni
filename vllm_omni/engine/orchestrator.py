@@ -35,6 +35,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -1199,7 +1200,8 @@ class Orchestrator:
                                 idle = False
                                 continue
 
-                            pool.record_output_timestamps([diffusion_output])
+                            if not is_diffusion_request_started_output(diffusion_output):
+                                pool.record_output_timestamps([diffusion_output])
                             processed = [diffusion_output]
                         else:
                             raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
@@ -1441,7 +1443,8 @@ class Orchestrator:
                         if self._absorb_diffusion_metrics(stage_id, replica_id, payload):
                             self._orch_monitor.note_loop(idle=False)
                             continue
-                        pool.record_output_timestamps([payload])
+                        if not is_diffusion_request_started_output(payload):
+                            pool.record_output_timestamps([payload])
                         processed = [payload]
                     else:
                         processed = await self._process_llm_stage_outputs(
@@ -2148,6 +2151,7 @@ class Orchestrator:
         *,
         mm_features: list | None = None,
         resumable: bool = False,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> Any:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2160,6 +2164,7 @@ class Orchestrator:
                 resumable=resumable,
             )
             request.external_req_id = request.request_id
+            request.payload_sender_info = payload_sender_info
             return request
 
         processor = self._get_stage_input_processor(next_stage_id)
@@ -2181,6 +2186,7 @@ class Orchestrator:
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
+        request.payload_sender_info = payload_sender_info
         return request
 
     @staticmethod
@@ -2829,6 +2835,7 @@ class Orchestrator:
                 params=params,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
+                payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
             )
 
             if already_submitted:
@@ -2967,6 +2974,7 @@ class Orchestrator:
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
                 )
+                request.payload_sender_info = self._build_payload_sender_info(next_stage_id - 1, request_id=request_id)
                 request.external_req_id = request.request_id
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(
@@ -3042,6 +3050,23 @@ class Orchestrator:
             sender_infos[sender_stage_id] = sender_info
 
         return sender_infos or None
+
+    def _build_payload_sender_info(
+        self,
+        sender_stage_id: int,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
+            return None
+        sender_pool = self.stage_pools[sender_stage_id]
+        sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
+        if sender_stage is None:
+            sender_stage = sender_pool.stage_client
+        get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
+        if not callable(get_sender_info):
+            return None
+        return get_sender_info()
 
     # ---- Shutdown / lifecycle ----
 

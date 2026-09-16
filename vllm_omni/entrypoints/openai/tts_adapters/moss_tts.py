@@ -13,6 +13,7 @@ from vllm.inputs import tokens_input
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
+    OutputPolicy,
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
 
 
 class _MossTTSAdapterBase(ARTTSAdapter):
+    accumulate_nonstreaming: bool = False
+
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._moss_variant = None if self.name == "moss_tts_nano" else self._detect_moss_variant()
@@ -369,7 +372,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
-        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
+        return PreparedRequest(
+            prompt=prompt,
+            tts_params=tts_params,
+            model_type=self.name,
+            output_policy=OutputPolicy(accumulate_nonstreaming=self.accumulate_nonstreaming),
+        )
 
     def apply_sampling_overrides(
         self,
@@ -385,6 +393,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 class MossTTSNanoAdapter(_MossTTSAdapterBase):
     stage_keys = frozenset({"moss_tts_nano"})
     name = "moss_tts_nano"
+    accumulate_nonstreaming = True
 
 
 @register_tts_adapter

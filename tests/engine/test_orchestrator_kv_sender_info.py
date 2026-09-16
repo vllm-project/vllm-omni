@@ -1,13 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from vllm import SamplingParams
+from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_engine_core_client import (
+    DPLBStageEngineCoreClient,
+    StageEngineCoreClient,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -28,7 +37,7 @@ class _DummySenderStage:
 class _DummyDiffusionStage:
     stage_type = "diffusion"
     final_output = True
-    custom_process_input_func = None
+    custom_process_input_func: Callable[..., Any] | None = None
 
     def __init__(self, engine_input_source=None):
         self.engine_input_source = engine_input_source or [0]
@@ -52,6 +61,97 @@ def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePo
         output_processor=object(),
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
+
+
+@pytest.mark.parametrize(
+    ("client_class", "base_client_class"),
+    [
+        (StageEngineCoreClient, AsyncMPClient),
+        (DPLBStageEngineCoreClient, DPLBAsyncMPClient),
+    ],
+)
+def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
+    monkeypatch, client_class, base_client_class
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            omni_kv_config=None,
+            hf_config=None,
+            stage_connector_config=None,
+        )
+    )
+    metadata = SimpleNamespace(
+        stage_id=0,
+        replica_id=0,
+        stage_type="llm",
+        model_stage="main",
+        is_comprehension=False,
+        requires_multimodal_data=False,
+        engine_input_source=[],
+        final_output=False,
+        final_output_type=None,
+        default_sampling_params=None,
+        prompt_transform_func=None,
+        prompt_expand_func=None,
+        custom_process_input_func=None,
+    )
+
+    def fake_base_init(self, config, *_args, **_kwargs):
+        self.vllm_config = config
+        self.resources = SimpleNamespace(engine_dead=False)
+
+    monkeypatch.setattr(base_client_class, "__init__", fake_base_init)
+
+    client = client_class(vllm_config, object, metadata=metadata)
+
+    assert client.vllm_config is vllm_config
+    assert client.get_payload_sender_info() is None
+
+
+@pytest.mark.parametrize("outgoing", [False, True])
+@pytest.mark.parametrize("base_port", [None, 48000])
+def test_payload_sender_endpoint_matches_resolver_with_unequal_replicas(outgoing, base_port):
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
+
+    edge = {"host": "10.0.0.2", "from_stage": 1}
+    if base_port is not None:
+        edge["zmq_port"] = base_port
+    extra = (
+        {
+            "role": "receiver",
+            "host": "10.0.0.1",
+            "zmq_port": 47000,
+            "from_stage": 0,
+            "outgoing": edge,
+        }
+        if outgoing
+        else {"role": "sender", **edge}
+    )
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 1
+    client.replica_id = 3
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_connector_config={"name": "NixlConnector", "extra": extra})
+    )
+    producer = resolve_connector_spec(
+        ConnectorSpec(name="NixlConnector", extra=extra),
+        stage_id=1,
+        role=extra["role"],
+        replica_id=client.replica_id,
+    )
+    consumer = resolve_connector_spec(
+        ConnectorSpec(name="NixlConnector", extra=edge), stage_id=2, role="receiver", replica_id=7
+    )
+
+    sender_info = client._build_payload_sender_info()
+
+    assert sender_info == {
+        "host": "10.0.0.2",
+        "zmq_port": (50051 if base_port is None else base_port) + 3 * 1024 + 1,
+    }
+    assert sender_info["zmq_port"] == producer.extra["zmq_port"]
+    assert sender_info["zmq_port"] != consumer.extra["sender_zmq_port"]
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
@@ -259,3 +359,58 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
         0: {"host": "10.0.0.3", "zmq_port": 50151},
     }
     assert req_state.stage_submit_ts[1] > 0
+
+
+def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
+    orchestrator = object.__new__(Orchestrator)
+    endpoints = {"a": {"host": "10.0.0.2", "zmq_port": 52099}, "b": {"host": "10.0.0.3", "zmq_port": 54147}}
+    source = SimpleNamespace(
+        get_bound_client=lambda key: SimpleNamespace(get_payload_sender_info=lambda: endpoints[key]),
+        get_bound_replica_id=lambda key: {"a": 2, "b": 4}[key],
+    )
+    submitted = {}
+
+    async def submit(key, state, request, **kwargs):
+        await asyncio.sleep(0)
+        submitted[key] = request
+
+    target = SimpleNamespace(
+        stage_type="llm",
+        stage_client=SimpleNamespace(engine_input_source=[0]),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=None, max_model_len=64)),
+        submit_initial=submit,
+        get_bound_replica_id=lambda key: {"a": 7, "b": 1}[key],
+    )
+    orchestrator.stage_pools = [source, target]
+    orchestrator._stage_receives_async_chunks = lambda stage: True
+    orchestrator._record_duplex_stage_submission = lambda *args: None
+    orchestrator._emit_tx_edge = lambda **kwargs: None
+
+    async def dispatch(callback, **kwargs):
+        await callback()
+        return True
+
+    orchestrator._dispatch_or_fail_request = dispatch
+
+    async def run():
+        await asyncio.gather(
+            *[
+                orchestrator._prewarm_async_chunk_stages(
+                    key,
+                    SimpleNamespace(prompt_token_ids=[1]),
+                    OrchestratorRequestState(
+                        request_id=key,
+                        prompt={},
+                        sampling_params_list=[SamplingParams(), SamplingParams()],
+                        final_stage_id=1,
+                    ),
+                )
+                for key in endpoints
+            ]
+        )
+
+    asyncio.run(run())
+    from vllm_omni.engine import OmniEngineCoreRequest
+
+    assert all(isinstance(request, OmniEngineCoreRequest) for request in submitted.values())
+    assert {key: request.payload_sender_info for key, request in submitted.items()} == endpoints

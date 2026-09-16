@@ -970,16 +970,29 @@ def _build_engine_args(
     return engine_args
 
 
+def merge_sampling_constraints(
+    sampling_params: Mapping[str, Any] | None,
+    constraints: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply scalar constraints and extend stop tokens without mutating inputs."""
+    resolved_constraints = dict(constraints)
+    if "stop_token_ids" in resolved_constraints:
+        caller_stop_ids = (sampling_params or {}).get("stop_token_ids") or []
+        required_stop_ids = resolved_constraints["stop_token_ids"] or []
+        resolved_constraints["stop_token_ids"] = list(dict.fromkeys([*caller_stop_ids, *required_stop_ids]))
+    return {**(sampling_params or {}), **resolved_constraints}
+
+
 def _build_extras(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
 ) -> dict[str, Any]:
     """Assemble ``yaml_extras`` (sampling + connectors + pipeline extras)."""
     extras: dict[str, Any] = {}
-    sampling: dict[str, Any] = {}
-    if ds is not None and ds.default_sampling_params:
-        sampling.update(ds.default_sampling_params)
-    sampling.update(ps.sampling_constraints)
+    sampling = merge_sampling_constraints(
+        ds.default_sampling_params if ds is not None else None,
+        ps.sampling_constraints,
+    )
     if sampling:
         extras["default_sampling_params"] = sampling
     if ds is not None and ds.default_pooling_params:

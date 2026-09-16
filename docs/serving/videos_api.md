@@ -109,6 +109,16 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 The final content is available from `/v1/videos/{video_id}/content` after the
 job status becomes `completed`.
 
+`queued` means the request is still waiting for diffusion scheduler admission.
+The status changes to `in_progress` when the scheduler first selects the
+request for execution.
+
+`DELETE /v1/videos/{video_id}` issues a bounded engine abort
+(`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
+task. Cancellation cleanup is also bounded and best-effort: it confirms
+the abort was queued, and the current request batch may still drain.
+The job is then re-read so a completed save is not orphaned.
+
 ### Synchronous Response
 
 `POST /v1/videos/sync` blocks until generation finishes and returns raw video
@@ -233,6 +243,34 @@ curl -X POST http://localhost:8091/v1/videos/sync \
   -F "fps=16" \
   -o output.mp4
 ```
+
+## Output Encoding
+
+These `extra_params` control how the server turns decoded frames into MP4 bytes.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `preencode_mp4` | boolean | false | Encode the MP4 on the worker while the VAE is still decoding, instead of after the full video is materialized |
+| `video_codec_options` | object | null | Encoder options passed through to the H.264 encoder, such as `{"preset": "ultrafast", "threads": "0"}` |
+
+With `preencode_mp4` enabled, each committed VAE chunk leaves the accelerator and
+is encoded while later chunks are still decoding, so host transfer and CPU
+encoding overlap the remaining decode instead of following it. The response is
+unchanged: the same complete MP4, byte-for-byte equivalent frames.
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A small robot walking through a neon city" \
+  -F 'extra_params={"preencode_mp4": true, "video_codec_options": {"preset": "ultrafast"}}' \
+  -o output.mp4
+```
+
+`preencode_mp4` applies to the complete-MP4 response paths only. The
+`/v1/realtime/video` WebSocket endpoint rejects it, because that path already
+overlaps encoding through its own incremental fragmented-MP4 encoder.
+
+Support is per model: MiniMax-H3 implements it, and other models ignore the flag
+and take the full-decode path.
 
 ## Storage
 
