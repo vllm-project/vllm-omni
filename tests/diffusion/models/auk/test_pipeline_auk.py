@@ -295,6 +295,7 @@ class TestRequestParsing:
         assert calls[0]["ref"].shape == (1, 100, LATENT_DIM)
         assert calls[0]["ref_mask"].shape == (1, 100)
         assert calls[0]["c_mask"].shape == (1, 8)
+        assert calls[0]["sampler"] is pipeline.cudagraph_wrapper
         assert outputs[0].output.shape == (300 * HOP,)
         assert outputs[0].output.dtype is torch.float32
 
