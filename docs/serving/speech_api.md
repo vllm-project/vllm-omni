@@ -949,21 +949,22 @@ Use `/v1/audio/voices` to list available voices for the loaded model.
 
 Multi-stage omni deployments route stage outputs through a single orchestrator
 loop. By default that loop polls every stage replica on a 1 ms cadence. An
-opt-in event-driven mode replaces the poll with one reader task per live stage
+the event-driven mode replaces the poll with one reader task per live stage
 replica awaiting its client directly, and switches the serving-side
-final-output drain to a condition-variable wakeup at the same time.
+final-output drain to a condition-variable wakeup at the same time. Qwen3-TTS
+uses this mode by default; other pipelines keep the legacy poll unless enabled.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off), except Qwen3-TTS defaults to on | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. Values are matched case-insensitively after surrounding whitespace is stripped; unrecognized values select the legacy poll loop. |
 
-Set it on the process that runs the orchestrator (stage 0 of an omni
-deployment) before starting the server:
+Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
+before starting the server when overriding the pipeline default:
 
 ```bash
-export VLLM_OMNI_EVENT_DRIVEN_ORCH=1
+VLLM_OMNI_EVENT_DRIVEN_ORCH=1 \
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --omni \
     --port 8091

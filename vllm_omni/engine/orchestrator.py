@@ -78,7 +78,7 @@ def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
 # 1 ms poll cadence to event-driven wakeups: one reader task per live LLM stage
 # replica awaits `client.get_output_async()` directly — the same pattern vLLM's
 # own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
-# Default off; the legacy poll loop remains the fallback.
+# Default is off except for pipelines with an explicit validated default.
 _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 
 # How often the event-driven loop reconciles its reader-task set against
@@ -86,8 +86,16 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
 
-def _event_driven_orch_enabled() -> bool:
-    return os.environ.get(_EVENT_DRIVEN_ORCH_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+def _event_driven_orch_enabled(*, default: bool = False) -> bool:
+    value = os.environ.get(_EVENT_DRIVEN_ORCH_ENV)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> bool:
+    """Return whether a pipeline has a validated event-driven default."""
+    return pipeline_model_type == "qwen3_tts"
 
 
 def _build_terminal_empty_output(
@@ -294,6 +302,7 @@ class OrchestratorBase:
         prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
+        event_driven_orch_default: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -336,7 +345,7 @@ class OrchestratorBase:
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
-        self._event_driven_orch = _event_driven_orch_enabled()
+        self._event_driven_orch = _event_driven_orch_enabled(default=event_driven_orch_default)
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -880,7 +889,8 @@ class OrchestratorBase:
     async def _orchestration_loop_event_driven(self) -> None:
         """Event-driven variant of ``_orchestration_loop``.
 
-        Selected by ``VLLM_OMNI_EVENT_DRIVEN_ORCH=1``. One reader task per
+        Selected by the explicit ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` value or the
+        pipeline default computed at engine initialization. One reader task per
         available LLM stage replica awaits ``client.get_output_async()``
         directly — the same pattern vLLM's own ``AsyncLLM`` output handler uses
         — and feeds a single dispatch queue. This coroutine consumes that queue
@@ -913,6 +923,7 @@ class OrchestratorBase:
                         await asyncio.sleep(0.001)
                         continue
                     await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
+                    self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
@@ -931,6 +942,7 @@ class OrchestratorBase:
                         if output is None:
                             continue
                         await ready_q.put(("diffusion", stage_id, replica_id, output))
+                        self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
                         got = True
                     await asyncio.sleep(0 if got else 0.001)
             except asyncio.CancelledError:
@@ -1049,6 +1061,9 @@ class OrchestratorBase:
                     continue
                 kind, stage_id, replica_id, payload = pending_get.result()
                 pending_get = None
+                # Record the queue after dequeue so the gauge reflects work
+                # still waiting for dispatch rather than producer-side depth.
+                self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
 
                 if kind == "error":
                     # replica_id < 0 means the failure was raised by a poller
