@@ -239,6 +239,7 @@ def test_personaplex_capabilities_are_honest() -> None:
 
     assert multi.implementation_level == "model_native_duplex"
     assert multi.input_modes == ["append_audio_chunk"]
+    assert multi.input_sample_rate_hz == 24_000
     assert multi.chunk_period_ms == 80
     assert single.supports_multi_session is False
     assert multi.supports_multi_session is True

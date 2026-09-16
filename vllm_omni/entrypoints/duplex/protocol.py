@@ -103,6 +103,9 @@ class DuplexCapabilities:
     supports_barge_in: bool = True
     supports_playback_ack: bool = True
     supports_input_append: bool = False
+    # Native append runtimes declare the fixed sample rate consumed by their
+    # model. A missing rate means the runtime accepts the session input rate.
+    input_sample_rate_hz: int | None = None
     supports_replace_latest_chunk: bool = True
     supports_reencode_context: bool = True
     supports_rollback_to_checkpoint: bool = False
@@ -141,6 +144,7 @@ class DuplexCapabilities:
             "supports_barge_in": self.supports_barge_in,
             "supports_playback_ack": self.supports_playback_ack,
             "supports_input_append": self.supports_input_append,
+            "input_sample_rate_hz": self.input_sample_rate_hz,
             "supports_replace_latest_chunk": self.supports_replace_latest_chunk,
             "supports_reencode_context": self.supports_reencode_context,
             "supports_rollback_to_checkpoint": self.supports_rollback_to_checkpoint,

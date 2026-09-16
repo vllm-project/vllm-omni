@@ -22,6 +22,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import
     NemotronVoiceChatDataPlaneSession,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import (
+    NEMOTRON_VOICECHAT_SAMPLE_RATE,
     NemotronVoiceChatPcmAppendBuffer,
 )
 
@@ -203,6 +204,7 @@ class NemotronVoiceChatServingRuntimeAdapter:
             supports_barge_in=False,
             supports_playback_ack=True,
             supports_input_append=True,
+            input_sample_rate_hz=NEMOTRON_VOICECHAT_SAMPLE_RATE,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
             supports_rollback_to_checkpoint=False,
