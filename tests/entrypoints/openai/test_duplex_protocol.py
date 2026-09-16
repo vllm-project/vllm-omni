@@ -8,6 +8,7 @@ import pytest
 
 from vllm_omni.entrypoints.duplex.protocol import (
     DuplexOverlapPolicy,
+    DuplexRequestIdScope,
     DuplexSession,
     DuplexSessionConfig,
     DuplexSessionRegistry,
@@ -418,6 +419,8 @@ def test_duplex_session_composes_single_owner_ledgers():
     assert not hasattr(session, "conversation")
     assert session.pending_text == ("hello",)
     assert session.active_request_id == "req-1"
+    assert session.active_request_binding is not None
+    assert session.active_request_binding.scope == DuplexRequestIdScope.INTERNAL
     assert session.active_response_id == response_id
     assert session.active_response_turn_id == 3
     assert session.playback.sent_ms == 240
@@ -428,6 +431,19 @@ def test_duplex_session_composes_single_owner_ledgers():
         pass
     else:
         raise AssertionError("playback view must be immutable")
+
+
+def test_duplex_session_records_external_request_id_scope():
+    session = DuplexSession(session_id="sid-external-request", config=DuplexSessionConfig())
+
+    session.bind_request(
+        "chatcmpl-external-request",
+        scope=DuplexRequestIdScope.EXTERNAL,
+    )
+
+    assert session.active_request_id == "chatcmpl-external-request"
+    assert session.active_request_binding is not None
+    assert session.active_request_binding.scope == DuplexRequestIdScope.EXTERNAL
 
 
 def test_duplex_barge_in_advances_epoch_and_drops_uncommitted_assistant_text():
