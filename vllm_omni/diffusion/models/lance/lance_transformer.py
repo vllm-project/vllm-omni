@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Lance transformer pieces.
 
 The Lance LLM is BAGEL's Qwen2-MoT transformer verbatim — the released
