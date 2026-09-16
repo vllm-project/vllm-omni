@@ -236,6 +236,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             req_state = ClientRequestState(
                 request_id=request_id,
                 external_request_id=external_request_id,
+                final_stage_id=final_stage_id_for_e2e,
             )
             req_state.metrics = metrics
             req_state.request_arrival_ts = wall_start_ts

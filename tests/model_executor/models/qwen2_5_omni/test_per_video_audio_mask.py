@@ -582,7 +582,7 @@ def test_get_video_use_audio_in_video_falls_back_to_prompt_updates_for_cache_hit
 
 
 def test_derive_audio_from_video_placeholders_only_pairs_true_videos():
-    fake_self = _fake_processor()
+    fake_self = _fake_qwen2_prompt_processor()
     video_placeholders = [
         PlaceholderFeaturesInfo(
             modality="video",

@@ -4,6 +4,8 @@
 """Breeze-TTS-2 serving adapter for synchronous full-payload generation."""
 
 import asyncio
+import copy
+import math
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -49,6 +51,7 @@ class BreezeTTS2Adapter(ARTTSAdapter):
         return set()
 
     def _load_codec_frame_rate(self) -> float | None:
+        assert self.ctx.engine_client is not None
         config = self.ctx.engine_client.model_config.hf_config
         codec = getattr(config, "codec_config", None)
         if isinstance(codec, dict):
@@ -99,6 +102,14 @@ class BreezeTTS2Adapter(ARTTSAdapter):
         greedy_error = _validate_greedy_sampling(extra_params)
         if greedy_error is not None:
             return greedy_error
+        repetition_penalty = extra_params.get("repetition_penalty")
+        if repetition_penalty is not None:
+            try:
+                repetition_penalty = float(repetition_penalty)
+            except (TypeError, ValueError):
+                return "Breeze-TTS-2 repetition_penalty must be finite and positive"
+            if not math.isfinite(repetition_penalty) or repetition_penalty <= 0:
+                return "Breeze-TTS-2 repetition_penalty must be finite and positive"
         if request.max_new_tokens is not None:
             if request.max_new_tokens < self.max_new_tokens_min:
                 return f"max_new_tokens must be at least {self.max_new_tokens_min}"
@@ -210,7 +221,16 @@ class BreezeTTS2Adapter(ARTTSAdapter):
         request_id: str | None = None,
     ) -> list:
         del prompt, request_id
-        return apply_max_new_tokens(sampling_params_list, request)
+        sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
+        repetition_penalty = (request.extra_params or {}).get("repetition_penalty")
+        if repetition_penalty is not None:
+            # The generic speech handler copies extra_params to extra_args;
+            # promote this value so the worker receives sampling metadata.
+            # Only this scalar changes; preserve the caller's params without
+            # copying nested state or the unchanged codec-stage parameters.
+            sampling_params_list = [copy.copy(sampling_params_list[0]), *sampling_params_list[1:]]
+            sampling_params_list[0].repetition_penalty = float(repetition_penalty)
+        return sampling_params_list
 
 
 def _validate_greedy_sampling(extra_params: dict[str, Any]) -> str | None:
