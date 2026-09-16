@@ -42,7 +42,8 @@ from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_client import StagePoolClient
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.entrypoints.async_omni import AsyncEventResolver, AsyncOmni
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni_base import AsyncEventResolver
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.outputs import OmniRequestOutput
 

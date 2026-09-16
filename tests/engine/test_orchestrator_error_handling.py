@@ -1054,7 +1054,7 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
         final_stage_id=1,
     )
     state.streaming.enabled = True
-    assert state.duplex_identity is None
+    assert state.session_owned is False
     orchestrator.request_states[state.request_id] = state
     try:
         await orchestrator._route_output(0, 0, _build_request_output(state.request_id), state, stage_metrics=None)
@@ -1074,34 +1074,14 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
             q.close()
 
 
-@pytest.mark.asyncio
-async def test_duplex_input_processor_failure_is_request_scoped(orchestrator_factory, monkeypatch) -> None:
-    class FailingStage(FakeStageClient):
-        def process_engine_inputs(self, *_args, **_kwargs):
-            raise ValueError("No latent or hidden_states found in thinker output")
-
-    fixture = orchestrator_factory(
-        [FakeStageClient(stage_type="llm"), FailingStage(stage_type="llm", final_output=True)]
-    )
-    state = OrchestratorRequestState(
-        request_id="bad",
-        prompt=SimpleNamespace(request_id="bad", prompt_token_ids=[1]),
-        sampling_params_list=[_sampling_params(), _sampling_params()],
-        final_stage_id=1,
-        duplex_identity=SimpleNamespace(),
-    )
-
-    async def no_cleanup(*_args, **_kwargs):
-        pass
-
-    monkeypatch.setattr(fixture.orchestrator, "_cleanup_request_ids", no_cleanup)
-    try:
-        await fixture.orchestrator._forward_to_next_stage_unguarded("bad", 0, _build_request_output("raw"), state)
-        error = await _wait_for_error_message(fixture, request_id="bad")
-        assert error.fatal is False
-    finally:
-        fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
-        fixture.thread.join(timeout=5)
+# ``test_duplex_input_processor_failure_is_request_scoped`` lived here upstream,
+# where one Orchestrator served both turn-based and duplex requests. Duplex
+# request ownership now belongs to DuplexOrchestrator, and the base
+# ``_handle_forward_failure`` deliberately absorbs nothing, so the equivalent
+# assertion is
+# ``tests/engine/test_duplex_orchestrator.py::test_forward_failure_closes_the_owning_session``
+# -- which also checks the stage abort, the session teardown and the
+# error-before-session.expired ordering.
 
 
 @pytest.mark.asyncio

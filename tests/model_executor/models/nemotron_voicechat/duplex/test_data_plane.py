@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from vllm_omni.engine.duplex.runtime import duplex_resource_request_id
 
 from vllm_omni.engine.duplex.messages import DuplexFence
-from vllm_omni.engine.duplex.runtime import duplex_resource_request_id
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import (
     NemotronVoiceChatDataPlaneContext,
     NemotronVoiceChatDataPlaneSession,

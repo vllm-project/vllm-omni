@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Camera trajectory loading and geometry for LingBot World v2 conditioning."""
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import torch
 
 _REFERENCE_HEIGHT = 480
 _REFERENCE_WIDTH = 832
-_MAX_ACTION_FRAMES = 117
 _MAX_SOURCE_ACTION_FRAMES = 4096
 _MAX_NPY_HEADER_BYTES = 10_000
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -207,9 +206,7 @@ def _load_bounded_npy(
             array = np.load(snapshot_file, allow_pickle=False)
         except (EOFError, TypeError, ValueError):
             raise ValueError(f"{filename} does not contain a valid numeric NPY array.") from None
-    # Official LingBot trajectories may be longer than one request. Only
-    # materialize the bounded prefix that any supported request can consume.
-    result: np.ndarray = np.asarray(array[:_MAX_ACTION_FRAMES], dtype=np.float32)
+    result: np.ndarray = np.asarray(array, dtype=np.float32)
     return result
 
 

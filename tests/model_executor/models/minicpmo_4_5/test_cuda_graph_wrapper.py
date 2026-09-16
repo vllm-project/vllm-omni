@@ -252,6 +252,37 @@ def test_cfm_graph_replay_matches_eager_for_uncached_and_cached_shapes(
     wrapper._flush()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_capture_keeps_the_real_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Static buffers must be built from the real inputs, mask included.
+
+    Capturing from zero-filled placeholders would bake the "nothing is masked"
+    branch into the graph, while replay copies the real mask into those very
+    buffers -- so the captured branch has to come from the real value.
+    """
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=4)
+
+    inputs = _cfm_inputs(2, 12, 0)
+    frames = int(inputs[0].shape[2])
+    mask = torch.ones(2, frames, frames, dtype=torch.bool, device="cuda")
+    mask[:, :, -2:] = False  # two padded keys are masked out
+
+    with torch.inference_mode():
+        wrapper.replay(*inputs, mask)
+        assert wrapper._stats["captures"] == 1
+
+    static_inputs, _, _ = next(iter(wrapper._cache.values()))
+    static_mask = static_inputs[6]
+    assert static_mask is not None
+    assert torch.equal(static_mask, mask)
+    wrapper._flush()
+
+
 def test_importing_wrapper_does_not_resolve_platform() -> None:
     """Importing this module must not build the OmniPlatform singleton.
 
@@ -354,7 +385,8 @@ def test_cfm_unsupported_dtype_eagers_only_that_shape(monkeypatch: pytest.Monkey
     """A key that cannot round-trip is a property of one shape, not of the GPU.
 
     It must not disable the wrapper or retire the generation the way a capture
-    failure does.
+    failure does. `_tensors_from_key` is the fallback used when no real inputs
+    are available, so the probe drives `_capture` without them.
     """
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
@@ -374,18 +406,16 @@ def test_cfm_unsupported_dtype_eagers_only_that_shape(monkeypatch: pytest.Monkey
     monkeypatch.setattr(wrapper_module, "_tensors_from_key", _reject_one_shape)
 
     with torch.inference_mode():
-        wrapper.replay(*_cfm_inputs(2, unbuildable_width, 0))
+        key = ("estimator_step",) + tuple(
+            wrapper_module._tensor_signature(t) for t in _cfm_inputs(2, unbuildable_width, 0)
+        )
+        assert wrapper._capture(key, None) is None
         assert wrapper.enabled is True
         assert wrapper._stats["captures"] == 0
 
         # a capturable shape still gets a graph
         wrapper.replay(*_cfm_inputs(2, 12, 0))
         assert wrapper._stats["captures"] == 1
-
-        # and the rejected shape stays eager without retrying the capture
-        wrapper.replay(*_cfm_inputs(2, unbuildable_width, 0))
-        assert wrapper._stats["captures"] == 1
-        assert wrapper._stats["eager"] == 2
 
     wrapper._flush()
 

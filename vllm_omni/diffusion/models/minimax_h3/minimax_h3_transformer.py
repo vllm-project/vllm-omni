@@ -33,12 +33,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
-    indexed_gate,
-    indexed_gate_rms_norm_scale_shift,
-    indexed_scale_shift_,
-    rms_norm_indexed_scale_shift,
-)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -50,6 +44,12 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.indexed_modulation import (
+    indexed_gate,
+    indexed_gate_rms_norm_scale_shift,
+    indexed_scale_shift_,
+    rms_norm_indexed_scale_shift,
+)
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
@@ -442,6 +442,8 @@ class MiniMaxH3Attention(nn.Module):
         self._gate_hidden_size = arch.hidden_size
         self._gate_quant_config = quant_config
         self._gate_prefix = f"{prefix}.to_gate_compress"
+        from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
+
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -454,6 +456,7 @@ class MiniMaxH3Attention(nn.Module):
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
+            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
 
     def enable_vsa_gate(self) -> None:
