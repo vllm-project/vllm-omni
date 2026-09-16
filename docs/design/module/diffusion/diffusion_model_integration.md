@@ -53,6 +53,23 @@ cross-stage routing.
 
 **Rule:** Model directories SHOULD contain only genuine model differences.
 
+## Adapter layout and residency
+
+Model-specific adapter loading must apply the same projection layout and TP
+partitioning as base-weight loading. Reuse the model's weight-reordering
+helpers for fused projections; checkpoint-specific layouts should not require
+branches in the shared LoRA manager. H3 native adapters, for example, normalize
+grouped QKV rows before binding the packed Q/K/V slices.
+
+Adapter sampling contracts must be available before request validation and
+step admission. Test schedule selection for both request and step execution.
+
+Offload support must account for adapter tensors as well as base parameters.
+In H3's runtime-adapter path, DLO streams base blocks while LoRA A/B buffers
+remain resident. Its ordinary module/layer offload is unsupported because
+these adapter tensors do not participate in those weight lifecycles. Validate
+layout, residency, switching, and repeated execution for each supported mode.
+
 ## Safe-change guide
 
 Test registry selection, checkpoint loading, minimal inference, input and output

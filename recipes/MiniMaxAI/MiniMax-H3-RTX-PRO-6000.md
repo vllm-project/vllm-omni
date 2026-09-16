@@ -1,5 +1,7 @@
 # MiniMax-H3 on RTX PRO 6000 Blackwell GPUs
 
+[Model guide](MiniMax-H3.md) · [Deployment choices](MiniMax-H3.md#choose-a-deployment) · [HTTP API](MiniMax-H3.md#http-api-examples)
+
 This recipe runs MiniMax-H3 in BF16 on 96 GiB RTX PRO 6000 Blackwell GPUs.
 The additional HBM over the RTX PRO 5000 profile removes the four-GPU
 minimum: two GPUs are enough to keep the model resident with TP2. Four and
@@ -8,6 +10,7 @@ CPU offload and distributed layerwise offload are not required in any of
 these configurations.
 
 Validated on:
+
 - Host: YLX Y762
 - GPUs: 8 × RTX PRO 6000 Blackwell (96 GiB)
 - Device order: default (`CUDA_VISIBLE_DEVICES` not set)
@@ -70,7 +73,9 @@ Device-order pinning and NUMA binding are tuning knobs, not prerequisites.
 The measurements in this recipe were taken without either, so any gain from
 them is additional to the numbers reported below and is host-specific.
 
-## Two-GPU serving configuration
+## Start a server
+
+### Two-GPU serving configuration
 
 Two 96 GiB GPUs hold the BF16 model with TP2 alone. There is no Ulysses
 group, so the DiT attention sequence is not sharded and activation memory is
@@ -79,15 +84,8 @@ peak memory before increasing the output shape, the reference-input length,
 or concurrency.
 
 ```bash
-export MODEL_ROOT=/path/to/MiniMax-H3
-export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8000
-
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/FL2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 2 \
   --tensor-parallel-size 2 \
@@ -100,7 +98,7 @@ vllm serve "${MODEL}" \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
-## Four-GPU serving configuration
+### Four-GPU serving configuration
 
 Four GPUs keep TP2 for the weight shard and add Ulysses2, which shards the
 attention sequence and lowers per-GPU activation memory. Text-encoder TP4
@@ -109,15 +107,8 @@ across all four GPUs. TP1 is not an option on this card: an unsharded BF16
 partition does not fit in 96 GiB.
 
 ```bash
-export MODEL_ROOT=/path/to/MiniMax-H3
-export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8000
-
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/FL2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 4 \
   --tensor-parallel-size 2 \
@@ -130,7 +121,7 @@ vllm serve "${MODEL}" \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
-## Eight-GPU serving configuration
+### Eight-GPU serving configuration
 
 Eight GPUs extend the Ulysses degree to 4 while keeping TP2. This does not
 lower per-GPU weight residency relative to the four-GPU profile; it lowers
@@ -138,15 +129,8 @@ activation memory and per-step latency by sharding the attention sequence
 four ways.
 
 ```bash
-export MODEL_ROOT=/path/to/MiniMax-H3
-export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8000
-
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/FL2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 8 \
   --tensor-parallel-size 2 \
@@ -159,7 +143,7 @@ vllm serve "${MODEL}" \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
-### Rank ordering across two sockets
+#### Rank ordering across two sockets
 
 With TP2 and Ulysses4 the two Ulysses groups are ranks `(0,2,4,6)` and
 `(1,3,5,7)`, and the four tensor-parallel pairs are `(0,1)`, `(2,3)`,
@@ -177,7 +161,7 @@ node 1. Reproduce that relationship on the target host rather than copying
 the IDs. The reported measurements use the default order and no NUMA
 binding; the two orders were not compared on this host.
 
-### Headroom variant: TP4 with Ulysses2
+#### Headroom variant: TP4 with Ulysses2
 
 Raising the tensor-parallel degree to 4 halves per-GPU weight residency and
 leaves room for long Ref2VA references, larger output shapes, or
@@ -190,7 +174,7 @@ headroom, not as the default. Replace the parallel flags above with:
   --usp 2 \
 ```
 
-### Two independent four-GPU servers
+#### Two independent four-GPU servers
 
 An eight-GPU host can instead run one FL2VA server and one Ref2VA server
 side by side, each pinned to its own NUMA node with the four-GPU
@@ -204,7 +188,7 @@ Use `CUDA_VISIBLE_DEVICES=0,2,1,3`, `--cpunodebind=0 --membind=0`, and
 This layout is described for completeness and was not part of the measured
 runs.
 
-## Shared serving notes
+### Shared serving notes
 
 Do not add `--enforce-eager` for a performance run. Warm the server before
 measuring so regional compilation is outside the measured request. On this
@@ -213,9 +197,55 @@ host the first request after startup ran 19% slower than the steady state
 converge.
 
 For Ref2VA on a single-server layout, stop the FL2VA server and restart the
-same command with `MODEL="${MODEL_ROOT}/Ref2VA"`.
+same command with `/path/to/MiniMax-H3/Ref2VA`.
 
-## Attention backend
+## Request examples
+
+### T2VA request example
+
+`t2va` requires an explicit `aspect_ratio` even when `width` and `height`
+are supplied.
+
+```bash
+curl -sS --max-time 1800 -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
+  -F 'width=1344' \
+  -F 'height=768' \
+  -F 'aspect_ratio=16:9' \
+  -F 'fps=24' \
+  -F 'num_inference_steps=50' \
+  -F 'flow_shift=12' \
+  -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
+  -o t2va.mp4
+```
+
+To collect the stage breakdown and peak memory for a request, add
+`--enable-diffusion-pipeline-profiler` to the server command and `-D
+headers.txt` to the curl invocation, then read `X-Stage-Durations` and
+`X-Peak-Memory-MB` from the saved headers.
+
+### Ref2VA request example
+
+`ref2va` defaults to a 16:9 aspect ratio, so `aspect_ratio` is optional
+here.
+
+```bash
+curl -X POST "http://127.0.0.1:8000/v1/videos/sync" \
+  --fail-with-body -w '\nHTTP %{http_code}\n' \
+  --max-time 1200 \
+  -F "input_reference=@/root/hand.jpg;type=image/jpeg" \
+  -F "audio_reference=</root/audio_ref.json" \
+  -F "prompt=2D动画融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。" \
+  -F 'width=1344' -F 'height=768' -F 'fps=24' \
+  -F 'num_inference_steps=60' -F 'flow_shift=12' -F 'seed=1101' \
+  -F 'extra_params={"task":"ref2va","duration":8,"audio_flow_shift":3.0}' \
+  -o /root/out_ref2va.mp4
+```
+
+## Optional settings
+
+### Attention backend
 
 RTX PRO 6000 Blackwell is an SM120 part, so the datacenter-Blackwell
 `TRTLLM_ATTN` default does not apply here. Every configuration above selects
@@ -223,13 +253,12 @@ cuDNN BF16 attention explicitly. This keeps the recipe independent of
 platform-default backend changes and does not depend on the experimental
 SM120 kernel.
 
-## Optional: online FP8
+### Optional: online FP8
 
-`--quantization fp8` quantizes eligible DiT linears at load time and is
-compatible with tensor parallelism and VAE tiling. Use it when the resident
-BF16 peak leaves too little headroom for long Ref2VA references, a larger
-output shape, or concurrency greater than one. It cannot be combined with
-layerwise offload.
+For eligible components and offload compatibility, see
+[H3 online FP8 quantization](MiniMax-H3.md#online-fp8-quantization).
+The measurements below use BF16; an FP8 deployment requires its own memory,
+latency, and quality validation.
 
 ## Target-hardware validation
 
@@ -244,7 +273,7 @@ preceded each measured request.
 | Topology | TP2 × USP1 | TP2 × USP2 | TP2 × USP4 |
 | Text encode | 0.040 s | 0.044 s | 0.035 s |
 | Denoise, 50 steps | 278.55 s | 168.73 s | 87.90 s |
-| Per step | 5.571 s | 3.375 s | 1.758 s |
+| Per requested step (denoise / 50) | 5.571 s | 3.375 s | 1.758 s |
 | VAE decode | 5.396 s | 2.791 s | 1.798 s |
 | Client E2E | 284.76 s | 172.32 s | 90.48 s |
 | Peak HBM per GPU | 77.49 GiB | 66.44 GiB | 61.07 GiB |
@@ -254,7 +283,9 @@ Stage times are read from the `X-Stage-Durations` response header of
 `/v1/videos/sync`. Peak memory is the maximum of `nvidia-smi
 --query-gpu=memory.used` sampled at 1 Hz across every device for the
 duration of the measured request. Per step is denoise wall time divided by
-the 50 requested steps. Stage times sum to roughly 0.75 s less than
+the 50 requested steps, not the number of executed denoiser updates. It is
+not directly comparable to the RTX PRO 5000 table's `denoise / 49` metric.
+Stage times sum to roughly 0.75 s less than
 end-to-end in all three configurations; queueing, result transfer, and MP4
 muxing sit outside the profiled stages.
 
@@ -281,7 +312,7 @@ Peak memory falls by 11.05 GiB from two to four GPUs and by a further
 because all three configurations shard the DiT with TP2 and hold identical
 weights per GPU. Fitting the first two points gives:
 
-```
+```text
 peak HBM per GPU ≈ 55.4 GiB + 22.1 GiB / ulysses_degree
 ```
 
@@ -300,47 +331,3 @@ drives the Qwen3-VL presentation from tens of tokens for text-only prompts
 to several thousand with image or video references, so T2VA numbers do not
 transfer to it. The eight-GPU device-order comparison in the section above
 was also not run.
-
-## T2VA request example
-
-`t2va` requires an explicit `aspect_ratio` even when `width` and `height`
-are supplied.
-
-```bash
-export API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
-
-curl -sS --max-time 1800 -X POST "${API_URL}" \
-  -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
-  -F 'width=1344' \
-  -F 'height=768' \
-  -F 'aspect_ratio=16:9' \
-  -F 'fps=24' \
-  -F 'num_inference_steps=50' \
-  -F 'flow_shift=12' \
-  -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
-  -o t2va.mp4
-```
-
-To collect the stage breakdown and peak memory for a request, add
-`--enable-diffusion-pipeline-profiler` to the server command and `-D
-headers.txt` to the curl invocation, then read `X-Stage-Durations` and
-`X-Peak-Memory-MB` from the saved headers.
-
-## Ref2VA request example
-
-`ref2va` defaults to a 16:9 aspect ratio, so `aspect_ratio` is optional
-here.
-
-```bash
-curl -X POST "http://127.0.0.1:${PORT}/v1/videos/sync" \
-  --fail-with-body -w '\nHTTP %{http_code}\n' \
-  --max-time 1200 \
-  -F "input_reference=@/root/hand.jpg;type=image/jpeg" \
-  -F "audio_reference=</root/audio_ref.json" \
-  -F "prompt=2D动画融合在一起的影像。夕阳余晖残留在窗边，生活感十足的小厨房里有旧木桌、洗到一半的马克杯、起雾的玻璃瓶、悬挂的抹布。画面带有智能手机单手拍摄的手抖、近距离对焦的犹豫、逆光曝光波动。要像在家中慌忙拍下某个不可思议事件的自然质感，不要广告影像的精心整理。声音只用厨房环境声与手绘生物柔和的电子音、小小的叫声。" \
-  -F 'width=1344' -F 'height=768' -F 'fps=24' \
-  -F 'num_inference_steps=60' -F 'flow_shift=12' -F 'seed=1101' \
-  -F 'extra_params={"task":"ref2va","duration":8,"audio_flow_shift":3.0}' \
-  -o /root/out_ref2va.mp4
-```

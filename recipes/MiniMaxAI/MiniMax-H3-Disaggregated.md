@@ -1,5 +1,7 @@
 # MiniMax H3 disaggregated text encoder
 
+[Model guide](MiniMax-H3.md) · [Deployment choices](MiniMax-H3.md#choose-a-deployment) · [HTTP API](MiniMax-H3.md#http-api-examples)
+
 This opt-in topology runs the Qwen3-VL text encoder as a vLLM stage and sends
 its hidden states and token-role metadata to an encoder-free diffusion stage.
 The standard MiniMax H3 recipes remain single-stage and continue to load the
@@ -10,7 +12,7 @@ text encoder inside the diffusion pipeline.
 Choose the topology explicitly and load its deployment defaults:
 
 ```bash
-vllm-omni serve MiniMaxAI/MiniMax-H3 \
+vllm serve MiniMaxAI/MiniMax-H3 \
   --omni \
   --deploy-config vllm_omni/deploy/minimax_h3_disaggregated.yaml
 ```
@@ -21,22 +23,23 @@ size 1, Ulysses degree 4, and VAE patch parallel size 4. Adjust the
 `devices`, `tensor_parallel_size`, and stage 1 `parallel_config` values in a
 deployment override for the available hardware. Diffusion quantization,
 layerwise offload, distributed layerwise offload, VAE parallelism, and USP
-settings use the same stage 1 options documented in [MiniMax-H3.md](MiniMax-H3.md).
+settings use the same stage 1 options documented in the
+[model guide](MiniMax-H3.md#optimization-options) and
+[CUDA deployment guide](MiniMax-H3-CUDA.md).
 
 For example, this five-GPU topology assigns one GPU to the encoder and four
 to the diffusion stage. `--stage-overrides` keeps placement and parallelism
 scoped to the owning stage rather than broadcasting an override to both:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 \
-vllm-omni serve MiniMaxAI/MiniMax-H3 \
+vllm serve MiniMaxAI/MiniMax-H3 \
   --omni \
   --deploy-config vllm_omni/deploy/minimax_h3_disaggregated.yaml \
   --stage-overrides '{"0":{"devices":"0","tensor_parallel_size":1},"1":{"devices":"1,2,3,4","tensor_parallel_size":1,"ulysses_degree":4,"vae_patch_parallel_size":4}}'
 ```
 
 For memory-constrained deployments, start from the CPU-offload or distributed
-layerwise-offload profiles in [MiniMax-H3.md](MiniMax-H3.md). Apply memory and
+layerwise-offload profiles in the [CUDA deployment guide](MiniMax-H3-CUDA.md). Apply memory and
 quantization options only to Stage 1 with `--stage-overrides`; retain the
 encoder's BF16 configuration and the video/audio VAEs' FP32 precision. Select
 one offload strategy per deployment:
@@ -54,7 +57,7 @@ one offload strategy per deployment:
 ```
 
 The Stage 1 VAE patch-parallel options remain independent of offload and
-quantization. See [MiniMax-H3.md](MiniMax-H3.md) for memory requirements and
+quantization. See the [deployment guides](MiniMax-H3.md#choose-a-deployment) for memory requirements and
 hardware-qualified profiles before combining these options.
 
 Stage 1 sets `model_loaded.text_encoder: false`; it must not load or download
@@ -73,7 +76,7 @@ points, `flow_shift=6`, `audio_flow_shift=3` -- so requests that omit sampling
 controls do not inherit the 50-step base schedule:
 
 ```bash
-vllm-omni serve MiniMaxAI/MiniMax-H3 \
+vllm serve MiniMaxAI/MiniMax-H3 \
   --omni \
   --lora-path /path/to/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
   --deploy-config vllm_omni/deploy/minimax_h3_disaggregated_turbo.yaml

@@ -1,61 +1,38 @@
 # MiniMax-H3 on RTX 5090
 
-This recipe uses BF16 weights, tiled VAE decode, tensor parallelism where a
-second GPU is available, and distributed layerwise offload (DLO). It is a
-memory-first serving configuration; lower resident counts reduce HBM use and
-increase CPU-to-GPU transfer time.
+[Model guide](MiniMax-H3.md) · [Deployment choices](MiniMax-H3.md#choose-a-deployment) · [HTTP API](MiniMax-H3.md#http-api-examples)
+
+This single-GPU configuration streams BF16 DiT and text-encoder blocks from
+host memory and loads the VAEs only for their encode/decode phases. VAE tiling
+reduces decode activation memory.
 
 ## Capacity requirements
 
-| Resource | One RTX 5090 | Two RTX 5090s |
-| --- | ---: | ---: |
-| GPU HBM | 32 GiB | 32 GiB per GPU |
-| Checkpoint storage | 135 GiB per partition | 135 GiB per partition |
-| Available system RAM | 200 GiB minimum | 200 GiB minimum |
-| Recommended system RAM | 384 GiB | 384 GiB |
+| Resource | Requirement |
+| --- | --- |
+| GPU memory | One RTX 5090 with 32 GiB |
+| Checkpoint storage | 135 GiB per partition |
+| Available system RAM | Minimum not established; see the host-memory requirements below |
 
-`FL2VA` and `Ref2VA` are separate 135 GiB checkpoint partitions. Start one
-server at a time. DLO keeps rank-local weights in pinned host memory; increasing
-`--dlo-resident-layers` improves latency but does **not** reduce host RAM in the
-current implementation because resident layers retain pinned CPU master copies.
+`FL2VA` and `Ref2VA` are separate checkpoint partitions. Start one server at a
+time. See the shared
+[host-memory requirements](MiniMax-H3-CUDA.md#single-gpu-low-memory-serving):
+GPU offload does not establish a 32 GiB system-RAM configuration.
 
-> **Modular H3:** after #5720 lands, preserve this recipe's one-partition
-> behavior with `--task-type fl2va` or `--task-type ref2va`.
+## Single GPU
 
-## One RTX 5090: 1344x768, 5 seconds
-
-Use 12 resident DiT layers. A 50-step B300 allocation test with this exact
-single-rank topology peaked at 26.50 GiB; re-measure peak HBM on the target
-card before increasing the resident count.
+Complete the [CUDA installation](MiniMax-H3-CUDA.md#installation), then start
+one worker with no retained DiT layers:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/MiniMax-H3/FL2VA \
-  --omni --trust-remote-code --host 0.0.0.0 --port 8000 \
-  --num-gpus 1 --tensor-parallel-size 1 --text-encoder-tp-size 1 \
-  --usp 1 --ring 1 --vae-patch-parallel-size 1 \
-  --vae-parallel-mode tile --vae-use-tiling \
-  --enable-distributed-layerwise-offload --dlo-no-use-allgather \
-  --dlo-resident-layers 12 --enforce-eager \
+vllm serve MiniMaxAI/MiniMax-H3 --omni --trust-remote-code \
+  --task-type fl2va \
+  --diffusion-offload-config \
+  '{"mode":"layer","components":["dit","text_encoder","vae"],"layer_options":{"dit":{"weight_transfer":"rank-local"}}}' \
+  --vae-use-tiling --enforce-eager \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
-## Two RTX 5090s: 1344x768, 5 seconds
-
-Use TP2 and 20 resident DiT layers. The two-rank B300 capacity run peaked at
-27,726 MiB per rank for this shape and 50 steps. This is a memory/correctness
-proxy, not a consumer-GPU latency claim.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/MiniMax-H3/FL2VA \
-  --omni --trust-remote-code --host 0.0.0.0 --port 8000 \
-  --num-gpus 2 --tensor-parallel-size 2 --text-encoder-tp-size 2 \
-  --usp 1 --ring 1 --vae-patch-parallel-size 2 \
-  --vae-parallel-mode tile --vae-use-tiling \
-  --enable-distributed-layerwise-offload --dlo-no-use-allgather \
-  --dlo-resident-layers 20 --enforce-eager \
-  --diffusion-attention-backend CUDNN_ATTN
-```
-
-For Ref2VA, stop the FL2VA server and restart the same command with
-`/path/to/MiniMax-H3/Ref2VA`. Ref2VA reference video count and prompt length
-can increase activation memory; begin with one request at a time.
+Start with the shared [480P T2VA request](MiniMax-H3-CUDA.md#single-gpu-low-memory-serving).
+This single-GPU configuration has not completed target-hardware end-to-end
+validation; neither a 768P capacity guarantee nor a latency result is available.

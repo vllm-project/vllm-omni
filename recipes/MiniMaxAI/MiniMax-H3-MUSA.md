@@ -1,5 +1,7 @@
 # MiniMax H3 on Moore Threads MUSA
 
+[Model guide](MiniMax-H3.md) · [Deployment choices](MiniMax-H3.md#choose-a-deployment) · [HTTP API](MiniMax-H3.md#http-api-examples)
+
 > Joint video and audio generation on Moore Threads GPUs
 
 ## Summary
@@ -28,9 +30,8 @@ For T2VA and FL2VA:
 
 ```bash
 python -m pip install modelscope
-export MODEL_ROOT=/path/to/MiniMax-H3
 modelscope download MiniMax/MiniMax-H3 \
-  --local_dir "${MODEL_ROOT}" \
+  --local_dir "/path/to/MiniMax-H3" \
   --max-workers 16 \
   --include 'FL2VA/**'
 ```
@@ -70,16 +71,8 @@ or `ref2va` for Ref2VA.
 The validated Ref2VA configuration uses tensor parallelism across four MTT S5000 GPUs and offloads inactive model components to CPU:
 
 ```bash
-export MODEL="${MODEL_ROOT}/Ref2VA"
-export PORT=8091
-
-MUSA_VISIBLE_DEVICES=0,1,2,3 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-vllm serve "${MODEL}" \
+vllm serve /path/to/MiniMax-H3/Ref2VA \
   --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
   --trust-remote-code \
   --num-gpus 4 \
   --task-type ref2va \
@@ -134,7 +127,7 @@ Keep `--vae-use-tiling` enabled for this serving profile.
 - This MUSA recipe uses an explicitly selected single task partition; combined
   serving loads both DiTs.
 - H3 currently executes one generation request per diffusion batch.
-- FP8 quantization has not been enabled for MiniMax H3.
+- FP8 quantization is outside this validated MUSA profile.
 - MP3, M4A, MP4, and reference-video audio fallback requires `ffmpeg` on
   `PATH`; WAV inputs can be read directly through soundfile.
 
