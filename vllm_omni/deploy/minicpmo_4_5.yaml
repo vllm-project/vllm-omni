@@ -33,6 +33,8 @@ connectors:
 
 stages:
   - stage_id: 0
+    # Stateful duplex sampling must not mutate state on discarded lookahead steps.
+    async_scheduling: false
     max_num_seqs: 4
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
@@ -63,6 +65,8 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
+    # Stateful duplex sampling must not mutate state on discarded lookahead steps.
+    async_scheduling: false
     max_num_seqs: 4
     # Preserve the checkpoint's full-attention Talker prompt while it fits;
     # native duplex rolls over to a one-chunk window at context capacity.

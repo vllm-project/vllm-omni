@@ -558,6 +558,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors
             multimodal_outputs = {"latent": text_hidden_states}
+            # Keep per-forward row identities alongside the latent payload.
+            if thinker_input_ids is not None and thinker_positions is not None:
+                multimodal_outputs["latent_input_ids"] = thinker_input_ids.reshape(-1, 1)
+                multimodal_outputs["latent_positions"] = thinker_positions.reshape(-1, 1)
+
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
                 duplex_rows = []
