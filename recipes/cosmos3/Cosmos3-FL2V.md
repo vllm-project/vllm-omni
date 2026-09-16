@@ -35,7 +35,7 @@ into the left jar, then back to the right glass), self-contained in the
 One GPU node with enough free VRAM:
 
 | Model | GPU | Notes |
-|---|---|---|
+| --- | --- | --- |
 | **Super** (recommended) | **B200** or **H200** | ~125 GB weights |
 | **Nano** (also works) | **H100** | ~46 GB VRAM |
 
@@ -185,7 +185,7 @@ Pixel length `T` maps to latents with temporal factor 4: `T_z = (T-1)/4 + 1`, so
 Three tricks make that work; on this runtime only one is ours:
 
 | FL2V trick | vLLM-Omni |
-|---|---|
+| --- | --- |
 | Lock start+end latent ranges instead of prefix `[0, 1]` | **native** — `extra_params.condition_frame_indexes_vision` accepts any indexes with `max(index) < T_lat` |
 | Clean head/tail for the causal VAE | **ours** — we build and upload the reference MP4 |
 | Re-inject clean boundary latents every UniPC step | **native** — the V2V denoise loop already runs `velocity_mask * latents + (1 - velocity_mask) * condition_latents` |
@@ -246,7 +246,7 @@ often never see:
 ## CLI reference
 
 | Flag | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--url` | `http://localhost:8000` | vLLM-Omni base URL |
 | `--model` | `nvidia/Cosmos3-Super` | Served model (`Super` recommended; `nvidia/Cosmos3-Nano` also works) |
 | `--start` / `--end` | package seed PNG files | Boundary image **or** video (auto-detected by extension) |
