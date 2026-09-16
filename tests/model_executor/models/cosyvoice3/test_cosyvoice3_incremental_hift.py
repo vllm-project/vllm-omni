@@ -393,3 +393,23 @@ def test_incremental_hift_empty_middle_chunk_emits_nothing():
         assert cache["phase_acc"] is None
     else:
         torch.testing.assert_close(cache["phase_acc"], phase_acc_before)
+
+
+@pytest.mark.parametrize("config", CONFIGS)
+@pytest.mark.parametrize("mel_frames", [1, 2, 3, 4])
+def test_incremental_hift_short_finalize_chunk_does_not_crash(config, mel_frames):
+    """A one-token (or otherwise sub-trim) utterance that finalizes on its very
+    first chunk must not crash. On finalize the F0 predictor consumes the whole
+    window (it does not hold back `trim` frames), so the phase-carry index must
+    not be inflated by `trim` -- it would point past the end of a short window.
+    """
+    hift = _make_hift(config)
+    model = _make_model(hift, window_len=32)
+    chunk = torch.randn(1, 80, mel_frames)
+
+    speech, cache = model._stream_hift_from_feat(chunk, cache_state=None, finalize=True)
+
+    assert cache is None
+    assert speech.shape[0] == 1
+    assert speech.shape[-1] > 0
+    assert torch.isfinite(speech).all()

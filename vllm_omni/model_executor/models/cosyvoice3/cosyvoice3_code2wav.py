@@ -279,13 +279,17 @@ class CosyVoice3Code2Wav(nn.Module):
             new_phase_acc = phase_acc
         else:
             next_overlap = min(window_len + trim, window_mel.shape[-1])
+            # On finalize the F0 predictor consumes the whole window (it does not
+            # hold back `trim` frames), so trim must not inflate the phase-carry
+            # index -- it would point past the end of a short window.
+            carry_trim = 0 if finalize else trim
             tts_speech, _, new_phase_acc = self.hift.inference(
                 speech_feat=f0_input_mel,
                 finalize=finalize,
                 phase_acc=phase_acc,
                 uv_offset=uv_offset,
                 next_overlap=next_overlap,
-                trim=trim,
+                trim=carry_trim,
                 f0_margin=f0_margin,
             )
 

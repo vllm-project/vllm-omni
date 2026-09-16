@@ -199,7 +199,12 @@ class SineGen(torch.nn.Module):
         cum_total = cum if phase_acc is None else phase_acc + cum
         theta_mat = 2 * np.pi * (cum_total % 1)
         new_phase_acc = _carry_phase_at_boundary(cum_total, phase_acc, next_overlap, dim=-1, trim=trim)
-        phase_vec = self.phase_vec.to(F_mat.device)
+        if self.causal:
+            phase_vec = self.phase_vec.to(F_mat.device)
+        else:
+            u_dist = Uniform(low=-np.pi, high=np.pi)
+            phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
+            phase_vec[:, 0, :] = 0
 
         # generate sine waveforms
         sine_waves = self.sine_amp * torch.sin(theta_mat + phase_vec)
