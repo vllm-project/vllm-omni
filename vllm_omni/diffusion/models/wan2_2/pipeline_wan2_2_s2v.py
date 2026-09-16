@@ -545,10 +545,10 @@ class Wan22S2VPipeline(
             self._init_original_format(model_path, dtype)
 
         # -- Scheduler --
-        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0  # S2V default
+        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0  # S2V default
         self.scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
 
@@ -1342,7 +1342,7 @@ class Wan22S2VPipeline(
                 )
 
             # -- Scheduler --
-            self.scheduler.set_timesteps(num_steps, device=device)
+            self.scheduler.set_timesteps(num_steps, device=device, shift=self._flow_shift)
             timesteps = self.scheduler.timesteps
             self._num_timesteps = len(timesteps)
 

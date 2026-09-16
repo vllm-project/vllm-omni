@@ -690,7 +690,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         )
 
         # Set up scheduler
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        if self._sample_solver == "unipc":
+            self.scheduler.set_timesteps(num_inference_steps, device=device, shift=self._flow_shift)
+        else:
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
