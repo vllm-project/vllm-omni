@@ -449,6 +449,8 @@ def main() -> None:
         "use_resolution_template": args.resolution_template,
         "use_duration_template": args.resolution_template,
         "guardrails": args.guardrails,
+        # Cosmos3 reads this from the model extras, not from a form field.
+        "max_sequence_length": args.max_sequence_length,
         # Trick 1 (stock V2V uses [0, 1]); trick 3 is applied server-side for
         # every index listed here.
         "condition_frame_indexes_vision": cond_idx,
@@ -466,7 +468,6 @@ def main() -> None:
         "num_inference_steps": str(args.steps),
         "guidance_scale": str(args.guidance),
         "flow_shift": str(args.flow_shift),
-        "max_sequence_length": str(args.max_sequence_length),
         "seed": str(args.seed),
         "extra_params": json.dumps(extra_params),
     }

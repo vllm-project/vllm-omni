@@ -105,9 +105,12 @@ def apply(target: Path) -> int:
             "caller's timeout to MessageQueue.recv()."
         )
     backup = target.with_name(target.name + BACKUP_SUFFIX)
-    if not backup.exists():
-        shutil.copy2(target, backup)
-        print(f"backed up original -> {backup}")
+    # `target` is unpatched here, so it is this install's pristine copy. Always
+    # refresh: a backup left over from an earlier vLLM version would make
+    # --revert overwrite the current install with pre-upgrade code.
+    refreshed = backup.exists()
+    shutil.copy2(target, backup)
+    print(f"{'refreshed' if refreshed else 'backed up'} original -> {backup}")
     target.write_text(text.replace(ORIGINAL, PATCHED, 1))
     print(f"patched: {target}")
     print("Restart the vLLM-Omni server for this to take effect.")
