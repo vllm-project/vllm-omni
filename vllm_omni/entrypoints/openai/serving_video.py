@@ -32,7 +32,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
@@ -169,6 +169,24 @@ class OmniOpenAIServingVideo:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
 
+    def _get_model_architectures(self, od_config: OmniDiffusionConfig | SimpleNamespace | None) -> list[str | None]:
+        """Read architecture names from the current config and stage projections."""
+        model_archs = [getattr(od_config, "model_class_name", None)]
+        for stage_config in self.stage_configs or ():
+            stage_get = (
+                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
+            )
+            engine_args = stage_get("engine_args") or {}
+            model_archs.extend(
+                (
+                    stage_get("model_arch"),
+                    engine_args.get("model_class_name")
+                    if isinstance(engine_args, Mapping)
+                    else getattr(engine_args, "model_class_name", None),
+                )
+            )
+        return model_archs
+
     @cached_property
     def preserves_reference_image_size(self) -> bool:
         """Return whether the active pipeline owns reference-image resizing."""
@@ -191,25 +209,44 @@ class OmniOpenAIServingVideo:
             return False
 
         capability = getattr(od_config, "supports_mixed_reference_inputs", None)
-        model_class_name = getattr(od_config, "model_class_name", None)
-        model_archs = [model_class_name]
-        for stage_config in self.stage_configs or ():
-            stage_get = (
-                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
-            )
-            engine_args = stage_get("engine_args") or {}
-            model_archs.extend(
-                (
-                    stage_get("model_arch"),
-                    engine_args.get("model_class_name")
-                    if isinstance(engine_args, Mapping)
-                    else getattr(engine_args, "model_class_name", None),
-                )
-            )
         metadata_capability = any(
-            get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
+            get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs
+            for model_arch in self._get_model_architectures(od_config)
         )
         return capability is True or metadata_capability
+
+    @property
+    def is_minimax_h3(self) -> bool:
+        config = self._resolve_diffusion_od_config()
+        architectures = set(self._get_model_architectures(config))
+        return bool(architectures & {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"})
+
+    @property
+    def controlnet_configured(self) -> bool:
+        """Whether the active model was started with a control checkpoint."""
+        config = self._resolve_diffusion_od_config()
+        if config is not None and hasattr(config, "controlnet_model_path"):
+            return bool(config.controlnet_model_path)
+        # Out-of-process clients expose only an architecture/capability view.
+        # Read the actual stage projection in that case, never request extras.
+        stages = self.stage_configs
+        if stages is None:
+            stages = getattr(self._engine_client, "stage_configs", None)
+        for stage in stages or []:
+            if get_stage_type(stage) != "diffusion":
+                continue
+            get = stage.get if isinstance(stage, Mapping) else lambda key: getattr(stage, key, None)
+            projection = get("diffusion_config")
+            if projection is None:
+                projection = get("engine_args") or {}
+            project_get = (
+                projection.get if isinstance(projection, Mapping) else lambda key: getattr(projection, key, None)
+            )
+            architecture = project_get("model_class_name") or get("model_arch")
+            if architecture not in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
+                return False
+            return bool(project_get("controlnet_model_path"))
+        return False
 
     @property
     def supported_control_upload_types(self) -> frozenset[str]:
@@ -220,23 +257,8 @@ class OmniOpenAIServingVideo:
         explicitly opts into the ``control_path`` contract in metadata.
         """
         od_config = self._resolve_diffusion_od_config()
-        model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
-        for stage_config in self.stage_configs or ():
-            stage_get = (
-                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
-            )
-            engine_args = stage_get("engine_args") or {}
-            model_archs.extend(
-                (
-                    stage_get("model_arch"),
-                    engine_args.get("model_class_name")
-                    if isinstance(engine_args, Mapping)
-                    else getattr(engine_args, "model_class_name", None),
-                )
-            )
-
         supported: set[str] = set()
-        for model_arch in model_archs:
+        for model_arch in self._get_model_architectures(od_config):
             supported.update(get_diffusion_model_metadata(model_arch).supported_control_upload_types)
         return frozenset(supported)
 

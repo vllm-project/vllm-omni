@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -73,13 +74,16 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
         is_layer_skipped,
     )
 
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 
     monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
     monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(blocks, "ColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(blocks, "MergedColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(blocks, "QKVParallelLinear", _FakeLinear)
+    monkeypatch.setattr(blocks, "RowParallelLinear", _FakeLinear)
+    monkeypatch.setattr(blocks, "Attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
     ignored_layers = {
@@ -195,19 +199,20 @@ def test_loader_adapter_declares_equivalent_direct_mmap_transform(monkeypatch):
     from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
         get_direct_mmap_adapter,
     )
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 
-    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(blocks, "QKVParallelLinear", _FakeLinear)
+    monkeypatch.setattr(blocks, "RowParallelLinear", _FakeLinear)
+    monkeypatch.setattr(blocks, "Attention", _FakeAttention)
 
-    arch = h3.MiniMaxH3DiTArchConfig(
+    arch = blocks.MiniMaxH3DiTArchConfig(
         hidden_size=1,
         num_attention_heads=2,
         attention_head_dim=1,
         rope_inv_freq_len=1,
     )
-    attention = h3.MiniMaxH3Attention(
+    attention = blocks.MiniMaxH3Attention(
         arch,
         quant_config=None,
         prefix="blocks.0.attn",

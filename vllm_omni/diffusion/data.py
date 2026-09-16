@@ -867,6 +867,8 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_scale: float | list[float] = 1.0
     lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
