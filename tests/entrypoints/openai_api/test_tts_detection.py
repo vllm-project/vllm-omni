@@ -148,6 +148,7 @@ _PIPELINE_STAGES = [
     "dit",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
+    "gepard",
     "glm_tts",
     "glm_tts_dit",
     "higgs_audio_v2",

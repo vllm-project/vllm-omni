@@ -531,14 +531,27 @@ def _decode_video_frames_ffmpeg(
     )
 
 
-def sample_reference_video_frames(prepared_path: str) -> dict[str, Any]:
-    meta = _probe_video(prepared_path)
+def sample_reference_video_frames(
+    prepared_path: str,
+    *,
+    decoded_frames: np.ndarray | None = None,
+) -> dict[str, Any]:
+    if decoded_frames is None:
+        meta = _probe_video(prepared_path)
+        frame_count = int(meta["frame_count"])
+    else:
+        decoded_frames = np.asarray(decoded_frames)
+        if decoded_frames.ndim != 4 or decoded_frames.shape[-1] != 3 or len(decoded_frames) <= 0:
+            raise OmniClientError(
+                f"decoded reference video frames must have shape [T, H, W, 3], got {decoded_frames.shape}"
+            )
+        frame_count = len(decoded_frames)
     ratio = MINIMAX_H3_FPS / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS
     indices: list[int] = []
     cursor = 0.0
     while True:
         frame_index = int(round(cursor))
-        if frame_index >= meta["frame_count"]:
+        if frame_index >= frame_count:
             break
         if not indices or frame_index > indices[-1]:
             indices.append(frame_index)
@@ -546,16 +559,16 @@ def sample_reference_video_frames(prepared_path: str) -> dict[str, Any]:
     if not indices:
         raise OmniClientError(f"no frames sampled from {prepared_path}")
 
-    # The preparation step emits a lossless RGB stream. Decode only the sampled
-    # frames in one ffmpeg process so Qwen3VL sees the exact prepared pixels
-    # without decoding the entire high-bitrate stream into host memory.
-    decoded_frames = _decode_video_frames_ffmpeg(
-        prepared_path,
-        frame_count=int(meta["frame_count"]),
-        indices=indices,
-        width=meta["width"],
-        height=meta["height"],
-    )
+    if decoded_frames is None:
+        decoded_frames = _decode_video_frames_ffmpeg(
+            prepared_path,
+            frame_count=frame_count,
+            indices=indices,
+            width=meta["width"],
+            height=meta["height"],
+        )
+    else:
+        decoded_frames = decoded_frames[indices]
     frames = [np.asarray(frame) for frame in decoded_frames]
 
     timestamps = [index / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS for index in range(len(indices))]

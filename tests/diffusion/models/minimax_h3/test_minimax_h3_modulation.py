@@ -6,7 +6,7 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
+from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
     _iter_row_chunks,
     _launch_row_chunks,

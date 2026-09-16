@@ -23,8 +23,8 @@ some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
 
 For Thinker pipeline parallelism, configure `pipeline_parallel_size` and `devices`
-on the Thinker stage and set `async_scheduling: false`. Keep Talker and Code2Wav
-at `pipeline_parallel_size: 1`. Audio chunk streaming can remain enabled.
+on the Thinker stage. Keep Talker and Code2Wav at `pipeline_parallel_size: 1`. The
+default asynchronous scheduling and audio chunk streaming can remain enabled.
 
 To explicitly utilize a custom deployment YAML, specify the configuration path:
 ```bash
