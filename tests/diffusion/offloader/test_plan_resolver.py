@@ -214,7 +214,7 @@ class TestResolvedTopology:
         encoder = resolved.encoders[0]
         assert encoder.on_demand
         assert [len(stack.blocks) for stack in encoder.stacks] == [2, 2]
-        # An explicit selection never stages a VAE through the legacy plan.
+        # An unselected VAE remains resident even when its plan supports staging.
         assert not resolved.vaes[0].on_demand
         # DiT is unselected, so it keeps no streaming topology.
         assert resolved.dits[0].selected is False
@@ -226,6 +226,24 @@ class TestResolvedTopology:
         assert resolved.vaes[0].on_demand
         assert resolved.encoders[0].on_demand
         assert resolved.dits[0].selected
+
+    @pytest.mark.parametrize("strategy", [OffloadStrategy.LAYER_WISE, OffloadStrategy.DISTRIBUTED_LAYER_WISE])
+    def test_explicit_vae_selection_reuses_declared_lifecycle(self, strategy):
+        pipeline = _StagedComponentPipeline()
+        resolved = resolve_offload_plan(pipeline, _config({"vae"}, strategy=strategy))
+        assert resolved.vaes[0].selected and resolved.vaes[0].on_demand
+        assert not resolved.encoders[0].selected and not resolved.dits[0].selected
+        assert pipeline.vae.to_calls == pipeline.vae.offload_calls == 0
+
+    def test_vae_selection_requires_declared_lifecycle_before_mutation(self):
+        pipeline = _WanStylePipeline()
+        with pytest.raises(ValueError, match="requires a pipeline-managed lifecycle"):
+            resolve_offload_plan(pipeline, _config({"dit", "text_encoder", "vae"}))
+        assert pipeline.vae.to_calls == pipeline.vae.offload_calls == 0
+
+    def test_vae_selection_rejects_missing_component(self):
+        with pytest.raises(ValueError, match="No VAE modules found"):
+            resolve_offload_plan(_LegacyScanPipeline(), _config({"vae"}))
 
     def test_on_demand_only_plan_resolves_without_stacks(self):
         class Pipeline(nn.Module):

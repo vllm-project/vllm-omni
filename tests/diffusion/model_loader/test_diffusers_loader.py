@@ -776,15 +776,21 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     assert get_current_diffusion_config_or_none() is None
 
 
-def test_dlo_transfers_loader_plan_and_skips_ordinary_weight_loading(monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_dlo_transfers_loader_plan_and_skips_ordinary_weight_loading(monkeypatch, compact):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
     od_config = SimpleNamespace(
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
         quantization_config=None,
-        enable_distributed_layerwise_offload=True,
-        dlo_use_allgather=False,
+        enable_distributed_layerwise_offload=not compact,
+        dlo_use_allgather=compact,
+        diffusion_offload_config=(
+            {"mode": "layer", "components": ["dit"], "layer_options": {"dit": {"weight_transfer": "rank-local"}}}
+            if compact
+            else None
+        ),
         model="unused",
     )
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)

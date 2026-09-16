@@ -22,6 +22,7 @@ import threading
 import time
 import weakref
 from collections.abc import Sequence
+from functools import partial
 from itertools import chain
 from typing import Any
 
@@ -46,7 +47,7 @@ from .component_utils import (
     prepare_pipeline_components,
     set_encoder_layerwise_state,
 )
-from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT
+from .config import DIT_COMPONENT, LAYER_OFFLOAD_COMPONENTS, TEXT_ENCODER_COMPONENT
 from .host_registration import (
     HostRegistration,
     HostRegistrationCleanupError,
@@ -825,7 +826,7 @@ class PinnedResidentLayerGroup:
                     bufs,
                     tensor_transforms,
                 )
-                cpu_shards = {}
+                cpu_shards: dict[torch.dtype, torch.Tensor] = {}
             else:
                 cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
                     params,
@@ -1430,7 +1431,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def _has_multirank_allgather(self) -> bool:
         components = self.config.components or frozenset({DIT_COMPONENT})
-        return self.dp_size > 1 and any(self.config.uses_allgather(component) for component in components)
+        return self.dp_size > 1 and any(
+            self.config.uses_allgather(component) for component in components & LAYER_OFFLOAD_COMPONENTS
+        )
 
     def _install_hook_group(
         self,
@@ -1862,7 +1865,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         total_blocks = sum(len(b) for b in self._blocks)
         transfer_summary = ", ".join(
             f"{component}: {self.config.transfer_for(component).value}"
-            for component in sorted(self.config.components or {DIT_COMPONENT})
+            for component in sorted((self.config.components or {DIT_COMPONENT}) & LAYER_OFFLOAD_COMPONENTS)
         )
         logger.info(
             f"Distributed layer-wise offloading enabled on {total_blocks} blocks "
@@ -1977,7 +1980,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         removal_error = run_cleanup_steps(
             (
                 "removing a distributed block hook",
-                lambda block=block: remove_distributed_block_hook(block),
+                partial(remove_distributed_block_hook, block),
             )
             for blocks in self._blocks
             for block in blocks
@@ -1985,7 +1988,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         encoder_error = run_cleanup_steps(
             (
                 "clearing distributed encoder state",
-                lambda module=module: clear_encoder_layerwise_state(module),
+                partial(clear_encoder_layerwise_state, module),
             )
             for module in self._encoder_modules
         )

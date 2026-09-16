@@ -31,7 +31,7 @@ The public API describes intent in one nested configuration:
 | Level | Setting | Question answered |
 | --- | --- | --- |
 | Granularity | `mode` | move a complete component (`module`) or stream its blocks (`layer`) |
-| Selection | `components` list | whether `dit` and/or `text_encoder` may move to CPU |
+| Selection | `components` list | whether `dit`, `text_encoder`, and/or `vae` may move to CPU |
 | Per-component layer options | `layer_options` | choose rank-local or AllGather weight transfer and optionally retain leading DiT blocks |
 
 `weight_transfer` applies only to model weights. It does not change encoder
@@ -72,11 +72,15 @@ vllm serve /path/to/model --omni \
   --usp 4
 ```
 
-A compact layer config whose selected components are all `rank-local` and
-whose `resident_layers` is zero resolves to the ordinary layerwise backend. It
-uses the ordinary loader and does not request DLO's direct-checkpoint mmap.
-Keep the compatibility DLO flags for a model-specific full-topology rank-local
-lifecycle; do not add resident layers solely to force backend selection.
+Explicit `weight_transfer` selects the bounded two-slot backend, including
+`rank-local` with zero resident layers. Compatible DiT checkpoints then use
+the loader's direct mmap path. Omitting both transfer and residency settings
+preserves ordinary layerwise loading.
+
+Add `vae` to `components` when the pipeline declares a VAE stage lifecycle.
+VAEs move as complete components around encode/decode, independently of DiT
+weight transfer; `layer_options.vae` is not supported. Unselected VAEs remain
+resident. See the [VAE integration contract](layerwise_offload.md#vae-stage-lifecycle).
 
 ```python
 from vllm_omni import Omni
@@ -105,7 +109,7 @@ omni = Omni(
 | Setting | Meaning | Default |
 | --- | --- | --- |
 | `diffusion_offload_config.mode` | `module` or `layer` granularity | required |
-| `diffusion_offload_config.components` | Non-empty list containing `dit`, `text_encoder`, or both | required |
+| `diffusion_offload_config.components` | Non-empty list containing `dit`, `text_encoder`, and/or `vae` | required |
 | `layer_options.NAME.weight_transfer` | `rank-local` or `allgather` | `rank-local` |
 | `layer_options.dit.resident_layers` | Leading main-DiT blocks kept on device; requires `rank-local` and model-declared resident paths | `0` |
 | `diffusion_offload_config.pin_memory` | Pin streamed host memory for faster H2D copies | `true` |

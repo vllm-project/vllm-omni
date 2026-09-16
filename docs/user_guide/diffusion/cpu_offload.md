@@ -13,7 +13,7 @@ For the shared factory, discovery, and lifecycle contract, see the
 | --- | --- | --- | --- |
 | Model-level (sequential) | One pipeline component group at a time | Single device | [Model-Level Offloading](offloader/module_offload.md) |
 | Layerwise (blockwise) | One transformer block, with next-block prefetch | Single device | [Layerwise Offloading](offloader/layerwise_offload.md) |
-| Distributed layerwise | Fixed two-block device buffer; optional host-weight sharding and AllGather | Multiple GPU/NPU ranks | [Distributed Layerwise Offloading](offloader/distributed_layerwise_offload.md) |
+| Distributed layerwise | Fixed two-block device buffer; optional host-weight sharding and AllGather | One or multiple GPU/NPU ranks | [Distributed Layerwise Offloading](offloader/distributed_layerwise_offload.md) |
 
 All strategies use pinned host memory for faster transfers where applicable.
 Configuration priority is:
@@ -33,7 +33,7 @@ higher-priority strategy is selected.
 - Use [layerwise offloading](offloader/layerwise_offload.md) for compute-heavy video
   DiTs where block transfers can overlap computation.
 - Use [distributed layerwise offloading](offloader/distributed_layerwise_offload.md)
-  when a multi-rank deployment also needs bounded device residency and,
+  for bounded two-block residency on one or multiple devices and,
   optionally, sharded host weights.
 
 ## Supported models

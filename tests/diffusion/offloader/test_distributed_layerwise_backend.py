@@ -97,7 +97,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook.offload_layer()
         assert not hook.is_materialized
 
-    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch):
+    def test_initialize_failure_keeps_next_block_materialized(self, patched_offload_runtime, monkeypatch):
         current_block = nn.Linear(2, 2)
         next_block = nn.Linear(2, 2)
         expected = {name: tensor.detach().clone() for name, tensor in next_block.state_dict().items()}
@@ -2631,7 +2631,9 @@ class TestDistributedComponentSelection:
             assert registry is None or registry.get_hook("distributed_layerwise_offload") is None
             torch.testing.assert_close(block.weight, expected)
 
-    def test_multirank_enable_failure_cleanup_skips_restore_collective(self, monkeypatch, mocker):
+    def test_multirank_enable_failure_cleanup_skips_restore_collective(
+        self, patched_offload_runtime, monkeypatch, mocker
+    ):
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
@@ -2717,7 +2719,8 @@ class TestDistributedComponentSelection:
         assert backend.enabled
         assert backend._all_hook_groups
 
-    def test_all_streams_encoder_and_keeps_vae_resident(self, patched_offload_runtime, monkeypatch):
+    @pytest.mark.parametrize("offload_vae", [False, True])
+    def test_selected_components_stream_and_stage(self, patched_offload_runtime, monkeypatch, offload_vae):
         pipeline = _DistributedComponentPipeline()
         move_non_block_state = Mock()
         monkeypatch.setattr(dist_backend_module, "move_non_block_state_to_device", move_non_block_state)
@@ -2726,7 +2729,7 @@ class TestDistributedComponentSelection:
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
                 pin_cpu_memory=False,
                 dlo_use_allgather=False,
-                components=frozenset({"dit", "text_encoder"}),
+                components=frozenset({"dit", "text_encoder", "vae"} if offload_vae else {"dit", "text_encoder"}),
             ),
             torch.device("cpu"),
         )
@@ -2738,8 +2741,8 @@ class TestDistributedComponentSelection:
         # The pipeline-owned stage lifecycle releases the encoder's non-block
         # state after DLO has installed blockwise hooks.
         assert pipeline.text_encoder.offload_calls == 1
-        assert pipeline.vae.offload_calls == 0
-        assert pipeline.vae.to_calls == 1
+        assert pipeline.vae.offload_calls == int(offload_vae)
+        assert (pipeline.vae in backend._staged_components) is offload_vae
         move_non_block_state.assert_not_called()
 
         backend.disable()

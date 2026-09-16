@@ -356,7 +356,8 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
     remove_offload.assert_called_once_with([*dits, *stages])
 
 
-def test_h3_model_cpu_offload_keeps_unselected_vaes_resident(monkeypatch):
+@pytest.mark.parametrize("offload_vae", [False, True])
+def test_h3_model_cpu_offload_honors_vae_selection(monkeypatch, offload_vae):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
 
@@ -374,7 +375,7 @@ def test_h3_model_cpu_offload_keeps_unselected_vaes_resident(monkeypatch):
         device=torch.device("cpu"),
         pin_memory=False,
         use_hsdp=False,
-        offload_components=frozenset({"dit", "text_encoder"}),
+        offload_components=frozenset({"dit", "text_encoder", "vae"} if offload_vae else {"dit", "text_encoder"}),
     )
 
     dits = [pipeline.transformer, pipeline.transformers_ref]
@@ -387,7 +388,7 @@ def test_h3_model_cpu_offload_keeps_unselected_vaes_resident(monkeypatch):
         use_hsdp=False,
         offload_initial_dits=True,
         offload_dit_modules=dits,
-        offload_encoder_modules=[pipeline.text_encoder],
+        offload_encoder_modules=stages if offload_vae else [pipeline.text_encoder],
     )
 
 
@@ -611,3 +612,38 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
     assert events[-1] == ("offload", pipeline.audio_vae)
     assert events.count(("activate", pipeline.audio_vae)) == 1
     assert events.count(("offload", pipeline.audio_vae)) == 1
+
+
+@pytest.mark.parametrize("name", ["text_encoder", "video_vae", "audio_vae"])
+@pytest.mark.parametrize("offload_vae", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_compact_layer_offload_scopes_selected_h3_stages(name, offload_vae, fails):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.offloader.config import materialize_legacy_offload_flags
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit", "text_encoder", "vae"] if offload_vae else ["dit", "text_encoder"],
+            "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+        },
+    )
+    materialize_legacy_offload_flags(pipeline.od_config)
+    pipeline.text_encoder = Mock()
+    pipeline.video_vae = Mock()
+    pipeline.audio_vae = Mock()
+    component = getattr(pipeline, name)
+    selected = name == "text_encoder" or offload_vae
+    # Repeat both successful and failed scopes to check release and reuse.
+    for _ in range(2):
+        component.reset_mock()
+        expected_exception = pytest.raises(RuntimeError, match="injected stage failure") if fails else nullcontext()
+        with expected_exception:
+            with pipeline._component_on_device(component):
+                assert component.load_to_device.call_count == int(selected)
+                component.offload_to_cpu.assert_not_called()
+                if fails:
+                    raise RuntimeError("injected stage failure")
+        assert component.offload_to_cpu.call_count == int(selected)

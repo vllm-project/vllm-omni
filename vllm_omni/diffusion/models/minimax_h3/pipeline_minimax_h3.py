@@ -55,6 +55,7 @@ from vllm_omni.diffusion.offloader import (
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
+    VAE_COMPONENT,
     OffloadStrategy,
     resolve_offload,
     should_offload_component,
@@ -1094,10 +1095,8 @@ class MiniMaxH3Pipeline(
         legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and bool(
             od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
         )
-        # Preserve the legacy MiniMax-H3 low-residency path. The compact API
-        # deliberately limits explicit component selection to dit/text_encoder,
-        # so VAEs stay resident for new configurations.
-        component_load_device = torch.device("cpu") if legacy_manual_components else self.device
+        offloads_vaes = legacy_manual_components or should_offload_component(od_config, VAE_COMPONENT)
+        component_load_device = torch.device("cpu") if offloads_vaes else self.device
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(model_path, "video_vae"),
             device=self.device,
@@ -1114,19 +1113,16 @@ class MiniMaxH3Pipeline(
         self.vae = self.video_vae
 
         self._dlo_component_cache = None
-        offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
-        needs_component_cache = legacy_manual_components or offloads_text_encoder
+        offloads_text_encoder = legacy_manual_components or should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
+        needs_component_cache = offloads_vaes or offloads_text_encoder
         if getattr(od_config, "enable_distributed_layerwise_offload", False) and needs_component_cache:
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
-            if legacy_manual_components:
-                _register_dlo_component_cache(
-                    self._dlo_component_cache,
-                    self.text_encoder,
-                    self.video_vae,
-                    self.audio_vae,
-                )
-            elif offloads_text_encoder:
-                _register_dlo_component_cache(self._dlo_component_cache, self.text_encoder)
+            _register_dlo_component_cache(
+                self._dlo_component_cache,
+                self.text_encoder if offloads_text_encoder else None,
+                self.video_vae if offloads_vaes else None,
+                self.audio_vae if offloads_vaes else None,
+            )
 
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
@@ -1610,9 +1606,10 @@ class MiniMaxH3Pipeline(
                 getattr(od_config, "enable_layerwise_offload", False)
                 or getattr(od_config, "enable_distributed_layerwise_offload", False)
             )
-        return component is getattr(self, "text_encoder", None) and should_offload_component(
-            od_config, TEXT_ENCODER_COMPONENT
-        )
+        for kind, paths in ((TEXT_ENCODER_COMPONENT, self._encoder_modules), (VAE_COMPONENT, self._vae_modules)):
+            if any(component is getattr(self, path, None) for path in paths):
+                return should_offload_component(od_config, kind)
+        return False
 
     def enable_omni_model_cpu_offload(
         self,
@@ -1635,10 +1632,13 @@ class MiniMaxH3Pipeline(
                 raise ValueError("MiniMax-H3 has no loaded DiT for selected module offload")
             if TEXT_ENCODER_COMPONENT in offload_components and not components.encoders:
                 raise ValueError("MiniMax-H3 has no loaded text encoder for selected module offload")
+            if VAE_COMPONENT in offload_components and not components.vaes:
+                raise ValueError("MiniMax-H3 has no loaded VAE for selected module offload")
             selection_options = {
                 "offload_dit_modules": dits if DIT_COMPONENT in offload_components else (),
                 "offload_encoder_modules": (
-                    components.encoders if TEXT_ENCODER_COMPONENT in offload_components else ()
+                    (components.encoders if TEXT_ENCODER_COMPONENT in offload_components else [])
+                    + (components.vaes if VAE_COMPONENT in offload_components else [])
                 ),
             }
         apply_sequential_offload(

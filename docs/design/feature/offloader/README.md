@@ -16,10 +16,14 @@ The three strategies have separate user and design pages:
 policy:
 
 - `mode="module"` selects model-level offload;
-- `mode="layer"` with rank-local transfers selects ordinary layerwise
-  offload; and
-- AllGather transfer or resident layers selects the distributed layerwise
-  backend that implements those capabilities.
+- `mode="layer"` without transfer or residency settings selects ordinary
+  layerwise offload; and
+- an explicit `weight_transfer` or retained DiT layers selects the distributed
+  layerwise backend, including rank-local transfer with zero retained layers.
+
+The `vae` selector uses pipeline-managed component staging. It has no block
+transfer options; the [VAE lifecycle contract](../../../user_guide/diffusion/offloader/layerwise_offload.md#vae-stage-lifecycle)
+keeps model entry points separate from generic transfer machinery.
 
 The compatibility boolean flags retain their historical priority (distributed
 layerwise, layerwise, then model-level). A compact config rejects a conflicting
