@@ -307,7 +307,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=1)
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen-Image"])
 def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifact_root: Path) -> None:
     output_dir = model_output_dir(accuracy_artifact_root, model_id + "-diffusers-backend")
@@ -346,7 +346,7 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"]}, num_cards=1)
 @pytest.mark.parametrize(
     "model_id",
     [
@@ -375,7 +375,7 @@ def test_diffusers_backend_i2v_matches_diffusers(
     diffusers_latency = diffusers_latency * 1000
     # H100 keeps the historical 30% slack. B200 measured ~35.8% (6008 vs 4425 ms).
     gpu_key, latency_threshold_factor = resolve_device_threshold(
-        {"H100": 0.3, "B200": 0.36},
+        {"H100": 0.3, "A100": 0.3, "B200": 0.36},
         label="latency threshold factor",
     )
     latency_threshold = diffusers_latency * (1 + latency_threshold_factor)

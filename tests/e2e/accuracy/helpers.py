@@ -145,7 +145,7 @@ def resolve_device_threshold(
 
     Returns ``(profile_key, threshold)``. A bare number uses profile ``default``.
     A mapping matches keys as substrings of the device name via
-    ``resolve_device_profile`` (for example ``{"H100": 0.3, "B200": 0.36}``).
+    ``resolve_device_profile`` (for example ``{"H100": 0.3, "A100": 0.3, "B200": 0.36}``).
     Prefer an explicit ``default`` entry when unmatched GPUs should fall back;
     otherwise unmatched devices raise.
     """

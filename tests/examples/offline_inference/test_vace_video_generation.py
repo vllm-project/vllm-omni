@@ -17,7 +17,7 @@ pytestmark = [
     pytest.mark.full_model,
     pytest.mark.diffusion,
     pytest.mark.example,
-    *hardware_marks(res={"cuda": ["H100", "B200"]}),
+    *hardware_marks(res={"cuda": ["H100", "B200", "A100"]}),
 ]
 
 TEXT_TO_VIDEO_README = EXAMPLES / "offline_inference" / "text_to_video" / "text_to_video.md"

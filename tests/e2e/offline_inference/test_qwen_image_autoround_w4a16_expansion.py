@@ -49,7 +49,7 @@ def _first_request_images(outputs) -> list:
 
 @pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": ["L4", "B200"]})
+@hardware_test(res={"cuda": ["L4", "B200", "A100"]})
 def test_qwen_image_autoround_w4a16_load():
     """Load the W4A16 quantized Qwen-Image model and run a minimal generation.
 
@@ -71,7 +71,7 @@ def test_qwen_image_autoround_w4a16_load():
 
 @pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": ["L4", "B200"]})
+@hardware_test(res={"cuda": ["L4", "B200", "A100"]})
 def test_qwen_image_autoround_w4a16_generate():
     """Full generation: 512×512, 20 steps, CFG=5.0.
 

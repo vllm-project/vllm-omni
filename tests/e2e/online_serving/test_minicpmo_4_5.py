@@ -162,7 +162,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
@@ -233,7 +233,7 @@ def test_text_to_audio_with_default_reference(omni_server, openai_client) -> Non
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -264,7 +264,7 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -300,7 +300,7 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200", "A100"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     """

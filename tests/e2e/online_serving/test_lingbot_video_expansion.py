@@ -26,7 +26,7 @@ MODEL = "robbyant/lingbot-video-dense-1.3b"
 PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200", "A100"]})
 
 
 def _get_diffusion_feature_cases(model: str):
