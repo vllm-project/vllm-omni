@@ -1186,6 +1186,12 @@ class WanTransformer3DModel(nn.Module):
                 if ".to_out.0." in lookup_name:
                     lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
 
+                # FastWan checkpoints store the compression gate on the block.
+                if ".to_gate_compress." in lookup_name and lookup_name not in params_dict:
+                    gate_alias = lookup_name.replace(".to_gate_compress.", ".attn1.to_gate_compress.")
+                    if gate_alias in params_dict:
+                        lookup_name = gate_alias
+
                 # Compatibility: some Wan conversion pipelines still keep
                 # block modulation keys as `blocks.N.modulation` instead of
                 # `blocks.N.scale_shift_table`.
