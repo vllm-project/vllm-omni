@@ -502,6 +502,8 @@ class _MiniMaxH3FakeAttention(nn.Module):
         super().__init__()
         self.attn_backend = self.FakeBackend
         self.use_ring = False
+        self.parallel_strategy = None
+        self.supports_qk_input_landing = False
 
     def forward(self, q, k, v, metadata=None):
         del k, v, metadata

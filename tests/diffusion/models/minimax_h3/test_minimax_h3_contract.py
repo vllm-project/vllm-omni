@@ -785,6 +785,8 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
 
     attention = object.__new__(MiniMaxH3Attention)
     torch.nn.Module.__init__(attention)
+    attention._h3_vsplit_mode = "off"
+    attention._h3_ulysses_overlap = False
     attention.attention = FakeAttention()
     # Model-side Ulysses shards rows before Attention gathers them again.
     # The Python packed_total must therefore remain global even though q is
@@ -833,6 +835,8 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
 
     attention = object.__new__(MiniMaxH3Attention)
     torch.nn.Module.__init__(attention)
+    attention._h3_vsplit_mode = "off"
+    attention._h3_ulysses_overlap = False
     attention.attention = FakeAttention()
     q = torch.randn(8, 2, 4)
 
@@ -883,6 +887,8 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
 
     attention = object.__new__(MiniMaxH3Attention)
     torch.nn.Module.__init__(attention)
+    attention._h3_vsplit_mode = "off"
+    attention._h3_ulysses_overlap = False
     attention.attention = FakeAttention()
     q = torch.randn(8, 2, 4)
 
@@ -999,6 +1005,8 @@ def _fake_packed_attention(
 
     attention = object.__new__(MiniMaxH3Attention)
     torch.nn.Module.__init__(attention)
+    attention._h3_vsplit_mode = "off"
+    attention._h3_ulysses_overlap = False
     attention.attention = FakeAttention()
     return attention
 
@@ -2851,7 +2859,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.pushes = []
@@ -2908,7 +2916,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs

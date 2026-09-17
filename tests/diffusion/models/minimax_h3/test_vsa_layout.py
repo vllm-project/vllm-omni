@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 import math
 import sys
 import types
@@ -15,8 +14,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     VideoTokenLayout,
     VideoTokenSpan,
 )
-from vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3 import (
+from vllm_omni.diffusion.models.minimax_h3.attention.vsa import (
     MiniMaxH3VSAImpl,
+    _build_h3_block_map,
     _get_h3_tile_metadata,
 )
 
@@ -159,6 +159,39 @@ def test_h3_forward_restores_rows_the_packed_padding_excludes(monkeypatch):
     assert torch.count_nonzero(output[:, valid:]) == 0
 
 
+def test_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
+    # The backend advertises supports_packed_mask_free, so MiniMax-H3 skips
+    # building the padding mask. Every fallback out of the VSA path must honour
+    # that contract itself; SDPA reads attn_mask and nothing else.
+    impl = MiniMaxH3VSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"topk": 1, "min_seq_len": 4096},
+    )
+    monkeypatch.setattr(impl.sdpa_fallback, "forward", impl.sdpa_fallback.forward_cuda)
+    valid = 40
+    torch.manual_seed(0)
+    query = torch.randn(1, 64, 2, 8)
+    padding = PackedPaddingMetadata(
+        q_length=valid,
+        kv_length=valid,
+        cu_seqlens_q=torch.tensor([0, valid], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, valid], dtype=torch.int32),
+    )
+
+    baseline = impl.forward_cuda(query, query, query, AttentionMetadata(packed_padding=padding, extra={}))
+    perturbed_input = query.clone()
+    perturbed_input[:, valid:] += 100.0
+    perturbed = impl.forward_cuda(
+        perturbed_input, perturbed_input, perturbed_input, AttentionMetadata(packed_padding=padding, extra={})
+    )
+
+    assert baseline.shape == query.shape
+    torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
+    assert torch.count_nonzero(baseline[:, valid:]) == 0
+
+
 def test_h3_geometry_keeps_prefix_segments_pure_and_tiles_video_3d():
     partition, sizes, non_pad, untile, prefix_blocks, video_blocks = _get_h3_tile_metadata(
         (5, 70, 9), (5, 6, 6), torch.device("cpu")
@@ -168,6 +201,14 @@ def test_h3_geometry_keeps_prefix_segments_pure_and_tiles_video_3d():
     assert video_blocks == 8
     assert int(sizes.sum()) == 5 + 70 + 9 + 5 * 6 * 6
     assert partition.numel() == non_pad.numel() == untile.numel() == int(sizes.sum())
+
+
+def test_h3_block_map_makes_prefix_queries_dense_and_prefix_keys_exempt():
+    scores = torch.arange(1 * 2 * 5 * 5, dtype=torch.float32).reshape(1, 2, 5, 5)
+    block_map = _build_h3_block_map(scores, num_prefix_blocks=2, num_video_blocks=3, topk=1)
+    assert block_map[:, :, :2].all()
+    assert block_map[..., :2].all()
+    assert (block_map[:, :, 2:, 2:].sum(dim=-1) == 1).all()
 
 
 @pytest.mark.parametrize("fallback_on_error", [False, True])

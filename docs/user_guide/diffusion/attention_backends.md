@@ -36,7 +36,7 @@ For the internal selector, registry, and platform contract, see
 | `FLASH_ATTN_HUB` | Hub kernel | FlashAttention 2 from Hugging Face `kernels` | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
-| `FASTVIDEO_VSA` | Block sparse | FastVideo variable sparse self-attention for FastWan2.2-TI2V-5B and FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
+| `FASTVIDEO_VSA` | Block sparse | VSA routing for FastWan2.2-TI2V-5B and FastH3 MiniMax-H3; compute-provider scope is documented separately | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 
 ## Configuration
 
