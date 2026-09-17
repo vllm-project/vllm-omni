@@ -225,6 +225,11 @@ class TestOmniVoiceVoiceCloning:
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
             "transcript_language": "en",
+            # whisper-small mishears cloned-voice audio often enough to flake this
+            # gate; re-verify with a stronger ASR before failing. Same opt-in
+            # pattern used for flake mitigation elsewhere in the tts test suite
+            # (e.g. test_gepard_tts.py, test_voxtral_tts_expansion.py).
+            "transcript_escalation_model": "large-v3",
         }
         response = online_client.send_audio_speech_request(request_config)[0]
         assert response.audio_bytes is not None
@@ -252,6 +257,7 @@ class TestOmniVoiceVoiceCloning:
             "response_format": "wav",
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "transcript_escalation_model": "large-v3",
         }
         online_client.send_audio_speech_request(request_config)
 
