@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-Omni-MoE pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation
 Stage 1: Talker  — text embeddings → RVQ codec codes
 Stage 2: Code2Wav — RVQ codes → audio waveform
 """
+
+from dataclasses import replace
 
 from transformers import Qwen3OmniMoeConfig
 
@@ -74,6 +76,18 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             requires_full_payload_input=True,
         ),
     ),
+)
+
+QWEN3_OMNI_DUPLEX_PLUGIN = "vllm_omni.model_executor.models.qwen3_omni.duplex.plugin.Qwen3OmniDuplexPlugin"
+
+# Duplex serving: same Thinker→Talker→Code2Wav topology as the stock
+# pipeline. Select with ``pipeline: qwen3_omni_moe_duplex`` and
+# ``session_mode: duplex``.
+QWEN3_OMNI_DUPLEX_PIPELINE = replace(
+    QWEN3_OMNI_PIPELINE,
+    model_type="qwen3_omni_moe_duplex",
+    default_deploy_config_name="qwen3_omni_moe_duplex.yaml",
+    duplex_plugin=QWEN3_OMNI_DUPLEX_PLUGIN,
 )
 
 QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(

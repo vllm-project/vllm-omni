@@ -248,10 +248,15 @@ class DuplexSessionRunner:
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
         decision: DuplexOutputDecision | None = None
+        observe = False
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
+            # Optional mid-pipeline observe: project to the client without
+            # short-circuiting the pipeline (still forwarded downstream).
+            if decision is None:
+                observe = self.model.observe_stage_output(stage_id, output, context)
         consume = decision is not None or stage_id >= context.final_stage_id
-        if not consume:
+        if not consume and not observe:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
             # into the engine the orchestrator published them as a standalone
@@ -274,7 +279,8 @@ class DuplexSessionRunner:
                 decision=decision,
             )
         )
-        return True
+        # An observe-only projection must still forward to the next stage.
+        return consume
 
     def on_stage_failure(self, stage_id: int, exc: BaseException) -> None:
         """A stage rejected this session's request: fail the active response now.

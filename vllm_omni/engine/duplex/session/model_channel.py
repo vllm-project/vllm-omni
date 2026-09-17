@@ -217,15 +217,39 @@ class ModelChannel:
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
         stage_id = 0
-        request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id)
+        resumable = bool(session.capabilities.supports_core_resumable_request)
+        request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
+        if not resumable and session.stage_request_submitted(stage_id, request_id):
+            # Ephemeral turn-commit cannot submit_update on a finished stage0
+            # id: this turn never completed (e.g. a listen-only turn), so its
+            # id is still bound. Complete the turn to advance turn_id, mint a
+            # fresh ephemeral id, and abort only that stale Stage0 request.
+            # Downstream stage bindings are left alone — they are created by
+            # orchestrator forward, not by this Stage0 append path.
+            stale_ephemeral_id = request_id
+            session.complete_model_turn(fence.turn_id)
+            fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
+            request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
+            session.request_resources.pop((stage_id, stale_ephemeral_id), None)
+            try:
+                await self._ctx.stage_port.cleanup([stale_ephemeral_id], abort=True)
+            except Exception:
+                logger.warning(
+                    "duplex abort of stale ephemeral request failed session=%s id=%s",
+                    session.session_id,
+                    stale_ephemeral_id,
+                    exc_info=True,
+                )
         try:
             session.begin_lease_operation(fence, lease_operation_id)
             operation_started = True
             reservation = session.prepare_append(fence)
-            already_submitted = session.stage_request_submitted(stage_id, request_id)
+            already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
             request_context = self._ctx.manager.ensure_stage_request(session, stage_id=stage_id, fence=fence)
             if request_context is None:
                 raise RuntimeError("duplex_data_plane_has_no_stage")
+            if request_context.request_id != request_id:
+                request_id = request_context.request_id
             append_plan = self._ctx.plugin.plan_append(
                 request_id=request_id,
                 fence=fence,
@@ -243,6 +267,7 @@ class ModelChannel:
                 context=request_context,
                 prompt=append_plan.prompt,
                 already_submitted=already_submitted,
+                resumable=resumable,
             )
             submission_result = await self._ctx.stage_port.submit(submission)
             try:
@@ -263,6 +288,7 @@ class ModelChannel:
                     )
                 raise
             session.touch_lease(DuplexLeaseActivity.APPEND)
+            session.bind_request(request_id)
             return {
                 "ok": True,
                 "operation": "append",
@@ -279,7 +305,7 @@ class ModelChannel:
                             "seq": update.seq,
                             "turn_id": update.turn_id,
                             "turn_seq": update.turn_seq,
-                            "resumable": True,
+                            "resumable": resumable,
                         },
                     }
                 ],
@@ -376,6 +402,16 @@ class ModelChannel:
             raise TypeError("duplex plugin decide_output() must return DuplexOutputDecision or None")
         return decision
 
+    def observe_stage_output(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
+        """Project an intermediate stage to the client without short-circuiting the pipeline."""
+        return bool(
+            self._ctx.plugin.observe_stage_output(
+                stage_id=stage_id,
+                output=output,
+                context=context,
+            )
+        )
+
     @staticmethod
     def stage_metrics_snapshot(stage_id: int, metrics: object, output: object) -> dict[str, dict[str, object]] | None:
         if not isinstance(metrics, StageRequestStats):
@@ -461,7 +497,12 @@ class ModelChannel:
             await self._close_from_runtime(close_reason)
             return
         finished = self._data_plane_outputs_finished(drain_result)
-        if finished and emitted_response and not self._out.auto_responds():
+        # An observed intermediate stage finishing means that stage is done,
+        # not the duplex turn: only the final stage — or a stage whose direct
+        # decision short-circuited the pipeline — closes the stream (and
+        # offers the model another silence unit).
+        response_completes_here = item.stage_id >= item.context.final_stage_id or item.decision is not None
+        if finished and emitted_response and not self._out.auto_responds() and response_completes_here:
             # A finished, emitted response releases the per-request projector
             # cursor on its way out and offers the model another
             # silence unit.
@@ -1053,6 +1094,11 @@ class ModelChannel:
         model_state = self._ctx.model_state
         response_id = session.active_response_id
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
+            model_state.clear_continuation()
+            return
+        if not session.capabilities.supports_core_resumable_request:
+            # Non-resumable stage0 cannot submit_update after the request
+            # finishes; a turn-commit model has no silence continuation.
             model_state.clear_continuation()
             return
         request_id = session.active_request_id

@@ -569,6 +569,7 @@ class TestPipelineDiscovery:
         assert "qwen2_5_omni" in OMNI_PIPELINES
         assert "qwen3_omni_moe" in OMNI_PIPELINES
         assert "qwen3_omni_moe_thinker_only" in OMNI_PIPELINES
+        assert "qwen3_omni_moe_duplex" in OMNI_PIPELINES
         assert "qwen3_tts" in OMNI_PIPELINES
 
     def test_registry_resolver_qwen3_omni_all_stages(self):

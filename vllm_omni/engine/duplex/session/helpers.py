@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING
 import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
-from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.contracts import (
+    DuplexFence,
+    duplex_ephemeral_stage_request_id,
+    duplex_resource_request_id,
+)
 from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
 
 if TYPE_CHECKING:
@@ -35,7 +39,11 @@ if TYPE_CHECKING:
 
 
 def stage0_request_id(session: DuplexEngineSession, epoch: int) -> str:
-    return duplex_resource_request_id(DuplexFence(session.session_id, epoch=epoch), "stage0")
+    fence = DuplexFence(session.session_id, epoch=epoch, turn_id=session.turn_id)
+    if session.capabilities.supports_core_resumable_request:
+        return duplex_resource_request_id(fence, "stage0")
+    # A non-resumable Stage0 gets one ordinary request per committed turn.
+    return duplex_ephemeral_stage_request_id(fence, stage_id=0)
 
 
 def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks) -> bool:

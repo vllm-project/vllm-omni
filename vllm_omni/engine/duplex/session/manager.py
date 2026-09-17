@@ -31,6 +31,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
     DuplexStageRequestContext,
+    duplex_ephemeral_stage_request_id,
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
@@ -408,8 +409,10 @@ class DuplexSessionManager:
         return configured
 
     @staticmethod
-    def stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
-        return duplex_resource_request_id(fence, f"stage{stage_id}")
+    def stage_request_id(fence: DuplexFence, *, stage_id: int, resumable: bool = True) -> str:
+        if resumable:
+            return duplex_resource_request_id(fence, f"stage{stage_id}")
+        return duplex_ephemeral_stage_request_id(fence, stage_id=stage_id)
 
     def ensure_stage_request(
         self,
@@ -422,7 +425,8 @@ class DuplexSessionManager:
         if stage_id >= self.stage_port.stage_count:
             return None
         effective_fence = fence or session.fence
-        request_id = self.stage_request_id(effective_fence, stage_id=stage_id)
+        resumable = bool(session.capabilities.supports_core_resumable_request)
+        request_id = self.stage_request_id(effective_fence, stage_id=stage_id, resumable=resumable)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
         context = DuplexStageRequestContext(
             request_id=request_id,
