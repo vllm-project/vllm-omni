@@ -1475,6 +1475,8 @@ def build_vllm_config(
     stage_connector_spec: dict[str, Any] | None = None,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
+    api_process_count: int = 1,
+    api_process_rank: int = 0,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
 
@@ -1491,6 +1493,9 @@ def build_vllm_config(
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+    if api_process_count != 1 or api_process_rank != 0:
+        filtered_engine_args_dict["_api_process_count"] = api_process_count
+        filtered_engine_args_dict["_api_process_rank"] = api_process_rank
 
     # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
     # plain dicts.  When OmniEngineArgs is instantiated with the dict, these
@@ -1747,6 +1752,7 @@ def acquire_device_locks(
     stage_id: int,
     engine_args_dict: dict[str, Any],
     stage_init_timeout: int,
+    locked_devices: set[int] | None = None,
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
@@ -1801,8 +1807,7 @@ def acquire_device_locks(
                 f"but only {len(physical_devices)} device(s) are available: {physical_devices}"
             )
 
-        num_devices_to_lock = num_devices_per_stage
-        devices_to_lock = sorted(physical_devices[:num_devices_to_lock])
+        devices_to_lock = sorted(set(physical_devices[:num_devices_per_stage]) - (locked_devices or set()))
 
         logger.debug(
             "Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d, SP=%d, CFG=%d; will lock %d devices: %s",
@@ -1812,7 +1817,7 @@ def acquire_device_locks(
             prefill_context_parallel_size,
             sequence_parallel_size,
             cfg_parallel_size,
-            num_devices_to_lock,
+            len(devices_to_lock),
             devices_to_lock,
         )
 
@@ -1830,6 +1835,8 @@ def acquire_device_locks(
                         record_lock_holder_pid(lock_fd, lock_writable)
                         lock_acquired = True
                         lock_fds.append(lock_fd)
+                        if locked_devices is not None:
+                            locked_devices.add(device_id)
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
