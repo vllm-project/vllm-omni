@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
+
 import pytest
 
 from tests.model_tests.diffusion.case_filtering import get_parametrized_options
@@ -19,7 +21,8 @@ from tests.model_tests.diffusion.task_runners import (
     run_and_validate_text_to_video_request,
 )
 
-# NOTE : Hardware marks are added dynamically based on test requirements
+# NOTE: pytest.mark.core_model / pytest.mark.full_model and hardware_marks(...)
+# are added dynamically by get_parametrized_options based on test requirements.
 pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
 
 
@@ -51,6 +54,8 @@ def test_pipeline_on_supported_tasks(
         accelerations=accelerations,
         model=tiny_model_paths[model_name],
         enforce_eager=True,
+        init_timeout=int(os.environ.get("VLLM_OMNI_TEST_INIT_TIMEOUT", "600")),
+        stage_init_timeout=int(os.environ.get("VLLM_OMNI_TEST_STAGE_INIT_TIMEOUT", "300")),
     )
     try:
         for task_type in supported_tasks:
