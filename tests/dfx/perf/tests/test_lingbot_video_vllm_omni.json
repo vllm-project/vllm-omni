@@ -28,11 +28,12 @@
       {
         "name": "320x192_frames9_steps2",
         "dataset_name": "random",
+        "tokenizer": "gpt2",
         "endpoint": "/v1/videos",
         "num_prompts": 3,
         "max_concurrency": 1,
         "num_warmups": 1,
-        "random_input_len": 64,
+        "random_input_len": 8,
         "random_output_len": 1,
         "percentile_metrics": "e2el",
         "extra_body": {

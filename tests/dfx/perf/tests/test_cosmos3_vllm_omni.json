@@ -36,10 +36,11 @@
       {
         "name": "1024x1024_steps4",
         "dataset_name": "random",
+        "tokenizer": "gpt2",
         "endpoint": "/v1/images/generations",
         "num_prompts": 3,
         "max_concurrency": 1,
-        "random_input_len": 64,
+        "random_input_len": 8,
         "random_output_len": 1,
         "percentile_metrics": "e2el",
         "extra_body": {
@@ -98,10 +99,11 @@
       {
         "name": "1280x720_frames189_steps4",
         "dataset_name": "random",
+        "tokenizer": "gpt2",
         "endpoint": "/v1/videos",
         "num_prompts": 3,
         "max_concurrency": 1,
-        "random_input_len": 64,
+        "random_input_len": 8,
         "random_output_len": 1,
         "percentile_metrics": "e2el",
         "extra_body": {
@@ -165,10 +167,11 @@
       {
         "name": "1280x720_frames189_steps4",
         "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
         "endpoint": "/v1/videos",
         "num_prompts": 3,
         "max_concurrency": 1,
-        "random_input_len": 64,
+        "random_input_len": 8,
         "random_output_len": 1,
         "random_range_ratio": 0.0,
         "percentile_metrics": "e2el",
@@ -239,10 +242,11 @@
       {
         "name": "1280x720_frames189_steps4",
         "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
         "endpoint": "/v1/videos",
         "num_prompts": 3,
         "max_concurrency": 1,
-        "random_input_len": 64,
+        "random_input_len": 8,
         "random_output_len": 1,
         "random_range_ratio": 0.0,
         "percentile_metrics": "e2el",

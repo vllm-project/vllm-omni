@@ -28,10 +28,11 @@
       {
         "name": "832x480_frames33_steps4",
         "dataset_name": "random",
+        "tokenizer": "gpt2",
         "endpoint": "/v1/videos",
         "num_prompts": 10,
         "max_concurrency": 1,
-        "random_input_len": 64,
+        "random_input_len": 8,
         "random_output_len": 1,
         "percentile_metrics": "e2el",
         "extra_body": {
@@ -81,10 +82,11 @@
       {
         "name": "832x480_frames33_steps4",
         "dataset_name": "random",
+        "tokenizer": "gpt2",
         "endpoint": "/v1/videos",
         "num_prompts": 10,
         "max_concurrency": 1,
-        "random_input_len": 64,
+        "random_input_len": 8,
         "random_output_len": 1,
         "percentile_metrics": "e2el",
         "extra_body": {
