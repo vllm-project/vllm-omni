@@ -17,6 +17,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
     HiFTGenerator,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -735,6 +736,7 @@ def test_code2wav_streaming_batch_pads_codec_tokens_and_preserves_lengths():
 
 
 @pytest.mark.core_model
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
     """A padded flow batch must match individual flow calls on valid mels."""
