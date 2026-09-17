@@ -178,9 +178,10 @@ class TestDeployTopology:
                 0.18,
             ]
             assert sum(memory_utilizations) <= 0.9 + 1e-6
-            # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
+            # Daily-Omni: up to 64 interleaved audio items; Video-MME
+            # minicpm-frames samples up to 96 frames as image_url.
             assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
-                "image": 64,
+                "image": 96,
                 "audio": 64,
                 "video": 1,
             }
