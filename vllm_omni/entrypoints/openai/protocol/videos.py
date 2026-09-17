@@ -15,7 +15,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, field_validator, model_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
@@ -103,6 +103,54 @@ class UrlAudioReference(BaseModel):
 
 
 AudioReference = UrlAudioReference
+
+
+class TimelineGuideUpload(BaseModel):
+    """Reference to one repeated ``guide_files`` multipart upload."""
+
+    model_config = ConfigDict(extra="forbid")
+    upload_index: int = Field(
+        strict=True,
+        ge=0,
+        le=_INT64_MAX,
+        description="Zero-based index into the request's guide_files uploads.",
+    )
+
+
+class TimelineGuide(BaseModel):
+    """One ordered timeline guide entry addressing uploaded guide media."""
+
+    model_config = ConfigDict(extra="forbid")
+    frame_index: int = Field(
+        strict=True,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
+        description=(
+            "Pixel-frame start of this guide in the output timeline. Negative values count back from "
+            "the aligned output end and are not rounded to a latent boundary."
+        ),
+    )
+    image: TimelineGuideUpload | None = Field(
+        default=None, description="Still-image guide source; cannot be combined with video."
+    )
+    video: TimelineGuideUpload | None = Field(
+        default=None, description="Clip guide source; cannot be combined with image."
+    )
+    audio: TimelineGuideUpload | None = Field(
+        default=None,
+        description=(
+            "Explicit audio guide source starting at the same frame. A guide video's soundtrack is "
+            "never extracted automatically."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "TimelineGuide":
+        if self.image is not None and self.video is not None:
+            raise ValueError("A timeline guide cannot contain both image and video")
+        if self.image is None and self.video is None and self.audio is None:
+            raise ValueError("A timeline guide requires at least one source")
+        return self
 
 
 class VideoGenerationRequest(BaseModel):
@@ -285,6 +333,24 @@ class VideoGenerationRequest(BaseModel):
         ),
     )
 
+    # vllm-omni extension for ordered timeline guides on guide-capable models
+    # (MiniMax H3). Multipart only: the manifest addresses the separate
+    # ``guide_files`` uploads by index and never carries paths or URLs.
+    timeline_guides: list[TimelineGuide] | None = Field(
+        default=None,
+        description=(
+            "Ordered MiniMax H3 timeline guides, sent as a JSON multipart field alongside repeated "
+            "guide_files uploads. Each entry requires frame_index (a strict integer; negative values "
+            "count back from the aligned output end) plus at least one of image, video, or audio, each "
+            "addressing one upload by its zero-based upload_index. image and video cannot coexist in a "
+            "single entry, and an upload may be reused by several entries. Guides are timeline "
+            "conditions rather than ordinary references: they never enter reference presentation, and "
+            "guided requests require a guide-capable model with base weights and cache-free execution."
+        ),
+    )
+    # Only the multipart transport can attach trusted, request-owned paths.
+    _guide_bundle: Any = PrivateAttr(default=None)
+
     # Generic model-specific parameters
     extra_params: dict[str, Any] | None = Field(
         default=None,
@@ -294,6 +360,16 @@ class VideoGenerationRequest(BaseModel):
         default=None,
         description="Whether to include server-side stage metrics in async video metadata.",
     )
+
+    @field_validator("extra_params")
+    @classmethod
+    def reject_internal_guides(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        # Keep the reserved key in sync with GUIDES_EXTRA_KEY in
+        # vllm_omni/model_executor/models/minimax_h3/timeline_guides.py. The
+        # literal is duplicated so this protocol module stays free of model imports.
+        if value and any(key in value for key in ("_minimax_h3_timeline_guides", "timeline_guides", "guide_files")):
+            raise ValueError("Timeline guides require top-level timeline_guides and guide_files uploads")
+        return value
 
     def resolve_video_params(
         self,

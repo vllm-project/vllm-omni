@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -134,15 +134,37 @@ def resolve_minimax_h3_aspect_ratio(
     return numeric_value
 
 
-def resolve_minimax_h3_reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    """Resize an H3 reference image to the official 2048-short-edge canvas."""
+def resolve_minimax_h3_reference_image_shape(
+    image: Image.Image,
+    *,
+    target: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Resize an H3 reference image to its (width, height) conditioning canvas.
+
+    Default policy: the official 2048-short-edge reference canvas, which may
+    upscale a small source.
+
+    ``target`` selects the target-area policy instead and must be the final
+    ``(width, height)`` output canvas. It is an internal selection reserved for
+    guided Ref2VA requests: the reference is scaled down only, keeping its
+    aspect ratio, so its pixel area does not exceed the generated canvas. This
+    matches the native multi-frame reference workflow, where reference tokens
+    ride through every sampling step next to the guide anchors.
+    """
     width, height = image.size
     ratio = width / height
     if not 0.4 <= ratio <= 2.5:
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    if target is None:
+        scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    else:
+        target_width, target_height = (int(value) for value in target)
+        if target_width <= 0 or target_height <= 0:
+            raise OmniClientError(f"reference image target canvas must be positive, got {target}")
+        # Down-only: an already smaller reference keeps its own resolution.
+        scale = min(1.0, math.sqrt((target_width * target_height) / (width * height)))
     return (
         _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
         _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
@@ -167,6 +189,50 @@ def resolve_minimax_h3_output_canvas(aspect_ratio: float, short_edge: int) -> tu
         width *= scale
         height *= scale
     return _align_multiple(height, 32), _align_multiple(width, 32)
+
+
+def resolve_minimax_h3_target_canvas(
+    task: str,
+    *,
+    height: Any,
+    width: Any,
+    extra_args: Mapping[str, Any] | None,
+    image: Image.Image | None,
+) -> tuple[int, int]:
+    """Resolve the request's final 32-aligned ``(height, width)`` output canvas.
+
+    Single source of truth for the sampling/``extra_args['target']`` canvas
+    rules, shared by the diffusion pipeline's shape resolver and the split-stage
+    Qwen image preparation so the two cannot drift apart. Explicit
+    ``height``/``width`` win; otherwise the aspect-ratio/short-edge policy
+    applies.
+    """
+    extra = extra_args if isinstance(extra_args, Mapping) else {}
+    target = extra.get("target")
+    if target is not None and not isinstance(target, Mapping):
+        raise OmniClientError("MiniMax H3 extra_args['target'] must be an object")
+    target = target if isinstance(target, Mapping) else {}
+    raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
+    if isinstance(raw_short_edge, bool) or not isinstance(raw_short_edge, (int, np.integer)):
+        raise OmniClientError(
+            f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {raw_short_edge!r}"
+        )
+    aspect_ratio = resolve_minimax_h3_aspect_ratio(
+        task,
+        target.get("aspect_ratio", extra.get("aspect_ratio")),
+        image,
+    )
+    if not 0.25 <= aspect_ratio <= 4.0:
+        raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be in [1:4, 4:1], got {aspect_ratio}")
+    if height is None or width is None:
+        height, width = resolve_minimax_h3_output_canvas(aspect_ratio, int(raw_short_edge))
+    height = int(height) // 32 * 32
+    width = int(width) // 32 * 32
+    if min(height, width) <= 0:
+        raise OmniClientError(f"invalid MiniMax H3 canvas {width}x{height}")
+    if width > 4 * height or height > 4 * width:
+        raise OmniClientError("MiniMax H3 canvas aspect ratio must be in [1:4, 4:1]")
+    return height, width
 
 
 def _text_ids(tokenizer: Any, text: str) -> list[int]:
@@ -490,4 +556,5 @@ __all__ = [
     "resolve_minimax_h3_aspect_ratio",
     "resolve_minimax_h3_output_canvas",
     "resolve_minimax_h3_reference_image_shape",
+    "resolve_minimax_h3_target_canvas",
 ]

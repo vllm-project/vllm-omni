@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import copy
 import multiprocessing as mp
 import queue
 import signal
@@ -31,6 +32,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -708,7 +710,7 @@ class TestSerialEngineOperations:
         assert len(results) == 1
         assert results[0].error == "rank0"
 
-    def test_collective_rpc_all_rank_status_error_propagation(self):
+    def test_collective_rpc_all_rank_status_error_propagation(self, caplog):
         engine, _, _, res_q = _make_engine(num_gpus=2)
 
         res_q.put(
@@ -723,18 +725,24 @@ class TestSerialEngineOperations:
                         "ok": False,
                         "error": "rank1 boom",
                         "error_type": "RuntimeError",
-                        "traceback": "rank1 traceback",
+                        "traceback": 'File "/opt/worker/diffusion_worker.py", line 42, in add_lora',
                     },
                 ],
             }
         )
 
-        with pytest.raises(RuntimeError) as excinfo:
-            engine.collective_rpc("add_lora")
+        with caplog.at_level("ERROR"):
+            with pytest.raises(RuntimeError) as excinfo:
+                engine.collective_rpc("add_lora")
         error = str(excinfo.value)
         assert "rank 1" in error
         assert "rank1 boom" in error
-        assert "rank1 traceback" in error
+        # ``api_server`` echoes ``str(exc)`` for 500s too, so the worker
+        # traceback must stay server-side.
+        assert "diffusion_worker.py" not in error
+        assert "Traceback" not in error
+        assert "diffusion_worker.py" in caplog.text
+        assert "add_lora" in caplog.text
 
     def test_collective_rpc_all_rank_bool_false_is_aggregated(self):
         engine, _, _, res_q = _make_engine(num_gpus=2)
@@ -825,6 +833,57 @@ class TestSerialEngineOperations:
             engine.collective_rpc("anything")
 
 
+@pytest.mark.parametrize("step_execution", [True, False])
+@pytest.mark.parametrize("enveloped", [True, False])
+@pytest.mark.parametrize("unknown_peer_error", [True, False])
+def test_dp_error_collector_drains_terminal_replies(step_execution, enveloped, unknown_peer_error):
+    executor, _, res_q = _make_executor(num_gpus=2)
+    executor.od_config = SimpleNamespace(
+        step_execution=step_execution,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+    )
+    executor._sync_result_buffer = res_q
+    executor._result_mqs = [executor._result_mq, executor._result_mq]
+    first = {
+        "status": "error",
+        "error": "invalid guide interval",
+        "error_status_code": 400,
+        "error_type": "GuideValidationError",
+    }
+    if enveloped:
+        first = {
+            "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+            "method": "execute_model",
+            "rank_statuses": [
+                {
+                    "rank": 0,
+                    "ok": False,
+                    "error": "invalid guide interval",
+                    "error_status_code": 400,
+                    "client_error_type": "GuideValidationError",
+                }
+            ],
+        }
+    res_q.put(first)
+    res_q.put(
+        {"status": "error", "error": "unknown worker failure"}
+        if unknown_peer_error
+        else {"dp_rank": 1, "output": DiffusionOutput()}
+    )
+
+    result = executor.execute_request(_make_sched_output("A", "B"))
+
+    assert res_q.empty(), "request rejection must not leave a peer's terminal reply unread"
+    assert len(result.runner_outputs) == 2
+    for output in result.runner_outputs:
+        assert output.finished
+        assert ("unknown worker failure" if unknown_peer_error else "invalid guide interval") in output.result.error
+        assert output.result.error_status_code == (None if unknown_peer_error else 400)
+        assert output.result.error_type == (None if unknown_peer_error else "GuideValidationError")
+
+
 class TestWorkerProcRpcRankStatus:
     def _make_worker_proc(self, has_result_mq: bool = True):
         proc = object.__new__(WorkerProc)
@@ -897,6 +956,27 @@ class TestWorkerProcRpcRankStatus:
         assert status["bool_result"] is None
         assert "local boom" in status["traceback"]
 
+    @pytest.mark.parametrize("client_error", [True, False])
+    def test_rank_status_error_preserves_metadata(self, monkeypatch, client_error):
+        proc = self._make_worker_proc()
+        message = "guide timestamp out of range"
+        original = (
+            OmniClientError(message, error_type="GuideValidationError") if client_error else RuntimeError(message)
+        )
+        proc.worker.execute_method = Mock(side_effect=original)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(diffusion_worker_module, "_cleanup_after_execution_error", Mock())
+        envelope, should_reply = proc._execute_rpc(
+            {"method": "execute_model", "output_rank": 0, "exec_all_ranks": True, "collect_rank_status": True}
+        )
+        assert should_reply
+        with pytest.raises(OmniClientError if client_error else RuntimeError) as caught:
+            MultiprocDiffusionExecutor._handle_rpc_response(copy.deepcopy(envelope))
+        output = DiffusionOutput.from_exception(caught.value)
+        assert message in output.error
+        assert output.error_status_code == (400 if client_error else None)
+        assert output.error_type == ("GuideValidationError" if client_error else None)
+
     def test_execute_rpc_collect_exception_releases_traceback_and_device_cache(self, monkeypatch):
         proc = self._make_worker_proc()
         original = RuntimeError("local boom")
@@ -947,11 +1027,13 @@ class TestWorkerProcRpcRankStatus:
         assert should_reply is False
         assert result is None, "a non-reply rank must not keep the output alive"
 
-    def test_execute_rpc_still_returns_the_result_on_the_replying_rank(self):
+    @pytest.mark.parametrize("async_rpc", [True, False])
+    def test_execute_rpc_still_returns_the_result_on_the_replying_rank(self, async_rpc):
         """The rank that owns the reply keeps returning the same object."""
         proc = self._make_worker_proc()
         payload = {"frames": object()}
         proc.worker.execute_method = lambda *args, **kwargs: payload
+        proc._gather_rpc_rank_statuses = lambda status: [status]
 
         result, should_reply = proc._execute_rpc(
             {
@@ -960,6 +1042,8 @@ class TestWorkerProcRpcRankStatus:
                 "kwargs": {},
                 "output_rank": 0,
                 "exec_all_ranks": True,
+                "collect_rank_status": async_rpc,
+                "rpc_id": "1" if async_rpc else None,
             }
         )
 

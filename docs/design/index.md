@@ -45,6 +45,10 @@ implementation contract; it is not, by itself, a general support claim.
 
 - [Quantization](feature/quantization.md)
 
+### Model conditioning
+
+- [MiniMax H3 Timeline Guides](feature/minimax_h3_timeline_guides.md)
+
 ### Diffusion acceleration
 
 #### Parallelism

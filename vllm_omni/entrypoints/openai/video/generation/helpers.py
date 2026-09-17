@@ -27,7 +27,7 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
 from http import HTTPStatus
 from numbers import Integral
@@ -36,6 +36,7 @@ from typing import Any, Literal, cast
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from PIL import Image
+from pydantic import ValidationError
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
@@ -63,6 +64,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
 from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestBundle
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
     _decode_image_bytes,
@@ -321,6 +323,11 @@ async def _run_video_generation_job(
     control_path: str | None = None,
     app_state: Any | None = None,
 ) -> None:
+    if request._guide_bundle is not None:
+        await _run_guided_video_generation_job(
+            handler, request, video_id, reference_image, reference_video, reference_audio, app_state
+        )
+        return
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
@@ -403,6 +410,101 @@ async def _run_video_generation_job(
         _cleanup_video_references(reference_video, reference_audio, control_path)
 
 
+async def _run_guided_video_generation_job(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+    video_id: str,
+    reference_image: ReferenceImage | None,
+    reference_video: ReferenceVideo | None,
+    reference_audio: ReferenceAudio | None,
+    app_state: Any,
+) -> None:
+    bundle = request._guide_bundle
+    started_at = time.perf_counter()
+    try:
+        async with bundle.lock:
+            job = await VIDEO_STORE.get(video_id)
+            if bundle.abandoned or job is None:
+                return
+
+        # Guided jobs stay QUEUED until the engine reports inference start, so
+        # the reported status matches the unguided path. Abandonment is checked
+        # under the bundle lock because DELETE pops the store entry there.
+        async def _mark_started() -> None:
+            async with bundle.lock:
+                if bundle.abandoned:
+                    return
+                await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
+        result = await handler.generate_video_bytes(
+            request,
+            video_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
+            reference_audio=reference_audio,
+            on_started=_mark_started,
+        )
+        if asyncio.current_task().cancelling():
+            bundle.abandoned = True
+        if bundle.abandoned:
+            return
+        video_bytes, stage_durations, peak_memory_mb, action, metadata = _unpack_video_generation_result(result)
+        # DELETE marks abandonment before taking this lock. A save already in
+        # progress is allowed to finish, then its artifact is removed, never published.
+        async with bundle.lock:
+            if bundle.abandoned:
+                return
+            saved = await bundle.finish_storage(STORAGE_MANAGER.save(video_bytes, video_id))
+            if bundle.abandoned:
+                await bundle.finish_storage(_cleanup_video(video_id))
+                return
+            fields = {
+                "status": VideoGenerationStatus.COMPLETED,
+                "progress": 100,
+                "file_name": f"{video_id}.{job.file_extension}",
+                "completed_at": saved.created_at,
+                "inference_time_s": time.perf_counter() - started_at,
+                "stage_durations": stage_durations,
+                "peak_memory_mb": peak_memory_mb,
+                "action": action,
+            }
+            fields.update({key: value for key, value in metadata.items() if value is not None})
+            if saved.expires_at is not None:
+                fields["expires_at"] = saved.expires_at
+            await VIDEO_STORE.update_fields(video_id, fields)
+    except asyncio.CancelledError:
+        bundle.abandoned = True
+        raise
+    except Exception as exc:
+        logger.exception("Guided video generation failed for id=%s", video_id)
+        if asyncio.current_task().cancelling():
+            bundle.abandoned = True
+        async with bundle.lock:
+            await bundle.finish_storage(_cleanup_video(video_id))
+            if not bundle.abandoned:
+                await VIDEO_STORE.update_fields(
+                    video_id,
+                    {
+                        "status": VideoGenerationStatus.FAILED,
+                        "completed_at": int(time.time()),
+                        "error": _video_error_from_exception(exc),
+                        "inference_time_s": time.perf_counter() - started_at,
+                    },
+                )
+        if app_state is not None and isinstance(exc, EngineDeadError):
+            terminate_if_errored(server=app_state.server, engine=app_state.engine_client)
+    finally:
+        if bundle.abandoned or asyncio.current_task().cancelling():
+            bundle.abandoned = True
+            await bundle.finish_storage(_delete_guided_video(video_id, bundle))
+
+
+async def _delete_guided_video(video_id: str, bundle: GuidedRequestBundle) -> None:
+    async with bundle.lock:
+        await STORAGE_MANAGER.delete(video_id)
+        await VIDEO_STORE.pop(video_id)
+
+
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
     paths: list[str] = []
     try:
@@ -415,7 +517,7 @@ async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[
             with os.fdopen(fd, "wb") as output:
                 while chunk := await upload.read(1024 * 1024):
                     output.write(chunk)
-    except Exception:
+    except BaseException:
         for path in paths:
             if os.path.exists(path):
                 os.unlink(path)
@@ -684,12 +786,82 @@ async def _persist_uploaded_media_references(
                 audios.append(path)
             else:
                 videos.append(path)
-    except Exception:
+    except BaseException:
         for path in paths:
             if os.path.exists(path):
                 os.unlink(path)
         raise
     return images, videos, audios
+
+
+def _bind_guide_uploads(request: VideoGenerationRequest, uploads: list[UploadFile], limits: Any) -> list[str]:
+    guides = request.timeline_guides or []
+    if len(guides) > limits.max_entries or len(uploads) > limits.max_unique_files:
+        raise HTTPException(400, "Timeline guide entry or file count exceeds the configured limit.")
+    kinds: dict[int, str] = {}
+    for guide in guides:
+        for kind in ("image", "video", "audio"):
+            source = getattr(guide, kind)
+            if source is None:
+                continue
+            index = source.upload_index
+            if index >= len(uploads):
+                raise HTTPException(400, f"Timeline guide upload_index {index} is out of range.")
+            if index in kinds and kinds[index] != kind:
+                raise HTTPException(400, "A guide upload cannot be reused as a different media type.")
+            kinds[index] = kind
+    if len(kinds) != len(uploads):
+        raise HTTPException(400, "Every guide_files upload must be referenced by timeline_guides.")
+    suffixes = {
+        "image": {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"},
+        "video": {".mp4", ".mov"},
+        "audio": {".wav", ".mp3", ".flac"},
+    }
+    for index, upload in enumerate(uploads):
+        kind = kinds[index]
+        suffix = Path(upload.filename or "").suffix.lower()
+        mime = (upload.content_type or "").split(";", 1)[0].strip().lower()
+        if suffix not in suffixes[kind] or (
+            mime and mime != "application/octet-stream" and not mime.startswith(kind + "/")
+        ):
+            raise HTTPException(400, f"guide_files[{index}] must be a supported {kind} file.")
+    return [kinds[index] for index in range(len(uploads))]
+
+
+async def _persist_guide_uploads(
+    request: VideoGenerationRequest, uploads: list[UploadFile], kinds: list[str], limits: Any
+) -> None:
+    bundle = request._guide_bundle
+    paths: list[str] = []
+    total = 0
+    for upload, kind in zip(uploads, kinds):
+        maximum = min(getattr(limits, f"max_{kind}_bytes"), limits.max_total_upload_bytes - total)
+        payload = await _read_upload_limited(upload, max_bytes=maximum)
+        total += len(payload)
+        if not payload:
+            raise HTTPException(400, "Timeline guide uploads must not be empty.")
+        if kind == "image":
+            _validate_minimax_h3_image_payload(payload, filename=upload.filename)
+            with Image.open(io.BytesIO(payload)) as image:
+                if image.width * image.height > limits.max_source_pixels:
+                    raise HTTPException(400, "Timeline guide image exceeds the configured pixel limit.")
+        suffix = Path(upload.filename or "").suffix.lower()
+        fd, path = tempfile.mkstemp(prefix="vllm_omni_guide_", suffix=suffix)
+        bundle.paths.add(path)
+        paths.append(path)
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
+    bundle.descriptors = [
+        {
+            "frame_index": guide.frame_index,
+            **{
+                kind: paths[getattr(guide, kind).upload_index]
+                for kind in ("image", "video", "audio")
+                if getattr(guide, kind) is not None
+            },
+        }
+        for guide in request.timeline_guides
+    ]
 
 
 async def _parse_video_form(
@@ -702,6 +874,8 @@ async def _parse_video_form(
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
     audio_reference: str | None = Form(default=None),
+    timeline_guides: str | None = Form(default=None),
+    guide_files: list[UploadFile] | None = File(default=None),
     model: str | None = Form(default=None),
     seconds: SecondStr | None = Form(default=None),
     size: SizeStr | None = Form(default=None),
@@ -732,14 +906,16 @@ async def _parse_video_form(
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
     return_stage_metrics: bool | None = Form(default=None),
-) -> tuple[
-    VideoGenerationRequest,
-    "OmniOpenAIServingVideo",
-    str,
-    ReferenceImage | None,
-    ReferenceVideo | None,
-    ReferenceAudio | None,
-    str | None,
+) -> AsyncIterator[
+    tuple[
+        VideoGenerationRequest,
+        "OmniOpenAIServingVideo",
+        str,
+        ReferenceImage | None,
+        ReferenceVideo | None,
+        ReferenceAudio | None,
+        str | None,
+    ]
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
@@ -747,7 +923,6 @@ async def _parse_video_form(
     Used by both ``POST /v1/videos`` (async) and ``POST /v1/videos/sync``.
     """
     input_references = input_references or []
-    input_reference_bytes: bytes | None = None
     parsed_image_reference = _parse_form_json(image_reference)
     parsed_video_reference = _parse_form_json(video_reference)
     parsed_audio_reference = _parse_form_json(audio_reference)
@@ -776,6 +951,7 @@ async def _parse_video_form(
         "image_reference": parsed_image_reference,
         "video_reference": parsed_video_reference,
         "audio_reference": parsed_audio_reference,
+        "timeline_guides": _parse_form_json(timeline_guides, expected_type=list),
         "user": user,
         "width": width,
         "height": height,
@@ -805,7 +981,10 @@ async def _parse_video_form(
         "return_stage_metrics": return_stage_metrics,
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}
-    request = VideoGenerationRequest(**request_data)
+    try:
+        request = VideoGenerationRequest(**request_data)
+    except ValidationError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
 
     handler = Omnivideo(raw_request)
     if handler is None:
@@ -842,6 +1021,54 @@ async def _parse_video_form(
         # until reference parsing succeeds, preserving failure cleanup.
         _attach_control_upload(request, normalized_control_type)
 
+    bundle = None
+    uploads = guide_files or []
+    if request.timeline_guides or uploads:
+        limits = handler.timeline_guide_limits()
+        kinds = _bind_guide_uploads(request, uploads, limits)
+        if request.lora is not None or request.quality == "high":
+            raise HTTPException(400, "Timeline guides require base H3 without LoRA and quality=lossless.")
+        bundle = handler.guided_requests.reserve(limits.max_outstanding_requests)
+        request._guide_bundle = bundle
+    try:
+        if bundle is not None:
+            await _persist_guide_uploads(request, uploads, kinds, limits)
+        ctx = await _parse_video_references(
+            request,
+            handler,
+            effective_model_name,
+            app_stage_configs,
+            input_reference,
+            input_references,
+            parsed_video_reference,
+            control_reference,
+            normalized_control_type,
+        )
+        yield ctx
+    except BaseException:
+        if bundle is not None:
+            bundle.abandoned = True
+            if bundle.job_id is not None:
+                await bundle.finish_storage(_delete_guided_video(bundle.job_id, bundle))
+        raise
+    finally:
+        if bundle is not None and bundle.task is None:
+            bundle.close()
+
+
+async def _parse_video_references(
+    request: VideoGenerationRequest,
+    handler: OmniOpenAIServingVideo,
+    effective_model_name: str,
+    app_stage_configs: list[Any] | None,
+    input_reference: UploadFile | None,
+    input_references: list[UploadFile],
+    parsed_video_reference: Any,
+    control_reference: UploadFile | None,
+    normalized_control_type: str | None,
+) -> tuple:
+    bundle: GuidedRequestBundle | None = request._guide_bundle
+    input_reference_bytes = None
     supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
     if input_reference is not None:
         input_reference_bytes = await _read_upload_limited(
@@ -874,6 +1101,9 @@ async def _parse_video_form(
             images, audio_paths = [], []
         else:
             images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references)
+        if bundle is not None:
+            bundle.paths.update(video_paths)
+            bundle.paths.update(audio_paths)
         if images:
             reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
         if video_paths:
@@ -905,6 +1135,8 @@ async def _parse_video_form(
                     raise InvalidInputReferenceError("video_reference did not decode to a video")
                 if media_data.source_path is not None:
                     video_paths.append(media_data.source_path)
+                    if bundle is not None:
+                        bundle.paths.add(media_data.source_path)
                 else:
                     if len(video_items) != 1:
                         raise InvalidInputReferenceError(
@@ -925,6 +1157,8 @@ async def _parse_video_form(
                 elif isinstance(media_data, VideoFrames):
                     if media_data.source_path is not None:
                         video_paths.append(media_data.source_path)
+                        if bundle is not None:
+                            bundle.paths.add(media_data.source_path)
                     else:
                         video_frames = list(media_data)
 
@@ -945,6 +1179,8 @@ async def _parse_video_form(
         try:
             for audio_reference in _reference_list(request.audio_reference):
                 audio_paths.append(await decode_audio_url(audio_reference.audio_url))
+                if bundle is not None:
+                    bundle.paths.add(audio_paths[-1])
         except InvalidInputReferenceError as exc:
             _cleanup_video_references(reference_video, reference_audio)
             cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
@@ -972,6 +1208,8 @@ async def _parse_video_form(
                 max_bytes=CONTROL_REFERENCE_MAX_BYTES,
             )
             _attach_control_upload(request, normalized_control_type, control_path)
+            if bundle is not None:
+                bundle.paths.add(control_path)
         except (asyncio.CancelledError, HTTPException, OSError, TypeError, ValueError):
             _cleanup_video_references(reference_video, reference_audio, control_path)
             raise

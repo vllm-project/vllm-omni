@@ -343,6 +343,22 @@ class OmniEngineBase:
 
         logger.info(f"[OmniEngine] Orchestrator ready with {self.num_stages} stages")
 
+    def _resolve_diffusion_model_config(self) -> dict[str, Any]:
+        """Return the diffusion stage's sanitized ``model_config`` snapshot.
+
+        Out-of-process diffusion clients keep the real ``OmniDiffusionConfig``
+        in the worker, but they carry a plain ``model_config`` copy so the API
+        process can still read server-owned policy blocks (timeline-guide
+        admission limits in particular).
+        """
+        for stage_client in self.stage_clients:
+            if getattr(stage_client, "stage_type", None) != "diffusion":
+                continue
+            snapshot = getattr(stage_client, "diffusion_model_config", None)
+            if snapshot:
+                return snapshot
+        return {}
+
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.
 
@@ -362,7 +378,12 @@ class OmniEngineBase:
                 supports_multimodal_inputs=metadata.supports_multimodal_inputs,
                 max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
                 supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+                supports_timeline_guides=metadata.supports_timeline_guides,
+                model_config={},
             )
+        # Resolved per call rather than cached: headless replicas can attach
+        # their diffusion stage client after the first lookup.
+        self._diffusion_od_config_view.model_config = self._resolve_diffusion_model_config()
         return self._diffusion_od_config_view
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:

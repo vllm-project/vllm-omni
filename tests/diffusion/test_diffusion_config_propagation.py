@@ -248,3 +248,39 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_model_config_snapshot_detaches_plain_mappings():
+    """The head process must never share mutable state with stage startup."""
+    from vllm_omni.diffusion.stage_diffusion_client import diffusion_model_config_snapshot
+
+    source = {"minimax_h3_timeline_guides": {"max_entries": 2}}
+    snapshot = diffusion_model_config_snapshot(source)
+
+    assert snapshot == source
+    source["minimax_h3_timeline_guides"]["max_entries"] = 99
+    assert snapshot["minimax_h3_timeline_guides"]["max_entries"] == 2
+
+
+def test_model_config_snapshot_converts_omegaconf_containers():
+    """``TimelineGuideLimits.from_config`` needs a real ``Mapping``, not a node."""
+    from omegaconf import OmegaConf
+
+    from vllm_omni.diffusion.stage_diffusion_client import diffusion_model_config_snapshot
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    source = OmegaConf.create({"minimax_h3_timeline_guides": {"max_entries": 2, "max_outstanding_requests": 1}})
+    snapshot = diffusion_model_config_snapshot(source)
+
+    assert type(snapshot) is dict
+    assert type(snapshot["minimax_h3_timeline_guides"]) is dict
+    limits = TimelineGuideLimits.from_config(snapshot)
+    assert limits.max_entries == 2
+    assert limits.max_outstanding_requests == 1
+
+
+@pytest.mark.parametrize("value", [None, "not-a-mapping", 7])
+def test_model_config_snapshot_rejects_non_mappings(value):
+    from vllm_omni.diffusion.stage_diffusion_client import diffusion_model_config_snapshot
+
+    assert diffusion_model_config_snapshot(value) == {}

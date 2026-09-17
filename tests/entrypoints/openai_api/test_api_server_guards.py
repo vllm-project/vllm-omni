@@ -481,8 +481,18 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     async def fake_omni_init_app_state(engine_client, state, args):
         state.engine_client = engine_client
         state.initialized_by_omni = True
+
+        # Guided video uploads must be drained before the handler is torn
+        # down, so record the order the worker calls them in.
+        async def drain_guided_requests():
+            captured.setdefault("video_teardown_order", []).append("drain")
+
         state.openai_serving_video = SimpleNamespace(
-            shutdown=lambda: captured.__setitem__("video_shutdown", True),
+            drain_guided_requests=drain_guided_requests,
+            shutdown=lambda: (
+                captured.__setitem__("video_shutdown", True),
+                captured.setdefault("video_teardown_order", []).append("shutdown"),
+            ),
         )
         state.openai_serving_speech = SimpleNamespace(
             shutdown=lambda: captured.__setitem__("speech_shutdown", True),
@@ -524,6 +534,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert captured["restrictions"] == {}
     assert captured["video_shutdown"] is True
     assert captured["speech_shutdown"] is True
+    assert captured["video_teardown_order"] == ["drain", "shutdown"]
     assert sock.closed is True
     assert served_app.state.initialized_by_omni is True
 

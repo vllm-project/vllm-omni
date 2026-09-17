@@ -156,6 +156,140 @@ def test_step_execution_matches_request_mode_denoise_loop():
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
 
 
+@pytest.mark.parametrize("mixed_unguided", [False, True])
+def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_unguided):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        minimax_h3_denoise_loop,
+        minimax_h3_prepare_denoise_rows,
+    )
+
+    batch_sizes = []
+
+    class RecordingModel(_SegmentMeanModel):
+        def __call__(self, **kwargs):
+            batch_sizes.append(kwargs["packed_seq_params"].get("num_requests", 1))
+            return super().__call__(**kwargs)
+
+    model = RecordingModel()
+    pipeline = _step_pipeline(model)
+    pipeline.od_config = SimpleNamespace(model_config={})
+    states, expected, target_shapes = [], [], []
+    for index in range(2):
+        inputs_kwargs = dict(
+            task="ref2va",
+            text_embeddings=torch.ones(3 + index, _HIDDEN),
+            text_tags=torch.ones(3 + index, dtype=torch.long),
+            seed=17 + index,
+            latent_t=7,
+            latent_h=4,
+            latent_w=4,
+            audio_t=37,
+            num_frames=22,
+            num_steps=4 + index,
+            video_shift=12.0,
+            audio_shift=3.0,
+            base_schedule=None,
+            visual_condition=torch.arange(16 * 96, dtype=torch.float32).reshape(16, 96) / 100,
+            visual_condition_shape=None,
+            visual_condition_shapes=[(2, 4, 4), (1, 4, 4), (1, 4, 4)],
+            audio_condition=torch.arange(18 * 32, dtype=torch.float32).reshape(18, 32) / 100,
+            ref_audio_t=None,
+            audio_condition_lengths=[6, 3],
+            guide_blocks=[
+                {
+                    "kind": "video_audio",
+                    "frame_index": 7,
+                    "latent_t": 2,
+                    "latent_h": 4,
+                    "latent_w": 4,
+                    "ref_audio_t": 6,
+                },
+                {"kind": "image", "frame_index": 1, "latent_h": 4, "latent_w": 4},
+            ],
+            ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}, {"kind": "audio", "ref_audio_t": 3}],
+        )
+        if mixed_unguided and index == 1:
+            inputs_kwargs.update(
+                latent_t=4,
+                latent_w=6,
+                audio_t=19,
+                num_frames=11,
+                visual_condition=torch.full((4, 96), 0.25),
+                visual_condition_shapes=[(1, 4, 4)],
+                audio_condition=None,
+                audio_condition_lengths=None,
+                guide_blocks=None,
+                ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}],
+            )
+        target_shapes.append(tuple(inputs_kwargs[key] for key in ("latent_t", "latent_h", "latent_w", "audio_t")))
+        inputs = pipeline._build_denoise_inputs(**inputs_kwargs)
+        branch = inputs["branch"]
+        video, audio = minimax_h3_denoise_loop(
+            model=model,
+            positive=branch,
+            initial_video_rows=inputs["video_rows"],
+            initial_audio_rows=inputs["audio_rows"],
+            keyframe_cond_rows=inputs["cond_anchor"],
+            audio_ref_rows=inputs["audio_anchor"],
+            sigmas_video=inputs["sigmas_video"],
+            sigmas_audio=inputs["sigmas_audio"],
+            device=torch.device("cpu"),
+        )
+        expected.append((video, audio))
+        video_rows, audio_rows, visual_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+            positive=branch,
+            initial_video_rows=inputs["video_rows"],
+            initial_audio_rows=inputs["audio_rows"],
+            keyframe_cond_rows=inputs["cond_anchor"],
+            audio_ref_rows=inputs["audio_anchor"],
+            device=torch.device("cpu"),
+        )
+        state = _make_state(
+            str(index), model, branch, video_rows, audio_rows, inputs["sigmas_video"], inputs["sigmas_audio"]
+        )
+        state.extra[mod._STEP_COND_ANCHOR] = visual_anchor
+        state.extra[mod._STEP_AUDIO_ANCHOR] = audio_anchor
+        states.append(state)
+    batch_sizes.clear()
+    active = list(states)
+    while active:
+        prediction = pipeline.denoise_step(SimpleNamespace(states=tuple(active)), states=active)
+        offset = 0
+        for state in active:
+            count = state.latents.shape[0]
+            pipeline.step_scheduler(state, prediction[offset : offset + count])
+            offset += count
+            branch = state.extra[mod._STEP_BRANCH]
+            torch.testing.assert_close(state.latents[~branch.update_mask], state.extra[mod._STEP_COND_ANCHOR])
+            if state.extra[mod._STEP_AUDIO_ANCHOR] is None:
+                assert branch.audio_update_mask.all()
+            else:
+                torch.testing.assert_close(
+                    state.extra[mod._STEP_AUDIO_ROWS][~branch.audio_update_mask],
+                    state.extra[mod._STEP_AUDIO_ANCHOR],
+                )
+        active = [state for state in active if not state.denoise_completed]
+    assert 2 in batch_sizes and batch_sizes[-1] == 1
+    for state, (video, audio), (latent_t, latent_h, latent_w, audio_t) in zip(
+        states, expected, target_shapes, strict=True
+    ):
+        torch.testing.assert_close(state.latents, video)
+        torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], audio)
+        branch = state.extra[mod._STEP_BRANCH]
+        target_video, target_audio = pipeline._unpack_denoised_rows(
+            branch,
+            state.latents,
+            state.extra[mod._STEP_AUDIO_ROWS],
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+        )
+        assert target_video.shape == (1, 24, latent_t, latent_h, latent_w)
+        assert target_audio.shape == (2, 32, audio_t)
+
+
 def test_batched_step_execution_matches_independent_requests():
     """Two co-batched requests must land where they would have landed alone."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
@@ -450,3 +584,53 @@ def test_packed_batch_rejects_backends_that_cannot_isolate_requests(attention):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     assert MiniMaxH3Pipeline._packed_batch_supported(_FakeTransformer([attention])) is False
+
+
+def test_broadcast_rank0_exception_single_rank_reraises():
+    """Single-rank execution has no group; the helper just reraises."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _broadcast_rank0_exception,
+    )
+    from vllm_omni.errors import OmniClientError
+
+    _broadcast_rank0_exception(None)
+    with pytest.raises(OmniClientError, match="bad ref"):
+        _broadcast_rank0_exception(OmniClientError("bad ref"))
+
+
+def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
+    """A rank-0 error becomes a matching client error on every other DiT rank."""
+    from vllm_omni.diffusion.models.minimax_h3 import distributed_errors
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    def fake_rank_world(rank):
+        return lambda: (object(), rank, 4)
+
+    def make_broadcast(rank0_payload):
+        def fake_broadcast(payload_list, *, src, group):
+            payload_list[0] = rank0_payload
+
+        return fake_broadcast
+
+    # ``_broadcast_rank0_exception`` lives in ``distributed_errors`` and resolves
+    # ``_dit_rank_world`` from that module's globals.
+    monkeypatch.setattr(distributed_errors, "_dit_rank_world", fake_rank_world(0))
+    err = OmniClientError("invalid reference-video file", status_code=422, error_type="UnprocessableEntityError")
+    rank0_payload = {
+        "type": type(err).__name__,
+        "message": str(err),
+        "status_code": err.status_code,
+        "error_type": err.error_type,
+    }
+    monkeypatch.setattr(mod.dist, "broadcast_object_list", make_broadcast(rank0_payload))
+    with pytest.raises(OmniClientError) as rank0_info:
+        mod._broadcast_rank0_exception(err)
+    assert rank0_info.value is err
+
+    monkeypatch.setattr(distributed_errors, "_dit_rank_world", fake_rank_world(2))
+    with pytest.raises(OmniClientError) as rank2_info:
+        mod._broadcast_rank0_exception(None)
+    assert rank2_info.value.status_code == 422
+    assert rank2_info.value.error_type == "UnprocessableEntityError"
+    assert "invalid reference-video file" in str(rank2_info.value)

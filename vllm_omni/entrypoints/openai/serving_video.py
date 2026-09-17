@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import math
 import time
@@ -34,11 +35,13 @@ from vllm_omni.entrypoints.openai.stage_params import (
     get_default_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestBundle, GuidedRequestLifetime
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import count_video_frames
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
@@ -79,6 +82,7 @@ def _stage_diffusion_model_class_name(stage_config: Any) -> str | None:
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
 
 
 @dataclass
@@ -155,6 +159,7 @@ class OmniOpenAIServingVideo:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        self.guided_requests = GuidedRequestLifetime()
         self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
         logger.info(
             "Video response frame conversion pool configured: workers=%d",
@@ -208,6 +213,18 @@ class OmniOpenAIServingVideo:
             revision=revision,
         )
 
+    def _candidate_model_archs(self, od_config: Any) -> list[str | None]:
+        """Collect every model-arch name that can carry capability metadata.
+
+        Split-stage deployments name the diffusion pipeline in a stage config
+        rather than in the resolved ``od_config``, so capability lookups must
+        consider both. Unknown names resolve to the metadata defaults.
+        """
+        model_archs: list[str | None] = [None if od_config is None else getattr(od_config, "model_class_name", None)]
+        for stage_config in self.stage_configs or ():
+            model_archs.append(_stage_diffusion_model_class_name(stage_config))
+        return model_archs
+
     @property
     def supports_mixed_reference_inputs(self) -> bool:
         """Return whether the configured diffusion model accepts mixed refs."""
@@ -216,12 +233,28 @@ class OmniOpenAIServingVideo:
             return False
 
         capability = getattr(od_config, "supports_mixed_reference_inputs", None)
-        model_class_name = getattr(od_config, "model_class_name", None)
-        model_archs = [model_class_name]
-        for stage_config in self.stage_configs or ():
-            model_archs.append(_stage_diffusion_model_class_name(stage_config))
         metadata_capability = any(
-            get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
+            get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs
+            for model_arch in self._candidate_model_archs(od_config)
+        )
+        return capability is True or metadata_capability
+
+    @property
+    def supports_timeline_guides(self) -> bool:
+        """Return whether the configured diffusion model accepts timeline guides.
+
+        Declared by shared capability metadata, not by a hardcoded pipeline
+        name, so every H3 alias that shares the guide contract is accepted and
+        other pipelines keep rejecting guides.
+        """
+        od_config = self._resolve_diffusion_od_config()
+        if od_config is None:
+            return False
+
+        capability = getattr(od_config, "supports_timeline_guides", None)
+        metadata_capability = any(
+            get_diffusion_model_metadata(model_arch).supports_timeline_guides
+            for model_arch in self._candidate_model_archs(od_config)
         )
         return capability is True or metadata_capability
 
@@ -234,9 +267,7 @@ class OmniOpenAIServingVideo:
         explicitly opts into the ``control_path`` contract in metadata.
         """
         od_config = self._resolve_diffusion_od_config()
-        model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
-        for stage_config in self.stage_configs or ():
-            model_archs.append(_stage_diffusion_model_class_name(stage_config))
+        model_archs = self._candidate_model_archs(od_config)
 
         supported: set[str] = set()
         for model_arch in model_archs:
@@ -262,6 +293,20 @@ class OmniOpenAIServingVideo:
     async def abort_request(self, request_id: str) -> None:
         await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
 
+    async def drain_guided_requests(self) -> None:
+        await self.guided_requests.drain()
+
+    def timeline_guide_limits(self) -> TimelineGuideLimits:
+        from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+        if not self.supports_timeline_guides:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="This diffusion model does not support timeline guides.",
+            )
+        od_config = self._resolve_diffusion_od_config()
+        return TimelineGuideLimits.from_config(getattr(od_config, "model_config", None))
+
     async def _run_and_extract(
         self,
         request: VideoGenerationRequest,
@@ -273,6 +318,12 @@ class OmniOpenAIServingVideo:
         on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
+        if request.extra_params and any(
+            key in request.extra_params for key in ("_minimax_h3_timeline_guides", "timeline_guides", "guide_files")
+        ):
+            raise HTTPException(400, "Timeline guide paths cannot be supplied in extra_params.")
+        if request.timeline_guides and request._guide_bundle is None:
+            raise HTTPException(400, "Timeline guides require bound guide_files uploads.")
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
@@ -443,6 +494,11 @@ class OmniOpenAIServingVideo:
 
         self._apply_lora(request.lora, gen_params)
 
+        if request._guide_bundle is not None:
+            from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
+
+            gen_params.extra_args[GUIDES_EXTRA_KEY] = copy.deepcopy(request._guide_bundle.descriptors)
+
         logger.info(
             "Video sampling params: steps=%s guidance=%s guidance_2=%s seed=%s",
             gen_params.num_inference_steps,
@@ -456,6 +512,7 @@ class OmniOpenAIServingVideo:
             gen_params,
             reference_id,
             on_started=on_started,
+            **({"guide_bundle": request._guide_bundle} if request._guide_bundle is not None else {}),
         )
         multimodal_output = self._extract_multimodal_output(result)
         metadata = multimodal_output.get("metadata") if isinstance(multimodal_output, dict) else {}
@@ -657,6 +714,7 @@ class OmniOpenAIServingVideo:
         request_id: str,
         *,
         on_started: Callable[[], Awaitable[None]] | None = None,
+        guide_bundle: GuidedRequestBundle | None = None,
     ) -> object:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
@@ -686,18 +744,41 @@ class OmniOpenAIServingVideo:
 
         result = None
         started_notified = False
-        async for output in engine_client.generate(
-            prompt=prompt,
-            request_id=request_id,
-            sampling_params_list=sampling_params_list,
-        ):
-            if is_diffusion_request_started_output(output):
-                if on_started is not None and not started_notified:
-                    await on_started()
-                    started_notified = True
-                continue
-            result = output
+        generate_kwargs: dict[str, Any] = {}
+        if guide_bundle is not None:
+            bundle = guide_bundle
 
+            # ``engine_started`` must mean "EngineCore accepted the request",
+            # not "the generate coroutine was entered". Failures before
+            # submission (asleep engine, list-prompt rejection, sampling
+            # resolution) must stay releasable so uploads and the admission
+            # slot are reclaimed.
+            def _mark_engine_admitted() -> None:
+                bundle.engine_started = True
+
+            generate_kwargs["on_engine_admitted"] = _mark_engine_admitted
+        try:
+            async for output in engine_client.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                **generate_kwargs,
+            ):
+                if is_diffusion_request_started_output(output):
+                    if on_started is not None and not started_notified:
+                        await on_started()
+                        started_notified = True
+                    continue
+                result = output
+        except OmniClientError as exc:
+            # Only origin-qualified terminal worker rejections prove completion.
+            # AsyncOmni also aborts on errors; that abort is not this proof.
+            if guide_bundle is not None and exc.worker_finished and not asyncio.current_task().cancelling():
+                guide_bundle.engine_completed = True
+            raise
+
+        if guide_bundle is not None and not asyncio.current_task().cancelling():
+            guide_bundle.engine_completed = True
         if result is None:
             raise HTTPException(
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,

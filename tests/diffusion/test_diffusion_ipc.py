@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import concurrent.futures
 import contextlib
 import multiprocessing as mp
 import queue
@@ -8,6 +9,8 @@ import threading
 import time
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -25,6 +28,7 @@ from vllm_omni.diffusion.ipc import (
     unpack_diffusion_output_shm,
 )
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -160,6 +164,69 @@ def test_per_worker_result_queues_release_nested_numpy_shm_and_processes() -> No
             continue
         leaked.close()
         pytest.fail(f"shared memory segment {name} still exists after unpack")
+
+
+@pytest.mark.parametrize("async_rpc", [True, False])
+@pytest.mark.parametrize("client_error", [True, False])
+def test_worker_error_round_trip_through_message_queue(monkeypatch, async_rpc, client_error) -> None:
+    from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+
+    message = "invalid guide frame count; OmniClientError text alone must not select HTTP 400"
+    original = OmniClientError(message, error_type="GuideValidationError") if client_error else RuntimeError(message)
+    writer = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0], max_chunk_bytes=65536, max_chunks=2)
+    reader = MessageQueue.create_from_handle(writer.export_handle(), 0)
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._result_mq = reader
+    executor._pump_stop = threading.Event()
+    executor._is_failed = False
+    executor._futures_lock = threading.RLock()
+    future = concurrent.futures.Future()
+    executor._rpc_futures = {"1": future}
+    pump = None
+    try:
+        proc = object.__new__(WorkerProc)
+        proc.gpu_id = 0
+        proc.od_config = SimpleNamespace(step_execution=not async_rpc)
+        proc.worker = SimpleNamespace(execute_method=Mock(side_effect=original))
+        proc.result_mq = writer
+        proc._result_mq_lock = threading.Lock()
+        proc._running = True
+        proc.recv_message = Mock(
+            side_effect=[
+                {
+                    "type": "rpc",
+                    "method": "execute_model",
+                    "output_rank": 0,
+                    "rpc_id": "1" if async_rpc else None,
+                },
+                {"type": "shutdown"},
+            ]
+        )
+        monkeypatch.setattr("vllm_omni.diffusion.worker.diffusion_worker._cleanup_after_execution_error", Mock())
+        proc._worker_busy_loop()
+        if async_rpc:
+            pump = threading.Thread(target=executor._result_pump)
+            pump.start()
+        with pytest.raises(OmniClientError if client_error else RuntimeError) as caught:
+            if async_rpc:
+                future.result(timeout=5)
+            else:
+                executor._handle_rpc_response(reader.dequeue(timeout=5))
+        output = DiffusionOutput.from_exception(caught.value)
+        assert message in output.error
+        assert output.error_status_code == (400 if client_error else None)
+        assert output.error_type == ("GuideValidationError" if client_error else None)
+        assert (output.error_status_code or 500) == (400 if client_error else 500)
+    finally:
+        executor._pump_stop.set()
+        if pump is not None:
+            pump.join(timeout=3)
+            assert not pump.is_alive()
+        reader.shutdown()
+        writer.shutdown()
+        # shutdown() wakes readers but does not close their ZMQ contexts.
+        reader.local_socket.context.destroy(linger=0)
+        writer.local_socket.context.destroy(linger=0)
 
 
 def test_diffusion_output_dict_tensors_round_trip_through_shm() -> None:
