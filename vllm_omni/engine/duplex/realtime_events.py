@@ -928,7 +928,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
     if event_type == "audio.cancelled":
         response_id = event.get("response_id")
         events = []
-        if event.get("reason") == "output_audio_buffer_clear":
+        if event.get("reason") in {"output_audio_buffer_clear", "context_replaced", "model_interrupt"}:
             if not isinstance(response_id, str) or not response_id:
                 response_id = state.active_response_id or state.last_response_id
             events.append(OutputAudioCleared(response_id=_str_or_none(response_id)))

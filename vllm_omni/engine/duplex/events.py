@@ -38,6 +38,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "unknown_event": "invalid_request_error",
     "internal_error": "server_error",
     "runtime_append_failed": "server_error",
+    "context_operation_failed": "server_error",
     "runtime_append_task_failed": "server_error",
     "runtime_signal_failed": "server_error",
     "runtime_abort_failed": "server_error",

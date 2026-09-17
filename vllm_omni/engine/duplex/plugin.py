@@ -16,17 +16,47 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
+    DuplexContextPlan,
     DuplexFence,
+    DuplexOutputContext,
     DuplexOutputDecision,
 )
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
+
+
+class DuplexContextPolicy(Protocol):
+    """Model-owned prompt journal format and validated reconstruction policy."""
+
+    max_bytes: int
+    max_tokens: int
+
+    def prepare_input(self, item: dict, runtime: dict, *, epoch: int) -> tuple[dict, dict | None]: ...
+    def prepare_replacement(self, item: dict, runtime: dict, *, epoch: int) -> tuple[dict, dict | None]: ...
+    def requires_replacement(self, item: dict) -> bool: ...
+    def should_rollover(self, prompts: list[dict], runtime: Mapping[str, object]) -> bool: ...
+    def describe(self, prompt: dict) -> dict: ...
+    def token_count(self, prompt: dict) -> int: ...
+    def complete(self, prompt: dict, output: object, context: DuplexOutputContext) -> dict | None: ...
+    def rollover(self, runtime: dict, *, epoch: int) -> tuple[dict, dict]: ...
+    def wake_payload(self, runtime: dict) -> dict: ...
+    def register_call(self, native: dict, runtime: dict, *, epoch: int) -> dict: ...
+    def plan(
+        self,
+        *,
+        prompts: list[dict],
+        runtime_config: dict,
+        session_config: dict,
+        request_id: str,
+        fence: DuplexFence,
+        context: dict,
+    ) -> DuplexContextPlan: ...
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -257,6 +287,10 @@ class DuplexModelPlugin(ABC):
         speed: float | None,
         modalities: tuple[str, ...],
     ) -> object: ...
+
+    def context_policy(self, runtime_config: Mapping[str, object]) -> DuplexContextPolicy | None:
+        """Return a model history policy, or None when editing is unsupported."""
+        return None
 
     # Optional hook: build the runtime config patch for a function-call output
     # item. Plugins without tools keep the default (no change).

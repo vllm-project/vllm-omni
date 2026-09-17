@@ -852,6 +852,11 @@ def translate_realtime_command(
             )
         return SignalTurn(event_id=event_id, event=signal_event, signal_payload=signal_payload)
 
+    if event_type in {"input.context.append", "input.context.replace", "input.context.get"}:
+        context = payload.get("context", {})
+        if not isinstance(context, dict):
+            raise DuplexCommandError("context must be an object", code="bad_event", event_id=event_id)
+        return SignalTurn(event_id=event_id, event=event_type, signal_payload=context)
     raise DuplexCommandError(f"Unknown duplex event type: {event_type}", code="unknown_event", event_id=event_id)
 
 

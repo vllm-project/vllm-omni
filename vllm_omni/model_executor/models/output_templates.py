@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import NamedTuple
 
 import torch
@@ -13,3 +16,7 @@ class OmniOutput(NamedTuple):
     multimodal_outputs: OmniPayload | None = None
     intermediate_tensors: IntermediateTensors | None = None
     next_token_id: torch.Tensor | None = None
+
+
+class ModelInputError(ValueError):
+    """Invalid or incomplete model-owned input for one request."""

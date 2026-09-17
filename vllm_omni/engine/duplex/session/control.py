@@ -281,6 +281,27 @@ class SessionControl:
         item = payload.get("item") if isinstance(payload, dict) else None
         item_type = item.get("type") if isinstance(item, dict) else None
         if item_type == "function_call_output" and isinstance(item, dict):
+            if self._ctx.history is not None:
+                applied = await self._ctx.history.handle(
+                    "input.context.append",
+                    {
+                        "kind": "tool_result",
+                        "event_id": str(item.get("id") or "result:" + str(item.get("call_id"))),
+                        "epoch": session.epoch,
+                        "call_id": item.get("call_id"),
+                        "output": item.get("output"),
+                    },
+                )
+                if applied:
+                    self._out.emit(
+                        {
+                            "type": "conversation.item.created",
+                            "session_id": session.session_id,
+                            "item": item,
+                            "created": True,
+                        }
+                    )
+                return
             if not await self._wait_for_append_tail():
                 return
             try:

@@ -31,6 +31,7 @@ if TYPE_CHECKING:
         DuplexStagePort,
     )
     from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSessionState
+    from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
     from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
     from vllm_omni.metrics.stats import StageRequestStats
@@ -92,6 +93,7 @@ class DuplexSessionContext:
     tasks: DuplexSessionTasks
     run: DuplexRunState
     services: RunnerServices
+    history: DuplexContextHistory | None = None
 
 
 # --------------------------------------------------------------------------- #
