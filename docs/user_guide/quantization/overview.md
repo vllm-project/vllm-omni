@@ -14,7 +14,7 @@ For the internal architecture and backend extension points, see the
 | ------ | ------- | ------------- | --------- |
 | Online quantization | [Online Quantization](online.md) | vLLM-Omni computes quantized weights and scales while loading the model. | FP8 W8A8, Int8 W8A8, BitsAndBytes W4, MXFP8 W8A8, MXFP4 W4A4 |
 | Runtime attention quantization | [Quantized KV Cache](quantized_kvcache.md) | vLLM-Omni dynamically quantizes eligible diffusion Flash Attention tensors during inference. | FP8 FA |
-| Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, AutoRound, TorchAO, msModelSlim, serialized Int8, offline MXFP8, offline MXFP4 DualScale |
+| Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, AutoRound, TorchAO, msModelSlim, serialized Int8, [INT8 ConvRot](int8_convrot.md), offline MXFP8, offline MXFP4 DualScale |
 
 ## Hardware Support
 
@@ -43,6 +43,7 @@ otherwise.
 | -------- | ------- | ------ | ---------------- | -------- |
 | FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
 | Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
+| INT8 ConvRot | [INT8 ConvRot](int8_convrot.md) | Offline ComfyUI W8A8 | MiniMax-H3 FL2VA | End-to-end validated on 2x A800 80GB with TP=2; compatible TP layouts are loader-validated but require topology-specific end-to-end validation |
 | BitsAndBytes W4 | [BitsAndBytes](bitsandbytes.md) | Online W4 weight-only | Z-Image-Turbo; Qwen-Image/Wan2.2 not validated | Validated for Z-Image-Turbo |
 | ModelOpt | [ModelOpt](modelopt.md) | Pre-quantized FP8 checkpoints | Qwen-Image, Z-Image, FLUX.2, HunyuanImage-3.0 | Validated for ModelOpt FP8 diffusion checkpoints |
 | MXFP8 W8A8 | [MXFP8](mxfp8.md) | Online W8A8 or offline pre-quantized | Wan2.2-T2V-A14B, I2V-A14B, TI2V-5B | Ascend NPU only; validated for Wan2.2 |
