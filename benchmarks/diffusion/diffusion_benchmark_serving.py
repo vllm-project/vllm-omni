@@ -1,6 +1,6 @@
 # adapted from fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Benchmark online serving for diffusion models (Image/Video Generation).
@@ -87,6 +87,7 @@ import base64
 import glob
 import json
 import logging
+import math
 import os
 import random
 import tempfile
@@ -1086,6 +1087,12 @@ async def _run_warmups(
 
     warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    failed_count = sum(not output.success for output in warmup_outputs)
+    if failed_count:
+        raise RuntimeError(
+            f"{failed_count}/{len(warmup_outputs)} warmup requests failed; "
+            "check server logs before running the benchmark."
+        )
     return list(zip(warmup_requests, warmup_outputs))
 
 
@@ -1116,6 +1123,11 @@ def calculate_metrics(
         "duration": total_duration,
         "completed_requests": num_success,
         "failed_requests": len(error_outputs),
+        "request_errors": [
+            {"request_id": req.request_id, "error": out.error}
+            for req, out in zip(requests_list, outputs)
+            if not out.success
+        ],
         "throughput_qps": num_success / total_duration if total_duration > 0 else 0,
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,
@@ -1261,6 +1273,9 @@ def _default_endpoint_for_task(task: str) -> str:
 
 
 async def benchmark(args):
+    if not math.isfinite(args.video_job_timeout) or args.video_job_timeout <= 0:
+        raise ValueError("--video-job-timeout must be a positive finite number of seconds.")
+
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
@@ -1312,6 +1327,8 @@ async def benchmark(args):
     print("Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+    for req in requests_list:
+        req.video_job_timeout = args.video_job_timeout
 
     if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
         for req in requests_list:
@@ -1376,6 +1393,8 @@ async def benchmark(args):
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
+    if args.endpoint == "/v1/videos":
+        metrics["video_job_timeout"] = args.video_job_timeout
     if args.endpoint == "/v1/images/edits":
         metrics["bot_task"] = args.bot_task
 
@@ -1398,6 +1417,11 @@ async def benchmark(args):
         )
     )
     print("{:<40} {}/{:<15}".format("Successful requests:", metrics["completed_requests"], len(requests_list)))
+    print("{:<40} {:<15}".format("Failed requests:", metrics["failed_requests"]))
+    for failure in metrics["request_errors"][:10]:
+        print(f"Request {failure['request_id']} failed: {failure['error']}")
+    if metrics["failed_requests"] > 10:
+        print("Showing first 10 failures; use --output-file to save all request errors.")
 
     # Section 3: Performance Metrics
     print(f"{'-' * 50}")
@@ -1437,7 +1461,7 @@ async def benchmark(args):
         print(f"Metrics saved to {args.output_file}")
 
 
-if __name__ == "__main__":
+def build_parser():
     parser = argparse.ArgumentParser(description="Benchmark serving for diffusion models.")
     parser.add_argument(
         "--base-url",
@@ -1481,6 +1505,13 @@ if __name__ == "__main__":
         help="Path to local dataset file (optional).",
     )
     parser.add_argument("--num-prompts", type=int, default=10, help="Number of prompts to benchmark.")
+    parser.add_argument(
+        "--video-job-timeout",
+        type=float,
+        default=900.0,
+        help="Maximum polling time in seconds per video job, including server queue time (default: 900). "
+        "Increase this for long-running video generation or high concurrency.",
+    )
     parser.add_argument(
         "--max-concurrency",
         type=int,
@@ -1612,6 +1643,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Request stage duration metrics from endpoints that support return_stage_metrics.",
     )
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_parser()
     args = parser.parse_args()
     asyncio.run(benchmark(args))

@@ -28,11 +28,9 @@ def _load_hub_module(repo_id: str):
 
     logger.info("Loading %s kernel from HuggingFace Hub...", repo_id)
     last_error = None
-    for version in (1, 2, None):
+    for version in (1, 2):
         try:
-            if version is not None:
-                return get_kernel(repo_id, version=version)
-            return get_kernel(repo_id)
+            return get_kernel(repo_id, version=version)
         except Exception as exc:
             logger.info("Failed to load %s version %s: %s", repo_id, version, exc)
             last_error = exc

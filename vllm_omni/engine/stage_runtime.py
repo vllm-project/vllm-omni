@@ -6,18 +6,20 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import copy
 import os
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, cast
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, field
+from multiprocessing.process import BaseProcess
+from typing import Any, TypedDict, cast
 
 import janus
-from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -48,14 +50,18 @@ from vllm_omni.engine.stage_init_utils import (
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_engine_args_dict,
+    build_engine_args_dict_from_omni_stage_config,
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
+    device_overlap_group_keys,
     extract_legacy_stage_metadata,
+    extract_stage_metadata_from_omni_stage_config,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
+    parse_physical_device_ids,
     prepare_engine_environment,
     release_device_locks,
     stage_runtime_env,
@@ -89,6 +95,44 @@ class StageRemoteFactoryContext:
     executor_class: type | None = None
 
 
+class OmniClientConfig(TypedDict, total=False):
+    """Per-frontend transport/configuration passed across process boundaries."""
+
+    client_count: int
+    client_index: int
+    stage_addresses: dict[int | str, dict[int | str, dict[str, Any]]]
+    input_address: str
+    output_address: str
+    stats_update_address: str
+    actual_address_pipe: Any
+    tensor_queue: Any
+
+
+@dataclass
+class StageEngineLaunch:
+    """Engine resources handed to a local client or the serving parent.
+
+    Successful launch transfers resource ownership to the caller. Startup or
+    attachment failures are rolled back by ``launch_stage_engines``.
+    """
+
+    client_configs: list[OmniClientConfig]
+    resources: list[StageReplicaResources]
+    watched_frontend_processes: list[BaseProcess] = field(default_factory=list)
+
+    def shutdown(self) -> None:
+        seen: set[int] = set()
+        for stage_resources in reversed(self.resources):
+            for resource in (stage_resources.manager, stage_resources.coordinator):
+                if resource is None or id(resource) in seen:
+                    continue
+                seen.add(id(resource))
+                try:
+                    resource.shutdown()
+                except Exception:
+                    logger.warning("[StageEngineLaunch] resource shutdown failed", exc_info=True)
+
+
 def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
     try:
         normalized = LoadBalancingPolicy(policy)
@@ -120,12 +164,14 @@ class StageRuntime:
         self,
         stage_configs: list[Any],
         model: str,
-        config_path: str,
+        config_path: str | None,
         *,
         stage_init_timeout: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        parallel_stage_init: bool = False,
         log_stats: bool = False,
+        client_config: OmniClientConfig | None = None,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -133,19 +179,29 @@ class StageRuntime:
         self._stage_init_timeout = stage_init_timeout
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
+        # When True, same-device stages initialize concurrently, coordinated by
+        # pre-launch admission control + the engine-core-held SH/EX device locks
+        # (see VllmOmniOrchestratorConfig.parallel_stage_init). Default False
+        # keeps the legacy per-device LOCK_EX serialization.
+        self._parallel_stage_init = parallel_stage_init
         self._log_stats = log_stats
         self._num_stages = len(stage_configs)
+        self._client_count = int((client_config or {}).get("client_count", 1))
+        self._client_index = int((client_config or {}).get("client_index", 0))
+        if self._client_count < 1:
+            raise ValueError(f"client_count must be >= 1, got {self._client_count}")
+        if self._client_index != -1 and not 0 <= self._client_index < self._client_count:
+            raise ValueError(f"client_index must be in [0, {self._client_count}), got {self._client_index}")
+        self._external_stage_addresses = (client_config or {}).get("stage_addresses")
+        self._api_process_rank = self._client_index
 
         # Populated by initialize()
         self.stage_pools: list[StagePool] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
-        # Serialize all LLM replica spawning + handshake across device groups
-        # to prevent ZMQ port-allocation races (get_engine_zmq_addresses) and
-        # CUDA-context conflicts when multiple engine core subprocesses
-        # initialize simultaneously on different GPUs.  Matches the old
-        # AsyncOmniEngine._initialize_llm_replica pattern which used a single
-        # ``llm_stage_launch_lock`` for all replicas.
+        # Serialize process spawning and process-global environment overlays.
+        # Readiness waits use per-device initialization protection so different
+        # device groups can initialize concurrently.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
 
@@ -256,6 +312,205 @@ class StageRuntime:
             self._cleanup_after_initialize_failure()
             raise exc
 
+    @contextmanager
+    def launch_stage_engines(
+        self,
+        num_api_servers: int = 1,
+        *,
+        stage_plans: Sequence[LogicalStageInitPlan] | None = None,
+        stage_init_timeout: int | None = None,
+    ) -> Iterator[StageEngineLaunch]:
+        """Launch EngineCore stages for local or subprocess client attachment.
+
+        The regular runtime supplies a replica plan from its device-group
+        scheduler; the serving parent resolves the whole pipeline here. Both
+        use the same device locks, spawn, readiness and rollback machinery.
+        One client completes readiness before attachment, preserving the
+        existing in-process frontend. Multiple clients attach in the caller's
+        ``with`` body before readiness completes on context exit.
+        """
+        if self._external_stage_addresses is not None:
+            raise ValueError("A runtime attached to external stage engines cannot launch engines")
+        if num_api_servers < 1:
+            raise ValueError(f"num_api_servers must be >= 1, got {num_api_servers}")
+        timeout = self._stage_init_timeout if stage_init_timeout is None else stage_init_timeout
+        resolve_plans = stage_plans is None
+        if stage_plans is None:
+            self._client_count = num_api_servers
+            self._api_process_rank = -1 if num_api_servers > 1 else self._client_index
+            self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
+            stage_plans = self._prepare_stage_plans()
+
+        unsupported = [
+            plan.stage_id
+            for plan in stage_plans
+            if any(replica.metadata.stage_type == "diffusion" for replica in plan.replicas)
+        ]
+        if unsupported:
+            raise ValueError(
+                "--api-server-count currently supports EngineCore stages only; "
+                f"diffusion stage(s) are not supported: {unsupported}"
+            )
+        if any(replica.launch_mode != "local" for plan in stage_plans for replica in plan.replicas):
+            raise ValueError("--api-server-count is not supported with remote or headless stages")
+
+        if num_api_servers > 1:
+            parallel_configs: list[Any] = []
+            for plan in stage_plans:
+                for replica in plan.replicas:
+                    if replica.stage_vllm_config is None or replica.executor_class is None:
+                        raise RuntimeError(f"LLM stage {plan.stage_id} is missing its engine configuration")
+                    parallel_configs.append(replica.stage_vllm_config.parallel_config)
+            if any(getattr(parallel_config, "enable_fault_tolerance", False) for parallel_config in parallel_configs):
+                raise ValueError("--api-server-count > 1 cannot be combined with --enable-fault-tolerance")
+            if any(getattr(parallel_config, "enable_elastic_ep", False) for parallel_config in parallel_configs):
+                raise ValueError("--api-server-count > 1 cannot be combined with --enable-elastic-ep")
+            if any(
+                getattr(parallel_config, "data_parallel_size", 1) != 1 or getattr(parallel_config, "use_ray", False)
+                for parallel_config in parallel_configs
+            ):
+                raise ValueError(
+                    "--api-server-count > 1 currently supports one local process group per replica; "
+                    "intra-replica data parallelism and Ray backends are not supported"
+                )
+
+        if resolve_plans and self._parallel_stage_init:
+            self._reject_unguardable_executors(stage_plans)
+            self._run_stage_admission(stage_plans)
+
+        client_configs: list[OmniClientConfig] = [
+            OmniClientConfig(
+                client_count=num_api_servers,
+                client_index=client_index,
+                stage_addresses={},
+            )
+            for client_index in range(num_api_servers)
+        ]
+        entered_contexts: list[AbstractContextManager[StageReplicaResources]] = []
+        resources: list[StageReplicaResources] = []
+        watched_frontend_processes: list[BaseProcess] = []
+        # launch_stage_replica performs its readiness handshake in __exit__,
+        # after API workers are started, so initialization locks must remain
+        # held until all launch contexts have exited.
+        lock_fds: list[int] = []
+        locked_devices: set[int] = set()
+        launch: StageEngineLaunch | None = None
+        exited_contexts = 0
+
+        try:
+            for plan in stage_plans:
+                for replica in plan.replicas:
+                    if replica.stage_vllm_config is None or replica.executor_class is None:
+                        raise RuntimeError(f"LLM stage {plan.stage_id} is missing its engine configuration")
+                    if replica.engine_args_dict is None:
+                        raise RuntimeError(f"LLM stage {plan.stage_id} is missing engine args")
+
+                    physical_devices = self._resolve_replica_physical_devices(
+                        replica.metadata.stage_id,
+                        replica.metadata.runtime_cfg,
+                    )
+                    if not self._parallel_stage_init:
+                        with self._scoped_spawn_device_env(physical_devices):
+                            lock_fds.extend(
+                                acquire_device_locks(
+                                    replica.metadata.stage_id,
+                                    replica.engine_args_dict,
+                                    timeout,
+                                    locked_devices,
+                                )
+                            )
+
+                    launch_context = launch_stage_replica(
+                        vllm_config=replica.stage_vllm_config,
+                        executor_class=replica.executor_class,
+                        log_stats=self._log_stats,
+                        stage_id=replica.metadata.stage_id,
+                        replica_id=replica.replica_id,
+                        stage_config=replica.stage_cfg,
+                        omni_master_server=self._get_omni_master_server(),
+                        omni_coordinator_address=self._get_coordinator_address(),
+                        stage_visible_devices=physical_devices,
+                        spawn_device_lock=self._spawn_device_lock,
+                        omni_parallel_stage_init=self._parallel_stage_init,
+                        num_api_servers=num_api_servers,
+                        watched_frontend_processes=watched_frontend_processes if num_api_servers > 1 else None,
+                    )
+                    # Environment overlays are process-global. Serialize spawn;
+                    # parallel initialization waits for READY outside this lock.
+                    with self._replica_launch_lock:
+                        with stage_runtime_env(replica.metadata.stage_id, replica.metadata.runtime_cfg):
+                            stage_resources = launch_context.__enter__()
+                        entered_contexts.append(launch_context)
+                        if stage_resources is None:
+                            raise RuntimeError(f"LLM stage {plan.stage_id} launcher returned no resources")
+                        resources.append(stage_resources)
+                    if num_api_servers == 1:
+                        exited_contexts += 1
+                        launch_context.__exit__(None, None, None)
+                    addresses = stage_resources.addresses
+                    # The generic resource bundle allows no addresses (e.g.
+                    # diffusion), but EngineCore attachment requires them.
+                    if addresses is None:
+                        raise RuntimeError(f"LLM stage {plan.stage_id} launcher returned no addresses")
+                    # Unlike the single-client handshake, only stage 0 is
+                    # handed to APIServerProcessManager for address updates.
+                    # Other stages must already expose connectable endpoints.
+                    if num_api_servers > 1 and any(
+                        address.startswith("tcp://") and address.rsplit(":", 1)[-1] == "0"
+                        for address in (*addresses.inputs, *addresses.outputs)
+                    ):
+                        raise RuntimeError(
+                            f"Stage {plan.stage_id} returned deferred TCP addresses; "
+                            "multi-API launch requires fixed ports or IPC addresses"
+                        )
+                    if len(addresses.inputs) != num_api_servers or len(addresses.outputs) != num_api_servers:
+                        raise RuntimeError(
+                            f"Stage {plan.stage_id} returned {len(addresses.inputs)} input and "
+                            f"{len(addresses.outputs)} output addresses for {num_api_servers} API servers"
+                        )
+
+                    if num_api_servers == 1 and lock_fds:
+                        release_device_locks(lock_fds)
+                        lock_fds.clear()
+                        locked_devices.clear()
+
+                    for client_index, client_config in enumerate(client_configs):
+                        stage_addresses = client_config["stage_addresses"]
+                        replica_addresses = stage_addresses.setdefault(plan.stage_id, {})
+                        replica_addresses[replica.replica_id] = {
+                            "input_address": addresses.inputs[client_index],
+                            "output_address": addresses.outputs[client_index],
+                        }
+                        if addresses.frontend_stats_publish_address is not None:
+                            replica_addresses[replica.replica_id]["stats_update_address"] = (
+                                addresses.frontend_stats_publish_address
+                            )
+
+            launch = StageEngineLaunch(
+                client_configs=client_configs,
+                resources=resources,
+                watched_frontend_processes=watched_frontend_processes,
+            )
+            yield launch
+
+            while exited_contexts < len(entered_contexts):
+                entered_context = entered_contexts[exited_contexts]
+                exited_contexts += 1
+                entered_context.__exit__(None, None, None)
+        except BaseException as exc:
+            if launch is not None:
+                launch.shutdown()
+            else:
+                StageEngineLaunch(client_configs=client_configs, resources=resources).shutdown()
+            exc_info = (type(exc), exc, exc.__traceback__)
+            for pending_context in reversed(entered_contexts[exited_contexts:]):
+                with contextlib.suppress(BaseException):
+                    pending_context.__exit__(*exc_info)
+            raise
+        finally:
+            if lock_fds:
+                release_device_locks(lock_fds)
+
     def shutdown(self) -> None:
         for pool in self.stage_pools:
             for client in pool.clients:
@@ -339,12 +594,12 @@ class StageRuntime:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
-        # RFC #4021 transition boundary: stage planning still relies on legacy
-        # StageConfig.runtime and StageConfig.engine_args for replica and engine
-        # setup. Keep metadata extraction on the legacy path until the
-        # coordinated stage-init cutover.
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
-            base_metadata = extract_legacy_stage_metadata(stage_cfg)
+            base_metadata = (
+                extract_stage_metadata_from_omni_stage_config(stage_cfg)
+                if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+                else extract_legacy_stage_metadata(stage_cfg)
+            )
             stage_id = int(base_metadata.stage_id)
             if stage_id != stage_idx:
                 raise ValueError(
@@ -368,14 +623,20 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
-                # The stable adapter entry point still receives the same
-                # legacy stage object as replica planning. Its implementation
-                # switches only at the coordinated RFC #4021 cutover.
-                engine_args_dict = build_engine_args_dict(
-                    stage_cfg,
-                    self._model,
-                    stage_connector_spec=stage_connector_spec,
-                    cli_tokenizer=self._tokenizer,
+                engine_args_dict = (
+                    build_engine_args_dict_from_omni_stage_config(
+                        stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        cli_tokenizer=self._tokenizer,
+                    )
+                    if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+                    else build_engine_args_dict(
+                        stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        cli_tokenizer=self._tokenizer,
+                    )
                 )
                 inject_omni_kv_connector_config(
                     engine_args_dict,
@@ -392,14 +653,25 @@ class StageRuntime:
                     self._model,
                     stage_connector_spec=stage_connector_spec,
                     engine_args_dict=engine_args_dict,
+                    api_process_count=self._client_count,
+                    api_process_rank=self._api_process_rank,
                 )
 
             for replica_id in range(num_replicas):
-                replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
+                # Keep the logical stage's device pool intact; each replica owns
+                # the same config throughout planning, metadata and launch.
+                replica_cfg = copy.deepcopy(stage_cfg) if num_replicas > 1 else stage_cfg
                 if stage_idx in replica_devices_map:
-                    replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
+                    devices = replica_devices_map[stage_idx][replica_id]
+                    runtime_cfg = getattr(replica_cfg, "runtime_config", getattr(replica_cfg, "runtime", None))
+                    if runtime_cfg is not None:
+                        runtime_cfg.devices = devices
 
-                replica_metadata = extract_legacy_stage_metadata(replica_cfg)
+                replica_metadata = (
+                    extract_stage_metadata_from_omni_stage_config(replica_cfg)
+                    if isinstance(replica_cfg, BaseVllmOmniStageConfig)
+                    else extract_legacy_stage_metadata(replica_cfg)
+                )
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
@@ -439,9 +711,10 @@ class StageRuntime:
     ) -> dict[int, list[StagePoolClient | None]]:
         """Initialize all stage replicas.
 
-        Stages sharing the same GPU are initialized sequentially to avoid
-        memory profiling interference. Stages on different GPUs are
-        initialized in parallel.
+        Stages that share any physical GPU — including overlapping-but-unequal
+        sets such as ``{0,1}`` and ``{0}`` — initialize sequentially to avoid
+        memory profiling interference and same-process ``flock`` self-contention.
+        Stages on disjoint GPUs initialize in parallel.
         """
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
@@ -450,10 +723,14 @@ class StageRuntime:
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
 
-        init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
-        for plan in stage_plans:
-            for replica in plan.replicas:
-                init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
+        if self._parallel_stage_init:
+            # Refuse executor backends the phase locks cannot cover, then prove
+            # every physical device's summed budget fits BEFORE any stage spawns.
+            # Both fail fast here rather than OOM at allocation time.
+            self._reject_unguardable_executors(stage_plans)
+            self._run_stage_admission(stage_plans)
+
+        init_groups = self._build_init_groups(stage_plans)
 
         def _init_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
             """Initialize replicas in one scheduling group sequentially."""
@@ -506,18 +783,183 @@ class StageRuntime:
 
         return initialized_clients_by_stage
 
-    def _replica_init_group_key(self, replica: ReplicaInitPlan) -> str:
-        """Return the scheduling group used during replica initialization."""
+    def _reject_unguardable_executors(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        """Fail closed for executors the SH/EX phase locks cannot actually guard.
+
+        ``DevicePhaseLock`` is a node-local ``flock`` over files on the engine-core
+        driver's host, and the admission ledger is built only from this host's
+        devices. A Ray executor may place the workers that load weights, profile,
+        allocate KV cache and capture graphs on **other** nodes, which participate
+        in neither mechanism. Running there would take the parallel path — the
+        parent skips its own device lock when ``parallel_stage_init`` is on —
+        while only advertising the protection, so refuse before anything spawns.
+
+        Ray detection uses both the executor's ``uses_ray`` class attribute and
+        ``ParallelConfig.use_ray``. Multi-node multiprocessing/external-launcher
+        configurations are detected through ``ParallelConfig.nnodes``. Both are
+        refused because some workers can live outside the driver's host.
+
+        Remote replicas are skipped: they are launched by the runtime owning their
+        node and are already ``ADMISSION_EXEMPT`` in this host's ledger.
+        """
+        offenders: list[str] = []
+        for plan in stage_plans:
+            for replica in plan.replicas:
+                if replica.launch_mode == "remote":
+                    continue
+                executor_class = replica.executor_class
+                parallel_config = getattr(replica.stage_vllm_config, "parallel_config", None)
+                uses_ray = bool(getattr(executor_class, "uses_ray", False)) or bool(
+                    getattr(parallel_config, "use_ray", False)
+                )
+                nnodes = int(getattr(parallel_config, "nnodes", 1) or 1)
+                reasons: list[str] = []
+                if uses_ray:
+                    reasons.append("Ray-backed")
+                if nnodes > 1:
+                    reasons.append(f"multi-node (nnodes={nnodes})")
+                if reasons:
+                    executor_name = getattr(executor_class, "__name__", "unknown executor")
+                    offenders.append(
+                        f"stage{replica.metadata.stage_id}/replica{replica.replica_id} "
+                        f"({executor_name}; {', '.join(reasons)})"
+                    )
+        if offenders:
+            raise RuntimeError(
+                "parallel_stage_init cannot guard Ray-backed or multi-node executors: the SH/EX "
+                "phase locks are node-local file locks and the admission ledger only accounts "
+                "for this host's devices, so workers placed on other nodes would initialize unprotected. "
+                f"Offending replicas: {', '.join(offenders)}. Disable parallel_stage_init for "
+                "this deployment, or use a single-node non-Ray executor backend."
+            )
+
+    def _run_stage_admission(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        """Pre-launch per-device admission for parallel stage init (fail-fast)."""
+        from vllm_omni.engine.stage_admission import (
+            ADMISSION_EXEMPT,
+            AdmissionExempt,
+            StageAdmissionError,
+            check_admission,
+        )
+
+        def _resolve(replica: ReplicaInitPlan) -> list[int] | AdmissionExempt | None:
+            if replica.launch_mode == "remote":
+                # Remote replicas consume a remote node's memory and the ledger
+                # is per-LOCAL-device. Remote LLM plans already carry
+                # runtime_cfg=None, but remote diffusion replicas keep their
+                # cfg — mark both exempt explicitly. Only this exemption may
+                # skip the ledger: a LOCAL replica that resolves to None below
+                # fails admission (fail-closed in check_admission).
+                return ADMISSION_EXEMPT
+            resolved = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
+            parsed = parse_physical_device_ids(resolved)
+            return sorted(parsed) if parsed else None
+
+        def _visible_ordinal(physical_id: int) -> int:
+            """Translate a physical device id to this process's visible ordinal.
+
+            The ledger is keyed by *physical* id (resolved against the visibility
+            baseline captured before any stage narrowed the env), but
+            ``get_device_total_memory`` and ``torch.cuda.get_device_properties``
+            interpret their argument as an ordinal in the **current** process's
+            visible-device namespace. Passing the physical id straight through
+            raises an invalid-ordinal error under a restricted
+            ``CUDA_VISIBLE_DEVICES`` and, when visibility is reordered, silently
+            reads a different GPU — which yields a wrong capacity, and therefore
+            an unsafe admission result, on heterogeneous devices.
+            """
+            baseline = self._init_visible_devices_baseline
+            if not baseline:
+                # No device-control env captured: ordinals are physical ids.
+                return physical_id
+            for ordinal, tok in enumerate(baseline.split(",")):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    candidate = int(tok)
+                except ValueError:
+                    # UUID/MIG entries cannot be converted to physical integer
+                    # ids, but they still occupy an ordinal in the visible list.
+                    continue
+                if candidate == physical_id:
+                    return ordinal
+            raise StageAdmissionError(
+                f"Physical device {physical_id} is not in the visibility baseline "
+                f"{baseline!r} captured at init, so its capacity cannot be measured "
+                "from this process. Refusing to admit against an unknown device."
+            )
+
+        def _total_memory(device_id: int) -> int:
+            ordinal = _visible_ordinal(device_id)
+            try:
+                mem = current_omni_platform.get_device_total_memory(ordinal)
+                if mem:
+                    return int(mem)
+            except (NotImplementedError, AttributeError, TypeError):
+                pass
+            import torch
+
+            return int(torch.cuda.get_device_properties(ordinal).total_memory)
+
+        check_admission(
+            stage_plans,
+            resolve_physical_devices=_resolve,
+            device_total_memory=_total_memory,
+        )
+
+    def _build_init_groups(
+        self,
+        stage_plans: Sequence[LogicalStageInitPlan],
+    ) -> dict[str, list[tuple[int, ReplicaInitPlan]]]:
+        items = [(plan.stage_idx, replica) for plan in stage_plans for replica in plan.replicas]
+        groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
+        for key, item in zip(self._init_group_keys([replica for _, replica in items]), items, strict=True):
+            groups.setdefault(key, []).append(item)
+        return groups
+
+    def _init_group_keys(self, replicas: Sequence[ReplicaInitPlan]) -> list[str]:
+        """One init-group key per replica: same key -> sequential, distinct -> parallel.
+
+        Diffusion, remote and parallel-stage-init replicas keep fixed per-replica
+        keys. Serial local LLM replicas are grouped by connected components of
+        their resolved physical-device overlap, so ``{0,1}`` and ``{0}`` share a
+        group and never re-``flock`` a device this process already holds.
+        """
+        keys = [self._init_group_key_override(replica) for replica in replicas]
+        pending = [i for i, key in enumerate(keys) if key is None]
+        device_sets: list[frozenset[int] | None] = []
+        for i in pending:
+            replica = replicas[i]
+            physical = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
+            parsed = parse_physical_device_ids(physical)
+            if parsed is None:
+                logger.warning(
+                    "[stage_init] Stage-%s replica %s physical devices %r are not integer GPU ids; "
+                    "all serial LLM replicas will share one init group",
+                    replica.metadata.stage_id,
+                    replica.replica_id,
+                    physical,
+                )
+            device_sets.append(parsed)
+        for i, key in zip(pending, device_overlap_group_keys(device_sets), strict=True):
+            keys[i] = key
+        return cast(list[str], keys)
+
+    def _init_group_key_override(self, replica: ReplicaInitPlan) -> str | None:
+        """Key that bypasses device-overlap grouping, or ``None`` to use it."""
         if replica.launch_mode == "local" and replica.metadata.stage_type == "diffusion":
             # Local diffusion process spawning must stay on the orchestrator
             # thread. Keep all local diffusion replicas in one sequential group.
             return "inline:diffusion"
         if replica.launch_mode == "remote":
             return f"remote:{replica.metadata.stage_id}:{replica.replica_id}"
-
-        runtime_cfg = replica.metadata.runtime_cfg or {}
-        devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        return f"device:{devices}"
+        if self._parallel_stage_init:
+            # Same-device concurrency is coordinated by the engine-core SH/EX
+            # device locks + pre-launch admission, so give every replica its own
+            # group to let them all initialize in parallel.
+            return f"parallel:{replica.metadata.stage_id}:{replica.replica_id}"
+        return None
 
     def _initialize_replica(
         self,
@@ -544,91 +986,69 @@ class StageRuntime:
         stage_init_timeout: int,
     ) -> StagePoolClient:
         """Initialize one local LLM replica using vLLM's launch/attach pattern."""
-        resources: StageReplicaResources | None = None
-        stage_client = None
-        lock_fds: list[int] = []
-        try:
-            physical_devices = self._resolve_replica_physical_devices(
-                plan.metadata.stage_id,
-                plan.metadata.runtime_cfg,
-            )
-            if physical_devices:
-                logger.info(
-                    "[stage_init] Stage-%s set runtime devices: %s",
-                    plan.metadata.stage_id,
-                    physical_devices,
-                )
-            vllm_config = plan.stage_vllm_config
-            executor_class = plan.executor_class
-            if vllm_config is None:
-                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing vllm_config")
-            if executor_class is None:
-                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing executor_class")
-            if plan.engine_args_dict is None:
-                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing engine args")
-            with self._scoped_spawn_device_env(physical_devices):
-                lock_fds = acquire_device_locks(
-                    plan.metadata.stage_id,
-                    plan.engine_args_dict,
-                    stage_init_timeout,
-                )
-            # Serialize engine-core spawning across all LLM replicas to avoid
-            # ZMQ port-allocation races and simultaneous CUDA context init.
-            with self._replica_launch_lock, stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
-                with launch_stage_replica(
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
+        external_addresses = self._get_external_client_addresses(
+            plan.metadata.stage_id,
+            plan.replica_id,
+        )
+        if external_addresses is not None:
+            if plan.stage_vllm_config is None or plan.executor_class is None:
+                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing its engine configuration")
+            return cast(
+                StagePoolClient,
+                StageEngineCoreClientBase.make_async_mp_client(
+                    vllm_config=plan.stage_vllm_config,
+                    executor_class=plan.executor_class,
                     log_stats=self._log_stats,
-                    stage_id=plan.metadata.stage_id,
-                    replica_id=plan.replica_id,
-                    stage_config=plan.stage_cfg,
-                    omni_master_server=self._get_omni_master_server(),
-                    omni_coordinator_address=self._get_coordinator_address(),
-                    stage_visible_devices=physical_devices,
-                    spawn_device_lock=self._spawn_device_lock,
-                ) as resources:
-                    pass
-
-            logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
-            if resources is None:
-                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} launcher returned no resources")
-            if resources.addresses is None:
-                raise RuntimeError(f"LLM stage {plan.metadata.stage_id} launcher returned no addresses")
-            stage_client = StageEngineCoreClientBase.make_async_mp_client(
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                log_stats=self._log_stats,
-                metadata=plan.metadata,
-                client_addresses=self._client_addresses_from_zmq(resources.addresses),
-                engine_manager=resources.manager,
-                coordinator=resources.coordinator,
+                    metadata=plan.metadata,
+                    client_addresses=external_addresses,
+                    client_count=self._client_count,
+                    client_index=self._client_index,
+                ),
             )
 
-            logger.info("[StageRuntime] Stage %s initialized", plan.metadata.stage_id)
-            return cast(StagePoolClient, stage_client)
-        except Exception:
-            if stage_client is not None:
-                try:
-                    stage_client.shutdown()
-                except Exception as cleanup_error:
-                    logger.warning(
-                        "[StageRuntime] Failed to cleanup stage %s after init failure: %s",
-                        plan.metadata.stage_id,
-                        cleanup_error,
-                    )
-            else:
-                self._cleanup_launched_resources(
-                    stage_id=plan.metadata.stage_id,
-                    resources=resources,
-                )
-            raise
-        finally:
-            if lock_fds:
-                release_device_locks(lock_fds)
+        if plan.stage_vllm_config is None or plan.executor_class is None:
+            raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing its engine configuration")
+        stage_plan = LogicalStageInitPlan(
+            stage_idx=plan.metadata.stage_id,
+            stage_id=plan.metadata.stage_id,
+            replicas=[plan],
+        )
+        with self.launch_stage_engines(
+            stage_plans=[stage_plan],
+            stage_init_timeout=stage_init_timeout,
+        ) as launch:
+            resources = launch.resources[0]
+            return cast(
+                StagePoolClient,
+                StageEngineCoreClientBase.make_async_mp_client(
+                    vllm_config=plan.stage_vllm_config,
+                    executor_class=plan.executor_class,
+                    log_stats=self._log_stats,
+                    metadata=plan.metadata,
+                    client_addresses=self._client_addresses_from_zmq(resources.addresses),
+                    engine_manager=resources.manager,
+                    coordinator=resources.coordinator,
+                ),
+            )
 
     def _get_coordinator_address(self) -> str | None:
         """Return coordinator router address. Overridden by DistStageRuntime."""
         return None
+
+    def _get_external_client_addresses(self, stage_id: int, replica_id: int) -> dict[str, Any] | None:
+        if self._external_stage_addresses is None:
+            return None
+        stage_addresses = self._external_stage_addresses.get(stage_id)
+        if stage_addresses is None:
+            stage_addresses = self._external_stage_addresses.get(str(stage_id))
+        if stage_addresses is None:
+            raise ValueError(f"Missing external addresses for stage {stage_id}")
+        replica_addresses = stage_addresses.get(replica_id)
+        if replica_addresses is None:
+            replica_addresses = stage_addresses.get(str(replica_id))
+        if replica_addresses is None:
+            raise ValueError(f"Missing external addresses for stage {stage_id} replica {replica_id}")
+        return dict(replica_addresses)
 
     def _get_omni_master_server(self) -> OmniMasterServer | None:
         """Return the master server for local distributed launches, if any."""
@@ -653,17 +1073,25 @@ class StageRuntime:
                         raise RuntimeError("Omni KV connector requires source and destination stages")
                     inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
                 inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
-                engine_args = getattr(plan.stage_cfg, "engine_args", {})
-                inline_diffusion = (
-                    engine_args.get("inline_diffusion", False)
-                    if hasattr(engine_args, "get")
-                    else getattr(engine_args, "inline_diffusion", False)
-                )
-                custom_pipeline_args = (
-                    engine_args.get("custom_pipeline_args")
-                    if hasattr(engine_args, "get")
-                    else getattr(engine_args, "custom_pipeline_args", None)
-                )
+                if isinstance(plan.stage_cfg, BaseVllmOmniStageConfig):
+                    inline_diffusion = plan.stage_cfg.stage_pipeline_config.inline_diffusion
+                    custom_pipeline_args = getattr(
+                        getattr(plan.stage_cfg, "diffusion_config", None),
+                        "custom_pipeline_args",
+                        None,
+                    )
+                else:
+                    engine_args = getattr(plan.stage_cfg, "engine_args", {})
+                    inline_diffusion = (
+                        engine_args.get("inline_diffusion", False)
+                        if hasattr(engine_args, "get")
+                        else getattr(engine_args, "inline_diffusion", False)
+                    )
+                    custom_pipeline_args = (
+                        engine_args.get("custom_pipeline_args")
+                        if hasattr(engine_args, "get")
+                        else getattr(engine_args, "custom_pipeline_args", None)
+                    )
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
                     stage_config=plan.stage_cfg,
@@ -760,7 +1188,7 @@ class DistStageRuntime(StageRuntime):
         self,
         stage_configs: list[Any],
         model: str,
-        config_path: str,
+        config_path: str | None,
         *,
         stage_init_timeout: int,
         async_chunk: bool,
@@ -773,6 +1201,7 @@ class DistStageRuntime(StageRuntime):
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
         request_queue: janus.Queue[EngineQueueMessage] | None = None,
+        parallel_stage_init: bool = False,
     ) -> None:
         super().__init__(
             stage_configs=stage_configs,
@@ -781,6 +1210,7 @@ class DistStageRuntime(StageRuntime):
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
         )
         self._single_stage_id_filter = single_stage_id_filter
@@ -820,7 +1250,7 @@ class DistStageRuntime(StageRuntime):
 
         for idx, stage_cfg in enumerate(self._stage_configs):
             stage_id = int(getattr(stage_cfg, "stage_id", idx))
-            runtime_cfg = getattr(stage_cfg, "runtime", None)
+            runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", None))
             if runtime_cfg is None:
                 continue
             if stage_id == target_stage_id:
@@ -892,13 +1322,9 @@ class DistStageRuntime(StageRuntime):
         if registered_stage_cfg is None:
             raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
-        # Remote diffusion registration still transports the legacy mapping
-        # shape. Reconstruct and project that shape until its RFC #4021 cutover.
-        metadata = (
-            extract_legacy_stage_metadata(OmegaConf.create(registered_stage_cfg))
-            if plan.metadata.stage_type == "diffusion"
-            else copy.deepcopy(plan.metadata)
-        )
+        # Registration is transport-only: the head-side typed plan remains
+        # authoritative for metadata and topology.
+        metadata = extract_stage_metadata_from_omni_stage_config(plan.stage_cfg)
         metadata.replica_id = plan.replica_id
         ctx = StageRemoteFactoryContext(
             stage_id=plan.metadata.stage_id,
@@ -1095,12 +1521,13 @@ class DistStageRuntime(StageRuntime):
 def create_stage_runtime(
     stage_configs: list[Any],
     model: str,
-    config_path: str,
+    config_path: str | None,
     *,
     single_stage_mode: bool,
     stage_init_timeout: int,
     async_chunk: bool,
     tokenizer: str | None = None,
+    parallel_stage_init: bool = False,
     # Distributed-only params:
     single_stage_id_filter: int | None = None,
     omni_master_address: str | None = None,
@@ -1110,6 +1537,7 @@ def create_stage_runtime(
     omni_lb_policy: str = "random",
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
     log_stats: bool = False,
+    client_config: OmniClientConfig | None = None,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1122,6 +1550,7 @@ def create_stage_runtime(
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
@@ -1138,5 +1567,7 @@ def create_stage_runtime(
         stage_init_timeout=stage_init_timeout,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
+        parallel_stage_init=parallel_stage_init,
         log_stats=log_stats,
+        client_config=client_config,
     )

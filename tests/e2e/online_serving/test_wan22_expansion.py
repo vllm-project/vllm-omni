@@ -30,8 +30,8 @@ PROMPT = "Two anthropomorphic cats in comfy boxing gear and bright gloves fight 
 NEGATIVE_PROMPT = "low quality, blurry, distorted face, extra limbs, bad anatomy, watermark, logo, text, ugly, deformed, mutated, jpeg artifacts"
 
 # CUDA marks (original matrix, unchanged)
-CUDA_SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-CUDA_PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+CUDA_SINGLE_CARD_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+CUDA_PARALLEL_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2)
 
 # NPU marks
 NPU_TWO_CARD_MARKS = hardware_marks(res={"npu": "A2"}, num_cards=2)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
@@ -17,11 +17,18 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.model_metadata import (
+    FLUX2_KLEIN_MAX_INPUT_IMAGES,
     HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _local_model_paths(monkeypatch):
+    # These tests exercise config transport, not model repository resolution.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
 
 
 def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
@@ -131,11 +138,20 @@ class TestCreateDefaultDiffusion:
 
     def test_dtype_serialized_as_string(self):
         stages = StageConfigFactory.create_default_diffusion({"dtype": torch.float16, "model": "x"})
-        assert stages[0]["engine_args"]["dtype"] == "torch.float16"
+        assert stages[0]["engine_args"]["dtype"] == "float16"
 
     def test_cache_backend_defaults_to_none(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["engine_args"]["cache_backend"] == "none"
+
+    def test_explicit_none_cache_backend_canonicalizes_to_none(self):
+        """Regression for #7032: ``cache_backend=None`` (e.g. an example CLI default)
+        must reach the pipeline as the canonical ``"none"`` string."""
+        od = _roundtrip_diffusion_config(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
+
+        od = OmniDiffusionConfig.from_kwargs(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
 
     def test_single_gpu_default_devices(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
@@ -185,6 +201,18 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_flux2_klein_sets_generic_multimodal_limit():
+    od_config = OmniDiffusionConfig(
+        model="black-forest-labs/FLUX.2-klein-9B",
+        model_class_name="Flux2KleinPipeline",
+    )
+
+    od_config.update_multimodal_support()
+
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == FLUX2_KLEIN_MAX_INPUT_IMAGES
 
 
 def test_task_type_roundtrip():

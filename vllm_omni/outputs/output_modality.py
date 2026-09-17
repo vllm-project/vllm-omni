@@ -115,8 +115,43 @@ class TensorAccumulationStrategy(Enum):
     """Replace previous tensor entirely with the latest one."""
 
 
-def get_accumulation_strategy(modality: OutputModality) -> TensorAccumulationStrategy:
-    """Determine tensor merge strategy from the multimodal flags."""
+# Per-tensor-key overrides for the modality-wide default below. A modality
+# is a coarse hint (e.g. AUDIO tensors are usually waveform chunks that grow
+# along the last dimension), but some models emit tensors under that same
+# modality whose accumulation semantics differ -- e.g. discrete codec-frame
+# matrices that grow along dim 0, or a constant reference/context tensor
+# re-emitted unchanged at every step. Pipelines that produce such keys
+# register the correct strategy here via ``register_key_accumulation_strategy``
+# instead of forcing every tensor of the modality through one default.
+_KEY_ACCUMULATION_OVERRIDES: dict[str, TensorAccumulationStrategy] = {}
+
+
+def register_key_accumulation_strategy(key: str, strategy: TensorAccumulationStrategy) -> None:
+    """Register a per-key override for ``get_accumulation_strategy``.
+
+    Args:
+        key: The flattened multimodal output key this override applies to,
+            e.g. ``"codes.audio"`` as produced by
+            ``vllm_omni.data_entry_keys.flatten_payload`` from a nested
+            ``{"codes": {"audio": tensor}}`` payload.
+        strategy: The accumulation strategy to use for this key, regardless
+            of the modality its request is otherwise associated with.
+    """
+    _KEY_ACCUMULATION_OVERRIDES[key] = strategy
+
+
+def get_accumulation_strategy(
+    modality: OutputModality,
+    key: str | None = None,
+) -> TensorAccumulationStrategy:
+    """Determine the tensor merge strategy for one output key.
+
+    A registered per-key override (see ``register_key_accumulation_strategy``)
+    always wins; otherwise the strategy falls back to the modality-wide
+    default.
+    """
+    if key is not None and key in _KEY_ACCUMULATION_OVERRIDES:
+        return _KEY_ACCUMULATION_OVERRIDES[key]
     if OutputModality.AUDIO in modality:
         return TensorAccumulationStrategy.CONCAT_LAST
     if OutputModality.IMAGE in modality or OutputModality.LATENT in modality:

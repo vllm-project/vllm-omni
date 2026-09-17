@@ -722,6 +722,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
             if isinstance(placeholder_positions, torch.Tensor):
                 if placeholder_positions.numel() == 0 or placeholder_positions.numel() != codes.shape[0]:
+                    logger.debug(
+                        "Skipping reference audio substitution for request %d: "
+                        "%d explicit placeholder positions do not match %d reference code rows",
+                        i,
+                        placeholder_positions.numel(),
+                        codes.shape[0],
+                    )
                     continue
                 request_positions = flat_positions[s:e]
                 ref_positions = placeholder_positions.to(
@@ -743,6 +750,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 placeholders = span_mask.nonzero(as_tuple=True)[0]
                 n_codes = int(codes.shape[0])
                 if int(placeholders.numel()) < n_codes:
+                    logger.debug(
+                        "Skipping reference audio substitution for request %d: "
+                        "legacy span contains %d placeholders for %d reference code rows",
+                        i,
+                        placeholders.numel(),
+                        n_codes,
+                    )
                     continue
                 target = placeholders[:n_codes] + s
 
@@ -1669,8 +1683,10 @@ class _BackboneWrapper(nn.Module):
         self.config = config
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm.model_executor.models.utils import AutoWeightsLoader
+        from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
         skip = ["lm_head."] if getattr(self.config, "tie_word_embeddings", False) else None
-        loader = AutoWeightsLoader(self, skip_prefixes=skip)
-        return loader.load_weights(weights)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip or ())})
+        )

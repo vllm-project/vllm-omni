@@ -29,6 +29,202 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_uaa_equal_rank_contract_skips_length_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    observed = []
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        observed.append((kwargs["seq_lens"], kwargs["padded_head_cnt"]))
+        return tensor, tensor.shape[2]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    monkeypatch.setattr(
+        ulysses,
+        "_all_gather_int",
+        lambda *args, **kwargs: pytest.fail("length gather must be skipped"),
+    )
+    strategy = ulysses.UlyssesParallelAttention(
+        FakeGroup(),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        get_forward_context()._sp_equal_pad_stack.append(True)
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    assert observed == [([3, 3], 32), ([3, 3], 8), ([3, 3], 8)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_uaa_hybrid_equal_rank_contract_skips_ulysses_gather_keeps_ring_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract + ring: the fast path skips only the Ulysses gather.
+
+    The ring equality check is a separate collective on ring_group and must
+    still run, receiving s_global derived from the contract.
+    """
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ring_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 2
+
+    sp_group = FakeGroup()
+    observed = []
+    ring_checks = []
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        observed.append((kwargs["seq_lens"], kwargs["padded_head_cnt"]))
+        return tensor, tensor.shape[2]
+
+    def fake_gather_int(pg, value, *, device):
+        if pg is sp_group.ulysses_group:
+            pytest.fail("Ulysses length gather must be skipped under the contract")
+        assert pg is sp_group.ring_group
+        ring_checks.append(int(value))
+        return [int(value), int(value)]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    monkeypatch.setattr(ulysses, "_all_gather_int", fake_gather_int)
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    strategy = ulysses.UlyssesParallelAttention(
+        sp_group,
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        get_forward_context()._sp_equal_pad_stack.append(True)
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    # Ring check ran: s_global = ulysses_world_size * local = 2 * 3.
+    assert ring_checks == [6]
+    assert observed == [([3, 3], 32), ([3, 3], 8), ([3, 3], 8)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_uaa_without_contract_keeps_dynamic_length_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No auto_pad boundary means shards may differ, so the gather must stay."""
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    observed = []
+    monkeypatch.setattr(
+        ulysses,
+        "_all_gather_int",
+        lambda *args, **kwargs: [3, 4],
+    )
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        observed.append(kwargs["seq_lens"])
+        return tensor, tensor.shape[2]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    strategy = ulysses.UlyssesParallelAttention(
+        FakeGroup(),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    assert observed == [[3, 4], [3, 4], [3, 4]]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_uaa_mixed_boundaries_keep_the_dynamic_length_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One manual boundary inside an auto_pad region voids the contract."""
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    gathered = []
+
+    def fake_gather(*args, **kwargs):
+        gathered.append(args)
+        return [3, 4]
+
+    monkeypatch.setattr(ulysses, "_all_gather_int", fake_gather)
+    monkeypatch.setattr(
+        ulysses,
+        "_ulysses_all_to_all_any_qkv",
+        lambda pg, tensor, **kwargs: (tensor, tensor.shape[2]),
+    )
+    strategy = ulysses.UlyssesParallelAttention(
+        FakeGroup(),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+    with set_forward_context():
+        ctx = get_forward_context()
+        ctx._sp_equal_pad_stack.extend([True, False])
+        assert not ctx.sp_rank_local_seq_lens_equal
+        strategy.pre_attention(
+            torch.zeros(1, 3, 28, 4),
+            torch.zeros(1, 3, 7, 4),
+            torch.zeros(1, 3, 7, 4),
+            None,
+        )
+
+    assert len(gathered) == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_uaa_gqa_head_padding_preserves_the_query_to_kv_ratio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -632,6 +828,187 @@ def test_ulysses_uaa_matches_baseline(
                 os.remove(path)
             except OSError:
                 pass
+
+
+def _run_contract_skip_case(
+    local_rank: int,
+    world_size: int,
+    init_method: str,
+    input_file: str,
+    num_heads: int,
+    head_size: int,
+    num_kv_heads: int | None,
+) -> None:
+    """Per-rank worker: slow path vs contract fast path on real rank pairs.
+
+    Phase 1 leaves the equal-pad stack empty so the Ulysses length all-gather
+    really runs (counted); phase 2 pushes the split hook's auto_pad marker and
+    replaces _all_gather_int with a raising guard. With ring_degree=1 any call
+    to it is the Ulysses length gather, so the guard proves the skip, and the
+    per-rank output comparison proves the fast path is numerically equivalent
+    to the slow path it replaces.
+    """
+    from vllm_omni.diffusion.attention.parallel import ulysses as ulysses_mod
+
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
+
+    os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
+
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
+    initialize_model_parallel(
+        data_parallel_size=1,
+        cfg_parallel_size=1,
+        sequence_parallel_size=world_size,
+        ulysses_degree=world_size,
+        ring_degree=1,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+
+    parallel_config = DiffusionParallelConfig(
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+        sequence_parallel_size=world_size,
+        ulysses_degree=world_size,
+        ring_degree=1,
+        cfg_parallel_size=1,
+        ulysses_mode="advanced_uaa",
+    )
+    od_config = OmniDiffusionConfig(model="test", dtype=torch.float32, parallel_config=parallel_config)
+
+    with set_forward_context(omni_diffusion_config=od_config), set_current_diffusion_config(od_config):
+        attn = Attention(
+            num_heads=num_heads,
+            head_size=head_size,
+            causal=False,
+            softmax_scale=1.0 / (head_size**0.5),
+            num_kv_heads=num_kv_heads,
+        ).to(device=device, dtype=torch.float32)
+
+        with np.load(input_file, allow_pickle=False) as payload:
+            q_full = torch.from_numpy(payload["q"]).to(device=device)
+            k_full = torch.from_numpy(payload["k"]).to(device=device)
+            v_full = torch.from_numpy(payload["v"]).to(device=device)
+
+        def make_shards() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            # Fresh contiguous shards for each phase; seq_len is divisible by
+            # world_size, so every rank gets the same local length.
+            return (
+                torch.tensor_split(q_full, world_size, dim=1)[local_rank].contiguous(),
+                torch.tensor_split(k_full, world_size, dim=1)[local_rank].contiguous(),
+                torch.tensor_split(v_full, world_size, dim=1)[local_rank].contiguous(),
+            )
+
+        # The Attention layer only enables SP communication when
+        # ForwardContext.sp_active is True; in production the split hook sets
+        # this (and pushes the auto_pad equal-length marker onto
+        # _sp_equal_pad_stack). Here we drive it directly.
+        ctx = get_forward_context()
+        ctx._sp_shard_depth = 1
+
+        def make_sdp_ctx() -> object:
+            # Fresh instance per phase: the @contextmanager instance releases
+            # its state on first exit and cannot be re-entered.
+            return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+
+        # Phase 1: contract absent -> the length all-gather must really run.
+        real_gather = ulysses_mod._all_gather_int
+        gather_calls: list[object] = []
+
+        def counting_gather(pg: object, value: int, *, device: torch.device) -> list[int]:
+            gather_calls.append(pg)
+            return real_gather(pg, value, device=device)
+
+        ulysses_mod._all_gather_int = counting_gather
+        try:
+            q, k, v = make_shards()
+            with make_sdp_ctx():
+                out_slow = attn(q, k, v, attn_metadata=None).contiguous()
+        finally:
+            ulysses_mod._all_gather_int = real_gather
+        assert len(gather_calls) >= 1, "slow path must call the Ulysses length all-gather"
+
+        # Phase 2: replicate the split hook's auto_pad marker so the fast
+        # path fires; any _all_gather_int call in this phase is the Ulysses
+        # length gather and must not happen.
+        ctx._sp_equal_pad_stack.append(True)
+
+        def fail_on_gather(pg: object, value: int, *, device: torch.device) -> list[int]:
+            raise AssertionError("the Ulysses length all-gather must be skipped under the equal-pad contract")
+
+        ulysses_mod._all_gather_int = fail_on_gather
+        try:
+            q, k, v = make_shards()
+            with make_sdp_ctx():
+                out_fast = attn(q, k, v, attn_metadata=None).contiguous()
+        finally:
+            ulysses_mod._all_gather_int = real_gather
+        ctx._sp_equal_pad_stack.pop()
+
+        torch.testing.assert_close(out_fast, out_slow, atol=1e-5, rtol=1e-5)
+
+    destroy_distributed_env()
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads",
+    [
+        (3, None),  # MHA: heads padded 3 -> 4 by ulysses_degree=2
+        (28, 7),  # GQA: derived-Q padding 28/7 -> 32/8, the main case for the skip
+    ],
+)
+def test_ulysses_uaa_contract_skips_length_gather_matches_slow_path(num_heads: int, num_kv_heads: int | None) -> None:
+    """Real 2-rank parity: contract fast path == slow path, gather skipped.
+
+    The CPU-only contract tests replace the all-to-all with a fake; this test
+    runs the real strategy on two ranks. Each rank first computes the slow
+    path (empty equal-pad stack, real length all-gather), then the fast path
+    with the split hook's auto_pad marker pushed and _all_gather_int replaced
+    by a raising guard -- which also proves the collective was truly skipped,
+    not just silently replaced.
+    """
+    sp_world_size = 2
+    if current_omni_platform.get_device_count() < sp_world_size:
+        pytest.skip(f"Test requires {sp_world_size} GPUs")
+
+    batch_size = 2
+    head_size = 8
+    seq_len = 6  # divisible by 2 so both ranks hold equal-length shards
+
+    init_method = get_distributed_init_method()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
+        input_file = f_in.name
+
+    try:
+        torch.manual_seed(0)
+        kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        np.savez(
+            input_file,
+            q=torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32).numpy(),
+            k=torch.randn(batch_size, seq_len, kv_heads, head_size, dtype=torch.float32).numpy(),
+            v=torch.randn(batch_size, seq_len, kv_heads, head_size, dtype=torch.float32).numpy(),
+        )
+
+        torch.multiprocessing.spawn(
+            _run_contract_skip_case,
+            args=(
+                sp_world_size,
+                init_method,
+                input_file,
+                num_heads,
+                head_size,
+                num_kv_heads,
+            ),
+            nprocs=sp_world_size,
+        )
+    finally:
+        try:
+            os.remove(input_file)
+        except OSError:
+            pass
 
 
 @pytest.mark.parametrize(

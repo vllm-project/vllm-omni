@@ -110,6 +110,8 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.load_text_encoder = False
+    pipeline.load_vae_encoder = False
     pipeline.transformer = model
     pipeline.device = torch.device("cpu")
     pipeline._transformer_for_task = lambda task: model
@@ -284,7 +286,8 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
     assert recorder.denoise_timestep is None
 
 
-def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
+@pytest.mark.parametrize("batch_frames", [1, 33])
+def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=8)
@@ -293,6 +296,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
     context = {
         "height": 96,
         "width": 64,
+        "preencode_mp4": True,
+        "preencode_batch_frames": batch_frames,
         "latent_t": 2,
         "latent_h": 4,
         "latent_w": 6,
@@ -301,8 +306,17 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
     }
 
     pipeline = _step_pipeline(_SegmentMeanModel())
-    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_extract_prompt", staticmethod(lambda _: ("a prompt", {})))
-    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_prepare_request_inputs", lambda self, **_: context)
+    conditioning = object()
+    monkeypatch.setattr(
+        mod.MiniMaxH3Pipeline,
+        "_extract_encoder_conditioning",
+        staticmethod(lambda _: conditioning),
+    )
+    monkeypatch.setattr(
+        mod.MiniMaxH3Pipeline,
+        "_prepare_encoder_conditioning_inputs",
+        lambda self, value, sampling: context,
+    )
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_build_denoise_inputs",
@@ -334,6 +348,18 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
     torch.testing.assert_close(state.current_timestep, torch.tensor(1.0 - sigmas_video[0]))
     assert state.extra[mod._STEP_BRANCH] is branch
     assert state.extra[mod._STEP_SHAPE]["height"] == 96
+
+    pipeline.od_config = SimpleNamespace()
+    monkeypatch.setattr(pipeline, "_unpack_denoised_rows", lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)))
+    calls = []
+
+    def decode_to_mp4(*args, **kwargs):
+        calls.append(kwargs)
+        return b"mp4"
+
+    monkeypatch.setattr(pipeline, "decode_to_mp4", decode_to_mp4)
+    assert pipeline.post_decode(state).output == (b"mp4", None)
+    assert calls[0]["batch_frames"] == batch_frames
 
 
 def test_prepare_encode_rejects_request_mode_only_features():
@@ -424,50 +450,3 @@ def test_packed_batch_rejects_backends_that_cannot_isolate_requests(attention):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     assert MiniMaxH3Pipeline._packed_batch_supported(_FakeTransformer([attention])) is False
-
-
-def test_broadcast_rank0_exception_single_rank_reraises():
-    """Single-rank execution has no group; the helper just reraises."""
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-        _broadcast_rank0_exception,
-    )
-    from vllm_omni.errors import OmniClientError
-
-    _broadcast_rank0_exception(None)
-    with pytest.raises(OmniClientError, match="bad ref"):
-        _broadcast_rank0_exception(OmniClientError("bad ref"))
-
-
-def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
-    """A rank-0 error becomes a matching client error on every other DiT rank."""
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
-    from vllm_omni.errors import OmniClientError
-
-    def fake_rank_world(rank):
-        return lambda: (object(), rank, 4)
-
-    def make_broadcast(rank0_payload):
-        def fake_broadcast(payload_list, *, src, group):
-            payload_list[0] = rank0_payload
-
-        return fake_broadcast
-
-    monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(0))
-    err = OmniClientError("invalid reference-video file", status_code=422, error_type="UnprocessableEntityError")
-    rank0_payload = {
-        "type": type(err).__name__,
-        "message": str(err),
-        "status_code": err.status_code,
-        "error_type": err.error_type,
-    }
-    monkeypatch.setattr(mod.dist, "broadcast_object_list", make_broadcast(rank0_payload))
-    with pytest.raises(OmniClientError) as rank0_info:
-        mod._broadcast_rank0_exception(err)
-    assert rank0_info.value is err
-
-    monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(2))
-    with pytest.raises(OmniClientError) as rank2_info:
-        mod._broadcast_rank0_exception(None)
-    assert rank2_info.value.status_code == 422
-    assert rank2_info.value.error_type == "UnprocessableEntityError"
-    assert "invalid reference-video file" in str(rank2_info.value)

@@ -17,11 +17,11 @@ import re as re_module
 from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import ClassVar
 
 import numpy as np
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -67,6 +67,7 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
@@ -120,6 +121,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     KV is managed by the AR-Diffusion engine through the explicit capability
     methods below. The runner binds one session state only for ``forward()``.
     """
+
+    # Generic warmup cannot synthesize robot observations. AR-Diffusion uses
+    # ar_diffusion_warmup_requests() for model-specific warmup instead.
+    dummy_run_num_frames: ClassVar[int] = 0
 
     _POSITIVE_BRANCH = "positive"
     _NEGATIVE_BRANCH = "negative"
@@ -581,7 +586,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 return json.load(f)
 
         try:
-            json_path = hf_hub_download(model_path, relative_path)
+            json_path = hf_api().hf_hub_download(model_path, relative_path)
             with open(json_path) as f:
                 return json.load(f)
         except Exception:

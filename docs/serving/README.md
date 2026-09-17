@@ -43,7 +43,7 @@ Completions for conversational or heterogeneous omni pipelines, rather than as
 the default wrapper for every generation task.
 
 | Task | Endpoint | Request | Response | Details |
-|------|----------|---------|----------|---------|
+| ------ | ---------- | --------- | ---------- | --------- |
 | Conversation or multimodal understanding/generation | `POST /v1/chat/completions` | JSON | OpenAI-style JSON or SSE | [Chat Completions](chat_completions_api.md) |
 | Text-to-speech | `POST /v1/audio/speech` | JSON | Audio bytes or SSE | [Speech](speech_api.md) |
 | Sound, music, or ambient audio generation | `POST /v1/audio/generate` | JSON | Audio bytes | [Audio Generation](audio_generate_api.md) |
@@ -141,24 +141,31 @@ These WebSocket APIs have different event schemas and cannot be used
 interchangeably.
 
 | Workload | Endpoint | Interaction model | Details |
-|----------|----------|-------------------|---------|
+| ---------- | ---------- | ------------------- | --------- |
 | Incremental text input for speech synthesis | `WS /v1/audio/speech/stream` | Send text events and receive audio | [Streaming Text to Speech](speech_api.md#streaming-text-input-websocket) |
 | Live video understanding | `WS /v1/video/chat/stream` | Send video frames and receive text/audio | [Streaming Video Input](video_stream_api.md) |
 | Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_api.md) |
-| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` or `WS /v1/duplex` | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
+| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`) | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
 | Generated video chunks | `WS /v1/realtime/video` | Start a diffusion request and receive fragmented MP4 | [Streaming Video Output](streaming_video_output_api.md) |
 | Robot policy inference | `WS /v1/realtime/robot/openpi` | Send MessagePack observations and receive action arrays | [OpenPI Robot Policy](openpi_api.md) |
 
 All six routes are model- or configuration-dependent. In particular,
-`/v1/realtime` is not full duplex unless the client sets `duplex=1` and the
-deployment explicitly enables duplex sessions. Clients should also verify the
-duplex capability payload because the query-parameter form falls back to the
-ordinary realtime handler when duplex is unavailable.
+`/v1/realtime` is full duplex when the model is a duplex model (its pipeline
+declares a `duplex_plugin` and the deploy configuration sets
+`session_mode: duplex`); a stock Realtime client needs no vendor query
+parameter, and `duplex=0` is the explicit opt-out. Such a server serves the
+websocket route plus `POST /v1/chat/completions`, and no other turn-based
+HTTP route. On a duplex server that chat route is not the turn-based path:
+each request runs on a short-lived duplex session, so it holds one of
+`duplex_session.max_sessions` for its lifetime and answers at the model's
+real-time pace -- see [Full Duplex](full_duplex_api.md). Clients should
+also verify the duplex capability payload because the query-parameter form
+falls back to the ordinary realtime handler when duplex is unavailable.
 
 ## Related Endpoints
 
 | Purpose | Endpoints | Reference |
-|---------|-----------|-----------|
+| --------- | ----------- | ----------- |
 | Discovery and readiness | `GET /health`, `GET /v1/models` | This page |
 | Batched conversations | `POST /v1/chat/completions/batch` | [Batch requests](chat_completions_api.md#batch-requests) |
 | Batched speech | `POST /v1/audio/speech/batch` | [Batch speech generation](speech_api.md#batch-speech-generation) |
@@ -168,11 +175,10 @@ ordinary realtime handler when duplex is unavailable.
 
 ## Standalone Experimental Servers
 
-PersonaPlex also provides a Moshi-compatible WebSocket server, while JoyVL
-provides a stateful interaction orchestrator in front of another model server.
-These are separate processes with their own routes; they are not additional
+JoyVL provides a stateful interaction orchestrator in front of another model
+server. It is a separate process with its own routes; they are not additional
 paths on every `vllm serve --omni` instance. See [Standalone Experimental
-Servers](standalone_servers.md) before deploying either one.
+Servers](standalone_servers.md) before deploying it.
 
 ## Compatibility Notes
 

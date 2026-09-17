@@ -19,7 +19,10 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+from vllm_omni.diffusion.data import (
+    DiffusionRequestAbortedError,
+    is_diffusion_request_started_output,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.stage_client import StageClientBase
@@ -107,6 +110,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None:
         # Each request mutates its sampling state while it is normalized and
         # executed. Callers commonly reuse one params object for concurrent
@@ -124,6 +128,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 prompt,
                 sampling_params,
                 kv_sender_info,
+                kv_transfer_params,
             )
         )
         self._tasks[request_id] = task
@@ -134,6 +139,7 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: Any,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -141,6 +147,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
+                kv_transfer_params=kv_transfer_params,
             )
 
             if self.od_config.streaming_output:
@@ -154,7 +161,13 @@ class InlineStageDiffusionClient(StageClientBase):
                 # only publish the final output.
                 result = None
                 async for results in self._engine.step_streaming(request):
-                    result = results[0]
+                    output = results[0]
+                    if is_diffusion_request_started_output(output):
+                        if not output.request_id:
+                            output.request_id = request_id
+                        self._output_queue.put_nowait(output)
+                        continue
+                    result = output
                 if result is None:
                     raise RuntimeError("Diffusion execution finished without output.")
                 if not result.request_id:

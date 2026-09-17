@@ -19,21 +19,33 @@ required_reviewers:
 primary_code_paths:
   - vllm_omni/entrypoints/omni.py
   - vllm_omni/entrypoints/async_omni.py
+  - vllm_omni/entrypoints/async_omni_base.py
   - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/entrypoints/duplex_omni.py
   - vllm_omni/entrypoints/cli/**
   - vllm_omni/entrypoints/openai/**
   - vllm_omni/entrypoints/openpi/**
   - vllm_omni/entrypoints/client_request_state.py
   - vllm_omni/entrypoints/stage_utils.py
   - vllm_omni/entrypoints/utils.py
+  - vllm_omni/entrypoints/duplex/**
+  - vllm_omni/clients/**
 primary_path_exceptions:
   - path: vllm_omni/entrypoints/openai/errors.py
     owner: error_contracts.md
+  - path: vllm_omni/entrypoints/duplex/**
+    owner: ../fullduplex.md
+  - path: vllm_omni/entrypoints/duplex_omni.py
+    owner: ../fullduplex.md
+  - path: vllm_omni/clients/**
+    owner: ../fullduplex.md
 related_code_paths:
   - vllm_omni/errors.py
   - vllm_omni/inputs/**
   - vllm_omni/outputs/**
+  - vllm_omni/engine/omni_engine_base.py
   - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/engine/duplex_omni_engine.py
   - vllm_omni/config/**
   - vllm_omni/deploy/**
 depends_on:
@@ -44,7 +56,9 @@ validation_paths:
   - tests/entrypoints/test_omni_entrypoints.py
   - tests/entrypoints/test_async_omni.py
   - tests/entrypoints/test_async_omni_pause_sleep_routing.py
-  - tests/entrypoints/test_async_omni_duplex.py
+  - tests/entrypoints/test_duplex_omni.py
+  - tests/entrypoints/duplex/**
+  - tests/entrypoints/openai_api/test_duplex_api_server.py
   - tests/entrypoints/test_serve.py
   - tests/entrypoints/test_stream_finish_reason.py
   - tests/entrypoints/openai/**
@@ -79,6 +93,13 @@ helper locations are not treated as current paths.
 This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
+
+When `--api-server-count` is greater than one, the serve composition root
+starts the frontend process manager while a parent-owned `StageRuntime`
+launches the shared local stage engines. Each frontend receives only its own
+stage-client channel configuration and does not launch or retire backend
+processes. CLI validation rejects unsupported distributed, diffusion,
+fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
 
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.
@@ -127,6 +148,9 @@ stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`
 Streaming input pumps take an admission slot immediately before each EngineCore
 ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
+Multi-API serving must preserve one client rank and one channel set per
+frontend, include every frontend in readiness/failure observation, and keep
+stage lifecycle ownership in the parent composition root.
 
 ## Promotion gate
 
