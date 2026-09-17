@@ -175,9 +175,9 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 - **GPU Count Must Match Parallel Degrees**: Total GPU count must satisfy:
   ```
-  total_gpus = ulysses_degree × ring_degree × cfg_parallel_size × tensor_parallel_size
+  total_gpus = ulysses_degree × ring_degree × allgather_degree × cfg_parallel_size × tensor_parallel_size
   ```
-  Any mismatch will cause a configuration error at startup.
+  Any mismatch will cause a configuration error at startup. `allgather_degree > 1` may be combined with `ulysses_degree > 1`, but not with `ring_degree > 1`.
 
 - **VAE Patch Parallel Size ≤ DiT Process Group Size**: `vae_patch_parallel_size` reuses the DiT process group and cannot exceed it. Larger values are automatically clamped with a warning.
 

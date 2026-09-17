@@ -428,8 +428,10 @@ class Attention(nn.Module):
                 raise NotImplementedError(
                     "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
                 )
-            if strategy_name == "allgather_kv":
-                raise NotImplementedError("paged Scheduler KV is not supported with AllGather-KV sequence parallelism")
+            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
+                raise NotImplementedError(
+                    f"paged Scheduler KV is not supported with the {strategy_name!r} sequence-parallel strategy"
+                )
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 

@@ -67,12 +67,17 @@ class SequenceParallelConfig:
         ring_degree: Number of devices for Ring attention. Sequence is split
             across devices, with K/V passed in a ring topology. Best for long
             sequences with limited memory/bandwidth.
+        allgather_degree: Number of devices for AllGather-KV attention. Sequence is
+            split across devices and K/V are gathered in an orthogonal group, so
+            every rank runs local-Q/global-KV attention.
         convert_to_fp32: Whether to convert output and LSE to float32 for
             numerical stability in ring attention.
 
     Note:
-        ulysses_degree * ring_degree = sequence_parallel_size
-        vLLM-Omni supports hybrid Ulysses-Ring attention (both > 1).
+        ulysses_degree * ring_degree * allgather_degree = sequence_parallel_size
+        vLLM-Omni supports hybrid Ulysses-Ring attention (both > 1) and the
+        orthogonal Ulysses x AllGather-KV topology (ulysses_degree and
+        allgather_degree > 1 with ring_degree == 1).
     """
 
     ulysses_degree: int = 1
@@ -89,15 +94,18 @@ class SequenceParallelConfig:
         if self.ulysses_degree < 1 or self.ring_degree < 1 or self.allgather_degree < 1:
             raise ValueError("SP degrees must be >= 1.")
 
-        if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
-            raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring.")
+        if self.allgather_degree > 1 and self.ring_degree > 1:
+            raise ValueError(
+                "AllGather-KV cannot be composed with Ring; the supported two-dimensional "
+                "topology is Ulysses x AllGather-KV (ulysses_degree > 1 with ring_degree == 1)."
+            )
         if self.ulysses_degree == self.ring_degree == self.allgather_degree == 1:
             raise ValueError("At least one SP degree must be > 1.")
 
     @property
     def sequence_parallel_size(self) -> int:
         """Total sequence parallel world size."""
-        return self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+        return self.ulysses_degree * self.ring_degree * self.allgather_degree
 
     def get_world_size(self) -> int:
         """Get the sequence parallel world size from parallel state.

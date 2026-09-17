@@ -512,6 +512,87 @@ def init_vllm_model_parallel_group(
     )
 
 
+def build_ulysses_allgather_rank_groups(
+    sp_group_ranks: list[list[int]],
+    sp_ulysses_degree: int,
+    sp_allgather_degree: int,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Rank lists of every Ulysses / AllGather-KV group in the composed topology.
+
+    Pure function (no ``torch.distributed``). Position ``p`` inside one SP
+    group maps to ``ulysses_rank = p % U`` and ``allgather_rank = p // U``::
+
+        SP group [0 1 2 3] (U=2, A=2):  Ulysses [0 1] [2 3]   AllGather [0 2] [1 3]
+
+    This is the layout invariant of the composed topology, chosen to match the
+    flat contiguous sharding of ``sp_shard`` (position ``p`` owns chunk ``p``):
+    a contiguous Ulysses group jointly holds one contiguous region, so its
+    all-to-all reproduces that region in order, and the stride-U AllGather
+    group holds regions in ``allgather_rank`` order, so the K/V all-gather
+    rebuilds the global sequence. Any other layout permutes the sequence.
+
+    Returns:
+        ``(ulysses_groups, allgather_groups)`` in a deterministic order, so
+        every rank issues the same ``new_group`` sequence.
+    """
+    ulysses_groups: list[list[int]] = []
+    allgather_groups: list[list[int]] = []
+    for group_ranks in sp_group_ranks:
+        if len(group_ranks) != sp_ulysses_degree * sp_allgather_degree:
+            raise ValueError(
+                f"Invalid sp_group_ranks entry: expected size "
+                f"{sp_ulysses_degree * sp_allgather_degree}, got {len(group_ranks)}."
+            )
+        # Ulysses groups: contiguous regions of U ranks. One region per
+        # AllGather rank, so region index == allgather_rank.
+        for region in range(sp_allgather_degree):
+            ulysses_groups.append(list(group_ranks[region * sp_ulysses_degree : (region + 1) * sp_ulysses_degree]))
+        # AllGather-KV groups: stride-U, so index inside the group == allgather_rank.
+        for ulysses_rank in range(sp_ulysses_degree):
+            allgather_groups.append(list(group_ranks[ulysses_rank::sp_ulysses_degree]))
+    return ulysses_groups, allgather_groups
+
+
+def _set_ulysses_allgather_pg(
+    sp_ulysses_degree: int,
+    sp_allgather_degree: int,
+    rank: int,
+    world_size: int,
+    sp_group_ranks: list[list[int]] | None,
+) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
+    """Build the orthogonal process groups of the Ulysses x AllGather-KV topology.
+
+    See ``build_ulysses_allgather_rank_groups`` for the rank-layout invariant.
+    ``ring_degree == 1`` is required, so every rank's Ring group is a singleton.
+    """
+    sp_size = sp_ulysses_degree * sp_allgather_degree
+    if sp_group_ranks is None:
+        sp_group_ranks = [list(range(offset, offset + sp_size)) for offset in range(0, world_size, sp_size)]
+    if len(sp_group_ranks) * sp_size != world_size or any(len(ranks) != sp_size for ranks in sp_group_ranks):
+        raise ValueError(f"Invalid sp_group_ranks: expected {world_size // sp_size} groups of size {sp_size}.")
+
+    ulysses_pg = ring_pg = allgather_pg = None
+    ulysses_groups, allgather_groups = build_ulysses_allgather_rank_groups(
+        sp_group_ranks,
+        sp_ulysses_degree,
+        sp_allgather_degree,
+    )
+    for ranks in ulysses_groups:
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            ulysses_pg = group
+    for ranks in allgather_groups:
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            allgather_pg = group
+    for singleton_rank in range(world_size):
+        group = torch.distributed.new_group([singleton_rank])
+        if rank == singleton_rank:
+            ring_pg = group
+    assert ulysses_pg is not None and ring_pg is not None and allgather_pg is not None
+    return ulysses_pg, ring_pg, allgather_pg
+
+
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
 def set_seq_parallel_pg(
     sp_ulysses_degree: int,
@@ -525,7 +606,8 @@ def set_seq_parallel_pg(
     """
     Initialize Ulysses, Ring, and AllGather-KV process groups.
 
-    AllGather-KV is mutually exclusive with Ulysses and Ring.
+    AllGather-KV may be composed with Ulysses (the orthogonal
+    Ulysses x AllGather-KV topology), but not with Ring.
 
     Args:
         sp_ulysses_degree: Size of each Ulysses subgroup.
@@ -535,19 +617,22 @@ def set_seq_parallel_pg(
         use_ulysses_low: If True, Ulysses groups are contiguous chunks and Ring
             groups are strided within each SP group. If False, the opposite.
         sp_group_ranks: Optional explicit SP groups. Each entry must be a list
-            of length sp_ulysses_degree * sp_ring_degree. When provided, groups
-            are built from these ranks instead of auto-generated contiguous
-            ranges.
+            of length sp_ulysses_degree * sp_ring_degree * sp_allgather_degree.
+            When provided, groups are built from these ranks instead of
+            auto-generated contiguous ranges.
 
     Returns:
         ulysses_pg (torch.distributed.ProcessGroup): The Ulysses process group
             for this rank.
         ring_pg (torch.distributed.ProcessGroup): The Ring process group for
             this rank.
+        allgather_pg (torch.distributed.ProcessGroup): The AllGather-KV process
+            group for this rank.
 
     Raises:
-        ValueError: If sp_group_ranks length does not match world_size or any
-            entry has the wrong size.
+        ValueError: If sp_group_ranks length does not match world_size, any
+            entry has the wrong size, or an unsupported degree combination is
+            requested.
         AssertionError: If world_size is not divisible by sp_size.
 
     Behavior:
@@ -558,8 +643,26 @@ def set_seq_parallel_pg(
           slice using offsets of size sp_size.
     """
     if sp_allgather_degree > 1:
-        if sp_ulysses_degree > 1 or sp_ring_degree > 1:
-            raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring")
+        if sp_ring_degree > 1:
+            raise ValueError(
+                "AllGather-KV cannot be composed with Ring: the supported two-dimensional "
+                "topology is Ulysses x AllGather-KV (ulysses_degree > 1 with ring_degree == 1). "
+                f"Got ulysses_degree={sp_ulysses_degree}, ring_degree={sp_ring_degree}, "
+                f"allgather_degree={sp_allgather_degree}."
+            )
+        if sp_ulysses_degree > 1:
+            logger.info(
+                "Building orthogonal Ulysses x AllGather-KV process groups "
+                f"(ulysses={sp_ulysses_degree}, allgather={sp_allgather_degree})."
+            )
+            return _set_ulysses_allgather_pg(
+                sp_ulysses_degree=sp_ulysses_degree,
+                sp_allgather_degree=sp_allgather_degree,
+                rank=rank,
+                world_size=world_size,
+                sp_group_ranks=sp_group_ranks,
+            )
+
         sp_size = sp_allgather_degree
         if sp_group_ranks is None:
             sp_group_ranks = [list(range(offset, offset + sp_size)) for offset in range(0, world_size, sp_size)]
@@ -715,12 +818,13 @@ def _initialize_model_parallel(
         data_parallel_size: number of data parallelism groups.
         cfg_parallel_size: number of GPUs used for Classifier Free Guidance (CFG) parallelism.
         sequence_parallel_size: number of GPUs used for sequence parallelism.
-            Uses allgather_degree when AllGather-KV is enabled, otherwise
-            ulysses_degree * ring_degree.
+            Equals ``ulysses_degree * ring_degree * allgather_degree``.
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
         allgather_degree: number of GPUs used for AllGather-KV sequence parallelism
-            (causal=False only). Mutually exclusive with ulysses/ring in v1.
+            (causal=False only). May be composed with ulysses_degree as the
+            orthogonal Ulysses x AllGather-KV topology; cannot be combined with
+            ring_degree > 1.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
         fully_shard_degree: number of GPUs used for the HSDP shard dimension.
@@ -760,15 +864,16 @@ def _initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    if allgather_degree > 1:
-        if ulysses_degree != 1 or ring_degree != 1:
-            raise ValueError(
-                "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
-                f"Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
-                f"allgather_degree={allgather_degree}."
-            )
+    if allgather_degree > 1 and ring_degree > 1:
+        raise ValueError(
+            "AllGather-KV (allgather_degree>1) cannot be composed with Ring (ring_degree>1). "
+            "The supported two-dimensional topology is Ulysses x AllGather-KV "
+            "(ulysses_degree > 1 with ring_degree == 1). "
+            f"Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
+            f"allgather_degree={allgather_degree}."
+        )
 
-    expected_sequence_parallel_size = allgather_degree if allgather_degree > 1 else ring_degree * ulysses_degree
+    expected_sequence_parallel_size = ring_degree * ulysses_degree * allgather_degree
     if sequence_parallel_size is None:
         sequence_parallel_size = expected_sequence_parallel_size
         logger.info("sequence_parallel_size is not provided, using %d", sequence_parallel_size)
