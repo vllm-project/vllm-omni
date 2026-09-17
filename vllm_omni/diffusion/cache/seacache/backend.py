@@ -76,6 +76,7 @@ class SeaCacheBackend(CacheBackend):
         self._transformer_id = id(pipeline.transformer)
         self.enabled = True
         pipeline._cache_context_factory = hook.cache_context
+        pipeline._control_cfg_cache_context_factory = hook.control_cfg_step
 
     def refresh(
         self,
@@ -96,5 +97,6 @@ class SeaCacheBackend(CacheBackend):
             raise RuntimeError("SeaCache hook is not installed on the pipeline transformer")
         hook.refresh(transformer)
         pipeline._cache_context_factory = hook.cache_context
+        pipeline._control_cfg_cache_context_factory = hook.control_cfg_step
         if verbose:
             logger.debug("SeaCache state refreshed")

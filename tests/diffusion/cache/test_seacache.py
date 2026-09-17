@@ -164,6 +164,190 @@ def _apply_test_hook(
     )
 
 
+def _control_inputs(value: float, names=("cond", "cond_no_control", "uncond")):
+    return {name: ([_latent(value)] if name == "cond_no_control" else [_latent(10), _latent(value)]) for name in names}
+
+
+def _execute_control_branches(transformer, hook, inputs):
+    for name, items in inputs.items():
+        with hook.cache_context(name):
+            transformer(hidden_states=items[-1], timestep=torch.tensor([500]), control_latents=items[:-1])
+
+
+@pytest.mark.parametrize("order", [0, 1, 2])
+def test_control_cfg_unanimous_skip_single_gate_and_separate_histories(monkeypatch, order):
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=7)
+    hook = _apply_test_hook(transformer, metadata, SeaCacheConfig(residual_order=order))
+    gate = hook._resolve_gate
+    votes, decisions = [], []
+
+    def observed_gate(state, indicator, step, num_steps):
+        result = gate(state, indicator, step, num_steps)
+        votes.append((step, hook.state_manager._context, result))
+        return result
+
+    monkeypatch.setattr(hook, "_resolve_gate", observed_gate)
+    for step, value in enumerate((1.0, 1.2, 1.4, 1.4, 1.4, 1.4, 1.4)):
+        metadata.step = step
+        inputs = _control_inputs(value)
+        with torch.inference_mode(), hook.control_cfg_step(inputs):
+            decision = list(hook._control_cfg_pending.values())
+            assert len(set(decision)) == 1
+            decisions.append(decision[0])
+            if decision[0]:
+                assert all(s.accumulated_distance == 0 for s in hook.state_manager._states.values())
+            _execute_control_branches(transformer, hook, inputs)
+        histories = [state.history for state in hook.state_manager._states.values()]
+        assert len({tuple(s for s, _ in history) for history in histories}) == 1
+        assert len({history[-1][1].data_ptr() for history in histories}) == 3
+    assert len(votes) == 21  # No second indicator/gate evaluation during forward.
+    assert [vote for step, _, vote in votes if step == 2] == [False, True, False]
+    assert decisions == [True, False, True, False, False, True, True]
+    assert hook.full_count == 12 and hook.skip_count == 9
+    assert hook._control_cfg_pending is None
+
+
+def test_control_cfg_rejects_unconsumed_and_duplicate_branches():
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    inputs = _control_inputs(1.0)
+    with pytest.raises(RuntimeError, match="Unconsumed"), torch.inference_mode(), hook.control_cfg_step(inputs):
+        pass
+    assert not hook.state_manager._states
+    with pytest.raises(RuntimeError, match="duplicate"), torch.inference_mode(), hook.control_cfg_step(inputs):
+        _execute_control_branches(transformer, hook, inputs)
+        _execute_control_branches(transformer, hook, {"cond": inputs["cond"]})
+    assert not hook.state_manager._states and hook._control_cfg_pending is None
+
+
+def test_control_cfg_exception_and_refresh_clear_preflight():
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    inputs = _control_inputs(1.0)
+    with pytest.raises(ValueError, match="forward failed"), torch.inference_mode(), hook.control_cfg_step(inputs):
+        raise ValueError("forward failed")
+    assert not hook.state_manager._states and hook._control_cfg_pending is None
+    with torch.inference_mode(), hook.control_cfg_step(inputs):
+        _execute_control_branches(transformer, hook, inputs)
+    hook.refresh(transformer)
+    assert not hook.state_manager._states
+    assert hook._control_cfg_branches == () and hook._control_cfg_last_step is None
+
+
+def test_control_cfg_interval_reactivation_restarts_all_anchors():
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=10)
+    hook = _apply_test_hook(transformer, metadata)
+    for step, names in (
+        (0, ("cond", "cond_no_control")),
+        (1, ("cond", "cond_no_control", "uncond")),
+        (4, ("cond", "cond_no_control", "uncond")),
+    ):
+        metadata.step = step
+        inputs = _control_inputs(1.0, names)
+        with torch.inference_mode(), hook.control_cfg_step(inputs):
+            assert all(hook._control_cfg_pending.values())
+            _execute_control_branches(transformer, hook, inputs)
+        assert all([s for s, _ in hook.state_manager._states[name].history] == [step] for name in names)
+
+
+def test_control_cfg_rank_override_forces_all_local_branches(monkeypatch):
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=5)
+    hook = _apply_test_hook(transformer, metadata)
+    sync_calls = []
+
+    def force_compute(vote, device):
+        sync_calls.append(vote)
+        return True
+
+    monkeypatch.setattr(hook, "_synchronize_compute", force_compute)
+    for step in range(2):
+        metadata.step = step
+        inputs = _control_inputs(1.0)
+        with torch.inference_mode(), hook.control_cfg_step(inputs):
+            assert all(hook._control_cfg_pending.values())
+            _execute_control_branches(transformer, hook, inputs)
+        assert all(s.accumulated_distance == 0 for s in hook.state_manager._states.values())
+    assert sync_calls == [True, False]  # One collective decision per step, not per branch.
+    assert hook.full_count == 6 and hook.skip_count == 0
+
+
+def test_control_cfg_invalid_indicator_forces_every_branch(monkeypatch):
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=5)
+    hook = _apply_test_hook(transformer, metadata)
+    inputs = _control_inputs(1.0)
+    with torch.inference_mode(), hook.control_cfg_step(inputs):
+        _execute_control_branches(transformer, hook, inputs)
+    build = hook._build_indicator
+    monkeypatch.setattr(hook, "_build_indicator", lambda items, sigma: None if len(items) == 1 else build(items, sigma))
+    metadata.step = 1
+    with torch.inference_mode(), hook.control_cfg_step(inputs):
+        assert all(hook._control_cfg_pending.values())
+        _execute_control_branches(transformer, hook, inputs)
+
+
+def _control_cfg_parallel_worker(rank, world_size, init_method, result_queue):
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    parallel_state._CFG = SimpleNamespace(
+        world_size=world_size, rank_in_group=rank, device_group=torch.distributed.group.WORLD
+    )
+    parallel_state._SP = SimpleNamespace(world_size=1)
+    try:
+        transformer = TinyCosmos3Transformer()
+        metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=5)
+        hook = _apply_test_hook(transformer, metadata, SeaCacheConfig())
+        decisions = []
+        for step, value in enumerate((1.0, 1.2, 1.4)):
+            metadata.step = step
+            inputs = _control_inputs(value)
+            with torch.inference_mode(), hook.control_cfg_step(inputs):
+                local = list(hook._control_cfg_pending)
+                decisions.append(list(hook._control_cfg_pending.values()))
+                _execute_control_branches(transformer, hook, {name: inputs[name] for name in local})
+        result_queue.put(
+            (
+                rank,
+                decisions,
+                {name: [s for s, _ in state.history] for name, state in hook.state_manager._states.items()},
+            )
+        )
+    finally:
+        parallel_state._CFG = None
+        parallel_state._SP = None
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_control_cfg_parallel_consensus_uneven_and_idle_ranks(world_size):
+    context = torch.multiprocessing.get_context("spawn")
+    with context.Manager() as manager:
+        result_queue = manager.Queue()
+        torch.multiprocessing.spawn(
+            _control_cfg_parallel_worker,
+            args=(world_size, get_distributed_init_method("seacache_control_cfg_"), result_queue),
+            nprocs=world_size,
+        )
+        results = [result_queue.get(timeout=2) for _ in range(world_size)]
+    for rank, decisions, histories in results:
+        names = [name for i, name in enumerate(_control_inputs(1.0)) if i % world_size == rank] or ["cond"]
+        assert set(histories) == set(names)
+        assert decisions == [[True] * len(names), [False] * len(names), [True] * len(names)]
+        assert all(anchors == [0, 2] for anchors in histories.values())
+
+
 def test_config_validation() -> None:
     assert SeaCacheConfig().threshold == 0.25
     with pytest.raises(ValueError, match="residual_order"):
@@ -590,6 +774,7 @@ def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
     assert isinstance(hook, SeaCacheRootHook)
     assert callable(getattr(pipeline, "_cache_context_factory", None))
+    assert getattr(pipeline, "_control_cfg_cache_context_factory", None) == hook.control_cfg_step
     for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
         assert not hasattr(pipeline.transformer, name)
     pipeline._current_step_index = 0
@@ -599,6 +784,7 @@ def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     assert hook.full_count == 1
 
     backend.refresh(pipeline, num_inference_steps=7)
+    assert getattr(pipeline, "_control_cfg_cache_context_factory", None) == hook.control_cfg_step
     assert hook.full_count == 0
     assert hook.skip_count == 0
     assert hook.state_manager._states == {}

@@ -73,6 +73,10 @@ class SeaCacheRootHook(ModelHook):
         self.extractor_fn = extractor_fn
         self._parameter_sharded = False
         self._collective_skip_groups: list[torch.distributed.ProcessGroup] = []
+        self._control_cfg_pending: dict[str, bool] | None = None
+        self._control_cfg_metadata: tuple[int, float, int] | None = None
+        self._control_cfg_branches: tuple[str, ...] = ()
+        self._control_cfg_last_step: int | None = None
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         if self.extractor_fn is None:
@@ -101,6 +105,99 @@ class SeaCacheRootHook(ModelHook):
             yield
         finally:
             self.state_manager.set_context(previous_context)
+
+    def _step_metadata(self) -> tuple[int, float, int]:
+        callbacks = (self.current_step_callback, self.current_sigma_callback, self.num_inference_steps_callback)
+        if any(callback is None for callback in callbacks):
+            raise ValueError("scheduler callbacks are unavailable")
+        values = [callback() for callback in callbacks if callback is not None]
+        values = [value.item() if isinstance(value, torch.Tensor) else value for value in values]
+        step_value, sigma_value, num_steps_value = values
+        if step_value is None or sigma_value is None or num_steps_value is None:
+            raise ValueError("scheduler metadata is unavailable")
+        step, sigma, num_steps = int(step_value), float(sigma_value), int(num_steps_value)
+        if step < 0 or num_steps <= 0 or step >= num_steps or not math.isfinite(sigma) or not 0 <= sigma <= 1:
+            raise ValueError("expected a valid step index and exact sigma in [0, 1]")
+        return step, sigma, num_steps
+
+    @contextmanager
+    def control_cfg_step(self, branch_latents: dict[str, list[torch.Tensor]]) -> Iterator[None]:
+        """Preflight control CFG: skip only when every participating branch/rank agrees.
+
+        Only indicators and budgets are evaluated here, never model forwards.
+        Each actual forward consumes its decision once and retains its own
+        residual tensors. CFG-parallel ownership matches the pipeline's
+        round-robin dispatch, including the shape-only forward on idle ranks.
+        """
+        if self._control_cfg_pending is not None:
+            raise RuntimeError("Previous SeaCache control-CFG preflight was not fully consumed")
+        if not branch_latents or any(not name or not items for name, items in branch_latents.items()):
+            raise ValueError("Control-CFG preflight requires named branches with vision inputs")
+        if torch.is_grad_enabled():
+            yield
+            return
+
+        from vllm_omni.diffusion.distributed.cfg_parallel import _get_cfg_world_size_or_one
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_cfg_group,
+            get_classifier_free_guidance_rank,
+        )
+
+        step, sigma, num_steps = self._step_metadata()
+        names = tuple(branch_latents)
+        cfg_size = _get_cfg_world_size_or_one()
+        cfg_rank = get_classifier_free_guidance_rank() if cfg_size > 1 else 0
+        local_names = [name for i, name in enumerate(names) if i % cfg_size == cfg_rank] or [names[0]]
+        new_group = names != self._control_cfg_branches or self._control_cfg_last_step != step - 1
+        votes = []
+        try:
+            for name in local_names:
+                with self.cache_context(name):
+                    state = self.state_manager.get_state()
+                    # A guidance interval can activate a previously absent branch.
+                    # Restart all active histories together instead of mixing ages.
+                    if new_group:
+                        state.reset()
+                    try:
+                        indicator = self._build_indicator(branch_latents[name], sigma)
+                    except (TypeError, ValueError, RuntimeError) as error:
+                        self._warn_once(f"SeaCache could not construct its vision indicator; running full: {error}")
+                        indicator = None
+                    votes.append(self._resolve_gate(state, indicator, step, num_steps))
+            device = branch_latents[local_names[0]][-1].device
+            compute = self._synchronize_compute(any(votes), device)
+            if cfg_size > 1:
+                decision = torch.tensor(int(compute), dtype=torch.int32, device=device)
+                torch.distributed.all_reduce(
+                    decision, op=torch.distributed.ReduceOp.MAX, group=get_cfg_group().device_group
+                )
+                compute = bool(decision.item())
+            if compute:
+                for name in local_names:
+                    with self.cache_context(name):
+                        self.state_manager.get_state().accumulated_distance = 0.0
+            self._control_cfg_pending = {name: compute for name in local_names}
+            self._control_cfg_metadata = (step, sigma, num_steps)
+            self._control_cfg_branches = names
+            self._control_cfg_last_step = step
+            completed = False
+            try:
+                yield
+                completed = True
+            finally:
+                remaining = self._control_cfg_pending
+                self._control_cfg_pending = None
+                self._control_cfg_metadata = None
+                if completed and remaining:
+                    raise RuntimeError(f"Unconsumed SeaCache control-CFG decisions: {list(remaining)}")
+        except BaseException:
+            # Never reuse partially advanced gate/history state after a failed step.
+            self.state_manager.reset()
+            self._control_cfg_pending = None
+            self._control_cfg_metadata = None
+            self._control_cfg_branches = ()
+            self._control_cfg_last_step = None
+            raise
 
     def _build_indicator(
         self,
@@ -262,28 +359,7 @@ class SeaCacheRootHook(ModelHook):
                 torch.any(noisy_frame_mask != 0).item()
             )
 
-            step = self.current_step_callback()
-            sigma = self.current_sigma_callback()
-            num_inference_steps = self.num_inference_steps_callback()
-            if isinstance(step, torch.Tensor):
-                step = step.item()
-            if isinstance(sigma, torch.Tensor):
-                sigma = sigma.item()
-            if isinstance(num_inference_steps, torch.Tensor):
-                num_inference_steps = num_inference_steps.item()
-            if step is None or sigma is None or num_inference_steps is None:
-                raise ValueError("scheduler metadata is unavailable")
-            step = int(step)
-            sigma = float(sigma)
-            num_inference_steps = int(num_inference_steps)
-            if (
-                step < 0
-                or num_inference_steps <= 0
-                or step >= num_inference_steps
-                or not math.isfinite(sigma)
-                or not 0.0 <= sigma <= 1.0
-            ):
-                raise ValueError("expected a valid step index and exact sigma in [0, 1]")
+            step, sigma, num_inference_steps = self._step_metadata()
         except (IndexError, TypeError, ValueError, RuntimeError) as error:
             self._warn_once(f"SeaCache metadata is invalid; running full: {error}")
             return self._run_uncached(ctx)
@@ -293,16 +369,26 @@ class SeaCacheRootHook(ModelHook):
             return self._run_uncached(ctx)
 
         state: SeaCacheState = self.state_manager.get_state()
-        try:
-            indicator = self._build_indicator(vision_items, sigma)
-        except (TypeError, ValueError, RuntimeError) as error:
-            self._warn_once(f"SeaCache could not construct its vision indicator; running full: {error}")
-            indicator = None
+        pending = self._control_cfg_pending
+        prepared = pending is not None
+        if pending is not None:
+            name = self.state_manager._current_context
+            if self._control_cfg_metadata != (step, sigma, num_inference_steps):
+                raise RuntimeError("SeaCache scheduler metadata changed after control-CFG preflight")
+            if name not in pending:
+                raise RuntimeError(f"Unexpected or duplicate SeaCache control-CFG branch: {name}")
+            should_compute = pending.pop(name)
+        else:
+            try:
+                indicator = self._build_indicator(vision_items, sigma)
+            except (TypeError, ValueError, RuntimeError) as error:
+                self._warn_once(f"SeaCache could not construct its vision indicator; running full: {error}")
+                indicator = None
 
-        local_compute = self._resolve_gate(state, indicator, step, num_inference_steps)
-        should_compute = self._synchronize_compute(local_compute, ctx.hidden_states.device)
-        if should_compute and not local_compute:
-            state.accumulated_distance = 0.0
+            local_compute = self._resolve_gate(state, indicator, step, num_inference_steps)
+            should_compute = self._synchronize_compute(local_compute, ctx.hidden_states.device)
+            if should_compute and not local_compute:
+                state.accumulated_distance = 0.0
 
         if should_compute:
             self.full_count += 1
@@ -328,6 +414,9 @@ class SeaCacheRootHook(ModelHook):
         )
         if can_reuse:
             return ctx.postprocess(ctx.hidden_states + residual)
+
+        if prepared:
+            raise RuntimeError("SeaCache control-CFG residual is incompatible with the execution input")
 
         output = self._run_full_stack(ctx)
         result = ctx.postprocess(output)
@@ -368,6 +457,10 @@ class SeaCacheRootHook(ModelHook):
 
     def reset_state(self, module: torch.nn.Module) -> torch.nn.Module:
         self.state_manager.reset()
+        self._control_cfg_pending = None
+        self._control_cfg_metadata = None
+        self._control_cfg_branches = ()
+        self._control_cfg_last_step = None
         self.full_count = 0
         self.skip_count = 0
         return module
