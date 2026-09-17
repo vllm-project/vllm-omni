@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -33,8 +33,6 @@ from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
-    fused_qk_norm_rope_available,
-    fused_qk_norm_rope_min_tokens,
     pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -50,33 +48,6 @@ logger = init_logger(__name__)
 # fused path won at every size measured on H200 for this chain, see Flux.2)
 # and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
 _FUSED_MIN_TOKENS = 0
-
-
-def _packed_qk_norm_rope_table(
-    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    text_seq_len: int,
-    batch_size: int,
-    dtype: torch.dtype,
-) -> torch.Tensor | None:
-    """Pack ``(cos, sin)`` ``[S_video, D/2]`` into the fused op's table for
-    the joint ``[video | text]`` sequence.
-
-    HunyuanVideo 1.5 rotates only the video tokens; the text rows get the
-    identity rotation ``cos = 1, sin = 0``, which the kernel applies exactly
-    (``x * 1 - pair * 0``), so the fused output for text equals plain RMSNorm.
-    Stored in the activation dtype like the eager chain's cos/sin.
-    """
-    cos, sin = image_rotary_emb
-    rotary_dim = 2 * cos.shape[-1]
-    # No table (no allocation, no copy) unless the CUDA kernel would run for
-    # these activations: CPU/NPU/ROCm and non-bf16 paths keep the eager chain.
-    if not fused_qk_norm_rope_available(cos.device, dtype, rotary_dim, rotary_dim):
-        return None
-    if batch_size * (cos.shape[0] + text_seq_len) < fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS):
-        return None
-    cos = torch.cat((cos, cos.new_ones((text_seq_len, cos.shape[-1]))), dim=0)
-    sin = torch.cat((sin, sin.new_zeros((text_seq_len, sin.shape[-1]))), dim=0)
-    return pack_qk_norm_rope_table(cos, sin, batch_size, dtype=dtype, min_tokens=_FUSED_MIN_TOKENS)
 
 
 class HunyuanVideo15PatchEmbed(nn.Module):
@@ -924,8 +895,15 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         # metadata and keeps the eager chain.
         qk_norm_rope_table = None
         if get_sequence_parallel_world_size() == 1 and image_rotary_emb[0].shape[0] == hidden_states.shape[1]:
-            qk_norm_rope_table = _packed_qk_norm_rope_table(
-                image_rotary_emb, encoder_hidden_states.shape[1], hidden_states.shape[0], hidden_states.dtype
+            # Text rows get the identity rotation (cos = 1, sin = 0): text
+            # tokens are normalised but not rotated, and the kernel applies
+            # it exactly (x * 1 - pair * 0).
+            qk_norm_rope_table = pack_qk_norm_rope_table(
+                *image_rotary_emb,
+                hidden_states.shape[0],
+                dtype=hidden_states.dtype,
+                min_tokens=_FUSED_MIN_TOKENS,
+                identity_rows=encoder_hidden_states.shape[1],
             )
 
         for block in self.transformer_blocks:

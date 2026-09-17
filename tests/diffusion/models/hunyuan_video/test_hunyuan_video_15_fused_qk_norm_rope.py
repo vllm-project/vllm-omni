@@ -16,6 +16,17 @@ _HEADS, _HEAD_DIM = 16, 128
 _DIM = _HEADS * _HEAD_DIM
 
 
+def _packed_qk_norm_rope_table(rotary_emb, text_seq_len, batch_size, dtype):
+    """The model's per-forward table: video rows rotated, text rows identity."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import pack_qk_norm_rope_table
+    from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import _FUSED_MIN_TOKENS
+
+    cos, sin = rotary_emb
+    return pack_qk_norm_rope_table(
+        cos, sin, batch_size, dtype=dtype, min_tokens=_FUSED_MIN_TOKENS, identity_rows=text_seq_len
+    )
+
+
 @pytest.fixture
 def _dist_env():
     from vllm.config import VllmConfig, set_current_vllm_config
@@ -38,7 +49,6 @@ def _dist_env():
 
 def test_packed_table_skipped_on_cpu(monkeypatch):
     """No table (no allocation) where the fused kernel cannot run."""
-    from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import _packed_qk_norm_rope_table
 
     monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     cos, sin = torch.randn(50, _HEAD_DIM // 2), torch.randn(50, _HEAD_DIM // 2)
@@ -48,8 +58,6 @@ def test_packed_table_skipped_on_cpu(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_packed_table_video_rows_then_identity_text_rows(monkeypatch):
-    from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import _packed_qk_norm_rope_table
-
     monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
     cos, sin = torch.randn(50, _HEAD_DIM // 2, device="cuda"), torch.randn(50, _HEAD_DIM // 2, device="cuda")
     table = _packed_qk_norm_rope_table((cos, sin), text_seq_len=7, batch_size=2, dtype=torch.bfloat16)
@@ -95,7 +103,6 @@ def test_hunyuan_attention_fused_matches_eager(_dist_env):
     from vllm_omni.diffusion.forward_context import set_forward_context
     from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
         HunyuanVideo15Attention,
-        _packed_qk_norm_rope_table,
     )
 
     torch.manual_seed(3)
