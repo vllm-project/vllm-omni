@@ -14,7 +14,7 @@ import time
 import traceback
 import uuid
 import wave
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -404,9 +404,13 @@ def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
     for sample in input_requests:
         if not isinstance(sample, OmniInteractSampleRequest):
             continue
-        root = sample.omniinteract_options.output_root.resolve()
+        options = sample.omniinteract_options
+        case = sample.omniinteract_case
+        if options is None or case is None:
+            continue
+        root = options.output_root.resolve()
         roots.add(root)
-        clear_case_artifacts(sample.omniinteract_options.output_root, sample.omniinteract_case)
+        clear_case_artifacts(options.output_root, case)
     for root in roots:
         clear_batch_artifacts(root)
 
@@ -711,7 +715,7 @@ datasets.get_samples = get_samples
 
 _serve_mod = sys.modules.get("vllm.benchmarks.serve")
 if _serve_mod is not None:
-    _serve_mod.get_samples = get_samples
+    setattr(_serve_mod, "get_samples", get_samples)
 
 
 @dataclass
@@ -748,6 +752,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     tts_turn_pcm_bytes: list[bytes] | None = None
     #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
     stage_metrics: dict[str, dict] | None = None
+    #: Diffusion pipeline profiler timings from response ``stage_durations``
+    #: (e.g. diffuse / text_encoder.forward / vae.decode), when present.
+    stage_durations: dict[str, float] | None = None
     stage_id: int | None = None
     final_output_type: str | None = None
     duplex_request_metrics: list[dict[str, object]] | None = None
@@ -1012,6 +1019,68 @@ def _update_output_peak_memory_from_payload(output: MixRequestFuncOutput, data: 
         output.peak_memory_mb = peak_memory_mb
 
 
+def _coerce_stage_durations_dict(raw: object) -> dict[str, float] | None:
+    """Normalize a stage_durations mapping to ``dict[str, float]``."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    coerced: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            continue
+        coerced[str(key)] = float(value)
+    return coerced or None
+
+
+def _extract_stage_durations_from_payload(data: Mapping[str, object]) -> dict[str, float] | None:
+    """Pull pipeline profiler timings from video/image/chat response shapes."""
+    found = _coerce_stage_durations_dict(data.get("stage_durations"))
+    if found:
+        return found
+
+    metrics = data.get("metrics")
+    if isinstance(metrics, dict):
+        found = _coerce_stage_durations_dict(metrics.get("stage_durations"))
+        if found:
+            return found
+
+    response_data = data.get("data")
+    if isinstance(response_data, list):
+        for item in response_data:
+            if isinstance(item, dict):
+                found = _coerce_stage_durations_dict(item.get("stage_durations"))
+                if found:
+                    return found
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            for message_key in ("message", "delta"):
+                message = choice.get(message_key)
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            found = _coerce_stage_durations_dict(item.get("stage_durations"))
+                            if found:
+                                return found
+                elif isinstance(content, dict):
+                    found = _coerce_stage_durations_dict(content.get("stage_durations"))
+                    if found:
+                        return found
+    return None
+
+
+def _update_output_stage_durations_from_payload(output: MixRequestFuncOutput, data: Mapping[str, object]) -> None:
+    """Persist the full profiler ``stage_durations`` map when the response has one."""
+    found = _extract_stage_durations_from_payload(data)
+    if found:
+        output.stage_durations = found
+
+
 def _image_metrics_from_stage_metrics(metrics: object) -> tuple[int, float, int, float]:
     if not isinstance(metrics, dict):
         return 0, 0.0, 0, 0.0
@@ -1084,6 +1153,7 @@ def _apply_image_metrics_from_payload(output: MixRequestFuncOutput, data: Mappin
     """Populate image benchmark fields from an OpenAI-compatible image payload."""
     _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
     _update_output_peak_memory_from_payload(output, data)
+    _update_output_stage_durations_from_payload(output, data)
 
     payload_image_count = 0
     response_data = data.get("data")
@@ -1296,8 +1366,9 @@ def _apply_video_metrics_from_payload(
     output.video_frames = _video_frames_from_payload(data, request_body)
     _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
     _update_output_peak_memory_from_payload(output, data)
+    _update_output_stage_durations_from_payload(output, data)
 
-    stage_durations = data.get("stage_durations")
+    stage_durations = output.stage_durations if output.stage_durations is not None else data.get("stage_durations")
     stage_gen_ms = _video_generation_ms_from_stage_durations(stage_durations)
     if stage_gen_ms <= 0:
         inference_time_s = coerce_positive_float_scalar(data.get("inference_time_s"))
@@ -1409,6 +1480,7 @@ async def async_request_openai_chat_omni_completions(
         output.image_pixels = 0
         output.denoise_step_latency_ms = 0.0
         output.peak_memory_mb = 0.0
+        output.stage_durations = None
         completion_tokens_seen = 0
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
@@ -1439,6 +1511,7 @@ async def async_request_openai_chat_omni_completions(
                                 data = json.loads(chunk)
                                 _update_output_stage_metrics_from_payload(output, data)
                                 _update_output_peak_memory_from_payload(output, data)
+                                _update_output_stage_durations_from_payload(output, data)
                                 usage = data.get("usage")
                                 completion_tokens = None
                                 if isinstance(usage, dict):
@@ -1977,6 +2050,7 @@ async def async_request_openai_image_edits_omni(
                             update_output_tokens=(data.get("type") == "ar_delta"),
                         )
                         _update_output_peak_memory_from_payload(output, data)
+                        _update_output_stage_durations_from_payload(output, data)
 
                         chunk_type = data.get("type")
                         if chunk_type == "ar_delta":
@@ -2531,9 +2605,12 @@ async def async_request_openai_realtime_duplex(
             output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
             output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
             output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
-            output.audio_duration = (
-                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
-            )
+            audio_duration_ms = 0.0
+            for metric in turn_metrics:
+                raw_duration = metric.get("audio_duration_ms") or 0.0
+                if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool):
+                    audio_duration_ms += float(raw_duration)
+            output.audio_duration = audio_duration_ms / 1000.0
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
             output.tts_turn_pcm_bytes = turn_pcm_bytes
@@ -2614,6 +2691,7 @@ from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, ge
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
+    aggregate_stage_durations,
     calculate_metrics,
     has_metric_samples,
 )
@@ -2732,7 +2810,7 @@ async def benchmark(
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
-        warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        warmup_semaphore: Any = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
         warmup_tasks = []
 
         async def warmup_limited_request_func():
@@ -2753,9 +2831,13 @@ async def benchmark(
     if lora_modules:
         lora_modules_list = list(lora_modules)
         if lora_assignment == "round-robin":
-            lora_modules = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
+            lora_module_iter: Iterator[str] | None = iter(
+                [lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))]
+            )
         else:
-            lora_modules = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
+            lora_module_iter = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
+    else:
+        lora_module_iter = None
 
     if profile:
         print("Starting profiler...")
@@ -2794,7 +2876,7 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+    semaphore: Any = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
 
     async def limited_request_func(request_func_input, session, pbar):
         async with semaphore:
@@ -2865,8 +2947,8 @@ async def benchmark(
         )
         per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
+        if lora_module_iter is not None:
+            req_lora_module = next(lora_module_iter)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
         request_func_input = RequestFuncInput(
@@ -2903,6 +2985,7 @@ async def benchmark(
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
 
+    actual_output_lens: list[int] | int
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
             input_requests=input_requests,
@@ -3022,6 +3105,10 @@ async def benchmark(
                 result[result_key] = summary
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
+
+    stage_duration_summaries = aggregate_stage_durations(outputs)
+    if stage_duration_summaries:
+        result.update(stage_duration_summaries)
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

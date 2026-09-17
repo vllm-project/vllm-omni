@@ -24,10 +24,12 @@ from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _add_video_extra_body_to_form,
     _add_video_reference_to_form,
+    _apply_image_metrics_from_payload,
     _apply_stage0_token_timings,
     _apply_video_metrics_from_payload,
     _attach_seed_tts_to_request_func_input,
     _build_benchmark_session,
+    _extract_stage_durations_from_payload,
     _omni_request_timeout_s,
     async_request_openai_chat_omni_completions,
     async_request_openai_image_edits_omni,
@@ -134,7 +136,7 @@ class MockResponse:
 @pytest.mark.asyncio
 async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
     class FakeRealtimeClient:
-        last_instance = None
+        last_instance: "FakeRealtimeClient | None" = None
 
         def __init__(self, url):
             assert url == "ws://localhost:8000/v1/realtime?duplex=1"
@@ -240,6 +242,8 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     )
 
     client = FakeRealtimeClient.last_instance
+    assert client is not None
+    assert client.configure_kwargs is not None
     assert client.configure_kwargs["native_duplex"] is False
     assert client.configure_kwargs["extra_body"] == {
         "ref_audio": "data:audio/wav;base64,AAAA",
@@ -1345,16 +1349,15 @@ async def test_image_edits_defaults_to_non_streaming_json(mocker: MockerFixture)
             return None
 
     captured_stream: list[str] = []
-    real_add_field = None
+    import aiohttp
+
+    real_add_field = aiohttp.FormData.add_field
 
     def tracking_add_field(self, name, value=None, **kwargs):
         if name == "stream":
             captured_stream.append(str(value))
         return real_add_field(self, name, value, **kwargs)
 
-    import aiohttp
-
-    real_add_field = aiohttp.FormData.add_field
     mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
 
     mock_session = mocker.AsyncMock()
@@ -1527,6 +1530,7 @@ def test_video_structured_image_reference_serialized_to_form(reference: object, 
     assert field_names.count("image_reference") == 1
     assert "input_reference" not in field_names
     payload = next(value for name, value in captured if name == "image_reference")
+    assert isinstance(payload, (str, bytes, bytearray))
     assert json.loads(payload) == reference
 
 
@@ -1538,6 +1542,63 @@ def test_video_unsupported_image_reference_raises() -> None:
         _add_video_reference_to_form(form, {"not_a_supported_key": "x"})
     with pytest.raises(ValueError, match="Unsupported image_reference"):
         _add_video_reference_to_form(form, "/tmp/does-not-exist-ref.png")
+
+
+def test_extract_stage_durations_from_video_and_image_shapes() -> None:
+    video_payload = {
+        "stage_durations": {
+            "diffuse": 1.5,
+            "text_encoder.forward": 0.2,
+            "vae.decode": 0.1,
+            "stage_0_gen_ms": 4000.0,
+        }
+    }
+    assert _extract_stage_durations_from_payload(video_payload) == video_payload["stage_durations"]
+
+    image_stage_durations = {
+        "diffuse": 2.0,
+        "vae.decode": 0.3,
+    }
+    image_payload = {
+        "metrics": {"stage_durations": image_stage_durations},
+        "data": [{"b64_json": "x"}],
+    }
+    assert _extract_stage_durations_from_payload(image_payload) == image_stage_durations
+
+
+def test_video_metrics_persist_full_stage_durations() -> None:
+    output = MixRequestFuncOutput()
+    output.latency = 4.2
+    stage_durations = {
+        "diffuse": 1.5,
+        "vae.decode": 0.25,
+        "stage_0_gen_ms": 4000.0,
+    }
+    payload = {
+        "duration_s": 2.0,
+        "num_frames": 48,
+        "fps": 24.0,
+        "stage_durations": stage_durations,
+    }
+    _apply_video_metrics_from_payload(output, payload, {})
+    assert output.stage_durations == stage_durations
+    assert output.video_generation_time_ms == pytest.approx(4000.0)
+
+
+def test_image_metrics_persist_stage_durations_from_metrics() -> None:
+    output = MixRequestFuncOutput()
+    stage_durations = {
+        "diffuse": 1.1,
+        "text_encoder.forward": 0.4,
+        "vae.decode": 0.2,
+    }
+    payload = {
+        "created": 1,
+        "data": [{"b64_json": _MIN_PNG_B64}],
+        "metrics": {"stage_durations": stage_durations},
+    }
+    assert _apply_image_metrics_from_payload(output, payload) == 1
+    assert output.stage_durations == stage_durations
 
 
 if __name__ == "__main__":

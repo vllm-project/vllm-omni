@@ -6,11 +6,16 @@ Unit tests for metrics.py
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 from vllm.benchmarks.serve import TaskType
 
-from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
+from vllm_omni.benchmarks.metrics.metrics import (
+    aggregate_stage_durations,
+    calculate_metrics,
+    print_stage_durations_metrics,
+)
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
@@ -379,12 +384,7 @@ class _EmptyAwareTokenizer:
     """
 
     def __call__(self, text, add_special_tokens=False):
-        class _R:
-            pass
-
-        r = _R()
-        r.input_ids = [0] * len(text)
-        return r
+        return SimpleNamespace(input_ids=[0] * len(text))
 
 
 def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
@@ -586,6 +586,35 @@ def test_image_with_generated_text_still_reports_text_result(capsys):
     assert " Text Result " in out
     assert "Time to First Token" in out
     assert " Image Result " in out
+
+
+def test_aggregate_stage_durations_mean_p50_p99() -> None:
+    ok_a = MixRequestFuncOutput()
+    ok_a.success = True
+    ok_a.stage_durations = {"diffuse": 1.0, "vae.decode": 0.2}
+    ok_b = MixRequestFuncOutput()
+    ok_b.success = True
+    ok_b.stage_durations = {"diffuse": 3.0, "vae.decode": 0.4}
+    failed = MixRequestFuncOutput()
+    failed.success = False
+    failed.stage_durations = {"diffuse": 99.0}
+
+    summaries = aggregate_stage_durations([ok_a, ok_b, failed])
+    assert summaries["stage_durations_mean"]["diffuse"] == pytest.approx(2.0)
+    assert summaries["stage_durations_p50"]["diffuse"] == pytest.approx(2.0)
+    assert summaries["stage_durations_mean"]["vae.decode"] == pytest.approx(0.3)
+    assert "stage_durations_p99" in summaries
+
+
+def test_print_stage_durations_metrics(capsys) -> None:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.stage_durations = {"diffuse": 1.25, "text_encoder.forward": 0.5}
+    print_stage_durations_metrics([output])
+    out = capsys.readouterr().out
+    assert "Stage Durations Mean (s):" in out
+    assert "diffuse" in out
+    assert "text_encoder.forward" in out
 
 
 if __name__ == "__main__":

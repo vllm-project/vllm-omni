@@ -5,6 +5,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import field, make_dataclass
+from typing import Any
 
 import numpy as np
 from vllm.benchmarks.datasets import SampleRequest
@@ -69,7 +70,9 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.PERCENTILES_PEAK_MEMORY_MB, _PERCENTILE_ROWS_TYPE, field(default=None)),
 ]
 
-MultiModalsBenchmarkMetrics = make_dataclass(
+# ``make_dataclass`` returns a runtime class that mypy treats as a variable, not
+# a type. Annotate as Any so call sites can use these names in annotations.
+MultiModalsBenchmarkMetrics: Any = make_dataclass(
     "MultiModalsBenchmarkMetrics",
     _MULTIMODAL_BENCHMARK_FIELDS,
     bases=(BenchmarkMetrics,),
@@ -99,7 +102,7 @@ _STAGE_BENCHMARK_FIELDS = [
     (defs.INTER_OUTPUT_LATENCIES_MS, _FLOAT_LIST_TYPE, field(default_factory=list)),
 ]
 
-StageBenchmarkMetrics = make_dataclass(
+StageBenchmarkMetrics: Any = make_dataclass(
     "StageBenchmarkMetrics",
     _STAGE_BENCHMARK_FIELDS,
     namespace={"__doc__": "Aggregated metrics for one pipeline stage (for printing only)."},
@@ -250,6 +253,7 @@ def print_metrics(
             print_image_metrics(selected_percentiles or [], metrics)
         if _has_video_output(metrics):
             print_video_metrics(selected_percentiles or [], metrics)
+        print_stage_durations_metrics(outputs)
         if print_stage and outputs and selected_percentiles is not None:
             stage_metrics = _build_stage_metrics_from_outputs(outputs)
             if stage_metrics:
@@ -336,6 +340,50 @@ def print_peak_memory_metrics(metrics: MultiModalsBenchmarkMetrics):
     print("{:<40} {:<10.2f}".format("Median PEAK_MEMORY_MB (MB):", getattr(metrics, defs.MEDIAN_PEAK_MEMORY_MB)))
     for p, value in getattr(metrics, defs.PERCENTILES_PEAK_MEMORY_MB) or []:
         print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} PEAK_MEMORY_MB (MB):", value))
+
+
+def aggregate_stage_durations(outputs: Sequence[RequestFuncOutput]) -> dict[str, dict[str, float]]:
+    """Aggregate per-request pipeline profiler timings into mean/p50/p99 maps.
+
+    Mirrors ``diffusion_benchmark_serving`` so ``--save-result`` JSON can carry
+    ``stage_durations_{mean,p50,p99}`` for Diffuse / VAE / TextEncoder keys.
+    """
+    stage_duration_lists: dict[str, list[float]] = {}
+    for output in outputs:
+        if not getattr(output, "success", False):
+            continue
+        stage_durations = getattr(output, "stage_durations", None)
+        if not isinstance(stage_durations, dict):
+            continue
+        for stage, duration in stage_durations.items():
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not np.isfinite(duration):
+                continue
+            stage_duration_lists.setdefault(str(stage), []).append(float(duration))
+    if not stage_duration_lists:
+        return {}
+    return {
+        "stage_durations_mean": {stage: float(np.mean(values)) for stage, values in stage_duration_lists.items()},
+        "stage_durations_p50": {
+            stage: float(np.percentile(values, 50)) for stage, values in stage_duration_lists.items()
+        },
+        "stage_durations_p99": {
+            stage: float(np.percentile(values, 99)) for stage, values in stage_duration_lists.items()
+        },
+    }
+
+
+def print_stage_durations_metrics(outputs: Sequence[RequestFuncOutput] | None) -> None:
+    """Print mean pipeline profiler stage durations when any request reported them."""
+    if not outputs:
+        return
+    summaries = aggregate_stage_durations(outputs)
+    mean = summaries.get("stage_durations_mean") or {}
+    if not mean:
+        return
+    print("{s:{c}^{n}}".format(s=" Stage Durations ", n=50, c="-"))
+    print("Stage Durations Mean (s):")
+    for stage, value in mean.items():
+        print("{:<40} {:<10.4f}".format(f"  {stage}:", value))
 
 
 def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsBenchmarkMetrics):
@@ -818,7 +866,7 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> tuple[MultiModalsBenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
     Args:
@@ -928,7 +976,7 @@ def calculate_metrics(
             goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
             goodput_audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) if audio_ttfp_measured else None)
             audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
-            audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0.0))
+            audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
             total_images += image_count
             image_generation_time_ms = float(getattr(outputs[i], defs.IMAGE_GENERATION_TIME_MS, 0.0) or 0.0)
@@ -982,9 +1030,17 @@ def calculate_metrics(
                 good_completed += 1
 
     if completed == 0:
-        warnings.formatwarning = lambda msg, category, filename, lineno, line=None: (
-            f"{filename}:{lineno}: {category.__name__}: {msg}\n"
-        )
+
+        def _formatwarning(
+            message: Warning | str,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            line: str | None = None,
+        ) -> str:
+            return f"{filename}:{lineno}: {category.__name__}: {message}\n"
+
+        warnings.formatwarning = _formatwarning
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration on the benchmark arguments.",
             stacklevel=2,
