@@ -48,6 +48,7 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageO
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.metrics.duplex_frame_timing import log_audio_emit_event
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -482,6 +483,13 @@ class ModelChannel:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context()
         for model_result in self._ctx.plugin.data_plane.project(result, context=context):
+            log_audio_emit_event(
+                session.session_id,
+                session.epoch,
+                request_id,
+                model_result,
+                session.capabilities.chunk_period_ms,
+            )
             close_reason_for_result, did_emit = await self._send_one_model_output_event(
                 model_result,
                 expected_epoch=expected_epoch,
