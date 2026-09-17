@@ -95,9 +95,4 @@ else
     exit_code=$?
 fi
 
-if [[ ${exit_code} -eq 5 && "${VLLM_CI_ALLOW_NO_TESTS:-0}" == "1" ]]; then
-    echo "Pytest collected no tests; VLLM_CI_ALLOW_NO_TESTS=1, treating exit code 5 as success."
-    exit 0
-fi
-
 exit "${exit_code}"

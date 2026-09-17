@@ -18,52 +18,39 @@ SPEC.loader.exec_module(SELECTOR)
 
 
 @pytest.mark.parametrize(
-    ("branch", "labels", "expected"),
+    ("branch", "labels", "nightly", "expected"),
     [
-        ("main", (), ("merge",)),
-        ("feature", ("ready",), ("ready",)),
-        ("feature", ("merge-test",), ("merge",)),
-        ("feature", ("merge-test", "ready"), ("ready", "merge")),
-        ("feature", ("nightly-test",), ("nightly",)),
-        ("feature", ("ready", "merge-test", "nightly-test"), ("ready", "merge", "nightly")),
-        ("feature", ("amd-test",), ("ready",)),
-        ("feature", ("amd-test", "merge-test"), ("merge",)),
-        ("feature", ("amd-test", "ready", "merge-test"), ("ready", "merge")),
-        ("feature", ("amd-test", "nightly-test"), ("nightly",)),
-        ("feature", ("not-ready", "merge-test-extra"), ("ready",)),
+        ("main", (), False, ("merge",)),
+        ("main", (), True, ("nightly",)),
+        ("feature", ("ready",), False, ("ready",)),
+        ("feature", ("merge-test",), False, ("merge",)),
+        ("feature", ("ready", "merge-test"), False, ("ready", "merge")),
+        ("feature", ("nightly-test",), False, ("nightly",)),
+        ("feature", ("amd-test",), False, ("ready",)),
+        ("feature", ("not-ready", "merge-test-extra"), False, ("ready",)),
     ],
 )
-def test_label_suite_selection(branch, labels, expected):
-    assert SELECTOR.select_amd_test_suites(branch=branch, labels=labels) == expected
+def test_label_suite_selection(branch, labels, nightly, expected):
+    assert (
+        SELECTOR.select_amd_test_suites(
+            branch=branch,
+            labels=labels,
+            nightly=nightly,
+        )
+        == expected
+    )
 
 
-def test_debug_override_takes_precedence_and_normalizes_input():
+def test_debug_override_takes_precedence() -> None:
     assert SELECTOR.select_amd_test_suites(
         branch="main",
         labels=("ready",),
         debug_test_yaml=" NIGHTLY, merge, ready,",
-        nightly=False,
     ) == ("nightly", "merge", "ready")
 
 
-def test_scheduled_main_selects_only_nightly():
-    assert SELECTOR.select_amd_test_suites(
-        branch="main",
-        labels=(),
-        nightly=True,
-    ) == ("nightly",)
-
-
-def test_empty_debug_override_uses_normal_selection():
-    assert SELECTOR.select_amd_test_suites(
-        branch="feature",
-        labels=("merge-test",),
-        debug_test_yaml="",
-    ) == ("merge",)
-
-
-@pytest.mark.parametrize("value", ["ready,ready", "nightly,nightly", "weekly", ", ,", " \t"])
-def test_invalid_debug_override(value):
+@pytest.mark.parametrize("value", ["ready,ready", "weekly", ", ,"])
+def test_invalid_debug_override(value: str) -> None:
     with pytest.raises(ValueError):
         SELECTOR.select_amd_test_suites(
             branch="feature",

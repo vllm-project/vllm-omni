@@ -67,31 +67,6 @@ env:
 {% endfor %}
 {% endif %}
 steps:
-  - group: "AMD Tests"
-    depends_on: ~
-    steps:
-      - label: "AMD: :docker: build image"
-        depends_on: ~
-        soft_fail: false
-        commands:
-          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --target test --build-arg ARG_PYTORCH_ROCM_ARCH=gfx942 --progress plain ."
-          - "docker push {{ docker_image_amd }}"
-        key: "amd-build"
-        env:
-          DOCKER_BUILDKIT: "1"
-        retry:
-          automatic:
-            - exit_status: -1  # Agent was lost
-              limit: 2
-            - exit_status: -10  # Agent was lost
-              limit: 2
-            - exit_status: 128  # Git connectivity issues
-              limit: 2
-            - exit_status: 1  # Machine occasionally fail
-              limit: 1
-        agents:
-          queue: amd-cpu
-
 {% for step_group in steps %}
 {% if step_group.group %}
   - group: "{{ step_group.group }}"
@@ -102,7 +77,7 @@ steps:
 {% for step in step_group.steps %}
 {% if step.mirror_hardwares and mirror_hw in step.mirror_hardwares %}
       - label: "{{ step.agent_pool }}: {{ step.label }}"
-        depends_on: amd-build
+        depends_on: image-build
         agents:
           {% if step.agent_pool %}
           queue: amd_{{ step.agent_pool }}
@@ -170,7 +145,7 @@ steps:
 {% elif step_group.mirror_hardwares and mirror_hw in step_group.mirror_hardwares %}
 {% set step = step_group %}
   - label: "{{ step.agent_pool }}: {{ step.label }}"
-    depends_on: amd-build
+    depends_on: image-build
     agents:
       {% if step.agent_pool %}
       queue: amd_{{ step.agent_pool }}
