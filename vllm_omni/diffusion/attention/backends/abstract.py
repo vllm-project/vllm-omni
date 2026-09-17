@@ -243,6 +243,10 @@ class AttentionMetadata:
     # not advertise supports_packed_mask_free ignore it.
     packed_padding: PackedPaddingMetadata | None = None
 
+    # Producer-known padding state: False certifies every attn_mask entry is True.
+    # None requires backend detection. Discard this hint if the mask changes.
+    attn_mask_has_padding: bool | None = None
+
 
 T = TypeVar("T", bound=AttentionMetadata)
 

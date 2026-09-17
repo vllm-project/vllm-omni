@@ -409,6 +409,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        attn_mask_has_padding = attn_metadata.attn_mask_has_padding if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
         extra = attn_metadata.extra if attn_metadata is not None else {}
 
@@ -456,7 +457,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 max_seqlen_k=extra["max_seqlen_k"],
             )
 
-        if attention_mask is not None and torch.any(~attention_mask):
+        if attention_mask is not None and attn_mask_has_padding is not False and torch.any(~attention_mask):
             self._warn_fa_deterministic_non_dense("masked-varlen")
             return self._forward_varlen_masked(
                 query,
