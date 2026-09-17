@@ -10,9 +10,10 @@ import time
 import types
 
 import pytest
+from omegaconf import OmegaConf
 
 from vllm_omni.diffusion.data import AttentionConfig
-from vllm_omni.engine import async_omni_engine as async_omni_engine_module
+from vllm_omni.engine import omni_engine_base as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
@@ -188,7 +189,7 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
 
 
 def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
+    import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
     engine.stage_configs = [types.SimpleNamespace()]
@@ -1829,3 +1830,25 @@ def test_port_from_zmq_address_parsing():
     assert _port_from_zmq_address(None) is None
     assert _port_from_zmq_address("ipc:///tmp/sock") is None
     assert _port_from_zmq_address("tcp://host:not-a-port") is None
+
+
+@pytest.mark.parametrize(
+    "stage_modes,expected", [([False, True, True], True), ([False, False], False), ([True, False], True)]
+)
+def test_engine_async_chunk_includes_downstream_stages(monkeypatch, stage_modes, expected):
+    engine = object.__new__(AsyncOmniEngine)
+    stages = [OmegaConf.create({"engine_args": {"async_chunk": mode}}) for mode in stage_modes]
+    monkeypatch.setattr(async_omni_engine_module.StageConfigFactory, "get_pipeline_config", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "_resolve_stage_configs", lambda *a, **k: (None, stages))
+    monkeypatch.setattr(engine, "_set_pipeline_runtime_config", lambda *a: None)
+
+    class ConfigResolvedError(Exception):
+        pass
+
+    def stop_before_queues(*args, **kwargs):
+        raise ConfigResolvedError
+
+    monkeypatch.setattr(async_omni_engine_module.janus, "Queue", stop_before_queues)
+    with pytest.raises(ConfigResolvedError):
+        engine.__init__("test-model")
+    assert engine.async_chunk is expected

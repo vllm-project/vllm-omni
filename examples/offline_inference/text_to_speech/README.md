@@ -16,9 +16,10 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | AuK | `tencent/AuK`, `tencent/AuK-Flash` (assembled with `tools/prepare_auk_checkpoint.py`) | 2 (thinker encoder + DiT) | ✓ | — | instruction-driven editing, enhancement, separation; no example script (use `vllm_omni.model_extras.auk`) | 24 kHz |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
+| Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
-| Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | — (serving WIP) | zero-shot | 22.05 kHz |
+| Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning later) | ✓ (online) | zero-shot | 22.05 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | 2 (AR + audio VAE) | ✓ | ✓ | style / IP / dialect / TTA / podcast | 44.1 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
@@ -166,7 +167,7 @@ python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
 ```
 
 ### Architecture
-```
+```text
 Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24 kHz)
         (Llama-based)    (32k vocab)      (Flow Matching)
 ```
@@ -490,8 +491,8 @@ Not yet — PR1 is zero-shot only (the learned `null_prefix` default voice). Ref
 ### Notes
 - Output: 22.05 kHz mono WAV.
 - First run downloads two checkpoints, not one: the model itself, and the NanoCodec decoder it names in `codec_id` (`nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps` by default). Both are fetched automatically; expect the first startup to be correspondingly slower.
-- Offline only for now; the `/v1/audio/speech` adapter is a follow-up PR.
-- Deploy config: `vllm_omni/deploy/gepard.yaml` (the example's default; copy it and pass `--deploy-config` to change it).
+- Offline and online: `examples/offline_inference/text_to_speech/gepard/end2end.py` and `/v1/audio/speech` (see the [online Gepard section](../../online_serving/text_to_speech/README.md#gepard-10)).
+- Deploy config: `vllm_omni/deploy/gepard.yaml` (the example's default; copy it and pass `--deploy-config` to change it). Online serving **must** pass `--deploy-config vllm_omni/deploy/gepard.yaml` because the checkpoint self-identifies as `qwen3_5_text`.
 - Generation length and reproducibility are stage settings, not script flags. One output token is one audio frame, so `max_tokens` in the YAML is the frame budget; `seed` makes the in-model 32-head sampling reproducible. The script deliberately passes no `SamplingParams`: one supplied by a caller replaces the stage defaults wholesale rather than merging, which would drop the pipeline's stop token and run every request to `max_tokens`.
 - Text length: short texts are repeated internally to match the training layout (the checkpoint's `text_repetition` block); the upper bound is the stage's `max_model_len`, enforced by the engine. Empty text is rejected rather than voiced.
 - `VLLM_GEPARD_GREEDY=1` swaps the 32-head Gumbel-max sampling for argmax, for reproducible comparisons that do not depend on a seed.
@@ -662,6 +663,37 @@ python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
 Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 
 ### Notes
+
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+---
+
+## Breeze-TTS-2
+
+Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder → bundled Qwen3-TTS codec) at 24 kHz mono. The prompt builder picks one of four templates automatically: plain, voice design (`--instruction`), clone (`--ref-audio` + `--ref-text`), or voice direction (reference + `--instruction`).
+
+### Quick start
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --model BreezeBlue/Breeze-TTS-2 \
+    --text "Hello, this is Breeze TTS 2 running on vLLM Omni."
+```
+
+### Voice direction
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --text "We need to discuss what happened last night." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "The exact transcript of the reference audio." \
+    --instruction "Speak slowly with a restrained, serious tone."
+```
+
+### Notes
+
+- Output: 24 kHz mono WAV; `--max-new-tokens` caps generated frames (80 ms each).
+- Speaker tags `--voice S0`..`S9` (default `S0`) select the timbre in non-reference modes; with `--ref-audio` the timbre comes from the reference clip.
+- Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.

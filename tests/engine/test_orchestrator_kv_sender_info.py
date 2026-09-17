@@ -414,3 +414,67 @@ def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
 
     assert all(isinstance(request, OmniEngineCoreRequest) for request in submitted.values())
     assert {key: request.payload_sender_info for key, request in submitted.items()} == endpoints
+
+
+@pytest.mark.asyncio
+async def test_async_pipeline_defers_sync_stage_until_audio_finishes(mocker):
+    from vllm import PoolingParams, RequestOutput
+    from vllm.config import VllmConfig
+
+    from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.engine import OmniEngineCoreRequest
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = None
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._duplex_output_decision = lambda *args: None
+    orchestrator._is_duplex_session_request = lambda state: False
+    orchestrator._forward_to_next_stage = mocker.AsyncMock()
+    orchestrator._cleanup_request_ids = mocker.AsyncMock()
+    # A sender stage stands in for Code2Wav, whose audio is also a final output.
+    audio_pool = _build_sender_pool(0, {})
+    audio_pool.stage_client.final_output = True
+    aligner = _DummyDiffusionStage()
+    aligner_pool = StagePool(
+        1,
+        aligner,
+        stage_vllm_config=mocker.Mock(
+            spec=VllmConfig, model_config=mocker.Mock(spec=OmniModelConfig, async_chunk=False)
+        ),
+    )
+    orchestrator.stage_pools = [audio_pool, aligner_pool]
+    state = OrchestratorRequestState(
+        request_id="aligned",
+        prompt={"additional_information": {"text": ["Hello world"]}},
+        sampling_params_list=[SamplingParams(), PoolingParams(task="token_classify")],
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+    )
+
+    await orchestrator._prewarm_async_chunk_stages(
+        "aligned", mocker.Mock(spec=OmniEngineCoreRequest, prompt_token_ids=[1, 2]), state
+    )
+    assert aligner.calls == []
+    assert 1 not in state.stage_submit_ts
+
+    output = RequestOutput("aligned", None, [1, 2], None, [], False)
+    await orchestrator._route_output(0, 0, output, state, None)
+    orchestrator._forward_to_next_stage.assert_not_awaited()
+    output.finished = True
+    await orchestrator._route_output(0, 0, output, state, None)
+    orchestrator._forward_to_next_stage.assert_awaited_once_with(
+        "aligned",
+        0,
+        output,
+        state,
+        src_replica_id=0,
+        is_streaming_session=False,
+        is_final_update=False,
+    )
+    orchestrator._cleanup_request_ids.assert_not_awaited()
+    await orchestrator._route_output(1, 0, output, state, None)
+    orchestrator._cleanup_request_ids.assert_awaited_once()
+    messages = [orchestrator.output_async_queue.get_nowait() for _ in range(3)]
+    assert [message.finished for message in messages] == [False, False, True]

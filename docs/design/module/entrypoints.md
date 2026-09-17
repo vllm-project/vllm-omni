@@ -19,7 +19,9 @@ required_reviewers:
 primary_code_paths:
   - vllm_omni/entrypoints/omni.py
   - vllm_omni/entrypoints/async_omni.py
+  - vllm_omni/entrypoints/async_omni_base.py
   - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/entrypoints/duplex_omni.py
   - vllm_omni/entrypoints/cli/**
   - vllm_omni/entrypoints/openai/**
   - vllm_omni/entrypoints/openpi/**
@@ -27,14 +29,13 @@ primary_code_paths:
   - vllm_omni/entrypoints/stage_utils.py
   - vllm_omni/entrypoints/utils.py
   - vllm_omni/entrypoints/duplex/**
-  - vllm_omni/entrypoints/duplex_request_client.py
   - vllm_omni/clients/**
 primary_path_exceptions:
   - path: vllm_omni/entrypoints/openai/errors.py
     owner: error_contracts.md
   - path: vllm_omni/entrypoints/duplex/**
     owner: ../fullduplex.md
-  - path: vllm_omni/entrypoints/duplex_request_client.py
+  - path: vllm_omni/entrypoints/duplex_omni.py
     owner: ../fullduplex.md
   - path: vllm_omni/clients/**
     owner: ../fullduplex.md
@@ -42,7 +43,9 @@ related_code_paths:
   - vllm_omni/errors.py
   - vllm_omni/inputs/**
   - vllm_omni/outputs/**
+  - vllm_omni/engine/omni_engine_base.py
   - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/engine/duplex_omni_engine.py
   - vllm_omni/config/**
   - vllm_omni/deploy/**
 depends_on:
@@ -53,7 +56,9 @@ validation_paths:
   - tests/entrypoints/test_omni_entrypoints.py
   - tests/entrypoints/test_async_omni.py
   - tests/entrypoints/test_async_omni_pause_sleep_routing.py
-  - tests/entrypoints/test_async_omni_duplex.py
+  - tests/entrypoints/test_duplex_omni.py
+  - tests/entrypoints/duplex/**
+  - tests/entrypoints/openai_api/test_duplex_api_server.py
   - tests/entrypoints/test_serve.py
   - tests/entrypoints/test_stream_finish_reason.py
   - tests/entrypoints/openai/**

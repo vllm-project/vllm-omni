@@ -65,9 +65,11 @@ EXPECTED_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "glm_tts",
+    "breeze_tts_2",
     "step_audio2",
     "indextts2",
     "indextts2_5",
+    "gepard",
     "dots_tts",
 }
 
@@ -140,6 +142,17 @@ def _build_moss_tts_request(adapter_cls, mocker, *, request_seed):
             has_inline_ref_audio=False,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("adapter_cls", "expect_accumulate"),
+    [(MossTTSAdapter, False), (MossTTSNanoAdapter, True)],
+)
+def test_moss_tts_accumulate_nonstreaming_follows_adapter_flag(adapter_cls, expect_accumulate, mocker):
+    prepared = _build_moss_tts_request(adapter_cls, mocker, request_seed=7)
+
+    assert adapter_cls.accumulate_nonstreaming is expect_accumulate
+    assert prepared.output_policy.accumulate_nonstreaming is expect_accumulate
 
 
 # Full-family coverage pins the adapter contract; only Nano consumes this seed end to end today.

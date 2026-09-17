@@ -231,6 +231,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving._tts_model_type = "higgs_audio_v3"
     serving._get_tts_adapter = lambda: Adapter()
     serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
+    serving._speech_output_policies = {}
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
     stage0_params = stage_sampling_params[0]

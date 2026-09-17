@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 
 import vllm_omni.config.pipeline_registry  # noqa: F401  (populate registry)
@@ -69,3 +72,25 @@ def test_inject_noop_without_forced_aligner():
 
     assert ext_pipeline is pipeline
     assert len(ext_deploy.stages) == 0
+
+
+@pytest.mark.parametrize("async_chunk", [True, False])
+@pytest.mark.parametrize("cli_async_chunk", [None, True, False])
+def test_aligner_uses_completed_audio_without_disabling_upstream_chunks(async_chunk, cli_async_chunk):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+    deploy = DeployConfig(async_chunk=async_chunk)
+    resolution = StageConfigFactory._resolve_legacy_from_registry(
+        pipeline,
+        {"forced_aligner": "/models/Qwen3-ForcedAligner-0.6B", "async_chunk": cli_async_chunk},
+        user_deploy_config=deploy,
+    )
+    stages = [stage.to_omegaconf() for stage in resolution.stage_configs]
+    expected_async = async_chunk if cli_async_chunk is None else cli_async_chunk
+    assert len(stages) == 3
+    assert [stage.engine_args.async_chunk for stage in stages] == [expected_async, expected_async, False]
+    assert stages[2].custom_process_input_func.endswith("code2wav2aligner")
+    assert stages[2].engine_args.runner == "pooling"
+    assert len(pipeline.stages) == 2
+    assert deploy.stages == []

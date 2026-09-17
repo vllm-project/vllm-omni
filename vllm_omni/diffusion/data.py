@@ -541,6 +541,8 @@ class DiffusionCacheConfig:
                     scm_steps_mask_policy, scm_steps_policy
         - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
                     mag_ratios, mag_calibrate
+        - SeaCache: sea_threshold, sea_residual_order,
+                    sea_max_consecutive_cached, sea_power_exp
         - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
                           velocity_skip_countdowns, step_cache_dit_min_history
 
@@ -559,6 +561,12 @@ class DiffusionCacheConfig:
     # None defers to the model-specific TeaCache default (0.2 fallback).
     rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
+
+    # SeaCache parameters [sea_cache only]
+    sea_threshold: float = 0.25
+    sea_residual_order: int = 1
+    sea_max_consecutive_cached: int = 2
+    sea_power_exp: float = 3.0
 
     # MagCache parameters [mag_cache only]
     # Default: 0.24 threshold for accumulated magnitude error
@@ -976,6 +984,7 @@ class OmniDiffusionConfig:
             "transformer": True,
             "vae": True,
             "text_encoder": True,
+            "vae_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -1629,6 +1638,18 @@ class OmniDiffusionConfig:
         return cls(**cls.normalize_init_kwargs(kwargs))
 
 
+DIFFUSION_REQUEST_LIFECYCLE_KEY = "_diffusion_request_lifecycle"
+DIFFUSION_REQUEST_STARTED = "started"
+
+
+def is_diffusion_request_started_output(output: Any) -> bool:
+    custom_output = getattr(output, "custom_output", None)
+    return (
+        isinstance(custom_output, dict)
+        and custom_output.get(DIFFUSION_REQUEST_LIFECYCLE_KEY) == DIFFUSION_REQUEST_STARTED
+    )
+
+
 @dataclass
 class DiffusionOutput:
     """
@@ -1676,6 +1697,9 @@ class DiffusionOutput:
     # the output is shipped across process boundaries (e.g. step-execution
     # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
+
+    # Internal control-plane event emitted on first scheduler admission.
+    request_started: bool = False
 
     # Typed video-media contract. Declared last so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
