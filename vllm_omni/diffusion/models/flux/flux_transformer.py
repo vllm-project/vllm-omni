@@ -41,6 +41,7 @@ from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNormZeroSingle,
 )
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    QK_NORM_ROPE_TABLE_KEY,
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
@@ -55,8 +56,6 @@ logger = init_logger(__name__)
 # every size measured on H200 for this chain (see Flux.2), so fuse by default
 # and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
 _FUSED_MIN_TOKENS = 0
-# joint_attention_kwargs key carrying the per-forward packed RoPE table.
-_QK_NORM_ROPE_TABLE_KEY = "qk_norm_rope_table"
 
 
 class ColumnParallelApproxGELU(nn.Module):
@@ -242,7 +241,7 @@ class FluxAttention(torch.nn.Module):
         # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
         # forward supplied the packed table and the CUDA kernel accepts the
         # geometry; otherwise the original eager chain.
-        qk_norm_rope_table = kwargs.get(_QK_NORM_ROPE_TABLE_KEY)
+        qk_norm_rope_table = kwargs.get(QK_NORM_ROPE_TABLE_KEY)
         use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
             query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
         )
@@ -547,7 +546,7 @@ def _with_qk_norm_rope_table(
     )
     if table is None:
         return joint_attention_kwargs
-    return {**(joint_attention_kwargs or {}), _QK_NORM_ROPE_TABLE_KEY: table}
+    return {**(joint_attention_kwargs or {}), QK_NORM_ROPE_TABLE_KEY: table}
 
 
 class FluxTransformer2DModel(nn.Module):

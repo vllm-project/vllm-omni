@@ -54,14 +54,14 @@ def test_table_skipped_on_cpu(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_table_gate_and_kwargs(monkeypatch):
-    from vllm_omni.diffusion.models.flux.flux_transformer import _QK_NORM_ROPE_TABLE_KEY, _with_qk_norm_rope_table
+    from vllm_omni.diffusion.models.flux.flux_transformer import QK_NORM_ROPE_TABLE_KEY, _with_qk_norm_rope_table
 
     cos, sin = torch.randn(2, 40, 64, device="cuda"), torch.randn(2, 40, 64, device="cuda")
     x = torch.zeros(2, 40, _DIM, dtype=torch.bfloat16, device="cuda")
     monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
     kw = _with_qk_norm_rope_table({"other": 1}, (cos[0], sin[0]), x)
-    assert kw["other"] == 1 and kw[_QK_NORM_ROPE_TABLE_KEY].shape == (80, _HEAD_DIM)
-    assert kw[_QK_NORM_ROPE_TABLE_KEY].dtype == torch.bfloat16
+    assert kw["other"] == 1 and kw[QK_NORM_ROPE_TABLE_KEY].shape == (80, _HEAD_DIM)
+    assert kw[QK_NORM_ROPE_TABLE_KEY].dtype == torch.bfloat16
     monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "1000000")
     assert _with_qk_norm_rope_table(None, (cos[0], sin[0]), x) is None
     assert _with_qk_norm_rope_table(None, (cos[0], sin[0]), x.half()) is None  # non-bf16 activations
@@ -72,7 +72,7 @@ def test_table_gate_and_kwargs(monkeypatch):
 @pytest.mark.parametrize("double_stream", [True, False])
 def test_flux_attention_fused_matches_eager(_dist_env, double_stream):
     from vllm_omni.diffusion.models.flux.flux_transformer import (
-        _QK_NORM_ROPE_TABLE_KEY,
+        QK_NORM_ROPE_TABLE_KEY,
         FluxAttention,
         pack_qk_norm_rope_table,
     )
@@ -101,7 +101,7 @@ def test_flux_attention_fused_matches_eager(_dist_env, double_stream):
     with torch.no_grad():
         eager = attn(hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin))
         fused = attn(
-            hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin), **{_QK_NORM_ROPE_TABLE_KEY: table}
+            hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin), **{QK_NORM_ROPE_TABLE_KEY: table}
         )
     for e, f in zip(eager if double_stream else (eager,), fused if double_stream else (fused,)):
         torch.testing.assert_close(f, e, atol=0.05, rtol=0.05)
