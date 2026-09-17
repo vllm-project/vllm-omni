@@ -46,7 +46,7 @@ def _rope(seq_len: int):
 @pytest.mark.parametrize("double_stream", [True, False])
 def test_ovis_attention_fused_matches_eager(_dist_env, double_stream):
     from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import (
-        _QK_NORM_ROPE_TABLE_KEY,
+        QK_NORM_ROPE_TABLE_KEY,
         OvisImageAttention,
         pack_qk_norm_rope_table,
     )
@@ -75,7 +75,7 @@ def test_ovis_attention_fused_matches_eager(_dist_env, double_stream):
     with torch.no_grad():
         eager = attn(hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin))
         fused = attn(
-            hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin), **{_QK_NORM_ROPE_TABLE_KEY: table}
+            hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin), **{QK_NORM_ROPE_TABLE_KEY: table}
         )
     for e, f in zip(eager if double_stream else (eager,), fused if double_stream else (fused,)):
         torch.testing.assert_close(f, e, atol=0.05, rtol=0.05)

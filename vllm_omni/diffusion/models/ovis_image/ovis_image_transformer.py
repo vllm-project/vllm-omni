@@ -33,6 +33,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    QK_NORM_ROPE_TABLE_KEY,
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
@@ -47,8 +48,6 @@ logger = init_logger(__name__)
 # fused path won at every size measured on H200 for this chain, see Flux.2)
 # and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
 _FUSED_MIN_TOKENS = 0
-# joint_attention_kwargs key carrying the per-forward packed RoPE table.
-_QK_NORM_ROPE_TABLE_KEY = "qk_norm_rope_table"
 
 
 class OvisImageAttention(nn.Module):
@@ -137,7 +136,7 @@ class OvisImageAttention(nn.Module):
         # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
         # forward supplied the packed table and the CUDA kernel accepts the
         # geometry; otherwise the original eager chain.
-        qk_norm_rope_table = kwargs.get(_QK_NORM_ROPE_TABLE_KEY)
+        qk_norm_rope_table = kwargs.get(QK_NORM_ROPE_TABLE_KEY)
         use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
             query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
         )
@@ -543,7 +542,7 @@ class OvisImageTransformer2DModel(nn.Module):
             min_tokens=_FUSED_MIN_TOKENS,
         )
         if qk_norm_rope_table is not None:
-            joint_attention_kwargs = {_QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
+            joint_attention_kwargs = {QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
