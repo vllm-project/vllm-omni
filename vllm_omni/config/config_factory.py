@@ -532,7 +532,12 @@ class StageConfigFactory:
             return None
         from vllm_omni.config.composable_parallel import apply_strategy_specs
 
-        applied = apply_strategy_specs(stages, strategy_specs)
+        # Defer the pre-spawn device check to _reconcile_strategy_with_cli:
+        # per-stage CLI overrides (--stage-overrides) are merged only after
+        # this overlay, so validating here would reject the documented flow
+        # of supplying devices via --stage-overrides on the default deploy.
+        # Reconciliation re-checks with the effective post-CLI values.
+        applied = apply_strategy_specs(stages, strategy_specs, validate_devices=False)
         if applied.omni_lb_policy is not None:
             logger.info(
                 "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "
