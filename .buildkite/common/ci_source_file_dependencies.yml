@@ -296,7 +296,7 @@ source_file_dependencies:
 
   diffusion_wan22_perf:
     - *wan22
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
 
   diffusion_wan22_reliability:
@@ -322,7 +322,7 @@ source_file_dependencies:
 
   diffusion_cosmos3_perf:
     - *cosmos3
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
 
   diffusion_qwen_image_function:
@@ -395,7 +395,7 @@ source_file_dependencies:
 
   diffusion_minimax_h3_perf:
     - *minimax_h3
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
 
   diffusion_hunyuan_video_function:
@@ -409,7 +409,7 @@ source_file_dependencies:
 
   diffusion_hunyuan_video_perf:
     - *hunyuan_video
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
     - tests/dfx/perf/tests/test_hunyuanvideo15_i2v_vllm_omni.json
 
@@ -437,7 +437,7 @@ source_file_dependencies:
 
   diffusion_lingbot_perf:
     - *lingbot_video
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
+    - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_lingbot_video_vllm_omni.json
 
 

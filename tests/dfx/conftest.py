@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
 import re
@@ -84,17 +87,20 @@ def resolve_pytest_marks(mark_field: Any) -> list[pytest.MarkDecorator]:
     raise ValueError(f"mark must be a list; got {type(mark_field).__name__}")
 
 
-def _mark_names(mark_field: Any) -> set[str]:
-    if isinstance(mark_field, list):
-        return {str(item) for item in mark_field if isinstance(item, str)}
-    return set()
-
-
 def is_diffusion_perf_config(cfg: dict[str, Any]) -> bool:
-    """True for perf JSON cases intended for ``run_diffusion_benchmark.py``."""
-    if cfg.get("server_type") is not None:
-        return True
-    return "diffusion" in _mark_names(cfg.get("mark"))
+    """True for perf JSON cases intended for ``run_diffusion_benchmark.py``.
+
+    Schema split (not marks / endpoints):
+
+    - ``benchmark_params[].dataset`` → diffusion client (``run_diffusion_benchmark.py``)
+    - ``benchmark_params[].dataset_name`` → ``vllm bench serve --omni`` (``run_benchmark.py``)
+    """
+    for params in cfg.get("benchmark_params") or []:
+        if not isinstance(params, dict):
+            continue
+        if "dataset" in params and "dataset_name" not in params:
+            return True
+    return False
 
 
 def _marks_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[pytest.MarkDecorator]]:

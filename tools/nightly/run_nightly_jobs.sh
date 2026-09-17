@@ -41,7 +41,7 @@
 #     From repo root: pytest -sv -m "<markers> and local_model" (markers from MODEL_TYPE: omni, tts,
 #     diffusion; all → "(omni or tts or diffusion) and local_model"). Not filtered by nightly YAML.
 #     LABEL_SUBSTR: if set, restrict to tests/**/test_*.py basenames and tests/dfx/perf/tests/*.json
-#                   whose filename contains the substring (benchmark runner chosen by JSON family).
+#                   whose filename contains the substring (benchmark runner via is_diffusion_perf_config).
 #
 #   stability (when included in TEST_TYPE):
 #     From repo root: pytest -s -v --run-level full_model -m "<mark>" tests/dfx/stability/scripts/...
@@ -686,8 +686,19 @@ def perf_json_model_family(json_basename: str) -> str:
 
 
 def perf_json_runner(json_basename: str) -> Path:
-    if perf_json_model_family(json_basename) in ("omni", "tts"):
+    """Pick benchmark runner from JSON schema (``dataset`` vs ``dataset_name``)."""
+    json_path = REPO_ROOT / PERF_TESTS_REL / json_basename
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from tests.dfx.conftest import is_diffusion_perf_config, load_configs
+
+        configs = load_configs(str(json_path))
+        if configs and any(is_diffusion_perf_config(cfg) for cfg in configs):
+            return RUN_DIFFUSION_BENCHMARK_REL
         return RUN_BENCHMARK_REL
+    except Exception as exc:
+        print(f"# warn: could not classify {json_basename}: {exc}", file=sys.stderr)
     return RUN_DIFFUSION_BENCHMARK_REL
 
 

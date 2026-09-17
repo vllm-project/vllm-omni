@@ -5,7 +5,10 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": ["H100", "B200"]
+            "cuda": [
+              "H100",
+              "B200"
+            ]
           },
           "num_cards": 1
         }
@@ -14,7 +17,6 @@
       "diffusion"
     ],
     "description": "Single-device baseline",
-    "server_type": "vllm-omni",
     "server_params": {
       "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       "serve_args": {
@@ -24,28 +26,36 @@
     "benchmark_params": [
       {
         "name": "832x480_frames81_steps4",
-        "dataset": "random",
-        "task": "i2v",
-        "num-prompts": 10,
-        "max-concurrency": 1,
-        "num-input-images": 1,
-        "seed": 42,
-        "enable-negative-prompt": true,
-        "random-request-config": [
-          {
-            "width": 832,
-            "height": 480,
-            "num_inference_steps": 4,
-            "num_frames": 81,
-            "fps": 16,
-            "weight": 1
-          }
-        ],
+        "dataset_name": "random-mm",
+        "endpoint": "/v1/videos",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 64,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(480, 832, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 832,
+          "height": 480,
+          "num_inference_steps": 4,
+          "num_frames": 81,
+          "fps": 16,
+          "seed": 42,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
         "baseline": {
           "H100": {
-            "throughput_qps": 0.0361,
-            "latency_mean": 27.6206,
-            "peak_memory_mb_mean": 80548.0
+            "request_throughput": 0.0361,
+            "mean_e2el_ms": 27620.6,
+            "mean_peak_memory_mb": 80548.0
           }
         }
       }
@@ -57,7 +67,10 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": ["H100", "B200"],
+            "cuda": [
+              "H100",
+              "B200"
+            ],
             "npu": "A3"
           },
           "num_cards": 2
@@ -67,7 +80,6 @@
       "diffusion"
     ],
     "description": "USP=2 + VAE patch parallel=2 + HSDP + VAE slicing",
-    "server_type": "vllm-omni",
     "server_params": {
       "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       "serve_args": {
@@ -81,55 +93,71 @@
     "benchmark_params": [
       {
         "name": "832x480_frames81_steps4",
-        "dataset": "random",
-        "task": "i2v",
-        "num-prompts": 10,
-        "max-concurrency": 1,
-        "num-input-images": 1,
-        "seed": 42,
-        "enable-negative-prompt": true,
-        "random-request-config": [
-          {
-            "width": 832,
-            "height": 480,
-            "num_inference_steps": 4,
-            "num_frames": 81,
-            "fps": 16,
-            "weight": 1
-          }
-        ],
+        "dataset_name": "random-mm",
+        "endpoint": "/v1/videos",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 64,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(480, 832, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 832,
+          "height": 480,
+          "num_inference_steps": 4,
+          "num_frames": 81,
+          "fps": 16,
+          "seed": 42,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
         "baseline": {
           "H100": {
-            "throughput_qps": 0.05263,
-            "latency_mean": 18.9415,
-            "peak_memory_mb_mean": 50053.7
+            "request_throughput": 0.05263,
+            "mean_e2el_ms": 18941.5,
+            "mean_peak_memory_mb": 50053.7
           }
         }
       },
       {
         "name": "1280x720_frames121_steps4",
-        "dataset": "random",
-        "task": "i2v",
-        "num-prompts": 10,
-        "max-concurrency": 1,
-        "num-input-images": 1,
-        "seed": 42,
-        "enable-negative-prompt": true,
-        "random-request-config": [
-          {
-            "width": 1280,
-            "height": 720,
-            "num_inference_steps": 4,
-            "num_frames": 121,
-            "fps": 16,
-            "weight": 1
-          }
-        ],
+        "dataset_name": "random-mm",
+        "endpoint": "/v1/videos",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 64,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(720, 1280, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 1280,
+          "height": 720,
+          "num_inference_steps": 4,
+          "num_frames": 121,
+          "fps": 16,
+          "seed": 42,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
         "baseline": {
           "H100": {
-            "throughput_qps": 0.009595,
-            "latency_mean": 104.1058,
-            "peak_memory_mb_mean": 59718.0
+            "request_throughput": 0.009595,
+            "mean_e2el_ms": 104105.8,
+            "mean_peak_memory_mb": 59718.0
           }
         }
       }
