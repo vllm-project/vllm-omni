@@ -25,10 +25,10 @@ matching the reference implementation frame for frame on the golden replays used
 as the acceptance gate.
 
 PersonaPlex is the first Moshi-class (pure-lockstep) model on the vLLM-Omni
-full-duplex serving stack: it plugs into the generic `/v1/duplex` handler
-through the standard plugin seams (`duplex_serving_adapter` /
-`duplex_runtime_extension` in its `pipeline.py`) with a model-specific
-package at `vllm_omni/model_executor/models/personaplex/duplex/`.
+unified full-duplex framework: its `pipeline.py` declares one
+`duplex_plugin` (`PersonaPlexDuplexPlugin`), and the model-specific package at
+`vllm_omni/model_executor/models/personaplex/duplex/` holds the plugin, the
+worker-side lockstep Stage 0 runtime and the 80 ms input framing.
 
 ## References
 
@@ -114,16 +114,18 @@ HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main ser
   --deploy-config vllm_omni/deploy/personaplex.yaml
 ```
 
-This exposes `WS /v1/duplex` (native duplex dialect) and
-`WS /v1/realtime?duplex=1` (OpenAI Realtime projection; client API and wire
-protocol in [`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md)).
-Voice and persona are set per session via `extra_body`.
+This exposes `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`): the OpenAI
+Realtime session protocol, client API and wire vocabulary in
+[`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md).
+Voice (`voice`, a bundled `.pt` basename) and persona (`instructions`) are set
+in `session.update`; the model takes no client commits and serves no
+`/v1/chat/completions` route.
 
 #### Verification
 
 ```bash
-# GPU-free contract tests (stage0 runtime + unified serving adapter)
-pytest tests/model_executor/models/personaplex/duplex/ -q
+# GPU-free contract tests (plugin, stage0 runtime, runner scenario)
+pytest tests/model_executor/models/personaplex/duplex/ tests/engine/duplex/test_session_runner_personaplex.py -q
 
 # GPU e2e: paced 24 kHz PCM over /v1/realtime?duplex=1, two concurrent
 # sessions, overflow admission, slot recycling, non-silent output

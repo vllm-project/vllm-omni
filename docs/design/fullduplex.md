@@ -172,7 +172,17 @@ vllm_omni/
 │           ├── lease.py             DuplexLeaseState (idle TTL, disconnect grace, resume generation)
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
 ├── config/stage_config.py           PipelineConfig.duplex_plugin; DuplexSessionRuntimeConfig
-├── model_executor/models/minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, ...)
+├── model_executor/
+│   ├── common/                      model-neutral helpers shared between model packages
+│   │   ├── request_outputs.py       RequestOutput / multimodal_output readers, cumulative-delta helpers
+│   │   ├── audio/pcm.py             pcm_f32le decode / count / materialise
+│   │   └── duplex/                  plugin building blocks (imported only from a model's duplex package)
+│   │       ├── payload.py           append-payload validation (format, rate, exact frame)
+│   │       ├── pcm_buffer.py        FixedFramePcmAppendBuffer: transactional fixed-frame PCM framing
+│   │       └── data_plane.py        CumulativeAudioTextDataPlane: cumulative stage output -> deltas
+│   └── models/
+│       ├── minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, stage0, ...)
+│       └── personaplex/duplex/plugin.py    PersonaPlexDuplexPlugin (+ capabilities, data_plane, input, stage0)
 └── clients/
     ├── duplex.py                    DuplexClientBase (ABC), DuplexClient (websocket), client-side events
     ├── inline_duplex.py             InlineDuplexClient (in-process, over DuplexOmni)
@@ -316,15 +326,31 @@ policy that used to be two separately configured objects:
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
 sampling defaults once the stage pools exist. Plugin hooks that may block
-(`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
-offloaded from the loop.
+(`prepare_runtime_config` fetching `ref_audio`, PersonaPlex reading its voice
+bundle) are awaited in `open()` and offloaded from the loop.
 
-The MiniCPM-o 4.5 plugin (`model_executor/models/minicpmo_4_5/duplex/plugin.py`)
-is the only integration in this framework version. PersonaPlex and Nemotron
-VoiceChat still carry their pre-framework duplex code (runtime extension plus
-serving adapter) and are therefore not served over this framework yet: their
-pipelines declare no `duplex_plugin`, so they run turn-based until the
-follow-up PRs port them (RFC vllm-omni#7181, PR 2/3).
+Three members have framework defaults so a plugin only overrides what is
+model-specific: `validate_client_extra_body` refuses the plugin's
+`private_runtime_config_keys`; `data_plane_context` builds the generic
+`DuplexDataPlaneContext`; `DefaultDuplexModelSessionState` implements the
+per-session flags and their transitions, leaving the plugin to supply the
+`audio_buffer`. The silence unit the runner appends to keep a model turn
+clocked is also the plugin's: `silence_unit_payload()` (built from
+`silence_continuation_samples` and `silence_continuation_sample_rate_hz`)
+goes through `plan_append` like client audio, and the startup warmup sends the
+same unit. A model that takes no client commits (`supports_client_commit`
+off) auto-responds without `extra_body.auto_response`.
+
+Two integrations exist: MiniCPM-o 4.5
+(`model_executor/models/minicpmo_4_5/duplex/plugin.py`, 1 s units at 16 kHz,
+model-owned listen decision) and PersonaPlex
+(`model_executor/models/personaplex/duplex/plugin.py`, 80 ms lockstep frames
+at 24 kHz, always-clocked; see [PersonaPlex](fullduplex-personaplex.md)).
+Model code the two need alike lives in `model_executor/common/` (PCM payload
+validation, a fixed-frame append buffer, request-output readers, a cumulative
+audio/text data plane). Nemotron VoiceChat still carries its pre-framework
+duplex code and runs turn-based until the follow-up PR ports it (RFC
+vllm-omni#7181, PR 4).
 
 ## Serving
 

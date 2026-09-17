@@ -80,13 +80,12 @@ class _FakeTalker:
         return torch.full((1, 4), value, device=device)
 
 
-def _duplex_info(*, seq: int, session_id: str = "session", incarnation: int = 1):
+def _duplex_info(*, seq: int, session_id: str = "session", epoch: int = 0):
     pcm = np.zeros(1920, dtype="<f4")
     return {
         "data_plane": True,
         "session_id": session_id,
-        "incarnation": incarnation,
-        "epoch": 0,
+        "epoch": epoch,
         "seq": seq,
         "payload": {
             "format": "pcm_f32le",
@@ -251,12 +250,12 @@ def _prepare_two_sessions(
 ) -> tuple[object, object, object, object]:
     first_1 = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
     second_1 = runtime.prepare_append(
-        _duplex_info(seq=1, session_id="other", incarnation=2),
+        _duplex_info(seq=1, session_id="other"),
         prompt_len=18,
     )
     first_2 = runtime.prepare_append(_duplex_info(seq=2), prompt_len=19)
     second_2 = runtime.prepare_append(
-        _duplex_info(seq=2, session_id="other", incarnation=2),
+        _duplex_info(seq=2, session_id="other"),
         prompt_len=19,
     )
     return first_1, second_1, first_2, second_2
@@ -281,7 +280,7 @@ def test_stage0_session_capacity_fails_before_codec_state_is_shared() -> None:
 
     with pytest.raises(RuntimeError, match="capacity 2"):
         runtime.prepare_append(
-            _duplex_info(seq=1, session_id="third", incarnation=3),
+            _duplex_info(seq=1, session_id="third"),
             prompt_len=18,
         )
 
@@ -292,12 +291,55 @@ def test_close_session_resets_and_reuses_released_codec() -> None:
     runtime = _runtime(first_codec, second_codec)
     _prepare_two_sessions(runtime)
 
-    runtime.close_session("session", 1)
+    runtime.close_session("session", 0)
 
     assert first_codec.reset_calls == 1
     assert second_codec.reset_calls == 0
     replacement = runtime.prepare_append(
-        _duplex_info(seq=1, session_id="replacement", incarnation=4),
+        _duplex_info(seq=1, session_id="replacement"),
         prompt_len=18,
     )
     assert replacement.user_codes[:, 0].tolist() == [3]
+
+
+def test_a_new_epoch_replays_the_prefill_and_recycles_the_codec() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req-e0")
+    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19, request_id="req-e0")
+
+    # A cancel advanced the fence: the next append is seq 1 of epoch 1 on a
+    # fresh Stage 0 request, so the voice/persona prefill is replayed and the
+    # earlier epoch's lockstep state is released first.
+    restarted = runtime.prepare_append(_duplex_info(seq=1, epoch=1), prompt_len=18, request_id="req-e1")
+
+    assert restarted.prefill_applied is True
+    assert restarted.prompt_offset == 0
+    assert restarted.user_codes.shape == (1, 8)
+    assert list(runtime.sessions) == [("session", 1)]
+    assert runtime.request_sessions == {"req-e1": ("session", 1)}
+    assert codec.reset_calls == 1
+    assert runtime.sessions[("session", 1)].codec is codec
+
+
+def test_a_late_finish_of_the_old_epoch_request_does_not_close_the_new_state() -> None:
+    runtime = _runtime(_FakeCodec())
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req-e0")
+    runtime.prepare_append(_duplex_info(seq=1, epoch=1), prompt_len=18, request_id="req-e1")
+
+    runtime.close_request("req-e0")
+
+    assert list(runtime.sessions) == [("session", 1)]
+    runtime.close_request("req-e1")
+    assert runtime.sessions == {}
+
+
+def test_stage0_capacity_counts_live_epochs_not_superseded_ones() -> None:
+    runtime = _runtime(_FakeCodec(), _FakeCodec())
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+
+    # Restarting one session must not need a third codec.
+    runtime.prepare_append(_duplex_info(seq=1, epoch=1), prompt_len=18)
+
+    assert sorted(runtime.sessions) == [("other", 0), ("session", 1)]

@@ -27,7 +27,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
-import pybase64 as base64
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
@@ -78,7 +77,6 @@ class ModelChannel:
     """Appends out to the model, events back from it, for one session."""
 
     # One MiniCPM model unit (1 s at 16 kHz) is the compatibility default.
-    _SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _RESPONSE_MAX_CONTINUATION_UNITS = 8
     _AUTO_RESPONSE_MAX_CONTINUATION_UNITS = 64
 
@@ -950,13 +948,8 @@ class ModelChannel:
     # ------------------------------------------------------------------ #
 
     def silence_unit_payload(self) -> dict[str, object]:
-        samples = int(self._ctx.plugin.silence_continuation_samples)
-        audio = (
-            self._SILENCE_UNIT_PAYLOAD_AUDIO
-            if samples == 16000
-            else base64.b64encode(bytes(samples * 4)).decode("ascii")
-        )
-        return {"type": "audio", "audio": audio, "format": "pcm_f32le", "sample_rate_hz": 16000}
+        """One silence unit in the model's own format: the plugin defines it (rate and length)."""
+        return dict(self._ctx.plugin.silence_unit_payload())
 
     def response_continuations_remaining(self, response_id: str) -> bool:
         model_state = self._ctx.model_state

@@ -72,10 +72,11 @@ does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
     `session.created.session.capabilities` is present before treating the
     connection as full duplex.
 
-**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`) is the only model
-served over this endpoint today. PersonaPlex and Nemotron VoiceChat still carry
-their pre-framework duplex code: their pipelines declare no `duplex_plugin`, so
-they run turn-based until the follow-up PRs port them to the plugin contract
+Two models are served over this endpoint today: **MiniCPM-o 4.5**
+(`vllm_omni/deploy/minicpmo_4_5.yaml`) and **PersonaPlex**
+(`vllm_omni/deploy/personaplex.yaml`). Nemotron VoiceChat still carries its
+pre-framework duplex code: its pipeline declares no `duplex_plugin`, so it runs
+turn-based until the follow-up PR ports it to the plugin contract
 (RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
 
 JoyVL is a separate HTTP interaction orchestrator and does not use these
@@ -102,6 +103,38 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
   --ref-audio reference_voice.wav \
   --output-dir /tmp/minicpmo-duplex
 ```
+
+## PersonaPlex Quick Start
+
+PersonaPlex (`nvidia/personaplex-7b-v1`, gated) is a pure-lockstep model: the
+client streams 24 kHz `pcm_f32le` continuously and the model speaks whenever it
+decides to, so there are no client commits and no `/v1/chat/completions`
+route. Start the duplex deployment:
+
+```bash
+HF_TOKEN=... vllm serve /path/to/personaplex-7b-v1 --omni \
+  --deploy-config vllm_omni/deploy/personaplex.yaml \
+  --port 8099
+```
+
+Open a session with the client preset (24 kHz float input, bundled voice
+prompt, persona text) and stream paced 80 ms frames:
+
+```python
+from vllm_omni.clients.duplex import DuplexClient
+from vllm_omni.clients.personaplex import create_duplex_session_config
+
+cfg = create_duplex_session_config(voice="NATF2.pt", persona="You are a concise assistant.")
+async with DuplexClient("ws://localhost:8099/v1/realtime?duplex=1", model=..., config=cfg) as client:
+    await client.stream_pcm(pcm_f32le_24k_bytes)  # continuous; the model answers as it listens
+```
+
+The strict driver used for validation (two paced sessions, admission
+overflow, slot recycling, audible whole-frame output) is
+`tests/e2e/online_serving/personaplex_realtime_duplex.py`. Note that
+`response.cancel` and `output_audio_buffer.clear` restart the model's
+conversation context on PersonaPlex: a cancel opens a fresh Stage 0 request,
+so the voice and persona prefill is replayed and earlier turns are forgotten.
 
 ## Realtime Event Lifecycle
 

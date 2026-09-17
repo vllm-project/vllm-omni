@@ -18,6 +18,25 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+_DEFAULT_SILENCE_SAMPLES = 16000
+_DEFAULT_SILENCE_SAMPLE_RATE_HZ = 16000
+
+
+def warmup_silence_unit(plugin: object | None) -> dict[str, object]:
+    """The append the warmup sends: the plugin's silence unit, or the 16 kHz default."""
+    factory = getattr(plugin, "silence_unit_payload", None)
+    if callable(factory):
+        unit = dict(factory())
+        if isinstance(unit.get("audio"), str) and isinstance(unit.get("format"), str):
+            unit.setdefault("sample_rate_hz", _DEFAULT_SILENCE_SAMPLE_RATE_HZ)
+            return unit
+    samples = int(getattr(plugin, "silence_continuation_samples", _DEFAULT_SILENCE_SAMPLES))
+    return {
+        "audio": base64.b64encode(bytes(samples * 4)).decode("ascii"),
+        "format": "pcm_f32le",
+        "sample_rate_hz": _DEFAULT_SILENCE_SAMPLE_RATE_HZ,
+    }
+
 
 async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
     """Run silent frames through a throwaway realtime session at startup.
@@ -43,10 +62,11 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             model_name = served
         else:
             model_name = args.model
-        # One silence unit as the engine-side plugin defines it (DuplexOmniEngine.plugin).
+        # One silence unit as the engine-side plugin defines it (DuplexOmniEngine.plugin):
+        # the unit's format, rate and length are the model's, not a fixed 16 kHz.
         plugin = getattr(getattr(app.state.engine_client, "engine", None), "plugin", None)
-        frame_samples = int(getattr(plugin, "silence_continuation_samples", 16000))
-        silence = base64.b64encode(bytes(frame_samples * 4)).decode("ascii")
+        unit = warmup_silence_unit(plugin)
+        frame_samples = len(base64.b64decode(str(unit["audio"]))) // 4
         from vllm_omni.clients.duplex import build_realtime_url
 
         url = (
@@ -77,7 +97,9 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                             "session_id": f"warmup-{uuid.uuid4().hex[:8]}",
                             "model": model_name,
                             "modalities": ["audio", "text"],
-                            "input_audio_format": "pcm_f32le",
+                            "input_audio_format": unit["format"],
+                            "sample_rate_hz": unit["sample_rate_hz"],
+                            "audio": {"input": {"sample_rate_hz": unit["sample_rate_hz"]}},
                             "output_audio_format": "pcm16",
                             "idle_timeout_s": 60,
                             "turn_detection": None,
@@ -105,7 +127,16 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 logger.warning("Duplex warmup: no session.created within 30 s; aborting warmup.")
                 return
             while sent < warmup_frames:
-                await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": silence}))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "input_audio_buffer.append",
+                            "audio": unit["audio"],
+                            "format": unit["format"],
+                            "sample_rate_hz": unit["sample_rate_hz"],
+                        }
+                    )
+                )
                 sent += 1
                 await asyncio.sleep(0.08)
             # Wait for the pipeline's first audio output so every stage ran.
@@ -128,4 +159,4 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             warmup_done.set()
 
 
-__all__ = ["_warmup_duplex_realtime"]
+__all__ = ["_warmup_duplex_realtime", "warmup_silence_unit"]
