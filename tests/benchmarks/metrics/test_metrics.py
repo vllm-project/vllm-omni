@@ -609,12 +609,19 @@ def test_aggregate_stage_durations_mean_p50_p99() -> None:
 def test_print_stage_durations_metrics(capsys) -> None:
     output = MixRequestFuncOutput()
     output.success = True
-    output.stage_durations = {"diffuse": 1.25, "text_encoder.forward": 0.5}
+    output.stage_durations = {
+        "Wan22I2VPipeline.diffuse": 1.25,
+        "Wan22I2VPipeline.text_encoder.forward": 0.4,
+        "queue_wait_ms": 0.5,
+    }
     print_stage_durations_metrics([output])
     out = capsys.readouterr().out
-    assert "Stage Durations Mean (s):" in out
-    assert "diffuse" in out
-    assert "text_encoder.forward" in out
+    assert "Wan22I2VPipeline" not in out
+    assert "Mean Diffuse (s):" in out
+    assert "Median Diffuse (s):" in out
+    assert "P99 Diffuse (s):" in out
+    assert "Mean Text Encoder Forward (s):" in out
+    assert "Mean Queue Wait (ms):" in out
 
 
 if __name__ == "__main__":

@@ -372,18 +372,41 @@ def aggregate_stage_durations(outputs: Sequence[RequestFuncOutput]) -> dict[str,
     }
 
 
+def _stage_duration_display_name(stage: str) -> str:
+    """Strip pipeline-class prefix and prettify profiler keys for printing.
+
+    ``Wan22I2VPipeline.diffuse`` -> ``Diffuse``
+    ``Wan22I2VPipeline.text_encoder.forward`` -> ``Text Encoder Forward``
+    ``queue_wait_ms`` / ``stage_0_gen_ms`` -> ``Queue Wait`` / ``Stage 0 Gen``
+    """
+    name = str(stage)
+    head, sep, tail = name.partition(".")
+    if sep and head.endswith("Pipeline"):
+        name = tail
+    if name.endswith("_ms"):
+        name = name[: -len("_ms")]
+    return name.replace("_", " ").replace(".", " ").title()
+
+
 def print_stage_durations_metrics(outputs: Sequence[RequestFuncOutput] | None) -> None:
-    """Print mean pipeline profiler stage durations when any request reported them."""
+    """Print per-stage mean / median / p99 in the same style as other bench metrics."""
     if not outputs:
         return
     summaries = aggregate_stage_durations(outputs)
     mean = summaries.get("stage_durations_mean") or {}
     if not mean:
         return
+    p50 = summaries.get("stage_durations_p50") or {}
+    p99 = summaries.get("stage_durations_p99") or {}
     print("{s:{c}^{n}}".format(s=" Stage Durations ", n=50, c="-"))
-    print("Stage Durations Mean (s):")
-    for stage, value in mean.items():
-        print("{:<40} {:<10.4f}".format(f"  {stage}:", value))
+    for stage in mean:
+        label = _stage_duration_display_name(stage)
+        unit = " (ms)" if str(stage).endswith("_ms") else " (s)"
+        print("{:<40} {:<10.4f}".format(f"Mean {label}{unit}:", mean[stage]))
+        if stage in p50:
+            print("{:<40} {:<10.4f}".format(f"Median {label}{unit}:", p50[stage]))
+        if stage in p99:
+            print("{:<40} {:<10.4f}".format(f"P99 {label}{unit}:", p99[stage]))
 
 
 def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsBenchmarkMetrics):
