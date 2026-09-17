@@ -257,6 +257,8 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
+        self.weight_transfer_engine = None
+        self._weight_update_active = False
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -318,6 +320,17 @@ class DiffusionWorker:
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
         vllm_config.kernel_config.ir_op_priority = _resolve_ir_op_priority(self.od_config, vllm_config)
+
+        # Initialize weight transfer engine if configured
+        if vllm_config.weight_transfer_config is not None:
+            from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
+            self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                model=None,  # Will be set via reset_weight_update_target later
+                model_config=vllm_config.model_config,
+                parallel_config=vllm_config.parallel_config,
+                weight_transfer_config=vllm_config.weight_transfer_config,
+            )
+
         if self.od_config.moe_backend != "auto":
             logger.warning(
                 "Overriding MoE backend from default 'auto' to '%s' per deploy config.",
@@ -619,6 +632,72 @@ class DiffusionWorker:
     def close_ar_diffusion_session(self, session_id: str) -> bool:
         """Close runner-owned AR state through the collective RPC boundary."""
         return self._run_ar_diffusion_session_lifecycle("close_session", session_id)
+
+    def _check_weight_transfer_engine(self) -> None:
+        """Check that weight transfer engine is initialized."""
+        if self.weight_transfer_engine is None:
+            raise RuntimeError(
+                "Weight transfer engine not initialized. "
+                "Set weight_transfer_config in engine args."
+            )
+
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """Initialize weight transfer mechanism for diffusion stage.
+
+        Args:
+            init_info: Dictionary containing backend-specific initialization info
+        """
+        self._check_weight_transfer_engine()
+        typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
+        self.weight_transfer_engine.init_transfer_engine(typed_init_info)
+
+    def start_weight_update(self) -> None:
+        """Start a new weight update session for diffusion model."""
+        self._check_weight_transfer_engine()
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while a weight update is already "
+                "active. Call finish_weight_update first."
+            )
+        try:
+            # Set model as the transfer target
+            assert self.model_runner is not None
+            assert self.model_runner.pipeline is not None
+            self.weight_transfer_engine.model = self.model_runner.pipeline
+            self.weight_transfer_engine.start_weight_update()
+        except BaseException:
+            self.weight_transfer_engine.reset_weight_update_target()
+            raise
+        self._weight_update_active = True
+
+    def update_weights(self, update_info: dict) -> None:
+        """Receive one weight update chunk from the trainer.
+
+        Args:
+            update_info: Backend-specific update info
+        """
+        self._check_weight_transfer_engine()
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update must be called before update_weights."
+            )
+        try:
+            self.weight_transfer_engine.update_weights(update_info)
+        except BaseException:
+            self._weight_update_active = False
+            self.weight_transfer_engine.reset_weight_update_target()
+            raise
+
+    def finish_weight_update(self) -> None:
+        """Finish the current weight update session."""
+        self._check_weight_transfer_engine()
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "finish_weight_update called without a matching start_weight_update."
+            )
+        self.weight_transfer_engine.finish_weight_update()
+        self.weight_transfer_engine.reset_weight_update_target()
+        self._weight_update_active = False
 
     def execute_model(
         self,

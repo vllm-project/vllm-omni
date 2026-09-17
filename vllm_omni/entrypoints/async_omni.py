@@ -1081,21 +1081,46 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             request_id,
         )
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
-        """Start a new weight update.
+    async def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """Initialize weight transfer mechanism across all stages.
 
-        Omni does not currently support weight transfer, so this is a no-op.
+        Args:
+            init_info: Backend-specific initialization information
         """
-        logger.debug("Weight update start requested (no-op in omni)")
+        await self.collective_rpc(method="init_weight_transfer_engine", args=(init_info,))
+        logger.info("[%s] Weight transfer engine initialized", self._name)
+
+    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+        """Start a new weight update session across all stages.
+
+        Calls ``start_weight_update()`` on every stage's worker, which prepares
+        the engine to receive weight chunks via ``update_weights()``.
+        """
+        await self.collective_rpc(method="start_weight_update", args=())
+        logger.info("[%s] Weight update session started", self._name)
+
+    async def update_weights(self, update_info: dict) -> None:
+        """Send weight update chunk to all stages.
+
+        Args:
+            update_info: Backend-specific update information containing weight data
+        """
+        await self.collective_rpc(method="update_weights", args=(update_info,))
+        logger.debug("[%s] Weight chunk forwarded to stages", self._name)
 
     async def finish_weight_update(self, weight_version: str | None = None) -> None:
-        """Finish the current weight update.
+        """Finish the current weight update session across all stages.
 
-        Omni does not currently support weight transfer, so this is a no-op.
-        ``weight_version`` is accepted for upstream ``EngineClient`` protocol
-        compatibility (RLHF weight-transfer routers pass it positionally).
+        Calls ``finish_weight_update()`` on every stage's worker, finalizing
+        the weight transfer and resetting the update target.
+
+        Args:
+            weight_version: Accepted for upstream ``EngineClient`` protocol
+                compatibility (RLHF weight-transfer routers pass it positionally).
+                Currently unused by omni stages.
         """
-        logger.debug("Weight update finish requested (no-op in omni)")
+        await self.collective_rpc(method="finish_weight_update", args=())
+        logger.info("[%s] Weight update session finished", self._name)
 
     async def do_log_stats(self) -> None:
         """Log statistics.
