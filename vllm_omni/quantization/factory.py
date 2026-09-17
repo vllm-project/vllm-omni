@@ -103,10 +103,15 @@ def _build_mxfp8(**kw: Any) -> QuantizationConfig:
 
 
 def _build_mxfp4(**kw: Any) -> QuantizationConfig:
-    """Lazy import for W4A4 MXFP4 diffusion config (NPU only)."""
+    """Lazy import for W4A4 MXFP4 diffusion config.
+
+    Route through from_config so a checkpoint's full quantization_config stanza
+    (with producer/algo/packing metadata) is tolerated rather than passed to
+    __init__ positionally.
+    """
     from .mxfp4_config import DiffusionMXFP4Config
 
-    return DiffusionMXFP4Config(**kw)
+    return DiffusionMXFP4Config.from_config(kw)
 
 
 def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
