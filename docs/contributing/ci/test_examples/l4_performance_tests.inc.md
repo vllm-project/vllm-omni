@@ -1,4 +1,4 @@
-When you want to add L4-level ***performance test*** cases, add entries to JSON files under `tests/dfx/perf/tests/` and run them via `tests/dfx/perf/scripts/run_benchmark.py` (omni / TTS) or `run_diffusion_benchmark.py` (diffusion).
+When you want to add L4-level ***performance test*** cases, add entries to JSON files under `tests/dfx/perf/tests/` and run them via `tests/dfx/perf/scripts/run_benchmark.py` (omni / TTS / most diffusion OpenAI endpoints) or `run_diffusion_benchmark.py` (remaining diffusion-client cases such as custom jsonl).
 
 #### Config file layout (in-tree examples)
 
@@ -7,8 +7,8 @@ When you want to add L4-level ***performance test*** cases, add entries to JSON 
 | Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` without `slow` in `mark`) |
 | Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json` (CUDA only), `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
-| Diffusion (`/v1/chat/completions`) | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, … |
-| Diffusion (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) | `run_benchmark.py` | `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_lingbot_video_vllm_omni.json`, … |
+| Diffusion (chat / images / videos via omni bench) | `run_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, … |
+| Diffusion (custom jsonl / remaining diffusion client) | `run_diffusion_benchmark.py` | `test_hunyuan_image3_it2i.json` |
 
 #### How runners pick cases
 
@@ -70,7 +70,7 @@ Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk sca
 | server_type        | Diffusion | Only for diffusion-script JSON; omit on omni-bench generation cases                      |
 | benchmark_endpoint | Optional  | Legacy diffusion custom-jsonl alias; prefer `benchmark_params[].endpoint`                |
 
-Omit `mark` only for configs not meant to be filtered by `-m`. Cases that call `/v1/images/edits`, `/v1/images/generations`, or `/v1/videos` use the same `benchmark_params` schema as Omni/TTS (`dataset_name`, `endpoint`, `extra_body`) and are executed by `run_benchmark.py` — do not set `server_type` or `task` on those cases. Remaining diffusion cases (usually `/v1/chat/completions`, or custom jsonl) stay on `run_diffusion_benchmark.py` and may keep `server_type`.
+Omit `mark` only for configs not meant to be filtered by `-m`. Diffusion image/video cases that use OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) share the Omni/TTS `benchmark_params` schema (`dataset_name`, `endpoint`, `extra_body`) and run via `run_benchmark.py` — do not set `server_type` or `task`. Remaining diffusion-script cases (custom jsonl, or features not yet in omni bench such as `random-request-config`) stay on `run_diffusion_benchmark.py` and may keep `server_type`.
 
 #### `mark` field
 
@@ -140,22 +140,28 @@ Result files use the **runtime** hardware label from `get_runtime_resource_label
 
 Examples:
 
-- Omni/TTS and OpenAI generation endpoints (`/v1/images/*`, `/v1/videos`): `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
+- Omni/TTS and diffusion OpenAI endpoints (`/v1/chat/completions`, `/v1/images/*`, `/v1/videos`): `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
 - Remaining diffusion (`run_diffusion_benchmark.py`): one aggregate `diffusion_result_{config_stem}_{optional_hw}_{timestamp}.json` per source JSON file
 
 #### Local commands
 
 ```bash
 # Bulk load + filter by JSON mark
-pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and H100 and diffusion"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and H100 and diffusion"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
+pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and H100 and diffusion"
 
 # Single file (same selectors as the CI Perf steps)
-pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json \
+  -m "H100 and B200 and cards_1"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json \
   -m "H100 and B200 and cards_2"
+pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_it2i.json
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
   -m "H100 and full_model and not slow"
@@ -214,7 +220,7 @@ You can add any benchmark running parameters you need here. For all optional par
 2. For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
 3. Optionally add a `baseline` object (see **Baseline thresholds** below). If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds from this field.
 4. Set `"name"` on each `benchmark_params` entry for stable pytest ids and readable result keys.
-5. Image/video generation cases (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) use this same schema: set `endpoint` to the API path, put width/height/steps/frames in `extra_body`, use `dataset_name: random` for text-only inputs or `random-mm` when the request needs a synthetic image/video. Do not set `server_type` or `task`, and do not use `random-request-config` or kebab-case diffusion client fields.
+5. Image/video generation cases (`/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) use this same schema: set `endpoint` to the API path (and `backend: openai-chat-omni` for chat), put width/height/steps/frames (and optional `negative_prompt`) in `extra_body`, use `dataset_name: random` for text-only inputs or `random-mm` when the request needs a synthetic image/video, and set `tokenizer` (e.g. `gpt2`) when the model has no HF tokenizer. Do not set `server_type` or `task`, and do not use `random-request-config` or kebab-case diffusion client fields.
 6. The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
 
 | Parameter       | Type          | Required | Example/Values       | Description                          |

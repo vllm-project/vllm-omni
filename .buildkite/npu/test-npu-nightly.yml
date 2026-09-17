@@ -186,13 +186,12 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_cfgp2.json
             EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 SP=2"
         source_file_dependencies: diffusion_hunyuan_image3_perf
@@ -203,13 +202,12 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_sp2.json
             EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=4"
         source_file_dependencies: diffusion_hunyuan_image3_perf
@@ -220,13 +218,12 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4.json
             EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group

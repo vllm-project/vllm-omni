@@ -160,7 +160,8 @@ When `mark` is present, it must be an **array** with exactly one ``hardware_mark
 ```
 
 - Local bulk load: `pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and H100"` (omni/TTS and `/v1/images/*` + `/v1/videos` diffusion)
-- Diffusion chat-completions remaining cases: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
+- Diffusion remaining custom-jsonl cases: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
+- Diffusion image/video via omni bench: `pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and diffusion and H100"`
 - Nightly CI perf steps: `--test-config-file tests/dfx/perf/tests/test_<model>_vllm_omni.json` (file selects cases; no `-m`)
 - Result filenames use **runtime** GPU detection (`get_runtime_resource_label`); `H100` is omitted on the default CI pool
 

@@ -14,7 +14,6 @@
       "diffusion"
     ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), t2i Task",
-    "server_type": "vllm-omni",
     "server_params": {
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
       "serve_args": {
@@ -23,7 +22,7 @@
         "no-async-chunk": true,
         "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
-        "gpu-memory-utilization": 0.90,
+        "gpu-memory-utilization": 0.9,
         "max-model-len": 8192,
         "max-num-batched-tokens": 9216
       }
@@ -31,22 +30,28 @@
     "benchmark_params": [
       {
         "name": "512x512_t2i_steps20",
-        "dataset": "random",
-        "task": "t2i",
-        "width": 512,
-        "height": 512,
-        "num-inference-steps": 20,
-        "num-prompts": 20,
-        "max-concurrency": 1,
-        "enable-negative-prompt": true,
+        "num_prompts": 20,
+        "max_concurrency": 1,
         "baseline": {
           "H100": {
-            "throughput_qps": 0.495,
-            "latency_mean": 2.0238,
-            "peak_memory_mb_max": 29392.0,
-            "peak_memory_mb_mean": 29392.0
+            "request_throughput": 0.495,
+            "mean_e2el_ms": 2023.8,
+            "mean_peak_memory_mb": 29392.0
           }
-        }
+        },
+        "dataset_name": "random",
+        "endpoint": "/v1/chat/completions",
+        "tokenizer": "gpt2",
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "backend": "openai-chat-omni"
       }
     ]
   },
@@ -65,7 +70,6 @@
       "diffusion"
     ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), i2i Task",
-    "server_type": "vllm-omni",
     "server_params": {
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
       "serve_args": {
@@ -74,7 +78,7 @@
         "no-async-chunk": true,
         "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
-        "gpu-memory-utilization": 0.90,
+        "gpu-memory-utilization": 0.9,
         "max-model-len": 8192,
         "max-num-batched-tokens": 9216
       }
@@ -82,23 +86,36 @@
     "benchmark_params": [
       {
         "name": "512x512_i2i_steps20",
-        "dataset": "random",
-        "task": "i2i",
-        "width": 512,
-        "height": 512,
-        "num-inference-steps": 20,
-        "num-prompts": 20,
-        "max-concurrency": 1,
-        "enable-negative-prompt": true,
-        "num-input-images": 1,
+        "num_prompts": 20,
+        "max_concurrency": 1,
         "baseline": {
           "H100": {
-            "throughput_qps": 0.3499,
-            "latency_mean": 2.8701,
-            "peak_memory_mb_max": 30466.0,
-            "peak_memory_mb_mean": 30465.0
+            "request_throughput": 0.3499,
+            "mean_e2el_ms": 2870.1,
+            "mean_peak_memory_mb": 30465.0
           }
-        }
+        },
+        "dataset_name": "random-mm",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(512, 512, 1)": 1.0
+        },
+        "endpoint": "/v1/chat/completions",
+        "tokenizer": "gpt2",
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "backend": "openai-chat-omni"
       }
     ]
   },
@@ -117,7 +134,6 @@
       "diffusion"
     ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, t2i Task",
-    "server_type": "vllm-omni",
     "server_params": {
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
       "serve_args": {
@@ -134,22 +150,28 @@
     "benchmark_params": [
       {
         "name": "512x512_t2i_steps20",
-        "dataset": "random",
-        "task": "t2i",
-        "width": 512,
-        "height": 512,
-        "num-inference-steps": 20,
-        "num-prompts": 20,
-        "max-concurrency": 1,
-        "enable-negative-prompt": true,
+        "num_prompts": 20,
+        "max_concurrency": 1,
         "baseline": {
           "H100": {
-            "throughput_qps": 0.5048,
-            "latency_mean": 1.987,
-            "peak_memory_mb_max": 29380.0,
-            "peak_memory_mb_mean": 29380.0
+            "request_throughput": 0.5048,
+            "mean_e2el_ms": 1987.0,
+            "mean_peak_memory_mb": 29380.0
           }
-        }
+        },
+        "dataset_name": "random",
+        "endpoint": "/v1/chat/completions",
+        "tokenizer": "gpt2",
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "backend": "openai-chat-omni"
       }
     ]
   },
@@ -168,7 +190,6 @@
       "diffusion"
     ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, i2i Task",
-    "server_type": "vllm-omni",
     "server_params": {
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
       "serve_args": {
@@ -185,23 +206,36 @@
     "benchmark_params": [
       {
         "name": "512x512_i2i_steps20",
-        "dataset": "random",
-        "task": "i2i",
-        "width": 512,
-        "height": 512,
-        "num-inference-steps": 20,
-        "num-prompts": 20,
-        "max-concurrency": 1,
-        "enable-negative-prompt": true,
-        "num-input-images": 1,
+        "num_prompts": 20,
+        "max_concurrency": 1,
         "baseline": {
           "H100": {
-            "throughput_qps": 0.1533,
-            "latency_mean": 6.5243,
-            "peak_memory_mb_max": 30574.0,
-            "peak_memory_mb_mean": 30574.0
+            "request_throughput": 0.1533,
+            "mean_e2el_ms": 6524.3,
+            "mean_peak_memory_mb": 30574.0
           }
-        }
+        },
+        "dataset_name": "random-mm",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(512, 512, 1)": 1.0
+        },
+        "endpoint": "/v1/chat/completions",
+        "tokenizer": "gpt2",
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "backend": "openai-chat-omni"
       }
     ]
   }

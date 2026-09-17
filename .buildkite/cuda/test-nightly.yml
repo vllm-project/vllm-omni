@@ -243,26 +243,24 @@ steps:
         key: nightly-diffusion-x2iat-performance-qwen-image-single
         timeout_in_minutes: 180
         artifact_paths:
-          - tests/dfx/perf/results/diffusion_result_*.json
-          - tests/dfx/perf/results/logs/*.log
+          - tests/dfx/perf/results/*.json
         commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - export CACHE_DIT_VERSION=1.5.0
-          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and cards_1"
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and cards_1"
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · 4-GPU"
         source_file_dependencies: diffusion_qwen_image_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-4gpu
         timeout_in_minutes: 180
         artifact_paths:
-          - tests/dfx/perf/results/diffusion_result_*.json
-          - tests/dfx/perf/results/logs/*.log
+          - tests/dfx/perf/results/*.json
         commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - export CACHE_DIT_VERSION=1.5.0
           # Do not pin DIFFUSION_ATTENTION_BACKEND: H100 auto-selects FLASH_ATTN;
           # B200 rejects explicit FLASH_ATTN without FA4 and uses CUDNN/TRTLLM.
-          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and cards_4"
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and cards_4"
 
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group

@@ -15,7 +15,6 @@
       "local_model"
     ],
     "description": "TP=2 CfgP=2 baseline",
-    "server_type": "vllm-omni",
     "server_params": {
       "model": "tencent/HunyuanImage-3.0-Instruct",
       "serve_args": {
@@ -30,21 +29,27 @@
     "benchmark_params": [
       {
         "name": "1024x1024_steps8",
-        "dataset": "random",
-        "task": "t2i",
-        "width": 1024,
-        "height": 1024,
-        "num-inference-steps": 8,
-        "num-prompts": 10,
-        "max-concurrency": 1,
+        "num_prompts": 10,
+        "max_concurrency": 1,
         "baseline": {
           "H200": {
-            "throughput_qps": 0.21,
-            "latency_p99": 4.7469,
-            "peak_memory_mb_max": 101100,
-            "peak_memory_mb_mean": 101100
+            "request_throughput": 0.21,
+            "mean_peak_memory_mb": 101100,
+            "mean_e2el_ms": 4746.9
           }
-        }
+        },
+        "dataset_name": "random",
+        "endpoint": "/v1/chat/completions",
+        "tokenizer": "gpt2",
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1024,
+          "height": 1024,
+          "num_inference_steps": 8
+        },
+        "backend": "openai-chat-omni"
       }
     ]
   }
