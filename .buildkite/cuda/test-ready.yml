@@ -128,6 +128,12 @@ steps:
           - timeout 20m pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
         mirror_hardwares: l4_1
 
+      - label: "Scheduler Injection Test"
+        source_file_dependencies: scheduler_injection
+        commands:
+          - timeout 20m pytest -s -v tests/e2e/features/scheduler_injection/ -m "core_model"
+        mirror_hardwares: l4_1
+
 
       - label: "RLHF · VeRL-Omni E2E Test"
         source_file_dependencies: rlhf_verl_omni

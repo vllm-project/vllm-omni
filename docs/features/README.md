@@ -67,6 +67,13 @@ The [Pipeline Parallelism guide](../user_guide/diffusion/parallelism/pipeline_pa
 remains available by direct link, but it is not promoted in the primary User
 Guide navigation until its user-facing support and placement are settled.
 
+## Integrations
+
+| Goal | User guide |
+| --- | --- |
+| Extend a stock pipeline with a custom class | [Custom Diffusion Pipeline](custom_pipeline.md) |
+| Inject a custom diffusion sampling scheduler | [Diffusion Scheduler Injection](scheduler_injection.md) |
+
 ## Experimental
 
 [Session State Manager](session_state_manager.md) is opt-in and experimental.

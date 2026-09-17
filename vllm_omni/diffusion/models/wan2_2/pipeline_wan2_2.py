@@ -39,7 +39,11 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.schedulers import (
+    FlowUniPCMultistepScheduler,
+    build_pipeline_scheduler,
+    is_injected_scheduler,
+)
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.offloader import OffloadPlan
@@ -75,6 +79,22 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     raise ValueError(
         f"Unsupported Wan sample_solver: {sample_solver}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}"
     )
+
+
+def apply_wan_runtime_scheduler(pipeline: Any, sample_solver: str, flow_shift: float) -> None:
+    """Rebuild the Wan scheduler unless an injected class owns stepping."""
+    if is_injected_scheduler(pipeline.od_config):
+        logger.warning(
+            "Ignoring per-request sample_solver=%s/flow_shift=%s: an injected scheduler "
+            "(od_config.scheduler=%r) is active and is left untouched.",
+            sample_solver,
+            flow_shift,
+            pipeline.od_config.scheduler,
+        )
+        return
+    pipeline.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+    pipeline._sample_solver = sample_solver
+    pipeline._flow_shift = flow_shift
 
 
 def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -514,7 +534,11 @@ class Wan22Pipeline(
             if od_config.flow_shift is not None
             else 5.0
         )
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: build_wan_scheduler(self._sample_solver, self._flow_shift),
+            local_files_only=os.path.exists(od_config.model),
+        )
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
@@ -803,9 +827,7 @@ class Wan22Pipeline(
             sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
             flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
             if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-                self._sample_solver = sample_solver
-                self._flow_shift = flow_shift
+                apply_wan_runtime_scheduler(self, sample_solver, flow_shift)
 
             if sample_solver == "unipc":
                 self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)

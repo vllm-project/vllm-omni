@@ -29,6 +29,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler, is_injected_scheduler
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -140,14 +141,26 @@ class HunyuanVideo15Pipeline(
             torch_dtype=torch.float32,
         ).to(self.device)
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            ),
+            local_files_only=local_files_only,
         )
 
         # Override the scheduler's shift if flow_shift is explicitly provided.
         # Must set _shift directly since the property has no setter.
+        # `_shift` is not part of the injected-scheduler contract.
         if od_config.flow_shift is not None:
-            self.scheduler._shift = od_config.flow_shift
+            if is_injected_scheduler(od_config):
+                logger.warning(
+                    "Skipping HunyuanVideo flow_shift=_shift mutation: an injected "
+                    "scheduler (od_config.scheduler=%r) is active.",
+                    od_config.scheduler,
+                )
+            else:
+                self.scheduler._shift = od_config.flow_shift
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
         self.transformer = HunyuanVideo15Transformer3DModel(

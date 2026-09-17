@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -236,8 +237,12 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         longcat_subfolders = ["scheduler", "text_encoder", "text_processor", "tokenizer", "vae"]
         prefetch_subfolders(model, longcat_subfolders, local_files_only=local_files_only)
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            ),
+            local_files_only=local_files_only,
         )
 
         self.text_encoder = from_pretrained_with_prefetch(

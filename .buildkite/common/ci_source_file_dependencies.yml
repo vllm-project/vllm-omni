@@ -151,6 +151,20 @@ source_file_dependencies:
     - vllm_omni/inputs/
     - vllm_omni/outputs/
 
+  scheduler_injection:
+    - tests/e2e/features/scheduler_injection/
+    - tests/e2e/features/helpers/custom_scheduler.py
+    - tests/e2e/features/helpers/custom_pipeline.py
+    - tests/diffusion/models/schedulers/
+    - tests/diffusion/test_diffusion_config_propagation.py
+    - vllm_omni/diffusion/models/schedulers/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/worker/diffusion_model_runner.py
+    - vllm_omni/config/omni_config.py
+    - vllm_omni/engine/arg_utils.py
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/
+
   rlhf_verl_omni:
     - tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
     - tests/e2e/features/helpers/verl_omni_server.py

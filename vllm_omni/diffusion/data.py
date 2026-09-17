@@ -56,6 +56,17 @@ def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, 
     elif not isinstance(dtype, str):
         raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(dtype).__name__}")
 
+    # OmniEngineArgs / deploy YAML use diffusion_scheduler so users can
+    # distinguish it from stage scheduler_cls (request batching).
+    if config_kwargs.get("diffusion_scheduler") is not None:
+        config_kwargs["scheduler"] = config_kwargs.pop("diffusion_scheduler")
+    else:
+        config_kwargs.pop("diffusion_scheduler", None)
+    if config_kwargs.get("diffusion_scheduler_kwargs") is not None:
+        config_kwargs["scheduler_kwargs"] = config_kwargs.pop("diffusion_scheduler_kwargs")
+    else:
+        config_kwargs.pop("diffusion_scheduler_kwargs", None)
+
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
     if "static_lora_scale" in config_kwargs:
@@ -541,8 +552,6 @@ class DiffusionCacheConfig:
                     scm_steps_mask_policy, scm_steps_policy
         - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
                     mag_ratios, mag_calibrate
-        - SeaCache: sea_threshold, sea_residual_order,
-                    sea_max_consecutive_cached, sea_power_exp
         - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
                           velocity_skip_countdowns, step_cache_dit_min_history
 
@@ -561,12 +570,6 @@ class DiffusionCacheConfig:
     # None defers to the model-specific TeaCache default (0.2 fallback).
     rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
-
-    # SeaCache parameters [sea_cache only]
-    sea_threshold: float = 0.25
-    sea_residual_order: int = 1
-    sea_max_consecutive_cached: int = 2
-    sea_power_exp: float = 3.0
 
     # MagCache parameters [mag_cache only]
     # Default: 0.24 threshold for accumulated magnitude error
@@ -952,6 +955,15 @@ class OmniDiffusionConfig:
 
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
+
+    # Diffusion sampling-scheduler injection (not the request scheduler).
+    # Registry name (see vllm_omni.diffusion.models.schedulers) or dotted
+    # class path. Constructed via build_pipeline_scheduler / from_pretrained.
+    # Set from OmniEngineArgs.diffusion_scheduler. Pipelines that do not
+    # consume this field fail at load (ensure_scheduler_consumed).
+    scheduler: str | None = None
+    # Extra kwargs forwarded to the injected scheduler's from_pretrained().
+    scheduler_kwargs: dict[str, Any] | None = None
 
     # Diffusion model loading format
     # "default", "custom_pipeline", "dummy", "diffusers" (HF diffusers adapter)
