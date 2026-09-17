@@ -13,6 +13,8 @@ import yaml
 
 from vllm_omni.config.stage_config import load_deploy_config
 
+QWEN3_OMNI_CI_SAMPLING_SEED = int(os.environ.get("VLLM_CI_QWEN3_OMNI_SEED", "42"))
+
 
 def modify_stage_config(
     yaml_path: str,
@@ -325,14 +327,23 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 5,
                 "max_model_len": 32768,
                 "mm_processor_cache_gb": 0,
-                "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
+                # Function expansion includes a 300-word generation case with
+                # a 200-word minimum. A 150-token cap deterministically
+                # truncated that case to 113 words in AMD build #11997.
+                "default_sampling_params": {"max_tokens": 512, "ignore_eos": False},
             },
             {
                 "stage_id": 1,
                 "max_num_seqs": 5,
                 "gpu_memory_utilization": 0.5,
                 "max_model_len": 32768,
-                "default_sampling_params": {"max_tokens": 1000},
+                # Qwen3-Omni's talker intentionally samples at temperature 0.9.
+                # Pin the CI request seed so audio/text similarity and the
+                # aggregate Seed-TTS WER gate measure one reproducible stream.
+                "default_sampling_params": {
+                    "max_tokens": 1000,
+                    "seed": QWEN3_OMNI_CI_SAMPLING_SEED,
+                },
             },
             {
                 "stage_id": 2,
@@ -341,6 +352,22 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        # MI300 function/accuracy runs exercise concurrent
+                        # multimodal encoder work. Percentage sizing left a
+                        # 103.74 GiB KV cache in Buildkite #11941 and only
+                        # 3.04 GiB free before a 4.12 GiB audio-encoder
+                        # allocation. Bound the CI-only cache explicitly so
+                        # those transient allocations retain headroom without
+                        # changing the production deploy configuration.
+                        "gpu_memory_utilization": None,
+                        "kv_cache_memory_bytes": 80 * 1024**3,
+                    },
+                ],
+            },
             "xpu": {
                 "stages": [
                     {
