@@ -19,9 +19,25 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-function/**/*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export VLLM_CI_QWEN3_OMNI_SEED=42
+          - export PYTHONHASHSEED=42
+          - export QWEN3_OMNI_FUNCTION_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-qwen3-omni-function"
+          - mkdir -p "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR"
+          - >-
+            timeout --signal=TERM --kill-after=1m 170m
+            pytest -s -v -ra
+            tests/e2e/online_serving/test_qwen3_omni_expansion.py
+            -m "full_model and rocm and MI325 and cards_2"
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest.log"
+          - tail -n 100 "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest.log" > "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest-summary.txt"
+          - printf 'qwen3_omni_sampling_seed=42\npythonhashseed=42\n' > "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/reproducibility.txt"
 
       - label: "Qwen3-Omni Accuracy"
         agent_pool: mi300_2
@@ -31,11 +47,27 @@ steps:
         timeout_in_minutes: 180
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
+          - artifacts/rocm-qwen3-omni-accuracy/**/*
         commands:
           - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_WER_SAVE_ITEMS=1
           # PyTorch ROCm uses the torch.cuda device namespace.
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export VLLM_CI_QWEN3_OMNI_SEED=42
+          - export PYTHONHASHSEED=42
+          - export QWEN3_OMNI_ACCURACY_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-qwen3-omni-accuracy"
+          - mkdir -p "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR"
+          - >-
+            timeout --signal=TERM --kill-after=1m 170m
+            pytest -s -v -ra
+            tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py
+            -m "full_model and rocm and MI325 and cards_2"
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest.log"
+          - tail -n 100 "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest.log" > "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest-summary.txt"
+          - printf 'qwen3_omni_sampling_seed=42\npythonhashseed=42\n' > "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/reproducibility.txt"
           # Native tests run from the image copy under /app/vllm-omni, while
           # Buildkite's artifact hook searches the checkout workspace.
           - |
@@ -64,3 +96,363 @@ steps:
         commands:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+
+  - group: ":full_moon: ROCm Omni parity expansion"
+    steps:
+      - label: "ROCm · Omni Function · Single-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 130
+        artifact_paths:
+          - "artifacts/rocm-omni-function-1gpu/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-omni-function-1gpu"
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 120m
+            pytest -s -v -ra tests/e2e/
+            --run-level "full_model"
+            -m "full_model and H100 and B200 and omni and cards_1"
+            --ignore=tests/e2e/accuracy
+            --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py pytest-result
+            --xml "$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            --log "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+            --output "$$ROCM_CI_ARTIFACT_DIR/pytest-result.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      - label: "ROCm · Omni Function · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 100
+        artifact_paths:
+          - "artifacts/rocm-omni-function-2gpu/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-omni-function-2gpu"
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 90m
+            pytest -s -v -ra tests/e2e/
+            --run-level "full_model"
+            -m "full_model and H100 and B200 and omni and cards_2"
+            --ignore=tests/e2e/accuracy
+            --ignore=tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py pytest-result
+            --xml "$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            --log "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+            --output "$$ROCM_CI_ARTIFACT_DIR/pytest-result.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      - label: "ROCm · Omni Documentation · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 100
+        artifact_paths:
+          - "artifacts/rocm-omni-doc-2gpu/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-omni-doc-2gpu"
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 90m
+            pytest -s -v -ra tests/examples/
+            -m "full_model and omni and H100 and B200 and cards_2"
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py pytest-result
+            --xml "$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            --log "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+            --output "$$ROCM_CI_ARTIFACT_DIR/pytest-result.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      - label: "ROCm · Omni Performance · No Async Chunk"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 310
+        artifact_paths:
+          - "artifacts/rocm-omni-perf-no-async/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-omni-perf-no-async"
+          - export BENCHMARK_DIR="$$ROCM_CI_ARTIFACT_DIR/benchmark-results"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR" "$$BENCHMARK_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 300m
+            pytest -s -v -ra tests/dfx/perf/scripts/run_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
+            -m "H100 and B200 and cards_2"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py pytest-result
+            --xml "$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            --log "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+            --output "$$ROCM_CI_ARTIFACT_DIR/pytest-result.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      - label: "ROCm · Omni Performance · Async Chunk"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 190
+        artifact_paths:
+          - "artifacts/rocm-omni-perf-async/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-omni-perf-async"
+          - export BENCHMARK_DIR="$$ROCM_CI_ARTIFACT_DIR/benchmark-results"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR" "$$BENCHMARK_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 180m
+            pytest -s -v -ra tests/dfx/perf/scripts/run_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+            -m "H100 and B200 and full_model and cards_2"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py pytest-result
+            --xml "$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            --log "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+            --output "$$ROCM_CI_ARTIFACT_DIR/pytest-result.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      - label: "ROCm · Omni Multi-Replica Startup · 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 55
+        artifact_paths:
+          - "artifacts/rocm-omni-multi-replica/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-omni-multi-replica"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 45m
+            pytest -s -v -ra
+            tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+            -m "full_model and H100 and B200 and cards_4"
+            --run-level "core_model"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py pytest-result
+            --xml "$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            --log "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+            --output "$$ROCM_CI_ARTIFACT_DIR/pytest-result.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+  - group: ":microscope: Diffusion parity burn-in"
+    steps:
+      - label: "ROCm · Tiny Diffusion Multi-GPU · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 40
+        artifact_paths:
+          - "artifacts/rocm-tiny-diffusion-2gpu/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-tiny-diffusion-2gpu"
+          - export VLLM_OMNI_TEST_INIT_TIMEOUT=900
+          - export VLLM_OMNI_TEST_STAGE_INIT_TIMEOUT=600
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 30m
+            pytest -s -v -ra
+            tests/model_tests/diffusion/
+            -m 'full_model and L4 and B200 and cuda and cards_2'
+            --run-level "core_model"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 40
+        artifact_paths:
+          - "artifacts/rocm-tiny-diffusion-4gpu/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-tiny-diffusion-4gpu"
+          - export VLLM_OMNI_TEST_INIT_TIMEOUT=900
+          - export VLLM_OMNI_TEST_STAGE_INIT_TIMEOUT=600
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 30m
+            pytest -s -v -ra
+            tests/model_tests/diffusion/
+            -m 'full_model and L4 and B200 and cuda and cards_4'
+            --run-level "core_model"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      # Both CUDA quantization lanes map to MI300. L4 is a marker-defined
+      # test subset, not a request for a lower-memory AMD architecture.
+      - label: "ROCm · Diffusion Quantization · H100-class Scope"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 100
+        artifact_paths:
+          - "artifacts/rocm-diffusion-quant-h100/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-diffusion-quant-h100"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          # The quality gate compares BF16 and FP8 under the same attention
+          # backend. Avoid first-use AITER JIT consuming Omni's 600-second
+          # startup budget on ROCm and poisoning later cases in this shard.
+          - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - echo "diffusion_attention_backend=$$DIFFUSION_ATTENTION_BACKEND" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 90m
+            pytest -s -v -ra
+            tests/diffusion/quantization/
+            -m 'full_model and cuda and H100 and B200 and cards_1'
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
+      - label: "ROCm · Diffusion Quantization · Legacy L4 Scope"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 70
+        artifact_paths:
+          - "artifacts/rocm-diffusion-quant-l4/**/*"
+        commands:
+          - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-diffusion-quant-l4"
+          - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          - python3 -m pip install "vllm-gguf-plugin==0.0.4"
+          - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+          - >-
+            timeout --signal=TERM --kill-after=1m 60m
+            pytest -s -v -ra
+            tests/diffusion/quantization/
+            -m 'full_model and cuda and L4 and B200 and cards_1'
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+          - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+          - >-
+            python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+            --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+            --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+            --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"

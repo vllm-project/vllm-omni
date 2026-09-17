@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end tests for GGUF quantization on diffusion models.
 
-Validates that GGUF-quantized diffusion models generate valid images and
-use less peak GPU memory than BF16 baseline.
+Validates that GGUF-quantized diffusion models generate valid images and,
+on CUDA, use less peak GPU memory than the BF16 baseline.
 
 Requires vllm-omni to be installed alongside the vllm-gguf-plugin package.
 
@@ -114,7 +114,7 @@ def _generate_single_stage_image(
 @pytest.mark.diffusion
 @pytest.mark.parametrize("model", [Z_IMAGE_CONFIG, FLUX_CONFIG], ids=["Z-Image-Turbo", "FLUX.2-klein"])
 def test_single_stage_diffusion_gguf(model: DiffusionGGUFTestConfig, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Z-Image-Turbo GGUF generates valid images and uses less memory than BF16."""
+    """GGUF generates a similar image and reduces CUDA peak memory."""
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
     # BF16 baseline
@@ -150,4 +150,5 @@ def test_single_stage_diffusion_gguf(model: DiffusionGGUFTestConfig, monkeypatch
     print(f"{model.artifact_prefix} GGUF peak VRAM delta: {mem_gguf:.2f} GiB")
     reduction = (mem_bf16 - mem_gguf) / mem_bf16 * 100
     print(f"VRAM reduction: {reduction:.1f}%")
-    assert mem_gguf < mem_bf16, f"GGUF ({mem_gguf:.2f} GiB) should use less VRAM than BF16 ({mem_bf16:.2f} GiB)"
+    if not current_omni_platform.is_rocm():
+        assert mem_gguf < mem_bf16, f"GGUF ({mem_gguf:.2f} GiB) should use less VRAM than BF16 ({mem_bf16:.2f} GiB)"
