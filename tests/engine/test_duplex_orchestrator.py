@@ -23,7 +23,12 @@ from tests.engine.test_orchestrator import (
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
-from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.contracts import (
+    DuplexFence,
+    DuplexStageRequestContext,
+    DuplexStageSubmission,
+    duplex_resource_request_id,
+)
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -290,6 +295,53 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     await _close(orchestrator, rpc_q)
     assert clients[0].abort_calls == [[request_id]]
     assert counter.value == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_threads_resumable_false_into_the_engine_core_request() -> None:
+    """Ephemeral turn-commit submissions must not resume a finished ordinary request."""
+    counter = FakeRunningCounter()
+    orchestrator, clients, rpc_q, _ = _build(running_counter=counter)
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+    request_state = orchestrator.request_states[request_id]
+    context = DuplexStageRequestContext(
+        request_id=request_id,
+        session_id=SESSION_ID,
+        fence=DuplexFence(SESSION_ID),
+        stage_id=0,
+        final_stage_id=0,
+        config_generation=request_state.config_generation,
+        sampling_params=tuple(request_state.sampling_params_list),
+    )
+    result = await orchestrator.submit(
+        DuplexStageSubmission(
+            context=context,
+            prompt={"prompt_token_ids": [1]},
+            already_submitted=False,
+            resumable=False,
+        )
+    )
+    assert result.request_id == request_id
+    assert len(clients[0].add_request_calls) == 1
+    submitted = clients[0].add_request_calls[0][0]
+    assert submitted.request_id == request_id
+    assert submitted.resumable is False
+    assert counter.value == 1
+
+    await orchestrator.submit(
+        DuplexStageSubmission(
+            context=context,
+            prompt={"prompt_token_ids": [1, 2]},
+            already_submitted=True,
+            resumable=False,
+        )
+    )
+    assert len(clients[0].add_request_calls) == 2
+    assert clients[0].add_request_calls[1][0].resumable is False
+    assert counter.value == 1
+
+    await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio

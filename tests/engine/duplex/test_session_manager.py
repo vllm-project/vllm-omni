@@ -196,7 +196,13 @@ class FakePlugin(DuplexModelPlugin):
 
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         del max_sessions
-        return DuplexCapabilities(supports_input_append=True)
+        # Match MiniCPM-o 4.5: a resident Stage0 request (``...r.stage0``).
+        # Leaving ``supports_core_resumable_request`` at its dataclass default
+        # (False) would mint turn-scoped ids, which this harness is not.
+        return DuplexCapabilities(
+            supports_input_append=True,
+            supports_core_resumable_request=True,
+        )
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         pass
@@ -408,7 +414,10 @@ async def test_open_answers_with_capabilities_and_emits_session_created() -> Non
         assert result.control_id == "open-sid-open"
         assert result.session_id == "sid-open"
         assert result.lease_generation == 0
-        assert result.capabilities == DuplexCapabilities(supports_input_append=True)
+        assert result.capabilities == DuplexCapabilities(
+            supports_input_append=True,
+            supports_core_resumable_request=True,
+        )
         assert result.public_session is not None
         assert result.public_session["id"] == "sid-open"
         assert result.public_session["voice"] == "test"

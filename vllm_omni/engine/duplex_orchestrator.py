@@ -311,7 +311,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             prompt=dict(submission.prompt),
             params=context.stage_sampling_params,
             model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
-            resumable=True,
+            resumable=submission.resumable,
         )
         request.external_req_id = request.request_id
         pool = self.stage_pools[context.stage_id]
