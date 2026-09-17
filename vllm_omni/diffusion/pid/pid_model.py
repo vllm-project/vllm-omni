@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -152,20 +152,20 @@ class PidInferenceModel(nn.Module):
         """Return compiled net for this shape, or eager net if compile is off."""
         if not self._compile_enabled:
             return self.net
+        self.net.precompute_positional_caches(
+            image_height=image_h,
+            image_width=image_w,
+            text_length=text_len,
+            device=device,
+            pixel_dtype=self.precision,
+        )
         key = (int(image_h), int(image_w))
         compiled = self._compiled_nets.get(key)
         if compiled is None:
             logger.info(
-                "PidInferenceModel: warming pos caches + compiling net for %dx%d",
+                "PidInferenceModel: compiling net for %dx%d",
                 image_h,
                 image_w,
-            )
-            self.net.precompute_positional_caches(
-                image_height=image_h,
-                image_width=image_w,
-                text_length=text_len,
-                device=device,
-                pixel_dtype=self.precision,
             )
             compiled = torch.compile(self.net, mode=self._compile_mode, dynamic=False)
             self._compiled_nets[key] = compiled
@@ -263,13 +263,14 @@ class PidInferenceModel(nn.Module):
         """
         if isinstance(caption, str):
             caption = [caption]
-        B = len(caption)
-
-        # Some upstream pipelines may leave allow_tf32=False, which penalises
-        # every fp32 Linear (AdaLN projections, controlnet gate) even under
-        # autocast(bf16).  Restoring it costs nothing and keeps A100 perf
-        # predictable.
-        # torch.backends.cuda.matmul.allow_tf32 = True
+        # The runner passes one request's latents as a single batch ([n, C, zH,
+        # zW] for num_outputs_per_prompt = n) with a single caption string, so
+        # broadcast the caption to the latent batch size.
+        B = int(lq_latent.shape[0])
+        if len(caption) == 1 and B > 1:
+            caption = caption * B
+        elif len(caption) != B:
+            raise ValueError(f"PiD decode: caption count ({len(caption)}) must be 1 or match latent batch size ({B})")
 
         # Use tensor_kwargs (dtype-only; device derived from lq_latent at
         # call time) to match the original PixelDiTModel: the student was
@@ -295,21 +296,19 @@ class PidInferenceModel(nn.Module):
 
         effective_steps = num_steps or self._cfg.student_sample_steps
 
+        autocast_ctx = torch.autocast(device.type, dtype=self.autocast_dtype) if self.autocast_dtype else nullcontext()
         if effective_steps == 1:
-            t_student = torch.full(
-                (B,),
-                self._cfg.student_t_list[0],
-                **tensor_kwargs,
-            )
+            t_student = torch.full((B,), self._cfg.student_t_list[0], **tensor_kwargs)
             t_scaled = t_student * self._cfg.fm_timescale
-            v = net(
-                noise,
-                t_scaled,
-                caption_embs,
-                lq_latent=lq_latent,
-                degrade_sigma=degrade_sigma_tensor,
-            )
-            x0 = self._velocity_to_x0(noise, v, t_student)
+            with autocast_ctx:
+                v = net(
+                    noise,
+                    t_scaled,
+                    caption_embs,
+                    lq_latent=lq_latent,
+                    degrade_sigma=degrade_sigma_tensor,
+                )
+                x0 = self._velocity_to_x0(noise, v, t_student)
         else:
             t_list = self._get_t_list(device, effective_steps)
             x0 = self._sample_loop(

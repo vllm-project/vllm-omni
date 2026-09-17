@@ -91,7 +91,7 @@ All flags live in the `omni_config_group` and are prefixed with `--pid-`.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--pid-enable` | flag (bool) | `False` | Master switch. When set, the matching `--pid-*` keys are packed into a `pid_decode` dict. |
+| `--enable-pid` | flag (bool) | `False` | Master switch. When set, the matching `--pid-*` keys are packed into a `pid_decode` dict. |
 | `--pid-checkpoint` | str | `None` | PiD decoder checkpoint: a local `.pth` path, an HF reference `<repo>/<subfolder>/<file>`, or `None` for auto-download. |
 | `--pid-gemma` | str | `Efficient-Large-Model/gemma-2-2b-it` | Gemma text encoder used by PiD (HF id or a local directory). |
 
@@ -99,7 +99,7 @@ All flags live in the `omni_config_group` and are prefixed with `--pid-`.
 > flags. They default in `PidDecodeConfig` and can be overridden **per
 > request** through `pid_decode` (see §4).
 
-**Packing logic** (`AsyncOmniEngine.__init__`): when `--pid-enable` is set,
+**Packing logic** (`AsyncOmniEngine.__init__`): when `--enable-pid` is set,
 the engine pops the two keys above from `kwargs` and re-injects a single
 `pid_decode` dict using the **config field names**:
 
@@ -152,10 +152,10 @@ Accepted keys (all optional): `enabled`, `scale`, `num_steps`, `seed`,
 `degrade_sigma`. The override is applied with `dataclasses.replace` on the
 frozen `PidDecodeConfig`, so the pipeline-level config is never mutated.
 
-| Override `enabled` | Startup `--pid-enable` | Behaviour |
+| Override `enabled` | Startup `--enable-pid` | Behaviour |
 |---|---|---|
 | `False` | any | Skip PiD, use VAE (a mixed batch falls back entirely — the batch `output_type` is uniform). |
-| `True` | `False` | **Error** — PiD weights are not lazily loaded; restart with `--pid-enable`. |
+| `True` | `False` | **Error** — PiD weights are not lazily loaded; restart with `--enable-pid`. |
 | `True` | `True` | Run PiD with per-request overrides. |
 | `None` / absent | `True` | Run PiD with pipeline-level config. |
 
@@ -384,7 +384,7 @@ channel error at inference.
 
 1. `pytest -s -v tests/diffusion/pid/ -m "core_model and cpu"` — table +
    gating + shape validation.
-2. Start with `--pid-enable` and send a request; the output size must be
+2. Start with `--enable-pid` and send a request; the output size must be
    `LDM size × scale` (see `PiD_TEST_GUIDE.md` L2/L3).
 
 ---
@@ -396,7 +396,7 @@ channel error at inference.
 ```bash
 vllm serve Qwen/Qwen-Image --omni \
   --port 8091 \
-  --pid-enable \
+  --enable-pid \
   --pid-checkpoint /path/to/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth \
   --pid-gemma /path/to/gemma-2-2b-it
 ```
@@ -410,7 +410,7 @@ tune those per request via `pid_decode`.
 
 ### Per-request override via HTTP API
 
-Once the server is started with `--pid-enable`, individual requests can
+Once the server is started with `--enable-pid`, individual requests can
 tune or disable PiD. Send `pid_decode` inside the request body:
 
 ```json

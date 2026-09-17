@@ -481,6 +481,9 @@ class StageDeployConfig:
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
+    # PiD super-resolution decoder settings; canonical packed form of the
+    # flat --enable-pid/--pid-checkpoint/--pid-gemma CLI flags.
+    pid_decode: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # PixelDiT T2I — consolidated network architecture.
 # Verbatim copy from the original PixelDiT repo, merged into a single file.
 # Sources:
@@ -351,27 +351,43 @@ class PatchTokenEmbedder(nn.Module):
         return x
 
 
+class _BoundedTensorCache:
+    """FIFO-bounded cache for positional-embedding tensors."""
+
+    def __init__(self, max_entries: int = 8):
+        self._max_entries = max_entries
+        self._entries: dict[tuple | int, torch.Tensor] = {}
+
+    def get(self, key):
+        return self._entries.get(key)
+
+    def put(self, key, value):
+        self._entries[key] = value
+        while len(self._entries) > self._max_entries:
+            self._entries.pop(next(iter(self._entries)))
+
+
 class PixelTokenEmbedder(nn.Module):
     def __init__(self, in_channels: int, hidden_size_output: int):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_size_output = int(hidden_size_output)
         self.proj = nn.Linear(self.in_channels, self.hidden_size_output, bias=True)
-        self._pos_cache = dict()
+        self._pos_cache = _BoundedTensorCache()
 
     def _fetch_pixel_pos_patch(self, patch_size: int, device, dtype):
         key = ("patch", patch_size)
-        if key in self._pos_cache:
-            pe = self._pos_cache[key]
+        pe = self._pos_cache.get(key)
+        if pe is not None:
             return pe.to(device=device, dtype=dtype)
         pos = get_2d_sincos_pos_embed(self.hidden_size_output, patch_size).to(device=device, dtype=dtype)  # [P2, D]
-        self._pos_cache[key] = pos
+        self._pos_cache.put(key, pos)
         return pos
 
     def _fetch_pixel_pos_image(self, height: int, width: int, device, dtype):
         key = ("image", height, width)
-        if key in self._pos_cache:
-            pe = self._pos_cache[key]
+        pe = self._pos_cache.get(key)
+        if pe is not None:
             return pe.to(device=device, dtype=dtype)
         if height == width:
             pos = get_2d_sincos_pos_embed(self.hidden_size_output, height).to(device=device, dtype=dtype)  # [H*W, D]
@@ -382,7 +398,7 @@ class PixelTokenEmbedder(nn.Module):
             grid = torch.meshgrid(grid_w, grid_h, indexing="xy")  # w first to match existing convention
             grid = torch.stack(grid, dim=0).reshape(2, 1, height, width)
             pos = get_2d_sincos_pos_embed_from_grid(self.hidden_size_output, grid).to(device=device, dtype=dtype)
-        self._pos_cache[key] = pos
+        self._pos_cache.put(key, pos)
         return pos
 
     def forward(
@@ -461,12 +477,12 @@ class PiTBlock(nn.Module):
         self.norm2 = RMSNorm(self.pixel_dim, eps=1e-6)
         self.mlp = MLP(self.pixel_dim, mlp_ratio=mlp_ratio, drop=0.0)
         self.adaLN_modulation = nn.Sequential(nn.Linear(self.context_dim, 6 * self.pixel_dim * p2, bias=True))
-        self._pos_cache = dict()
+        self._pos_cache = _BoundedTensorCache()
 
     def _fetch_pos(self, height: int, width: int, device):
-        key = (height, width)
-        if key in self._pos_cache:
-            return self._pos_cache[key].to(device)
+        pos = self._pos_cache.get((height, width))
+        if pos is not None:
+            return pos.to(device)
         head_dim = self.attn_dim // self.num_heads
         if self.rope_mode == "ntk_aware":
             pos = precompute_freqs_cis_2d_ntk(head_dim, height, width, self.rope_ref_grid_h, self.rope_ref_grid_w).to(
@@ -474,7 +490,7 @@ class PiTBlock(nn.Module):
             )
         else:
             pos = precompute_freqs_cis_2d(head_dim, height, width).to(device)
-        self._pos_cache[key] = pos
+        self._pos_cache.put((height, width), pos)
         return pos
 
     def forward(
@@ -631,8 +647,6 @@ class MMDiTJointAttention(nn.Module):
             # SP: image stream sharded along Nx, text stream replicated as a
             # joint-front KV context. vLLM-Omni Attention internally handles
             # Ulysses (all-to-all) / Ring / AllGather-KV for the image query.
-            # The text stream's own attention output is not produced (same as
-            # Qwen-Image under SP) -> its residual stays unchanged.
             if attn_mask is not None:
                 logger.warning_once("MMDiTJointAttention: attention mask ignored under sequence parallelism.")
             md = AttentionMetadata(
@@ -641,13 +655,10 @@ class MMDiTJointAttention(nn.Module):
                 joint_value=vy,
                 joint_strategy="front",
             )
-            # The Ulysses/Ring strategies re-concatenate the joint text to the
-            # front of the output ([Ny + Nx, H, Hc]), so drop the text part and
-            # keep only the (sharded) image tokens.
-            out_x = self.vattn(qx, kx, vx, md)  # [B, Ny + Nx, H, Hc]
-            out_x = out_x[:, Ny:, :, :]
-            out_x = out_x.reshape(B, Nx, C)
-            out_y = torch.zeros_like(y)
+
+            out_joint = self.vattn(qx, kx, vx, md)  # [B, Ny + Nx, H, Hc]
+            out_y = out_joint[:, :Ny, :, :].reshape(B, Ny, C)
+            out_x = out_joint[:, Ny:, :, :].reshape(B, Nx, C)
         else:
             # SDPA expects [B, H, S, Hc]; build joint sequence [text, image].
             qx = qx.transpose(1, 2)
@@ -853,16 +864,17 @@ class PixDiT_T2I(nn.Module):
         # produces the patch/pixel/RoPE tensors the _sp_plan shards together).
         self.pid_prepare = PiDPrepare()
 
-        self.precompute_pos = dict()
-        self.precompute_pos_txt = dict()  # cache for 1D text RoPE
+        self.precompute_pos = _BoundedTensorCache()
+        self.precompute_pos_txt = _BoundedTensorCache()  # cache for 1D text RoPE
         self.last_repa_tokens = None
 
     def _sp_active(self) -> bool:
         return is_forward_context_available() and bool(get_forward_context().sp_active)
 
     def fetch_pos(self, height, width, device):
-        if (height, width) in self.precompute_pos:
-            return self.precompute_pos[(height, width)].to(device)
+        pos = self.precompute_pos.get((height, width))
+        if pos is not None:
+            return pos.to(device)
         head_dim = self.hidden_size // self.num_groups
         if self.rope_mode == "ntk_aware":
             pos = precompute_freqs_cis_2d_ntk(head_dim, height, width, self.rope_ref_grid_h, self.rope_ref_grid_w).to(
@@ -870,12 +882,13 @@ class PixDiT_T2I(nn.Module):
             )
         else:
             pos = precompute_freqs_cis_2d(head_dim, height, width).to(device)
-        self.precompute_pos[(height, width)] = pos
+        self.precompute_pos.put((height, width), pos)
         return pos
 
     def fetch_pos_text(self, length, device):
-        if length in self.precompute_pos_txt:
-            return self.precompute_pos_txt[length].to(device)
+        pos = self.precompute_pos_txt.get(length)
+        if pos is not None:
+            return pos.to(device)
         # Build 1D RoPE freqs for text stream using the same per-head dim as image.
         head_dim = self.hidden_size // self.num_groups
         freqs = 1.0 / (self.text_rope_theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
@@ -883,7 +896,7 @@ class PixDiT_T2I(nn.Module):
         angles = positions * freqs.unsqueeze(0)  # [length, head_dim//2]
         # Real (cos, sin) layout [length, head_dim//2, 2] consumed by `apply_rotary_emb`.
         freqs_cis = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
-        self.precompute_pos_txt[length] = freqs_cis
+        self.precompute_pos_txt.put(length, freqs_cis)
         return freqs_cis
 
     @torch.no_grad()

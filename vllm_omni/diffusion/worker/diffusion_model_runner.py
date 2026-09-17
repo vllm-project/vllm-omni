@@ -53,12 +53,12 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
-from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.pid import (
     decode_stepwise_output,
     maybe_pid_passthrough,
     stepwise_pid_active,
 )
+from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (

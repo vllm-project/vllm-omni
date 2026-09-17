@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Centralized latent-form adaptation table (Plan B).
 
 Maps each pipeline family to (PiD backbone, ``to_x0`` pure function) that

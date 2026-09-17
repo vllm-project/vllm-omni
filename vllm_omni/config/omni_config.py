@@ -827,6 +827,7 @@ class _DiffusionConfigProjection:
     lora_backend: str = "peft"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
+    pid_decode: dict[str, Any] | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.

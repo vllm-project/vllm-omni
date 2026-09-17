@@ -22,7 +22,7 @@ MODEL = "Qwen/Qwen-Image"
 _PID_SERVER = [
     pytest.param(
         OmniServerParams(
-            model=MODEL, server_args=["--pid-enable", "--pid-gemma", "Efficient-Large-Model/gemma-2-2b-it"]
+            model=MODEL, server_args=["--enable-pid", "--pid-gemma", "Efficient-Large-Model/gemma-2-2b-it"]
         ),
         id="pid_enabled",
         marks=hardware_marks(res={"cuda": "H100"}),
@@ -54,7 +54,7 @@ def _minimal_body(omni_server) -> dict[str, Any]:
 )
 @pytest.mark.parametrize("omni_server", _PID_SERVER, indirect=True)
 def test_images_generations_invalid_pid_decode(omni_server, openai_client, pid_decode, err_code, err_message) -> None:
-    """Malformed ``pid_decode`` values on a server started with ``--pid-enable`` -> 4xx/5xx."""
+    """Malformed ``pid_decode`` values on a server started with ``--enable-pid`` -> 4xx/5xx."""
     body = _minimal_body(omni_server)
     body["pid_decode"] = pid_decode
     openai_client.send_images_generations_http_request(
@@ -62,16 +62,15 @@ def test_images_generations_invalid_pid_decode(omni_server, openai_client, pid_d
     )
 
 
-@pytest.mark.parametrize("omni_server_function", _NO_PID_SERVER, indirect=True)
-def test_images_generations_pid_enabled_without_server_flag(omni_server_function, openai_client_function) -> None:
-    """``pid_decode.enabled=True`` on a server without ``--pid-enable`` -> 4xx/5xx (mixin RuntimeError)."""
-    body = _minimal_body(omni_server_function)
+@pytest.mark.parametrize("omni_server", _NO_PID_SERVER, indirect=True)
+def test_images_generations_pid_enabled_without_server_flag(omni_server, openai_client) -> None:
+    body = _minimal_body(omni_server)
     body["pid_decode"] = {"enabled": True, "scale": 4}
-    openai_client_function.send_images_generations_http_request(
+    openai_client.send_images_generations_http_request(
         {
             "json": body,
             "timeout": 300,
             "err_code": (400, 500),
-            "err_message": "--pid-enable",
+            "err_message": "--enable-pid",
         }
     )
