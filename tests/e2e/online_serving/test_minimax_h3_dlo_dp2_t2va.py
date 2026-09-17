@@ -51,7 +51,18 @@ SERVER_ARGS = [
     "--vae-parallel-mode",
     "tile",
     "--vae-use-tiling",
-    "--enable-distributed-layerwise-offload",
+    "--diffusion-offload-config",
+    json.dumps(
+        {
+            "mode": "layer",
+            "components": ["dit", "text_encoder"],
+            "layer_options": {
+                "dit": {"weight_transfer": "allgather"},
+                "text_encoder": {"weight_transfer": "rank-local"},
+            },
+        },
+        separators=(",", ":"),
+    ),
 ]
 
 
@@ -100,7 +111,6 @@ def _run_t2va_request(client: OpenAIClientHandler, seed: int) -> bytes:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.slow
 @pytest.mark.parametrize(
     "omni_server",
     [

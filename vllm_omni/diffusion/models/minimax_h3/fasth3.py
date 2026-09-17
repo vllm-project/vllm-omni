@@ -114,6 +114,7 @@ _BLOCK_TARGETS = {
     "attn.to_k": ("attn.qkv_proj", _QKV_K),
     "attn.to_v": ("attn.qkv_proj", _QKV_V),
     "attn.to_out.0": ("attn.out_proj", _PLAIN),
+    "attn.to_gate_compress": ("attn.to_gate_compress", _PLAIN),
     "ff.net.0.proj": ("mlp.fc1", _SWAP_HALVES),
     "ff.net.2": ("mlp.fc2", _PLAIN),
     "adaln_proj.linear": ("adaln_proj.linear", _PLAIN),
@@ -121,11 +122,36 @@ _BLOCK_TARGETS = {
     "norm2": ("norm2", _PLAIN),
 }
 
+# The attention role MiniMaxH3Attention gives its 50 DiT blocks. The
+# compression gates live on exactly these layers, so this is the role whose
+# resolved backend decides whether the artifact runs sparse.
+_H3_DIT_ATTENTION_ROLE = "self"
+
 # Adapter block prefix -> native block prefix.
 _BLOCK_PREFIXES = (
     ("token_refiner.refiner_blocks.", "token_refiner.blocks."),
     ("transformer_blocks.", "blocks."),
 )
+
+
+def _resolve_dit_attention_backend(od_config: Any) -> str:
+    """The backend the 50-block H3 DiT will actually resolve to.
+
+    The DiT's attention layers carry role ``"self"``, so a ``per_role`` entry
+    overrides the default for exactly the layers the compression gates live on.
+    Reading only the default would accept a config that runs the sparse student
+    dense, and reject a per-role-only config that is correct.
+    """
+    attention_config = getattr(od_config, "diffusion_attention_config", None)
+    per_role = getattr(attention_config, "per_role", None) or {}
+    spec = per_role.get(_H3_DIT_ATTENTION_ROLE)
+    if spec is not None:
+        return str(getattr(spec, "backend", "") or "").upper()
+    backend = str(getattr(od_config, "diffusion_attention_backend", "") or "").upper()
+    if backend:
+        return backend
+    default_spec = getattr(attention_config, "default", None)
+    return str(getattr(default_spec, "backend", "") or "").upper()
 
 
 class FastH3AdapterError(ValueError):
@@ -305,11 +331,16 @@ class FastH3WeightFusion:
         patches: Mapping[str, _ParamPatch],
         head_dim: int,
         requires_vsa: bool,
+        injections: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
         self._source = source
         self._patches = dict(patches)
         self._head_dim = head_dim
         self.requires_vsa = requires_vsa
+        # Parameters the base checkpoint does not carry, assigned into the
+        # stream instead of fused onto an existing weight.
+        self._injections = dict(injections or {})
+        self._injected: set[str] = set()
         self._applied: set[str] = set()
         self._device: torch.device | None = None
 
@@ -352,6 +383,7 @@ class FastH3WeightFusion:
 
         patches: dict[str, _ParamPatch] = {}
         gate_tensors: list[str] = []
+        injections: dict[str, torch.Tensor] = {}
         unmapped: list[str] = []
         blocks_seen: dict[str, set[int]] = {}
         counted = {"low_rank_tensors": 0, "diff_tensors": 0}
@@ -365,12 +397,20 @@ class FastH3WeightFusion:
                     unmapped.append(name)
                     continue
                 module, role = split
-                if role == "set_weight":
-                    # A VSA compression gate: a module the base transformer does
-                    # not have, so there is nothing to fuse it into.
-                    gate_tensors.append(name)
-                    continue
                 target = _resolve_native_target(module)
+                if role == "set_weight":
+                    # A VSA compression gate. The base transformer has no such
+                    # parameter, so this is assigned into the stream rather than
+                    # fused onto an existing weight.
+                    if target is None:
+                        unmapped.append(name)
+                        continue
+                    native_module, _, block = target
+                    if block is not None:
+                        blocks_seen.setdefault(block[0], set()).add(block[1])
+                    gate_tensors.append(name)
+                    injections[f"{native_module}.weight"] = checkpoint.get_tensor(name)
+                    continue
                 if target is None:
                     unmapped.append(name)
                     continue
@@ -422,6 +462,7 @@ class FastH3WeightFusion:
             patches=patches,
             head_dim=head_dim,
             requires_vsa=bool(gate_tensors),
+            injections=injections,
         )
         logger.info(
             "FastH3 adapter %s: rank=%s, parameters patched=%d, low-rank=%s, diff=%s, set_weight=%d",
@@ -510,24 +551,48 @@ class FastH3WeightFusion:
             # server would serve base H3 weights on the student's ladder.
             raise FastH3AdapterError(f"{self._source} has already been fused into this checkpoint")
         for name, weight in weights:
+            if name in self._injections:
+                raise FastH3AdapterError(
+                    f"the checkpoint already provides {name}, which this adapter assigns; "
+                    "assigning it would discard the checkpoint's own weight"
+                )
             yield name, self.fuse(name, weight)
+        # The VSA gates have no counterpart in the base checkpoint, so they join
+        # the stream after it rather than being folded into one of its tensors.
+        for name, weight in self._injections.items():
+            self._injected.add(name)
+            yield name, weight
 
-    def validate_fully_applied(self) -> None:
+    def validate_fully_applied(self, loaded: Iterable[str] | None = None) -> None:
         """Close the fusion: every edit must have met its parameter.
 
         A silently unapplied delta is the failure mode that matters here: the
         model would load and generate, just not as the distilled student. The
         weights are loaded once, so the mapped payloads are dropped afterwards
         rather than held for the life of the process.
+
+        ``loaded`` is the set of parameter names ``load_weights`` actually
+        consumed. A gate is assigned rather than fused, so it lands on a module
+        the base transformer does not have; if that module was never built,
+        ``load_weights`` only logs a skip and the server would serve a
+        zero-initialized gate. Yielding a tensor is not evidence it arrived, so
+        the injections are closed against that set when it is available.
         """
         missing = sorted(set(self._patches) - self._applied)
         if missing:
             raise FastH3AdapterError(
                 f"FastH3 adapter edits {len(missing)} parameters the checkpoint never provided: {missing[:5]}"
             )
+        arrived = self._injected if loaded is None else set(loaded)
+        uninjected = sorted(set(self._injections) - arrived)
+        if uninjected:
+            raise FastH3AdapterError(
+                f"FastH3 adapter assigns {len(uninjected)} parameters that never reached the model: {uninjected[:5]}"
+            )
         for patch in self._patches.values():
             patch.low_rank.clear()
             patch.diff = None
+        self._injections.clear()
 
     def check_serving_contract(
         self,
@@ -555,11 +620,22 @@ class FastH3WeightFusion:
                 f"{sorted(offloads)}. Serve it without offload."
             )
         if self.requires_vsa:
-            raise ValueError(
-                f"{self.source} is a Video Sparse Attention variant of FastH3, and its "
-                "compression gates have no counterpart in vLLM-Omni's dense H3 attention. Use the "
-                "release's Dense variant until VSA lands for H3's packed sequence."
-            )
+            backend = _resolve_dit_attention_backend(od_config)
+            if backend != "FASTVIDEO_VSA":
+                raise ValueError(
+                    f"{self.source} is a Video Sparse Attention variant of FastH3. Its compression "
+                    "gates only mean anything to the VSA kernel, and any other backend would run it "
+                    f"as dense attention on a student distilled for 90% sparsity (got {backend or 'default'}). "
+                    "Serve it with --diffusion-attention-backend FASTVIDEO_VSA."
+                )
+            parallel_config = getattr(od_config, "parallel_config", None)
+            ring_degree = int(getattr(parallel_config, "ring_degree", 1) or 1)
+            allgather_degree = int(getattr(parallel_config, "allgather_degree", 1) or 1)
+            if ring_degree != 1 or allgather_degree != 1:
+                raise ValueError(
+                    "FastH3 VSA supports local attention or pure Ulysses sequence parallelism; "
+                    "ring/all-gather SP does not give the block-sparse kernel the complete packed sequence."
+                )
         logger.info(
             "FastH3 adapter active: sigma points %s for %d transformer forwards, "
             "flow_shift=%g, audio_flow_shift=%g, tasks=%s",

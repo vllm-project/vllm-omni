@@ -10,10 +10,22 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -133,17 +145,25 @@ class _CompileTrackingModel:
 
 
 def _make_request():
-    sampling_params = SimpleNamespace(
-        generator=None,
-        seed=None,
-        generator_device=None,
-        num_inference_steps=4,
-    )
+    sampling_params = OmniDiffusionSamplingParams(num_inference_steps=4)
     return SimpleNamespace(
         request_id="req-test",
         prompt="a prompt",
         sampling_params=sampling_params,
         kv_sender_info=None,
+    )
+
+
+def _raw_video_media(batch_size: int = 1, tensor: torch.Tensor | None = None) -> DiffusionMediaOutput:
+    return DiffusionMediaOutput(
+        video=VideoMediaOutput(
+            tensor=tensor if tensor is not None else torch.randn(batch_size, 3, 2, 4, 5),
+            spec=VideoTensorSpec(
+                layout=VideoTensorLayout.BCTHW,
+                encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+            ),
+        )
     )
 
 
@@ -179,6 +199,30 @@ def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
     assert events == [backend]
 
 
+def test_release_captured_graphs_clears_runners_and_delegates_to_the_pipeline():
+    """Both halves in one place, so a pipeline that keeps captures is collected
+    without the caller knowing which pipelines have one."""
+    released = []
+    runner = object.__new__(DiffusionModelRunner)
+    runner.graph_runners = {"decode": object()}
+    runner.pipeline = SimpleNamespace(release_captured_graphs=lambda: released.append(True))
+
+    runner.release_captured_graphs()
+
+    assert runner.graph_runners == {}
+    assert released == [True]
+
+
+def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
+    """Most pipelines keep none, and the runner may not carry `graph_runners`."""
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = object()
+
+    runner.release_captured_graphs()
+
+    assert not hasattr(runner, "graph_runners")
+
+
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -193,6 +237,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         enable_cache_dit_summary=enable_cache_dit_summary,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
+        video_output_transport=VideoOutputTransportConfig(),
     )
     runner.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
         vllm_config=runner.vllm_config,
@@ -223,6 +268,158 @@ def _make_compile_runner(
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
     )
     return runner
+
+
+class _EnabledCacheBackend:
+    def __init__(self):
+        self.refresh_calls = []
+
+    def is_enabled(self):
+        return True
+
+    def refresh(self, pipeline, num_inference_steps, verbose=True):
+        self.refresh_calls.append((pipeline, num_inference_steps, verbose))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default():
+    cache_backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
+    runner.pipeline.default_num_inference_steps = 50
+    req = _make_request()
+
+    custom_timesteps = torch.linspace(999.0, 0.0, 8)
+    custom_sigmas = [0.9, 0.5, 0.1]
+    cases = [
+        (20, None, None),
+        (30, custom_timesteps, custom_sigmas),
+        (None, custom_timesteps, None),
+        (None, custom_timesteps, custom_sigmas),
+        (None, None, custom_sigmas),
+        (None, None, None),
+    ]
+    for num_inference_steps, timesteps, sigmas in cases:
+        req.sampling_params.num_inference_steps = num_inference_steps
+        req.sampling_params.timesteps = timesteps
+        req.sampling_params.sigmas = sigmas
+        DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+
+    assert [steps for _, steps, _ in cache_backend.refresh_calls] == [20, 30, 8, 8, 3, 50]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+    cache_backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
+    req = _make_request()
+    req.sampling_params.num_inference_steps = None
+
+    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+
+    assert cache_backend.refresh_calls == []
+    assert "requires num_inference_steps to be passed explicitly" in caplog.text
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_falls_back_to_full_forward_without_creating_step_state(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _SingleRequestDiffusionOutputPipeline()
+    request = _make_request()
+    request.request_id = "text-request"
+    request.use_step_execution = False
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=request.request_id,
+                req=request,
+                diffusion_kv_metadata=None,
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+
+    result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    output = result.get_request_output(request.request_id)
+
+    assert output.finished is True
+    assert output.step_index == 0
+    assert output.result is not None
+    assert output.result.output == request.prompt
+    assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
+    assert runner.pipeline.last_req.num_reqs == 1
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypatch):
+    """A finished step request must not survive into a text fallback wave."""
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _SingleRequestDiffusionOutputPipeline()
+    runner.state_cache = {"aborted-step-request": object()}
+    old_step_batch = object()
+    runner.input_batch = old_step_batch
+    runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    runner.remove_diffusion_kv_requests = Mock()
+
+    text_request = _make_request()
+    text_request.request_id = "text-fallback-request"
+    text_request.use_step_execution = False
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"aborted-step-request"},
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=text_request.request_id,
+                req=text_request,
+                diffusion_kv_metadata=None,
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+
+    result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    assert result.get_request_output(text_request.request_id).finished is True
+    assert runner.state_cache == {}
+    runner.remove_diffusion_kv_requests.assert_called_once_with(["aborted-step-request"])
+    assert runner.input_batch is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_rejects_mixed_step_and_full_forward_batch():
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    non_step_request = _make_request()
+    non_step_request.use_step_execution = False
+    step_request = _make_request()
+    step_request.request_id = "step-request"
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=non_step_request.request_id,
+                req=non_step_request,
+                diffusion_kv_metadata=None,
+            ),
+            SimpleNamespace(
+                request_id=step_request.request_id,
+                req=step_request,
+                diffusion_kv_metadata=None,
+            ),
+        ],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    with pytest.raises(ValueError, match="Cannot mix stepwise and non-step fallback"):
+        DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
 
 
 @pytest.mark.core_model
@@ -311,20 +508,23 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch, caplog):
+def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch):
     model = _CompileTrackingModel()
     runner = _make_compile_runner(model)
+    warning = Mock()
 
     def _regionally_compile(*args, **kwargs):
         raise RuntimeError("compile setup failed")
 
     monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+    monkeypatch.setattr(model_runner_module.logger, "warning", warning)
 
     DiffusionModelRunner._compile_transformer(runner, "transformer")
 
     assert runner.pipeline.transformer is model
-    assert "failed before activation" in caplog.text
-    assert "lazy compilation errors" in caplog.text
+    warning.assert_called_once()
+    assert "failed before activation" in warning.call_args.args[0]
+    assert "lazy compilation errors" in warning.call_args.args[0]
 
 
 @pytest.mark.core_model
@@ -368,6 +568,48 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     fourth = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert fourth.get_request_output("req").result == chunks[1]
     assert fourth.get_request_output("req").finished is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_prepares_typed_media(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _ChunkStepPipeline([DiffusionOutput(media=_raw_video_media())])
+    runner.od_config.streaming_output = True
+    runner.od_config.step_execution = True
+    runner.od_config.video_output_transport = VideoOutputTransportConfig(enable_device_postprocess=True)
+    req = OmniDiffusionRequest(
+        prompt="a prompt",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+        request_id="req",
+    )
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=1,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=["req"]),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+    result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req").result
+
+    assert result.media.prepared_for_transport is True
+    assert result.media.video.spec.encoding is VideoTensorEncoding.UINT8_FRAMES
 
 
 @pytest.mark.core_model
@@ -427,16 +669,6 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeypatch):
-    class _EnabledCacheBackend:
-        def __init__(self):
-            self.refresh_calls = []
-
-        def is_enabled(self):
-            return True
-
-        def refresh(self, pipeline, num_inference_steps, verbose=True):
-            self.refresh_calls.append((pipeline, num_inference_steps, verbose))
-
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
@@ -653,6 +885,7 @@ def _make_batch_runner(pipeline):
         cache_backend="none",
         enable_cache_dit_summary=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        video_output_transport=VideoOutputTransportConfig(),
     )
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
@@ -774,6 +1007,21 @@ def test_execute_model_batch_uses_runner_output_helper(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_execute_model_batch_prepares_typed_media_before_return(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    runner = _make_batch_runner(_BatchPipeline(outputs=[DiffusionOutput(media=_raw_video_media())]))
+    runner.od_config.video_output_transport = VideoOutputTransportConfig(enable_device_postprocess=True)
+
+    result = DiffusionModelRunner.execute_model_batch(runner, _make_scheduler_output(num_reqs=1), runner.od_config)
+
+    prepared = result.runner_outputs[0].result.media
+    assert prepared.prepared_for_transport is True
+    assert prepared.video.spec.encoding is VideoTensorEncoding.UINT8_FRAMES
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_diffusion_output_by_request_slices_single_and_multi_request_outputs():
     reqs = [_make_request(), _make_request()]
     reqs[0].request_id = "req-0"
@@ -791,6 +1039,36 @@ def test_split_diffusion_output_by_request_slices_single_and_multi_request_outpu
     )
 
     assert single[0].output == ["img-0a", "img-0b"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_split_diffusion_output_by_request_preserves_typed_media():
+    reqs = [_make_request(), _make_request()]
+    batch = DiffusionRequestBatch(requests=reqs)
+    source = torch.randn(4, 3, 2, 4, 5)
+    result = DiffusionOutput(media=_raw_video_media(tensor=source))
+
+    outputs = split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=2)
+
+    assert [output.media.video.tensor.shape for output in outputs] == [
+        torch.Size([2, 3, 2, 4, 5]),
+        torch.Size([2, 3, 2, 4, 5]),
+    ]
+    assert all(output.media.prepared_for_transport is False for output in outputs)
+    torch.testing.assert_close(outputs[0].media.video.tensor, source[:2])
+    torch.testing.assert_close(outputs[1].media.video.tensor, source[2:])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_split_diffusion_output_by_request_validates_media_batch_dimension():
+    reqs = [_make_request(), _make_request()]
+    batch = DiffusionRequestBatch(requests=reqs)
+    result = DiffusionOutput(media=_raw_video_media(batch_size=3))
+
+    with pytest.raises(ValueError, match=r"request_count \* num_outputs_per_prompt \(4\), got 3"):
+        split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=2)
 
 
 @pytest.mark.core_model
@@ -896,6 +1174,51 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monkeypatch):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.pipeline = None
+    runner.offload_backend = None
+    runner.od_config = SimpleNamespace(
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["text_encoder"],
+            "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+        },
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
+        cache_backend="none",
+        model_class_name="Wan22Pipeline",
+        enforce_eager=True,
+        streaming_output=False,
+        step_execution=False,
+    )
+    monkeypatch.setenv("OMNI_DIFFUSION_PROMPT_EMBED_CACHE", "1")
+    runtime_init = Mock(side_effect=pytest.fail)
+    loader = Mock(side_effect=pytest.fail)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "init_diffusion_model_runner_runtime", runtime_init)
+    monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", loader)
+    enable_offload = Mock(side_effect=pytest.fail)
+    monkeypatch.setattr(model_runner_module, "enable_offload_backend", enable_offload)
+
+    with pytest.raises(ValueError, match="Prompt embedding cache cannot be combined"):
+        DiffusionModelRunner.load_model(runner)
+
+    runtime_init.assert_not_called()
+    loader.assert_not_called()
+    enable_offload.assert_not_called()
 
 
 def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):

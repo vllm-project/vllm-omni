@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -18,6 +19,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -179,6 +181,26 @@ def _preserve_vsa_all_blocks(attn_metadata: AttentionMetadata | None) -> bool:
 class FastVideoVSABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
+    @classmethod
+    def supports_packed_mask_free(cls) -> bool:
+        # FastVideo accepts variable-sized edge blocks. This lets packed
+        # [real, pad] inputs run on their valid prefix without materializing an
+        # attention mask; the implementation restores the ignored pad rows.
+        # Only forward_cuda honours packed_padding: every other platform hands
+        # the tensors straight to SDPA, which reads attn_mask and nothing else,
+        # so the pad rows would be attended as real keys.
+        return current_omni_platform.is_cuda()
+
+    @classmethod
+    def validate_available(cls) -> None:
+        if importlib.util.find_spec("fastvideo_kernel") is None:
+            raise ImportError(
+                "FASTVIDEO_VSA requires the optional fastvideo-kernel package "
+                "included in vllm-omni[vsa]. Install with `uv pip install 'vllm-omni[vsa]'` "
+                "(from source: `uv pip install -e '.[vsa]'`). "
+                "Prebuilt kernels require Linux, Python 3.12 and glibc >= 2.34."
+            )
+
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # FastVideo VSA is intended for video DiT head sizes such as 64/128.
@@ -257,8 +279,31 @@ class FastVideoVSAImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None,
         reason: str,
     ) -> torch.Tensor:
+        """Run dense SDPA, honouring the mask-free packed contract this backend claims.
+
+        ``supports_packed_mask_free`` tells the model it may skip building the
+        padding mask, so on this path there is nothing to stop SDPA attending
+        the structural pad rows as real keys. Slice to the valid prefix instead
+        and leave the pad rows zeroed, exactly as the VSA path does.
+        """
         logger.warning_once("FASTVIDEO_VSA falling back to SDPA: %s", reason)
-        return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        packed = attn_metadata.packed_padding if attn_metadata is not None else None
+        if attn_metadata is None or packed is None or attn_metadata.attn_mask is not None:
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        q_length = min(int(packed.q_length), query.shape[1])
+        kv_length = min(int(packed.kv_length), key.shape[1])
+        output = self.sdpa_fallback.forward(
+            query[:, :q_length], key[:, :kv_length], value[:, :kv_length], attn_metadata
+        )
+        if q_length == query.shape[1]:
+            return output
+        restored = torch.zeros(
+            (output.shape[0], query.shape[1], output.shape[2], output.shape[3]),
+            device=output.device,
+            dtype=output.dtype,
+        )
+        restored[:, :q_length] = output
+        return restored
 
     def _fallback_reason(
         self,
@@ -321,9 +366,22 @@ class FastVideoVSAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        original_query, original_key, original_value = query, key, value
+        original_seq_len = query.shape[1]
+        valid_seq_len = original_seq_len
+        if attn_metadata is not None and attn_metadata.packed_padding is not None:
+            valid_seq_len = attn_metadata.packed_padding.q_length
+            if attn_metadata.packed_padding.kv_length != valid_seq_len:
+                return self._fallback(
+                    original_query, original_key, original_value, attn_metadata, "packed Q/KV lengths must match"
+                )
+            query = query[:, :valid_seq_len]
+            key = key[:, :valid_seq_len]
+            value = value[:, :valid_seq_len]
+
         reason = self._fallback_reason(query, key, value, attn_metadata)
         if reason is not None:
-            return self._fallback(query, key, value, attn_metadata, reason)
+            return self._fallback(original_query, original_key, original_value, attn_metadata, reason)
 
         seq_len = query.shape[1]
         dit_seq_shape = _get_vsa_dit_seq_shape(attn_metadata)
@@ -379,6 +437,8 @@ class FastVideoVSAImpl(AttentionImpl):
             gate_compress = _get_gate_compress(attn_metadata)
             if gate_compress is None:
                 gate_compress = torch.zeros_like(query)
+            elif valid_seq_len != original_seq_len:
+                gate_compress = gate_compress[:, :valid_seq_len]
             elif gate_compress.shape != query.shape:
                 raise ValueError(f"gate_compress shape {gate_compress.shape} must match query shape {query.shape}")
             gate_tiled = torch.zeros_like(query_tiled)
@@ -397,11 +457,22 @@ class FastVideoVSAImpl(AttentionImpl):
                 self.block_size[1],
                 self.block_size[2],
             )
-            return output[:, untile_combined_index].contiguous()
+            output = output[:, untile_combined_index].contiguous()
+            if valid_seq_len == original_seq_len:
+                return output
+            restored = torch.zeros(
+                (query.shape[0], original_seq_len, query.shape[2], query.shape[3]),
+                device=query.device,
+                dtype=query.dtype,
+            )
+            restored[:, :valid_seq_len] = output
+            return restored
         except Exception as exc:
             if not self.fallback_on_error:
                 raise
-            return self._fallback(query, key, value, attn_metadata, f"VSA kernel failed: {exc}")
+            return self._fallback(
+                original_query, original_key, original_value, attn_metadata, f"VSA kernel failed: {exc}"
+            )
 
     def forward_npu(
         self,

@@ -197,6 +197,7 @@ def test_create_unique_server_pytest_params_applies_marks(tmp_path):
     assert len(by_id["test_with_mark"].values) == 1
     assert isinstance(by_id["test_with_mark"].values[0], tuple)
     assert any(m.name == "H100" for m in by_id["test_with_mark"].marks)
+    assert not any(m.name == "B200" for m in by_id["test_with_mark"].marks)
     assert not any(m.name == "H100" for m in by_id["test_without_mark"].marks)
 
 
@@ -517,6 +518,40 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
         )
 
 
+def test_num_warmups_preserves_explicit_zero():
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    assert _resolve_num_warmups({}, default=4) == 4
+    assert _resolve_num_warmups({"num_warmups": 0}, default=4) == 0
+
+
+def test_omniinteract_result_accepts_complete_artifacts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 4,
+            "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": True},
+        },
+        {"dataset_name": "omniinteract"},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_incomplete_artifacts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="artifacts are incomplete"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": False},
+            },
+            {"dataset_name": "omniinteract"},
+            4,
+        )
+
+
 def test_omni_tpot_baseline_accepts_measured_finite_sample():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -535,6 +570,7 @@ def test_omni_tpot_baseline_accepts_measured_finite_sample():
 @pytest.mark.parametrize(
     ("num_tpot_samples", "mean_tpot_ms", "match"),
     [
+        (None, 10.0, "no measurable TPOT samples"),
         (0, float("nan"), "no measurable TPOT samples"),
         (1, float("nan"), "mean_tpot_ms is not finite"),
     ],
@@ -542,14 +578,17 @@ def test_omni_tpot_baseline_accepts_measured_finite_sample():
 def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples, mean_tpot_ms, match):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
+    result = {
+        "completed": 1,
+        "Hardware": "H100",
+        "mean_tpot_ms": mean_tpot_ms,
+    }
+    if num_tpot_samples is not None:
+        result["num_tpot_samples"] = num_tpot_samples
+
     with pytest.raises(AssertionError, match=match):
         assert_result(
-            {
-                "completed": 1,
-                "Hardware": "H100",
-                "num_tpot_samples": num_tpot_samples,
-                "mean_tpot_ms": mean_tpot_ms,
-            },
+            result,
             {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
             1,
         )

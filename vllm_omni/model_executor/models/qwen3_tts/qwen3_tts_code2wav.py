@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -11,7 +14,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
@@ -496,7 +499,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             if wav.numel() == 0:
                 continue
             if wav.shape[0] > 0:
-                # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
+                # Return FP32 audio regardless of the decoder compute dtype.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
         for req_id, finished, segment_finished in zip(
@@ -552,13 +555,12 @@ class Qwen3TTSCode2Wav(nn.Module):
             subfolder="speech_tokenizer",
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
-        loaded = AutoWeightsLoader(
-            self,
-            skip_prefixes=["encoder."],
-        ).load_weights(subfolder_weights)
+        loaded = AutoWeightsLoader(self).load_weights(
+            subfolder_weights, mapper=WeightsMapper(orig_to_new_prefix={"encoder.": None})
+        )
 
         device = self.vllm_config.device_config.device
-        self.decoder.to(device=device, dtype=torch.float32)
+        self.decoder.to(device=device, dtype=self.vllm_config.model_config.dtype)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(self.decoder, "precompute_snake_caches"):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Offline E2E smoke test for CosyVoice3 zero-shot reference inference.
 
@@ -20,7 +20,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import soundfile as sf
-from huggingface_hub import snapshot_download
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
@@ -29,6 +28,7 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 MODEL_DIR_ENV = "VLLM_OMNI_COSYVOICE3_MODEL_DIR"
@@ -58,7 +58,7 @@ def _resolve_model_dir() -> Path:
     override = os.environ.get(MODEL_DIR_ENV)
     if override:
         return Path(override).expanduser().resolve()
-    return Path(snapshot_download(MODEL, allow_patterns=["*"]))
+    return Path(hf_api().snapshot_download(MODEL, allow_patterns=["*"]))
 
 
 def _reference_zero_shot_stage0_sampling(*, text: str) -> SamplingParams:

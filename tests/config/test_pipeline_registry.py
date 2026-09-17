@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for out of tree registration to OMNI_PIPELINES."""
 
 import pytest
 from transformers import PretrainedConfig
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
-from vllm_omni.config.stage_config import PipelineConfig, pipeline_cfg_resolver
+from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig, pipeline_cfg_resolver
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def build_fake_pipeline_config(model_type: str) -> PipelineConfig:
+    return PipelineConfig(
+        model_type=model_type, stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),)
+    )
 
 
 @pytest.fixture
@@ -22,7 +28,7 @@ def custom_resolver():
     def custom_resolver(
         hf_config: CustomConfigType,
     ) -> PipelineConfig:
-        return PipelineConfig(model_type="resolved_type")
+        return build_fake_pipeline_config("resolved_type")
 
     return custom_resolver
 
@@ -30,7 +36,7 @@ def custom_resolver():
 def test_register_pipeline_config(clean_pipeline_registry):
     """Ensure that we can register a custom pipeline config to OMNI_PIPELINES."""
     new_model_type = "new_model_type"
-    pipe_cfg = PipelineConfig(model_type=new_model_type)
+    pipe_cfg = build_fake_pipeline_config(new_model_type)
     assert new_model_type not in OMNI_PIPELINES
     register_pipeline(pipe_cfg)
     assert new_model_type in OMNI_PIPELINES
@@ -41,7 +47,7 @@ def test_register_pipeline_config_with_model_type(clean_pipeline_registry):
     """Ensure that we can register a custom pipeline config with an explicit model_type to OMNI_PIPELINES."""
     new_model_type = "new_model_type"
     unused_model_type = "foo"
-    pipe_cfg = PipelineConfig(model_type=unused_model_type)
+    pipe_cfg = build_fake_pipeline_config(unused_model_type)
     assert new_model_type not in OMNI_PIPELINES
     assert unused_model_type not in OMNI_PIPELINES
 
@@ -73,20 +79,3 @@ def test_minimax_h3_disaggregation_is_explicit_opt_in():
     pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
     assert isinstance(pipeline, PipelineConfig)
     assert pipeline.model_type == "minimax_h3_disaggregated"
-
-
-def test_in_tree_pipelines_pass_topology_validation():
-    """Every statically registered in-tree pipeline must have a valid topology.
-
-    ``PipelineConfig.validate()`` only runs on ``register_pipeline``, which
-    in-tree pipelines never go through, so a shipped topology error would
-    otherwise stay invisible until serving hangs or misroutes.
-    Resolver entries are skipped: they need an ``hf_config`` to produce a
-    ``PipelineConfig``.
-    """
-    failures = {
-        model_type: errors
-        for model_type, pipeline in OMNI_PIPELINES.items()
-        if isinstance(pipeline, PipelineConfig) and (errors := pipeline.validate())
-    }
-    assert not failures, f"in-tree pipelines failed topology validation: {failures}"

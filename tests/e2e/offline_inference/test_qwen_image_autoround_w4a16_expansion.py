@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E test for Qwen-Image AutoRound W4A16 quantized inference.
 
 Verifies that the W4A16 quantized Qwen-Image checkpoint loads end-to-end
@@ -47,8 +47,9 @@ def _first_request_images(outputs) -> list:
     return req_out.images
 
 
+@pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_qwen_image_autoround_w4a16_load():
     """Load the W4A16 quantized Qwen-Image model and run a minimal generation.
 
@@ -68,8 +69,9 @@ def test_qwen_image_autoround_w4a16_load():
         assert arr.std() > 1.0, "Generated image appears blank (std ≈ 0)"
 
 
+@pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_qwen_image_autoround_w4a16_generate():
     """Full generation: 512×512, 20 steps, CFG=5.0.
 

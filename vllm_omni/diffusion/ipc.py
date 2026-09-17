@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """IPC utilities for transferring large tensors via POSIX shared memory.
 
@@ -11,15 +11,32 @@ serialised through the queue.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    FloatVideoConsumer,
+    VideoColorModel,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoTransportConstraints,
+    VideoValueRange,
+)
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
+_DIFFUSION_MEDIA_WIRE_TYPE = "diffusion_media_v1"
+
+# Sentinel so compute-then-assign packing can tell "field not packed" apart from
+# "field packed to None".
+_UNSET = object()
 
 
 def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
@@ -61,9 +78,39 @@ def _array_from_shm(handle: dict[str, Any]) -> np.ndarray:
     return array
 
 
+def _unlink_shm_handle(handle: dict[str, Any]) -> None:
+    """Best-effort removal of a shared-memory segment created during packing."""
+    from multiprocessing import shared_memory
+
+    name = handle.get("name")
+    if not name:
+        return
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+    except FileNotFoundError:
+        return
+    try:
+        shm.close()
+    finally:
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _unlink_shm_handles(handles: list[dict[str, Any]]) -> None:
+    for handle in handles:
+        try:
+            _unlink_shm_handle(handle)
+        except Exception:
+            # Cleanup is best-effort; never mask the original packing failure.
+            pass
+
+
 def _tensor_to_shm(
     tensor: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
+    created: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Copy a tensor into POSIX shared memory and return a metadata handle.
 
@@ -82,14 +129,17 @@ def _tensor_to_shm(
         torch.accelerator.set_stream(d2h_stream)
         try:
             t = tensor.detach()
-            if original_dtype == torch.bfloat16:
-                t = t.to(torch.float32)
             cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
             cpu.copy_(t, non_blocking=True)
         finally:
             torch.accelerator.set_stream(old_stream)
         d2h_stream.synchronize()
         tensor = cpu
+        # numpy has no bfloat16, so widen on the host after D2H. Never widen on
+        # the accelerator before the copy: a payload that already fell back after
+        # an fp32 OOM would OOM again on a second device-side fp32 allocation.
+        if original_dtype == torch.bfloat16:
+            tensor = tensor.to(torch.float32)
     else:
         tensor = tensor.detach().cpu().contiguous()
         if original_dtype == torch.bfloat16:
@@ -101,6 +151,8 @@ def _tensor_to_shm(
             "torch_dtype": str(original_dtype),
         }
     )
+    if created is not None:
+        created.append(handle)
     return handle
 
 
@@ -120,6 +172,7 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
 def _pack_tensor_if_large(
     val: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
+    created: list[dict[str, Any]] | None = None,
 ) -> torch.Tensor | dict:
     """Replace a tensor with an SHM handle if it exceeds the threshold.
 
@@ -134,14 +187,16 @@ def _pack_tensor_if_large(
     except Exception:
         storage_bytes = view_bytes
     if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD:
-        return _tensor_to_shm(val, d2h_stream=d2h_stream)
+        return _tensor_to_shm(val, d2h_stream=d2h_stream, created=created)
     return val
 
 
-def _ndarray_to_shm(array: np.ndarray) -> dict[str, Any]:
+def _ndarray_to_shm(array: np.ndarray, created: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Copy a contiguous NumPy array into POSIX shared memory."""
     handle = _array_to_shm(array)
     handle["__ndarray_shm__"] = True
+    if created is not None:
+        created.append(handle)
     return handle
 
 
@@ -153,6 +208,7 @@ def _ndarray_from_shm(handle: dict[str, Any]) -> np.ndarray:
 def _pack_value_if_large(
     val: object,
     d2h_stream: torch.Stream | None = None,
+    created: list[dict[str, Any]] | None = None,
 ) -> object:
     """Recursively replace large tensors with SHM handles.
 
@@ -163,15 +219,19 @@ def _pack_value_if_large(
     the two in sync.
     """
     if isinstance(val, torch.Tensor):
-        return _pack_tensor_if_large(val, d2h_stream=d2h_stream)
+        return _pack_tensor_if_large(val, d2h_stream=d2h_stream, created=created)
     if isinstance(val, np.ndarray):
-        return _ndarray_to_shm(val) if not val.dtype.hasobject and val.nbytes > _SHM_TENSOR_THRESHOLD else val
+        return (
+            _ndarray_to_shm(val, created=created)
+            if not val.dtype.hasobject and val.nbytes > _SHM_TENSOR_THRESHOLD
+            else val
+        )
     if isinstance(val, dict):
-        return {key: _pack_value_if_large(value, d2h_stream=d2h_stream) for key, value in val.items()}
+        return {key: _pack_value_if_large(value, d2h_stream=d2h_stream, created=created) for key, value in val.items()}
     if isinstance(val, list):
-        return [_pack_value_if_large(item, d2h_stream=d2h_stream) for item in val]
+        return [_pack_value_if_large(item, d2h_stream=d2h_stream, created=created) for item in val]
     if isinstance(val, tuple):
-        return tuple(_pack_value_if_large(item, d2h_stream=d2h_stream) for item in val)
+        return tuple(_pack_value_if_large(item, d2h_stream=d2h_stream, created=created) for item in val)
     return val
 
 
@@ -190,18 +250,116 @@ def _unpack_if_shm_handle(val: object) -> object:
     return val
 
 
+def _pack_diffusion_media(
+    media: DiffusionMediaOutput,
+    *,
+    d2h_stream: torch.Stream | None,
+    created: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    media.validate()
+    if not media.prepared_for_transport:
+        raise ValueError("Diffusion media must be prepared before IPC packing")
+    video = media.video
+    packed_tensor = _pack_tensor_if_large(video.tensor, d2h_stream=d2h_stream, created=created)
+    if isinstance(packed_tensor, torch.Tensor) and packed_tensor.device.type != "cpu":
+        packed_tensor = packed_tensor.detach().cpu().contiguous()
+    return {
+        "__type__": _DIFFUSION_MEDIA_WIRE_TYPE,
+        "schema_version": video.schema_version,
+        "prepared_for_transport": True,
+        "video": {
+            "tensor": packed_tensor,
+            "layout": video.spec.layout.value,
+            "encoding": video.spec.encoding.value,
+            "value_range": video.spec.value_range.value,
+            "color_model": video.spec.color_model.value,
+            "pending_float_consumers": sorted(consumer.value for consumer in video.constraints.pending_float_consumers),
+        },
+    }
+
+
+def _unpack_diffusion_media(packed: dict[str, Any]) -> DiffusionMediaOutput:
+    if packed.get("__type__") != _DIFFUSION_MEDIA_WIRE_TYPE:
+        raise ValueError("Invalid diffusion media wire payload")
+    video_payload = packed.get("video")
+    if not isinstance(video_payload, dict):
+        raise ValueError("Diffusion media wire payload is missing video metadata")
+    tensor = _unpack_if_shm_handle(video_payload.get("tensor"))
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError("Diffusion media wire payload contains an invalid video tensor")
+    schema_version = packed.get("schema_version")
+    if schema_version != 1:
+        raise ValueError(f"Unsupported video media schema version: {schema_version}")
+    if packed.get("prepared_for_transport") is not True:
+        raise ValueError("Diffusion media wire payload was not prepared for transport")
+    media = DiffusionMediaOutput(
+        video=VideoMediaOutput(
+            tensor=tensor,
+            spec=VideoTensorSpec(
+                layout=VideoTensorLayout(video_payload["layout"]),
+                encoding=VideoTensorEncoding(video_payload["encoding"]),
+                value_range=VideoValueRange(video_payload["value_range"]),
+                color_model=VideoColorModel(video_payload["color_model"]),
+            ),
+            constraints=VideoTransportConstraints(
+                pending_float_consumers=frozenset(
+                    FloatVideoConsumer(value) for value in video_payload.get("pending_float_consumers", [])
+                )
+            ),
+            schema_version=1,
+        ),
+        prepared_for_transport=True,
+    )
+    media.validate()
+    return media
+
+
 def _pack_diffusion_fields(
     output: DiffusionOutput,
     d2h_stream: torch.Stream | None = None,
+    created: list[dict[str, Any]] | None = None,
+    pending_updates: list[tuple[DiffusionOutput, str, object]] | None = None,
 ) -> DiffusionOutput:
+    if output.media is not None and output.output is not None:
+        raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+    if output.media is not None and not isinstance(output.media, DiffusionMediaOutput):
+        raise TypeError(f"DiffusionOutput.media must be DiffusionMediaOutput, got {type(output.media).__name__}")
+
+    # Pack into locals first so a mid-payload failure leaves ``output`` unmutated
+    # (never enqueue a half-packed object); the caller unlinks any SHM segments
+    # accumulated in ``created`` on failure.
+    packed_output = _UNSET
     if output.output is not None:
-        output.output = _pack_value_if_large(output.output, d2h_stream=d2h_stream)
-    if output.trajectory_latents is not None and isinstance(output.trajectory_latents, torch.Tensor):
-        output.trajectory_latents = _pack_tensor_if_large(output.trajectory_latents, d2h_stream=d2h_stream)
-    if output.trajectory_timesteps is not None and isinstance(output.trajectory_timesteps, torch.Tensor):
-        output.trajectory_timesteps = _pack_tensor_if_large(output.trajectory_timesteps, d2h_stream=d2h_stream)
-    if output.trajectory_log_probs is not None and isinstance(output.trajectory_log_probs, torch.Tensor):
-        output.trajectory_log_probs = _pack_tensor_if_large(output.trajectory_log_probs, d2h_stream=d2h_stream)
+        packed_output = _pack_value_if_large(output.output, d2h_stream=d2h_stream, created=created)
+    packed_media = _UNSET
+    if output.media is not None:
+        packed_media = _pack_diffusion_media(output.media, d2h_stream=d2h_stream, created=created)
+    packed_latents = _UNSET
+    if isinstance(output.trajectory_latents, torch.Tensor):
+        packed_latents = _pack_tensor_if_large(output.trajectory_latents, d2h_stream=d2h_stream, created=created)
+    packed_timesteps = _UNSET
+    if isinstance(output.trajectory_timesteps, torch.Tensor):
+        packed_timesteps = _pack_tensor_if_large(output.trajectory_timesteps, d2h_stream=d2h_stream, created=created)
+    packed_log_probs = _UNSET
+    if isinstance(output.trajectory_log_probs, torch.Tensor):
+        packed_log_probs = _pack_tensor_if_large(output.trajectory_log_probs, d2h_stream=d2h_stream, created=created)
+
+    updates = [
+        (output, field_name, value)
+        for field_name, value in (
+            ("output", packed_output),
+            ("media", packed_media),
+            ("trajectory_latents", packed_latents),
+            ("trajectory_timesteps", packed_timesteps),
+            ("trajectory_log_probs", packed_log_probs),
+        )
+        if value is not _UNSET
+    ]
+    if pending_updates is None:
+        for target, field_name, value in updates:
+            setattr(target, field_name, value)
+    else:
+        pending_updates.extend(updates)
     return output
 
 
@@ -223,35 +381,84 @@ def pack_diffusion_output_shm(
 
     If *d2h_stream* is provided, D2H copies use that stream (non-blocking on
     the default stream).  The caller must synchronize *d2h_stream* afterward.
+
+    Packing is failure-atomic: every SHM segment created during the call is
+    tracked and unlinked if any part of the payload fails to pack, and field
+    mutations are committed only after the complete payload succeeds.
     """
+    created: list[dict[str, Any]] = []
+    pending_updates: list[tuple[DiffusionOutput, str, object]] = []
+    try:
+        packed = _pack_output_shm(
+            output,
+            d2h_stream=d2h_stream,
+            created=created,
+            pending_updates=pending_updates,
+        )
+    except BaseException:
+        _unlink_shm_handles(created)
+        raise
+
+    # Commit mutations only after every field and batch entry packed. Until
+    # this point, a failure leaves the complete caller-owned payload untouched.
+    for target, field_name, value in pending_updates:
+        setattr(target, field_name, value)
+    return packed
+
+
+def _iter_diffusion_outputs(output: object) -> Iterator[DiffusionOutput]:
+    """Yield every packable ``DiffusionOutput`` leaf in a worker payload."""
     if isinstance(output, DiffusionOutput):
-        return _pack_diffusion_fields(output, d2h_stream=d2h_stream)
+        yield output
+        return
 
     # DP multi-concurrency: {"dp_rank": int, "output": DiffusionOutput}
     if isinstance(output, dict) and "dp_rank" in output and "output" in output:
         inner = output["output"]
         if isinstance(inner, DiffusionOutput):
-            output["output"] = _pack_diffusion_fields(inner, d2h_stream=d2h_stream)
-        return output
+            yield inner
+        return
 
     if _is_rpc_result_envelope(output):
-        result = output.get("result")
-        output["result"] = pack_diffusion_output_shm(result, d2h_stream=d2h_stream)
-        return output
+        yield from _iter_diffusion_outputs(output.get("result"))
+        return
 
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):
-        output.result = _pack_diffusion_fields(result, d2h_stream=d2h_stream)
+        yield result
 
     runner_outputs = getattr(output, "runner_outputs", None)
     if isinstance(runner_outputs, list):
         for runner_output in runner_outputs:
-            pack_diffusion_output_shm(runner_output, d2h_stream=d2h_stream)
+            yield from _iter_diffusion_outputs(runner_output)
+
+
+def payload_carries_typed_media(output: object) -> bool:
+    """True if *output* carries any typed ``DiffusionOutput.media`` payload."""
+    return any(item.media is not None for item in _iter_diffusion_outputs(output))
+
+
+def _pack_output_shm(
+    output: object,
+    *,
+    d2h_stream: torch.Stream | None,
+    created: list[dict[str, Any]],
+    pending_updates: list[tuple[DiffusionOutput, str, object]],
+) -> object:
+    for item in _iter_diffusion_outputs(output):
+        _pack_diffusion_fields(
+            item,
+            d2h_stream=d2h_stream,
+            created=created,
+            pending_updates=pending_updates,
+        )
     return output
 
 
 def _unpack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
     output.output = _unpack_if_shm_handle(output.output)
+    if isinstance(output.media, dict):
+        output.media = _unpack_diffusion_media(output.media)
     output.trajectory_latents = _unpack_if_shm_handle(output.trajectory_latents)
     output.trajectory_timesteps = _unpack_if_shm_handle(output.trajectory_timesteps)
     output.trajectory_log_probs = _unpack_if_shm_handle(output.trajectory_log_probs)

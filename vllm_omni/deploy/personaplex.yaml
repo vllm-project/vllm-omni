@@ -25,12 +25,8 @@ connectors:
     extra:
       shm_threshold_bytes: 65536
       codec_streaming: true
-      connector_get_sleep_s: 0.01
-      connector_get_max_wait_first_chunk: 3000
-      connector_get_max_wait: 300
       # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk.
       codec_chunk_frames: 5
-      codec_left_context_frames: 10
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
 

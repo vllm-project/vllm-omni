@@ -1,5 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import asyncio
+import gc
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -97,9 +102,11 @@ class FakeAsyncOmniEngine:
     ) -> None:
         self.model = model
         self.config_path = None
-        self.stage_configs: list[Any] = []
         self.stage_metadata = stage_metadata or [THREE_STAGE_META[-1]]
         self.num_stages = len(self.stage_metadata)
+        self.stage_configs = [
+            StageConfig(stage_id=i, model_stage="dummy-model").to_omegaconf() for i in range(self.num_stages)
+        ]
         self.default_sampling_params_list = default_sampling_params_list or [
             SamplingParams(max_tokens=8) for _ in range(self.num_stages)
         ]
@@ -112,8 +119,6 @@ class FakeAsyncOmniEngine:
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
         self.endpoint_restrictions = ()
-        self.duplex_session_config = None
-        self.duplex_serving_adapter_path = None
 
         self.output_q: queue.Queue[Any] = queue.Queue()
         self.submitted: list[dict[str, Any]] = []
@@ -161,7 +166,8 @@ class FakeAsyncOmniEngine:
     def abort(self, request_ids: list[str]) -> None:
         self.aborted.append(list(request_ids))
 
-    async def abort_async(self, request_ids: list[str]) -> None:
+    async def abort_async(self, request_ids: list[str], timeout=None) -> None:
+        del timeout
         self.abort(request_ids)
 
     async def collective_rpc_async(self, **_: Any) -> list[Any]:
@@ -176,7 +182,8 @@ class FakeAsyncOmniEngine:
 
 
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
     # Don't add random UUIDs to requests calling .generate since we usually
     # just want to check for present requests anyway, and would need to just
@@ -195,20 +202,28 @@ def _make_base():
     return obj
 
 
-def test_resolve_sampling_params_list_preserves_stage_constraints():
+def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base = _make_base()
     base.engine.num_stages = 1
-    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    required_stop_ids = [151704, 151645]
+    base.default_sampling_params_list = [
+        SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[99, *required_stop_ids])
+    ]
     base.engine.stage_configs = [
         StageConfig(
             stage_id=0,
             model_stage="dummy-model",
-            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+            sampling_constraints={"detokenize": False, "stop_token_ids": required_stop_ids},
         ).to_omegaconf()
     ]
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
-    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
-    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": required_stop_ids}]
+
+    resolved_defaults = base.resolve_sampling_params_list(None)
+
+    assert resolved_defaults[0].stop_token_ids == [99, 151704, 151645]
+
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[100, 151704])
 
     resolved = base.resolve_sampling_params_list(caller_params)
 
@@ -216,10 +231,29 @@ def test_resolve_sampling_params_list_preserves_stage_constraints():
     assert resolved[0].seed == 1234
     assert resolved[0].max_tokens == 7
     assert resolved[0].detokenize is False
-    assert resolved[0].stop_token_ids == [42]
-    assert 42 in resolved[0]._all_stop_token_ids
+    assert resolved[0].stop_token_ids == [100, 151704, 151645]
+    assert {100, 151704, 151645}.issubset(resolved[0]._all_stop_token_ids)
     assert caller_params.detokenize is True
-    assert caller_params.stop_token_ids == [7]
+    assert caller_params.stop_token_ids == [100, 151704]
+
+
+@pytest.mark.parametrize("use_defaults", [False, True])
+def test_moss_local_output_policy_preserves_codec_streaming(use_defaults):
+    from vllm_omni.model_executor.models.moss_tts.pipeline import MOSS_TTS_LOCAL_PIPELINE
+
+    base = _make_base()
+    base.engine.num_stages = 2
+    base.sampling_constraints_list = [stage.sampling_constraints for stage in MOSS_TTS_LOCAL_PIPELINE.stages]
+    base.default_sampling_params_list = [
+        base._apply_sampling_constraints(SamplingParams(), constraints)
+        for constraints in base.sampling_constraints_list
+    ]
+    caller = [SamplingParams(output_kind=RequestOutputKind.DELTA) for _ in range(2)]
+    result = base.resolve_sampling_params_list(None if use_defaults else caller, allow_delta_coercion=True)
+
+    assert [params.output_kind for params in result] == [RequestOutputKind.FINAL_ONLY, RequestOutputKind.DELTA]
+    assert all(params.output_kind == RequestOutputKind.DELTA for params in caller)
+    assert base.default_sampling_params_list[0].output_kind == RequestOutputKind.FINAL_ONLY
 
 
 def _stage_spec(
@@ -602,6 +636,43 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_async_omni_abort_yields_terminal_from_requested_final_stage(monkeypatch: pytest.MonkeyPatch):
+    stage_metadata = [
+        _stage_meta(stage_type="llm", final_output=False, final_output_type=None),
+        _stage_meta(stage_type="llm", final_output=True, final_output_type="audio"),
+    ]
+    engine = FakeAsyncOmniEngine(stage_metadata=stage_metadata)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+
+    async def collect_outputs() -> list[OmniRequestOutput]:
+        return [
+            output
+            async for output in app.generate(
+                prompt="hello",
+                request_id="req-1",
+                output_modalities=["audio"],
+            )
+        ]
+
+    try:
+        generate_task = asyncio.create_task(collect_outputs())
+        while not engine.submitted:
+            await asyncio.sleep(0)
+        await app.abort("req-1")
+        outputs = await asyncio.wait_for(generate_task, timeout=1)
+    finally:
+        app.shutdown()
+
+    assert len(outputs) == 1
+    assert outputs[0].stage_id == 1
+    assert outputs[0].final_output_type == "audio"
+    assert outputs[0].finished is True
+    assert outputs[0].outputs[0].finish_reason == "abort"
+    assert "req-1" not in app.request_states
+
+
+@pytest.mark.asyncio
 async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
     _patch_engine(monkeypatch, engine)
@@ -734,7 +805,7 @@ def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkey
         f"{engine.submitted[1]['request_id']}-stage0-0",
         f"{engine.submitted[1]['request_id']}-stage2-final",
     ]
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_generate_returns_list_when_not_using_generator(monkeypatch: pytest.MonkeyPatch):
@@ -780,7 +851,7 @@ def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatc
         [f"{engine.submitted[0]['request_id']}-image"],
         [f"{engine.submitted[1]['request_id']}-image"],
     ]
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
@@ -813,7 +884,7 @@ def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
         [f"{engine.submitted[1]['request_id']}-image"],
     ]
     assert engine.submitted[0]["sampling_params_list"][0].output_kind == RequestOutputKind.FINAL_ONLY
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
@@ -1294,3 +1365,57 @@ def test_omni_errored_property_dead_stage(monkeypatch: pytest.MonkeyPatch):
         assert app.errored is False
     finally:
         app.shutdown()
+
+
+def test_omni_pygenerator_does_not_kill_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    # Evaluating the generator should not shut down the engine
+    list(app.generate(["hello"], py_generator=True))
+    assert not engine.shutdown_called
+
+
+def test_omni_generator_close_cleans_up(monkeypatch: pytest.MonkeyPatch):
+    """Ensure that a closed generator cleans things up properly."""
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+
+    # Create a generator and start to evaluate it to make sure the request isn't aborted yet
+    my_gen = app.generate(["hello"], py_generator=True)
+    next(my_gen)
+    request_id = engine.submitted[0]["request_id"]
+    assert engine.aborted == []
+    assert request_id in app.request_states
+
+    # Close it and make sure the sure it's aborted, but without killing engine
+    my_gen.close()
+    assert engine.aborted == [[request_id]]
+    assert request_id not in app.request_states
+    assert not engine.shutdown_called
+
+
+def test_del_shutsdown_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    assert not engine.shutdown_called
+    del app
+    gc.collect()
+    assert engine.shutdown_called

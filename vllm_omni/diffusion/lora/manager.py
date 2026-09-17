@@ -48,6 +48,11 @@ class DiffusionLoRAManager:
     # Valid max allowed ranks for LoRA in vLLM
     _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
 
+    # Adapter whose weights are still uploaded while gated off. Class-level so
+    # a manager built without __init__ (some tests use object.__new__) reads as
+    # "nothing suspended" instead of raising.
+    _suspended_adapter_id: int | None = None
+
     def __init__(
         self,
         pipeline: nn.Module,
@@ -389,17 +394,20 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Default denoising components, declared DiT components, and any a
-        # pipeline opts into via ``_lora_components``.
+        # Components scanned for LoRA-capable layers: framework defaults,
+        # declared DiT components, and any a pipeline opts into via
+        # ``_lora_components``. The defaults only cover the generic diffusers
+        # naming convention: ``transformer`` (plus ``transformer_2`` for
+        # dual-DiT pipelines such as Wan2.2) and ``unet`` for SDXL-style
+        # pipelines. Model-specific attribute names must be declared by the
+        # pipeline itself via ``_dit_modules`` or ``_lora_components``.
         #
-        # NOTE: SDXL-style pipelines expose the denoiser as ``unet``.
-        # Without scanning this component, adapters can load/activate while
-        # effectively applying to zero layers, producing base-identical output.
+        # NOTE: if the denoiser component is not scanned here, adapters can
+        # load/activate while effectively applying to zero layers, producing
+        # base-identical output.
         default_components = (
             "transformer",
             "transformer_2",
-            "dit",
-            "bagel",
             "unet",
         )
         declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
@@ -493,9 +501,11 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Recreate per-layer buffers with the new maximum rank.
+        # Recreate per-layer buffers with the new maximum rank. The previous
+        # upload is gone, so nothing may be re-armed afterwards.
         for lora_layer in self._lora_modules.values():
             lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        self._suspended_adapter_id = None
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -549,9 +559,9 @@ class DiffusionLoRAManager:
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
-        lora_names_by_id = (
-            {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
-        )
+        # Track bindings unconditionally. The zero-binding guard below needs this
+        # bookkeeping on every pipeline, not only the ones that supply a validator.
+        lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
 
         def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
@@ -670,6 +680,13 @@ class DiffusionLoRAManager:
                 scale,
             )
 
+        if not bound_lora_names:
+            raise ValueError(
+                f"LoRA adapter {lora_model.id} applies to no layer: expected target modules in "
+                f"{sorted(self._expected_lora_modules)} but received {sorted(lora_model.loras)}. "
+                "Activating it would leave the base model unchanged."
+            )
+
         if callable(binding_validator):
             binding_validator(
                 lora_model=lora_model,
@@ -679,10 +696,23 @@ class DiffusionLoRAManager:
     def _reset_lora_layers(self) -> None:
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
+        self._suspended_adapter_id = None
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
         if self._is_active_at_scale(adapter_id, scale):
             logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            return
+
+        if self._suspended_adapter_id == adapter_id and self._adapter_scales.get(
+            adapter_id
+        ) == DiffusionLoRAManager._get_rounded_scale(scale):
+            # Weights are still uploaded from an earlier activation; re-arming
+            # the masks avoids rebuilding and re-uploading every layer.
+            for lora_layer in self._lora_modules.values():
+                lora_layer.resume_lora()
+            self._suspended_adapter_id = None
+            self._active_adapter_id = adapter_id
+            logger.debug("Re-armed suspended adapter %d", adapter_id)
             return
 
         logger.info("Activating adapter: id=%d", adapter_id)
@@ -691,6 +721,7 @@ class DiffusionLoRAManager:
         # state before the first mutation and leave every wrapper inactive if
         # any set_lora() call or model validator fails.
         self._active_adapter_id = None
+        self._suspended_adapter_id = None
         try:
             self._bind_adapter_weights(lora_model, scale)
         except Exception:
@@ -704,8 +735,10 @@ class DiffusionLoRAManager:
         if self._active_adapter_id is None:
             logger.debug("All adapters already inactive")
             return
-        logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
-        self._reset_lora_layers()
+        logger.info("Suspending all adapters: %d layers", len(self._lora_modules))
+        for lora_layer in self._lora_modules.values():
+            lora_layer.suspend_lora()
+        self._suspended_adapter_id = self._active_adapter_id
         self._active_adapter_id = None
         logger.debug("All adapters deactivated")
 
@@ -771,6 +804,11 @@ class DiffusionLoRAManager:
         logger.info("Removing adapter: id=%d", adapter_id)
         if self._active_adapter_id == adapter_id:
             self._deactivate_all_adapters()
+
+        if self._suspended_adapter_id == adapter_id:
+            # The adapter is going away, so the upload can never be resumed.
+            # Tear it down instead of leaving it in the stacked buffers.
+            self._reset_lora_layers()
 
         del self._registered_adapters[adapter_id]
         self._adapter_scales.pop(adapter_id, None)

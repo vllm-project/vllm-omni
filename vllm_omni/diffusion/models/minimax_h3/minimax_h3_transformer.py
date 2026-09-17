@@ -33,19 +33,23 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
-    indexed_gate,
-    indexed_gate_rms_norm_scale_shift,
-    indexed_scale_shift_,
-    rms_norm_indexed_scale_shift,
-)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.indexed_modulation import (
+    indexed_gate,
+    indexed_gate_rms_norm_scale_shift,
+    indexed_scale_shift_,
+    rms_norm_indexed_scale_shift,
+)
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
@@ -67,6 +71,15 @@ logger = init_logger(__name__)
 # packing, and ``_run_packed_attention`` re-checks it per forward; a name-only
 # gate would let FLASH_ATTN's NPU/XPU code paths through even though those
 # variants would silently attend across request boundaries.
+def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
+    """Match :meth:`Attention._get_active_parallel_strategy` for Ring."""
+    if not getattr(attention_layer, "use_ring", False) or getattr(attention_layer, "skip_sequence_parallel", False):
+        return False
+    if is_forward_context_available() and not get_forward_context().sp_active:
+        return False
+    return True
+
+
 def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     """True if this attention layer keeps N-document packed boundaries.
 
@@ -78,7 +91,7 @@ def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     backend = getattr(attention_layer, "attn_backend", None)
     if backend is None or not backend.supports_multi_doc_packed_varlen():
         return False
-    return not getattr(attention_layer, "use_ring", False)
+    return not _ring_sequence_parallel_is_active(attention_layer)
 
 
 @dataclass
@@ -422,6 +435,15 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        # VSA compression gate. A FastH3 VSA artifact assigns this projection
+        # with ``.set_weight``; the dense path never builds it, so the module is
+        # created only once the loader knows a VSA artifact is coming.
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        self._gate_hidden_size = arch.hidden_size
+        self._gate_quant_config = quant_config
+        self._gate_prefix = f"{prefix}.to_gate_compress"
+        from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
+
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -434,7 +456,28 @@ class MiniMaxH3Attention(nn.Module):
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
+            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
+
+    def enable_vsa_gate(self) -> None:
+        """Build the VSA compression gate this attention would otherwise lack.
+
+        Called before ``load_weights`` so the artifact's ``.set_weight`` tensor
+        has a parameter to land on. Zero-initialized like the Wan VSA layers, so
+        a gate that never receives weights degrades to sparse-only selection
+        rather than to garbage.
+        """
+        if self.to_gate_compress is not None:
+            return
+        self.to_gate_compress = ColumnParallelLinear(
+            self._gate_hidden_size,
+            self.total_num_heads * self.head_dim,
+            bias=False,
+            params_dtype=_BF16_DTYPE,
+            quant_config=self._gate_quant_config,
+            prefix=self._gate_prefix,
+        )
+        nn.init.zeros_(self.to_gate_compress.weight)
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -461,6 +504,8 @@ class MiniMaxH3Attention(nn.Module):
         packed_total: int,
         num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
+        gate_compress: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -479,6 +524,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         attn_mask = None
         mask_free_packed_padding = False
+        use_ring = _ring_sequence_parallel_is_active(self.attention)
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
             # rows are block-diagonal rather than a prefix: neither a KV prefix
@@ -505,12 +551,15 @@ class MiniMaxH3Attention(nn.Module):
             # supports_packed_mask_free: backend consumes the packed metadata
             # without ever reading attn_mask (CUDA packed varlen, NPU
             # npu_attn_varlen opt-in with its own fallback rebuild).
-            use_ring = getattr(self.attention, "use_ring", False)
             mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
-            if used < packed_total and not no_mask:
+            # Hybrid Ulysses reshards Q to one ring partition before the ring
+            # kernel runs, so a global [packed_total] mask cannot pass its
+            # query-length check. Ring consumes valid_kv_length directly and
+            # trims the circulated K/V blocks instead.
+            if used < packed_total and not no_mask and not use_ring:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -534,11 +583,21 @@ class MiniMaxH3Attention(nn.Module):
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
                 # fixed-size P2P buffers and still needs the mask.
-                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                "npu_attn_varlen": not use_ring,
                 # fp16-range protection for the ascend_laser_attention kernel
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
                 "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+                # Present only for a VSA artifact; the VSA backend reads it as
+                # the learned compression gate and every other backend ignores it.
+                **({"gate_compress": gate_compress.unsqueeze(0)} if gate_compress is not None else {}),
+                # FastH3 uses segment-pure prefix chunks. The target video and
+                # its true 3-D shape remain in the shared typed video layout.
+                **(
+                    {"vsa_h3_prefix_segments": vsa_prefix_segments}
+                    if gate_compress is not None and video_layout is not None and video_layout.video_spans
+                    else {}
+                ),
             },
             video_layout=video_layout,
         )
@@ -560,6 +619,7 @@ class MiniMaxH3Attention(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -593,6 +653,15 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
             )
 
+        # The gate is projected from the same local rows as Q. Pure Ulysses
+        # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
+        # rank receives the full sequence for its local head shard.
+        gate_compress = None
+        if self.to_gate_compress is not None:
+            gate_result = self.to_gate_compress(x)
+            gate_compress = gate_result[0] if isinstance(gate_result, tuple) else gate_result
+            gate_compress = gate_compress.view(total, self.num_heads, self.head_dim)
+
         # Each request contributes a document for its rows plus one for any
         # nonempty alignment padding. Local/Ulysses backends unpad it, while
         # Ring keeps aligned rows for fixed-size P2P buffers.
@@ -608,6 +677,8 @@ class MiniMaxH3Attention(nn.Module):
             packed_total=packed_total if packed_total is not None else q.shape[0],
             num_requests=num_requests,
             video_layout=video_layout,
+            vsa_prefix_segments=vsa_prefix_segments,
+            gate_compress=gate_compress,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -826,6 +897,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -861,6 +933,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             num_requests=num_requests,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
+            vsa_prefix_segments=vsa_prefix_segments,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1130,12 +1203,27 @@ class MiniMaxH3DiTModel(nn.Module):
         self.sp_prepare = MiniMaxH3SPPrepare()
         self.local_sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
+        self.vsa_gates_enabled = False
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
             quant_config,
             prefix="final_layer",
         )
         self._mark_missing_params_required()
+
+    def enable_vsa_gates(self) -> None:
+        """Give every DiT block's attention a VSA compression gate.
+
+        A FastH3 VSA artifact assigns these projections rather than adding to
+        them, so they have to exist before the weight stream reaches them. The
+        token refiner is left alone: the artifact carries gates for the 50 DiT
+        blocks only.
+        """
+        if self.vsa_gates_enabled:
+            return
+        for block in self.blocks:
+            block.attn.enable_vsa_gate()
+        self.vsa_gates_enabled = True
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1399,6 +1487,7 @@ class MiniMaxH3DiTModel(nn.Module):
         # attention never reads cu_seqlens scalars off the device; a producer
         # that omits it is packing a single request.
         num_requests = int(self._psp_optional(psp, "num_requests", 1))
+        vsa_prefix_segments = tuple(int(length) for length in self._psp_optional(psp, "vsa_prefix_segments", ()))
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1480,6 +1569,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 packed_total=seq_len,
                 num_requests=num_requests,
                 video_layout=video_layout,
+                vsa_prefix_segments=vsa_prefix_segments,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)

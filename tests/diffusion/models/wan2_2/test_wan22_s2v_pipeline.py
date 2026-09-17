@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -7,6 +10,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
     Wan22S2VPipeline,
     _make_clip_generators,
@@ -14,11 +18,32 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import WanS2VTransformer3DModel
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("configured_shift", [None, 12.0])
+def test_s2v_constructor_preserves_unshifted_endpoints(configured_shift: float | None) -> None:
+    module = "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v"
+    config = SimpleNamespace(model="unused", flow_shift=configured_shift, enable_diffusion_pipeline_profiler=False)
+
+    def init_components(pipeline, *args):
+        pipeline.vae = SimpleNamespace(config=SimpleNamespace(scale_factor_temporal=4, scale_factor_spatial=8))
+
+    with (
+        patch(f"{module}.get_local_device", return_value=torch.device("cpu")),
+        patch(f"{module}._resolve_model_path", return_value="unused"),
+        patch(f"{module}._is_diffusers_format", return_value=True),
+        patch.object(Wan22S2VPipeline, "_init_diffusers_format", init_components),
+        patch.object(Wan22S2VPipeline, "setup_diffusion_pipeline_profiler"),
+    ):
+        pipeline = Wan22S2VPipeline(od_config=config)
+    assert pipeline._flow_shift == (3.0 if configured_shift is None else configured_shift)
+    assert pipeline.scheduler.config.shift == pipeline.scheduler.config["shift"] == 1.0
+    assert pipeline.scheduler.sigma_max == float(np.float32(0.999))
 
 
 def _make_s2v_sampling(**overrides):
-    values = {
+    values: dict[str, object] = {
         "height": 16,
         "width": 16,
         "num_frames": 8,
@@ -211,7 +236,8 @@ def test_s2v_forward_rejects_different_raw_audio_shapes() -> None:
         pipeline.forward(batch)
 
 
-def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
+@pytest.mark.parametrize("shift", [3.0, 12.0])
+def test_s2v_forward_batches_request_local_inputs_and_splits_outputs(shift: float) -> None:
     pipeline = object.__new__(Wan22S2VPipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
@@ -227,7 +253,8 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
         enable_cpu_offload=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
     )
-    pipeline.scheduler = MagicMock(timesteps=torch.tensor([1.0]))
+    pipeline._flow_shift = shift
+    pipeline.scheduler = FlowUniPCMultistepScheduler(shift=1.0)
     pipeline.vae_scale_factor_spatial = 8
     pipeline.resolution_divisor = 16
     pipeline.motion_frames = 7
@@ -262,6 +289,7 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
                     "multi_modal_data": {"image": image, "audio": audio_a},
                 },
                 sampling_params=_make_s2v_sampling(
+                    num_inference_steps=5,
                     num_outputs_per_prompt=2,
                     generator=generators_a,
                     latents=latents_a,
@@ -275,6 +303,7 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
                     "multi_modal_data": {"image": image, "audio": audio_b},
                 },
                 sampling_params=_make_s2v_sampling(
+                    num_inference_steps=5,
                     num_outputs_per_prompt=2,
                     generator=generators_b,
                     latents=latents_b,
@@ -287,6 +316,12 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
         platform.is_available.return_value = False
         outputs = pipeline.forward(batch)
 
+    expected = np.linspace(float(np.float32(0.999)), 0.0, 6)[:-1]
+    expected = shift * expected / (1.0 + (shift - 1.0) * expected)
+    torch.testing.assert_close(
+        pipeline.scheduler.sigmas, torch.tensor(np.append(expected, 0.0), dtype=torch.float32), rtol=0, atol=0
+    )
+    assert pipeline.scheduler.config.shift == pipeline.scheduler.config["shift"] == 1.0
     assert len(outputs) == 2
     assert outputs[0].output[0].shape[0] == 2
     assert outputs[1].output[0].shape[0] == 2
@@ -392,52 +427,31 @@ def test_encode_audio_skips_unshard_reshard_when_not_fsdp():
     assert "audio_emb" in result
 
 
-def test_s2v_pipeline_skips_cpu_offload_when_hsdp_enabled():
-    """Test that transformer.to('cpu') is NOT called when HSDP is active."""
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import Wan22S2VPipeline
-
+@pytest.mark.parametrize(
+    ("components", "use_hsdp", "expected"),
+    [
+        (None, False, True),
+        (["dit"], False, True),
+        (["text_encoder"], False, False),
+        (["dit"], True, False),
+    ],
+)
+def test_s2v_dit_release_honors_component_selection(components, use_hsdp, expected):
     pipeline = object.__new__(Wan22S2VPipeline)
     nn.Module.__init__(pipeline)
+    compact = None if components is None else {"mode": "module", "components": components}
+    pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config=compact,
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+        parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+    )
 
-    od_config = MagicMock()
-    od_config.enable_cpu_offload = True
-    parallel_config = MagicMock()
-    parallel_config.use_hsdp = True
-    od_config.parallel_config = parallel_config
-    pipeline.od_config = od_config
-
-    mock_transformer = MagicMock()
-    pipeline.transformer = mock_transformer
-
-    # Simulate the offload decision from the forward loop
-    if pipeline.od_config.enable_cpu_offload and not getattr(pipeline.od_config.parallel_config, "use_hsdp", False):
-        pipeline.transformer.to("cpu")
-
-    mock_transformer.to.assert_not_called()
-
-
-def test_s2v_pipeline_allows_cpu_offload_when_hsdp_disabled():
-    """Test that transformer.to('cpu') IS called when HSDP is not active."""
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import Wan22S2VPipeline
-
-    pipeline = object.__new__(Wan22S2VPipeline)
-    nn.Module.__init__(pipeline)
-
-    od_config = MagicMock()
-    od_config.enable_cpu_offload = True
-    parallel_config = MagicMock()
-    parallel_config.use_hsdp = False
-    od_config.parallel_config = parallel_config
-    pipeline.od_config = od_config
-
-    mock_transformer = MagicMock()
-    pipeline.transformer = mock_transformer
-
-    # Simulate the offload decision from the forward loop
-    if pipeline.od_config.enable_cpu_offload and not getattr(pipeline.od_config.parallel_config, "use_hsdp", False):
-        pipeline.transformer.to("cpu")
-
-    mock_transformer.to.assert_called_once_with("cpu")
+    assert pipeline._should_release_dit_before_decode() is expected
 
 
 def test_s2v_pipeline_hsdp_forward_complete_process():
@@ -540,6 +554,7 @@ def test_s2v_pipeline_hsdp_forward_complete_process():
     mock_scheduler.timesteps = torch.linspace(999, 0, 5)
     mock_scheduler.step = MagicMock(return_value=(torch.zeros(1, 16, 20, 88, 128),))
     pipeline.scheduler = mock_scheduler
+    pipeline._flow_shift = 3.0
 
     # -- Bind methods from the real class --
     pipeline.encode_prompt = Wan22S2VPipeline.encode_prompt.__get__(pipeline)
